@@ -17,19 +17,19 @@ Execute each step sequentially. Skip steps whose preconditions are already satis
 
 ### Step 1: Detect Platform
 
-Run the following and record the results for later use (PTOAS wheel matching):
+Run the following and record the results for later use:
 
 ```bash
 uname -s          # Darwin → macos, Linux → linux
-uname -m          # arm64 / x86_64
+uname -m          # arm64 / aarch64 / x86_64
 python3 --version # e.g. Python 3.11.x → PY_VER=cp311
 ```
 
-Derive the wheel platform tag:
-- macOS arm64  → `macosx_*_arm64`
-- macOS x86_64 → `macosx_*_x86_64`
-- Linux aarch64 → `manylinux_*_aarch64`
-- Linux x86_64  → `manylinux_*_x86_64`
+Derive platform tags:
+- macOS arm64  → wheel tag `macosx_*_arm64`
+- macOS x86_64 → wheel tag `macosx_*_x86_64`
+- Linux aarch64 → tar.gz asset `ptoas-bin-aarch64.tar.gz`
+- Linux x86_64  → tar.gz asset `ptoas-bin-x86_64.tar.gz`
 
 ### Step 2: Clone / verify pypto
 
@@ -37,7 +37,7 @@ Derive the wheel platform tag:
 WORKSPACE_DIR="$(cd "$(dirname "$PWD")" && pwd)"   # parent of current repo
 
 if [ ! -d "$WORKSPACE_DIR/pypto" ]; then
-    git clone https://github.com/hw-native-sys/pypto.git "$WORKSPACE_DIR/pypto"
+    git clone git@github.com:hw-native-sys/pypto.git "$WORKSPACE_DIR/pypto"
 fi
 ```
 
@@ -45,7 +45,7 @@ If the directory exists, verify the origin remote points to the correct URL:
 
 ```bash
 cd "$WORKSPACE_DIR/pypto"
-git remote get-url origin   # expect https://github.com/hw-native-sys/pypto.git
+git remote get-url origin   # expect git@github.com:hw-native-sys/pypto.git
 ```
 
 ### Step 3: Check pypto installation & decide whether to update
@@ -85,18 +85,74 @@ python3 -m pip install -e .
 
 ```bash
 if [ ! -d "$WORKSPACE_DIR/PTOAS" ]; then
-    git clone https://github.com/zhangstevenunity/PTOAS.git "$WORKSPACE_DIR/PTOAS"
+    git clone git@github.com:zhangstevenunity/PTOAS.git "$WORKSPACE_DIR/PTOAS"
 fi
 ```
 
-### Step 5: Install ptoas from release wheel
+### Step 5: Install ptoas from release
+
+The installation method depends on the platform detected in Step 1.
+
+#### Step 5a: Linux — download pre-built binary tarball
+
+On Linux, ptoas is **not** a Python package. Download the matching `tar.gz` from
+`https://github.com/zhangstevenunity/PTOAS/releases` and extract it next to pypto-lib.
+
+Use the helper script for automated download:
 
 ```bash
-python3 -m pip show ptoas 2>/dev/null
+bash .claude/skills/setup_env/scripts/setup_env.sh install-ptoas
 ```
 
-If not installed, download and install the matching wheel from
-`https://github.com/huawei-csl/PTOAS/releases`.
+Or manually:
+
+1. Pick the tarball matching the architecture from Step 1:
+   - `aarch64` → `ptoas-bin-aarch64.tar.gz`
+   - `x86_64`  → `ptoas-bin-x86_64.tar.gz`
+
+2. Download the tarball:
+   ```bash
+   curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
+     | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); \
+       [print(a['browser_download_url']) for a in assets if a['name']=='ptoas-bin-<arch>.tar.gz']"
+   # Download using the URL above:
+   curl --http1.1 -L -o /tmp/ptoas-bin-<arch>.tar.gz <download_url>
+   ```
+
+3. Create a target directory and extract into it (the tarball contains `ptoas` and
+   `bin/ptoas` at the top level, so extract into a dedicated directory):
+   ```bash
+   mkdir -p "$WORKSPACE_DIR/ptoas-bin"
+   tar -xzf /tmp/ptoas-bin-<arch>.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
+   ```
+
+4. Add execute permissions and set `PTOAS_ROOT`:
+   ```bash
+   chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
+   export PTOAS_ROOT="$WORKSPACE_DIR/ptoas-bin"
+   ```
+
+5. Verify:
+   ```bash
+   "$PTOAS_ROOT/ptoas" --version   # or "$PTOAS_ROOT/bin/ptoas" --version
+   ```
+
+**Slow download?** The tarball is ~40–50 MB. If the download speed is very slow (< 50 KB/s)
+or the command hangs for more than 2 minutes, **stop the download and ask the user to
+manually download the tarball** from `https://github.com/zhangstevenunity/PTOAS/releases`
+to their `~/Downloads` folder. Then extract from there:
+
+```bash
+mkdir -p "$WORKSPACE_DIR/ptoas-bin"
+tar -xzf ~/Downloads/ptoas-bin-<arch>.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
+chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
+export PTOAS_ROOT="$WORKSPACE_DIR/ptoas-bin"
+```
+
+#### Step 5b: macOS — install via Python wheel
+
+On macOS, ptoas is distributed as a Python wheel. Download and install the matching wheel
+from `https://github.com/huawei-csl/PTOAS/releases`.
 
 **Important:** This step requires full permissions (`required_permissions: ["all"]`) for
 both the download and the `pip install`.
@@ -111,19 +167,19 @@ Or manually:
 
 1. List latest release assets:
    ```bash
-   gh release view --repo huawei-csl/PTOAS --json assets -q '.assets[].name'
+   gh release view --repo zhangstevenunity/PTOAS --json assets -q '.assets[].name'
    ```
-2. Pick the wheel matching `cp{PY_VER}` + `{os}_{arch}` from Step 1.
+2. Pick the wheel matching `cp{PY_VER}` + `macosx` + `{arch}` from Step 1.
 3. Download and install:
    ```bash
-   gh release download --repo huawei-csl/PTOAS -p '<matched_wheel_name>' -D /tmp
+   gh release download --repo zhangstevenunity/PTOAS -p '<matched_wheel_name>' -D /tmp
    python3 -m pip install /tmp/<matched_wheel_name>
    ```
 
-**Slow download?** The wheel is ~45 MB. If the download speed is very slow (< 50 KB/s)
+**Slow download?** If the download speed is very slow (< 50 KB/s)
 or the command hangs for more than 2 minutes, **stop the download and ask the user to
-manually download the wheel** from `https://github.com/huawei-csl/PTOAS/releases` to
-their `~/Downloads` folder. Then install from there:
+manually download the wheel** from `https://github.com/zhangstevenunity/PTOAS/releases`
+to their `~/Downloads` folder. Then install from there:
 
 ```bash
 python3 -m pip install ~/Downloads/<matched_wheel_name>
@@ -133,7 +189,7 @@ python3 -m pip install ~/Downloads/<matched_wheel_name>
 
 ```bash
 if [ ! -d "$WORKSPACE_DIR/simpler" ]; then
-    git clone https://github.com/ChaoWao/simpler.git "$WORKSPACE_DIR/simpler"
+    git clone git@github.com:ChaoWao/simpler.git "$WORKSPACE_DIR/simpler"
 fi
 ```
 
@@ -144,6 +200,7 @@ cd "$WORKSPACE_DIR/simpler"
 git fetch origin
 git checkout stable
 git pull origin stable
+export SIMPLER_ROOT="$WORKSPACE_DIR/simpler"
 ```
 
 ### Step 8: Validate environment
@@ -168,9 +225,10 @@ If the script completes without errors, the environment is correctly configured.
 | Symptom | Fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'pypto'` | Re-run Step 3b — make sure `python3 -m pip` matches the active `python3` |
-| `ModuleNotFoundError: No module named 'ptoas'` | Re-run Step 5 — check that the wheel matches your platform |
+| `ModuleNotFoundError: No module named 'ptoas'` | macOS only — re-run Step 5b and check that the wheel matches your platform |
+| `ptoas: command not found` or `Permission denied` | Linux — re-run Step 5a, ensure `chmod +x` was applied and `PTOAS_ROOT` is exported |
 | `pip3 show pypto` shows wrong Location (e.g. Python 3.9 path) | Uninstall first (`python3 -m pip uninstall pypto`) then reinstall |
 | `gh: command not found` | Install GitHub CLI or use `curl` with the GitHub API instead |
-| Git clone fails with permission denied | Check SSH keys or switch to HTTPS URL |
-| ptoas wheel download is extremely slow | Ask user to download manually from GitHub releases to `~/Downloads`, then `python3 -m pip install ~/Downloads/<wheel>` |
+| Git clone fails with permission denied | Check SSH keys are configured correctly for GitHub |
+| ptoas download is extremely slow | Ask user to download manually from GitHub releases to `~/Downloads` |
 | `Wheel ... is invalid` after download | Incomplete download — delete the file and re-download |

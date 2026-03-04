@@ -2,7 +2,7 @@
 # Environment setup helper for pypto-lib.
 # Usage:
 #   bash setup_env.sh            # Run full setup
-#   bash setup_env.sh install-ptoas  # Only install ptoas wheel
+#   bash setup_env.sh install-ptoas  # Only install ptoas (binary on Linux, wheel on macOS)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,8 +74,62 @@ SetupPtoasRepo() {
 }
 
 # ---------------------------------------------------------------------------
-# ptoas wheel: download from huawei-csl/PTOAS releases and pip install
+# ptoas: platform-dependent installation
+#   Linux  → download pre-built tar.gz, extract, chmod, set PTOAS_ROOT
+#   macOS  → download wheel and pip install
 # ---------------------------------------------------------------------------
+InstallPtoas() {
+    DetectPlatform
+
+    if [ "$OS_NAME" = "Linux" ]; then
+        InstallPtoasBinary
+    elif [ "$OS_NAME" = "Darwin" ]; then
+        InstallPtoasWheel
+    else
+        echo "ERROR: Unsupported OS for ptoas installation: $OS_NAME"
+        exit 1
+    fi
+}
+
+InstallPtoasBinary() {
+    local ptoas_dir="$WORKSPACE_DIR/ptoas-bin"
+    if [ -x "$ptoas_dir/ptoas" ] || [ -x "$ptoas_dir/bin/ptoas" ]; then
+        echo "ptoas binary already present at $ptoas_dir"
+        export PTOAS_ROOT="$ptoas_dir"
+        echo "PTOAS_ROOT=$PTOAS_ROOT"
+        return 0
+    fi
+
+    local tarball="ptoas-bin-${ARCH_TAG}.tar.gz"
+    echo "Fetching latest release assets from zhangstevenunity/PTOAS..."
+    local dl_url
+    dl_url="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
+              | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); \
+                [print(a['browser_download_url']) for a in assets if a['name']=='$tarball']")"
+
+    if [ -z "$dl_url" ]; then
+        echo "ERROR: Could not find $tarball in latest release."
+        exit 1
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    echo "Downloading $tarball via curl..."
+    curl --http1.1 -L -o "$tmp_dir/$tarball" "$dl_url"
+
+    echo "Extracting to $ptoas_dir..."
+    mkdir -p "$ptoas_dir"
+    tar -xzf "$tmp_dir/$tarball" -C "$ptoas_dir"
+    rm -rf "$tmp_dir"
+
+    chmod +x "$ptoas_dir/ptoas" 2>/dev/null || true
+    chmod +x "$ptoas_dir/bin/ptoas" 2>/dev/null || true
+
+    export PTOAS_ROOT="$ptoas_dir"
+    echo "PTOAS_ROOT=$PTOAS_ROOT"
+    echo "ptoas binary installed successfully."
+}
+
 InstallPtoasWheel() {
     if python3 -m pip show ptoas >/dev/null 2>&1; then
         echo "ptoas already installed."
@@ -83,16 +137,14 @@ InstallPtoasWheel() {
         return 0
     fi
 
-    DetectPlatform
-
-    echo "Fetching latest release assets from huawei-csl/PTOAS..."
+    echo "Fetching latest release assets from zhangstevenunity/PTOAS..."
     local assets
-    assets="$(gh release view --repo huawei-csl/PTOAS --json assets -q '.assets[].name' 2>/dev/null)" || true
+    assets="$(gh release view --repo zhangstevenunity/PTOAS --json assets -q '.assets[].name' 2>/dev/null)" || true
     if [ -z "$assets" ] && command -v gh >/dev/null 2>&1; then
         echo "gh failed or needs GH_TOKEN, using curl..."
     fi
     if [ -z "$assets" ]; then
-        assets="$(curl --http1.1 -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
+        assets="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
                   | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]")"
     fi
 
@@ -124,11 +176,11 @@ InstallPtoasWheel() {
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
-    if command -v gh >/dev/null 2>&1 && gh release download --repo huawei-csl/PTOAS -p "$match" -D "$tmp_dir" 2>/dev/null; then
+    if command -v gh >/dev/null 2>&1 && gh release download --repo zhangstevenunity/PTOAS -p "$match" -D "$tmp_dir" 2>/dev/null; then
         :
     else
         local dl_url
-        dl_url="$(curl --http1.1 -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
+        dl_url="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
                   | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); [print(a['browser_download_url']) for a in assets if a['name']=='$match']")"
         echo "Downloading $match via curl (HTTP/1.1 to avoid framing issues)..."
         curl --http1.1 -L -o "$tmp_dir/$match" "$dl_url"
@@ -166,14 +218,13 @@ Main() {
     local cmd="${1:-all}"
     case "$cmd" in
         install-ptoas)
-            DetectPlatform
-            InstallPtoasWheel
+            InstallPtoas
             ;;
         all)
             DetectPlatform
             SetupPypto
             SetupPtoasRepo
-            InstallPtoasWheel
+            InstallPtoas
             SetupSimpler
             Validate
             ;;

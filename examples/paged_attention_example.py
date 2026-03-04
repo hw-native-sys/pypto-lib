@@ -25,13 +25,174 @@ Pipeline per KV block iteration:
   3. PV Matmul:       oi_tmp       = kernel_pv_matmul(pij, vj, oi_tmp)
   4. Online Update:   mi, li, oi, dst = kernel_online_update(
                           mi_j, li_j, oi_new, mi, li, oi, dst, is_first, is_last)
+
+Shared InCore kernels (module-level @pl.function):
+  kernel_init_inplace, kernel_qk_matmul, kernel_softmax_prepare,
+  kernel_pv_matmul, kernel_online_update
+
+These can be imported and reused by other @pl.program definitions.
 """
 
-import os
+import struct
 
 import pypto.language as pl
-from pypto import ir
+import torch  # type: ignore[import]
 from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy
+from pypto.runtime import RunConfig, TensorSpec, run
+
+# ── Shared InCore kernels (module-level, reusable across programs) ──────────
+
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel_init_inplace(
+    oi: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    li: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+    mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+) -> tuple[
+    pl.Tensor[[16, 128], pl.FP32],
+    pl.Tensor[[16, 1], pl.FP32],
+    pl.Tensor[[16, 1], pl.FP32],
+]:
+    """Initialize inplace accumulators to zero (VECTOR)."""
+    return oi, li, mi
+
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel_qk_matmul(
+    qi: pl.Tensor[[16, 128], pl.BF16],
+    kj: pl.Tensor[[128, 128], pl.BF16],
+    output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+) -> pl.Tensor[[16, 128], pl.FP32]:
+    """QK matmul: sij = qi @ kj.T (CUBE). kj transposed before move to L0B."""
+    qi_l1 = pl.load(qi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+    kj_l1 = pl.load(kj, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+    qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
+    kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
+    sij_l0c = pl.matmul(qi_l0a, kj_l0b)
+    out: pl.Tensor[[16, 128], pl.FP32] = pl.l0c_store(sij_l0c, [0, 0], [16, 128], output)
+    return out
+
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel_softmax_prepare(
+    sij: pl.Tensor[[16, 128], pl.FP32],
+    scale: pl.Scalar[pl.FP32],
+    out_pij: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+    out_mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+    out_li: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+) -> tuple[
+    pl.Tensor[[16, 128], pl.BF16],
+    pl.Tensor[[16, 1], pl.FP32],
+    pl.Tensor[[16, 1], pl.FP32],
+]:
+    """Softmax prepare: scale, row_max, exp, row_sum (VECTOR)."""
+    s_tile = pl.load(sij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
+    scaled = pl.mul(s_tile, scale)
+    tmp_tile = pl.create_tile([16, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+    mi_tile = pl.row_max(scaled, tmp_tile)
+    sij_centered = pl.row_expand_sub(scaled, mi_tile)
+    exp_tile = pl.exp(sij_centered)
+    pij_tile_bf16 = pl.cast(exp_tile, target_type=pl.BF16)
+    pij_tile = pl.cast(pij_tile_bf16, target_type=pl.FP32)
+    li_tile = pl.row_sum(pij_tile, tmp_tile)
+    out_pij = pl.store(pij_tile_bf16, [0, 0], [16, 128], out_pij)
+    out_mi = pl.store(mi_tile, [0, 0], [16, 1], out_mi)
+    out_li = pl.store(li_tile, [0, 0], [16, 1], out_li)
+    return out_pij, out_mi, out_li
+
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel_pv_matmul(
+    pij: pl.Tensor[[16, 128], pl.BF16],
+    vj: pl.Tensor[[128, 128], pl.BF16],
+    output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+) -> pl.Tensor[[16, 128], pl.FP32]:
+    """PV matmul: oi_tmp = pij @ vj (CUBE)."""
+    pij_l1 = pl.load(pij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+    vj_l1 = pl.load(vj, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+    pij_l0a = pl.move(pij_l1, target_memory=pl.MemorySpace.Left)
+    vj_l0b = pl.move(vj_l1, target_memory=pl.MemorySpace.Right)
+    oi_l0c = pl.matmul(pij_l0a, vj_l0b)
+    out = pl.l0c_store(oi_l0c, [0, 0], [16, 128], output)
+    return out
+
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel_online_update(
+    mij: pl.Tensor[[16, 1], pl.FP32],
+    lij: pl.Tensor[[16, 1], pl.FP32],
+    oi_new: pl.Tensor[[16, 128], pl.FP32],
+    mi: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
+    li: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
+    oi: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
+    dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+    is_first: pl.Scalar[pl.BOOL],
+    is_last: pl.Scalar[pl.BOOL],
+) -> tuple[
+    pl.Tensor[[16, 1], pl.FP32],
+    pl.Tensor[[16, 1], pl.FP32],
+    pl.Tensor[[16, 128], pl.FP32],
+    pl.Tensor[[16, 128], pl.FP32],
+]:
+    """Online softmax update with inplace mi/li/oi (VECTOR)."""
+    mij_tile = pl.load(mij, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
+    lij_tile = pl.load(lij, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
+    oi_new_tile = pl.load(oi_new, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
+    mi_tile = pl.load(mi, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
+    li_tile = pl.load(li, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
+    oi_tile = pl.load(oi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
+
+    if is_first:
+        mi_out = pl.store(mij_tile, [0, 0], [16, 1], mi)
+        li_out = pl.store(lij_tile, [0, 0], [16, 1], li)
+        oi_out = pl.store(oi_new_tile, [0, 0], [16, 128], oi)
+        if is_last:
+            dst_tile = pl.row_expand_div(oi_new_tile, lij_tile)
+            dst_out = pl.store(dst_tile, [0, 0], [16, 128], dst)
+        else:
+            # First block but not last: dst is not yet meaningful, store zeros
+            zero_tile = pl.block.full([16, 128], dtype=pl.FP32, value=0.0)
+            dst_out = pl.store(zero_tile, [0, 0], [16, 128], dst)
+    else:
+        # Reshape DN [16,1] -> ND [1,16] for element-wise ops
+        mi_tile_nd = pl.reshape(mi_tile, [1, 16])
+        mij_tile_nd = pl.reshape(mij_tile, [1, 16])
+        li_tile_nd = pl.reshape(li_tile, [1, 16])
+        lij_tile_nd = pl.reshape(lij_tile, [1, 16])
+
+        mi_new = pl.maximum(mi_tile_nd, mij_tile_nd)
+        mi_diff = pl.sub(mi_tile_nd, mi_new)
+        alpha = pl.exp(mi_diff)
+        mij_diff = pl.sub(mij_tile_nd, mi_new)
+        beta = pl.exp(mij_diff)
+
+        li_scaled = pl.mul(alpha, li_tile_nd)
+        lij_scaled = pl.mul(beta, lij_tile_nd)
+        li_updated = pl.add(li_scaled, lij_scaled)
+
+        alpha_dn = pl.reshape(alpha, [16, 1])  # Reshape [1,16] -> [16,1] DN for row_expand_mul
+        oi_scaled = pl.row_expand_mul(oi_tile, alpha_dn)
+        beta_dn = pl.reshape(beta, [16, 1])  # Reshape [1,16] -> [16,1] DN for row_expand_mul
+        oi_new_scaled = pl.row_expand_mul(oi_new_tile, beta_dn)
+        oi_updated = pl.add(oi_scaled, oi_new_scaled)
+
+        mi_new_dn = pl.reshape(mi_new, [16, 1])  # Reshape back to DN [16,1] for store
+        li_updated_dn = pl.reshape(li_updated, [16, 1])  # Reshape back to DN [16,1] for store
+
+        mi_out = pl.store(mi_new_dn, [0, 0], [16, 1], mi)
+        li_out = pl.store(li_updated_dn, [0, 0], [16, 1], li)
+
+        if is_last:
+            dst_tile = pl.row_expand_div(oi_updated, li_updated_dn)
+            dst_out = pl.store(dst_tile, [0, 0], [16, 128], dst)
+            oi_out = pl.store(oi_updated, [0, 0], [16, 128], oi)
+        else:
+            zero_tile = pl.block.full([16, 128], dtype=pl.FP32, value=0.0)
+            dst_out = pl.store(zero_tile, [0, 0], [16, 128], dst)
+            oi_out = pl.store(oi_updated, [0, 0], [16, 128], oi)
+
+    return mi_out, li_out, oi_out, dst_out
 
 
 def build_paged_attention_program(
@@ -65,159 +226,13 @@ def build_paged_attention_program(
 
     @pl.program
     class PagedAttentionProgram:
-        """Paged attention program with CUBE and VECTOR kernels (online softmax)."""
+        """Paged attention program with CUBE and VECTOR kernels (online softmax).
 
-        # ── VECTOR kernel: init inplace tensors ─────────────────────────────
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_init_inplace(
-            self,
-            oi: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-            li: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-            mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> tuple[
-            pl.Tensor[[16, 128], pl.FP32],
-            pl.Tensor[[16, 1], pl.FP32],
-            pl.Tensor[[16, 1], pl.FP32],
-        ]:
-            """Initialize inplace accumulators to zero (VECTOR)."""
-            return oi, li, mi
-
-        # ── CUBE kernel: QK matmul ──────────────────────────────────────────
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_qk_matmul(
-            self,
-            qi: pl.Tensor[[16, 128], pl.BF16],
-            kj: pl.Tensor[[128, 128], pl.BF16],
-            output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-        ) -> pl.Tensor[[16, 128], pl.FP32]:
-            """QK matmul: sij = qi @ kj.T (CUBE). kj transposed before move to L0B."""
-            qi_l1 = pl.load(qi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
-            kj_l1 = pl.load(kj, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
-            qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
-            kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
-            sij_l0c = pl.matmul(qi_l0a, kj_l0b)
-            out: pl.Tensor[[16, 128], pl.FP32] = pl.l0c_store(sij_l0c, [0, 0], [16, 128], output)
-            return out
-
-        # ── VECTOR kernel: softmax prepare ──────────────────────────────────
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_softmax_prepare(
-            self,
-            sij: pl.Tensor[[16, 128], pl.FP32],
-            scale: pl.Scalar[pl.FP32],
-            out_pij: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
-            out_mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-            out_li: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> tuple[
-            pl.Tensor[[16, 128], pl.BF16],
-            pl.Tensor[[16, 1], pl.FP32],
-            pl.Tensor[[16, 1], pl.FP32],
-        ]:
-            """Softmax prepare: scale, row_max, exp, row_sum (VECTOR)."""
-            s_tile = pl.load(sij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-            scaled = pl.mul(s_tile, scale)
-            tmp_tile = pl.create_tile([16, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            mi_tile = pl.row_max(scaled, tmp_tile)
-            sij_centered = pl.row_expand_sub(scaled, mi_tile)
-            exp_tile = pl.exp(sij_centered)
-            pij_tile_bf16 = pl.cast(exp_tile, target_type=pl.BF16)
-            pij_tile = pl.cast(pij_tile_bf16, target_type=pl.FP32)
-            li_tile = pl.row_sum(pij_tile, tmp_tile)
-            out_pij = pl.store(pij_tile_bf16, [0, 0], [16, 128], out_pij)
-            out_mi = pl.store(mi_tile, [0, 0], [16, 1], out_mi)
-            out_li = pl.store(li_tile, [0, 0], [16, 1], out_li)
-            return out_pij, out_mi, out_li
-
-        # ── CUBE kernel: PV matmul ──────────────────────────────────────────
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_pv_matmul(
-            self,
-            pij: pl.Tensor[[16, 128], pl.BF16],
-            vj: pl.Tensor[[128, 128], pl.BF16],
-            output: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-        ) -> pl.Tensor[[16, 128], pl.FP32]:
-            """PV matmul: oi_tmp = pij @ vj (CUBE)."""
-            pij_l1 = pl.load(pij, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
-            vj_l1 = pl.load(vj, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
-            pij_l0a = pl.move(pij_l1, target_memory=pl.MemorySpace.Left)
-            vj_l0b = pl.move(vj_l1, target_memory=pl.MemorySpace.Right)
-            oi_l0c = pl.matmul(pij_l0a, vj_l0b)
-            out = pl.l0c_store(oi_l0c, [0, 0], [16, 128], output)
-            return out
-
-        # ── VECTOR kernel: online update (inplace) ──────────────────────────
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel_online_update(
-            self,
-            mij: pl.Tensor[[16, 1], pl.FP32],
-            lij: pl.Tensor[[16, 1], pl.FP32],
-            oi_new: pl.Tensor[[16, 128], pl.FP32],
-            mi: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
-            li: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
-            oi: pl.InOut[pl.Tensor[[16, 128], pl.FP32]],
-            dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-            is_first: pl.Scalar[pl.BOOL],
-            is_last: pl.Scalar[pl.BOOL],
-        ) -> tuple[
-            pl.Tensor[[16, 1], pl.FP32],
-            pl.Tensor[[16, 1], pl.FP32],
-            pl.Tensor[[16, 128], pl.FP32],
-            pl.Tensor[[16, 128], pl.FP32],
-        ]:
-            """Online softmax update with inplace mi/li/oi (VECTOR)."""
-            mij_tile = pl.load(mij, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
-            lij_tile = pl.load(lij, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
-            oi_new_tile = pl.load(oi_new, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-            mi_tile = pl.load(mi, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
-            li_tile = pl.load(li, [0, 0], [16, 1], target_memory=pl.MemorySpace.Vec)
-            oi_tile = pl.load(oi, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
-
-            if is_first:
-                mi_out = pl.store(mij_tile, [0, 0], [16, 1], mi)
-                li_out = pl.store(lij_tile, [0, 0], [16, 1], li)
-                oi_out = pl.store(oi_new_tile, [0, 0], [16, 128], oi)
-                if is_last:
-                    dst_tile = pl.row_expand_div(oi_new_tile, lij_tile)
-                    dst_out = pl.store(dst_tile, [0, 0], [16, 128], dst)
-            else:
-                # Reshape DN [16,1] -> ND [1,16] for element-wise ops
-                mi_tile_nd = pl.reshape(mi_tile, [1, 16])
-                mij_tile_nd = pl.reshape(mij_tile, [1, 16])
-                li_tile_nd = pl.reshape(li_tile, [1, 16])
-                lij_tile_nd = pl.reshape(lij_tile, [1, 16])
-
-                mi_new = pl.maximum(mi_tile_nd, mij_tile_nd)
-                mi_diff = pl.sub(mi_tile_nd, mi_new)
-                alpha = pl.exp(mi_diff)
-                mij_diff = pl.sub(mij_tile_nd, mi_new)
-                beta = pl.exp(mij_diff)
-
-                li_scaled = pl.mul(alpha, li_tile_nd)
-                lij_scaled = pl.mul(beta, lij_tile_nd)
-                li_updated = pl.add(li_scaled, lij_scaled)
-
-                alpha_dn = pl.reshape(alpha, [16, 1])  # Reshape [1,16] -> [16,1] DN for row_expand_mul
-                oi_scaled = pl.row_expand_mul(oi_tile, alpha_dn)
-                beta_dn = pl.reshape(beta, [16, 1])  # Reshape [1,16] -> [16,1] DN for row_expand_mul
-                oi_new_scaled = pl.row_expand_mul(oi_new_tile, beta_dn)
-                oi_updated = pl.add(oi_scaled, oi_new_scaled)
-
-                mi_new_dn = pl.reshape(mi_new, [16, 1])  # Reshape back to DN [16,1] for store
-                li_updated_dn = pl.reshape(li_updated, [16, 1])  # Reshape back to DN [16,1] for store
-
-                mi_out = pl.store(mi_new_dn, [0, 0], [16, 1], mi)
-                li_out = pl.store(li_updated_dn, [0, 0], [16, 1], li)
-
-                if is_last:
-                    dst_tile = pl.row_expand_div(oi_updated, li_updated_dn)
-                    dst_out = pl.store(dst_tile, [0, 0], [16, 128], dst)
-                    oi_out = pl.store(oi_updated, [0, 0], [16, 128], oi)
-                else:
-                    zero_tile = pl.block.full([16, 128], dtype=pl.FP32, value=0.0)
-                    dst_out = pl.store(zero_tile, [0, 0], [16, 128], dst)
-                    oi_out = pl.store(oi_updated, [0, 0], [16, 128], oi)
-
-            return mi_out, li_out, oi_out, dst_out
+        InCore kernels (kernel_init_inplace, kernel_qk_matmul,
+        kernel_softmax_prepare, kernel_pv_matmul, kernel_online_update) are
+        defined at module level and automatically added to this program when
+        called from the orchestration function.
+        """
 
         # ── Orchestration function ──────────────────────────────────────────
         # Parameters: query, key_cache, value_cache, block_table, context_lens,
@@ -268,8 +283,8 @@ def build_paged_attention_program(
                     li_update: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
                     mi_update: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
 
-                    # Initialize accumulators
-                    oi, li_update, mi_update = self.kernel_init_inplace(oi, li_update, mi_update)
+                    # Initialize accumulators via shared module-level InCore kernel
+                    oi, li_update, mi_update = kernel_init_inplace(oi, li_update, mi_update)
 
                     for bn in pl.range(bn_this_batch):
                         # Query view: row offset = b_idx * num_heads + q_idx * q_tile
@@ -301,8 +316,8 @@ def build_paged_attention_program(
                             dtype=pl.FP32,
                         )
 
-                        # QK matmul (CUBE)
-                        sij = self.kernel_qk_matmul(qi, kj, sij)
+                        # QK matmul (CUBE) via shared module-level InCore kernel
+                        sij = kernel_qk_matmul(qi, kj, sij)
                         sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.view(
                             sij,
                             [q_tile, valid_len],  # type: ignore[reportArgumentType]
@@ -316,15 +331,15 @@ def build_paged_attention_program(
                         mi: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
                         li: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
 
-                        # Softmax prepare (VECTOR) — use valid slice of sij
-                        pij_f16, mi, li = self.kernel_softmax_prepare(sij_valid, 1.0, pij_f16, mi, li)  # type: ignore[reportArgumentType]
+                        # Softmax prepare (VECTOR) via shared module-level InCore kernel
+                        pij_f16, mi, li = kernel_softmax_prepare(sij_valid, 1.0, pij_f16, mi, li)  # type: ignore[reportArgumentType]
 
                         oi_tmp: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.create_tensor(
                             [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
                             dtype=pl.FP32,
                         )
-                        # PV matmul (CUBE)
-                        oi_tmp = self.kernel_pv_matmul(pij_f16, vj, oi_tmp)
+                        # PV matmul (CUBE) via shared module-level InCore kernel
+                        oi_tmp = kernel_pv_matmul(pij_f16, vj, oi_tmp)
 
                         # Conditional flags
                         if bn == 0:
@@ -342,7 +357,8 @@ def build_paged_attention_program(
                             [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
                             [cur_offset, 0],
                         )
-                        mi_update, li_update, oi, out_view = self.kernel_online_update(
+                        # Online softmax update via shared module-level InCore kernel
+                        mi_update, li_update, oi, out_view = kernel_online_update(
                             mi, li, oi_tmp, mi_update, li_update, oi, out_view, is_first, is_last
                         )
 
@@ -351,56 +367,178 @@ def build_paged_attention_program(
     return PagedAttentionProgram
 
 
+def golden(tensors: dict, params: dict | None = None) -> None:
+    """Reference paged-attention computation (torch), mirroring the kernel pipeline.
+
+    Implements the online-softmax paged attention matching the 4-kernel pipeline:
+    QK matmul → softmax prepare → PV matmul → online update.
+
+    Args:
+        tensors: Dict mapping tensor names to torch tensors.
+        params: Unused.
+    """
+    config = tensors["config"]
+    batch = int(config[0].item())
+    num_heads = int(config[1].item())
+    head_dim = int(config[3].item())
+    block_size = int(config[4].item())
+    max_num_blocks_per_req = int(config[5].item())
+    # scale_bits is stored as float32 bits (IEEE 754) in an INT64 slot
+    scale_bits = int(config[6].item())
+    scale = struct.unpack("f", struct.pack("I", scale_bits & 0xFFFFFFFF))[0]
+
+    query = tensors["query"].float().reshape(batch, num_heads, head_dim)
+    total_pool_blocks = batch * max_num_blocks_per_req
+    key_cache = tensors["key_cache"].float().reshape(total_pool_blocks, block_size, head_dim)
+    value_cache = tensors["value_cache"].float().reshape(total_pool_blocks, block_size, head_dim)
+    block_table = tensors["block_table"].reshape(batch, max_num_blocks_per_req)
+    context_lens = tensors["context_lens"]
+
+    out = torch.zeros((batch, num_heads, head_dim), dtype=torch.float32)
+    q_tile = 16
+    max_bn = int((context_lens.max().item() + block_size - 1) // block_size)
+
+    for q_offset in range(0, num_heads, q_tile):
+        q_tile_size = min(q_tile, num_heads - q_offset)
+        qi = query[:, q_offset : q_offset + q_tile_size, :]  # [batch, q_tile, head_dim]
+        oi, li, mi = None, None, None
+
+        for bn in range(max_bn):
+            valid_lens = torch.clamp(context_lens - bn * block_size, min=0, max=block_size)
+            if not (valid_lens > 0).any():
+                break
+            block_indices = block_table[:, bn]  # [batch]
+            kj_all = key_cache[block_indices]  # [batch, block_size, head_dim]
+            vj_all = value_cache[block_indices]  # [batch, block_size, head_dim]
+
+            sij = torch.bmm(qi, kj_all.transpose(1, 2)) * scale  # [batch, q_tile, block_size]
+            pos = torch.arange(block_size).unsqueeze(0)  # [1, block_size]
+            valid_mask = (pos < valid_lens.unsqueeze(1)).unsqueeze(1)  # [batch, 1, block_size]
+            sij = sij.masked_fill(~valid_mask, float("-inf"))
+            mij = sij.max(dim=-1, keepdim=True)[0].clamp(min=-1e30)  # [batch, q_tile, 1]
+            pij = torch.exp(sij - mij).masked_fill(~valid_mask, 0.0)
+            pij = pij.to(torch.bfloat16).to(torch.float32)
+            lij = pij.sum(dim=-1, keepdim=True)  # [batch, q_tile, 1]
+            oi_new = torch.bmm(pij, vj_all)  # [batch, q_tile, head_dim]
+
+            if bn == 0:
+                oi, li, mi = oi_new, lij, mij
+            else:
+                mi_new = torch.maximum(mi, mij)
+                alpha = torch.exp(mi - mi_new)
+                beta = torch.exp(mij - mi_new)
+                li = alpha * li + beta * lij
+                oi = alpha * oi + beta * oi_new
+                mi = mi_new
+
+        assert oi is not None and li is not None, "No KV blocks processed for this query tile"
+        out[:, q_offset : q_offset + q_tile_size, :] = oi / li
+
+    tensors["out"][:] = out.reshape(batch * num_heads, head_dim)
+
+
+def build_tensor_specs(
+    batch: int,
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    max_num_blocks_per_req: int,
+    context_len: int,
+    scale: float = 1.0,
+) -> list[TensorSpec]:
+    """Build the TensorSpec list matching the paged_attention orchestration signature.
+
+    Args:
+        batch: Number of requests in the batch.
+        num_heads: Number of query heads.
+        head_dim: Per-head feature dimension.
+        block_size: KV-cache block size (rows per physical block).
+        max_num_blocks_per_req: Maximum number of KV blocks per request.
+        context_len: Number of valid tokens per request.
+        scale: Attention scale factor (stored as float32 bits in config[6]).
+    """
+    query_rows = batch * num_heads
+    key_cache_rows = batch * max_num_blocks_per_req * block_size
+    block_table_flat_size = batch * max_num_blocks_per_req
+
+    # config layout: [batch, num_heads, kv_head_num=1, head_dim, block_size, max_blocks, scale_bits]
+    # scale_bits: float32 value stored as its raw IEEE-754 bit pattern in an INT64 slot
+    scale_bits = struct.unpack("I", struct.pack("f", scale))[0]
+    config_data = torch.tensor(
+        [batch, num_heads, 1, head_dim, block_size, max_num_blocks_per_req, scale_bits],
+        dtype=torch.int64,
+    )
+
+    # Each request has context_len valid tokens
+    context_lens_data = torch.full((batch,), context_len, dtype=torch.int32)
+
+    # block_table: random physical block assignment, indices in [0, batch*max_blocks)
+    block_table_data = torch.randint(
+        0, max(block_table_flat_size, 1), size=(batch, max_num_blocks_per_req), dtype=torch.int32
+    ).flatten()
+
+    # Byte sizes: BF16 tensors use 2 bytes per element
+    size_query = torch.tensor([query_rows * head_dim * 2], dtype=torch.int64)
+    size_key_cache = torch.tensor([key_cache_rows * head_dim * 2], dtype=torch.int64)
+    size_value_cache = torch.tensor([key_cache_rows * head_dim * 2], dtype=torch.int64)
+
+    return [
+        TensorSpec("query", [query_rows, head_dim], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("key_cache", [key_cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("value_cache", [key_cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("block_table", [block_table_flat_size], torch.int32, init_value=block_table_data),
+        TensorSpec("context_lens", [batch], torch.int32, init_value=context_lens_data),
+        TensorSpec("out", [query_rows, head_dim], torch.float32, is_output=True),
+        TensorSpec("config", [7], torch.int64, init_value=config_data),
+        TensorSpec("size_query", [1], torch.int64, init_value=size_query),
+        TensorSpec("size_key_cache", [1], torch.int64, init_value=size_key_cache),
+        TensorSpec("size_value_cache", [1], torch.int64, init_value=size_value_cache),
+    ]
+
+
 def main():
-    """Build IR, compile, and display generated orchestration C++ code."""
-    print("=" * 70)
-    print("Paged Attention Orchestration Code Generation")
-    print("=" * 70)
+    batch = 64
+    num_heads = 16
+    head_dim = 128
+    block_size = 128
+    max_model_len = 32768
+    context_len = 8192
+    scale = 1.0
+    max_num_blocks_per_req = max_model_len // block_size  # 256
 
     program = build_paged_attention_program(
-        batch=2,
-        num_heads=16,
-        head_dim=128,
-        block_size=128,
-        max_num_blocks_per_req=32,
+        batch=batch,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks_per_req=max_num_blocks_per_req,
     )
-    print(f"\nProgram: {program.name}")
-    print(f"Functions: {[f.name for f in program.functions.values()]}")
 
-    # Print IR preview
-    print("\n[1] IR Preview:")
-    print("-" * 70)
-    ir_text = ir.python_print(program)
-    lines = ir_text.split("\n")
-    preview = min(60, len(lines))
-    print("\n".join(lines[:preview]))
-    if len(lines) > preview:
-        print(f"\n... ({len(lines) - preview} more lines)")
-    print("-" * 70)
-
-    # Compile
-    print("\n[2] Compiling...")
-    output_dir = ir.compile(
-        program,
-        strategy=ir.OptimizationStrategy.Default,
-        dump_passes=True,
-        backend_type=BackendType.CCE,
+    # Run on device (requires Simpler's CodeRunner in SIMPLER_ROOT)
+    tensor_specs = build_tensor_specs(
+        batch=batch,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks_per_req=max_num_blocks_per_req,
+        context_len=context_len,
+        scale=scale,
     )
-    print(f"Output: {output_dir}")
-
-    # List generated files
-    print("\n[3] Generated files:")
-    for root, _dirs, files in os.walk(output_dir):
-        for f in files:
-            path = os.path.join(root, f)
-            rel = os.path.relpath(path, output_dir)
-            print(f"  - {rel} ({os.path.getsize(path)} bytes)")
-
-    # Show orchestration code path
-    orch_file = os.path.join(output_dir, "orchestration", "paged_attention.cpp")
-    if os.path.exists(orch_file):
-        print("\n[4] Generated Orchestration C++ path:")
-        print(orch_file)
+    result = run(
+        program=program,
+        tensor_specs=tensor_specs,
+        golden=golden,
+        config=RunConfig(
+            platform="a2a3",
+            device_id=11,
+            rtol=2e-2,
+            atol=2e-2,
+            strategy=OptimizationStrategy.Default,
+            dump_passes=True,
+            backend_type=BackendType.CCE,
+        ),
+    )
+    print(f"Result: {result}")
 
     print("\nDone.")
 
