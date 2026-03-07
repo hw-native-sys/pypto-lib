@@ -40,18 +40,16 @@ EPS = 1e-6
 ATTN_SCALE = 0.08838834764831845
 HIDDEN_INV = 1.0 / HIDDEN
 
-# Chunk choices are picked so the common innermost tensor views stay roughly in
-# the 1KB~16KB range:
-# - [16, 128] BF16 activation tile = 4KB
-# - [16, 128] FP32 activation tile = 8KB
-# - [128, 64] BF16 weight tile = 16KB
-# - [64, 128] BF16 KV tile = 16KB
+# Chunk choices are tuned to balance InCore local tensor pressure:
+# - reduce projection/MLP chunk sizes to avoid over-large local buffers
+# - keep decode SEQ tile moderately large but under AIC SRAM pressure
 # Small decode-only per-head vectors like [1, 128] are unavoidable exceptions.
-K_CHUNK = 128
+K_CHUNK = 256
 Q_OUT_CHUNK = 64
-KV_OUT_CHUNK = 64
-SEQ_TILE = 64
-MLP_OUT_CHUNK = 64
+KV_OUT_CHUNK = 32
+SEQ_TILE = 120
+MLP_OUT_CHUNK = 32
+BATCH_TILE = 4
 
 
 def build_qwen3_single_layer_decode_program(
@@ -106,15 +104,13 @@ def build_qwen3_single_layer_decode_program(
             k_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.BF16)
             v_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.BF16)
             attn_out = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.FP32)
-            resid1 = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.FP32)
-            post_norm = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.BF16)
 
             # Scope 1: input RMSNorm + Q/K/V projection.
             with pl.auto_incore():
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0.0)
 
-                for kb in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
+                for kb in pl.range(HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
                     x_chunk = pl.cast(
                         pl.view(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0]),
@@ -123,45 +119,45 @@ def build_qwen3_single_layer_decode_program(
                     sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
 
                 inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-                q_proj_acc = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.FP32)
-                k_proj_acc = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.FP32)
-                v_proj_acc = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.FP32)
-                q_proj_acc = pl.mul(q_proj_acc, 0.0)
-                k_proj_acc = pl.mul(k_proj_acc, 0.0)
-                v_proj_acc = pl.mul(v_proj_acc, 0.0)
+                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+                    inv_rms_tile = pl.view(inv_rms, [BATCH_TILE, 1], [b0, 0])
 
-                for kb in pl.range(HIDDEN_BLOCKS):
-                    k0 = kb * K_CHUNK
-                    x_chunk_bf16 = pl.view(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0])
-                    x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                    gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
-                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                    normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-
-                    for ob in pl.parallel(0, PROJ_OUTER_BLOCKS, 1, chunk=8):
-                        if ob < Q_OUT_BLOCKS:
-                            q0 = ob * Q_OUT_CHUNK
-                            q_prev = pl.view(q_proj_acc, [BATCH_CFG, Q_OUT_CHUNK], [0, q0])
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
+                        q0 = ob * Q_OUT_CHUNK
+                        q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                        q_acc = pl.mul(q_acc, 0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
                             wq_chunk = pl.view(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                            q_next = pl.add(q_prev, pl.matmul(normed_bf16, wq_chunk))
-                            q_proj_acc = pl.assemble(q_proj_acc, q_next, [0, q0])
-                        if ob < KV_OUT_BLOCKS:
-                            kv0 = ob * KV_OUT_CHUNK
-                            k_prev = pl.view(k_proj_acc, [BATCH_CFG, KV_OUT_CHUNK], [0, kv0])
-                            v_prev = pl.view(v_proj_acc, [BATCH_CFG, KV_OUT_CHUNK], [0, kv0])
+                            q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
+                        q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+
+                    for ob in pl.parallel(0, KV_OUT_BLOCKS, 1, chunk=8):
+                        kv0 = ob * KV_OUT_CHUNK
+                        k_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                        k_acc = pl.mul(k_acc, 0.0)
+                        v_acc = pl.mul(v_acc, 0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                            normed_bf16 = pl.cast(normed, target_type=pl.BF16)
                             wk_chunk = pl.view(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             wv_chunk = pl.view(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            k_next = pl.add(k_prev, pl.matmul(normed_bf16, wk_chunk))
-                            v_next = pl.add(v_prev, pl.matmul(normed_bf16, wv_chunk))
-                            k_proj_acc = pl.assemble(k_proj_acc, k_next, [0, kv0])
-                            v_proj_acc = pl.assemble(v_proj_acc, v_next, [0, kv0])
-
-                q_proj = pl.cast(q_proj_acc, target_type=pl.BF16)
-                k_proj = pl.cast(k_proj_acc, target_type=pl.BF16)
-                v_proj = pl.cast(v_proj_acc, target_type=pl.BF16)
+                            k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
+                            v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
+                        k_proj = pl.assemble(k_proj, pl.cast(k_acc, target_type=pl.BF16), [b0, kv0])
+                        v_proj = pl.assemble(v_proj, pl.cast(v_acc, target_type=pl.BF16), [b0, kv0])
 
             # Scope 2: RoPE + cache update + decode attention.
-            # SEQ_TILE = 64 keeps K/V cache tiles at 16KB. Per-head vectors such
+            # SEQ_TILE = 120 keeps K/V cache tiles at about 30KB. Per-head vectors such
             # as [1, 128] remain small, which is an inherent decode-side pattern.
             for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                 pos = pl.tensor.read(cache_pos, [b])
@@ -174,33 +170,32 @@ def build_qwen3_single_layer_decode_program(
                 sin_lo = pl.view(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
                 sin_hi = pl.view(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
-                with pl.auto_incore():
-                    for kvh in pl.parallel(0, NUM_KV_HEADS_CFG, 1, chunk=4):
-                        kv_col = kvh * HEAD_DIM_CFG
-                        k_row = pl.cast(
-                            pl.view(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
-                            target_type=pl.FP32,
-                        )
-                        k_lo = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                        k_hi = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
-                        k_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
-                        k_rot = pl.assemble(
-                            k_rot,
-                            pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo)),
-                            [0, 0],
-                        )
-                        k_rot = pl.assemble(
-                            k_rot,
-                            pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi)),
-                            [0, HEAD_DIM_CFG // 2],
-                        )
-                        cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + pos
-                        k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
-                        v_cache = pl.assemble(
-                            v_cache,
-                            pl.view(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
-                            [cache_row, 0],
-                        )
+                for kvh in pl.parallel(0, NUM_KV_HEADS_CFG, 1, chunk=4):
+                    kv_col = kvh * HEAD_DIM_CFG
+                    k_row = pl.cast(
+                        pl.view(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                        target_type=pl.FP32,
+                    )
+                    k_lo = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                    k_hi = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                    k_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
+                    k_rot = pl.assemble(
+                        k_rot,
+                        pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo)),
+                        [0, 0],
+                    )
+                    k_rot = pl.assemble(
+                        k_rot,
+                        pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi)),
+                        [0, HEAD_DIM_CFG // 2],
+                    )
+                    cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + pos
+                    k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
+                    v_cache = pl.assemble(
+                        v_cache,
+                        pl.view(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                        [cache_row, 0],
+                    )
 
                 with pl.auto_incore():
                     attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
@@ -275,75 +270,79 @@ def build_qwen3_single_layer_decode_program(
 
             # Scope 3: output projection + residual + post RMSNorm + MLP + residual.
             with pl.auto_incore():
-                for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                    o0 = ob * Q_OUT_CHUNK
-                    o_acc = pl.create_tensor([BATCH_CFG, Q_OUT_CHUNK], dtype=pl.FP32)
-                    o_acc = pl.mul(o_acc, 0.0)
-                    for kb in pl.range(HIDDEN_BLOCKS):
-                        k0 = kb * K_CHUNK
-                        a_chunk = pl.cast(
-                            pl.view(attn_out, [BATCH_CFG, K_CHUNK], [0, k0]),
-                            target_type=pl.BF16,
+                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+                    resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
+                        o0 = ob * Q_OUT_CHUNK
+                        o_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                        o_acc = pl.mul(o_acc, 0.0)
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            a_chunk = pl.cast(
+                                pl.view(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                                target_type=pl.BF16,
+                            )
+                            w_chunk = pl.view(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                            o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                        resid = pl.cast(
+                            pl.view(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
+                            target_type=pl.FP32,
                         )
-                        w_chunk = pl.view(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                        o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
-                    resid = pl.cast(
-                        pl.view(hidden_states, [BATCH_CFG, Q_OUT_CHUNK], [0, o0]),
-                        target_type=pl.FP32,
-                    )
-                    resid1 = pl.assemble(resid1, pl.add(o_acc, resid), [0, o0])
+                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
-                sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
-                sq_sum = pl.mul(sq_sum, 0.0)
-                for kb in pl.parallel(0, HIDDEN_BLOCKS, 1, chunk=4):
-                    k0 = kb * K_CHUNK
-                    x_chunk = pl.view(resid1, [BATCH_CFG, K_CHUNK], [0, k0])
-                    sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-                down_proj_acc = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.FP32)
-                down_proj_acc = pl.mul(down_proj_acc, 0.0)
+                    sq_sum = pl.create_tensor([BATCH_TILE, 1], dtype=pl.FP32)
+                    sq_sum = pl.mul(sq_sum, 0.0)
+                    for kb in pl.range(HIDDEN_BLOCKS):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
+                    inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
 
-                for kb in pl.range(HIDDEN_BLOCKS):
-                    k0 = kb * K_CHUNK
-                    x_chunk = pl.view(resid1, [BATCH_CFG, K_CHUNK], [0, k0])
-                    gamma = pl.view(post_rms_weight, [1, K_CHUNK], [0, k0])
-                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                    normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-                    post_norm = pl.assemble(post_norm, normed_bf16, [0, k0])
-
-                for ob in pl.range(MLP_OUT_BLOCKS):
-                    o0 = ob * MLP_OUT_CHUNK
-                    gate_acc = pl.create_tensor([BATCH_CFG, MLP_OUT_CHUNK], dtype=pl.FP32)
-                    up_acc = pl.create_tensor([BATCH_CFG, MLP_OUT_CHUNK], dtype=pl.FP32)
-                    gate_acc = pl.mul(gate_acc, 0.0)
-                    up_acc = pl.mul(up_acc, 0.0)
+                    post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
+                    down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
+                    down_proj_tile = pl.mul(down_proj_tile, 0.0)
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
-                        post_chunk = pl.view(post_norm, [BATCH_CFG, K_CHUNK], [0, k0])
-                        wg = pl.view(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        wu = pl.view(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
-                        up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
+                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        gamma = pl.view(post_rms_weight, [1, K_CHUNK], [0, k0])
+                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
+                        post_norm_tile = pl.assemble(post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                    mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
-                    mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
+                    for ob in pl.range(MLP_OUT_BLOCKS):
+                        o0 = ob * MLP_OUT_CHUNK
+                        gate_acc = pl.create_tensor([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                        up_acc = pl.create_tensor([BATCH_TILE, MLP_OUT_CHUNK], dtype=pl.FP32)
+                        gate_acc = pl.mul(gate_acc, 0.0)
+                        up_acc = pl.mul(up_acc, 0.0)
 
-                    for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                        d0 = dob * Q_OUT_CHUNK
-                        down_prev = pl.view(down_proj_acc, [BATCH_CFG, Q_OUT_CHUNK], [0, d0])
-                        w_down_chunk = pl.view(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
-                        down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                        down_proj_acc = pl.assemble(down_proj_acc, down_next, [0, d0])
+                        for kb in pl.range(HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            post_chunk = pl.view(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wg = pl.view(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            wu = pl.view(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
+                            up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
-                for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                    o0 = ob * Q_OUT_CHUNK
-                    down_acc = pl.add(
-                        pl.view(down_proj_acc, [BATCH_CFG, Q_OUT_CHUNK], [0, o0]),
-                        pl.view(resid1, [BATCH_CFG, Q_OUT_CHUNK], [0, o0]),
-                    )
-                    out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [0, o0])
+                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
+                        mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
+                        mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
+
+                        for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
+                            d0 = dob * Q_OUT_CHUNK
+                            down_prev = pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                            w_down_chunk = pl.view(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
+                            down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
+                            down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
+
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
+                        o0 = ob * Q_OUT_CHUNK
+                        down_acc = pl.add(
+                            pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                            pl.view(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                        )
+                        out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [b0, o0])
 
             return out
 
