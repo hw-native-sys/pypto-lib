@@ -1,4 +1,5 @@
 # Copyright (c) PyPTO Contributors.
+from __future__ import annotations
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -27,6 +28,7 @@ Note:
 """
 
 import os
+from typing import Optional
 
 import pypto.language as pl
 
@@ -34,7 +36,7 @@ import pypto.language as pl
 BATCH = 16
 MAX_SEQ = 4096
 HIDDEN = 7168
-NUM_HEADS = 128
+NUM_HEADS = 1
 Q_LORA_RANK = 1536
 KV_LORA_RANK = 512
 QK_NOPE_HEAD_DIM = 128
@@ -167,14 +169,14 @@ def build_deepseek_v3_2_decode_front_program(
                 for kb in pl.range(HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
                     x_chunk = pl.cast(
-                        pl.view(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0]),
+                        pl.slice(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0]),
                         target_type=pl.FP32,
                     )
                     sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
 
                 inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    inv_rms_tile = pl.view(inv_rms, [BATCH_TILE, 1], [b0, 0])
+                    inv_rms_tile = pl.slice(inv_rms, [BATCH_TILE, 1], [b0, 0])
                     inv_rms_tile = pl.add(inv_rms_tile, pl.mul(usage_pad_sum, 0.0))
                     for ob in pl.parallel(0, QR_BLOCKS, 1, chunk=4):
                         q0 = ob * LORA_CHUNK
@@ -182,11 +184,11 @@ def build_deepseek_v3_2_decode_front_program(
                         q_acc = pl.mul(q_acc, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
                             x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            wq_chunk = pl.view(wq_a, [K_CHUNK, LORA_CHUNK], [k0, q0])
+                            wq_chunk = pl.slice(wq_a, [K_CHUNK, LORA_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
                         qr = pl.assemble(qr, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
 
@@ -196,10 +198,10 @@ def build_deepseek_v3_2_decode_front_program(
                         q_acc = pl.mul(q_acc, 0.0)
                         for kb in pl.range(QR_BLOCKS):
                             k0 = kb * LORA_CHUNK
-                            q_chunk = pl.cast(pl.view(qr, [BATCH_TILE, LORA_CHUNK], [b0, k0]), target_type=pl.FP32)
-                            gamma = pl.view(q_norm_weight, [1, LORA_CHUNK], [0, k0])
+                            q_chunk = pl.cast(pl.slice(qr, [BATCH_TILE, LORA_CHUNK], [b0, k0]), target_type=pl.FP32)
+                            gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
                             qn = pl.col_expand_mul(q_chunk, gamma)
-                            wq_chunk = pl.view(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            wq_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(qn, target_type=pl.BF16), wq_chunk))
                         q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
 
@@ -209,11 +211,11 @@ def build_deepseek_v3_2_decode_front_program(
                         kv_acc = pl.mul(kv_acc, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
                             x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            wkv_chunk = pl.view(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            wkv_chunk = pl.slice(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             kv_acc = pl.add(kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk))
                         kv_a = pl.assemble(kv_a, pl.cast(kv_acc, target_type=pl.BF16), [b0, kv0])
 
@@ -230,26 +232,32 @@ def build_deepseek_v3_2_decode_front_program(
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     ctx_len = pl.tensor.read(seq_lens, [b])
                     pos = ctx_len - 1
-                    cos_row = pl.view(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
-                    sin_row = pl.view(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
-                    cos_lo = pl.view(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                    cos_hi = pl.view(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                    sin_lo = pl.view(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                    sin_hi = pl.view(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
+                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
+                    sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
+                    sin_hi = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
 
                     cache_row = b * MAX_SEQ_CFG + pos
-                    kv_row = pl.cast(pl.view(kv_a, [1, KV_LORA_RANK_CFG], [b, 0]), target_type=pl.FP32)
-                    kv_gamma = pl.view(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
+                    kv_row = pl.cast(pl.slice(kv_a, [1, KV_LORA_RANK_CFG], [b, 0]), target_type=pl.FP32)
+                    kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
                     kv_normed = pl.col_expand_mul(kv_row, kv_gamma)
-                    pe_row = pl.cast(
-                        pl.view(kv_a, [1, QK_ROPE_HEAD_DIM_CFG], [b, KV_LORA_RANK_CFG]),
+                    pe_lo = pl.cast(
+                        pl.slice(kv_a, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, KV_LORA_RANK_CFG]),
                         target_type=pl.FP32,
                     )
-                    pe_lo = pl.view(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                    pe_hi = pl.view(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    pe_hi = pl.cast(
+                        pl.slice(kv_a, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, KV_LORA_RANK_CFG + QK_ROPE_HEAD_DIM_CFG // 2]),
+                        target_type=pl.FP32,
+                    )
                     pe_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                    pe_rot = pl.assemble(pe_rot, pl.sub(pl.col_expand_mul(pe_lo, cos_lo), pl.col_expand_mul(pe_hi, sin_lo)), [0, 0])
-                    pe_rot = pl.assemble(pe_rot, pl.add(pl.col_expand_mul(pe_hi, cos_hi), pl.col_expand_mul(pe_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    pe_lo_cos = pl.col_expand_mul(pe_lo, cos_lo)
+                    pe_hi_sin = pl.col_expand_mul(pe_hi, sin_lo)
+                    pe_rot_lo = pl.sub(pe_lo_cos, pe_hi_sin)
+                    pe_rot = pl.assemble(pe_rot, pe_rot_lo, [0, 0])
+                    pe_hi_cos = pl.col_expand_mul(pe_hi, cos_hi)
+                    pe_lo_sin = pl.col_expand_mul(pe_lo, sin_hi)
+                    pe_rot_hi = pl.add(pe_hi_cos, pe_lo_sin)
+                    pe_rot = pl.assemble(pe_rot, pe_rot_hi, [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     kv_cache = pl.assemble(kv_cache, pl.cast(kv_normed, target_type=pl.BF16), [cache_row, 0])
                     pe_cache = pl.assemble(pe_cache, pl.cast(pe_rot, target_type=pl.BF16), [cache_row, 0])
 
@@ -272,21 +280,23 @@ def build_deepseek_v3_2_decode_front_program(
 
                     q_col0 = 0
                     q_nope0 = pl.cast(
-                        pl.view(q_proj, [1, QK_NOPE_HEAD_DIM_CFG], [b, q_col0]),
+                        pl.slice(q_proj, [1, QK_NOPE_HEAD_DIM_CFG], [b, q_col0]),
                         target_type=pl.FP32,
                     )
-                    q_pe0 = pl.cast(
-                        pl.view(q_proj, [1, QK_ROPE_HEAD_DIM_CFG], [b, q_col0 + QK_NOPE_HEAD_DIM_CFG]),
+                    q0_lo = pl.cast(
+                        pl.slice(q_proj, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, q_col0 + QK_NOPE_HEAD_DIM_CFG]),
                         target_type=pl.FP32,
                     )
-                    q0_lo = pl.view(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                    q0_hi = pl.view(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    q0_hi = pl.cast(
+                        pl.slice(q_proj, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, q_col0 + QK_NOPE_HEAD_DIM_CFG + QK_ROPE_HEAD_DIM_CFG // 2]),
+                        target_type=pl.FP32,
+                    )
                     q0_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
                     q0_rot = pl.assemble(q0_rot, pl.sub(pl.col_expand_mul(q0_lo, cos_lo), pl.col_expand_mul(q0_hi, sin_lo)), [0, 0])
                     q0_rot = pl.assemble(q0_rot, pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
                     q0_nope_latent = pl.matmul(
                         pl.cast(q_nope0, target_type=pl.BF16),
-                        pl.view(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]),
+                        pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]),
                     )
 
                     sparse_k_gen = pl.min(INDEX_TOPK_CFG, ctx_len)
@@ -297,8 +307,8 @@ def build_deepseek_v3_2_decode_front_program(
                             s = blk_start + ss
                             if s < blk_end:
                                 cache_s = b * MAX_SEQ_CFG + s
-                                kv_s = pl.cast(pl.view(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                pe_s = pl.cast(pl.view(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
                                 score_nope = pl.row_sum(pl.mul(q0_nope_latent, kv_s))
                                 score_pe = pl.row_sum(pl.mul(q0_rot, pe_s))
                                 score_fp32 = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
@@ -380,21 +390,21 @@ def build_deepseek_v3_2_decode_front_program(
                     for h in pl.parallel(0, NUM_HEADS_CFG, 1, chunk=8):
                         q_col = h * QK_HEAD_DIM_CFG
                         q_nope = pl.cast(
-                            pl.view(q_proj, [1, QK_NOPE_HEAD_DIM_CFG], [b, q_col]),
+                            pl.slice(q_proj, [1, QK_NOPE_HEAD_DIM_CFG], [b, q_col]),
                             target_type=pl.FP32,
                         )
                         q_pe = pl.cast(
-                            pl.view(q_proj, [1, QK_ROPE_HEAD_DIM_CFG], [b, q_col + QK_NOPE_HEAD_DIM_CFG]),
+                            pl.slice(q_proj, [1, QK_ROPE_HEAD_DIM_CFG], [b, q_col + QK_NOPE_HEAD_DIM_CFG]),
                             target_type=pl.FP32,
                         )
-                        q_lo = pl.view(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                        q_hi = pl.view(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                        q_lo = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                        q_hi = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
                         q_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
                         q_rot = pl.assemble(q_rot, pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)), [0, 0])
                         q_rot = pl.assemble(q_rot, pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
                         q_nope_latent = pl.matmul(
                             pl.cast(q_nope, target_type=pl.BF16),
-                            pl.view(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]),
+                            pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]),
                         )
 
                         oi = pl.create_tensor([1, KV_LORA_RANK_CFG], dtype=pl.FP32)
@@ -409,8 +419,8 @@ def build_deepseek_v3_2_decode_front_program(
                             s = pl.tensor.read(topk_idx, [0, kk])
                             if s >= 0:
                                 cache_s = b * MAX_SEQ_CFG + s
-                                kv_s = pl.cast(pl.view(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                pe_s = pl.cast(pl.view(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
                                 score_nope = pl.row_sum(pl.mul(q_nope_latent, kv_s))
                                 score_pe = pl.row_sum(pl.mul(q_rot, pe_s))
                                 score = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
@@ -434,7 +444,7 @@ def build_deepseek_v3_2_decode_front_program(
                         ctx_v = pl.mul(ctx_v, 0.0)
                         for vb in pl.range(V_OUT_BLOCKS):
                             v0 = vb * V_OUT_CHUNK
-                            wv_tile = pl.view(w_latent_to_v, [KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
+                            wv_tile = pl.slice(w_latent_to_v, [KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
                             v_part = pl.matmul(pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
                             ctx_v = pl.assemble(ctx_v, v_part, [0, v0])
                         attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
@@ -443,7 +453,7 @@ def build_deepseek_v3_2_decode_front_program(
                 # Scope 3: dispatch write to cross-node GM tensor and return.
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     target_node = (b + layer_id) % EP_NODES_CFG
-                    token_row = pl.cast(pl.view(attn_front, [1, ATTN_OUT_CFG], [b, 0]), target_type=pl.BF16)
+                    token_row = pl.cast(pl.slice(attn_front, [1, ATTN_OUT_CFG], [b, 0]), target_type=pl.BF16)
                     dispatch_buf = pl.assemble(dispatch_buf, token_row, [target_node, b, 0])
 
             return dispatch_buf
@@ -511,7 +521,7 @@ def compile_and_run(
     ep_nodes: int = EP_NODES,
     platform: str = "a2a3",
     device_id: int = 11,
-    work_dir: str | None = None,
+    work_dir: Optional[str] = None,
     dump_passes: bool = True,
 ):
     from pypto.backend import BackendType
@@ -547,9 +557,6 @@ def compile_and_run(
         ep_nodes=ep_nodes,
     )
 
-    if work_dir is None:
-        work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "deepseek_v3_2_decode_front_dump"))
-
     result = run(
         program=program,
         tensor_specs=tensor_specs,
@@ -561,19 +568,13 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.CCE,
-            work_dir=work_dir,
+            backend_type=BackendType.Ascend910B_PTO,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
         print("Result: COMPILE OK — device run skipped (code_runner not found).")
-        print("  Generated kernels/orchestration:", work_dir)
-        return result
     if not result.passed and result.error:
         print(f"Result: {result.error}")
-        print("  Pass dumps may still have been written to:", work_dir)
-    else:
-        print("  Generated kernels/orchestration:", work_dir)
     return result
 
 

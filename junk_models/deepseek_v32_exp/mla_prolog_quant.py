@@ -25,8 +25,8 @@ def rotate_half(x: pl.Tensor,
     M, N = x.shape[0], x.shape[1]
     half = N // 2
 
-    first = pl.view(x, [M, half], [0, 0])
-    second = pl.view(x, [M, half], [0, half])
+    first = pl.slice(x, [M, half], [0, 0])
+    second = pl.slice(x, [M, half], [0, half])
 
     from tensor_functions import tensor_neg
     neg_second = tensor_neg(second)
@@ -106,8 +106,8 @@ def mla_prolog_quant_compute(
     rope_dim = cos.shape[1]
     nope_dim = total_q - rope_dim
 
-    q_nope = pl.view(q_all, [bs, nope_dim], [0, 0])
-    q_rope_raw = pl.view(q_all, [bs, rope_dim], [0, nope_dim])
+    q_nope = pl.slice(q_all, [bs, nope_dim], [0, 0])
+    q_rope_raw = pl.slice(q_all, [bs, rope_dim], [0, nope_dim])
 
     pl.assemble(query_nope_out, q_nope, [0, 0])
 
@@ -119,8 +119,8 @@ def mla_prolog_quant_compute(
     ckv_all = tensor_matmul(token_x, w_dkv_t)
 
     kv_lora_rank = gamma_ckv.shape[1]
-    ckv = pl.view(ckv_all, [bs, kv_lora_rank], [0, 0])
-    kr_raw = pl.view(ckv_all, [bs, rope_dim], [0, kv_lora_rank])
+    ckv = pl.slice(ckv_all, [bs, kv_lora_rank], [0, 0])
+    kr_raw = pl.slice(ckv_all, [bs, rope_dim], [0, kv_lora_rank])
 
     ckv_normed = tensor_rmsnorm(ckv, gamma_ckv, epsilon_ckv)
 

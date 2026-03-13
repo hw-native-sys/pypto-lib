@@ -56,7 +56,7 @@ padded to `MAX_SEQ` on the sequence axis; only valid tokens are processed.
 | `down_proj_tile` | `[TOK_TILE, HIDDEN]` | `[valid_tok, HIDDEN]` |
 
 **Current workaround** (until the compiler propagates `valid_shape`):
-`scores_valid = pl.view(scores, [1, valid_len], ...)` + zero-padded `exp_pad`
+`scores_valid = pl.slice(scores, [1, valid_len], ...)` + zero-padded `exp_pad`
 are used to mask garbage scores from padding cache rows in the attention loop.
 Once the compiler's `ConvertTensorToBlockOps` pass forwards tensor-level
 `valid_shape` to `block.load valid_shapes`, these workarounds can be removed.

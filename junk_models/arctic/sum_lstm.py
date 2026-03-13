@@ -104,17 +104,17 @@ def sum_lstm_compute(
     for bs in pl.range(0, batch_size, 1):
         # Step 1: input fusion (states + alpha * z4)
         states_tile = tensor_cast(
-            pl.view(states_4d, [1, hidden_dim_4], [bs, 0]), pl.FP32)
+            pl.slice(states_4d, [1, hidden_dim_4], [bs, 0]), pl.FP32)
         z4_tile = tensor_cast(
-            pl.view(z4_4d, [1, hidden_dim_4], [bs, 0]), pl.FP32)
+            pl.slice(z4_4d, [1, hidden_dim_4], [bs, 0]), pl.FP32)
         z4_scaled = tensor_mul(z4_tile, alpha)
         fused = tensor_add(states_tile, z4_scaled)
 
         # Step 2: split into 4 gates
-        pre_f = pl.view(fused, [1, hidden_dim], [0, 0])
-        pre_i = pl.view(fused, [1, hidden_dim], [0, hidden_dim])
-        pre_o = pl.view(fused, [1, hidden_dim], [0, hidden_dim * 2])
-        pre_c = pl.view(fused, [1, hidden_dim], [0, hidden_dim * 3])
+        pre_f = pl.slice(fused, [1, hidden_dim], [0, 0])
+        pre_i = pl.slice(fused, [1, hidden_dim], [0, hidden_dim])
+        pre_o = pl.slice(fused, [1, hidden_dim], [0, hidden_dim * 2])
+        pre_c = pl.slice(fused, [1, hidden_dim], [0, hidden_dim * 3])
 
         # Step 3: gate activations
         f_gate = tensor_sigmoid(pre_f)
@@ -129,7 +129,7 @@ def sum_lstm_compute(
 
         # Step 5: cell update  c_new = prev*f + c_act*i
         prev_tile = tensor_cast(
-            pl.view(prev_cell, [1, hidden_dim], [bs, 0]), pl.FP32)
+            pl.slice(prev_cell, [1, hidden_dim], [bs, 0]), pl.FP32)
         term1 = tensor_mul(prev_tile, f_gate)
         term2 = tensor_mul(c_act, i_gate)
         c_new = tensor_add(term1, term2)

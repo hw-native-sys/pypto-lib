@@ -53,8 +53,8 @@ def ffn_shared_expert_quant(
     up_gate = tensor_mul(up_gate, w13_scale)
 
     # Step 3: SwiGLU
-    gate_proj = pl.view(up_gate, [bs, intermediate], [0, 0])
-    up_proj = pl.view(up_gate, [bs, intermediate], [0, intermediate])
+    gate_proj = pl.slice(up_gate, [bs, intermediate], [0, 0])
+    up_proj = pl.slice(up_gate, [bs, intermediate], [0, intermediate])
     sig = tensor_sigmoid(gate_proj)
     activated = tensor_mul(sig, up_proj)
 

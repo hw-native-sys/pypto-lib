@@ -53,8 +53,8 @@ def swiglu(up_proj: pl.Tensor,
     M = up_proj.shape[0]
     D = up_proj.shape[1] // 2
 
-    left = pl.view(up_proj, [M, D], [0, 0])
-    right = pl.view(up_proj, [M, D], [0, D])
+    left = pl.slice(up_proj, [M, D], [0, 0])
+    right = pl.slice(up_proj, [M, D], [0, D])
 
     sig = tensor_sigmoid(left)
     gated = tensor_mul(sig, right)

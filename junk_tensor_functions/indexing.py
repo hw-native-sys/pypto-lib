@@ -32,10 +32,10 @@ def tensor_gather(x: pl.Tensor, indices: pl.Tensor,
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            idx_sub = pl.view(indices, [actual_m, actual_n], [r, c])
+            idx_sub = pl.slice(indices, [actual_m, actual_n], [r, c])
             idx_tile = cast_tensor_to_tile(idx_sub)
 
-            x_sub = pl.view(x, [x.shape[0], actual_n], [0, c])
+            x_sub = pl.slice(x, [x.shape[0], actual_n], [0, c])
             x_tile = cast_tensor_to_tile(x_sub)
 
             # TODO: replace with actual tile-level gather when available
@@ -64,7 +64,7 @@ def tensor_scatter_update(x: pl.Tensor, indices: pl.Tensor,
         for c in pl.range(0, N_x, TILE_N):
             actual_m = compute_actual_size(M_x, r, TILE_M)
             actual_n = compute_actual_size(N_x, c, TILE_N)
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
             x_tile = cast_tensor_to_tile(x_sub)
             x_out = cast_tile_to_tensor(x_tile)
             pl.assemble(output, x_out, [r, c])
@@ -75,7 +75,7 @@ def tensor_scatter_update(x: pl.Tensor, indices: pl.Tensor,
             actual_m = compute_actual_size(M_src, r, TILE_M)
             actual_n = compute_actual_size(N_src, c, TILE_N)
 
-            src_sub = pl.view(src, [actual_m, actual_n], [r, c])
+            src_sub = pl.slice(src, [actual_m, actual_n], [r, c])
             src_tile = cast_tensor_to_tile(src_sub)
             src_out = cast_tile_to_tensor(src_tile)
             # placeholder: writes to [r, c]; actual scatter needs index remapping
@@ -100,9 +100,9 @@ def tensor_where(condition: pl.Tensor, x: pl.Tensor, y: pl.Tensor,
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            cond_sub = pl.view(condition, [actual_m, actual_n], [r, c])
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
-            y_sub = pl.view(y, [actual_m, actual_n], [r, c])
+            cond_sub = pl.slice(condition, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
+            y_sub = pl.slice(y, [actual_m, actual_n], [r, c])
 
             cond_tile = cast_tensor_to_tile(cond_sub)
             x_tile = cast_tensor_to_tile(x_sub)

@@ -10,7 +10,7 @@ Semantics
 - cast_tensor_to_tile(tensor) -> Tile
     Pure type cast: the returned Tile has the **same shape** as the input
     Tensor.  No data movement, no size change.  The caller is responsible
-    for extracting the desired sub-region via ``pl.view()`` *before*
+    for extracting the desired sub-region via ``pl.slice()`` *before*
     calling this function.
 
     After the compiler establishes incore boundaries, a later pass will
@@ -32,7 +32,7 @@ def cast_tensor_to_tile(tensor: pl.Tensor) -> pl.Tile:
 
     Usage::
 
-        x_sub = pl.view(x, [tile_m, tile_n], [row, col])
+        x_sub = pl.slice(x, [tile_m, tile_n], [row, col])
         x_tile = cast_tensor_to_tile(x_sub)
         # ... tile-level operations on x_tile ...
     """

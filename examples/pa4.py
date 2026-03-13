@@ -94,7 +94,7 @@ def build_paged_attention_program(
 
                         for bn in pl.range(bn_this_batch):
                             # ── Sub-tensor views for input data ──────────
-                            qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 query, [q_tile, HEAD_DIM_CFG], [cur_offset, 0]
                             )
                             cur_block_idx = pl.tensor.read(
@@ -104,17 +104,17 @@ def build_paged_attention_program(
                                 BLOCK_SIZE_CFG, cur_seq - bn * BLOCK_SIZE_CFG
                             )
                             kv_block_row = cur_block_idx * BLOCK_SIZE_CFG
-                            kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 key_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                             )
-                            vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 value_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                             )
 
                             # ── QK matmul: sij = qi @ kj^T ──────────────
                             sij = pl.matmul(qi, kj, b_trans=True)
 
-                            sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.view(
+                            sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.slice(
                                 sij, [q_tile, valid_len], [0, 0]
                             )
 

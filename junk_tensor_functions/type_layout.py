@@ -24,7 +24,7 @@ def tensor_reshape(x: pl.Tensor, new_shape: list) -> pl.Tensor:
 @pl.function
 def tensor_view(x: pl.Tensor, shape: list, offset: list) -> pl.Tensor:
     """Return a view (sub-tensor) of *x* (metadata-only)."""
-    return pl.view(x, shape, offset)
+    return pl.slice(x, shape, offset)
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ def tensor_cast(x: pl.Tensor, output: pl.Out[pl.Tensor],
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
             x_tile = cast_tensor_to_tile(x_sub)
 
             result_tile = pl.cast(x_tile, dtype)
@@ -69,7 +69,7 @@ def tensor_transpose(x: pl.Tensor, output: pl.Out[pl.Tensor]) -> pl.Tensor:
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
             x_tile = cast_tensor_to_tile(x_sub)
 
             result_tile = pl.transpose(x_tile)
@@ -91,7 +91,7 @@ def tensor_full(output: pl.Out[pl.Tensor], value: float) -> pl.Tensor:
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            out_sub = pl.view(output, [actual_m, actual_n], [r, c])
+            out_sub = pl.slice(output, [actual_m, actual_n], [r, c])
             out_tile = cast_tensor_to_tile(out_sub)
 
             result_tile = pl.expands(out_tile, value)
@@ -113,7 +113,7 @@ def tensor_clone(x: pl.Tensor, output: pl.Out[pl.Tensor]) -> pl.Tensor:
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
             x_tile = cast_tensor_to_tile(x_sub)
 
             result_sub = cast_tile_to_tensor(x_tile)
@@ -138,7 +138,7 @@ def tensor_concat(a: pl.Tensor, b: pl.Tensor,
             for c in pl.range(0, N, TILE_N):
                 actual_m = compute_actual_size(M_a, r, TILE_M)
                 actual_n = compute_actual_size(N, c, TILE_N)
-                a_sub = pl.view(a, [actual_m, actual_n], [r, c])
+                a_sub = pl.slice(a, [actual_m, actual_n], [r, c])
                 a_tile = cast_tensor_to_tile(a_sub)
                 a_out = cast_tile_to_tensor(a_tile)
                 pl.assemble(output, a_out, [r, c])
@@ -148,7 +148,7 @@ def tensor_concat(a: pl.Tensor, b: pl.Tensor,
             for c in pl.range(0, N, TILE_N):
                 actual_m = compute_actual_size(M_b, r, TILE_M)
                 actual_n = compute_actual_size(N, c, TILE_N)
-                b_sub = pl.view(b, [actual_m, actual_n], [r, c])
+                b_sub = pl.slice(b, [actual_m, actual_n], [r, c])
                 b_tile = cast_tensor_to_tile(b_sub)
                 b_out = cast_tile_to_tensor(b_tile)
                 pl.assemble(output, b_out, [M_a + r, c])
@@ -175,7 +175,7 @@ def tensor_expand_clone(x: pl.Tensor, output: pl.Out[pl.Tensor],
                 actual_m = compute_actual_size(M, r, TILE_M)
                 actual_n = compute_actual_size(N, c, TILE_N)
 
-                x_sub = pl.view(x, [actual_m, actual_n], [r, c])
+                x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
                 x_tile = cast_tensor_to_tile(x_sub)
                 result_sub = cast_tile_to_tensor(x_tile)
 

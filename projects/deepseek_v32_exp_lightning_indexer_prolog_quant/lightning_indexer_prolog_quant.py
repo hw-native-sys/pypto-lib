@@ -29,8 +29,8 @@ def rotate_half(x: pl.Tensor,
     M, N = x.shape[0], x.shape[1]
     half = N // 2
 
-    first = pl.view(x, [M, half], [0, 0])
-    second = pl.view(x, [M, half], [0, half])
+    first = pl.slice(x, [M, half], [0, 0])
+    second = pl.slice(x, [M, half], [0, half])
 
     neg_second = tensor_neg(second)
     pl.assemble(output, neg_second, [0, 0])
@@ -79,8 +79,8 @@ def lightning_indexer_prolog_quant_compute(
     q_dim = q_raw.shape[1]
     q_roped = pl.create_tensor([bs, q_dim], dtype=pl.FP32)
     rope_2d(q_deq,
-            pl.view(cos, [bs, q_dim], [0, 0]),
-            pl.view(sin, [bs, q_dim], [0, 0]),
+            pl.slice(cos, [bs, q_dim], [0, 0]),
+            pl.slice(sin, [bs, q_dim], [0, 0]),
             q_roped)
 
     q_had = tensor_matmul(q_roped, hadamard_q)
@@ -94,8 +94,8 @@ def lightning_indexer_prolog_quant_compute(
     k_dim = k_raw.shape[1]
     k_roped = pl.create_tensor([bs, k_dim], dtype=pl.FP32)
     rope_2d(k_normed,
-            pl.view(cos, [bs, k_dim], [0, 0]),
-            pl.view(sin, [bs, k_dim], [0, 0]),
+            pl.slice(cos, [bs, k_dim], [0, 0]),
+            pl.slice(sin, [bs, k_dim], [0, 0]),
             k_roped)
 
     k_had = tensor_matmul(k_roped, hadamard_k)

@@ -50,8 +50,8 @@ def tensor_matmul(
             for k in pl.range(0, K_a, TILE_K):
                 actual_k = compute_actual_size(K_a, k, TILE_K)
 
-                a_sub = pl.view(a, [actual_m, actual_k], [m, k])
-                b_sub = pl.view(b, [actual_k, actual_n], [k, n])
+                a_sub = pl.slice(a, [actual_m, actual_k], [m, k])
+                b_sub = pl.slice(b, [actual_k, actual_n], [k, n])
 
                 a_tile = cast_tensor_to_tile(a_sub)
                 b_tile = cast_tensor_to_tile(b_sub)
@@ -87,8 +87,8 @@ def tensor_batch_matmul(
     TILE_K = DEFAULT_MAT_TILE_K
 
     for bi in pl.range(0, B, 1):
-        a_batch = pl.view(a, [1, M, K_a], [bi, 0, 0])
-        b_batch = pl.view(b, [1, K_a, N], [bi, 0, 0])
+        a_batch = pl.slice(a, [1, M, K_a], [bi, 0, 0])
+        b_batch = pl.slice(b, [1, K_a, N], [bi, 0, 0])
 
         for m in pl.range(0, M, TILE_M):
             actual_m = compute_actual_size(M, m, TILE_M)
@@ -99,8 +99,8 @@ def tensor_batch_matmul(
                 for k in pl.range(0, K_a, TILE_K):
                     actual_k = compute_actual_size(K_a, k, TILE_K)
 
-                    a_sub = pl.view(a_batch, [actual_m, actual_k], [0, m, k])
-                    b_sub = pl.view(b_batch, [actual_k, actual_n], [0, k, n])
+                    a_sub = pl.slice(a_batch, [actual_m, actual_k], [0, m, k])
+                    b_sub = pl.slice(b_batch, [actual_k, actual_n], [0, k, n])
 
                     a_tile = cast_tensor_to_tile(a_sub)
                     b_tile = cast_tensor_to_tile(b_sub)

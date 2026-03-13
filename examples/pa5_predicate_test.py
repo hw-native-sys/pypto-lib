@@ -40,13 +40,13 @@ def build_program():
                 for b_idx in pl.parallel(0, BATCH, 1, chunk=BATCH_CHUNK):
                     cur_offset = b_idx * Q_TILE
 
-                    qi: pl.Tensor[[Q_TILE, HEAD_DIM], pl.BF16] = pl.view(
+                    qi: pl.Tensor[[Q_TILE, HEAD_DIM], pl.BF16] = pl.slice(
                         query, [Q_TILE, HEAD_DIM], [cur_offset, 0]
                     )
-                    kj: pl.Tensor[[BLOCK_SIZE, HEAD_DIM], pl.BF16] = pl.view(
+                    kj: pl.Tensor[[BLOCK_SIZE, HEAD_DIM], pl.BF16] = pl.slice(
                         key, [BLOCK_SIZE, HEAD_DIM], [0, 0]
                     )
-                    vj: pl.Tensor[[BLOCK_SIZE, HEAD_DIM], pl.BF16] = pl.view(
+                    vj: pl.Tensor[[BLOCK_SIZE, HEAD_DIM], pl.BF16] = pl.slice(
                         value, [BLOCK_SIZE, HEAD_DIM], [0, 0]
                     )
 

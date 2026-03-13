@@ -62,9 +62,9 @@ def attention_pre_quant(
     q_size = total_qkv // 3
     kv_size = q_size
 
-    q_raw = pl.view(qkv_proj, [bs, q_size], [0, 0])
-    k_raw = pl.view(qkv_proj, [bs, kv_size], [0, q_size])
-    v_raw = pl.view(qkv_proj, [bs, kv_size], [0, q_size + kv_size])
+    q_raw = pl.slice(qkv_proj, [bs, q_size], [0, 0])
+    k_raw = pl.slice(qkv_proj, [bs, kv_size], [0, q_size])
+    v_raw = pl.slice(qkv_proj, [bs, kv_size], [0, q_size + kv_size])
     pl.assemble(value_out, v_raw, [0, 0])
 
     # RoPE on Q and K

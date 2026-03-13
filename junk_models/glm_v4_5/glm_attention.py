@@ -97,7 +97,7 @@ def attention(
     D = query.shape[2]
 
     for b in pl.range(0, B, 1):
-        q = pl.view(query, [1, D], [b, 0, 0])
+        q = pl.slice(query, [1, D], [b, 0, 0])
 
         # Iterate over KV blocks (simplified: sequential over block_table)
         max_blocks = block_tables.shape[1]
@@ -110,8 +110,8 @@ def attention(
 
         for blk in pl.range(0, max_blocks, 1):
             block_id = pl.tensor.read(block_tables, [b, blk])
-            k_block = pl.view(key_cache, [block_size, D], [block_id, 0, 0])
-            v_block = pl.view(value_cache, [block_size, D], [block_id, 0, 0])
+            k_block = pl.slice(key_cache, [block_size, D], [block_id, 0, 0])
+            v_block = pl.slice(value_cache, [block_size, D], [block_id, 0, 0])
 
             new_max = pl.create_tensor([1, 1], dtype=pl.FP32)
             new_sum = pl.create_tensor([1, 1], dtype=pl.FP32)

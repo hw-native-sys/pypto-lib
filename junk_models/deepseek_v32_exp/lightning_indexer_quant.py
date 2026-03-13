@@ -44,8 +44,8 @@ def lightning_indexer_decode_compute(
     max_blocks = block_table.shape[1]
 
     for b in pl.range(0, bs, 1):
-        q_int8 = pl.view(idx_query_int8, [1, idx_dim], [b, 0])
-        q_scale = pl.view(idx_query_scale, [1, 1], [b, 0])
+        q_int8 = pl.slice(idx_query_int8, [1, idx_dim], [b, 0])
+        q_scale = pl.slice(idx_query_scale, [1, 1], [b, 0])
         q_fp = tensor_dequant(q_int8, q_scale)
 
         # Compute scores for all blocks
@@ -55,9 +55,9 @@ def lightning_indexer_decode_compute(
         for blk in pl.range(0, max_blocks, 1):
             block_idx = pl.tensor.read(block_table, [b, blk])
 
-            k_int8 = pl.view(idx_key_cache_int8,
+            k_int8 = pl.slice(idx_key_cache_int8,
                              [1, idx_dim], [block_idx, 0, 0])
-            k_scale = pl.view(idx_key_scale_cache,
+            k_scale = pl.slice(idx_key_scale_cache,
                               [1, 1], [block_idx, 0, 0])
             k_fp = tensor_dequant(k_int8, k_scale)
 
@@ -66,7 +66,7 @@ def lightning_indexer_decode_compute(
             pl.assemble(scores, block_score, [0, blk])
 
         # Apply head weights
-        w = pl.view(idx_weight, [1, idx_weight.shape[1]], [b, 0])
+        w = pl.slice(idx_weight, [1, idx_weight.shape[1]], [b, 0])
         scores_weighted = tensor_mul(scores, w)
 
         # Multi-level top-k

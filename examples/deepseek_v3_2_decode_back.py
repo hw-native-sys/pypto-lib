@@ -1,4 +1,5 @@
 # Copyright (c) PyPTO Contributors.
+from __future__ import annotations
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -79,7 +80,7 @@ def build_deepseek_v3_2_decode_back_program(
                 combined = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
                 # Read combine results from this node view.
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    row = pl.cast(pl.view(combine_buf, [1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32)
+                    row = pl.cast(pl.slice(combine_buf, [1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32)
                     combined = pl.assemble(combined, row, [b, 0])
 
                 # Scope: output projection + residual + post-rms + MLP + residual.
@@ -93,10 +94,10 @@ def build_deepseek_v3_2_decode_back_program(
                         o_acc = pl.mul(o_acc, 0.0)
                         for kb in pl.range(ATTN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            a_chunk = pl.cast(pl.view(combined, [BATCH_TILE, K_CHUNK], [b0, k0]), target_type=pl.BF16)
-                            w_chunk = pl.view(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                            a_chunk = pl.cast(pl.slice(combined, [BATCH_TILE, K_CHUNK], [b0, k0]), target_type=pl.BF16)
+                            w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
-                        resid = pl.cast(pl.view(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32)
+                        resid = pl.cast(pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32)
                         resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
                     # Post RMSNorm.
@@ -104,7 +105,7 @@ def build_deepseek_v3_2_decode_back_program(
                     sq_sum = pl.mul(sq_sum, 0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
                     inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
 
@@ -114,8 +115,8 @@ def build_deepseek_v3_2_decode_back_program(
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        gamma = pl.view(post_rms_weight, [1, K_CHUNK], [0, k0])
+                        x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                         post_norm_tile = pl.assemble(post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
@@ -129,9 +130,9 @@ def build_deepseek_v3_2_decode_back_program(
 
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            post_chunk = pl.view(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                            wg = pl.view(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            wu = pl.view(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
                             up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
@@ -141,8 +142,8 @@ def build_deepseek_v3_2_decode_back_program(
 
                         for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                             d0 = dob * Q_OUT_CHUNK
-                            down_prev = pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
-                            w_down_chunk = pl.view(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
+                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                            w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
                             down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
                             down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
 
@@ -150,8 +151,8 @@ def build_deepseek_v3_2_decode_back_program(
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                         o0 = ob * Q_OUT_CHUNK
                         down_acc = pl.add(
-                            pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
-                            pl.view(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                            pl.slice(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                            pl.slice(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
                         )
                         out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [b0, o0])
 

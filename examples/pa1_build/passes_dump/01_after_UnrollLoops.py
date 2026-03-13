@@ -32,7 +32,7 @@ class PagedAttentionProgram:
                     qi_l0a: pl.Tile[[16, 128], pl.BFLOAT16, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512, pad=pl.TilePad.null)] = pl.block.move(qi_l1, target_memory=pl.MemorySpace.Left, transpose=False)
                     kj_l0b: pl.Tile[[128, 128], pl.BFLOAT16, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512, pad=pl.TilePad.null)] = pl.block.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
                     sij_l0c: pl.Tile[[16, 128], pl.FP32, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=1024, pad=pl.TilePad.null)] = pl.block.matmul(qi_l0a, kj_l0b)
-                    pl.block.l0c_store(sij_l0c, [0, 0], [16, 128], sij)
+                    pl.block.store(sij_l0c, [0, 0], [16, 128], sij)
                     sij_valid: pl.Tensor[[16, valid_len], pl.FP32] = pl.tensor.view(sij, [16, valid_len], [0, 0])
                     pij_f16: pl.Tensor[[16, 128], pl.BFLOAT16] = pl.tensor.create([16, 128], dtype=pl.BFLOAT16)
                     mi: pl.Tensor[[16, 1], pl.FP32] = pl.tensor.create([16, 1], dtype=pl.FP32)
@@ -56,7 +56,7 @@ class PagedAttentionProgram:
                     pij_l0a: pl.Tile[[16, 128], pl.BFLOAT16, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512, pad=pl.TilePad.null)] = pl.block.move(pij_l1, target_memory=pl.MemorySpace.Left, transpose=False)
                     vj_l0b: pl.Tile[[128, 128], pl.BFLOAT16, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major, fractal=512, pad=pl.TilePad.null)] = pl.block.move(vj_l1, target_memory=pl.MemorySpace.Right, transpose=False)
                     oi_l0c: pl.Tile[[16, 128], pl.FP32, tile_view=pl.TileView(valid_shape=[], stride=[], start_offset=<unsupported IRNode type>, blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=1024, pad=pl.TilePad.null)] = pl.block.matmul(pij_l0a, vj_l0b)
-                    pl.block.l0c_store(oi_l0c, [0, 0], [16, 128], oi_tmp)
+                    pl.block.store(oi_l0c, [0, 0], [16, 128], oi_tmp)
                     if bn == 0:
                         is_first: pl.Scalar[pl.INT64] = pl.yield_(1)
                     else:

@@ -48,8 +48,8 @@ def sparse_attention_antiquant_compute(
     topk = topk_indices.shape[1]
 
     for b in pl.range(0, bs, 1):
-        q_nope = pl.view(query_nope, [1, nope_dim], [b, 0])
-        q_rope = pl.view(query_rope, [1, rope_dim], [b, 0])
+        q_nope = pl.slice(query_nope, [1, nope_dim], [b, 0])
+        q_rope = pl.slice(query_rope, [1, rope_dim], [b, 0])
 
         # Accumulate attention over selected blocks
         out_accum = pl.create_tensor([1, nope_dim], dtype=pl.FP32)
@@ -63,7 +63,7 @@ def sparse_attention_antiquant_compute(
 
         for ti in pl.range(0, topk, 1):
             block_idx = pl.tensor.read(topk_indices, [b, ti])
-            k_block = pl.view(nope_cache, [block_size, nope_dim],
+            k_block = pl.slice(nope_cache, [block_size, nope_dim],
                               [block_idx, 0, 0])
 
             # QK score (nope part)

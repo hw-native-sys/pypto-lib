@@ -31,8 +31,8 @@ def _tiled_binary_op(x, y, output, tile_op):
             actual_m = compute_actual_size(M, r, TILE_M)
             actual_n = compute_actual_size(N, c, TILE_N)
 
-            x_sub = pl.view(x, [actual_m, actual_n], [r, c])
-            y_sub = pl.view(y, [actual_m, actual_n], [r, c])
+            x_sub = pl.slice(x, [actual_m, actual_n], [r, c])
+            y_sub = pl.slice(y, [actual_m, actual_n], [r, c])
 
             x_tile = cast_tensor_to_tile(x_sub)
             y_tile = cast_tensor_to_tile(y_sub)

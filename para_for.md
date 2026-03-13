@@ -213,7 +213,7 @@ for c in pl.range(0, 4):
     t_start = c * 1024
     t_end   = min(t_start + 1024, 4096)
     r_start = t_start * TILE_M   # or derived from t_start
-    x_tile = pl.view(x, [TILE_M, N], [r_start, 0])
+    x_tile = pl.slice(x, [TILE_M, N], [r_start, 0])
     with pl.incore():    # placed to encompass only the in_chunk loop + body
         for t in pl.range(t_start, t_end):   # in_chunk loop inside incore
             # body: e.g. load(x_tile), softmax, store
@@ -327,7 +327,7 @@ num_tiles = 4096   # 4K
 for t in pl.range(0, num_tiles, chunk=1024):
     r_start = t * TILE_M
     r_end = min(r_start + TILE_M, M)
-    x_tile = pl.view(x, [r_end - r_start, N], [r_start, 0])
+    x_tile = pl.slice(x, [r_end - r_start, N], [r_start, 0])
 
     # Non-dividable: sequential reduction within the tile
     for phase in pl.range(3):

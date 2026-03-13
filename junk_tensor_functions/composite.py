@@ -31,7 +31,7 @@ def tensor_softmax(x: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
         x_tile = cast_tensor_to_tile(x_sub)
 
         max_tile = pl.row_max(x_tile)
@@ -66,8 +66,8 @@ def tensor_rmsnorm(x: pl.Tensor, weight: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
-        w_sub = pl.view(weight, [1, N], [0, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
+        w_sub = pl.slice(weight, [1, N], [0, 0])
 
         x_tile = cast_tensor_to_tile(x_sub)
         w_tile = cast_tensor_to_tile(w_sub)
@@ -102,9 +102,9 @@ def tensor_layernorm(x: pl.Tensor, weight: pl.Tensor, bias: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
-        w_sub = pl.view(weight, [1, N], [0, 0])
-        b_sub = pl.view(bias, [1, N], [0, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
+        w_sub = pl.slice(weight, [1, N], [0, 0])
+        b_sub = pl.slice(bias, [1, N], [0, 0])
 
         x_tile = cast_tensor_to_tile(x_sub)
         w_tile = cast_tensor_to_tile(w_sub)
@@ -159,10 +159,10 @@ def tensor_rope(q: pl.Tensor, k: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        q_sub = pl.view(q, [actual_m, N], [r, 0])
-        k_sub = pl.view(k, [actual_m, N], [r, 0])
-        cos_sub = pl.view(cos, [actual_m, N], [r, 0])
-        sin_sub = pl.view(sin, [actual_m, N], [r, 0])
+        q_sub = pl.slice(q, [actual_m, N], [r, 0])
+        k_sub = pl.slice(k, [actual_m, N], [r, 0])
+        cos_sub = pl.slice(cos, [actual_m, N], [r, 0])
+        sin_sub = pl.slice(sin, [actual_m, N], [r, 0])
 
         q_tile = cast_tensor_to_tile(q_sub)
         k_tile = cast_tensor_to_tile(k_sub)
@@ -170,8 +170,8 @@ def tensor_rope(q: pl.Tensor, k: pl.Tensor,
         sin_tile = cast_tensor_to_tile(sin_sub)
 
         # rotate_half for q
-        q_first = pl.view(q_tile, [actual_m, half_n], [0, 0])
-        q_second = pl.view(q_tile, [actual_m, half_n], [0, half_n])
+        q_first = pl.slice(q_tile, [actual_m, half_n], [0, 0])
+        q_second = pl.slice(q_tile, [actual_m, half_n], [0, half_n])
         q_rot_first = pl.neg(q_second)
         # TODO: concat q_rot_first and q_first to form rotated q
         # Placeholder: q_rotated = concat(neg(q[..., N//2:]), q[..., :N//2])
@@ -214,8 +214,8 @@ def tensor_swiglu(x: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x1_sub = pl.view(x, [actual_m, D], [r, 0])
-        x2_sub = pl.view(x, [actual_m, D], [r, D])
+        x1_sub = pl.slice(x, [actual_m, D], [r, 0])
+        x2_sub = pl.slice(x, [actual_m, D], [r, D])
 
         x1_tile = cast_tensor_to_tile(x1_sub)
         x2_tile = cast_tensor_to_tile(x2_sub)
@@ -249,7 +249,7 @@ def tensor_gelu(x: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
         x_tile = cast_tensor_to_tile(x_sub)
 
         scaled = pl_block.muls(x_tile, GELU_COEFF)
@@ -285,7 +285,7 @@ def tensor_symmetric_quant(x: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
         x_tile = cast_tensor_to_tile(x_sub)
 
         abs_tile = pl.abs(x_tile)
@@ -320,8 +320,8 @@ def tensor_dequant(x: pl.Tensor, scale: pl.Tensor,
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
-        s_sub = pl.view(scale, [actual_m, 1], [r, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
+        s_sub = pl.slice(scale, [actual_m, 1], [r, 0])
 
         x_tile = cast_tensor_to_tile(x_sub)
         s_tile = cast_tensor_to_tile(s_sub)

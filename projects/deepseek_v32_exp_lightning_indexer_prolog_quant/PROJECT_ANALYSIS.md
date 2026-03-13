@@ -22,7 +22,7 @@
   - **VECTOR**: `incore_mul` (elementwise); `incore_softmax` (row_max → row_expand_sub → exp → row_sum → row_expand_div); `incore_layernorm` (full norm in one kernel); `incore_symmetric_quant` (abs → row_max → scale → row_expand_div → cast).
 - **Orchestration**: `LightningIndexerPrologQuant` allocates intermediates, calls incore in sequence, uses `pl.assemble` for weights_out.
 - **RoPE**: Simplified to `q_roped = q_deq * cos`; full RoPE would need a dedicated incore (rotate_half + cos/sin combination).
-- **Tile sizes**: Fixed 16×16 for compilability; extend to tiled loops with `pl.range` and `pl.view` for larger tensors.
+- **Tile sizes**: Fixed 16×16 for compilability; extend to tiled loops with `pl.range` and `pl.slice` for larger tensors.
 
 ### Fusion and backend constraint
 

@@ -9,10 +9,10 @@
 """
 Paged Attention (view / assemble / cast_to_tile / cast_to_tensor model).
 
-Compared to pa1.py, this variant eliminates direct pl.load / pl.store / pl.l0c_store
+Compared to pa1.py, this variant eliminates direct pl.load / pl.store / pl.store
 calls.  Instead it uses:
 
-    pl.view(tensor, shape, offsets)     — read a sub-tensor
+    pl.slice(tensor, shape, offsets)     — read a sub-tensor
     pl.assemble(parent, sub, offsets)   — write a sub-tensor back into a parent tensor
     pl.cast_to_tile(tensor, target_memory=...) — tensor → tile (for ISA operands)
     pl.cast_to_tensor(tile)             — tile → tensor (after ISA computation)
@@ -98,7 +98,7 @@ def build_paged_attention_program(
 
                     for bn in pl.range(bn_this_batch):
                         # ── Sub-tensor views for input data ──────────────
-                        qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                        qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                             query, [q_tile, HEAD_DIM_CFG], [cur_offset, 0]
                         )
                         cur_block_idx = pl.tensor.read(
@@ -108,10 +108,10 @@ def build_paged_attention_program(
                             BLOCK_SIZE_CFG, cur_seq - bn * BLOCK_SIZE_CFG
                         )
                         kv_block_row = cur_block_idx * BLOCK_SIZE_CFG
-                        kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                        kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                             key_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                         )
-                        vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                        vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                             value_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                         )
 
@@ -125,7 +125,7 @@ def build_paged_attention_program(
                         sij_l0c = pl.matmul(qi_l0a, kj_l0b)
                         sij = pl.cast_to_tensor(sij_l0c)
 
-                        sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.view(
+                        sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.slice(
                             sij, [q_tile, valid_len], [0, 0]
                         )
 

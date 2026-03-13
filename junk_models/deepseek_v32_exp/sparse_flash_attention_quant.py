@@ -53,8 +53,8 @@ def sparse_flash_attention_quant_compute(
     topk = topk_indices.shape[1]
 
     for b in pl.range(0, bs, 1):
-        q_nope = pl.view(query_nope, [1, nope_dim], [b, 0])
-        q_rope = pl.view(query_rope, [1, rope_dim], [b, 0])
+        q_nope = pl.slice(query_nope, [1, nope_dim], [b, 0])
+        q_rope = pl.slice(query_rope, [1, rope_dim], [b, 0])
 
         out_accum = pl.create_tensor([1, nope_dim], dtype=pl.FP32)
         running_max = pl.create_tensor([1, 1], dtype=pl.FP32)
@@ -67,16 +67,16 @@ def sparse_flash_attention_quant_compute(
             block_idx = pl.tensor.read(topk_indices, [b, ti])
 
             # Dequantize key nope
-            k_nope_int8 = pl.view(key_nope_cache,
+            k_nope_int8 = pl.slice(key_nope_cache,
                                   [block_size, nope_dim],
                                   [block_idx, 0, 0])
-            k_scale = pl.view(k_nope_scales,
+            k_scale = pl.slice(k_nope_scales,
                               [block_size, 1],
                               [block_idx, 0, 0])
             k_nope_fp = tensor_dequant(k_nope_int8, k_scale)
 
             # Key rope
-            k_rope = pl.view(key_rope_cache,
+            k_rope = pl.slice(key_rope_cache,
                              [block_size, rope_dim],
                              [block_idx, 0, 0])
 

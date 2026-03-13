@@ -115,7 +115,7 @@ def build_paged_attention_program(
                         # Sequential loop over KV blocks (no parallel): online softmax has loop-carried
                         # dependency (mi_update, li_update, oi depend on previous bn); order must be preserved.
                         for bn in pl.range(bn_this_batch):
-                            qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            qi: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 query, [q_tile, HEAD_DIM_CFG], [cur_offset, 0]
                             )
                             cur_block_idx = pl.tensor.read(
@@ -125,10 +125,10 @@ def build_paged_attention_program(
                                 BLOCK_SIZE_CFG, cur_seq - bn * BLOCK_SIZE_CFG
                             )
                             kv_block_row = cur_block_idx * BLOCK_SIZE_CFG
-                            kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            kj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 key_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                             )
-                            vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.view(
+                            vj: pl.Tensor[[BLOCK_SIZE_CFG, HEAD_DIM_CFG], pl.BF16] = pl.slice(
                                 value_cache, [BLOCK_SIZE_CFG, HEAD_DIM_CFG], [kv_block_row, 0]
                             )
 
@@ -149,9 +149,9 @@ def build_paged_attention_program(
                                 kj_l1, target_memory=pl.MemorySpace.Right, transpose=True
                             )
                             sij_l0c = pl.matmul(qi_l0a, kj_l0b)
-                            pl.l0c_store(sij_l0c, [0, 0], [Q_TILE, BLOCK_SIZE], sij)
+                            pl.store(sij_l0c, [0, 0], [Q_TILE, BLOCK_SIZE], sij)
 
-                            sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.view(
+                            sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.slice(
                                 sij, [q_tile, valid_len], [0, 0]
                             )
 
@@ -201,7 +201,7 @@ def build_paged_attention_program(
                             pij_l0a = pl.move(pij_l1, target_memory=pl.MemorySpace.Left)
                             vj_l0b = pl.move(vj_l1, target_memory=pl.MemorySpace.Right)
                             oi_l0c = pl.matmul(pij_l0a, vj_l0b)
-                            pl.l0c_store(oi_l0c, [0, 0], [Q_TILE, HEAD_DIM], oi_tmp)
+                            pl.store(oi_l0c, [0, 0], [Q_TILE, HEAD_DIM], oi_tmp)
 
                             if bn == 0:
                                 is_first: pl.Scalar[pl.INT64] = pl.yield_(1)
@@ -212,7 +212,7 @@ def build_paged_attention_program(
                             else:
                                 is_last = pl.yield_(0)
 
-                            out_view: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.FP32] = pl.view(
+                            out_view: pl.Tensor[[q_tile, HEAD_DIM_CFG], pl.FP32] = pl.slice(
                                 out, [q_tile, HEAD_DIM_CFG], [cur_offset, 0]
                             )
 

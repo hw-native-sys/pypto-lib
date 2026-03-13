@@ -127,7 +127,7 @@ def BuildExampleGraph(
 - `self.kernel_xxx(...)`：调用同 Program 内的 InCore 函数（解析为 `ir.Call(GlobalVar, args)`）。
 - `pl.range(start, stop, step)`、`pl.range(..., init_values=(...))`：循环与 iter_args。
 - `pl.tensor.read(tensor, [index])`：读标量（如 config、context_lens）。
-- `pl.view(tensor, shape, [offset_row, offset_col])`：张量视图。
+- `pl.slice(tensor, shape, [offset_row, offset_col])`：张量视图。
 
 ---
 
@@ -300,7 +300,7 @@ PyPTO 前端（DSL/IR）的**块级算子**（如 `pl.load`、`pl.store`、`pl.m
 | PyPTO 前端（IR / pl.*） | PTO-ISA（.pto 中） |
 |-------------------------|---------------------|
 | `block.load` | `pto.partition_view` + `pto.tload` |
-| `block.store` / `block.l0c_store` | `pto.partition_view` + `pto.tstore` |
+| `block.store` | `pto.partition_view` + `pto.tstore` |
 | `block.add` | `pto.tadd` |
 | `block.sub` / `block.mul` / `block.div` | `pto.tsub` / `pto.tmul` / `pto.tdiv` |
 | `block.adds` / `block.subs` / `block.muls` / `block.divs` | `pto.tadds` / `pto.tsubs` / `pto.tmuls` / `pto.tdivs` |
@@ -327,7 +327,7 @@ PyPTO 前端（DSL/IR）的**块级算子**（如 `pl.load`、`pl.store`、`pl.m
 
 | 暴露方式 | 写法示例 | 说明 |
 |----------|----------|------|
-| **Promoted（仅 block 有）** | `pl.load(...)`、`pl.store(...)`、`pl.move(...)`、`pl.create_tile(...)`、`pl.l0c_store(...)` | 这些操作只有块级语义，直接以 `pl.xxx` 暴露，解析为 `block.load` / `block.store` / `block.move` / `block.create_tile` / `block.l0c_store`。 |
+| **Promoted（仅 block 有）** | `pl.load(...)`、`pl.store(...)`、`pl.move(...)`、`pl.create_tile(...)` | 这些操作只有块级语义，直接以 `pl.xxx` 暴露，解析为 `block.load` / `block.store` / `block.move` / `block.create_tile`。 |
 | **Unified dispatch（按类型分发）** | `pl.add(a, b)`、`pl.mul(a, b)`、`pl.exp(x)`、`pl.matmul(a, b)`、`pl.row_max(x, tmp)` 等 | 首参为 `Tile` 时走 block 路径，为 `Tensor` 时走 tensor 路径。解析时根据首参类型选择 `block.add` / `tensor.add` 等。 |
 
 **说明**：`pl.block.xxx` 显式命名空间已过时，**不再支持**；块级操作请统一使用 `pl.xxx`（promoted 或 unified dispatch）。
@@ -341,7 +341,6 @@ PyPTO 前端（DSL/IR）的**块级算子**（如 `pl.load`、`pl.store`、`pl.m
 - **访存 / 搬运**  
   `pl.load` → `block.load` → `pto.partition_view` + `pto.tload`  
   `pl.store` → `block.store` → `pto.partition_view` + `pto.tstore`  
-  `pl.l0c_store` → `block.l0c_store` → `pto.partition_view` + `pto.tstore`  
   `pl.move` → `block.move` → `pto.tmov`  
   `block.move_fp`（仅 IR/后端）→ `pto.tmov.fp`  
   `block.alloc`（仅 IR/后端）→ 不直接生成指令（alloc_tile 由 MemRef 统一生成）

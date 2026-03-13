@@ -24,7 +24,7 @@ def _tiled_row_reduction(x, output, tile_reduce_op):
     for r in pl.range(0, M, TILE_M):
         actual_m = compute_actual_size(M, r, TILE_M)
 
-        x_sub = pl.view(x, [actual_m, N], [r, 0])
+        x_sub = pl.slice(x, [actual_m, N], [r, 0])
         x_tile = cast_tensor_to_tile(x_sub)
 
         result_tile = tile_reduce_op(x_tile)

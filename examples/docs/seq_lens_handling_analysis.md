@@ -78,9 +78,9 @@ with pl.auto_incore():                              # enters InCore
             valid_len = pl.min(SEQ_TILE, ctx_len - s0)  # (F) tail tile size
             cache_row0 = b * NUM_KV_HEADS * MAX_SEQ + kvh * MAX_SEQ + s0  # (G) address
 
-            k_tile = pl.view(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
+            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
                              valid_shape=[valid_len, HEAD_DIM])
-            v_tile = pl.view(v_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
+            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
                              valid_shape=[valid_len, HEAD_DIM])
             # ... online softmax attention ...
 ```
@@ -200,7 +200,7 @@ for b in pl.parallel(0, BATCH, 1, chunk=4):
 ```python
 with pl.auto_incore():
     for kb in pl.range(HIDDEN_BLOCKS):
-        x_chunk = pl.view(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0],
+        x_chunk = pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0],
                           valid_shape=[valid_tok, K_CHUNK])     # ← dynamic offset p0
         # ... RMSNorm ...
 
@@ -211,8 +211,8 @@ with pl.auto_incore():
 
 | `seq_lens` derivative | Where used | Effect |
 |-----------------------|-----------|--------|
-| `p0` (offset) | `pl.view(hidden_states, ..., [b, p0, k0])` | Selects which token tile to read from the padded `[BATCH, MAX_SEQ, HIDDEN]` tensor. |
-| `valid_tok` (valid_shape) | `pl.view(..., valid_shape=[valid_tok, K_CHUNK])` | Annotates that only `valid_tok` rows of the tile contain real data. |
+| `p0` (offset) | `pl.slice(hidden_states, ..., [b, p0, k0])` | Selects which token tile to read from the padded `[BATCH, MAX_SEQ, HIDDEN]` tensor. |
+| `valid_tok` (valid_shape) | `pl.slice(..., valid_shape=[valid_tok, K_CHUNK])` | Annotates that only `valid_tok` rows of the tile contain real data. |
 | `valid_tok` (valid_shape) | `pl.create_tensor(..., valid_shape=[valid_tok, ...])` | Projection output tiles track valid rows via `valid_shape`. |
 
 **512-B alignment strategy**: The storage shape is always `[TOK_TILE, ...]` (fixed, aligned).
@@ -238,7 +238,7 @@ with pl.auto_incore():
 
         for sb in pl.range(ctx_blocks):              # (I) dynamic inner loop
             valid_len = pl.min(SEQ_TILE, ctx_len - s0)
-            k_tile = pl.view(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
+            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
                              valid_shape=[valid_len, HEAD_DIM])
             # ... attention with scores_valid + exp_pad workaround ...
 ```
@@ -264,7 +264,7 @@ with pl.auto_incore():
     resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=FP32,
                                    valid_shape=[valid_tok, HIDDEN])
     # ... output projection using attn_tile ...
-    resid = pl.view(hidden_states, [TOK_TILE, Q_OUT_CHUNK], [b, p0, o0],
+    resid = pl.slice(hidden_states, [TOK_TILE, Q_OUT_CHUNK], [b, p0, o0],
                     valid_shape=[valid_tok, Q_OUT_CHUNK])  # ← residual add
     # ... post-RMSNorm + MLP ...
     out = pl.assemble(out, result_bf16, [b, p0, d0])       # ← output write at (b, p0)
@@ -273,7 +273,7 @@ with pl.auto_incore():
 | `seq_lens` derivative | Where used | Effect |
 |-----------------------|-----------|--------|
 | `valid_tok` (valid_shape) | `resid1_tile`, `post_norm_tile`, `down_proj_tile` creation | Marks valid rows for tail tile |
-| `p0` (offset) | `pl.view(hidden_states, ..., [b, p0, o0])` | Reads residual from correct token positions |
+| `p0` (offset) | `pl.slice(hidden_states, ..., [b, p0, o0])` | Reads residual from correct token positions |
 | `p0` (offset) | `pl.assemble(out, ..., [b, p0, d0])` | Writes final output to correct positions in padded output tensor |
 
 ### 3.7 Prefill `seq_lens` Flow Diagram
@@ -363,7 +363,7 @@ Session 0: seq_len = 37   → needs 37 tokens processed
 Session 1: seq_len = 4096 → needs 4096 tokens processed
 Session 2: seq_len = 1    → needs 1 token processed
 ...
-Hardware:  every pl.view / pl.create_tensor must produce storage ≥ 512 B and aligned
+Hardware:  every pl.slice / pl.create_tensor must produce storage ≥ 512 B and aligned
 ```
 
 The programs resolve this by always using **fixed, aligned tile shapes** (`TOK_TILE`,
@@ -381,7 +381,7 @@ Step 1: Orchestration arithmetic
   seq_lens[b]  ──►  runtime scalars (valid_tok, valid_len, pos, ctx_len, ctx_blocks)
 
 Step 2: valid_shape annotation
-  runtime scalars  ──►  valid_shape parameter on pl.view / pl.create_tensor
+  runtime scalars  ──►  valid_shape parameter on pl.slice / pl.create_tensor
 ```
 
 **Step 1** happens at the orchestration level (host-side control flow), where
@@ -402,11 +402,11 @@ arguments:
 
 ```python
 # Token-axis: storage is [TOK_TILE, ...], valid data is [valid_tok, ...]
-x_chunk = pl.view(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0],
+x_chunk = pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0],
                   valid_shape=[valid_tok, K_CHUNK])
 
 # Cache-axis: storage is [SEQ_TILE, HEAD_DIM], valid data is [valid_len, HEAD_DIM]
-k_tile = pl.view(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
+k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0],
                  valid_shape=[valid_len, HEAD_DIM])
 ```
 
@@ -431,11 +431,11 @@ The `valid_shape=[valid_tok, ...]` annotation appears on:
 
 | Operation | Storage shape | valid_shape | Why needed |
 |-----------|--------------|-------------|------------|
-| `pl.view(hidden_states, ...)` | `[TOK_TILE, K_CHUNK]` | `[valid_tok, K_CHUNK]` | Marks which input rows are real tokens vs. padding from `MAX_SEQ`-padded storage |
+| `pl.slice(hidden_states, ...)` | `[TOK_TILE, K_CHUNK]` | `[valid_tok, K_CHUNK]` | Marks which input rows are real tokens vs. padding from `MAX_SEQ`-padded storage |
 | `pl.create_tensor(q/k/v_proj_tile)` | `[TOK_TILE, HIDDEN/KV_HIDDEN]` | `[valid_tok, ...]` | Projection outputs carry the same valid extent as their inputs |
 | `pl.create_tensor(attn_tile)` | `[TOK_TILE, HIDDEN]` | `[valid_tok, HIDDEN]` | Attention output: only `valid_tok` rows have meaningful values |
 | `pl.create_tensor(resid1/post_norm/down_proj)` | `[TOK_TILE, HIDDEN]` | `[valid_tok, HIDDEN]` | MLP intermediates track valid rows |
-| `pl.view(hidden_states, ...)` for residual | `[TOK_TILE, Q_OUT_CHUNK]` | `[valid_tok, Q_OUT_CHUNK]` | Residual connection reads valid rows |
+| `pl.slice(hidden_states, ...)` for residual | `[TOK_TILE, Q_OUT_CHUNK]` | `[valid_tok, Q_OUT_CHUNK]` | Residual connection reads valid rows |
 
 **512-B alignment strategy**: The storage shape always uses `TOK_TILE` rows (e.g.,
 `TOK_TILE=4` × `K_CHUNK=256` × 2B = 2048B, aligned).  On the tail tile, the extra
@@ -464,8 +464,8 @@ The `valid_shape=[valid_len, HEAD_DIM]` annotation appears on:
 
 | Operation | Storage shape | valid_shape | Why needed |
 |-----------|--------------|-------------|------------|
-| `pl.view(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | Only `valid_len` rows are real cached keys; rest is uninitialized or stale |
-| `pl.view(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | Same for cached values |
+| `pl.slice(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | Only `valid_len` rows are real cached keys; rest is uninitialized or stale |
+| `pl.slice(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | Same for cached values |
 
 This is critical for **attention correctness**: the `matmul(q, k^T)` produces
 `[1, SEQ_TILE]` scores, but only the first `valid_len` columns correspond to real
@@ -492,7 +492,7 @@ seq_lens[b]  (GM tensor, INT32)
       │   │       │                        │                     │
       │   │       └──► valid_tok = min(TOK_TILE, seq_len_b - p0) │
       │   │                   │                                  │
-      │   │                   ├──► pl.view(hidden_states, [TOK_TILE, ...],  │
+      │   │                   ├──► pl.slice(hidden_states, [TOK_TILE, ...],  │
       │   │                   │         valid_shape=[valid_tok, ...])       │
       │   │                   ├──► pl.create_tensor([TOK_TILE, ...],       │
       │   │                   │         valid_shape=[valid_tok, ...])       │
@@ -509,9 +509,9 @@ seq_lens[b]  (GM tensor, INT32)
       │   │       │                       │                      │
       │   │       └──► valid_len = min(SEQ_TILE, ctx_len - s0)   │
       │   │                   │                                  │
-      │   │                   ├──► pl.view(k_cache, [SEQ_TILE, HEAD_DIM], │
+      │   │                   ├──► pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], │
       │   │                   │         valid_shape=[valid_len, HEAD_DIM]) │
-      │   │                   └──► pl.view(v_cache, [SEQ_TILE, HEAD_DIM], │
+      │   │                   └──► pl.slice(v_cache, [SEQ_TILE, HEAD_DIM], │
       │   │                             valid_shape=[valid_len, HEAD_DIM]) │
       │   └──────────────────────────────────────────────────────┘
 ```
@@ -535,7 +535,7 @@ Configuration: `TOK_TILE = 4`, `SEQ_TILE = 120`, `K_CHUNK = 256`, `HEAD_DIM = 12
 **Scope 1** (RMSNorm + projections) for the tail tile (`p0=8, valid_tok=2`):
 
 ```python
-x_chunk = pl.view(hidden_states, [4, 256], [b, 8, k0],
+x_chunk = pl.slice(hidden_states, [4, 256], [b, 8, k0],
                   valid_shape=[2, 256])
 #         storage: 4 × 256 × 2B = 2048B  ✓ (512B-aligned)
 #         valid:   rows 0-1 = real tokens at positions 8-9
@@ -558,7 +558,7 @@ runs **only 2 iterations** (ti=0, ti=1), not 4:
 
 ```python
 # ti=1, sb=0:
-k_tile = pl.view(k_cache, [120, 128], [cache_row0, 0],
+k_tile = pl.slice(k_cache, [120, 128], [cache_row0, 0],
                  valid_shape=[10, 128])
 #         storage: 120 × 128 × 2B = 30720B  ✓
 #         valid:   rows 0-9 = cached keys for positions 0-9
@@ -568,7 +568,7 @@ k_tile = pl.view(k_cache, [120, 128], [cache_row0, 0],
 **Scope 3** (output projection + MLP) for the tail tile:
 
 ```python
-resid = pl.view(hidden_states, [4, 64], [b, 8, o0],
+resid = pl.slice(hidden_states, [4, 64], [b, 8, o0],
                 valid_shape=[2, 64])
 #         Only valid_tok=2 rows participate in residual addition
 
@@ -620,19 +620,19 @@ operations according to the rules in `tensor_valid_shape.md`:
 
 | Location | Operation | Storage Shape | valid_shape | Derived from |
 |----------|----------|---------------|-------------|-------------|
-| Scope 2, cache read | `pl.view(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, seq_lens[b] - s0)` |
-| Scope 2, cache read | `pl.view(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, seq_lens[b] - s0)` |
+| Scope 2, cache read | `pl.slice(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, seq_lens[b] - s0)` |
+| Scope 2, cache read | `pl.slice(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, seq_lens[b] - s0)` |
 
 #### Prefill Annotations
 
 | Location | Operation | Storage Shape | valid_shape | Derived from |
 |----------|----------|---------------|-------------|-------------|
-| Scope 1, input read | `pl.view(hidden_states, ...)` | `[TOK_TILE, K_CHUNK]` | `[valid_tok, K_CHUNK]` | `min(TOK_TILE, seq_lens[b] - p0)` |
+| Scope 1, input read | `pl.slice(hidden_states, ...)` | `[TOK_TILE, K_CHUNK]` | `[valid_tok, K_CHUNK]` | `min(TOK_TILE, seq_lens[b] - p0)` |
 | Scope 1, proj tiles | `pl.create_tensor(...)` | `[TOK_TILE, HIDDEN/KV_HIDDEN]` | `[valid_tok, ...]` | `min(TOK_TILE, seq_lens[b] - p0)` |
 | Scope 2, attn tile | `pl.create_tensor(...)` | `[TOK_TILE, HIDDEN]` | `[valid_tok, HIDDEN]` | `min(TOK_TILE, seq_lens[b] - p0)` |
-| Scope 2, cache read | `pl.view(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, (p0+ti+1) - s0)` |
-| Scope 2, cache read | `pl.view(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, (p0+ti+1) - s0)` |
-| Scope 3, residual | `pl.view(hidden_states, ...)` | `[TOK_TILE, Q_OUT_CHUNK]` | `[valid_tok, Q_OUT_CHUNK]` | `min(TOK_TILE, seq_lens[b] - p0)` |
+| Scope 2, cache read | `pl.slice(k_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, (p0+ti+1) - s0)` |
+| Scope 2, cache read | `pl.slice(v_cache, ...)` | `[SEQ_TILE, HEAD_DIM]` | `[valid_len, HEAD_DIM]` | `min(SEQ_TILE, (p0+ti+1) - s0)` |
+| Scope 3, residual | `pl.slice(hidden_states, ...)` | `[TOK_TILE, Q_OUT_CHUNK]` | `[valid_tok, Q_OUT_CHUNK]` | `min(TOK_TILE, seq_lens[b] - p0)` |
 | Scope 3, intermediates | `pl.create_tensor(...)` | `[TOK_TILE, HIDDEN]` | `[valid_tok, HIDDEN]` | `min(TOK_TILE, seq_lens[b] - p0)` |
 
 ### 5.9 Correctness Guarantees Provided by `valid_shape`
@@ -673,7 +673,7 @@ scores = pl.matmul(q, k_tile, b_trans=True)   # k_tile.vs = [valid_len, HEAD_DIM
 
 Today, this requires **two manual workaround steps**:
 
-1. **Extract valid scores**: `scores_valid = pl.view(scores, [1, valid_len], [0, 0])`
+1. **Extract valid scores**: `scores_valid = pl.slice(scores, [1, valid_len], [0, 0])`
    — creates a view with `valid_len` columns so `row_max` / `row_sum` operate only on
    real scores.
 

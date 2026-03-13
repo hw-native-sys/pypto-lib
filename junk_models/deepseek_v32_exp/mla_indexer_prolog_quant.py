@@ -81,8 +81,8 @@ def mla_indexer_prolog_quant_compute(
     ip_q_raw = tensor_mul(ip_q_raw, ip_w_qb_scale)
 
     ip_q_dim = ip_q_raw.shape[1]
-    ip_cos = pl.view(cos, [bs, ip_q_dim], [0, 0])
-    ip_sin = pl.view(sin, [bs, ip_q_dim], [0, 0])
+    ip_cos = pl.slice(cos, [bs, ip_q_dim], [0, 0])
+    ip_sin = pl.slice(sin, [bs, ip_q_dim], [0, 0])
 
     ip_q_roped = pl.create_tensor([bs, ip_q_dim], dtype=pl.FP32)
     rope_2d(ip_q_raw, ip_cos, ip_sin, ip_q_roped)
@@ -101,8 +101,8 @@ def mla_indexer_prolog_quant_compute(
                                    eps=ip_epsilon)
 
     ip_k_dim = ip_k_raw.shape[1]
-    ik_cos = pl.view(cos, [bs, ip_k_dim], [0, 0])
-    ik_sin = pl.view(sin, [bs, ip_k_dim], [0, 0])
+    ik_cos = pl.slice(cos, [bs, ip_k_dim], [0, 0])
+    ik_sin = pl.slice(sin, [bs, ip_k_dim], [0, 0])
 
     ip_k_roped = pl.create_tensor([bs, ip_k_dim], dtype=pl.FP32)
     rope_2d(ip_k_normed, ik_cos, ik_sin, ip_k_roped)

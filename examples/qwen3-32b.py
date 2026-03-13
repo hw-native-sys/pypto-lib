@@ -113,14 +113,14 @@ def build_qwen3_single_layer_decode_program(
                 for kb in pl.range(HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
                     x_chunk = pl.cast(
-                        pl.view(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0]),
+                        pl.slice(hidden_states, [BATCH_CFG, K_CHUNK], [0, k0]),
                         target_type=pl.FP32,
                     )
                     sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
 
                 inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    inv_rms_tile = pl.view(inv_rms, [BATCH_TILE, 1], [b0, 0])
+                    inv_rms_tile = pl.slice(inv_rms, [BATCH_TILE, 1], [b0, 0])
 
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
                         q0 = ob * Q_OUT_CHUNK
@@ -128,11 +128,11 @@ def build_qwen3_single_layer_decode_program(
                         q_acc = pl.mul(q_acc, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
                             x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            wq_chunk = pl.view(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
                         q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
 
@@ -144,13 +144,13 @@ def build_qwen3_single_layer_decode_program(
                         v_acc = pl.mul(v_acc, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.view(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
                             x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.view(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
                             normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
                             normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-                            wk_chunk = pl.view(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            wv_chunk = pl.view(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
                             v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
                         k_proj = pl.assemble(k_proj, pl.cast(k_acc, target_type=pl.BF16), [b0, kv0])
@@ -163,21 +163,21 @@ def build_qwen3_single_layer_decode_program(
                 pos = pl.tensor.read(cache_pos, [b])
                 ctx_len = pos + 1
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                cos_row = pl.view(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
-                sin_row = pl.view(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
-                cos_lo = pl.view(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                cos_hi = pl.view(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
-                sin_lo = pl.view(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                sin_hi = pl.view(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                cos_row = pl.slice(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
+                sin_row = pl.slice(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
+                cos_lo = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                cos_hi = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
                 for kvh in pl.parallel(0, NUM_KV_HEADS_CFG, 1, chunk=4):
                     kv_col = kvh * HEAD_DIM_CFG
                     k_row = pl.cast(
-                        pl.view(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                        pl.slice(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
                         target_type=pl.FP32,
                     )
-                    k_lo = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                    k_hi = pl.view(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                    k_lo = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                    k_hi = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
                     k_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
                     k_rot = pl.assemble(
                         k_rot,
@@ -193,7 +193,7 @@ def build_qwen3_single_layer_decode_program(
                     k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
                     v_cache = pl.assemble(
                         v_cache,
-                        pl.view(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                        pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
                         [cache_row, 0],
                     )
 
@@ -206,11 +206,11 @@ def build_qwen3_single_layer_decode_program(
                         q_col = h * HEAD_DIM_CFG
 
                         q_row = pl.cast(
-                            pl.view(q_proj, [1, HEAD_DIM_CFG], [b, q_col]),
+                            pl.slice(q_proj, [1, HEAD_DIM_CFG], [b, q_col]),
                             target_type=pl.FP32,
                         )
-                        q_lo = pl.view(q_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                        q_hi = pl.view(q_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                        q_lo = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                        q_hi = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
                         q_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
                         q_rot = pl.assemble(
                             q_rot,
@@ -235,10 +235,10 @@ def build_qwen3_single_layer_decode_program(
                             s0 = sb * SEQ_TILE
                             valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                             cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
-                            k_tile = pl.view(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
-                            v_tile = pl.view(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
+                            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
+                            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
                             scores = pl.mul(pl.matmul(q_rot_bf16, k_tile, b_trans=True), ATTN_SCALE)
-                            scores_valid = pl.view(scores, [1, valid_len], [0, 0])
+                            scores_valid = pl.slice(scores, [1, valid_len], [0, 0])
                             cur_mi = pl.cast(pl.row_max(scores_valid), target_type=pl.FP32)
                             exp_scores = pl.exp(pl.row_expand_sub(scores_valid, cur_mi))
                             cur_li = pl.cast(pl.row_sum(exp_scores), target_type=pl.FP32)
@@ -280,13 +280,13 @@ def build_qwen3_single_layer_decode_program(
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             a_chunk = pl.cast(
-                                pl.view(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                                pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0]),
                                 target_type=pl.BF16,
                             )
-                            w_chunk = pl.view(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                            w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
                         resid = pl.cast(
-                            pl.view(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
+                            pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
                         )
                         resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
@@ -295,7 +295,7 @@ def build_qwen3_single_layer_decode_program(
                     sq_sum = pl.mul(sq_sum, 0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
                     inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
 
@@ -305,8 +305,8 @@ def build_qwen3_single_layer_decode_program(
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
-                        x_chunk = pl.view(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        gamma = pl.view(post_rms_weight, [1, K_CHUNK], [0, k0])
+                        x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                        gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                         post_norm_tile = pl.assemble(post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
@@ -319,9 +319,9 @@ def build_qwen3_single_layer_decode_program(
 
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            post_chunk = pl.view(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                            wg = pl.view(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                            wu = pl.view(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
+                            wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.add(gate_acc, pl.matmul(post_chunk, wg))
                             up_acc = pl.add(up_acc, pl.matmul(post_chunk, wu))
 
@@ -331,16 +331,16 @@ def build_qwen3_single_layer_decode_program(
 
                         for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
                             d0 = dob * Q_OUT_CHUNK
-                            down_prev = pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
-                            w_down_chunk = pl.view(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
+                            down_prev = pl.slice(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                            w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
                             down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
                             down_proj_tile = pl.assemble(down_proj_tile, down_next, [0, d0])
 
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
                         o0 = ob * Q_OUT_CHUNK
                         down_acc = pl.add(
-                            pl.view(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
-                            pl.view(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                            pl.slice(down_proj_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
+                            pl.slice(resid1_tile, [BATCH_TILE, Q_OUT_CHUNK], [0, o0]),
                         )
                         out = pl.assemble(out, pl.cast(down_acc, target_type=pl.BF16), [b0, o0])
 
