@@ -103,43 +103,53 @@ def build_batch_hash_lookup_program(
 
 
             # Probe rounds are the outermost loop as requested.
+            # DSL frontend does not support `break`, so we emulate early
+            # termination with a loop-carried enable flag.
+            probe_enabled = 1
             for probe in pl.range(MAX_PROBE_ROUNDS):
-                with pl.incore():
-                    for b in pl.parallel(0, batch_num, 32):
-                        for ti in pl.parallel(0, num_tables_i, 32):
-                            keys_tile: pl.Tensor[[1, NTJ], pl.INT32] = pl.view(
-                                search_key, [1, NTJ], [b, ti, 0]
-                            )
-                            mixed = pl.mul(keys_tile, GOLDEN_PRIME)
-                            h_probe = pl.ands(
-                                pl.add(mixed, probe * PROBE_STRIDE),
-                                TABLE_BUCKET_COUNT - 1,
-                            )
-
-                            cand_key = pl.mul(keys_tile, 0)
-                            cand_val = pl.mul(keys_tile, 0)
-
-                            for bucket in pl.range(TABLE_BUCKET_COUNT):
-                                bucket_mask = pl.cmps(h_probe, bucket, cmp_type=0)
-                                bucket_keys = pl.view(
-                                    hash_pool, [1, NTJ], [ti, bucket, 0]
+                if probe_enabled != 0:
+                    round_has_active = 0
+                    with pl.incore():
+                        for b in pl.parallel(0, batch_num, 32):
+                            for ti in pl.parallel(0, num_tables_i, 32):
+                                keys_tile: pl.Tensor[[1, NTJ], pl.INT32] = pl.view(
+                                    search_key, [1, NTJ], [b, ti, 0]
                                 )
-                                bucket_vals = pl.view(
-                                    hash_pool,
-                                    [1, NTJ],
-                                    [ti, HASH_PLANE_ROWS + bucket, 0],
+                                mixed = pl.mul(keys_tile, GOLDEN_PRIME)
+                                h_probe = pl.ands(
+                                    pl.add(mixed, probe * PROBE_STRIDE),
+                                    TABLE_BUCKET_COUNT - 1,
                                 )
-                                cand_key = pl.sel(bucket_mask, bucket_keys, cand_key)
-                                cand_val = pl.sel(bucket_mask, bucket_vals, cand_val)
 
-                            result_prev = pl.view(value_ptr_out, [1, NTJ], [b, ti, 0])
-                            active_mask = pl.cmps(result_prev, 0, cmp_type=0)
-                            key_match = pl.cmp(cand_key, keys_tile, cmp_type=0)
-                            hit_mask = pl.and_(active_mask, key_match)
-                            result_next = pl.sel(hit_mask, cand_val, result_prev)
-                            value_ptr_out = pl.assemble(
-                                value_ptr_out, result_next, [b, ti, 0]
-                            )
+                                cand_key = pl.mul(keys_tile, 0)
+                                cand_val = pl.mul(keys_tile, 0)
+
+                                for bucket in pl.range(TABLE_BUCKET_COUNT):
+                                    bucket_mask = pl.cmps(h_probe, bucket, cmp_type=0)
+                                    bucket_keys = pl.view(
+                                        hash_pool, [1, NTJ], [ti, bucket, 0]
+                                    )
+                                    bucket_vals = pl.view(
+                                        hash_pool,
+                                        [1, NTJ],
+                                        [ti, HASH_PLANE_ROWS + bucket, 0],
+                                    )
+                                    cand_key = pl.sel(bucket_mask, bucket_keys, cand_key)
+                                    cand_val = pl.sel(bucket_mask, bucket_vals, cand_val)
+
+                                result_prev = pl.view(value_ptr_out, [1, NTJ], [b, ti, 0])
+                                active_mask = pl.cmps(result_prev, 0, cmp_type=0)
+                                active_count = pl.row_sum(active_mask)
+                                active_count_s = pl.tensor.read(active_count, [0, 0])
+                                if active_count_s != 0:
+                                    round_has_active = 1
+                                key_match = pl.cmp(cand_key, keys_tile, cmp_type=0)
+                                hit_mask = pl.and_(active_mask, key_match)
+                                result_next = pl.sel(hit_mask, cand_val, result_prev)
+                                value_ptr_out = pl.assemble(
+                                    value_ptr_out, result_next, [b, ti, 0]
+                                )
+                    probe_enabled = round_has_active
 
             return value_ptr_out
 
@@ -180,6 +190,8 @@ def golden(tensors, params=None):
         new_hit = (~found) & (cand_key == sk)
         out[new_hit] = cand_val[new_hit]
         found |= new_hit
+        if found.all():
+            break
 
     tensors["value_ptr_out"][:] = torch.from_numpy(out)
 
