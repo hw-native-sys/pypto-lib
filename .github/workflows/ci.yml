@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codegen:
+    runs-on: ubuntu-latest
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
+
+    steps:
+      - name: Checkout pypto-lib
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install pypto
+        run: |
+          python -m pip install --upgrade pip
+          pip install nanobind
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          pip install -v /tmp/pypto
+
+      - name: Install ptoas
+        run: |
+          PTOAS_VERSION=v0.7
+          pip install https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-0.1.1-cp310-none-manylinux_2_34_x86_64.whl
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
+            -o /tmp/ptoas-bin-x86_64.tar.gz
+          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
+          tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
+          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
