@@ -10,6 +10,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 WORKSPACE_DIR="$(cd "$REPO_ROOT/.." && pwd)"
 
 # ---------------------------------------------------------------------------
+# Pinned PTOAS version — keep in sync with pypto CI
+# Override via environment variable, e.g. PTOAS_VERSION=v0.7 bash setup_env.sh
+# ---------------------------------------------------------------------------
+PTOAS_VERSION="${PTOAS_VERSION:-v0.6}"
+PTOAS_SHA256_AARCH64="b2082034faf20a2eae9e0355c9c3587353f4a20b39dc68d59bd02a8eb341ca33"
+PTOAS_SHA256_X86_64="696782b1c9c0ec24279aaaed83bbb9db97c950584f2c29d229650508824e0851"
+
+# ---------------------------------------------------------------------------
 # Platform detection
 # ---------------------------------------------------------------------------
 DetectPlatform() {
@@ -101,33 +109,35 @@ InstallPtoasBinary() {
     fi
 
     local tarball="ptoas-bin-${ARCH_TAG}.tar.gz"
-    echo "Fetching latest release assets from zhangstevenunity/PTOAS..."
-    local dl_url
-    dl_url="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
-              | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); \
-                [print(a['browser_download_url']) for a in assets if a['name']=='$tarball']")"
+    local dl_url="https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/${tarball}"
 
-    if [ -z "$dl_url" ]; then
-        echo "ERROR: Could not find $tarball in latest release."
-        exit 1
-    fi
+    # Select checksum by architecture
+    local expected_sha256=""
+    case "$ARCH_TAG" in
+        aarch64) expected_sha256="$PTOAS_SHA256_AARCH64" ;;
+        x86_64)  expected_sha256="$PTOAS_SHA256_X86_64" ;;
+        *)       echo "ERROR: No pinned SHA256 for arch $ARCH_TAG. Refusing unverified binary install."; exit 1 ;;
+    esac
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    echo "Downloading $tarball via curl..."
-    curl --http1.1 -L -o "$tmp_dir/$tarball" "$dl_url"
+    trap 'rm -rf "$tmp_dir"' RETURN
+    echo "Downloading ptoas ${PTOAS_VERSION} (${tarball})..."
+    curl --fail --location --retry 3 --retry-all-errors -o "$tmp_dir/$tarball" "$dl_url"
+
+    echo "Verifying SHA256 checksum..."
+    echo "${expected_sha256}  $tmp_dir/$tarball" | sha256sum -c -
 
     echo "Extracting to $ptoas_dir..."
     mkdir -p "$ptoas_dir"
     tar -xzf "$tmp_dir/$tarball" -C "$ptoas_dir"
-    rm -rf "$tmp_dir"
 
     chmod +x "$ptoas_dir/ptoas" 2>/dev/null || true
     chmod +x "$ptoas_dir/bin/ptoas" 2>/dev/null || true
 
     export PTOAS_ROOT="$ptoas_dir"
     echo "PTOAS_ROOT=$PTOAS_ROOT"
-    echo "ptoas binary installed successfully."
+    echo "ptoas binary installed successfully (${PTOAS_VERSION})."
 }
 
 InstallPtoasWheel() {
@@ -137,19 +147,14 @@ InstallPtoasWheel() {
         return 0
     fi
 
-    echo "Fetching latest release assets from zhangstevenunity/PTOAS..."
+    echo "Fetching release assets for PTOAS ${PTOAS_VERSION}..."
     local assets
-    assets="$(gh release view --repo zhangstevenunity/PTOAS --json assets -q '.assets[].name' 2>/dev/null)" || true
-    if [ -z "$assets" ] && command -v gh >/dev/null 2>&1; then
-        echo "gh failed or needs GH_TOKEN, using curl..."
-    fi
-    if [ -z "$assets" ]; then
-        assets="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
-                  | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]")"
-    fi
+    assets="$(curl --http1.1 --fail --location --retry 3 --retry-all-errors -sS \
+              "https://api.github.com/repos/zhangstevenunity/PTOAS/releases/tags/${PTOAS_VERSION}" \
+              | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]")"
 
     if [ -z "$assets" ]; then
-        echo "ERROR: Could not fetch release assets."
+        echo "ERROR: Could not fetch release assets for ${PTOAS_VERSION}."
         exit 1
     fi
 
@@ -166,7 +171,7 @@ InstallPtoasWheel() {
     done <<< "$assets"
 
     if [ -z "$match" ]; then
-        echo "ERROR: No matching wheel for ${PY_TAG} / ${OS_TAG} / ${ARCH_TAG}."
+        echo "ERROR: No matching wheel for ${PY_TAG} / ${OS_TAG} / ${ARCH_TAG} in ${PTOAS_VERSION}."
         echo "Available wheels:"
         echo "$assets" | grep '\.whl$' || true
         exit 1
@@ -175,21 +180,15 @@ InstallPtoasWheel() {
     echo "Matched wheel: $match"
     local tmp_dir
     tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' RETURN
 
-    if command -v gh >/dev/null 2>&1 && gh release download --repo zhangstevenunity/PTOAS -p "$match" -D "$tmp_dir" 2>/dev/null; then
-        :
-    else
-        local dl_url
-        dl_url="$(curl --http1.1 -sL https://api.github.com/repos/zhangstevenunity/PTOAS/releases/latest \
-                  | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); [print(a['browser_download_url']) for a in assets if a['name']=='$match']")"
-        echo "Downloading $match via curl (HTTP/1.1 to avoid framing issues)..."
-        curl --http1.1 -L -o "$tmp_dir/$match" "$dl_url"
-    fi
+    local dl_url="https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/${match}"
+    echo "Downloading $match (${PTOAS_VERSION})..."
+    curl --fail --location --retry 3 --retry-all-errors -o "$tmp_dir/$match" "$dl_url"
 
     echo "Installing $match..."
     python3 -m pip install "$tmp_dir/$match"
-    rm -rf "$tmp_dir"
-    echo "ptoas installed successfully."
+    echo "ptoas installed successfully (${PTOAS_VERSION})."
 }
 
 # ---------------------------------------------------------------------------
