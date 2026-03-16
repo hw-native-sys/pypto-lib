@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-headers
+        name: check-headers
+        entry: python tests/lint/check_headers.py
+        language: python
+        language_version: python3
+        pass_filenames: false
+
+      - id: check-english-only
+        name: check-english-only
+        entry: python tests/lint/check_english_only.py
+        language: python
+        language_version: python3
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.8
+    hooks:
+      - id: ruff-check
+        types_or: [python, pyi]
+        args: [--config, ruff.toml, --fix]

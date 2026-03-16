@@ -23,7 +23,6 @@ Design goals:
 - all pl.slice / pl.slice of GM tensors are >= 512 B (alignment rule)
 """
 
-import os
 
 import pypto.language as pl
 

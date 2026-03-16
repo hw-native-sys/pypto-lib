@@ -1,0 +1,17 @@
+line-length = 110
+target-version = "py310"
+
+exclude = [
+    "*_build/",
+    "junk_models/",
+    "junk_tensor_functions/",
+    "projects/",
+]
+
+[lint]
+select = [
+    "F",  # pyflakes (unused imports, undefined names, etc.)
+]
+ignore = [
+    "F841", # unused local variable (common in DSL config code)
+]

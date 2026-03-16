@@ -1,4 +1,11 @@
 # Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 # Predicate test: mixed kernel with UNSPLITTABLE vector operation.
 #
 # Contains a [1, Q_TILE] tensor consumed by row_max — the only non-unit axis
@@ -11,7 +18,7 @@ import pypto.language as pl
 import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
-from pypto.runtime import RunConfig, RunResult, TensorSpec, run
+from pypto.runtime import RunConfig, TensorSpec, run
 
 Q_TILE = 16
 BLOCK_SIZE = 128

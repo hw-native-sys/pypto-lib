@@ -5,6 +5,7 @@
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 
 """
 Qwen3-32B single-layer training forward + backward (batch=64, max_seq=4096).

@@ -1,6 +1,6 @@
 ---
 name: git-commit
-description: Complete git commit workflow including review, staging, message generation, and verification. Use when creating commits or preparing changes for commit.
+description: Complete git commit workflow including pre-commit checks, staging, message generation, and verification. Use when creating commits or preparing changes for commit.
 ---
 
 # Git Commit Workflow
