@@ -48,6 +48,12 @@ cd "$WORKSPACE_DIR/pypto"
 git remote get-url origin   # expect git@github.com:hw-native-sys/pypto.git
 ```
 
+Set the environment variable for other tools to locate pypto:
+
+```bash
+export PYPTO_ROOT="$WORKSPACE_DIR/pypto"
+```
+
 ### Step 3: Check pypto installation & decide whether to update
 
 ```bash

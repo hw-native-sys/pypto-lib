@@ -11,3 +11,4 @@ build_output/
 pa_build/
 .DS_Store
 .cursor/
+KNOWN_ISSUES.md
