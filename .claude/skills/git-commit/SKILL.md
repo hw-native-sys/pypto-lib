@@ -91,7 +91,10 @@ Docs: clarify incore scope memory constraints
 
 ## Co-Author Policy
 
-**Never** add AI co-author lines. Commits reflect human authorship only.
+**❌ NEVER add AI assistants**: No Claude, ChatGPT, Cursor AI, etc.
+**✅ Only credit human contributors**: `Co-authored-by: Name <email>`
+
+**Why?** AI tools are not collaborators. Commits reflect human authorship.
 
 ## Post-Commit Verification
 
