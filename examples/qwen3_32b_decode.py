@@ -160,18 +160,18 @@ def build_qwen3_single_layer_decode_program(
             # Scope 2: RoPE + cache update + decode attention.
             # SEQ_TILE = 120 keeps K/V cache tiles at about 30KB. Per-head vectors such
             # as [1, 128] remain small, which is an inherent decode-side pattern.
-            with pl.auto_incore():
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    ctx_len = pl.tensor.read(seq_lens, [b])
-                    pos = ctx_len - 1
-                    ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    cos_row = pl.slice(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
-                    sin_row = pl.slice(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
-                    cos_lo = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                    cos_hi = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
-                    sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                    sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+            for b in pl.parallel(BATCH_CFG):
+                ctx_len = pl.tensor.read(seq_lens, [b])
+                pos = ctx_len - 1
+                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                cos_row = pl.slice(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
+                sin_row = pl.slice(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
+                cos_lo = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                cos_hi = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
+                with pl.auto_incore():
                     for kvh in pl.parallel(0, NUM_KV_HEADS_CFG, 1, chunk=4):
                         kv_col = kvh * HEAD_DIM_CFG
                         k_row = pl.cast(
@@ -192,11 +192,7 @@ def build_qwen3_single_layer_decode_program(
                             [0, HEAD_DIM_CFG // 2],
                         )
                         cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + pos
-                        k_cache = pl.assemble(
-                            k_cache,
-                            pl.cast(k_rot, target_type=pl.BF16),
-                            [cache_row, 0],
-                        )
+                        k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
                         v_cache = pl.assemble(
                             v_cache,
                             pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
@@ -240,18 +236,10 @@ def build_qwen3_single_layer_decode_program(
                             s0 = sb * SEQ_TILE
                             valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                             cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
-                            k_tile = pl.slice(
-                                k_cache,
-                                [SEQ_TILE, HEAD_DIM_CFG],
-                                [cache_row0, 0],
-                                valid_shape=[valid_len, HEAD_DIM_CFG],
-                            )
-                            v_tile = pl.slice(
-                                v_cache,
-                                [SEQ_TILE, HEAD_DIM_CFG],
-                                [cache_row0, 0],
-                                valid_shape=[valid_len, HEAD_DIM_CFG],
-                            )
+                            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0],
+                                             valid_shape=[valid_len, HEAD_DIM_CFG])
+                            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0],
+                                             valid_shape=[valid_len, HEAD_DIM_CFG])
                             scores = pl.mul(pl.matmul(q_rot_bf16, k_tile, b_trans=True), ATTN_SCALE)
                             # TODO(valid_shape): once the compiler propagates valid_shape
                             # from k_tile, scores will auto-get vs=[1, valid_len] and the
@@ -455,10 +443,9 @@ def compile_and_run(
             device_id=device_id,
             rtol=2e-2,
             atol=2e-2,
-            save_kernels=True,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend910B_PTO,
+            backend_type=BackendType.Ascend950,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
