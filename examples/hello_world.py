@@ -112,11 +112,16 @@ def compile_and_run(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    sim = "--sim" in sys.argv
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sim", action="store_true")
+    parser.add_argument("-d", "--device", type=int, default=0)
+    args = parser.parse_args()
+
     result = compile_and_run(
-        platform="a2a3sim" if sim else "a2a3",
+        platform="a2a3sim" if args.sim else "a2a3",
+        device_id=args.device,
     )
     if not result.passed:
         raise SystemExit(1)
