@@ -74,6 +74,9 @@ jobs:
       - name: Run hello_world sim test
         run: python examples/hello_world.py --sim
 
+      - name: Run matmul sim test
+        run: python examples/matmul.py --sim
+
   a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
     env:
@@ -130,3 +133,6 @@ jobs:
 
       - name: Run hello_world a2a3 test
         run: python examples/hello_world.py --device=$DEVICE_ID
+
+      - name: Run matmul a2a3 test
+        run: python examples/matmul.py --device=$DEVICE_ID
