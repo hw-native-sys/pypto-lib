@@ -37,8 +37,8 @@ HIDDEN_INV = 1.0 / HIDDEN
 # Increase tile sizes to encourage larger mixed-kernel fusion regions
 # (notably for decode_back_layer_incore_0/1).
 K_CHUNK = 512
-Q_OUT_CHUNK = 128
-MLP_OUT_CHUNK = 512
+Q_OUT_CHUNK = 64
+MLP_OUT_CHUNK = 64
 BATCH_TILE = 4
 
 
@@ -81,7 +81,8 @@ def build_deepseek_v3_2_decode_back_program(
                 combined = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
                 # Read combine results from this node view.
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    row = pl.cast(pl.slice(combine_buf, [1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32)
+                    row = pl.cast(pl.slice(combine_buf, [1, 1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32)
+                    row = pl.reshape(row, [1, ATTN_OUT_CFG])
                     combined = pl.assemble(combined, row, [b, 0])
 
                 # Scope: output projection + residual + post-rms + MLP + residual.
@@ -231,8 +232,7 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.CCE,
-            work_dir=work_dir,
+            backend_type=BackendType.Ascend950,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
