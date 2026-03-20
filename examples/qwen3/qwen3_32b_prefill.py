@@ -374,9 +374,10 @@ def build_qwen3_single_layer_prefill_program(
                                         pl.slice(down_proj_tile, [TOK_TILE, Q_OUT_CHUNK], [0, d0]),
                                         pl.slice(resid1_tile, [TOK_TILE, Q_OUT_CHUNK], [0, d0]),
                                     )
+                                    down_acc_3d = pl.reshape(down_acc, [1, TOK_TILE, Q_OUT_CHUNK])
                                     out = pl.assemble(
                                         out,
-                                        pl.cast(down_acc, target_type=pl.BF16),
+                                        pl.cast(down_acc_3d, target_type=pl.BF16),
                                         [b, p0, d0],
                                     )
 
