@@ -73,17 +73,13 @@ jobs:
       - name: Clone simpler repository (stable)
         run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
 
-      - name: Run hello_world sim test
-        run: python examples/hello_world.py --sim
-
-      - name: Run matmul sim test
-        run: python examples/matmul.py --sim
-
-      - name: Run softmax sim test
-        run: python examples/softmax.py --sim
-
-      - name: Run rms_norm sim test
-        run: python examples/rms_norm.py --sim
+      - name: Run sim tests
+        run: |
+          for f in examples/*.py; do
+            echo "::group::$(basename "$f")"
+            python "$f" --sim
+            echo "::endgroup::"
+          done
 
   a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
@@ -139,14 +135,10 @@ jobs:
       - name: Clone simpler repository (stable)
         run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
 
-      - name: Run hello_world a2a3 test
-        run: python examples/hello_world.py --device=$DEVICE_ID
-
-      - name: Run matmul a2a3 test
-        run: python examples/matmul.py --device=$DEVICE_ID
-
-      - name: Run softmax a2a3 test
-        run: python examples/softmax.py --device=$DEVICE_ID
-
-      - name: Run rms_norm a2a3 test
-        run: python examples/rms_norm.py --device=$DEVICE_ID
+      - name: Run a2a3 tests
+        run: |
+          for f in examples/*.py; do
+            echo "::group::$(basename "$f")"
+            python "$f" --device=$DEVICE_ID
+            echo "::endgroup::"
+          done
