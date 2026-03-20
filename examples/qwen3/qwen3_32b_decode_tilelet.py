@@ -149,8 +149,6 @@ def build_qwen3_single_layer_decode_program(
             with pl.auto_incore():
                 # Compute per-row squared sum in BATCH_TILE chunks so that
                 # each vector tile is [BATCH_TILE, K_CHUNK] FP32 = 2 KB.
-                sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
-                sq_sum = pl.mul(sq_sum, 0.0)
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                     partial_sq = pl.create_tensor([BATCH_TILE, 1], dtype=pl.FP32)
                     partial_sq = pl.mul(partial_sq, 0.0)
@@ -161,11 +159,7 @@ def build_qwen3_single_layer_decode_program(
                             target_type=pl.FP32,
                         )
                         partial_sq = pl.add(partial_sq, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                    sq_sum = pl.assemble(sq_sum, partial_sq, [b0, 0])
-
-                inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    inv_rms_tile = pl.slice(inv_rms, [BATCH_TILE, 1], [b0, 0])
+                    inv_rms_tile = pl.rsqrt(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS))
 
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
                         q0 = ob * Q_OUT_CHUNK
@@ -236,18 +230,11 @@ def build_qwen3_single_layer_decode_program(
                     k_lo = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2], [0, 0])
                     k_hi = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2],
                                     [0, HEAD_DIM_CFG // 2])
-                    k_rot = pl.create_tensor([NUM_KV_HEADS_CFG, HEAD_DIM_CFG], dtype=pl.FP32)
-                    k_rot = pl.assemble(
-                        k_rot,
+                    k_rot = pl.concat(
                         pl.sub(pl.col_expand_mul(k_lo, cos_lo),
                                pl.col_expand_mul(k_hi, sin_lo)),
-                        [0, 0],
-                    )
-                    k_rot = pl.assemble(
-                        k_rot,
                         pl.add(pl.col_expand_mul(k_hi, cos_hi),
                                pl.col_expand_mul(k_lo, sin_hi)),
-                        [0, HEAD_DIM_CFG // 2],
                     )
                     for ki in pl.range(NUM_KV_HEADS_CFG):
                         cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + ki * MAX_SEQ_CFG + pos
@@ -286,22 +273,15 @@ def build_qwen3_single_layer_decode_program(
                                         target_type=pl.FP32),
                                 [qi, 0],
                             )
-
+                        
                         q_lo = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2], [0, 0])
                         q_hi = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2],
                                         [0, HEAD_DIM_CFG // 2])
-                        q_rot = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
-                        q_rot = pl.assemble(
-                            q_rot,
+                        q_rot = pl.concat(
                             pl.sub(pl.col_expand_mul(q_lo, cos_lo),
                                    pl.col_expand_mul(q_hi, sin_lo)),
-                            [0, 0],
-                        )
-                        q_rot = pl.assemble(
-                            q_rot,
                             pl.add(pl.col_expand_mul(q_hi, cos_hi),
                                    pl.col_expand_mul(q_lo, sin_hi)),
-                            [0, HEAD_DIM_CFG // 2],
                         )
                         q_rot_bf16 = pl.cast(q_rot, target_type=pl.BF16)
 
