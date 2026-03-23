@@ -6,7 +6,10 @@ PyPTO-Lib is a **primitive tensor function library** built on the pypto programm
 
 ## Directory Structure
 
-- `examples/` — Model implementations and algorithm examples (Hello World, DeepSeek V3.2, Qwen3-32B)
+- `examples/` — Examples organized by difficulty level
+  - `beginner/` — Basic operations (hello_world, matmul)
+  - `intermediate/` — Multi-step algorithms (softmax, rms_norm, layer_norm, rope)
+  - `models/` — Full LLM model kernels (Qwen3-32B, DeepSeek V3.2)
 - `docs/` — Reference documentation (coding style, runtime design, parallel loops)
 - `tests/` — Lint checks and tests
 - `build_output/` — Generated compilation artifacts (gitignored)
@@ -34,7 +37,7 @@ Use the `/setup_env` skill to set up the development environment, or refer to `.
 
 ### Run an example (requires pypto + ptoas installed)
 ```bash
-python examples/hello_world.py
+python examples/beginner/hello_world.py
 ```
 
 ### Check codegen output

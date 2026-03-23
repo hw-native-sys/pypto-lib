@@ -73,8 +73,8 @@ jobs:
 
       - name: Run sim tests
         run: |
-          for f in examples/*.py; do
-            echo "::group::$(basename "$f")"
+          for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
+            echo "::group::$f"
             python "$f" --sim
             echo "::endgroup::"
           done
@@ -133,8 +133,8 @@ jobs:
 
       - name: Run a2a3 tests
         run: |
-          for f in examples/*.py; do
-            echo "::group::$(basename "$f")"
+          for f in $(find examples/beginner examples/intermediate -name '*.py' | sort); do
+            echo "::group::$f"
             python "$f" --device=$DEVICE_ID
             echo "::endgroup::"
           done
