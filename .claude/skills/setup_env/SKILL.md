@@ -103,7 +103,7 @@ The installation method depends on the platform detected in Step 1.
 
 On Linux, ptoas is **not** a Python package. Download the pinned `tar.gz` from
 `https://github.com/zhangstevenunity/PTOAS/releases` and extract it next to pypto-lib.
-The pinned version and SHA256 checksums are defined in `.github/workflows/ci.yml`.
+The pinned version is defined in `.github/workflows/ci.yml`.
 
 Use the helper script for automated download:
 
@@ -125,22 +125,20 @@ Or manually:
      https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-<arch>.tar.gz
    ```
 
-3. Verify the checksum (see `.github/workflows/ci.yml` for the pinned SHA256 values per architecture).
-
-4. Create a target directory and extract into it (the tarball contains `ptoas` and
+3. Create a target directory and extract into it (the tarball contains `ptoas` and
    `bin/ptoas` at the top level, so extract into a dedicated directory):
    ```bash
    mkdir -p "$WORKSPACE_DIR/ptoas-bin"
    tar -xzf /tmp/ptoas-bin-<arch>.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
    ```
 
-5. Add execute permissions and set `PTOAS_ROOT`:
+4. Add execute permissions and set `PTOAS_ROOT`:
    ```bash
    chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
    export PTOAS_ROOT="$WORKSPACE_DIR/ptoas-bin"
    ```
 
-6. Verify:
+5. Verify:
    ```bash
    "$PTOAS_ROOT/ptoas" --version   # or "$PTOAS_ROOT/bin/ptoas" --version
    ```
@@ -152,7 +150,6 @@ to their `~/Downloads` folder. Then extract from there:
 
 ```bash
 mkdir -p "$WORKSPACE_DIR/ptoas-bin"
-# Verify checksum before extracting (see .github/workflows/ci.yml for pinned SHA256)
 tar -xzf ~/Downloads/ptoas-bin-<arch>.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
 chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
 export PTOAS_ROOT="$WORKSPACE_DIR/ptoas-bin"

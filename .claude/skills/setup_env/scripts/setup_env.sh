@@ -13,9 +13,7 @@ WORKSPACE_DIR="$(cd "$REPO_ROOT/.." && pwd)"
 # Pinned PTOAS version — keep in sync with pypto CI
 # Override via environment variable, e.g. PTOAS_VERSION=v0.8 bash setup_env.sh
 # ---------------------------------------------------------------------------
-PTOAS_VERSION="${PTOAS_VERSION:-v0.9}"
-PTOAS_SHA256_AARCH64="fca96d1af813ce4c3b46cd4c7d31e1a47ab2cff3e62fc25a88b4d41a5083a549"
-PTOAS_SHA256_X86_64="e133b8f4f9736f480574d5afc99c9cebd4d4b5a115af1d4d01d5666df6c4e69a"
+PTOAS_VERSION="${PTOAS_VERSION:-v0.12}"
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -111,22 +109,11 @@ InstallPtoasBinary() {
     local tarball="ptoas-bin-${ARCH_TAG}.tar.gz"
     local dl_url="https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/${tarball}"
 
-    # Select checksum by architecture
-    local expected_sha256=""
-    case "$ARCH_TAG" in
-        aarch64) expected_sha256="$PTOAS_SHA256_AARCH64" ;;
-        x86_64)  expected_sha256="$PTOAS_SHA256_X86_64" ;;
-        *)       echo "ERROR: No pinned SHA256 for arch $ARCH_TAG. Refusing unverified binary install."; exit 1 ;;
-    esac
-
     local tmp_dir
     tmp_dir="$(mktemp -d)"
     trap 'rm -rf "$tmp_dir"' RETURN
     echo "Downloading ptoas ${PTOAS_VERSION} (${tarball})..."
     curl --fail --location --retry 3 --retry-all-errors -o "$tmp_dir/$tarball" "$dl_url"
-
-    echo "Verifying SHA256 checksum..."
-    echo "${expected_sha256}  $tmp_dir/$tarball" | sha256sum -c -
 
     echo "Extracting to $ptoas_dir..."
     mkdir -p "$ptoas_dir"

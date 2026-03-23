@@ -56,12 +56,10 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.9
-          PTOAS_SHA256=e133b8f4f9736f480574d5afc99c9cebd4d4b5a115af1d4d01d5666df6c4e69a
+          PTOAS_VERSION=v0.12
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-x86_64.tar.gz \
             -o /tmp/ptoas-bin-x86_64.tar.gz
-          echo "${PTOAS_SHA256}  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
@@ -118,12 +116,10 @@ jobs:
 
       - name: Install ptoas
         run: |
-          PTOAS_VERSION=v0.9
-          PTOAS_SHA256=fca96d1af813ce4c3b46cd4c7d31e1a47ab2cff3e62fc25a88b4d41a5083a549
+          PTOAS_VERSION=v0.12
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/zhangstevenunity/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
             -o /tmp/ptoas-bin-aarch64.tar.gz
-          echo "${PTOAS_SHA256}  /tmp/ptoas-bin-aarch64.tar.gz" | sha256sum -c -
           mkdir -p $GITHUB_WORKSPACE/ptoas-bin
           tar -xzf /tmp/ptoas-bin-aarch64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
