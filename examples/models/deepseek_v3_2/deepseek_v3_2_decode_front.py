@@ -49,7 +49,7 @@ INDEX_TOPK = 2048
 EP_NODES = 128  # configurable
 
 EPS = 1e-6
-ATTN_SCALE = 1.0 / (QK_HEAD_DIM ** 0.5)
+ATTN_SCALE = 1.0 / (QK_HEAD_DIM**0.5)
 HIDDEN_INV = 1.0 / HIDDEN
 
 K_CHUNK = 512
@@ -158,11 +158,11 @@ def build_deepseek_v3_2_decode_front_program(
             kv_a = pl.create_tensor([BATCH_CFG, KV_A_OUT], dtype=pl.BF16)
             with pl.auto_incore():
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
-                sq_sum = pl.mul(sq_sum, 0.0)
+                sq_sum = pl.mul(sq_sum, 0)
                 # Keep an explicit local Vec pad tensor alive in this scope so
                 # AllocateMemoryAddr reflects a high-occupancy tuning point.
                 usage_pad = pl.create_tensor([BATCH_TILE, LOCAL_PAD_WIDTH], dtype=pl.BF16)
-                usage_pad = pl.mul(usage_pad, 0.0)
+                usage_pad = pl.mul(usage_pad, 0)
                 usage_pad_fp = pl.cast(usage_pad, target_type=pl.FP32)
                 usage_pad_sum = pl.row_sum(usage_pad_fp)
 
@@ -185,25 +185,29 @@ def build_deepseek_v3_2_decode_front_program(
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                            x_tile_qr = pl.cast(x_chunk_bf16, target_type=pl.FP32)
                             gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                            normed = pl.col_expand_mul(pl.row_expand_mul(x_tile_qr, inv_rms_tile), gamma)
                             wq_chunk = pl.slice(wq_a, [K_CHUNK, LORA_CHUNK], [k0, q0])
                             q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
                         qr = pl.assemble(qr, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
 
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                         q0 = ob * Q_OUT_CHUNK
-                        q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                        q_acc = pl.mul(q_acc, 0.0)
+                        q_out_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                        q_out_acc = pl.mul(q_out_acc, 0.0)
                         for kb in pl.range(QR_BLOCKS):
                             k0 = kb * LORA_CHUNK
-                            q_chunk = pl.cast(pl.slice(qr, [BATCH_TILE, LORA_CHUNK], [b0, k0]), target_type=pl.FP32)
-                            gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
-                            qn = pl.col_expand_mul(q_chunk, gamma)
-                            wq_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                            q_acc = pl.add(q_acc, pl.matmul(pl.cast(qn, target_type=pl.BF16), wq_chunk))
-                        q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+                            q_chunk = pl.cast(
+                                pl.slice(qr, [BATCH_TILE, LORA_CHUNK], [b0, k0]), target_type=pl.FP32
+                            )
+                            q_gamma = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, k0])
+                            qn = pl.col_expand_mul(q_chunk, q_gamma)
+                            wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            q_out_acc = pl.add(
+                                q_out_acc, pl.matmul(pl.cast(qn, target_type=pl.BF16), wq_b_chunk)
+                            )
+                        q_proj = pl.assemble(q_proj, pl.cast(q_out_acc, target_type=pl.BF16), [b0, q0])
 
                     for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
                         kv0 = ob * KV_OUT_CHUNK
@@ -212,11 +216,13 @@ def build_deepseek_v3_2_decode_front_program(
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                            x_tile_kv = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                            gamma_kv = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                            normed = pl.col_expand_mul(pl.row_expand_mul(x_tile_kv, inv_rms_tile), gamma_kv)
                             wkv_chunk = pl.slice(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            kv_acc = pl.add(kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk))
+                            kv_acc = pl.add(
+                                kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk)
+                            )
                         kv_a = pl.assemble(kv_a, pl.cast(kv_acc, target_type=pl.BF16), [b0, kv0])
 
             # Scope 2: RoPE + cache update + indexer topk + sparse attention.
@@ -233,9 +239,13 @@ def build_deepseek_v3_2_decode_front_program(
                     ctx_len = pl.tensor.read(seq_lens, [b])
                     pos = ctx_len - 1
                     cos_lo = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                    cos_hi = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
+                    cos_hi = pl.slice(
+                        rope_cos, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2]
+                    )
                     sin_lo = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, 0])
-                    sin_hi = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2])
+                    sin_hi = pl.slice(
+                        rope_sin, [1, QK_ROPE_HEAD_DIM_CFG // 2], [pos, QK_ROPE_HEAD_DIM_CFG // 2]
+                    )
 
                     cache_row = b * MAX_SEQ_CFG + pos
                     kv_row = pl.cast(pl.slice(kv_a, [1, KV_LORA_RANK_CFG], [b, 0]), target_type=pl.FP32)
@@ -246,7 +256,11 @@ def build_deepseek_v3_2_decode_front_program(
                         target_type=pl.FP32,
                     )
                     pe_hi = pl.cast(
-                        pl.slice(kv_a, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, KV_LORA_RANK_CFG + QK_ROPE_HEAD_DIM_CFG // 2]),
+                        pl.slice(
+                            kv_a,
+                            [1, QK_ROPE_HEAD_DIM_CFG // 2],
+                            [b, KV_LORA_RANK_CFG + QK_ROPE_HEAD_DIM_CFG // 2],
+                        ),
                         target_type=pl.FP32,
                     )
                     pe_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
@@ -267,13 +281,13 @@ def build_deepseek_v3_2_decode_front_program(
                     blk_topk_vals = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.FP32)
                     blk_topk_idx = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.INT32)
                     topk_vals = pl.mul(topk_vals, -3.402823e38)
-                    topk_idx = pl.mul(topk_idx, 0)
+                    topk_idx = pl.cast(pl.mul(topk_idx, 0), target_type=pl.INT32)
                     blk_topk_vals = pl.mul(blk_topk_vals, -3.402823e38)
-                    blk_topk_idx = pl.mul(blk_topk_idx, 0)
+                    blk_topk_idx = pl.cast(pl.mul(blk_topk_idx, 0), target_type=pl.INT32)
                     for kk in pl.range(INDEX_TOPK_CFG):
                         neg_one = pl.create_tensor([1, 1], dtype=pl.INT32)
-                        neg_one = pl.mul(neg_one, 0)
-                        neg_one = pl.add(neg_one, -1)
+                        neg_one = pl.cast(pl.mul(neg_one, 0), target_type=pl.INT32)
+                        neg_one = pl.cast(pl.add(neg_one, -1), target_type=pl.INT32)
                         topk_idx = pl.assemble(topk_idx, neg_one, [0, kk])
                         blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [0, kk])
                         blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [1, kk])
@@ -288,15 +302,32 @@ def build_deepseek_v3_2_decode_front_program(
                         target_type=pl.FP32,
                     )
                     q0_hi = pl.cast(
-                        pl.slice(q_proj, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, q_col0 + QK_NOPE_HEAD_DIM_CFG + QK_ROPE_HEAD_DIM_CFG // 2]),
+                        pl.slice(
+                            q_proj,
+                            [1, QK_ROPE_HEAD_DIM_CFG // 2],
+                            [b, q_col0 + QK_NOPE_HEAD_DIM_CFG + QK_ROPE_HEAD_DIM_CFG // 2],
+                        ),
                         target_type=pl.FP32,
                     )
                     q0_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                    q0_rot = pl.assemble(q0_rot, pl.sub(pl.col_expand_mul(q0_lo, cos_lo), pl.col_expand_mul(q0_hi, sin_lo)), [0, 0])
-                    q0_rot = pl.assemble(q0_rot, pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                    q0_rot = pl.assemble(
+                        q0_rot,
+                        pl.sub(pl.col_expand_mul(q0_lo, cos_lo), pl.col_expand_mul(q0_hi, sin_lo)),
+                        [0, 0],
+                    )
+                    q0_rot = pl.assemble(
+                        q0_rot,
+                        pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)),
+                        [0, QK_ROPE_HEAD_DIM_CFG // 2],
+                    )
                     q0_nope_latent = pl.matmul(
                         pl.cast(q_nope0, target_type=pl.BF16),
-                        pl.reshape(pl.slice(w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]), [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG]),
+                        pl.reshape(
+                            pl.slice(
+                                w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]
+                            ),
+                            [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG],
+                        ),
                     )
 
                     sparse_k_gen = pl.min(INDEX_TOPK_CFG, ctx_len)
@@ -307,8 +338,14 @@ def build_deepseek_v3_2_decode_front_program(
                             s = blk_start + ss
                             if s < blk_end:
                                 cache_s = b * MAX_SEQ_CFG + s
-                                kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                kv_s = pl.cast(
+                                    pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]),
+                                    target_type=pl.FP32,
+                                )
+                                pe_s = pl.cast(
+                                    pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]),
+                                    target_type=pl.FP32,
+                                )
                                 score_nope = pl.row_sum(pl.mul(q0_nope_latent, kv_s))
                                 score_pe = pl.row_sum(pl.mul(q0_rot, pe_s))
                                 score_fp32 = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
@@ -317,7 +354,7 @@ def build_deepseek_v3_2_decode_front_program(
                                 cur_score = pl.tensor.read(score_a5, [0, 0])
 
                                 inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                inserted = pl.mul(inserted, 0)
+                                inserted = pl.cast(pl.mul(inserted, 0), target_type=pl.INT32)
                                 for kk in pl.range(sparse_k_gen):
                                     ins = pl.tensor.read(inserted, [0, 0])
                                     kth_val = pl.tensor.read(blk_topk_vals, [blk, kk])
@@ -329,20 +366,30 @@ def build_deepseek_v3_2_decode_front_program(
                                                 prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
                                                 prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                                 prev_val_t = pl.mul(prev_val_t, 0.0)
-                                                prev_idx_t = pl.mul(prev_idx_t, 0)
+                                                prev_idx_t = pl.cast(
+                                                    pl.mul(prev_idx_t, 0), target_type=pl.INT32
+                                                )
                                                 prev_val_t = pl.add(prev_val_t, prev_val)
                                                 prev_idx_t = pl.add(prev_idx_t, prev_idx)
-                                                blk_topk_vals = pl.assemble(blk_topk_vals, prev_val_t, [blk, sh])
-                                                blk_topk_idx = pl.assemble(blk_topk_idx, prev_idx_t, [blk, sh])
+                                                blk_topk_vals = pl.assemble(
+                                                    blk_topk_vals, prev_val_t, [blk, sh]
+                                                )
+                                                blk_topk_idx = pl.assemble(
+                                                    blk_topk_idx, prev_idx_t, [blk, sh]
+                                                )
                                             cur_score_t = pl.create_tensor([1, 1], dtype=pl.FP32)
                                             cur_index_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                             one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                             cur_score_t = pl.mul(cur_score_t, 0.0)
-                                            cur_index_t = pl.mul(cur_index_t, 0)
-                                            one_t = pl.mul(one_t, 0)
+                                            cur_index_t = pl.cast(
+                                                pl.mul(cur_index_t, 0), target_type=pl.INT32
+                                            )
+                                            one_t = pl.cast(pl.mul(one_t, 0), target_type=pl.INT32)
                                             cur_score_t = pl.add(cur_score_t, cur_score)
-                                            cur_index_t = pl.add(cur_index_t, s)
-                                            one_t = pl.add(one_t, 1)
+                                            cur_index_t = pl.cast(
+                                                pl.add(cur_index_t, s), target_type=pl.INT32
+                                            )
+                                            one_t = pl.cast(pl.add(one_t, 1), target_type=pl.INT32)
                                             blk_topk_vals = pl.assemble(blk_topk_vals, cur_score_t, [blk, kk])
                                             blk_topk_idx = pl.assemble(blk_topk_idx, cur_index_t, [blk, kk])
                                             inserted = pl.assemble(inserted, one_t, [0, 0])
@@ -354,7 +401,7 @@ def build_deepseek_v3_2_decode_front_program(
                             if cand_idx >= 0:
                                 cand_val = pl.tensor.read(blk_topk_vals, [blk, kk])
                                 inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                inserted = pl.mul(inserted, 0)
+                                inserted = pl.cast(pl.mul(inserted, 0), target_type=pl.INT32)
                                 for tkk in pl.range(sparse_k_gen):
                                     ins = pl.tensor.read(inserted, [0, 0])
                                     kth_val = pl.tensor.read(topk_vals, [0, tkk])
@@ -366,7 +413,9 @@ def build_deepseek_v3_2_decode_front_program(
                                                 prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
                                                 prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                                 prev_val_t = pl.mul(prev_val_t, 0.0)
-                                                prev_idx_t = pl.mul(prev_idx_t, 0)
+                                                prev_idx_t = pl.cast(
+                                                    pl.mul(prev_idx_t, 0), target_type=pl.INT32
+                                                )
                                                 prev_val_t = pl.add(prev_val_t, prev_val)
                                                 prev_idx_t = pl.add(prev_idx_t, prev_idx)
                                                 topk_vals = pl.assemble(topk_vals, prev_val_t, [0, sh])
@@ -375,11 +424,13 @@ def build_deepseek_v3_2_decode_front_program(
                                             cand_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                             one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
                                             cand_val_t = pl.mul(cand_val_t, 0.0)
-                                            cand_idx_t = pl.mul(cand_idx_t, 0)
-                                            one_t = pl.mul(one_t, 0)
+                                            cand_idx_t = pl.cast(pl.mul(cand_idx_t, 0), target_type=pl.INT32)
+                                            one_t = pl.cast(pl.mul(one_t, 0), target_type=pl.INT32)
                                             cand_val_t = pl.add(cand_val_t, cand_val)
-                                            cand_idx_t = pl.add(cand_idx_t, cand_idx)
-                                            one_t = pl.add(one_t, 1)
+                                            cand_idx_t = pl.cast(
+                                                pl.add(cand_idx_t, cand_idx), target_type=pl.INT32
+                                            )
+                                            one_t = pl.cast(pl.add(one_t, 1), target_type=pl.INT32)
                                             topk_vals = pl.assemble(topk_vals, cand_val_t, [0, tkk])
                                             topk_idx = pl.assemble(topk_idx, cand_idx_t, [0, tkk])
                                             inserted = pl.assemble(inserted, one_t, [0, 0])
@@ -400,11 +451,24 @@ def build_deepseek_v3_2_decode_front_program(
                         q_lo = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
                         q_hi = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
                         q_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                        q_rot = pl.assemble(q_rot, pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)), [0, 0])
-                        q_rot = pl.assemble(q_rot, pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                        q_rot = pl.assemble(
+                            q_rot,
+                            pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)),
+                            [0, 0],
+                        )
+                        q_rot = pl.assemble(
+                            q_rot,
+                            pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
+                            [0, QK_ROPE_HEAD_DIM_CFG // 2],
+                        )
                         q_nope_latent = pl.matmul(
                             pl.cast(q_nope, target_type=pl.BF16),
-                            pl.reshape(pl.slice(w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]), [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG]),
+                            pl.reshape(
+                                pl.slice(
+                                    w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]
+                                ),
+                                [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG],
+                            ),
                         )
 
                         oi = pl.create_tensor([1, KV_LORA_RANK_CFG], dtype=pl.FP32)
@@ -416,11 +480,17 @@ def build_deepseek_v3_2_decode_front_program(
 
                         sparse_k = pl.min(INDEX_TOPK_CFG, ctx_len)
                         for kk in pl.range(sparse_k):
-                            s = pl.tensor.read(topk_idx, [0, kk])
-                            if s >= 0:
-                                cache_s = b * MAX_SEQ_CFG + s
-                                kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                            topk_pos = pl.tensor.read(topk_idx, [0, kk])
+                            if topk_pos >= 0:
+                                cache_s = b * MAX_SEQ_CFG + topk_pos
+                                kv_s = pl.cast(
+                                    pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]),
+                                    target_type=pl.FP32,
+                                )
+                                pe_s = pl.cast(
+                                    pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]),
+                                    target_type=pl.FP32,
+                                )
                                 score_nope = pl.row_sum(pl.mul(q_nope_latent, kv_s))
                                 score_pe = pl.row_sum(pl.mul(q_rot, pe_s))
                                 score = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
@@ -444,9 +514,13 @@ def build_deepseek_v3_2_decode_front_program(
                         ctx_v = pl.mul(ctx_v, 0.0)
                         for vb in pl.range(V_OUT_BLOCKS):
                             v0 = vb * V_OUT_CHUNK
-                            wv_tile = pl.slice(w_latent_to_v, [1, KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
-                            wv_tile = pl.reshape(wv_tile, [KV_LORA_RANK_CFG, V_OUT_CHUNK])
-                            v_part = pl.matmul(pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
+                            wv_tile_3d = pl.slice(
+                                w_latent_to_v, [1, KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0]
+                            )
+                            wv_tile = pl.reshape(wv_tile_3d, [KV_LORA_RANK_CFG, V_OUT_CHUNK])
+                            v_part = pl.matmul(
+                                pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32
+                            )
                             ctx_v = pl.assemble(ctx_v, v_part, [0, v0])
                         attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
                         attn_front = pl.assemble(attn_front, attn_row, [b, 0])
@@ -501,8 +575,15 @@ def build_tensor_specs(
         TensorSpec("wq_b", [q_lora_rank, num_heads * qk_head_dim], torch.bfloat16, init_value=torch.randn),
         TensorSpec("wkv_a", [hidden_size, kv_a_out], torch.bfloat16, init_value=torch.randn),
         TensorSpec("kv_norm_weight", [1, kv_lora_rank], torch.float32, init_value=torch.randn),
-        TensorSpec("w_q_nope_to_latent", [num_heads, qk_nope_head_dim, kv_lora_rank], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("w_latent_to_v", [num_heads, kv_lora_rank, v_head_dim], torch.bfloat16, init_value=torch.randn),
+        TensorSpec(
+            "w_q_nope_to_latent",
+            [num_heads, qk_nope_head_dim, kv_lora_rank],
+            torch.bfloat16,
+            init_value=torch.randn,
+        ),
+        TensorSpec(
+            "w_latent_to_v", [num_heads, kv_lora_rank, v_head_dim], torch.bfloat16, init_value=torch.randn
+        ),
         TensorSpec("dispatch_buf", [ep_nodes, batch, attn_out], torch.bfloat16, is_output=True),
     ]
 

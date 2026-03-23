@@ -81,8 +81,10 @@ def build_deepseek_v3_2_decode_back_program(
                 combined = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
                 # Read combine results from this node view.
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    row = pl.cast(pl.slice(combine_buf, [1, 1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32)
-                    row = pl.reshape(row, [1, ATTN_OUT_CFG])
+                    row_3d = pl.cast(
+                        pl.slice(combine_buf, [1, 1, ATTN_OUT_CFG], [node_id, b, 0]), target_type=pl.FP32
+                    )
+                    row = pl.reshape(row_3d, [1, ATTN_OUT_CFG])
                     combined = pl.assemble(combined, row, [b, 0])
 
                 # Scope: output projection + residual + post-rms + MLP + residual.
@@ -96,10 +98,14 @@ def build_deepseek_v3_2_decode_back_program(
                         o_acc = pl.mul(o_acc, 0.0)
                         for kb in pl.range(ATTN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            a_chunk = pl.cast(pl.slice(combined, [BATCH_TILE, K_CHUNK], [b0, k0]), target_type=pl.BF16)
+                            a_chunk = pl.cast(
+                                pl.slice(combined, [BATCH_TILE, K_CHUNK], [b0, k0]), target_type=pl.BF16
+                            )
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
-                        resid = pl.cast(pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32)
+                        resid = pl.cast(
+                            pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]), target_type=pl.FP32
+                        )
                         resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
                     # Post RMSNorm.
@@ -120,7 +126,9 @@ def build_deepseek_v3_2_decode_back_program(
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                        post_norm_tile = pl.assemble(post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
+                        post_norm_tile = pl.assemble(
+                            post_norm_tile, pl.cast(normed, target_type=pl.BF16), [0, k0]
+                        )
 
                     # MLP.
                     for ob in pl.range(MLP_OUT_BLOCKS):
