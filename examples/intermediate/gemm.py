@@ -6,11 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Matmul — tiled matrix multiplication with M/N blocking (no K tiling).
+"""GEMM — tiled matrix multiplication with M/N/K blocking.
 
     C[m, n] = A[m, k] @ B[k, n]
 
-M and N are parallelised via pl.parallel; K is consumed in a single matmul.
+M and N are parallelised via pl.parallel; K is tiled and reduced using
+pl.matmul (first K-tile) + pl.matmul_acc (remaining K-tiles).
 
 Input and output matrices are FP32.
 """
@@ -19,30 +20,34 @@ from __future__ import annotations
 import pypto.language as pl
 
 # ---------------------------------------------------------------------------
-# Matmul parameters — edit these to change problem size and tiling
+# GEMM parameters — edit these to change problem size and tiling
 # ---------------------------------------------------------------------------
 M = 256         # total rows of A / C
 N = 256         # total cols of B / C
 K = 256         # total cols of A / rows of B
 M_TILE = 64     # tile size along M dimension
 N_TILE = 64     # tile size along N dimension
+K_TILE = 64     # tile size along K dimension (reduction)
 M_CHUNK = 2     # M-tiles grouped per incore chunk
 N_CHUNK = 2     # N-tiles grouped per incore chunk
 
 
-def build_matmul_program(
+def build_gemm_program(
     m: int = M,
     n: int = N,
     k: int = K,
     m_tile: int = M_TILE,
     n_tile: int = N_TILE,
+    k_tile: int = K_TILE,
     m_chunk: int = M_CHUNK,
     n_chunk: int = N_CHUNK,
 ):
+    k_blocks = k // k_tile
+
     @pl.program
-    class MatmulProgram:
+    class GemmProgram:
         @pl.function(type=pl.FunctionType.Opaque)
-        def matmul(
+        def gemm(
             self,
             a: pl.Tensor[[m, k], pl.FP32],
             b: pl.Tensor[[k, n], pl.FP32],
@@ -51,14 +56,23 @@ def build_matmul_program(
             with pl.auto_incore():
                 for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
                     for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        tile_a = pl.slice(a, [m_tile, k], [mb, 0])
-                        tile_b = pl.slice(b, [k, n_tile], [0, nb])
-                        tile_c = pl.matmul(tile_a, tile_b)
-                        c = pl.assemble(c, tile_c, [mb, nb])
+                        # First K-tile: initialize accumulator via matmul
+                        tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
+                        tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
+                        acc = pl.matmul(tile_a, tile_b)
+
+                        # Remaining K-tiles: accumulate via matmul_acc
+                        for kb in pl.range(1, k_blocks):
+                            k0 = kb * k_tile
+                            tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
+                            tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
+                            acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
+
+                        c = pl.assemble(c, acc, [mb, nb])
 
             return c
 
-    return MatmulProgram
+    return GemmProgram
 
 
 def build_tensor_specs(
@@ -76,7 +90,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_matmul(tensors, params):
+def golden_gemm(tensors, params):
     tensors["c"][:] = tensors["a"] @ tensors["b"]
 
 
@@ -86,6 +100,7 @@ def compile_and_run(
     k: int = K,
     m_tile: int = M_TILE,
     n_tile: int = N_TILE,
+    k_tile: int = K_TILE,
     m_chunk: int = M_CHUNK,
     n_chunk: int = N_CHUNK,
     platform: str = "a2a3",
@@ -96,9 +111,9 @@ def compile_and_run(
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
 
-    program = build_matmul_program(
+    program = build_gemm_program(
         m=m, n=n, k=k,
-        m_tile=m_tile, n_tile=n_tile,
+        m_tile=m_tile, n_tile=n_tile, k_tile=k_tile,
         m_chunk=m_chunk, n_chunk=n_chunk,
     )
     tensor_specs = build_tensor_specs(m=m, n=n, k=k)
@@ -106,7 +121,7 @@ def compile_and_run(
     result = run(
         program=program,
         tensor_specs=tensor_specs,
-        golden=golden_matmul,
+        golden=golden_gemm,
         config=RunConfig(
             platform=platform,
             device_id=device_id,
