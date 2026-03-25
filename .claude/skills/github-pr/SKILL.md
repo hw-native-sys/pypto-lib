@@ -5,25 +5,43 @@ description: Create or update a GitHub pull request after committing and pushing
 
 # GitHub Pull Request Workflow
 
+## Task Tracking
+
+Create tasks to track progress through this workflow:
+
+1. Prepare branch & commit
+2. Check for existing PR
+3. Fetch upstream & rebase
+4. Push to remote
+5. Create PR
+
 ## Step 1: Check Current State
 
 ```bash
 BRANCH_NAME=$(git branch --show-current)
 git status --porcelain
-git fetch origin
-git rev-list HEAD --not origin/main --count
+git fetch upstream 2>/dev/null || git fetch origin
+if git rev-parse --verify upstream/main >/dev/null 2>&1; then
+  BASE_REF=upstream/main
+else
+  BASE_REF=origin/main
+fi
+git rev-list HEAD --not "$BASE_REF" --count
 ```
+
+A branch "needs a new branch" when it is effectively on main — either the branch
+name is `main`/`master`, **or** it has zero commits ahead of the base ref.
 
 ## Step 2: Route
 
-| On main? | Uncommitted changes? | Action |
-| -------- | -------------------- | ------ |
+| Needs new branch? | Uncommitted changes? | Action |
+| ----------------- | -------------------- | ------ |
 | Yes | Yes | Create new branch, commit via `/git-commit`, then create PR |
 | Yes | No | Error — nothing to PR |
 | No | Yes | Commit on current branch via `/git-commit`, then create PR |
 | No | No | Already committed — proceed to push and create PR |
 
-### Create Branch (if on main)
+### Create Branch (if needed)
 
 Auto-generate a branch name with a meaningful prefix. Do NOT ask the user.
 
@@ -54,18 +72,42 @@ If PR already exists, display with `gh pr view` and exit.
 ## Step 4: Rebase and Push
 
 ```bash
-git fetch origin
-git rebase origin/main
-git push --set-upstream origin "$BRANCH_NAME"
+git fetch upstream 2>/dev/null || git fetch origin
+git rebase "$BASE_REF"
 ```
 
-After rebase (if already pushed):
+**On conflicts**:
 
 ```bash
+git status
+# Edit files, remove markers
+git add path/to/resolved/file
+git rebase --continue
+# If stuck: git rebase --abort
+```
+
+**Push**:
+
+```bash
+# First push
+git push --set-upstream origin "$BRANCH_NAME"
+
+# After rebase (use --force-with-lease, NOT --force)
 git push --force-with-lease origin "$BRANCH_NAME"
 ```
 
 ## Step 5: Create PR
+
+**Check gh CLI**:
+
+```bash
+gh auth status
+```
+
+**If gh NOT available or not authenticated**: Report to user and provide manual URL:
+`https://github.com/hw-native-sys/pypto-lib/compare/main...BRANCH_NAME`
+
+**If gh available**:
 
 ```bash
 gh pr create \
@@ -76,8 +118,10 @@ gh pr create \
 - Key change 2
 
 ## Testing
-- [ ] Example runs successfully
-- [ ] Code follows pypto frontend coding style
+- [ ] Pre-commit checks pass
+
+## Related Issues
+Fixes #ISSUE_NUMBER (if applicable)
 EOF
 )"
 ```
@@ -95,12 +139,20 @@ EOF
 | Merge conflicts | Resolve, `git add`, `git rebase --continue` |
 | Push rejected | `git push --force-with-lease` |
 | gh not authenticated | Tell user to run `gh auth login` |
+| Wrong upstream branch | Use `git rebase upstream/BRANCH` |
 
 ## Checklist
 
-- [ ] Branch created (if was on main)
+- [ ] Branch prepared (created from main if needed)
 - [ ] Changes committed via `/git-commit`
-- [ ] Rebased onto `origin/main`
-- [ ] Pushed to origin
+- [ ] No existing PR for branch (exit if found)
+- [ ] Fetched upstream and rebased successfully
+- [ ] Pushed with `--force-with-lease`
 - [ ] PR created with clear title and summary
 - [ ] No AI co-author footers
+
+## Remember
+
+- Always rebase before creating PR
+- Use `--force-with-lease`, not `--force`
+- Don't auto-install gh CLI - let user do it

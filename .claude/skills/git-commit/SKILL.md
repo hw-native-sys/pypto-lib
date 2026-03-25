@@ -5,6 +5,14 @@ description: Complete git commit workflow including pre-commit checks, staging, 
 
 # Git Commit Workflow
 
+## Task Tracking
+
+Create tasks to track progress through this workflow:
+
+1. Analyze changes & run pre-commit checks
+2. Stage changes & commit
+3. Post-commit verification
+
 ## Prerequisites
 
 Check what changed to determine review needs:
@@ -34,6 +42,30 @@ Check for:
 - Proper parameter directions (`pl.Out`, `pl.InOut`)
 - No hardcoded absolute paths or private information
 - Comments and docstrings in English
+
+## Pre-Commit Hooks
+
+This project uses pre-commit hooks. Verify these pass before committing:
+
+| Hook | What it checks |
+|------|----------------|
+| `ruff-check` | Python linting (pyflakes: unused imports, undefined names) |
+| `check-headers` | Copyright header format |
+| `check-english-only` | Code comments and docstrings are in English |
+
+Run all hooks:
+
+```bash
+pre-commit run --all-files
+```
+
+Or run individually:
+
+```bash
+ruff check --config ruff.toml .
+python tests/lint/check_headers.py
+python tests/lint/check_english_only.py
+```
 
 ## Stage Changes
 
