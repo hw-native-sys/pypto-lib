@@ -104,7 +104,7 @@ def compile_and_run(
     m_chunk: int = M_CHUNK,
     n_chunk: int = N_CHUNK,
     platform: str = "a2a3",
-    device_id: int = 11,
+    device_id: int = 0,
     dump_passes: bool = True,
 ):
     from pypto.backend import BackendType
