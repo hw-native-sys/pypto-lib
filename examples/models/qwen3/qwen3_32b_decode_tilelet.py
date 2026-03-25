@@ -216,9 +216,9 @@ def build_qwen3_single_layer_decode_program(
                 sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
-                with pl.auto_incore():
-                    # K RoPE + cache write — all KV heads batched.
-                    k_group = pl.create_tensor([NUM_KV_HEADS_CFG, HEAD_DIM_CFG], dtype=pl.FP32)
+                k_group = pl.create_tensor([NUM_KV_HEADS_CFG, HEAD_DIM_CFG], dtype=pl.FP32)
+                with pl.incore():
+                    # Stage 1a: gather all KV heads into a shared tensor buffer.
                     for ki in pl.range(NUM_KV_HEADS_CFG):
                         kv_col = ki * HEAD_DIM_CFG
                         k_group = pl.assemble(
@@ -227,6 +227,9 @@ def build_qwen3_single_layer_decode_program(
                                     target_type=pl.FP32),
                             [ki, 0],
                         )
+
+                with pl.incore():
+                    # Stage 1b: rotate K and update the caches.
                     k_lo = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2], [0, 0])
                     k_hi = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2],
                                     [0, HEAD_DIM_CFG // 2])
@@ -250,21 +253,25 @@ def build_qwen3_single_layer_decode_program(
                             [cache_row, 0],
                         )
 
+                attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
+                with pl.incore():
                     # Zero-init attn_row in [1, ATTN_INIT_CHUNK] = [1, 512] FP32 = 2 KB chunks.
-                    attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
                     for zi in pl.range(ATTN_INIT_BLOCKS):
                         z0 = zi * ATTN_INIT_CHUNK
                         z = pl.create_tensor([1, ATTN_INIT_CHUNK], dtype=pl.FP32)
                         z = pl.mul(z, 0.0)
                         attn_row = pl.assemble(attn_row, z, [0, z0])
 
-                    # Batched Q-head attention: Q_HEAD_BATCH Q heads per group.
-                    for gi in pl.parallel(0, TOTAL_Q_GROUPS, 1, chunk=4):
-                        kvh = gi // Q_GROUPS
-                        qg = gi - kvh * Q_GROUPS
-                        q_base = kvh * Q_PER_KV_CFG + qg * Q_HEAD_BATCH
+                # Manually split the decode attention into smaller incore stages so
+                # each outlined kernel has a single cross-core payload size.
+                for gi in pl.parallel(0, TOTAL_Q_GROUPS, 1):
+                    kvh = gi // Q_GROUPS
+                    qg = gi - kvh * Q_GROUPS
+                    q_base = kvh * Q_PER_KV_CFG + qg * Q_HEAD_BATCH
 
-                        q_group = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
+                    q_group = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
+                    with pl.incore():
+                        # Stage 2a: gather the Q-head group into a tensor buffer.
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * HEAD_DIM_CFG
                             q_group = pl.assemble(
@@ -273,7 +280,9 @@ def build_qwen3_single_layer_decode_program(
                                         target_type=pl.FP32),
                                 [qi, 0],
                             )
-                        
+
+                    with pl.incore():
+                        # Stage 2b: apply RoPE and cast once for the cube stages.
                         q_lo = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2], [0, 0])
                         q_hi = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2],
                                         [0, HEAD_DIM_CFG // 2])
@@ -285,22 +294,29 @@ def build_qwen3_single_layer_decode_program(
                         )
                         q_rot_bf16 = pl.cast(q_rot, target_type=pl.BF16)
 
-                        oi = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
-                        li = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
-                        mi = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
-                        oi = pl.mul(oi, 0.0)
-                        li = pl.mul(li, 0.0)
-                        mi = pl.mul(mi, 0.0)
+                    oi = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
+                    li = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
+                    mi = pl.create_tensor([Q_HEAD_BATCH, 1], dtype=pl.FP32)
+                    oi = pl.mul(oi, 0.0)
+                    li = pl.mul(li, 0.0)
+                    mi = pl.mul(mi, 0.0)
 
-                        for sb in pl.range(ctx_blocks):
-                            s0 = sb * SEQ_TILE
-                            valid_len = pl.min(SEQ_TILE, ctx_len - s0)
-                            cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
-                            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0],
-                                             valid_shape=[valid_len, HEAD_DIM_CFG])
-                            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0],
-                                             valid_shape=[valid_len, HEAD_DIM_CFG])
-                            scores = pl.mul(pl.matmul(q_rot_bf16, k_tile, b_trans=True), ATTN_SCALE)
+                    for sb in pl.range(ctx_blocks):
+                        s0 = sb * SEQ_TILE
+                        valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                        cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
+
+                        with pl.incore():
+                            k_tile = pl.slice(
+                                k_cache,
+                                [SEQ_TILE, HEAD_DIM_CFG],
+                                [cache_row0, 0],
+                                valid_shape=[valid_len, HEAD_DIM_CFG],
+                            )
+                            raw_scores = pl.matmul(q_rot_bf16, k_tile, b_trans=True, out_dtype=pl.FP32)
+
+                        with pl.incore():
+                            scores = pl.mul(raw_scores, ATTN_SCALE)
                             scores_valid = pl.slice(
                                 scores,
                                 [Q_HEAD_BATCH, SEQ_TILE],
@@ -311,12 +327,18 @@ def build_qwen3_single_layer_decode_program(
                             cur_mi = pl.cast(pl.row_max(scores_padded), target_type=pl.FP32)
                             exp_scores = pl.exp(pl.row_expand_sub(scores_padded, cur_mi))
                             cur_li = pl.cast(pl.row_sum(exp_scores), target_type=pl.FP32)
-                            oi_tmp = pl.matmul(
-                                pl.cast(exp_scores, target_type=pl.BF16),
-                                v_tile,
-                                out_dtype=pl.FP32,
-                            )
+                            exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
 
+                        with pl.incore():
+                            v_tile = pl.slice(
+                                v_cache,
+                                [SEQ_TILE, HEAD_DIM_CFG],
+                                [cache_row0, 0],
+                                valid_shape=[valid_len, HEAD_DIM_CFG],
+                            )
+                            oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
+
+                        with pl.incore():
                             if sb == 0:
                                 oi = oi_tmp
                                 li = cur_li
@@ -330,6 +352,7 @@ def build_qwen3_single_layer_decode_program(
                                             pl.row_expand_mul(oi_tmp, beta))
                                 mi = mi_new
 
+                    with pl.incore():
                         ctx = pl.row_expand_div(oi, li)
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * HEAD_DIM_CFG
@@ -339,7 +362,7 @@ def build_qwen3_single_layer_decode_program(
                                 [0, q_col],
                             )
 
-                    attn_out = pl.assemble(attn_out, attn_row, [b, 0])
+                attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
             # Scope 3: output projection + residual + post RMSNorm + MLP + residual.
             with pl.auto_incore():
@@ -376,9 +399,9 @@ def build_qwen3_single_layer_decode_program(
                     down_proj_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
                     for zi in pl.range(HIDDEN_BLOCKS):
                         z0 = zi * K_CHUNK
-                        z = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
-                        z = pl.mul(z, 0.0)
-                        down_proj_tile = pl.assemble(down_proj_tile, z, [0, z0])
+                        down_zero_chunk = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
+                        down_zero_chunk = pl.mul(down_zero_chunk, 0.0)
+                        down_proj_tile = pl.assemble(down_proj_tile, down_zero_chunk, [0, z0])
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
