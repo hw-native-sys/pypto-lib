@@ -260,17 +260,12 @@ def build_qwen3_single_layer_decode_program(
                                 out_dtype=pl.FP32,
                             )
 
-                            if sb == 0:
-                                oi = oi_tmp
-                                li = cur_li
-                                mi = cur_mi
-                            else:
-                                mi_new = pl.maximum(mi, cur_mi)
-                                alpha = pl.exp(pl.sub(mi, mi_new))
-                                beta = pl.exp(pl.sub(cur_mi, mi_new))
-                                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
-                                mi = mi_new
+                            mi_new = pl.maximum(mi, cur_mi)
+                            alpha = pl.exp(pl.sub(mi, mi_new))
+                            beta = pl.exp(pl.sub(cur_mi, mi_new))
+                            li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                            oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
+                            mi = mi_new
 
                         ctx = pl.row_expand_div(oi, li)
                         attn_row = pl.assemble(attn_row, ctx, [0, q_col])
