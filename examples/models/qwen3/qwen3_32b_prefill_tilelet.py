@@ -467,6 +467,225 @@ def build_tensor_specs(
     ]
 
 
+def golden_qwen3_prefill(tensors, params):
+    import torch
+
+    batch = BATCH
+    max_seq_len = MAX_SEQ
+    hidden_size = HIDDEN
+    num_heads = NUM_HEADS
+    num_kv_heads = NUM_KV_HEADS
+    head_dim = HEAD_DIM
+    intermediate_size = INTERMEDIATE
+    kv_hidden = num_kv_heads * head_dim
+    q_per_kv = num_heads // num_kv_heads
+    eps = EPS
+    attn_scale = ATTN_SCALE
+
+    hidden_states = tensors["hidden_states"]
+    seq_lens = tensors["seq_lens"]
+    rope_cos = tensors["rope_cos"]
+    rope_sin = tensors["rope_sin"]
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
+    input_rms_weight = tensors["input_rms_weight"]
+    wq = tensors["wq"]
+    wk = tensors["wk"]
+    wv = tensors["wv"]
+    wo = tensors["wo"]
+    post_rms_weight = tensors["post_rms_weight"]
+    w_gate = tensors["w_gate"]
+    w_up = tensors["w_up"]
+    w_down = tensors["w_down"]
+
+    out = tensors["out"]
+
+    for b in range(batch):
+        seq_len_b = seq_lens[b].item()
+
+        for p0 in range(0, seq_len_b, TOK_TILE):
+            valid_tok = min(TOK_TILE, seq_len_b - p0)
+
+            x_tile = hidden_states[b, p0:p0+valid_tok, :].float()
+
+            sq_sum = (x_tile ** 2).sum(dim=-1, keepdim=True)
+            inv_rms = torch.rsqrt(sq_sum / hidden_size + eps)
+
+            normed = x_tile * inv_rms * input_rms_weight.float()
+
+            q_proj = torch.zeros(valid_tok, hidden_size, dtype=torch.bfloat16)
+            k_proj = torch.zeros(valid_tok, kv_hidden, dtype=torch.bfloat16)
+            v_proj = torch.zeros(valid_tok, kv_hidden, dtype=torch.bfloat16)
+
+            hidden_blocks = hidden_size // K_CHUNK
+            q_out_blocks = hidden_size // Q_OUT_CHUNK
+            kv_out_blocks = kv_hidden // KV_OUT_CHUNK
+
+            for q0_idx in range(q_out_blocks):
+                q0 = q0_idx * Q_OUT_CHUNK
+                q_acc = torch.zeros(valid_tok, Q_OUT_CHUNK, dtype=torch.float32)
+                for kb_idx in range(hidden_blocks):
+                    k0 = kb_idx * K_CHUNK
+                    normed_chunk = normed[:, k0:k0+K_CHUNK].bfloat16()
+                    wq_chunk = wq[k0:k0+K_CHUNK, q0:q0+Q_OUT_CHUNK]
+                    q_acc = q_acc + torch.matmul(normed_chunk, wq_chunk).float()
+                q_proj[:, q0:q0+Q_OUT_CHUNK] = q_acc.bfloat16()
+
+            for kv0_idx in range(kv_out_blocks):
+                kv0 = kv0_idx * KV_OUT_CHUNK
+                k_acc = torch.zeros(valid_tok, KV_OUT_CHUNK, dtype=torch.float32)
+                v_acc = torch.zeros(valid_tok, KV_OUT_CHUNK, dtype=torch.float32)
+                for kb_idx in range(hidden_blocks):
+                    k0 = kb_idx * K_CHUNK
+                    normed_chunk = normed[:, k0:k0+K_CHUNK].bfloat16()
+                    wk_chunk = wk[k0:k0+K_CHUNK, kv0:kv0+KV_OUT_CHUNK]
+                    wv_chunk = wv[k0:k0+K_CHUNK, kv0:kv0+KV_OUT_CHUNK]
+                    k_acc = k_acc + torch.matmul(normed_chunk, wk_chunk).float()
+                    v_acc = v_acc + torch.matmul(normed_chunk, wv_chunk).float()
+                k_proj[:, kv0:kv0+KV_OUT_CHUNK] = k_acc.bfloat16()
+                v_proj[:, kv0:kv0+KV_OUT_CHUNK] = v_acc.bfloat16()
+
+            attn_tile = torch.zeros(valid_tok, hidden_size, dtype=torch.float32)
+
+            for ti in range(valid_tok):
+                pos = p0 + ti
+                ctx_len = pos + 1
+
+                cos_row = rope_cos[pos, :].float()
+                sin_row = rope_sin[pos, :].float()
+                cos_lo = cos_row[:head_dim // 2]
+                cos_hi = cos_row[head_dim // 2:]
+                sin_lo = sin_row[:head_dim // 2]
+                sin_hi = sin_row[head_dim // 2:]
+
+                k_group = torch.zeros(num_kv_heads, head_dim, dtype=torch.float32)
+                for ki in range(num_kv_heads):
+                    kv_col = ki * head_dim
+                    k_group[ki, :] = k_proj[ti, kv_col:kv_col+head_dim].float()
+
+                k_lo = k_group[:, :head_dim // 2]
+                k_hi = k_group[:, head_dim // 2:]
+                k_rot = torch.cat([
+                    k_lo * cos_lo.unsqueeze(0) - k_hi * sin_lo.unsqueeze(0),
+                    k_hi * cos_hi.unsqueeze(0) + k_lo * sin_hi.unsqueeze(0),
+                ], dim=-1)
+
+                for ki in range(num_kv_heads):
+                    cache_row = b * num_kv_heads * max_seq_len + ki * max_seq_len + pos
+                    k_cache[cache_row, :] = k_rot[ki, :].bfloat16()
+                    v_cache[cache_row, :] = v_proj[ti, ki * head_dim:(ki+1) * head_dim]
+
+                attn_row = torch.zeros(1, hidden_size, dtype=torch.float32)
+
+                q_groups = q_per_kv // Q_HEAD_BATCH
+                total_q_groups = num_kv_heads * q_groups
+
+                for gi in range(total_q_groups):
+                    kvh = gi // q_groups
+                    qg = gi - kvh * q_groups
+                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
+
+                    q_group = torch.zeros(Q_HEAD_BATCH, head_dim, dtype=torch.float32)
+                    for qi in range(Q_HEAD_BATCH):
+                        q_col = (q_base + qi) * head_dim
+                        q_group[qi, :] = q_proj[ti, q_col:q_col+head_dim]
+
+                    q_lo = q_group[:, :head_dim // 2]
+                    q_hi = q_group[:, head_dim // 2:]
+                    q_rot = torch.cat([
+                        q_lo * cos_lo.unsqueeze(0) - q_hi * sin_lo.unsqueeze(0),
+                        q_hi * cos_hi.unsqueeze(0) + q_lo * sin_hi.unsqueeze(0),
+                    ], dim=-1)
+                    q_rot_bf16 = q_rot.bfloat16().float()
+
+                    oi = torch.zeros(Q_HEAD_BATCH, head_dim, dtype=torch.float32)
+                    li = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
+                    mi = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
+
+                    for s0 in range(0, ctx_len, SEQ_TILE):
+                        valid_len = min(SEQ_TILE, ctx_len - s0)
+                        cache_row0 = b * num_kv_heads * max_seq_len + kvh * max_seq_len + s0
+
+                        k_tile = k_cache[cache_row0:cache_row0+valid_len, :].float()
+                        v_tile = v_cache[cache_row0:cache_row0+valid_len, :].float()
+
+                        raw_scores = torch.matmul(q_rot_bf16, k_tile.transpose(0, 1))
+                        scores = raw_scores * attn_scale
+
+                        cur_mi = scores.max(dim=-1, keepdim=True)[0]
+                        exp_scores = torch.exp(scores - cur_mi)
+                        cur_li = exp_scores.sum(dim=-1, keepdim=True)
+
+                        exp_pad = torch.zeros(Q_HEAD_BATCH, SEQ_TILE, dtype=torch.float32)
+                        exp_pad[:, :valid_len] = exp_scores
+                        exp_pad_bf16 = exp_pad.bfloat16().float()
+
+                        oi_tmp = torch.matmul(exp_pad_bf16, v_tile)
+
+                        if s0 == 0:
+                            oi = oi_tmp
+                            li = cur_li
+                            mi = cur_mi
+                        else:
+                            mi_new = torch.maximum(mi, cur_mi)
+                            alpha = torch.exp(mi - mi_new)
+                            beta = torch.exp(cur_mi - mi_new)
+                            li = alpha * li + beta * cur_li
+                            oi = alpha * oi + beta * oi_tmp
+                            mi = mi_new
+
+                    ctx = oi / li
+                    for qi in range(Q_HEAD_BATCH):
+                        q_col = (q_base + qi) * head_dim
+                        attn_row[0, q_col:q_col+head_dim] = ctx[qi, :]
+
+                attn_tile[ti, :] = attn_row
+
+            resid1 = torch.zeros(valid_tok, hidden_size, dtype=torch.float32)
+            for o0 in range(0, hidden_size, Q_OUT_CHUNK):
+                o_chunk_size = min(Q_OUT_CHUNK, hidden_size - o0)
+                o_acc = torch.zeros(valid_tok, o_chunk_size, dtype=torch.float32)
+                for k0 in range(0, hidden_size, K_CHUNK):
+                    k_chunk_size = min(K_CHUNK, hidden_size - k0)
+                    a_chunk = attn_tile[:, k0:k0+k_chunk_size].bfloat16()
+                    w_chunk = wo[k0:k0+k_chunk_size, o0:o0+o_chunk_size]
+                    o_acc = o_acc + torch.matmul(a_chunk, w_chunk).float()
+                resid = x_tile[:, o0:o0+o_chunk_size]
+                resid1[:, o0:o0+o_chunk_size] = o_acc + resid
+
+            sq_sum_post = (resid1 ** 2).sum(dim=-1, keepdim=True)
+            inv_rms_post = torch.rsqrt(sq_sum_post / hidden_size + eps)
+
+            post_norm = resid1 * inv_rms_post * post_rms_weight.float()
+
+            down_proj = torch.zeros(valid_tok, hidden_size, dtype=torch.float32)
+            for o0 in range(0, intermediate_size, MLP_OUT_CHUNK):
+                o_chunk_size = min(MLP_OUT_CHUNK, intermediate_size - o0)
+                gate_acc = torch.zeros(valid_tok, o_chunk_size, dtype=torch.float32)
+                up_acc = torch.zeros(valid_tok, o_chunk_size, dtype=torch.float32)
+
+                for k0 in range(0, hidden_size, K_CHUNK):
+                    k_chunk_size = min(K_CHUNK, hidden_size - k0)
+                    post_chunk = post_norm[:, k0:k0+k_chunk_size].bfloat16()
+                    wg = w_gate[k0:k0+k_chunk_size, o0:o0+o_chunk_size]
+                    wu = w_up[k0:k0+k_chunk_size, o0:o0+o_chunk_size]
+                    gate_acc = gate_acc + torch.matmul(post_chunk, wg).float()
+                    up_acc = up_acc + torch.matmul(post_chunk, wu).float()
+
+                sigmoid = torch.sigmoid(gate_acc)
+                mlp_chunk = gate_acc * sigmoid * up_acc
+                mlp_chunk_bf16 = mlp_chunk.bfloat16().float()
+
+                for d0 in range(0, hidden_size, K_CHUNK):
+                    d_chunk_size = min(K_CHUNK, hidden_size - d0)
+                    down_prev = down_proj[:, d0:d0+d_chunk_size]
+                    w_down_chunk = w_down[o0:o0+o_chunk_size, d0:d0+d_chunk_size]
+                    down_proj[:, d0:d0+d_chunk_size] = down_prev + torch.matmul(mlp_chunk_bf16, w_down_chunk).float()
+
+            final_out = down_proj + resid1
+            out[b, p0:p0+valid_tok, :] = final_out.bfloat16()
+
+
 def compile_and_run(
     batch: int = BATCH,
     max_seq_len: int = MAX_SEQ,
@@ -506,7 +725,7 @@ def compile_and_run(
     result = run(
         program=program,
         tensor_specs=tensor_specs,
-        golden=None,
+        golden=golden_qwen3_prefill,
         config=RunConfig(
             platform=platform,
             device_id=device_id,
