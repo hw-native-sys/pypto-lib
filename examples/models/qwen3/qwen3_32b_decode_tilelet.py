@@ -115,8 +115,6 @@ def build_qwen3_single_layer_decode_program(
     CACHE_ROWS = BATCH_CFG * NUM_KV_HEADS_CFG * MAX_SEQ_CFG
     Q_GROUPS = Q_PER_KV_CFG // Q_HEAD_BATCH
     TOTAL_Q_GROUPS = NUM_KV_HEADS_CFG * Q_GROUPS
-    ATTN_INIT_CHUNK = Q_HEAD_BATCH * HEAD_DIM_CFG
-    ATTN_INIT_BLOCKS = HIDDEN_CFG // ATTN_INIT_CHUNK
 
     @pl.program
     class Qwen3SingleLayerDecode:
@@ -262,12 +260,6 @@ def build_qwen3_single_layer_decode_program(
                         )
 
                 attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
-                with pl.incore():
-                    # Zero-init attn_row in [1, ATTN_INIT_CHUNK] = [1, 512] FP32 = 2 KB chunks.
-                    for zi in pl.range(ATTN_INIT_BLOCKS):
-                        z0 = zi * ATTN_INIT_CHUNK
-                        z = pl.full([1, ATTN_INIT_CHUNK], dtype=pl.FP32, value=0.0)
-                        attn_row = pl.assemble(attn_row, z, [0, z0])
 
                 # Manually split the decode attention into smaller incore stages so
                 # each outlined kernel has a single cross-core payload size.
@@ -309,8 +301,10 @@ def build_qwen3_single_layer_decode_program(
 
                     with pl.incore():
                         oi = pl.full([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
-                        li = pl.full([Q_HEAD_BATCH, 1], dtype=pl.FP32, value=0.0)
-                        mi = pl.full([Q_HEAD_BATCH, 1], dtype=pl.FP32, value=0.0)
+                        li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                        li = pl.reshape(li_flat, [Q_HEAD_BATCH, 1])
+                        mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
+                        mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
@@ -339,12 +333,12 @@ def build_qwen3_single_layer_decode_program(
                             # 2. scale after fillpad
                             scores = pl.mul(scores_padded, ATTN_SCALE)
                             # 3. row_max, exp
-                            cur_mi = pl.cast(pl.row_max(scores), target_type=pl.FP32)
+                            cur_mi = pl.row_max(scores)
                             exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                             # 4. BF16 round-trip before row_sum (li matches SV matmul weights)
                             exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                             exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
-                            cur_li = pl.cast(pl.row_sum(exp_scores_fp32), target_type=pl.FP32)
+                            cur_li = pl.row_sum(exp_scores_fp32)
 
                         with pl.incore():
                             # SV matmul: load full V tile without valid_shape.
@@ -371,13 +365,10 @@ def build_qwen3_single_layer_decode_program(
 
                     with pl.incore():
                         ctx = pl.row_expand_div(oi, li)
-                        for qi in pl.range(Q_HEAD_BATCH):
-                            q_col = (q_base + qi) * HEAD_DIM_CFG
-                            attn_row = pl.assemble(
-                                attn_row,
-                                pl.slice(ctx, [1, HEAD_DIM_CFG], [qi, 0]),
-                                [0, q_col],
-                            )
+                        ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * HEAD_DIM_CFG])
+                        attn_row = pl.assemble(
+                            attn_row, ctx_flat, [0, q_base * HEAD_DIM_CFG],
+                        )
 
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
@@ -525,6 +516,8 @@ def compile_and_run(
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
 
+    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
+
     program = build_qwen3_single_layer_decode_program(
         batch=batch,
         max_seq_len=max_seq_len,
@@ -556,7 +549,7 @@ def compile_and_run(
             atol=2e-2,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend950,
+            backend_type=backend,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
@@ -567,4 +560,17 @@ def compile_and_run(
 
 
 if __name__ == "__main__":
-    compile_and_run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    args = parser.parse_args()
+
+    result = compile_and_run(
+        platform=args.platform,
+        device_id=args.device,
+    )
+    if not result.passed:
+        raise SystemExit(1)

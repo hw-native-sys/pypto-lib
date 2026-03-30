@@ -63,14 +63,16 @@ download from GitHub releases to `~/Downloads`, then extract from there.
 ## Step 5: Clone pto-isa
 
 ```bash
-git clone --depth=1 https://github.com/PTO-ISA/pto-isa.git "$WORKSPACE_DIR/pto-isa"
+git clone https://github.com/PTO-ISA/pto-isa.git "$WORKSPACE_DIR/pto-isa"
+git -C "$WORKSPACE_DIR/pto-isa" checkout a652804
 export PTO_ISA_ROOT="$WORKSPACE_DIR/pto-isa"
 ```
 
-## Step 6: Clone simpler (stable branch)
+## Step 6: Install simpler (stable branch)
 
 ```bash
 git clone --branch stable https://github.com/ChaoWao/simpler.git "$WORKSPACE_DIR/simpler"
+pip install "$WORKSPACE_DIR/simpler"
 export SIMPLER_ROOT="$WORKSPACE_DIR/simpler"
 ```
 

@@ -66,10 +66,14 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
       - name: Clone pto-isa repository
-        run: git clone --depth=1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+        run: |
+          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
 
-      - name: Clone simpler repository (stable)
-        run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+      - name: Install simpler (stable)
+        run: |
+          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+          pip install $GITHUB_WORKSPACE/simpler
 
       - name: Run a2a3sim tests
         run: |
@@ -124,10 +128,14 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
       - name: Clone pto-isa repository
-        run: git clone --depth=1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+        run: |
+          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
 
-      - name: Clone simpler repository (stable)
-        run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+      - name: Install simpler (stable)
+        run: |
+          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+          pip install $GITHUB_WORKSPACE/simpler
 
       - name: Run a5sim tests
         run: |
@@ -184,10 +192,14 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
       - name: Clone pto-isa repository
-        run: git clone --depth=1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+        run: |
+          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
 
-      - name: Clone simpler repository (stable)
-        run: git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+      - name: Install simpler (stable)
+        run: |
+          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
+          pip install $GITHUB_WORKSPACE/simpler
 
       - name: Run a2a3 tests
         run: |
