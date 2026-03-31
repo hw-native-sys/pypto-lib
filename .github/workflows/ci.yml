@@ -66,9 +66,7 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
       - name: Clone pto-isa repository
-        run: |
-          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
-          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
+        run: git clone --depth 1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
 
       - name: Install simpler (stable)
         run: |
@@ -129,9 +127,7 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
       - name: Clone pto-isa repository
-        run: |
-          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
-          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
+        run: git clone --depth 1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
 
       - name: Install simpler (stable)
         run: |
@@ -197,9 +193,7 @@ jobs:
         run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
 
       - name: Clone pto-isa repository
-        run: |
-          git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
-          git -C $GITHUB_WORKSPACE/pto-isa checkout a652804
+        run: git clone --depth 1 https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
 
       - name: Install simpler (stable)
         run: |

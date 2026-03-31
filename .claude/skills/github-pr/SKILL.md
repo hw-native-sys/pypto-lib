@@ -117,9 +117,6 @@ gh pr create \
 - Key change 1
 - Key change 2
 
-## Testing
-- [ ] Pre-commit checks pass
-
 ## Related Issues
 Fixes #ISSUE_NUMBER (if applicable)
 EOF
