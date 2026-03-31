@@ -3,9 +3,7 @@ target-version = "py310"
 
 exclude = [
     "*_build/",
-    "junk_models/",
-    "junk_tensor_functions/",
-    "projects/",
+    ".claude/skills/cannbot-skills/",
 ]
 
 [lint]

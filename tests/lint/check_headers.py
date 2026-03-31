@@ -23,10 +23,7 @@ PY_HEADER = """\
 # -----------------------------------------------------------------------------------------------------------"""
 
 EXCLUDED_PREFIXES = [
-    "junk_models/",
-    "junk_tensor_functions/",
-    "projects/",
-    "examples/docs/",
+    ".claude/skills/cannbot-skills/",
 ]
 
 EXCLUDED_SUFFIXES = [

@@ -72,8 +72,9 @@ jobs:
 
       - name: Install simpler (stable)
         run: |
-          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
-          pip install $GITHUB_WORKSPACE/simpler
+          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler.git $GITHUB_WORKSPACE/simpler
+          cd $GITHUB_WORKSPACE/simpler
+          pip install -v .
 
       - name: Run a2a3sim tests
         run: |
@@ -134,8 +135,9 @@ jobs:
 
       - name: Install simpler (stable)
         run: |
-          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
-          pip install $GITHUB_WORKSPACE/simpler
+          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler.git $GITHUB_WORKSPACE/simpler
+          cd $GITHUB_WORKSPACE/simpler
+          pip install -v .
 
       - name: Run a5sim tests
         run: |
@@ -191,6 +193,9 @@ jobs:
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
           chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
 
+      - name: Add Ascend tools to PATH
+        run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
+
       - name: Clone pto-isa repository
         run: |
           git clone https://github.com/PTO-ISA/pto-isa.git $GITHUB_WORKSPACE/pto-isa
@@ -198,8 +203,9 @@ jobs:
 
       - name: Install simpler (stable)
         run: |
-          git clone --branch stable https://github.com/ChaoWao/simpler.git $GITHUB_WORKSPACE/simpler
-          pip install $GITHUB_WORKSPACE/simpler
+          git clone --branch stable --depth 1 https://github.com/hw-native-sys/simpler.git $GITHUB_WORKSPACE/simpler
+          cd $GITHUB_WORKSPACE/simpler
+          pip install -v .
 
       - name: Run a2a3 tests
         run: |
