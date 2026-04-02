@@ -82,6 +82,20 @@ def build_decode_scope12_program(
             k_proj = pl.create_tensor([batch, kv_hidden], dtype=pl.FP32)
             v_proj = pl.create_tensor([batch, kv_hidden], dtype=pl.FP32)
 
+            # Initialize intermediate tensors to zero so assemble generates inout.
+            for ob in pl.range(q_out_blocks):
+                q0 = ob * Q_OUT_CHUNK
+                with pl.incore():
+                    zero_q = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    q_proj = pl.assemble(q_proj, zero_q, [0, q0])
+            for ob in pl.range(kv_out_blocks):
+                kv0 = ob * KV_OUT_CHUNK
+                with pl.incore():
+                    zero_k = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    zero_v = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    k_proj = pl.assemble(k_proj, zero_k, [0, kv0])
+                    v_proj = pl.assemble(v_proj, zero_v, [0, kv0])
+
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
             for b0 in pl.range(0, batch, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
@@ -473,8 +487,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1e-3,
+            atol=1e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
