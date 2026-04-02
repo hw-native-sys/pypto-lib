@@ -165,11 +165,16 @@ def build_tensor_specs(
     kv_hidden = num_kv_heads * head_dim
 
     return [
-        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32, init_value=torch.randn),
-        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
+                   init_value=torch.rand(batch, hidden_size) * 2 - 1),
+        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32,
+                   init_value=torch.rand(1, hidden_size) * 2 - 1),
+        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16,
+                   init_value=torch.rand(hidden_size, hidden_size) * 2 - 1),
+        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16,
+                   init_value=torch.rand(hidden_size, kv_hidden) * 2 - 1),
+        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
+                   init_value=torch.rand(hidden_size, kv_hidden) * 2 - 1),
         TensorSpec("q_proj", [batch, hidden_size], torch.float32, is_output=True),
         TensorSpec("k_proj", [batch, kv_hidden], torch.float32, is_output=True),
         TensorSpec("v_proj", [batch, kv_hidden], torch.float32, is_output=True),
@@ -256,8 +261,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=5e-3,
-            atol=5e-3,
+            rtol=1e-3,
+            atol=1e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,

@@ -53,7 +53,7 @@ def build_rmsnorm_program(
                             target_type=pl.FP32,
                         )
                         partial_sq = pl.add(partial_sq, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                    inv_rms_tile = pl.rsqrt(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS))
+                    variance = pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS)
 
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -62,7 +62,7 @@ def build_rmsnorm_program(
                             target_type=pl.FP32,
                         )
                         gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, variance), gamma)
                         normed_out = pl.assemble(normed_out, pl.cast(normed, target_type=pl.BF16), [b0, k0])
 
             return normed_out
@@ -104,8 +104,8 @@ def golden_rmsnorm(tensors, params):
         for k0 in range(0, hidden_size, K_CHUNK):
             x_chunk = x_tile[:, k0:k0 + K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
-        inv_rms = torch.rsqrt(sq_sum / hidden_size + EPS)
-        normed = (x_tile * inv_rms * input_rms_weight.float()).bfloat16()
+        variance = sq_sum / hidden_size + EPS
+        normed = (x_tile * variance * input_rms_weight.float()).bfloat16()
         normed_out[b0:b_end, :] = normed
 
     tensors["normed_out"][:] = normed_out
@@ -135,8 +135,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=1e-3,
+            atol=1e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
