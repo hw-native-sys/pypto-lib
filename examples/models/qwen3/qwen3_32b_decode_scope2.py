@@ -30,7 +30,7 @@ Hardware TILELET / TILE sizing (at default HEAD_DIM=128):
   * Attention K tile    [SEQ_TILE, HEAD_DIM]          BF16 = [64,128]*2 = 16 KB = MAX
 
 Input projections are BF16; cos/sin tables are FP32; KV caches are BF16.
-Output attention is FP32.
+Output attention is BF16.
 """
 from __future__ import annotations
 
@@ -77,8 +77,8 @@ def build_decode_attention_program(
             rope_sin: pl.Tensor[[max_seq, head_dim], pl.FP32],
             k_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
             v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
-            attn_out: pl.Out[pl.Tensor[[batch, hidden], pl.FP32]],
-        ) -> pl.Tensor[[batch, hidden], pl.FP32]:
+            attn_out: pl.Out[pl.Tensor[[batch, hidden], pl.BF16]],
+        ) -> pl.Tensor[[batch, hidden], pl.BF16]:
             for b in pl.parallel(batch):
                 ctx_len = pl.tensor.read(seq_lens, [b])
                 pos = ctx_len - 1
@@ -90,44 +90,36 @@ def build_decode_attention_program(
                 sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
-                k_group = pl.create_tensor([num_kv_heads, head_dim], dtype=pl.FP32)
                 with pl.incore():
-                    # Stage 1a: gather all KV heads into a shared tensor buffer.
+                    # Stage 1: per-head K gather + RoPE + cache update.
                     for ki in pl.range(num_kv_heads):
                         kv_col = ki * head_dim
-                        k_group = pl.assemble(
-                            k_group,
-                            pl.cast(pl.slice(k_proj, [1, head_dim], [b, kv_col]),
-                                    target_type=pl.FP32),
-                            [ki, 0],
+                        k_lo = pl.cast(
+                            pl.slice(k_proj, [1, half_dim], [b, kv_col]),
+                            target_type=pl.FP32,
                         )
-
-                k_rot_tensor = pl.create_tensor([num_kv_heads, head_dim], dtype=pl.FP32)
-                with pl.incore():
-                    # Stage 1b: rotate K halves and assemble to GM (no concat).
-                    k_lo = pl.slice(k_group, [num_kv_heads, half_dim], [0, 0])
-                    k_hi = pl.slice(k_group, [num_kv_heads, half_dim],
-                                    [0, half_dim])
-                    rot_lo = pl.sub(
-                        pl.col_expand_mul(k_lo, cos_lo),
-                        pl.col_expand_mul(k_hi, sin_lo),
-                    )
-                    rot_hi = pl.add(
-                        pl.col_expand_mul(k_hi, cos_hi),
-                        pl.col_expand_mul(k_lo, sin_hi),
-                    )
-                    k_rot_tensor = pl.assemble(k_rot_tensor, rot_lo, [0, 0])
-                    k_rot_tensor = pl.assemble(k_rot_tensor, rot_hi, [0, half_dim])
-
-                with pl.incore():
-                    # Stage 1c: update the caches from rotated K tensor.
-                    for ki in pl.range(num_kv_heads):
+                        k_hi = pl.cast(
+                            pl.slice(k_proj, [1, half_dim], [b, kv_col + half_dim]),
+                            target_type=pl.FP32,
+                        )
+                        rot_lo = pl.sub(
+                            pl.col_expand_mul(k_lo, cos_lo),
+                            pl.col_expand_mul(k_hi, sin_lo),
+                        )
+                        rot_hi = pl.add(
+                            pl.col_expand_mul(k_hi, cos_hi),
+                            pl.col_expand_mul(k_lo, sin_hi),
+                        )
                         cache_row = b * num_kv_heads * max_seq + ki * max_seq + pos
                         k_cache = pl.assemble(
                             k_cache,
-                            pl.cast(pl.slice(k_rot_tensor, [1, head_dim], [ki, 0]),
-                                    target_type=pl.BF16),
+                            pl.cast(rot_lo, target_type=pl.BF16),
                             [cache_row, 0],
+                        )
+                        k_cache = pl.assemble(
+                            k_cache,
+                            pl.cast(rot_hi, target_type=pl.BF16),
+                            [cache_row, half_dim],
                         )
                         v_cache = pl.assemble(
                             v_cache,
@@ -135,7 +127,7 @@ def build_decode_attention_program(
                             [cache_row, 0],
                         )
 
-                attn_row = pl.create_tensor([1, hidden], dtype=pl.FP32)
+                attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
 
                 # Manually split decode attention into smaller incore stages so
                 # each outlined kernel has a single cross-core payload size.
@@ -144,49 +136,42 @@ def build_decode_attention_program(
                     qg = gi - kvh * q_groups
                     q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
 
-                    q_group = pl.create_tensor([Q_HEAD_BATCH, head_dim], dtype=pl.FP32)
+                    # Pad Q for cube fractal alignment.
+                    q_padded = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.BF16)
                     with pl.incore():
-                        # Stage 2a: gather the Q-head group into a tensor buffer.
+                        # Stage 2: per-head Q gather + RoPE + pad + init accumulators.
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * head_dim
-                            q_group = pl.assemble(
-                                q_group,
-                                pl.cast(pl.slice(q_proj, [1, head_dim], [b, q_col]),
-                                        target_type=pl.FP32),
-                                [qi, 0],
+                            q_lo = pl.cast(
+                                pl.slice(q_proj, [1, half_dim], [b, q_col]),
+                                target_type=pl.FP32,
                             )
+                            q_hi = pl.cast(
+                                pl.slice(q_proj, [1, half_dim], [b, q_col + half_dim]),
+                                target_type=pl.FP32,
+                            )
+                            rot_lo_bf16 = pl.cast(
+                                pl.sub(
+                                    pl.col_expand_mul(q_lo, cos_lo),
+                                    pl.col_expand_mul(q_hi, sin_lo),
+                                ),
+                                target_type=pl.BF16,
+                            )
+                            rot_hi_bf16 = pl.cast(
+                                pl.add(
+                                    pl.col_expand_mul(q_hi, cos_hi),
+                                    pl.col_expand_mul(q_lo, sin_hi),
+                                ),
+                                target_type=pl.BF16,
+                            )
+                            q_padded = pl.assemble(q_padded, rot_lo_bf16, [qi, 0])
+                            q_padded = pl.assemble(q_padded, rot_hi_bf16, [qi, half_dim])
 
-                    q_rot_bf16 = pl.create_tensor([Q_HEAD_BATCH, head_dim], dtype=pl.BF16)
-                    with pl.incore():
-                        # Stage 2b: apply RoPE halves, cast and assemble to GM (no concat).
-                        q_lo = pl.slice(q_group, [Q_HEAD_BATCH, half_dim], [0, 0])
-                        q_hi = pl.slice(q_group, [Q_HEAD_BATCH, half_dim],
-                                        [0, half_dim])
-                        q_rot_lo = pl.sub(
-                            pl.col_expand_mul(q_lo, cos_lo),
-                            pl.col_expand_mul(q_hi, sin_lo),
-                        )
-                        q_rot_hi = pl.add(
-                            pl.col_expand_mul(q_hi, cos_hi),
-                            pl.col_expand_mul(q_lo, sin_hi),
-                        )
-                        q_rot_lo_bf16 = pl.cast(q_rot_lo, target_type=pl.BF16)
-                        q_rot_hi_bf16 = pl.cast(q_rot_hi, target_type=pl.BF16)
-                        q_rot_bf16 = pl.assemble(q_rot_bf16, q_rot_lo_bf16, [0, 0])
-                        q_rot_bf16 = pl.assemble(q_rot_bf16, q_rot_hi_bf16, [0, half_dim])
-
-                    with pl.incore():
                         oi = pl.full([Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0)
                         li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
                         li = pl.reshape(li_flat, [Q_HEAD_BATCH, 1])
                         mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
                         mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
-
-                    # Pad Q for cube fractal alignment.
-                    q_padded = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                    with pl.incore():
-                        q_bf16_tile = pl.slice(q_rot_bf16, [Q_HEAD_BATCH, head_dim], [0, 0])
-                        q_padded = pl.assemble(q_padded, q_bf16_tile, [0, 0])
 
                     for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
@@ -203,8 +188,9 @@ def build_decode_attention_program(
                             )
                             raw_scores_pad = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
 
+                        exp_padded = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                         with pl.incore():
-                            # Softmax: slice valid rows from padded scores.
+                            # Softmax + pad exp_scores.
                             scores_valid = pl.slice(
                                 raw_scores_pad,
                                 [Q_HEAD_BATCH, SEQ_TILE],
@@ -212,21 +198,13 @@ def build_decode_attention_program(
                                 valid_shape=[Q_HEAD_BATCH, valid_len],
                             )
                             scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                            # 2. scale after fillpad
                             scores = pl.mul(scores_padded, attn_scale)
-                            # 3. row_max, exp
                             cur_mi = pl.row_max(scores)
                             exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                            # 4. BF16 round-trip before row_sum (li matches SV matmul weights)
                             exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
                             exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                             cur_li = pl.row_sum(exp_scores_fp32)
-
-                        # Pad exp_scores for SV matmul.
-                        exp_padded = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
-                        with pl.incore():
-                            exp_tile = pl.slice(exp_scores_bf16, [Q_HEAD_BATCH, SEQ_TILE], [0, 0])
-                            exp_padded = pl.assemble(exp_padded, exp_tile, [0, 0])
+                            exp_padded = pl.assemble(exp_padded, exp_scores_bf16, [0, 0])
 
                         oi_tmp_pad = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.FP32)
                         with pl.incore():
@@ -258,7 +236,7 @@ def build_decode_attention_program(
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
                         attn_row = pl.assemble(
-                            attn_row, ctx_flat, [0, q_base * head_dim],
+                            attn_row, pl.cast(ctx_flat, target_type=pl.BF16), [0, q_base * head_dim],
                         )
 
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
@@ -293,7 +271,7 @@ def build_tensor_specs(
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32, init_value=torch.randn),
         TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("attn_out", [batch, hidden], torch.float32, is_output=True),
+        TensorSpec("attn_out", [batch, hidden], torch.bfloat16, is_output=True),
     ]
 
 
@@ -426,7 +404,7 @@ def golden_decode_attention(tensors, params):
                     qh = q_base + qi
                     attn_out[b, qh * head_dim : (qh + 1) * head_dim] = ctx[qi]
 
-    tensors["attn_out"][:] = attn_out
+    tensors["attn_out"][:] = attn_out.to(torch.bfloat16)
 
 
 def compile_and_run(
