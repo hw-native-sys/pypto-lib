@@ -127,6 +127,7 @@ EOF
 - Auto-generate title and body from commit messages
 - Keep title under 72 characters
 - Do NOT add AI co-author footers or branding
+- Use ONLY the `## Summary` and `## Related Issues` sections shown above. Do NOT add `## Test plan`, `## Test Plan`, or any other sections
 
 ## Common Issues
 

@@ -416,6 +416,7 @@ def compile_and_run(
     platform: str = "a5",
     device_id: int = 0,
     dump_passes: bool = True,
+    enable_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
@@ -450,13 +451,9 @@ def compile_and_run(
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
+            enable_profiling=enable_profiling,
         ),
     )
-    if not result.passed and result.error and "code_runner" in result.error:
-        print("Result: COMPILE OK — device run skipped (code_runner not found).\n")
-        print(result.error)
-    elif not result.passed and result.error:
-        print(f"Result: {result.error}")
     return result
 
 
@@ -467,11 +464,15 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a5",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
     result = compile_and_run(
         platform=args.platform,
         device_id=args.device,
+        enable_profiling=args.enable_profiling,
     )
     if not result.passed:
+        if result.error:
+            print(f"Result: {result.error}")
         raise SystemExit(1)

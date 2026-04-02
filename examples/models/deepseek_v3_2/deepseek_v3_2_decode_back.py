@@ -243,17 +243,12 @@ def compile_and_run(
             backend_type=BackendType.Ascend950,
         ),
     )
-    if not result.passed and result.error and "code_runner" in result.error:
-        print("Result: COMPILE OK — device run skipped (code_runner not found).")
-        print("  Generated kernels/orchestration:", work_dir)
-        return result
-    if not result.passed and result.error:
-        print(f"Result: {result.error}")
-        print("  Pass dumps may still have been written to:", work_dir)
-    else:
-        print("  Generated kernels/orchestration:", work_dir)
     return result
 
 
 if __name__ == "__main__":
-    compile_and_run()
+    result = compile_and_run()
+    if not result.passed:
+        if result.error:
+            print(f"Result: {result.error}")
+        raise SystemExit(1)

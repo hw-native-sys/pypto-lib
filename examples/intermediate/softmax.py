@@ -121,11 +121,6 @@ def compile_and_run(
             backend_type=backend,
         ),
     )
-    if not result.passed and result.error and "code_runner" in result.error:
-        print("Result: COMPILE OK — device run skipped (code_runner not found).\n")
-        print(result.error)
-    elif not result.passed and result.error:
-        print(f"Result: {result.error}")
     return result
 
 
@@ -143,4 +138,6 @@ if __name__ == "__main__":
         device_id=args.device,
     )
     if not result.passed:
+        if result.error:
+            print(f"Result: {result.error}")
         raise SystemExit(1)
