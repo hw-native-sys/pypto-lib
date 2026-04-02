@@ -67,16 +67,16 @@ def build_decode_projection_program(
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
             wv: pl.Tensor[[hidden, kv_hidden], pl.BF16],
-            q_proj: pl.Out[pl.Tensor[[batch, hidden], pl.BF16]],
-            k_proj: pl.Out[pl.Tensor[[batch, kv_hidden], pl.BF16]],
-            v_proj: pl.Out[pl.Tensor[[batch, kv_hidden], pl.BF16]],
+            q_proj: pl.Out[pl.Tensor[[batch, hidden], pl.FP32]],
+            k_proj: pl.Out[pl.Tensor[[batch, kv_hidden], pl.FP32]],
+            v_proj: pl.Out[pl.Tensor[[batch, kv_hidden], pl.FP32]],
         ) -> tuple[
-            pl.Tensor[[batch, hidden], pl.BF16],
-            pl.Tensor[[batch, kv_hidden], pl.BF16],
-            pl.Tensor[[batch, kv_hidden], pl.BF16],
+            pl.Tensor[[batch, hidden], pl.FP32],
+            pl.Tensor[[batch, kv_hidden], pl.FP32],
+            pl.Tensor[[batch, kv_hidden], pl.FP32],
         ]:
             for b0 in pl.range(0, batch, BATCH_TILE):
-                normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.FP32)
+                normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
                 # Stage 1: RMSNorm + apply weights (vector ops only).
                 with pl.incore():
@@ -99,83 +99,54 @@ def build_decode_projection_program(
                         )
                         gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                        normed_tile = pl.assemble(normed_tile, normed, [0, k0])
+                        normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
-                # Stage 2: Q projection.
+                # Stage 2: Q projection (matmul + matmul_acc in single incore).
                 for ob in pl.range(q_out_blocks):
                     q0 = ob * Q_OUT_CHUNK
 
                     with pl.incore():
-                        # vec: init accumulator.
-                        q_acc = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_b = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                        q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
 
-                    for kb in pl.range(hidden_blocks):
-                        k0 = kb * K_CHUNK
-                        normed_bf16_chunk = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.BF16)
-                        with pl.incore():
-                            # vec: cast normed to BF16.
-                            normed_chunk = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                            normed_bf16_chunk = pl.assemble(
-                                normed_bf16_chunk, pl.cast(normed_chunk, target_type=pl.BF16), [0, 0],
-                            )
+                        for kb in pl.range(1, hidden_blocks):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
 
-                        q_matmul_out = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                        with pl.incore():
-                            # cube: matmul.
-                            wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                            q_matmul_out = pl.matmul(normed_bf16_chunk, wq_chunk, out_dtype=pl.FP32)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
-                        with pl.incore():
-                            # vec: accumulate.
-                            q_acc = pl.add(q_acc, q_matmul_out)
-
-                    with pl.incore():
-                        # vec: cast result.
-                        q_acc_bf16 = pl.cast(q_acc, target_type=pl.BF16)
-                    q_proj = pl.assemble(q_proj, q_acc_bf16, [b0, q0])
-
-                # Stage 3: K/V projection.
+                # Stage 3: K/V projection (matmul + matmul_acc in single incore).
                 for ob in pl.range(kv_out_blocks):
                     kv0 = ob * KV_OUT_CHUNK
 
                     with pl.incore():
-                        # vec: init accumulators.
-                        k_acc = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        v_acc = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
 
-                    for kb in pl.range(hidden_blocks):
-                        k0 = kb * K_CHUNK
-                        normed_bf16_chunk = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.BF16)
-                        with pl.incore():
-                            # vec: cast normed to BF16.
-                            normed_chunk = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                            normed_bf16_chunk = pl.assemble(
-                                normed_bf16_chunk, pl.cast(normed_chunk, target_type=pl.BF16), [0, 0],
-                            )
+                        for kb in pl.range(1, hidden_blocks):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
 
-                        k_matmul_out = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        with pl.incore():
-                            # cube: K matmul.
-                            wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            k_matmul_out = pl.matmul(normed_bf16_chunk, wk_chunk, out_dtype=pl.FP32)
-
-                        v_matmul_out = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        with pl.incore():
-                            # cube: V matmul.
-                            wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            v_matmul_out = pl.matmul(normed_bf16_chunk, wv_chunk, out_dtype=pl.FP32)
-
-                        with pl.incore():
-                            # vec: accumulate both.
-                            k_acc = pl.add(k_acc, k_matmul_out)
-                            v_acc = pl.add(v_acc, v_matmul_out)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
                     with pl.incore():
-                        # vec: cast results.
-                        k_acc_bf16 = pl.cast(k_acc, target_type=pl.BF16)
-                        v_acc_bf16 = pl.cast(v_acc, target_type=pl.BF16)
-                    k_proj = pl.assemble(k_proj, k_acc_bf16, [b0, kv0])
-                    v_proj = pl.assemble(v_proj, v_acc_bf16, [b0, kv0])
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
+
+                        for kb in pl.range(1, hidden_blocks):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             return q_proj, k_proj, v_proj
 
@@ -199,17 +170,17 @@ def build_tensor_specs(
         TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16, init_value=torch.randn),
         TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
         TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("q_proj", [batch, hidden_size], torch.bfloat16, is_output=True),
-        TensorSpec("k_proj", [batch, kv_hidden], torch.bfloat16, is_output=True),
-        TensorSpec("v_proj", [batch, kv_hidden], torch.bfloat16, is_output=True),
+        TensorSpec("q_proj", [batch, hidden_size], torch.float32, is_output=True),
+        TensorSpec("k_proj", [batch, kv_hidden], torch.float32, is_output=True),
+        TensorSpec("v_proj", [batch, kv_hidden], torch.float32, is_output=True),
     ]
 
 
 def golden_decode_projection(tensors, params):
-    """PyTorch reference matching kernel BF16 precision path.
+    """PyTorch reference matching kernel precision path.
 
-    Tile-by-tile computation to match the kernel's FP32 accumulation across
-    K_CHUNK blocks, with BF16 cast on normed chunks before each matmul.
+    RMSNorm in FP32, then cast normed to BF16.
+    Projections: BF16 matmul with FP32 accumulation, final BF16 cast.
     """
     import torch
 
@@ -223,9 +194,9 @@ def golden_decode_projection(tensors, params):
     hidden_size = hidden_states.shape[1]
     kv_hidden = wk.shape[1]
 
-    q_proj = torch.zeros(batch, hidden_size, dtype=torch.bfloat16)
-    k_proj = torch.zeros(batch, kv_hidden, dtype=torch.bfloat16)
-    v_proj = torch.zeros(batch, kv_hidden, dtype=torch.bfloat16)
+    q_proj = torch.zeros(batch, hidden_size, dtype=torch.float32)
+    k_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
+    v_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
 
     for b0 in range(0, batch, BATCH_TILE):
         b_end = min(b0 + BATCH_TILE, batch)
@@ -237,29 +208,12 @@ def golden_decode_projection(tensors, params):
             x_chunk = x_tile[:, k0:k0 + K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
         inv_rms = torch.rsqrt(sq_sum / hidden_size + EPS)
-        normed = x_tile * inv_rms * input_rms_weight.float()
+        normed = (x_tile * inv_rms * input_rms_weight.float()).bfloat16()
 
-        # Q projection: chunked matmul with FP32 accumulation.
-        for q0 in range(0, hidden_size, Q_OUT_CHUNK):
-            q_acc = torch.zeros(b_end - b0, Q_OUT_CHUNK, dtype=torch.float32)
-            for k0 in range(0, hidden_size, K_CHUNK):
-                normed_chunk = normed[:, k0:k0 + K_CHUNK].bfloat16()
-                wq_chunk = wq[k0:k0 + K_CHUNK, q0:q0 + Q_OUT_CHUNK]
-                q_acc = q_acc + torch.matmul(normed_chunk, wq_chunk).float()
-            q_proj[b0:b_end, q0:q0 + Q_OUT_CHUNK] = q_acc.bfloat16()
-
-        # K/V projection: chunked matmul with FP32 accumulation.
-        for kv0 in range(0, kv_hidden, KV_OUT_CHUNK):
-            k_acc = torch.zeros(b_end - b0, KV_OUT_CHUNK, dtype=torch.float32)
-            v_acc = torch.zeros(b_end - b0, KV_OUT_CHUNK, dtype=torch.float32)
-            for k0 in range(0, hidden_size, K_CHUNK):
-                normed_chunk = normed[:, k0:k0 + K_CHUNK].bfloat16()
-                wk_chunk = wk[k0:k0 + K_CHUNK, kv0:kv0 + KV_OUT_CHUNK]
-                wv_chunk = wv[k0:k0 + K_CHUNK, kv0:kv0 + KV_OUT_CHUNK]
-                k_acc = k_acc + torch.matmul(normed_chunk, wk_chunk).float()
-                v_acc = v_acc + torch.matmul(normed_chunk, wv_chunk).float()
-            k_proj[b0:b_end, kv0:kv0 + KV_OUT_CHUNK] = k_acc.bfloat16()
-            v_proj[b0:b_end, kv0:kv0 + KV_OUT_CHUNK] = v_acc.bfloat16()
+        # Q/K/V projection: BF16 matmul, FP32 output.
+        q_proj[b0:b_end, :] = (normed.float() @ wq.float()).float()
+        k_proj[b0:b_end, :] = (normed.float() @ wk.float()).float()
+        v_proj[b0:b_end, :] = (normed.float() @ wv.float()).float()
 
     tensors["q_proj"][:] = q_proj
     tensors["k_proj"][:] = k_proj
@@ -302,8 +256,8 @@ def compile_and_run(
         config=RunConfig(
             platform=platform,
             device_id=device_id,
-            rtol=2e-2,
-            atol=2e-2,
+            rtol=5e-3,
+            atol=5e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
