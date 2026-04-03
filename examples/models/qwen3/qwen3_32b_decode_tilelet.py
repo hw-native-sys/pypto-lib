@@ -144,64 +144,91 @@ def build_qwen3_single_layer_decode_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16]:
-            q_proj = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.BF16)
-            k_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.BF16)
-            v_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.BF16)
+            q_proj = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.FP32)
+            k_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.FP32)
+            v_proj = pl.create_tensor([BATCH_CFG, KV_HIDDEN_CFG], dtype=pl.FP32)
             attn_out = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.BF16)
 
-            # Scope 1: input RMSNorm + Q/K/V projection.
-            with pl.auto_incore():
-                # Compute per-row squared sum in BATCH_TILE chunks so that
-                # each vector tile is [BATCH_TILE, K_CHUNK] FP32 = 2 KB.
-                for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
-                    partial_sq = pl.create_tensor([BATCH_TILE, 1], dtype=pl.FP32)
-                    partial_sq = pl.mul(partial_sq, 0.0)
+            # Initialize intermediate tensors to zero so assemble generates inout.
+            for ob in pl.range(Q_OUT_BLOCKS):
+                q0 = ob * Q_OUT_CHUNK
+                with pl.incore():
+                    zero_q = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    q_proj = pl.assemble(q_proj, zero_q, [0, q0])
+            for ob in pl.range(KV_OUT_BLOCKS):
+                kv0 = ob * KV_OUT_CHUNK
+                with pl.incore():
+                    zero_k = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    zero_v = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    k_proj = pl.assemble(k_proj, zero_k, [0, kv0])
+                    v_proj = pl.assemble(v_proj, zero_v, [0, kv0])
+
+            # ── Scope 1: input RMSNorm + Q/K/V projection ──
+            for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+                normed_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
+
+                with pl.incore():
+                    partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        partial_sq = pl.add(partial_sq, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                    inv_rms_tile = pl.rsqrt(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS))
+                        partial_sq = pl.add(
+                            partial_sq,
+                            pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]),
+                        )
+                    variance = pl.reshape(
+                        pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS),
+                        [BATCH_TILE, 1],
+                    )
 
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
-                        q0 = ob * Q_OUT_CHUNK
-                        q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                        q_acc = pl.mul(q_acc, 0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            x_chunk = pl.cast(
-                                pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
-                                target_type=pl.FP32,
-                            )
-                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                            q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
-                        q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+                    for kb in pl.range(HIDDEN_BLOCKS):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.cast(
+                            pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                            target_type=pl.FP32,
+                        )
+                        gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                        normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, variance), gamma)
+                        normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
-                    for ob in pl.parallel(0, KV_OUT_BLOCKS, 1, chunk=8):
-                        kv0 = ob * KV_OUT_CHUNK
-                        k_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        k_acc = pl.mul(k_acc, 0.0)
-                        v_acc = pl.mul(v_acc, 0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
+                for ob in pl.range(Q_OUT_BLOCKS):
+                    q0 = ob * Q_OUT_CHUNK
+                    with pl.incore():
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_b = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                        q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
-                            x_chunk = pl.cast(
-                                pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
-                                target_type=pl.FP32,
-                            )
-                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-                            wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
-                            v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
-                        k_proj = pl.assemble(k_proj, pl.cast(k_acc, target_type=pl.BF16), [b0, kv0])
-                        v_proj = pl.assemble(v_proj, pl.cast(v_acc, target_type=pl.BF16), [b0, kv0])
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                            q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+
+                for ob in pl.range(KV_OUT_BLOCKS):
+                    kv0 = ob * KV_OUT_CHUNK
+                    with pl.incore():
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                    with pl.incore():
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                        tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
+                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
+                            tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             # Scope 2: RoPE + cache update + decode attention.
             # K RoPE loops per head so each half-vector is [1, HEAD_DIM//2] FP32.
@@ -223,14 +250,8 @@ def build_qwen3_single_layer_decode_program(
                     # Stage 1: per-head K gather + RoPE + cache update.
                     for ki in pl.range(NUM_KV_HEADS_CFG):
                         kv_col = ki * HEAD_DIM_CFG
-                        k_lo = pl.cast(
-                            pl.slice(k_proj, [1, HEAD_DIM_CFG // 2], [b, kv_col]),
-                            target_type=pl.FP32,
-                        )
-                        k_hi = pl.cast(
-                            pl.slice(k_proj, [1, HEAD_DIM_CFG // 2], [b, kv_col + HEAD_DIM_CFG // 2]),
-                            target_type=pl.FP32,
-                        )
+                        k_lo = pl.slice(k_proj, [1, HEAD_DIM_CFG // 2], [b, kv_col])
+                        k_hi = pl.slice(k_proj, [1, HEAD_DIM_CFG // 2], [b, kv_col + HEAD_DIM_CFG // 2])
                         rot_lo = pl.sub(
                             pl.col_expand_mul(k_lo, cos_lo),
                             pl.col_expand_mul(k_hi, sin_lo),
@@ -252,7 +273,7 @@ def build_qwen3_single_layer_decode_program(
                         )
                         v_cache = pl.assemble(
                             v_cache,
-                            pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, ki * HEAD_DIM_CFG]),
+                            pl.cast(pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, ki * HEAD_DIM_CFG]), target_type=pl.BF16),
                             [cache_row, 0],
                         )
 
@@ -271,14 +292,8 @@ def build_qwen3_single_layer_decode_program(
                         # Stage 2: per-head Q gather + RoPE + pad + init accumulators.
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * HEAD_DIM_CFG
-                            q_lo = pl.cast(
-                                pl.slice(q_proj, [1, HEAD_DIM_CFG // 2], [b, q_col]),
-                                target_type=pl.FP32,
-                            )
-                            q_hi = pl.cast(
-                                pl.slice(q_proj, [1, HEAD_DIM_CFG // 2], [b, q_col + HEAD_DIM_CFG // 2]),
-                                target_type=pl.FP32,
-                            )
+                            q_lo = pl.slice(q_proj, [1, HEAD_DIM_CFG // 2], [b, q_col])
+                            q_hi = pl.slice(q_proj, [1, HEAD_DIM_CFG // 2], [b, q_col + HEAD_DIM_CFG // 2])
                             rot_lo_bf16 = pl.cast(
                                 pl.sub(
                                     pl.col_expand_mul(q_lo, cos_lo),
@@ -493,48 +508,24 @@ def golden_qwen3_decode(tensors, params):
 
     out = tensors["out"]
 
-    q_proj = torch.zeros(batch, hidden_size, dtype=torch.bfloat16)
-    k_proj = torch.zeros(batch, kv_hidden, dtype=torch.bfloat16)
-    v_proj = torch.zeros(batch, kv_hidden, dtype=torch.bfloat16)
+    q_proj = torch.zeros(batch, hidden_size, dtype=torch.float32)
+    k_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
+    v_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
 
     for b0 in range(0, batch, BATCH_TILE):
-        valid_batch = min(BATCH_TILE, batch - b0)
-        b_slice = b0 + valid_batch
+        b_end = min(b0 + BATCH_TILE, batch)
+        x_tile = hidden_states[b0:b_end, :].float()
 
-        x_tile = hidden_states[b0:b_slice, :].float()
-
-        sq_sum = torch.zeros(valid_batch, 1, dtype=torch.float32)
+        sq_sum = torch.zeros(b_end - b0, 1, dtype=torch.float32)
         for k0 in range(0, hidden_size, K_CHUNK):
-            k_chunk_size = min(K_CHUNK, hidden_size - k0)
-            x_chunk = x_tile[:, k0:k0+k_chunk_size]
+            x_chunk = x_tile[:, k0:k0 + K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
+        variance = sq_sum / hidden_size + EPS
+        normed = (x_tile * variance * input_rms_weight.float()).bfloat16()
 
-        inv_rms = torch.rsqrt(sq_sum / hidden_size + eps)
-        normed = x_tile * inv_rms * input_rms_weight.float()
-
-        for q0 in range(0, hidden_size, Q_OUT_CHUNK):
-            q_chunk_size = min(Q_OUT_CHUNK, hidden_size - q0)
-            q_acc = torch.zeros(valid_batch, q_chunk_size, dtype=torch.float32)
-            for k0 in range(0, hidden_size, K_CHUNK):
-                k_chunk_size = min(K_CHUNK, hidden_size - k0)
-                normed_chunk = normed[:, k0:k0+k_chunk_size].bfloat16()
-                wq_chunk = wq[k0:k0+k_chunk_size, q0:q0+q_chunk_size]
-                q_acc = q_acc + torch.matmul(normed_chunk, wq_chunk).float()
-            q_proj[b0:b_slice, q0:q0+q_chunk_size] = q_acc.bfloat16()
-
-        for kv0 in range(0, kv_hidden, KV_OUT_CHUNK):
-            kv_chunk_size = min(KV_OUT_CHUNK, kv_hidden - kv0)
-            k_acc = torch.zeros(valid_batch, kv_chunk_size, dtype=torch.float32)
-            v_acc = torch.zeros(valid_batch, kv_chunk_size, dtype=torch.float32)
-            for k0 in range(0, hidden_size, K_CHUNK):
-                k_chunk_size = min(K_CHUNK, hidden_size - k0)
-                normed_chunk = normed[:, k0:k0+k_chunk_size].bfloat16()
-                wk_chunk = wk[k0:k0+k_chunk_size, kv0:kv0+kv_chunk_size]
-                wv_chunk = wv[k0:k0+k_chunk_size, kv0:kv0+kv_chunk_size]
-                k_acc = k_acc + torch.matmul(normed_chunk, wk_chunk).float()
-                v_acc = v_acc + torch.matmul(normed_chunk, wv_chunk).float()
-            k_proj[b0:b_slice, kv0:kv0+kv_chunk_size] = k_acc.bfloat16()
-            v_proj[b0:b_slice, kv0:kv0+kv_chunk_size] = v_acc.bfloat16()
+        q_proj[b0:b_end, :] = (normed.float() @ wq.float()).float()
+        k_proj[b0:b_end, :] = (normed.float() @ wk.float()).float()
+        v_proj[b0:b_end, :] = (normed.float() @ wv.float()).float()
 
     attn_out = torch.zeros(batch, hidden_size, dtype=torch.bfloat16)
 
@@ -563,7 +554,7 @@ def golden_qwen3_decode(tensors, params):
         for ki in range(num_kv_heads):
             cache_row = b * num_kv_heads * max_seq_len + ki * max_seq_len + pos
             k_cache[cache_row, :] = k_rot[ki, :].bfloat16()
-            v_cache[cache_row, :] = v_proj[b, ki * head_dim:(ki+1) * head_dim]
+            v_cache[cache_row, :] = v_proj[b, ki * head_dim:(ki+1) * head_dim].to(torch.bfloat16)
 
         attn_row = torch.zeros(1, hidden_size, dtype=torch.bfloat16)
 
@@ -706,30 +697,87 @@ def build_tensor_specs(
     head_dim: int = HEAD_DIM,
     intermediate_size: int = INTERMEDIATE,
 ):
-    import torch  # type: ignore[import]
+    import torch
     from pypto.runtime import TensorSpec
 
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq_len
 
-    seq_lens_data = torch.randint(1, max_seq_len + 1, (batch,), dtype=torch.int32)
+    def init_hidden_states():
+        return torch.rand(batch, hidden_size) - 0.5
+
+    def init_seq_lens():
+        return torch.randint(1, max_seq_len + 1, (batch,), dtype=torch.int32)
+
+    def init_rope_cos():
+        return torch.rand(max_seq_len, head_dim) - 0.5
+
+    def init_rope_sin():
+        return torch.rand(max_seq_len, head_dim) - 0.5
+
+    def init_k_cache():
+        return torch.rand(cache_rows, head_dim) - 0.5
+
+    def init_v_cache():
+        return torch.rand(cache_rows, head_dim) - 0.5
+
+    def init_rms_weight():
+        return torch.rand(1, hidden_size) - 0.5
+
+    def init_wq():
+        return torch.rand(hidden_size, hidden_size) - 0.5
+
+    def init_wk():
+        return torch.rand(hidden_size, kv_hidden) - 0.5
+
+    def init_wv():
+        return torch.rand(hidden_size, kv_hidden) - 0.5
+
+    def init_wo():
+        return torch.rand(hidden_size, hidden_size) - 0.5
+
+    def init_post_rms_weight():
+        return torch.rand(1, hidden_size) - 0.5
+
+    def init_w_gate():
+        return torch.rand(hidden_size, intermediate_size) - 0.5
+
+    def init_w_up():
+        return torch.rand(hidden_size, intermediate_size) - 0.5
+
+    def init_w_down():
+        return torch.rand(intermediate_size, hidden_size) - 0.5
 
     return [
-        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("seq_lens", [batch], torch.int32, init_value=seq_lens_data),
-        TensorSpec("rope_cos", [max_seq_len, head_dim], torch.float32, init_value=torch.randn),
-        TensorSpec("rope_sin", [max_seq_len, head_dim], torch.float32, init_value=torch.randn),
-        TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32, init_value=torch.randn),
-        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("post_rms_weight", [1, hidden_size], torch.float32, init_value=torch.randn),
-        TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16, init_value=torch.randn),
-        TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16, init_value=torch.randn),
+        TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
+                   init_value=init_hidden_states),
+        TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
+        TensorSpec("rope_cos", [max_seq_len, head_dim], torch.float32,
+                   init_value=init_rope_cos),
+        TensorSpec("rope_sin", [max_seq_len, head_dim], torch.float32,
+                   init_value=init_rope_sin),
+        TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16,
+                   init_value=init_k_cache),
+        TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
+                   init_value=init_v_cache),
+        TensorSpec("input_rms_weight", [1, hidden_size], torch.float32,
+                   init_value=init_rms_weight),
+        TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16,
+                   init_value=init_wq),
+        TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16,
+                   init_value=init_wk),
+        TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
+                   init_value=init_wv),
+        TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16,
+                   init_value=init_wo),
+        TensorSpec("post_rms_weight", [1, hidden_size], torch.float32,
+                   init_value=init_post_rms_weight),
+        TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16,
+                   init_value=init_w_gate),
+        TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16,
+                   init_value=init_w_up),
+        TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16,
+                   init_value=init_w_down),
         TensorSpec("out", [batch, hidden_size], torch.bfloat16, is_output=True),
     ]
 
