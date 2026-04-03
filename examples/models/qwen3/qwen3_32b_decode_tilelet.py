@@ -52,10 +52,10 @@ import pypto.language as pl
 
 BATCH = 16
 MAX_SEQ = 4096
-HIDDEN = 5120
 NUM_HEADS = 64
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
+HIDDEN = NUM_HEADS * HEAD_DIM  # 8192
 KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM
 INTERMEDIATE = 25600
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
@@ -154,7 +154,9 @@ def build_qwen3_single_layer_decode_program(
                 q0 = ob * Q_OUT_CHUNK
                 with pl.incore():
                     zero_q = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                    zero_attn = pl.cast(zero_q, target_type=pl.BF16)
                     q_proj = pl.assemble(q_proj, zero_q, [0, q0])
+                    attn_out = pl.assemble(attn_out, zero_attn, [0, q0])
             for ob in pl.range(KV_OUT_BLOCKS):
                 kv0 = ob * KV_OUT_CHUNK
                 with pl.incore():
@@ -676,7 +678,7 @@ def golden_qwen3_decode(tensors, params):
 
             sigmoid = torch.sigmoid(gate_acc)
             mlp_chunk = gate_acc * sigmoid * up_acc
-            mlp_chunk_bf16 = mlp_chunk.bfloat16().float()
+            mlp_chunk_bf16 = mlp_chunk.bfloat16()
 
             for d0 in range(0, hidden_size, K_CHUNK):
                 d_chunk_size = min(K_CHUNK, hidden_size - d0)
@@ -704,49 +706,49 @@ def build_tensor_specs(
     cache_rows = batch * num_kv_heads * max_seq_len
 
     def init_hidden_states():
-        return torch.rand(batch, hidden_size) - 0.5
+        return torch.randn(batch, hidden_size)
 
     def init_seq_lens():
         return torch.randint(1, max_seq_len + 1, (batch,), dtype=torch.int32)
 
     def init_rope_cos():
-        return torch.rand(max_seq_len, head_dim) - 0.5
+        return torch.randn(max_seq_len, head_dim)
 
     def init_rope_sin():
-        return torch.rand(max_seq_len, head_dim) - 0.5
+        return torch.randn(max_seq_len, head_dim)
 
     def init_k_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
+        return torch.randn(cache_rows, head_dim) * 0.01
 
     def init_v_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
+        return torch.randn(cache_rows, head_dim) * 0.01
 
     def init_rms_weight():
-        return torch.rand(1, hidden_size) - 0.5
+        return torch.ones(1, hidden_size)
 
     def init_wq():
-        return torch.rand(hidden_size, hidden_size) - 0.5
+        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
 
     def init_wk():
-        return torch.rand(hidden_size, kv_hidden) - 0.5
+        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.rand(hidden_size, kv_hidden) - 0.5
+        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wo():
-        return torch.rand(hidden_size, hidden_size) - 0.5
+        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
 
     def init_post_rms_weight():
-        return torch.rand(1, hidden_size) - 0.5
+        return torch.ones(1, hidden_size)
 
     def init_w_gate():
-        return torch.rand(hidden_size, intermediate_size) - 0.5
+        return torch.randn(hidden_size, intermediate_size) / hidden_size ** 0.5
 
     def init_w_up():
-        return torch.rand(hidden_size, intermediate_size) - 0.5
+        return torch.randn(hidden_size, intermediate_size) / hidden_size ** 0.5
 
     def init_w_down():
-        return torch.rand(intermediate_size, hidden_size) - 0.5
+        return torch.randn(intermediate_size, hidden_size) / intermediate_size ** 0.5
 
     return [
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
