@@ -24,10 +24,10 @@ Valid_shape handling aligned to pypto's kernel_softmax_prepare_unaligned approac
 For each batch element:
   1. Apply RoPE to K projections (auto_incore, chunk=8) and store to cache.
   2. Copy V projections directly to cache.
+  2a. Gather all Q-head groups and apply RoPE (auto_incore, hoisted).
   3. For each Q-head group:
-     a. Gather Q heads and apply RoPE (auto_incore).
-     b. Online flash-attention over the KV cache (up to ctx_len tokens).
-     c. Write normalised attention output.
+     a. Online flash-attention over the KV cache (up to ctx_len tokens).
+     b. Write normalised attention output.
 
 Hardware TILELET / TILE sizing (at default HEAD_DIM=128):
   * K RoPE half-vectors [NUM_KV_HEADS, HEAD_DIM//2] FP32 = [8,64]*4 = 2 KB = MAX
@@ -51,7 +51,7 @@ HEAD_DIM = 128
 Q_HEAD_BATCH = 8        # Q heads batched per attention group
 Q_HEAD_PAD = 16         # padded Q rows for cube fractal alignment
 SEQ_TILE = 64           # sequence tile for attention loop
-
+SB_BATCH = 64
 
 def build_decode_attention_program(
     batch: int = BATCH,
@@ -69,7 +69,6 @@ def build_decode_attention_program(
     total_q_groups = num_kv_heads * q_groups
     attn_scale = 1.0 / (head_dim ** 0.5)
     max_ctx_blocks = (max_seq + SEQ_TILE - 1) // SEQ_TILE
-    SB_BATCH = 32
 
     @pl.program
     class DecodeAttentionProgram:
@@ -97,9 +96,18 @@ def build_decode_attention_program(
                 sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
+                # Stage 1+2a: K RoPE + cache update + V cache + Q RoPE + pad.
+                all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
+                with pl.incore():
+                    for gi in pl.range(total_q_groups):
+                        all_q_padded = pl.assemble(
+                            all_q_padded,
+                            pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                            [gi * Q_HEAD_PAD, 0],
+                        )
                 with pl.auto_incore():
-                    # Stage 1: per-head K gather + RoPE + cache update.
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
+                        # K RoPE + cache update.
                         kv_col = ki * head_dim
                         k_lo = pl.slice(k_proj, [1, half_dim], [b, kv_col])
                         k_hi = pl.slice(k_proj, [1, half_dim], [b, kv_col + half_dim])
@@ -122,6 +130,7 @@ def build_decode_attention_program(
                             pl.cast(rot_hi, target_type=pl.BF16),
                             [cache_row, half_dim],
                         )
+                        # V cache update.
                         v_cache = pl.assemble(
                             v_cache,
                             pl.cast(
@@ -130,21 +139,9 @@ def build_decode_attention_program(
                             ),
                             [cache_row, 0],
                         )
-
-                attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
-
-                # Manually split decode attention into smaller incore stages so
-                # each outlined kernel has a single cross-core payload size.
-                for gi in pl.range(total_q_groups):
-                    kvh = gi // q_groups
-                    qg = gi - kvh * q_groups
-                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-
-                    # Pad Q for cube fractal alignment.
-                    q_padded = pl.create_tensor([Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-                    with pl.auto_incore():
-                        # Stage 2a: per-head Q gather + RoPE + pad.
-                        for qi in pl.parallel(0, Q_HEAD_BATCH, chunk=Q_HEAD_BATCH):
+                        # Q RoPE + pad (ki == kvh since q_groups == 1).
+                        q_base = ki * q_per_kv
+                        for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * head_dim
                             q_lo = pl.slice(q_proj, [1, half_dim], [b, q_col])
                             q_hi = pl.slice(q_proj, [1, half_dim], [b, q_col + half_dim])
@@ -162,8 +159,20 @@ def build_decode_attention_program(
                                 ),
                                 target_type=pl.BF16,
                             )
-                            q_padded = pl.assemble(q_padded, rot_lo_bf16, [qi, 0])
-                            q_padded = pl.assemble(q_padded, rot_hi_bf16, [qi, half_dim])
+                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [ki * Q_HEAD_PAD + qi, 0])
+                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [ki * Q_HEAD_PAD + qi, half_dim])
+
+                attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
+
+                # Manually split decode attention into smaller incore stages so
+                # each outlined kernel has a single cross-core payload size.
+                for gi in pl.range(total_q_groups):
+                    kvh = gi // q_groups
+                    qg = gi - kvh * q_groups
+                    q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
+
+                    # Slice pre-computed Q padded for this group.
+                    q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, head_dim], [gi * Q_HEAD_PAD, 0])
 
                     # Pre-allocate GM buffers for cross-stage data and zero-init
                     # only the active ctx blocks.
@@ -317,6 +326,7 @@ def build_tensor_specs(
     num_heads: int = NUM_HEADS,
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
+    use_max_seq: bool = False,
 ):
     import torch
     from pypto.runtime import TensorSpec
@@ -324,8 +334,9 @@ def build_tensor_specs(
     hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq
-
     def init_seq_lens():
+        if use_max_seq:
+            return torch.full((batch,), max_seq, dtype=torch.int32)
         return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
 
     def init_q_proj():
@@ -507,6 +518,7 @@ def compile_and_run(
     num_heads: int = NUM_HEADS,
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
+    use_max_seq: bool = False,
     platform: str = "a5",
     device_id: int = 0,
     dump_passes: bool = True,
@@ -531,6 +543,7 @@ def compile_and_run(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        use_max_seq=use_max_seq,
     )
 
     result = run(
@@ -559,11 +572,14 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-profiling", action="store_true", default=False)
+    parser.add_argument("--max-seq", action="store_true", default=False,
+                        help="set all seq_lens to MAX_SEQ (default: random)")
     args = parser.parse_args()
 
     result = compile_and_run(
         platform=args.platform,
         device_id=args.device,
+        use_max_seq=args.max_seq,
         enable_profiling=args.enable_profiling,
     )
     if not result.passed:
