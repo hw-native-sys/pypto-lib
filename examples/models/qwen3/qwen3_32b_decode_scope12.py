@@ -8,8 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """Qwen3-32B decode Scope 1+2 — RMSNorm + projection + RoPE + attention.
 
-Combined test chaining scope1 (RMSNorm + Q/K/V projection) and scope2
-(RoPE + KV cache update + grouped-query attention).
+Scope 1:
+  1. RMSNorm of input hidden states
+  2. Q/K/V projection via matmul
+
+Scope 2:
+  1. K RoPE + cache write, V cache write, Q RoPE + pad
+  2. QK matmul
+  3. Softmax
+  4. SV matmul
+  5. Online-softmax accumulation + final normalisation
 
 Intermediate q_proj/k_proj/v_proj are FP32 GM tensors between the two scopes.
 """
@@ -41,7 +49,7 @@ SEQ_TILE = 64
 SB_BATCH = 64
 
 
-def build_decode_scope12_program(
+def build_qwen3_scope12_program(
     batch: int = BATCH,
     max_seq: int = MAX_SEQ,
     hidden_size: int = HIDDEN,
@@ -63,9 +71,9 @@ def build_decode_scope12_program(
     max_ctx_blocks = (max_seq + SEQ_TILE - 1) // SEQ_TILE
 
     @pl.program
-    class DecodeScope12Program:
+    class Qwen3Scope12:
         @pl.function(type=pl.FunctionType.Opaque)
-        def decode_scope12(
+        def qwen3_scope12(
             self,
             hidden_states: pl.Tensor[[batch, hidden], pl.BF16],
             input_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
@@ -180,7 +188,7 @@ def build_decode_scope12_program(
                 sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
-                # Stage 1+2a: K RoPE + cache update + V cache + Q RoPE + pad.
+                # Workaround
                 all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
                 with pl.incore():
                     for gi in pl.range(total_q_groups):
@@ -189,6 +197,8 @@ def build_decode_scope12_program(
                             pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                             [gi * Q_HEAD_PAD, 0],
                         )
+
+                # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
                 with pl.auto_incore():
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
                         # K RoPE + cache update.
@@ -230,19 +240,13 @@ def build_decode_scope12_program(
                             all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [ki * Q_HEAD_PAD + qi, half_dim])
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
-
-                # Manually split decode attention into smaller incore stages so
-                # each outlined kernel has a single cross-core payload size.
                 for gi in pl.range(total_q_groups):
                     kvh = gi // q_groups
                     qg = gi - kvh * q_groups
                     q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
-
-                    # Slice pre-computed Q padded for this group.
                     q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, head_dim], [gi * Q_HEAD_PAD, 0])
 
-                    # Pre-allocate GM buffers for cross-stage data and zero-init
-                    # only the active ctx blocks.
+                    # Workaround
                     all_raw_scores = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
                     all_exp_padded = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
                     all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
@@ -281,7 +285,7 @@ def build_decode_scope12_program(
                                         [sb * Q_HEAD_BATCH, 0],
                                     )
 
-                    # Stage 3: QK matmul for all active sb blocks.
+                    # Stage 2: QK matmul for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
                         with pl.incore():
                             for si in pl.range(SB_BATCH):
@@ -297,7 +301,7 @@ def build_decode_scope12_program(
                                     raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
                                     all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
-                    # Stage 4: softmax for all active sb blocks.
+                    # Stage 3: softmax for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
                         with pl.incore():
                             for si in pl.range(SB_BATCH):
@@ -322,7 +326,7 @@ def build_decode_scope12_program(
                                     all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_BATCH, 0])
                                     all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0])
 
-                    # Stage 5: SV matmul for all active sb blocks.
+                    # Stage 4: SV matmul for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
                         with pl.incore():
                             for si in pl.range(SB_BATCH):
@@ -343,7 +347,7 @@ def build_decode_scope12_program(
                                     oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
                                     all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
-                    # Stage 6a: init accumulators for online softmax.
+                    # Workaround
                     with pl.incore():
                         oi = pl.full([Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0)
                         li_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
@@ -351,7 +355,7 @@ def build_decode_scope12_program(
                         mi_flat = pl.full([1, Q_HEAD_BATCH], dtype=pl.FP32, value=0.0)
                         mi = pl.reshape(mi_flat, [Q_HEAD_BATCH, 1])
 
-                    # Stage 6b: online softmax accumulation for active sb blocks.
+                    # Stage 5: online softmax accumulation for active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
                         with pl.incore():
                             for si in pl.range(SB_BATCH):
@@ -369,9 +373,11 @@ def build_decode_scope12_program(
                                         alpha = pl.exp(pl.sub(mi, mi_new))
                                         beta = pl.exp(pl.sub(cur_mi, mi_new))
                                         li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                                        oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
+                                        oi = pl.add(pl.row_expand_mul(oi, alpha),
+                                                    pl.row_expand_mul(oi_tmp_valid, beta))
                                         mi = mi_new
 
+                    # Stage 6: normalise and write back one Q-head batch.
                     with pl.incore():
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
@@ -383,7 +389,7 @@ def build_decode_scope12_program(
 
             return attn_out
 
-    return DecodeScope12Program
+    return Qwen3Scope12
 
 
 def build_tensor_specs(
@@ -409,13 +415,13 @@ def build_tensor_specs(
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
-        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
+        return torch.rand(hidden_size, hidden_size) / hidden_size ** 0.5
 
     def init_wk():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_seq_lens():
         if use_max_seq:
@@ -458,7 +464,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_decode_scope12(tensors, params):
+def golden_qwen3_scope12(tensors, params):
     """PyTorch reference: scope1 (RMSNorm + projection) then scope2 (attention)."""
     import math
 
@@ -602,7 +608,7 @@ def compile_and_run(
 
     backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
-    program = build_decode_scope12_program(
+    program = build_qwen3_scope12_program(
         batch=batch,
         max_seq=max_seq,
         hidden_size=hidden_size,
@@ -623,7 +629,7 @@ def compile_and_run(
     result = run(
         program=program,
         tensor_specs=tensor_specs,
-        golden=golden_decode_scope12,
+        golden=golden_qwen3_scope12,
         config=RunConfig(
             platform=platform,
             device_id=device_id,

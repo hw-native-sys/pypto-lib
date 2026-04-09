@@ -7,19 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """Qwen3-32B decode Scope 1 — input RMSNorm + Q/K/V projection.
+  1. RMSNorm of input hidden states
+  2. Q/K/V projection via matmul
 
-Standalone test for the RMSNorm + projection scope of the Qwen3-32B decode layer,
-with parameters aligned to qwen3_32b_decode_tilelet.py.
-
-For each batch element:
-  1. Compute RMSNorm of input hidden states.
-  2. Project to Q (hidden_size), K (kv_hidden), V (kv_hidden).
-
-Hardware TILELET / TILE sizing (at default HIDDEN=5120, KV_HIDDEN=1024):
-  * Partial sum [BATCH_TILE, 1]         FP32 = [4,1]*4 = 16 B
-  * Norm factor [BATCH_TILE, 1]         FP32 = [4,1]*4 = 16 B
-  * Q/K/V accumulator [BATCH_TILE, OUT] FP32 = [4,64]*4 = 1 KB (max 2 KB)
-  * Weight tiles [K_CHUNK, OUT]         BF16 = [128,64]*2 = 16 KB = MAX
+Input hidden states are BF16; weights are BF16; projections output FP32.
 """
 from __future__ import annotations
 
@@ -45,7 +36,7 @@ MLP_OUT_CHUNK = 64
 BATCH_TILE = 16
 
 
-def build_decode_projection_program(
+def build_qwen3_scope1_program(
     batch: int = BATCH,
     hidden_size: int = HIDDEN,
     num_kv_heads: int = NUM_KV_HEADS,
@@ -58,9 +49,9 @@ def build_decode_projection_program(
     kv_out_blocks = kv_hidden // KV_OUT_CHUNK
 
     @pl.program
-    class DecodeProjectionProgram:
+    class Qwen3Scope1:
         @pl.function(type=pl.FunctionType.Opaque)
-        def decode_projection(
+        def qwen3_scope1(
             self,
             hidden_states: pl.Tensor[[batch, hidden], pl.BF16],
             input_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
@@ -159,7 +150,7 @@ def build_decode_projection_program(
 
             return q_proj, k_proj, v_proj
 
-    return DecodeProjectionProgram
+    return Qwen3Scope1
 
 
 def build_tensor_specs(
@@ -180,13 +171,13 @@ def build_tensor_specs(
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
-        return torch.randn(hidden_size, hidden_size) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_wk():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.randn(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     return [
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
@@ -205,12 +196,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_decode_projection(tensors, params):
-    """PyTorch reference matching kernel precision path.
-
-    RMSNorm in FP32, then cast normed to BF16.
-    Projections: BF16 matmul with FP32 accumulation, final BF16 cast.
-    """
+def golden_qwen3_scope1(tensors, params):
     import torch
 
     hidden_states = tensors["hidden_states"]
@@ -266,7 +252,7 @@ def compile_and_run(
 
     backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
-    program = build_decode_projection_program(
+    program = build_qwen3_scope1_program(
         batch=batch,
         hidden_size=hidden_size,
         num_kv_heads=num_kv_heads,
@@ -282,7 +268,7 @@ def compile_and_run(
     result = run(
         program=program,
         tensor_specs=tensor_specs,
-        golden=golden_decode_projection,
+        golden=golden_qwen3_scope1,
         config=RunConfig(
             platform=platform,
             device_id=device_id,
