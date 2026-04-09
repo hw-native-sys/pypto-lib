@@ -270,10 +270,13 @@ def compile_and_run(
     device_id: int = 0,
     work_dir: str | None = None,
     dump_passes: bool = True,
+    enable_profiling: bool = False,
 ):
     from pypto.backend import BackendType
     from pypto.ir.pass_manager import OptimizationStrategy
     from pypto.runtime import RunConfig, run
+
+    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
 
     program = build_qwen3_scope3_program(
         batch=batch,
@@ -298,7 +301,8 @@ def compile_and_run(
             atol=3e-3,
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
-            backend_type=BackendType.Ascend950,
+            backend_type=backend,
+            enable_profiling=enable_profiling,
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
@@ -309,4 +313,21 @@ def compile_and_run(
 
 
 if __name__ == "__main__":
-    compile_and_run()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a5",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = compile_and_run(
+        platform=args.platform,
+        device_id=args.device,
+        enable_profiling=args.enable_profiling,
+    )
+    if not result.passed:
+        if result.error:
+            print(f"Result: {result.error}")
+        raise SystemExit(1)
