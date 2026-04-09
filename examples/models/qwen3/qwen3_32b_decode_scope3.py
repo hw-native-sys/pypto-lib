@@ -103,7 +103,7 @@ def build_qwen3_scope3_program(
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]))
-                    inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
+                    inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)))
 
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
