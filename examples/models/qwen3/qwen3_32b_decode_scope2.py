@@ -66,7 +66,7 @@ def build_qwen3_scope2_program(
         ) -> pl.Tensor[[batch, hidden], pl.BF16]:
             # Padding q
             all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-            with pl.incore():
+            with pl.at(level=pl.Level.CORE_GROUP):
                 for idx in pl.range(batch * total_q_groups):
                     all_q_padded = pl.assemble(
                         all_q_padded,
@@ -86,7 +86,7 @@ def build_qwen3_scope2_program(
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
-                with pl.auto_incore():
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
                         # K RoPE + cache update.
                         kv_col = ki * head_dim
@@ -157,7 +157,7 @@ def build_qwen3_scope2_program(
                     all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -173,7 +173,7 @@ def build_qwen3_scope2_program(
 
                     # Stage 3: softmax for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -198,7 +198,7 @@ def build_qwen3_scope2_program(
 
                     # Stage 4: SV matmul for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -218,7 +218,7 @@ def build_qwen3_scope2_program(
                                     all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                     # Stage 5: online softmax accumulation and normalisation.
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
                         mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
                         li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])

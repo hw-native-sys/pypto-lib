@@ -153,7 +153,7 @@ def build_qwen3_single_layer_decode_program(
             normed_buf = pl.create_tensor([BATCH_CFG, HIDDEN_CFG], dtype=pl.BF16)
 
             # Initialize intermediate tensors to zero so assemble generates inout.
-            with pl.incore():
+            with pl.at(level=pl.Level.CORE_GROUP):
                 for ob in pl.range(Q_OUT_BLOCKS):
                     q0 = ob * Q_OUT_CHUNK
                     zero_1 = pl.full([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32, value=0.0)
@@ -161,7 +161,7 @@ def build_qwen3_single_layer_decode_program(
                     q_proj = pl.assemble(q_proj, zero_1, [0, q0])
                     attn_out = pl.assemble(attn_out, zero_1_bf, [0, q0])
                     normed_buf = pl.assemble(normed_buf, zero_1_bf, [0, q0])
-            with pl.incore():
+            with pl.at(level=pl.Level.CORE_GROUP):
                 for ob in pl.range(KV_OUT_BLOCKS):
                     kv0 = ob * KV_OUT_CHUNK
                     zero_2 = pl.full([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32, value=0.0)
@@ -170,7 +170,7 @@ def build_qwen3_single_layer_decode_program(
 
             # Scope 1 input RMSNorm + Q/K/V projection
             # Stage 1: RMSNorm — two-pass over all batch tiles, results in normed_buf.
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
                     # Phase 1: accumulate squared sum in [1, BATCH_TILE], compute inv_rms.
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
@@ -248,7 +248,7 @@ def build_qwen3_single_layer_decode_program(
                 sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
                 sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
-                with pl.incore():
+                with pl.at(level=pl.Level.CORE_GROUP):
                     # Stage 1: per-head K gather + RoPE + cache update.
                     for ki in pl.range(NUM_KV_HEADS_CFG):
                         kv_col = ki * HEAD_DIM_CFG
@@ -295,7 +295,7 @@ def build_qwen3_single_layer_decode_program(
 
                     # Pad Q for cube fractal alignment.
                     q_padded = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM_CFG], dtype=pl.BF16)
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         # Stage 2: per-head Q gather + RoPE + pad + init accumulators.
                         for qi in pl.range(Q_HEAD_BATCH):
                             q_col = (q_base + qi) * HEAD_DIM_CFG
@@ -332,7 +332,7 @@ def build_qwen3_single_layer_decode_program(
                         cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
 
                         raw_scores_pad = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.FP32)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             # QK matmul: padded Q × K^T.
                             k_tile = pl.slice(
                                 k_cache,
@@ -342,7 +342,7 @@ def build_qwen3_single_layer_decode_program(
                             raw_scores_pad = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
 
                         exp_padded = pl.create_tensor([Q_HEAD_PAD, SEQ_TILE], dtype=pl.BF16)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             # Softmax: slice valid rows from padded scores.
                             scores_valid = pl.slice(
                                 raw_scores_pad,
@@ -361,7 +361,7 @@ def build_qwen3_single_layer_decode_program(
                             exp_padded = pl.assemble(exp_padded, exp_scores_bf16, [0, 0])
 
                         oi_tmp_pad = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM_CFG], dtype=pl.FP32)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             # SV matmul: padded exp_scores × V.
                             v_tile = pl.slice(
                                 v_cache,
@@ -370,7 +370,7 @@ def build_qwen3_single_layer_decode_program(
                             )
                             oi_tmp_pad = pl.matmul(exp_padded, v_tile, out_dtype=pl.FP32)
 
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             # Slice valid rows from padded SV result.
                             oi_tmp = pl.slice(oi_tmp_pad, [Q_HEAD_BATCH, HEAD_DIM_CFG], [0, 0])
                             if sb == 0:
@@ -386,7 +386,7 @@ def build_qwen3_single_layer_decode_program(
                                             pl.row_expand_mul(oi_tmp, beta))
                                 mi = mi_new
 
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * HEAD_DIM_CFG])
                         ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)

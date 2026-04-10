@@ -38,7 +38,7 @@ def build_hello_world_program(
             x: pl.Tensor[[rows, cols], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for r in pl.parallel(0, rows, 1, chunk=row_chunk):
                     tile_x = pl.slice(x, [1, cols], [r, 0])
                     tile_y = pl.add(tile_x, 1.0)

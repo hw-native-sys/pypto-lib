@@ -131,11 +131,11 @@ def BuildExampleGraph(
 
 ---
 
-## 5. InCore 作用域与匿名 InCore（with pl.incore()）
+## 5. InCore 作用域与匿名 InCore（with pl.at()）
 
 ### 5.1 语法
 
-在 **Opaque** 函数内用 `with pl.incore():` 标记一段“匿名” InCore 区域；解析后生成 `ScopeStmt(scope_type=InCore)`。
+在 **Opaque** 函数内用 `with pl.at(level=pl.Level.CORE_GROUP):` 标记一段”匿名” InCore 区域；解析后生成 `ScopeStmt(scope_type=InCore)`。
 
 ```python
 @pl.program
@@ -143,7 +143,7 @@ class Before:
     @pl.function   # 默认 Opaque
     def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
         y = x + 1
-        with pl.incore():
+        with pl.at(level=pl.Level.CORE_GROUP):
             tile = pl.load(y, [0], [64])
             tile_sq = pl.mul(tile, tile)
             result = pl.store(tile_sq, [0], [64], x)
@@ -163,7 +163,7 @@ class Before:
 
 | 类型 | 写法 | 用途 |
 |------|------|------|
-| Opaque | 默认 / `pl.FunctionType.Opaque` | 未指定，可含 `pl.incore()` 待 outline |
+| Opaque | 默认 / `pl.FunctionType.Opaque` | 未指定，可含 `pl.at()` 待 outline |
 | Orchestration | `pl.FunctionType.Orchestration` | Host/AICPU 编排，调用 InCore |
 | InCore | `pl.FunctionType.InCore` | AICore 上的子图（load/compute/store） |
 

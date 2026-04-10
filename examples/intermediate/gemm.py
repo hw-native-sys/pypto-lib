@@ -53,7 +53,7 @@ def build_gemm_program(
             b: pl.Tensor[[k, n], pl.FP32],
             c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
         ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
                     for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
                         # First K-tile: initialize accumulator via matmul

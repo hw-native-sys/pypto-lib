@@ -156,7 +156,7 @@ def build_deepseek_v3_2_decode_front_program(
             qr = pl.create_tensor([BATCH_CFG, Q_LORA_RANK_CFG], dtype=pl.BF16)
             q_proj = pl.create_tensor([BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16)
             kv_a = pl.create_tensor([BATCH_CFG, KV_A_OUT], dtype=pl.BF16)
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0)
                 # Keep an explicit local Vec pad tensor alive in this scope so
@@ -233,7 +233,7 @@ def build_deepseek_v3_2_decode_front_program(
             # - C: sparse attention consumes merged topk immediately
             # This avoids materializing topk intermediates across kernel boundaries.
             attn_front = pl.create_tensor([BATCH_CFG, ATTN_OUT_CFG], dtype=pl.FP32)
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 layer_id = pl.tensor.read(layer_id_t, [0])
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     ctx_len = pl.tensor.read(seq_lens, [b])

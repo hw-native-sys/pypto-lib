@@ -110,7 +110,7 @@ def build_qwen3_single_layer_prefill_program(
                     # Uses full [TOK_TILE, ...] views from hidden_states even on the
                     # tail tile — padding rows map to allocated-but-unused MAX_SEQ
                     # slots, keeping every GM view >= 512 B aligned.
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         sq_sum = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
                         sq_sum = pl.mul(sq_sum, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
@@ -195,7 +195,7 @@ def build_qwen3_single_layer_prefill_program(
                         sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
                         k_group = pl.create_tensor([NUM_KV_HEADS_CFG, HEAD_DIM_CFG], dtype=pl.FP32)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for ki in pl.range(NUM_KV_HEADS_CFG):
                                 kv_col = ki * HEAD_DIM_CFG
                                 k_group = pl.assemble(
@@ -205,7 +205,7 @@ def build_qwen3_single_layer_prefill_program(
                                     [ki, 0],
                                 )
 
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             k_lo = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2], [0, 0])
                             k_hi = pl.slice(k_group, [NUM_KV_HEADS_CFG, HEAD_DIM_CFG // 2],
                                             [0, HEAD_DIM_CFG // 2])
@@ -230,7 +230,7 @@ def build_qwen3_single_layer_prefill_program(
                                 )
 
                         attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             attn_row = pl.mul(attn_row, 0.0)
 
                         for gi in pl.parallel(0, TOTAL_Q_GROUPS, 1):
@@ -239,7 +239,7 @@ def build_qwen3_single_layer_prefill_program(
                             q_base = kvh * Q_PER_KV_CFG + qg * Q_HEAD_BATCH
 
                             q_group = pl.create_tensor([Q_HEAD_BATCH, HEAD_DIM_CFG], dtype=pl.FP32)
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_col = (q_base + qi) * HEAD_DIM_CFG
                                     q_group = pl.assemble(
@@ -249,7 +249,7 @@ def build_qwen3_single_layer_prefill_program(
                                         [qi, 0],
                                     )
 
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 q_lo = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2], [0, 0])
                                 q_hi = pl.slice(q_group, [Q_HEAD_BATCH, HEAD_DIM_CFG // 2],
                                                 [0, HEAD_DIM_CFG // 2])
@@ -273,7 +273,7 @@ def build_qwen3_single_layer_prefill_program(
                                 valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                                 cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
 
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     k_tile = pl.slice(
                                         k_cache,
                                         [SEQ_TILE, HEAD_DIM_CFG],
@@ -282,7 +282,7 @@ def build_qwen3_single_layer_prefill_program(
                                     )
                                     raw_scores = pl.matmul(q_rot_bf16, k_tile, b_trans=True, out_dtype=pl.FP32)
 
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     scores = pl.mul(raw_scores, ATTN_SCALE)
                                     scores_valid = pl.slice(
                                         scores,
@@ -298,7 +298,7 @@ def build_qwen3_single_layer_prefill_program(
                                     exp_pad = pl.assemble(exp_pad, exp_scores, [0, 0])
                                     exp_pad_bf16 = pl.cast(exp_pad, target_type=pl.BF16)
 
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     v_tile = pl.slice(
                                         v_cache,
                                         [SEQ_TILE, HEAD_DIM_CFG],
@@ -307,7 +307,7 @@ def build_qwen3_single_layer_prefill_program(
                                     )
                                     oi_tmp = pl.matmul(exp_pad_bf16, v_tile, out_dtype=pl.FP32)
 
-                                with pl.incore():
+                                with pl.at(level=pl.Level.CORE_GROUP):
                                     if sb == 0:
                                         oi = oi_tmp
                                         li = cur_li
@@ -321,7 +321,7 @@ def build_qwen3_single_layer_prefill_program(
                                                     pl.row_expand_mul(oi_tmp, beta))
                                         mi = mi_new
 
-                            with pl.incore():
+                            with pl.at(level=pl.Level.CORE_GROUP):
                                 ctx = pl.row_expand_div(oi, li)
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_col = (q_base + qi) * HEAD_DIM_CFG
@@ -334,7 +334,7 @@ def build_qwen3_single_layer_prefill_program(
                         attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
 
                     # Scope 3: output projection + residual + post-rms + MLP + residual.
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
                         for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                             o0 = ob * Q_OUT_CHUNK

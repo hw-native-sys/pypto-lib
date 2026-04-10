@@ -151,7 +151,7 @@ When a **`with pl.incore`** scope **covers** nested chunked loops, each such chu
 **Example:** two chunked loops inside one incore scope.
 
 ```python
-with pl.incore():
+with pl.at(level=pl.Level.CORE_GROUP):
     for i in pl.range(0, 4096, chunk=1024):
         for j in pl.range(0, 2048, chunk=512):
             <body using i, j>
@@ -179,7 +179,7 @@ The compiler should **try to interchange** loop nesting so that:
 for c_1 in ...:           # chunk loop 1
   for c_2 in ...:         # chunk loop 2
     ...
-      with pl.incore():   # incore placed here (see §5.4)
+      with pl.at(level=pl.Level.CORE_GROUP):   # incore placed here (see §5.4)
         for i in ...:     # in_chunk loop 1
           for j in ...:   # in_chunk loop 2
             <body>
@@ -214,7 +214,7 @@ for c in pl.range(0, 4):
     t_end   = min(t_start + 1024, 4096)
     r_start = t_start * TILE_M   # or derived from t_start
     x_tile = pl.slice(x, [TILE_M, N], [r_start, 0])
-    with pl.incore():    # placed to encompass only the in_chunk loop + body
+    with pl.at(level=pl.Level.CORE_GROUP):    # placed to encompass only the in_chunk loop + body
         for t in pl.range(t_start, t_end):   # in_chunk loop inside incore
             # body: e.g. load(x_tile), softmax, store
             ...

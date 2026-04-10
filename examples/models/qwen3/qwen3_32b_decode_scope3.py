@@ -67,7 +67,7 @@ def build_qwen3_scope3_program(
                 for ob in pl.range(Q_OUT_BLOCKS):
                     o0 = ob * Q_OUT_CHUNK
 
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
@@ -78,7 +78,7 @@ def build_qwen3_scope3_program(
                             o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
                     # Stage 1: Residual addition with hidden_states
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         resid = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
@@ -88,7 +88,7 @@ def build_qwen3_scope3_program(
 
                 # Stage 2: Post-attention RMSNorm
                 post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                with pl.incore():
+                with pl.at(level=pl.Level.CORE_GROUP):
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(HIDDEN_BLOCKS):
                         k0 = kb * K_CHUNK
@@ -108,7 +108,7 @@ def build_qwen3_scope3_program(
                 mlp_tile = pl.create_tensor([BATCH_TILE, INTER_CFG], dtype=pl.BF16)
                 for ob in pl.range(MLP_OUT_BLOCKS):
                     o0 = ob * MLP_OUT_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
@@ -118,7 +118,7 @@ def build_qwen3_scope3_program(
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
@@ -128,7 +128,7 @@ def build_qwen3_scope3_program(
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -137,7 +137,7 @@ def build_qwen3_scope3_program(
                 # Stage 6 & 7: Down projection + final residual writeback.
                 for dob in pl.range(HIDDEN_BLOCKS):
                     d0 = dob * K_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
                         down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
@@ -148,7 +148,7 @@ def build_qwen3_scope3_program(
                             )
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                             down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         out_chunk = pl.add(
                             down_acc,
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0]),

@@ -44,7 +44,7 @@ def build_layer_norm_program(
             beta: pl.Tensor[[1, hidden], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
         ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for r in pl.parallel(0, rows, row_chunk, chunk=1):
                     tile_x = pl.slice(x, [row_chunk, hidden], [r, 0])
                     gamma_tile = pl.slice(gamma, [1, hidden], [0, 0])

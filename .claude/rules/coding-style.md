@@ -32,7 +32,7 @@ PyPTO supports three function types:
 |------|---------|-------------|
 | `pl.FunctionType.InCore` | Runs on AICore. Manually load/store between GM and UB. | Explicit control over data movement and memory placement |
 | `pl.FunctionType.Orchestration` | Host/AICPU scheduling. Calls InCore kernels, manages tensor allocation. | Composing InCore kernels into a computation graph |
-| `pl.FunctionType.Opaque` | Compiler decides InCore/Orchestration boundary. Use with `pl.auto_incore()`. | When you don't need manual placement control |
+| `pl.FunctionType.Opaque` | Compiler decides InCore/Orchestration boundary. Use with `pl.at()`. | When you don't need manual placement control |
 
 ### Explicit InCore + Orchestration (pypto standard style)
 
@@ -70,7 +70,7 @@ class HelloWorldProgram:
 class SoftmaxProgram:
     @pl.function(type=pl.FunctionType.Opaque)
     def softmax(self, input_tensor: pl.Tensor[[B, S, H], pl.FP32], ...):
-        with pl.auto_incore():
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
             for b in pl.parallel(0, B, 1, chunk=4):
                 ...
 ```

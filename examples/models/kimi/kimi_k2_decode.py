@@ -137,7 +137,7 @@ def build_kimi_k2_decode_program(
             # =========================================================================
             # Scope 1: Input RMSNorm + QKV Projection
             # =========================================================================
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0.0)
 
@@ -241,7 +241,7 @@ def build_kimi_k2_decode_program(
                     )
 
                 # Flash Decoding Attention per head
-                with pl.auto_incore():
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
                     attn_row = pl.mul(attn_row, 0.0)
 
@@ -325,7 +325,7 @@ def build_kimi_k2_decode_program(
             # =========================================================================
             # Scope 3: Output Projection + Residual + Post RMSNorm + MoE
             # =========================================================================
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                     # Output projection + residual
                     resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)

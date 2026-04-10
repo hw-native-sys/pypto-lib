@@ -107,7 +107,7 @@ def build_qwen3_single_layer_prefill_program(
                     # Uses full [TOK_TILE, ...] views from hidden_states even on the
                     # tail tile — padding rows map to allocated-but-unused MAX_SEQ
                     # slots, keeping every GM view >= 512 B aligned.
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         sq_sum = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
                         sq_sum = pl.mul(sq_sum, 0.0)
                         for kb in pl.range(HIDDEN_BLOCKS):
@@ -191,7 +191,7 @@ def build_qwen3_single_layer_prefill_program(
                         sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
                         sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
-                        with pl.auto_incore():
+                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                             attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
                             attn_row = pl.mul(attn_row, 0.0)
                             # First loop: update KV cache (separate from attention to avoid tensor view issues)
@@ -301,7 +301,7 @@ def build_qwen3_single_layer_prefill_program(
                             attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
 
                     # Scope 3: output projection + residual + post-rms + MLP + residual.
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN_CFG], dtype=pl.FP32)
                         for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
                             o0 = ob * Q_OUT_CHUNK

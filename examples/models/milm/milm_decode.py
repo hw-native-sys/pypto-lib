@@ -128,7 +128,7 @@ def build_milm_decode_program(
             # Scope 1: Input RMSNorm + QKV Projection
             # Optimized with chunked computation to reduce InCore pressure
             # =========================================================================
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 # Compute sum of squares for RMSNorm
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0.0)
@@ -234,7 +234,7 @@ def build_milm_decode_program(
                     )
 
                 # Flash Decoding Attention (per head with GQA)
-                with pl.auto_incore():
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
                     attn_row = pl.mul(attn_row, 0.0)
 
@@ -318,7 +318,7 @@ def build_milm_decode_program(
             # =========================================================================
             # Scope 3: Output Projection + Residual + Post RMSNorm + SwiGLU MLP
             # =========================================================================
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                     # Output projection + residual (first residual connection)
                     resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)

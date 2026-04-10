@@ -121,7 +121,7 @@ def build_qwen3_32b_training_forward_backward_program(
             pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
             pl.Tensor[[1], pl.FP32],
         ]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 grad_wq = pl.mul(grad_wq, 0.0)
                 grad_wk = pl.mul(grad_wk, 0.0)
                 grad_wv = pl.mul(grad_wv, 0.0)

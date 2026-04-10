@@ -75,7 +75,7 @@ def build_deepseek_v3_2_prefill_back_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 node_id = pl.tensor.read(node_id_t, [0])
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     seq_len_b = pl.tensor.read(seq_lens, [b])

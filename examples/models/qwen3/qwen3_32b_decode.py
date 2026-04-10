@@ -112,7 +112,7 @@ def build_qwen3_decode_program(
             for b0 in pl.range(0, batch, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
-                with pl.incore():
+                with pl.at(level=pl.Level.CORE_GROUP):
                     partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -144,7 +144,7 @@ def build_qwen3_decode_program(
 
                 for ob in pl.range(q_out_blocks):
                     q0 = ob * Q_OUT_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_b = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
                         q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
@@ -157,7 +157,7 @@ def build_qwen3_decode_program(
 
                 for ob in pl.range(kv_out_blocks):
                     kv0 = ob * KV_OUT_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
@@ -167,7 +167,7 @@ def build_qwen3_decode_program(
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
                     k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
@@ -181,7 +181,7 @@ def build_qwen3_decode_program(
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
             # Pad q
             all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-            with pl.incore():
+            with pl.at(level=pl.Level.CORE_GROUP):
                 for idx in pl.range(batch * total_q_groups):
                     all_q_padded = pl.assemble(
                         all_q_padded,
@@ -202,7 +202,7 @@ def build_qwen3_decode_program(
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
-                with pl.auto_incore():
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
                         # K RoPE + cache update.
                         kv_col = ki * head_dim
@@ -256,7 +256,7 @@ def build_qwen3_decode_program(
                     all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -290,7 +290,7 @@ def build_qwen3_decode_program(
 
                     # Stage 2: QK matmul for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -306,7 +306,7 @@ def build_qwen3_decode_program(
 
                     # Stage 3: softmax for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -331,7 +331,7 @@ def build_qwen3_decode_program(
 
                     # Stage 4: SV matmul for all active sb blocks.
                     for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                        with pl.incore():
+                        with pl.at(level=pl.Level.CORE_GROUP):
                             for si in pl.range(SB_BATCH):
                                 sb = sb0 + si
                                 if sb < ctx_blocks:
@@ -351,7 +351,7 @@ def build_qwen3_decode_program(
                                     all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                     # Stage 5: online softmax accumulation and normalisation.
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
                         mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
                         li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])
@@ -383,7 +383,7 @@ def build_qwen3_decode_program(
                 for ob in pl.range(q_out_blocks):
                     o0 = ob * Q_OUT_CHUNK
 
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
@@ -394,7 +394,7 @@ def build_qwen3_decode_program(
                             o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
                     # Stage 2: Residual addition with hidden_states
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         resid = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
@@ -404,7 +404,7 @@ def build_qwen3_decode_program(
 
                 # Stage 3: Post-attention RMSNorm
                 post_norm_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
-                with pl.incore():
+                with pl.at(level=pl.Level.CORE_GROUP):
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
@@ -424,7 +424,7 @@ def build_qwen3_decode_program(
                 mlp_tile = pl.create_tensor([BATCH_TILE, inter], dtype=pl.BF16)
                 for ob in pl.range(mlp_out_blocks):
                     o0 = ob * MLP_OUT_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
@@ -434,7 +434,7 @@ def build_qwen3_decode_program(
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                         up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
@@ -444,7 +444,7 @@ def build_qwen3_decode_program(
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                    with pl.auto_incore():
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -453,7 +453,7 @@ def build_qwen3_decode_program(
                 # Stage 7 & 8: Down projection + final residual writeback.
                 for dob in pl.range(hidden_blocks):
                     d0 = dob * K_CHUNK
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
                         down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
@@ -464,7 +464,7 @@ def build_qwen3_decode_program(
                             )
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                             down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
-                    with pl.incore():
+                    with pl.at(level=pl.Level.CORE_GROUP):
                         out_chunk = pl.add(
                             down_acc,
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0]),

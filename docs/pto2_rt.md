@@ -765,7 +765,7 @@ The `docs/pypto-frontend-coding-style.md` describes the Python-to-C++ code gener
 
 | Type | Description |
 |------|-------------|
-| **Opaque** | Default function type; may contain `pl.incore()` calls |
+| **Opaque** | Default function type; may contain `pl.at()` scopes |
 | **Orchestration** | Host/AICPU orchestration function; calls InCore functions |
 | **InCore** | AICore kernel subgraph (load/compute/store) |
 

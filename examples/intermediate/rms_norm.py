@@ -50,7 +50,7 @@ def build_rms_norm_program(
             gamma: pl.Tensor[[1, hidden], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
         ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.auto_incore():
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for r in pl.parallel(0, rows, row_chunk, chunk=1):
                     # Pass 1: accumulate sum(x^2) across hidden chunks
                     # row_sum produces [row_chunk, 1] col_major; scalar ops
