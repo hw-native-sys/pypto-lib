@@ -381,8 +381,9 @@ def build_qwen3_scope12_program(
                     with pl.incore():
                         ctx = pl.row_expand_div(oi, li)
                         ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
+                        ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
                         attn_row = pl.assemble(
-                            attn_row, pl.cast(ctx_flat, target_type=pl.BF16), [0, q_base * head_dim],
+                            attn_row, ctx_flat_bf16, [0, q_base * head_dim],
                         )
 
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
