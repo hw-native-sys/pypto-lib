@@ -29,7 +29,7 @@ EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Vector TILELET budget (2 KB = 2048 B, FP32 = 4 B/elem):
-K_CHUNK = 128
+K_CHUNK = 512
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 MLP_OUT_CHUNK = 64
@@ -102,10 +102,10 @@ def build_qwen3_scope1_program(
                         normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                 # Stage 2: Q projection (matmul + matmul_acc in single incore).
-                for ob in pl.range(q_out_blocks):
-                    q0 = ob * Q_OUT_CHUNK
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    for ob in pl.parallel(q_out_blocks, chunk=4):
+                        q0 = ob * Q_OUT_CHUNK
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_b = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
                         q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
@@ -116,13 +116,13 @@ def build_qwen3_scope1_program(
                             tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
 
-                    q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
+                        q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 # Stage 3: K/V projection (matmul + matmul_acc in single incore).
-                for ob in pl.range(kv_out_blocks):
-                    kv0 = ob * KV_OUT_CHUNK
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    for ob in pl.parallel(kv_out_blocks, chunk=4):
+                        kv0 = ob * KV_OUT_CHUNK
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
@@ -133,9 +133,8 @@ def build_qwen3_scope1_program(
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
 
-                    k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                         tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
@@ -146,7 +145,7 @@ def build_qwen3_scope1_program(
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
 
-                    v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
+                        v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             return q_proj, k_proj, v_proj
 
