@@ -29,7 +29,7 @@ HIDDEN_INV = 1.0 / HIDDEN
 
 K_CHUNK = 128
 Q_OUT_CHUNK = 64
-MLP_OUT_CHUNK = 64
+MLP_OUT_CHUNK = 256
 BATCH_TILE = 16
 
 
@@ -63,11 +63,11 @@ def build_qwen3_scope3_program(
             for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                 resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
 
-                # Stage 0: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
-                for ob in pl.range(Q_OUT_BLOCKS):
-                    o0 = ob * Q_OUT_CHUNK
+                # Stage 0 & 1: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK & Residual addition with hidden_states
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer(split=pl.SplitMode.UP_DOWN)):
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=4):
+                        o0 = ob * Q_OUT_CHUNK
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
@@ -77,8 +77,6 @@ def build_qwen3_scope3_program(
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
-                    # Stage 1: Residual addition with hidden_states
-                    with pl.at(level=pl.Level.CORE_GROUP):
                         resid = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
                             target_type=pl.FP32,
@@ -135,9 +133,10 @@ def build_qwen3_scope3_program(
                         mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
                 # Stage 6 & 7: Down projection + final residual writeback.
-                for dob in pl.range(HIDDEN_BLOCKS):
-                    d0 = dob * K_CHUNK
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer(split=pl.SplitMode.UP_DOWN)):
+                    for dob in pl.parallel(0, HIDDEN_BLOCKS, chunk=4):
+                        d0 = dob * K_CHUNK
+
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
                         down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
@@ -148,7 +147,7 @@ def build_qwen3_scope3_program(
                             )
                             w_down_chunk = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                             down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
-                    with pl.at(level=pl.Level.CORE_GROUP):
+
                         out_chunk = pl.add(
                             down_acc,
                             pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0]),
@@ -289,7 +288,7 @@ def compile_and_run(
             strategy=OptimizationStrategy.Default,
             dump_passes=dump_passes,
             backend_type=backend,
-            runtime_profiling=runtime_profiling,
+            runtime_profiling=runtime_profiling
         ),
     )
     if not result.passed and result.error and "code_runner" in result.error:
