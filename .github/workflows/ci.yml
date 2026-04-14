@@ -69,10 +69,26 @@ jobs:
           pip install nanobind
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Install pypto
+      - name: Get pypto HEAD commit
+        id: pypto-hash
+        run: |
+          echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+      - name: Cache pypto wheel
+        id: cache-pypto
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pypto-wheel
+          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
+
+      - name: Build pypto wheel
+        if: steps.cache-pypto.outputs.cache-hit != 'true'
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip install -v /tmp/pypto
+          pip wheel /tmp/pypto -w /tmp/pypto-wheel --no-deps
+
+      - name: Install pypto
+        run: pip install /tmp/pypto-wheel/*.whl
 
       - name: Cache ptoas binary
         id: cache-ptoas
@@ -147,10 +163,26 @@ jobs:
           pip install nanobind
           pip install torch
 
-      - name: Install pypto
+      - name: Get pypto HEAD commit
+        id: pypto-hash
+        run: |
+          echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
+
+      - name: Cache pypto wheel
+        id: cache-pypto
+        uses: actions/cache@v4
+        with:
+          path: /tmp/pypto-wheel
+          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
+
+      - name: Build pypto wheel
+        if: steps.cache-pypto.outputs.cache-hit != 'true'
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip install -v /tmp/pypto
+          pip wheel /tmp/pypto -w /tmp/pypto-wheel --no-deps
+
+      - name: Install pypto
+        run: pip install /tmp/pypto-wheel/*.whl
 
       - name: Cache ptoas binary
         id: cache-ptoas
