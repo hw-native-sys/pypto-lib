@@ -29,6 +29,8 @@ Scope 3:
 
 import pypto.language as pl
 
+SEED = 0
+
 BATCH = 16
 MAX_SEQ = 4096
 NUM_HEADS = 64
@@ -42,7 +44,7 @@ EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
 
 # Scope 1 tiling constants.
-SCOPE1_K_CHUNK = 512
+PROJ_K_CHUNK = 512
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 BATCH_TILE = 16
@@ -70,7 +72,7 @@ def build_qwen3_decode_program(
     hidden = hidden_size
     kv_hidden = num_kv_heads * head_dim
     inter = intermediate_size
-    scope1_hidden_blocks = hidden // SCOPE1_K_CHUNK
+    proj_hidden_blocks = hidden // PROJ_K_CHUNK
     hidden_blocks = hidden // K_CHUNK
     q_out_blocks = hidden // Q_OUT_CHUNK
     kv_out_blocks = kv_hidden // KV_OUT_CHUNK
@@ -116,10 +118,10 @@ def build_qwen3_decode_program(
 
                 with pl.at(level=pl.Level.CORE_GROUP):
                     partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    for kb in pl.range(scope1_hidden_blocks):
-                        k0 = kb * SCOPE1_K_CHUNK
+                    for kb in pl.range(proj_hidden_blocks):
+                        k0 = kb * PROJ_K_CHUNK
                         x_chunk = pl.cast(
-                            pl.slice(hidden_states, [BATCH_TILE, SCOPE1_K_CHUNK], [b0, k0]),
+                            pl.slice(hidden_states, [BATCH_TILE, PROJ_K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
                         partial_sq = pl.add(
@@ -134,48 +136,48 @@ def build_qwen3_decode_program(
                     )
                     inv_rms = pl.recip(pl.sqrt(variance))
 
-                    for kb in pl.range(scope1_hidden_blocks):
-                        k0 = kb * SCOPE1_K_CHUNK
+                    for kb in pl.range(proj_hidden_blocks):
+                        k0 = kb * PROJ_K_CHUNK
                         x_chunk = pl.cast(
-                            pl.slice(hidden_states, [BATCH_TILE, SCOPE1_K_CHUNK], [b0, k0]),
+                            pl.slice(hidden_states, [BATCH_TILE, PROJ_K_CHUNK], [b0, k0]),
                             target_type=pl.FP32,
                         )
-                        gamma = pl.slice(input_rms_weight, [1, SCOPE1_K_CHUNK], [0, k0])
+                        gamma = pl.slice(input_rms_weight, [1, PROJ_K_CHUNK], [0, k0])
                         normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
                         normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ob in pl.parallel(q_out_blocks, chunk=4):
                         q0 = ob * Q_OUT_CHUNK
-                        tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                        tile_b = pl.slice(wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, 0])
+                        tile_b = pl.slice(wq, [PROJ_K_CHUNK, Q_OUT_CHUNK], [0, q0])
                         q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
-                        for kb in pl.range(1, scope1_hidden_blocks):
-                            k0 = kb * SCOPE1_K_CHUNK
-                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                            tile_b_i = pl.slice(wq, [SCOPE1_K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                        for kb in pl.range(1, proj_hidden_blocks):
+                            k0 = kb * PROJ_K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, k0])
+                            tile_b_i = pl.slice(wq, [PROJ_K_CHUNK, Q_OUT_CHUNK], [k0, q0])
                             q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
                         q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                     for ob in pl.parallel(kv_out_blocks, chunk=4):
                         kv0 = ob * KV_OUT_CHUNK
-                        tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                        tile_wk = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, 0])
+                        tile_wk = pl.slice(wk, [PROJ_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                        for kb in pl.range(1, scope1_hidden_blocks):
-                            k0 = kb * SCOPE1_K_CHUNK
-                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                            tile_wk_i = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                        for kb in pl.range(1, proj_hidden_blocks):
+                            k0 = kb * PROJ_K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, k0])
+                            tile_wk_i = pl.slice(wk, [PROJ_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
                         k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
-                        tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                        tile_wv = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        tile_a = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, 0])
+                        tile_wv = pl.slice(wv, [PROJ_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                        for kb in pl.range(1, scope1_hidden_blocks):
-                            k0 = kb * SCOPE1_K_CHUNK
-                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
-                            tile_wv_i = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                        for kb in pl.range(1, proj_hidden_blocks):
+                            k0 = kb * PROJ_K_CHUNK
+                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, PROJ_K_CHUNK], [0, k0])
+                            tile_wv_i = pl.slice(wv, [PROJ_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
                         v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
@@ -450,6 +452,7 @@ def build_tensor_specs(
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
     use_max_seq: bool = False,
+    seed: int = SEED,
 ):
     import torch
     from pypto.runtime import TensorSpec
@@ -460,50 +463,64 @@ def build_tensor_specs(
     cache_rows = batch * num_kv_heads * max_seq
 
     def init_hidden_states():
+        torch.manual_seed(seed)
         return torch.rand(batch, hidden_size) - 0.5
 
     def init_rms_weight():
+        torch.manual_seed(seed + 1)
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
+        torch.manual_seed(seed + 2)
         return torch.rand(hidden_size, hidden_size) / hidden_size ** 0.5
 
     def init_wk():
+        torch.manual_seed(seed + 3)
         return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wv():
+        torch.manual_seed(seed + 4)
         return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_seq_lens():
         if use_max_seq:
             return torch.full((batch,), max_seq, dtype=torch.int32)
+        torch.manual_seed(seed + 5)
         return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
 
     def init_rope_cos():
+        torch.manual_seed(seed + 6)
         return torch.rand(max_seq, head_dim) - 0.5
 
     def init_rope_sin():
+        torch.manual_seed(seed + 7)
         return torch.rand(max_seq, head_dim) - 0.5
 
     def init_k_cache():
+        torch.manual_seed(seed + 8)
         return torch.rand(cache_rows, head_dim) - 0.5
 
     def init_v_cache():
+        torch.manual_seed(seed + 9)
         return torch.rand(cache_rows, head_dim) - 0.5
 
     def init_wo():
+        torch.manual_seed(seed + 10)
         return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_post_rms_weight():
         return torch.ones(1, hidden_size)
 
     def init_w_gate():
+        torch.manual_seed(seed + 11)
         return (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
 
     def init_w_up():
+        torch.manual_seed(seed + 12)
         return (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
 
     def init_w_down():
+        torch.manual_seed(seed + 13)
         return (torch.rand(inter, hidden_size) - 0.5) / inter ** 0.5
 
     return [
@@ -586,8 +603,8 @@ def golden_qwen3_decode(tensors, params):
         x_tile = hidden_states[b0:b_end, :].float()
 
         sq_sum = torch.zeros(b_end - b0, 1, dtype=torch.float32)
-        for k0 in range(0, hidden_size, SCOPE1_K_CHUNK):
-            x_chunk = x_tile[:, k0:k0 + SCOPE1_K_CHUNK]
+        for k0 in range(0, hidden_size, PROJ_K_CHUNK):
+            x_chunk = x_tile[:, k0:k0 + PROJ_K_CHUNK]
             sq_sum = sq_sum + (x_chunk ** 2).sum(dim=-1, keepdim=True)
         variance = sq_sum / hidden_size + EPS
         rms = torch.sqrt(variance)

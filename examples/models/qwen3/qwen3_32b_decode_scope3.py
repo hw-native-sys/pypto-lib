@@ -20,6 +20,8 @@ isolation. Covers:
 
 import pypto.language as pl
 
+SEED = 0
+
 BATCH = 16
 HIDDEN = 8192
 INTERMEDIATE = 25600
@@ -205,29 +207,36 @@ def build_tensor_specs(
     batch: int = BATCH,
     hidden_size: int = HIDDEN,
     intermediate_size: int = INTERMEDIATE,
+    seed: int = SEED,
 ):
     import torch
     from pypto.runtime import TensorSpec
 
     def init_attn_out():
+        torch.manual_seed(seed)
         return torch.rand(batch, hidden_size) - 0.5
 
     def init_hidden_states():
+        torch.manual_seed(seed + 1)
         return torch.rand(batch, hidden_size) - 0.5
 
     def init_wo():
+        torch.manual_seed(seed + 2)
         return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_post_rms_weight():
         return torch.ones(1, hidden_size)
 
     def init_w_gate():
+        torch.manual_seed(seed + 3)
         return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
 
     def init_w_up():
+        torch.manual_seed(seed + 4)
         return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
 
     def init_w_down():
+        torch.manual_seed(seed + 5)
         return (torch.rand(intermediate_size, hidden_size) - 0.5) / intermediate_size ** 0.5
 
     return [

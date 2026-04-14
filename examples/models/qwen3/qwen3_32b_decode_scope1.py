@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import pypto.language as pl
 
+SEED = 0
+
 BATCH = 16
 MAX_SEQ = 4096
 NUM_HEADS = 64
@@ -157,6 +159,7 @@ def build_tensor_specs(
     hidden_size: int = HIDDEN,
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
+    seed: int = SEED,
 ):
     import torch
     from pypto.runtime import TensorSpec
@@ -164,18 +167,23 @@ def build_tensor_specs(
     kv_hidden = num_kv_heads * head_dim
 
     def init_hidden_states():
+        torch.manual_seed(seed)
         return torch.rand(batch, hidden_size) - 0.5
 
     def init_rms_weight():
+        torch.manual_seed(seed + 1)
         return torch.rand(1, hidden_size) - 0.5
 
     def init_wq():
+        torch.manual_seed(seed + 2)
         return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_wk():
+        torch.manual_seed(seed + 3)
         return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     def init_wv():
+        torch.manual_seed(seed + 4)
         return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     return [

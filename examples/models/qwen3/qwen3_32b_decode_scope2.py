@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import pypto.language as pl
 
+SEED = 0
+
 BATCH = 16
 MAX_SEQ = 4096
 NUM_HEADS = 64
@@ -245,6 +247,7 @@ def build_tensor_specs(
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
     use_max_seq: bool = False,
+    seed: int = SEED,
 ):
     import torch
     from pypto.runtime import TensorSpec
@@ -256,27 +259,35 @@ def build_tensor_specs(
     def init_seq_lens():
         if use_max_seq:
             return torch.full((batch,), max_seq, dtype=torch.int32)
+        torch.manual_seed(seed)
         return torch.randint(1, max_seq + 1, (batch,), dtype=torch.int32)
 
     def init_q_proj():
+        torch.manual_seed(seed + 1)
         return torch.rand(batch, hidden) - 0.5
 
     def init_k_proj():
+        torch.manual_seed(seed + 2)
         return torch.rand(batch, kv_hidden) - 0.5
 
     def init_v_proj():
+        torch.manual_seed(seed + 3)
         return torch.rand(batch, kv_hidden) - 0.5
 
     def init_rope_cos():
+        torch.manual_seed(seed + 4)
         return torch.rand(max_seq, head_dim) - 0.5
 
     def init_rope_sin():
+        torch.manual_seed(seed + 5)
         return torch.rand(max_seq, head_dim) - 0.5
 
     def init_k_cache():
+        torch.manual_seed(seed + 6)
         return torch.rand(cache_rows, head_dim) - 0.5
 
     def init_v_cache():
+        torch.manual_seed(seed + 7)
         return torch.rand(cache_rows, head_dim) - 0.5
 
     return [
