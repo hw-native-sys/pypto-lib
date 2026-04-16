@@ -58,13 +58,12 @@ def build_deepseek_v3_2_prefill_back_scope1_program(
             wo: pl.Tensor[[ATTN_OUT_CFG, HIDDEN_CFG], pl.BF16],
             resid1: pl.Out[pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.FP32]],
         ) -> pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.FP32]:
-            combine_local = pl.create_tensor([TOK_TILE, ATTN_OUT_CFG], dtype=pl.BF16)
-
             for b in pl.parallel(0, BATCH_CFG, 1):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
                 tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
                 for p0_idx in pl.range(tok_blocks):
                     p0 = p0_idx * TOK_TILE
+                    combine_local = pl.create_tensor([TOK_TILE, ATTN_OUT_CFG], dtype=pl.BF16)
 
                     for ob in pl.range(Q_OUT_BLOCKS):
                         o0 = ob * Q_OUT_CHUNK
