@@ -23,7 +23,6 @@ Aligned to official v3.2-exp MLA shapes:
 - kv_lora_rank = 512
 """
 
-from typing import Optional
 
 import pypto.language as pl
 
@@ -228,7 +227,7 @@ def build_deepseek_v3_2_decode_front_scope1_program(
     return DeepSeekV32DecodeFrontScope1
 
 
-def golden_decode_front_scope1(tensors, params):
+def golden_decode_front_scope1(tensors):
     import torch  # type: ignore[import]
 
     hidden_states = tensors["hidden_states"].float()
@@ -270,7 +269,7 @@ def build_tensor_specs(
     v_head_dim: int = V_HEAD_DIM,
 ):
     import torch  # type: ignore[import]
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     kv_a_out = kv_lora_rank + qk_rope_head_dim
@@ -306,66 +305,14 @@ def build_tensor_specs(
     ]
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    hidden_size: int = HIDDEN,
-    num_heads: int = NUM_HEADS,
-    q_lora_rank: int = Q_LORA_RANK,
-    kv_lora_rank: int = KV_LORA_RANK,
-    qk_nope_head_dim: int = QK_NOPE_HEAD_DIM,
-    qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
-    v_head_dim: int = V_HEAD_DIM,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    work_dir: Optional[str] = None,
-    dump_passes: bool = True,
-    runtime_profiling: bool = False,
-):
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, run
-
-    program = build_deepseek_v3_2_decode_front_scope1_program(
-        batch=batch,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=kv_lora_rank,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-    )
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        q_lora_rank=q_lora_rank,
-        kv_lora_rank=kv_lora_rank,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-    )
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden=golden_decode_front_scope1,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=2e-2,
-            atol=2e-2,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=BackendType.Ascend910B,
-            runtime_profiling=runtime_profiling,
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -374,13 +321,21 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        runtime_profiling=args.runtime_profiling,
+    result = run(
+        program=build_deepseek_v3_2_decode_front_scope1_program(),
+        tensor_specs=build_tensor_specs(),
+        golden_fn=golden_decode_front_scope1,
+        config=RunConfig(
+            rtol=2e-2,
+            atol=2e-2,
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:
             print(f"Result: {result.error}")
         raise SystemExit(1)
-    print("Result: precision validation passed")

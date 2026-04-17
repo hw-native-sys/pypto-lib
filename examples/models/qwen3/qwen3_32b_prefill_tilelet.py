@@ -439,7 +439,7 @@ def build_tensor_specs(
     intermediate_size: int = INTERMEDIATE,
 ):
     import torch  # type: ignore[import]
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq_len
@@ -466,7 +466,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_qwen3_prefill(tensors, params):
+def golden_qwen3_prefill(tensors):
     import torch
 
     batch = BATCH
@@ -685,63 +685,14 @@ def golden_qwen3_prefill(tensors, params):
             out[b, p0:p0+valid_tok, :] = final_out.bfloat16()
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq_len: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    num_heads: int = NUM_HEADS,
-    num_kv_heads: int = NUM_KV_HEADS,
-    head_dim: int = HEAD_DIM,
-    intermediate_size: int = INTERMEDIATE,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    dump_passes: bool = True,
-    runtime_profiling: bool = False,
-):
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, run
-
-    program = build_qwen3_single_layer_prefill_program(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        intermediate_size=intermediate_size,
-    )
-
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        intermediate_size=intermediate_size,
-    )
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden=golden_qwen3_prefill,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=2e-2,
-            atol=2e-2,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=BackendType.Ascend950,
-            runtime_profiling=runtime_profiling,
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -750,10 +701,19 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        runtime_profiling=args.runtime_profiling,
+    result = run(
+        program=build_qwen3_single_layer_prefill_program(),
+        tensor_specs=build_tensor_specs(),
+        golden_fn=golden_qwen3_prefill,
+        config=RunConfig(
+            rtol=2e-2,
+            atol=2e-2,
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:

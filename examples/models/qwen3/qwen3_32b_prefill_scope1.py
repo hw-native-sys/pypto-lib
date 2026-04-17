@@ -182,7 +182,7 @@ def build_tensor_specs(
     head_dim: int = HEAD_DIM,
 ):
     import torch
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     kv_hidden = num_kv_heads * head_dim
 
@@ -224,7 +224,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_prefill_projection(tensors, params):
+def golden_prefill_projection(tensors):
     """Reference computation for Scope 1 (prefill).
 
     Steps:
@@ -272,70 +272,35 @@ def golden_prefill_projection(tensors, params):
     tensors["v_proj"][:] = v_proj
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    num_kv_heads: int = NUM_KV_HEADS,
-    head_dim: int = HEAD_DIM,
-    platform: str = "a5",
-    device_id: int = 0,
-    dump_passes: bool = True,
-    enable_profiling: bool = False,
-):
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, run
-
-    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-
-    program = build_prefill_projection_program(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-    )
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-    )
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden=golden_prefill_projection,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=backend,
-            runtime_profiling=enable_profiling,
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a5",
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        enable_profiling=args.enable_profiling,
+    result = run(
+        program=build_prefill_projection_program(),
+        tensor_specs=build_tensor_specs(),
+        golden_fn=golden_prefill_projection,
+        config=RunConfig(
+            rtol=1e-3,
+            atol=1e-3,
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:

@@ -215,7 +215,7 @@ def build_prefill_scope3_program(
     return PrefillScope3Program
 
 
-def golden_prefill_scope3(tensors, params):
+def golden_prefill_scope3(tensors):
     """Reference computation for Scope 3 (prefill).
 
     Steps:
@@ -278,7 +278,7 @@ def build_tensor_specs(
     intermediate_size: int = INTERMEDIATE,
 ):
     import torch
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     def init_seq_lens():
         n_blocks = max_seq // TOK_TILE
@@ -326,67 +326,35 @@ def build_tensor_specs(
     ]
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    intermediate_size: int = INTERMEDIATE,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    dump_passes: bool = True,
-    enable_profiling: bool = False,
-):
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, run
-
-    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-
-    program = build_prefill_scope3_program(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-    )
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-    )
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden=golden_prefill_scope3,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=3e-3,
-            atol=3e-3,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=backend,
-            runtime_profiling=enable_profiling,
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-profiling", action="store_true", default=False)
+    parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        enable_profiling=args.enable_profiling,
+    result = run(
+        program=build_prefill_scope3_program(),
+        tensor_specs=build_tensor_specs(),
+        golden_fn=golden_prefill_scope3,
+        config=RunConfig(
+            rtol=3e-3,
+            atol=3e-3,
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:
