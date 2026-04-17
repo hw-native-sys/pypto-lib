@@ -703,15 +703,17 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--max-seq", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run(
         program=build_qwen3_decode_program(),
-        tensor_specs=build_tensor_specs(),
+        tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_decode,
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,
+            compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
@@ -721,5 +723,5 @@ if __name__ == "__main__":
     )
     if not result.passed:
         if result.error:
-            print(f"Result: {result.error}")
+            print(result.error)
         raise SystemExit(1)

@@ -18,7 +18,12 @@ computes the golden reference, and validates with :func:`validate_golden`.
 verbatim to pypto:
 
 - ``compile`` → :func:`pypto.ir.compile` kwargs.
-- ``runtime`` → :class:`pypto.runtime.RunConfig` kwargs for the compiled callable.
+- ``runtime`` → :func:`pypto.runtime.execute_compiled` kwargs.
+
+Setting the ``golden_data`` argument of :func:`run` to a directory that
+already contains ``in/{name}.pt`` / ``out/{name}.pt`` files reuses the
+persisted tensors: input generation and golden computation are skipped;
+device execution and validation still run.
 
 Any field accepted by pypto is available without adding glue here.
 """
@@ -45,16 +50,11 @@ class RunConfig:
         compile_only: If ``True``, stop after code generation without
             executing on device or validating against golden.
         compile: Kwargs forwarded to :func:`pypto.ir.compile` (e.g.
-            ``backend_type``, ``dump_passes``, ``output_dir``, ``strategy``).
-            When ``backend_type`` is not set and ``runtime['platform']`` is,
-            :func:`run` fills it in by inferring from the platform prefix
-            (``a5*`` → Ascend950, otherwise Ascend910B).
-        runtime: Kwargs forwarded to :class:`pypto.runtime.RunConfig` for
-            the compiled callable (e.g. ``platform``, ``device_id``,
-            ``runtime_profiling``, ``pto_isa_commit``).
+            ``backend_type``, ``dump_passes``, ``output_dir``, ``strategy``,
+            ``profiling``).
+        runtime: Kwargs forwarded to :func:`pypto.runtime.execute_compiled`
+            (e.g. ``platform``, ``device_id``, ``runtime_profiling``).
     """
-
-    __test__ = False  # Not a pytest test class
 
     rtol: float = 1e-5
     atol: float = 1e-5
@@ -66,8 +66,6 @@ class RunConfig:
 @dataclass
 class RunResult:
     """Result of a :func:`run` invocation."""
-
-    __test__ = False  # Not a pytest test class
 
     passed: bool
     error: str | None = None
@@ -90,83 +88,174 @@ def _save_tensors(dest_dir: Path, tensors: dict[str, torch.Tensor]) -> None:
         torch.save(tensor, dest_dir / f"{name}.pt")
 
 
+def _load_tensors(src_dir: Path, subdir: str, names: list[str]) -> dict[str, torch.Tensor]:
+    """Load ``src_dir/subdir/{name}.pt`` for each name."""
+    return {n: torch.load(src_dir / subdir / f"{n}.pt", weights_only=True) for n in names}
+
+
+def _required_files(spec: TensorSpec) -> list[tuple[str, str]]:
+    """Return ``[(subdir, filename), ...]`` required for *spec* in a golden-data dir.
+
+    - Pure input: ``in/{name}.pt``
+    - Pure output: ``out/{name}.pt``
+    - Inout (is_output + init_value): both ``in/{name}.pt`` and ``out/{name}.pt``
+    """
+    files: list[tuple[str, str]] = []
+    if not spec.is_output:
+        files.append(("in", f"{spec.name}.pt"))
+    else:
+        files.append(("out", f"{spec.name}.pt"))
+        if spec.init_value is not None:
+            files.append(("in", f"{spec.name}.pt"))
+    return files
+
+
+def _backend_for_platform(platform: str) -> Any:
+    """Return the :class:`pypto.backend.BackendType` for a platform string."""
+    from pypto.backend import BackendType
+
+    mapping = {
+        "a2a3": BackendType.Ascend910B,
+        "a2a3sim": BackendType.Ascend910B,
+        "a5": BackendType.Ascend950,
+        "a5sim": BackendType.Ascend950,
+    }
+    try:
+        return mapping[platform]
+    except KeyError:
+        raise ValueError(
+            f"Unknown runtime platform {platform!r}; expected one of {sorted(mapping)}"
+        ) from None
+
+
 def run(
     program: Any,
     tensor_specs: list[TensorSpec],
-    golden_fn: Callable | None = None,
     config: RunConfig | None = None,
+    golden_fn: Callable | None = None,
+    golden_data: str | None = None,
 ) -> RunResult:
-    """Compile *program*, run on device, and optionally validate against *golden_fn*.
+    """Compile *program*, run on device, and optionally validate goldens.
 
     Args:
         program: A ``@pl.program`` decorated class or an ``ir.Program``.
         tensor_specs: Ordered list of tensor specifications matching the
             orchestration function's parameter order.
-        golden_fn: Optional callable ``golden_fn(tensors)`` that computes
-            expected outputs in-place into its ``tensors`` argument.  When
-            ``None``, :func:`run` skips golden computation and validation;
-            the device is still executed and ``data/in/`` is still persisted.
         config: Run configuration.  Uses default :class:`RunConfig` if ``None``.
+        golden_fn: Optional callable ``golden_fn(tensors)`` that computes
+            expected outputs in-place.  When ``None``, golden is sourced from
+            *golden_data* if set; if neither is provided, validation is skipped.
+        golden_data: Optional directory with persisted ``in/{name}.pt`` and
+            ``out/{name}.pt``.  When set, :func:`run` loads tensors from it
+            instead of generating inputs or computing goldens (read-only).
+            Takes precedence over *golden_fn* when both are provided.
 
     Returns:
         :class:`RunResult` with ``passed=True`` on success, or ``passed=False``
         with an ``error`` message on failure.
     """
-    from pypto import ir  # noqa: PLC0415
-    from pypto.backend import BackendType  # noqa: PLC0415
-    from pypto.runtime import RunConfig as PyPTORunConfig  # noqa: PLC0415
+    from pypto import ir
+    from pypto.runtime import execute_compiled
 
     if config is None:
         config = RunConfig()
 
+    data_dir = Path(golden_data) if golden_data is not None else None
+
     start = time.time()
 
+    def _stage(name: str):
+        """Context manager-like helper: print begin/done around a block."""
+        class _Ctx:
+            def __enter__(self_):
+                print(f"[RUN] {name} ...", flush=True)
+                self_._t0 = time.time()
+                return self_
+            def __exit__(self_, *_exc):
+                dt = time.time() - self_._t0
+                print(f"[RUN] {name} done ({dt:.2f}s)", flush=True)
+                return False
+        return _Ctx()
+
+    def _fail(error: str) -> RunResult:
+        return RunResult(passed=False, error=error, execution_time=time.time() - start)
+
     # Compile
-    compile_kwargs = dict(config.compile)
-    platform = config.runtime.get("platform")
-    if platform is not None:
-        compile_kwargs.setdefault("platform", platform)
-        if "backend_type" not in compile_kwargs:
-            compile_kwargs["backend_type"] = (
-                BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-            )
-    compiled = ir.compile(program, **compile_kwargs)
+    with _stage("compile"):
+        compile_kwargs = dict(config.compile)
+        platform = config.runtime.get("platform")
+        if platform is not None:
+            compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
+        compiled = ir.compile(program, **compile_kwargs)
 
     if config.compile_only:
-        return RunResult(passed=True, execution_time=time.time() - start)
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+        return RunResult(passed=True, execution_time=total)
 
     # Generate Inputs
-    tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
-    input_snapshot = {
-        spec.name: tensors[spec.name].clone()
-        for spec in tensor_specs
-        if not spec.is_output or spec.init_value is not None
-    }
-    _save_tensors(compiled.output_dir / "data" / "in", input_snapshot)
+    with _stage("generate inputs"):
+        if data_dir is not None:
+            missing = [
+                str(data_dir / sub / name)
+                for spec in tensor_specs
+                for sub, name in _required_files(spec)
+                if not (data_dir / sub / name).is_file()
+            ]
+            if missing:
+                return _fail(f"golden_data is missing files: {missing}")
+            print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
+            # Load inputs + inout initial values from {dir}/in/; pure outputs stay zero-init.
+            input_names = [s.name for s in tensor_specs if not s.is_output or s.init_value is not None]
+            tensors = _load_tensors(data_dir, "in", input_names)
+            for spec in tensor_specs:
+                if spec.is_output and spec.init_value is None:
+                    tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+        else:
+            tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
+            input_snapshot = {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
+            _save_tensors(compiled.output_dir / "data" / "in", input_snapshot)
 
     # Runtime
-    ordered = [tensors[spec.name] for spec in tensor_specs]
-    compiled(*ordered, config=PyPTORunConfig(**config.runtime))
+    with _stage("runtime"):
+        ordered = [tensors[spec.name] for spec in tensor_specs]
+        execute_compiled(compiled.output_dir, ordered, **config.runtime)
 
-    if golden_fn is None:
-        return RunResult(passed=True, execution_time=time.time() - start)
+    if golden_fn is None and golden_data is None:
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
+        return RunResult(passed=True, execution_time=total)
 
     device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
 
-    # Compute Golden
-    scratch: dict[str, torch.Tensor] = {}
-    for spec in tensor_specs:
-        if spec.is_output and spec.init_value is None:
-            scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+    # Compute Golden (or load from cache)
+    with _stage("compute golden"):
+        if data_dir is not None:
+            print(f"[RUN]   cache hit: {data_dir / 'out'}", flush=True)
+            output_names = [s.name for s in tensor_specs if s.is_output]
+            golden_outputs = _load_tensors(data_dir, "out", output_names)
         else:
-            scratch[spec.name] = input_snapshot[spec.name].clone()
-    golden_fn(scratch)
-    golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
-    _save_tensors(compiled.output_dir / "data" / "out", golden_outputs)
+            scratch: dict[str, torch.Tensor] = {}
+            for spec in tensor_specs:
+                if spec.is_output and spec.init_value is None:
+                    scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+                else:
+                    scratch[spec.name] = input_snapshot[spec.name].clone()
+            golden_fn(scratch)
+            golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
+            _save_tensors(compiled.output_dir / "data" / "out", golden_outputs)
 
     # Validate
-    try:
-        validate_golden(device_outputs, golden_outputs, rtol=config.rtol, atol=config.atol)
-        return RunResult(passed=True, execution_time=time.time() - start)
-    except AssertionError as e:
-        return RunResult(passed=False, error=str(e), execution_time=time.time() - start)
+    with _stage("validate"):
+        try:
+            validate_golden(device_outputs, golden_outputs, rtol=config.rtol, atol=config.atol)
+        except AssertionError as e:
+            return _fail(str(e))
+
+    total = time.time() - start
+    print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+    return RunResult(passed=True, execution_time=total)

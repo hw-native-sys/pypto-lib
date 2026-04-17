@@ -582,5 +582,5 @@ if __name__ == "__main__":
     )
     if not result.passed:
         if result.error:
-            print(f"Result: {result.error}")
+            print(result.error)
         raise SystemExit(1)

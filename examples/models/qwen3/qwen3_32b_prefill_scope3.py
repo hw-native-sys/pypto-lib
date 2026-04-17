@@ -349,6 +349,7 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,
+            compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
@@ -358,5 +359,5 @@ if __name__ == "__main__":
     )
     if not result.passed:
         if result.error:
-            print(f"Result: {result.error}")
+            print(result.error)
         raise SystemExit(1)
