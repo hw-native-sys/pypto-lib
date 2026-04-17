@@ -7,17 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Golden output validation.
-
-Compares actual kernel outputs against golden reference tensors using
-element-wise tolerance checking via ``torch.allclose``.
-"""
-
-import logging
+"""Golden output validation."""
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 def validate_golden(
@@ -34,7 +26,6 @@ def validate_golden(
     for name, actual_tensor in outputs.items():
         actual = actual_tensor.cpu()
         expected = golden[name].cpu()
-        logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
 
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
             close_mask = torch.isclose(actual, expected, rtol=rtol, atol=atol)
@@ -53,6 +44,3 @@ def validate_golden(
                 f"rtol={rtol}, atol={atol}\n"
                 f"First {n_show} mismatches:\n" + "\n".join(lines)
             )
-
-        matched = torch.isclose(actual, expected, rtol=rtol, atol=atol).sum().item()
-        logger.info(f"  {name}: PASS ({matched}/{actual.numel()} elements matched)")

@@ -397,6 +397,144 @@ class TestCompileOnly:
         assert not (compiled_dir / "data").exists()
 
 
+class TestRuntimeDir:
+    """``runtime_dir`` skips compile and executes against a pre-compiled dir."""
+
+    def test_runtime_dir_skips_compile(self, three_kinds_specs, tmp_path):
+        """When runtime_dir is set, ir.compile must not be called and
+        execute_compiled gets the runtime_dir as work_dir."""
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+
+        def compile_must_not_run(*_args, **_kwargs):
+            pytest.fail("ir.compile must not run when runtime_dir is provided")
+
+        observed_work_dir: list[Path] = []
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            observed_work_dir.append(Path(work_dir))
+            # Leave outputs zero; no golden_fn is provided so no validation runs.
+
+        with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                runtime_dir=str(prebuilt),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert observed_work_dir == [prebuilt]
+
+    def test_runtime_dir_writes_data_under_runtime_dir(
+        self, three_kinds_specs, tmp_path,
+    ):
+        """With golden_fn, data/in and data/out are persisted under runtime_dir."""
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+
+        def golden_fn(tensors):
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        def fake_execute(_work_dir, tensors, **_kwargs):
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=golden_fn,
+                runtime_dir=str(prebuilt),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert (prebuilt / "data" / "in" / "x.pt").is_file()
+        assert (prebuilt / "data" / "in" / "state.pt").is_file()
+        assert (prebuilt / "data" / "out" / "y.pt").is_file()
+        assert (prebuilt / "data" / "out" / "state.pt").is_file()
+
+    def test_runtime_dir_missing_returns_fail(self, three_kinds_specs, tmp_path):
+        missing = tmp_path / "does_not_exist"
+
+        def compile_must_not_run(*_args, **_kwargs):
+            pytest.fail("ir.compile must not run when runtime_dir is provided")
+
+        def exec_must_not_run(*_args, **_kwargs):
+            pytest.fail("execute_compiled must not run when runtime_dir is missing")
+
+        with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
+             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                runtime_dir=str(missing),
+            )
+
+        assert not r.passed
+        assert "runtime_dir does not exist" in (r.error or "")
+
+    def test_runtime_dir_with_compile_only_returns_fail(
+        self, three_kinds_specs, tmp_path,
+    ):
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+
+        def compile_must_not_run(*_args, **_kwargs):
+            pytest.fail("ir.compile must not run")
+
+        def exec_must_not_run(*_args, **_kwargs):
+            pytest.fail("execute_compiled must not run")
+
+        with patch("pypto.ir.compile", side_effect=compile_must_not_run), \
+             patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                config=RunConfig(compile_only=True),
+                runtime_dir=str(prebuilt),
+            )
+
+        assert not r.passed
+        assert "incompatible" in (r.error or "")
+
+    def test_runtime_dir_with_golden_data_uses_runtime_dir_and_reads_cache(
+        self, populated_cache, three_kinds_specs, tmp_path,
+    ):
+        """runtime_dir and golden_data are independent: execute uses runtime_dir,
+        but inputs/goldens come from golden_data's cache (read-only)."""
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+
+        observed_work_dir: list[Path] = []
+
+        def fake_execute(work_dir, tensors, **_kwargs):
+            observed_work_dir.append(Path(work_dir))
+            # Write the cached golden values so validation passes.
+            tensors[1][:] = torch.tensor([2.0, 3.0, 4.0, 5.0])
+            tensors[2][:] = torch.tensor([11.0, 22.0, 33.0, 44.0])
+
+        def golden_fn_should_not_run(_tensors):
+            pytest.fail("golden_fn must not run when golden_data is a complete cache")
+
+        with patch("pypto.ir.compile", side_effect=lambda *a, **kw: pytest.fail("compile must not run")), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                tensor_specs=three_kinds_specs,
+                golden_fn=golden_fn_should_not_run,
+                golden_data=str(populated_cache),
+                runtime_dir=str(prebuilt),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert observed_work_dir == [prebuilt]
+        # golden_data cache-hit path is read-only: nothing is written under runtime_dir.
+        assert not (prebuilt / "data").exists()
+
+
 class TestBackendForPlatform:
     """``_backend_for_platform`` maps platform strings to BackendType values."""
 

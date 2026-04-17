@@ -7,25 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""
-Runner for compiling and executing PyPTO programs with golden validation.
+"""Compile PyPTO programs, run them on device, and validate against goldens.
 
-Public entry point: :func:`run`.  Builds tensors from :class:`TensorSpec`,
-compiles the program via :func:`pypto.ir.compile`, executes on device,
-computes the golden reference, and validates with :func:`validate_golden`.
-
-:class:`RunConfig` carries two free-form kwarg dicts that are forwarded
-verbatim to pypto:
-
-- ``compile`` → :func:`pypto.ir.compile` kwargs.
-- ``runtime`` → :func:`pypto.runtime.execute_compiled` kwargs.
-
-Setting the ``golden_data`` argument of :func:`run` to a directory that
-already contains ``in/{name}.pt`` / ``out/{name}.pt`` files reuses the
-persisted tensors: input generation and golden computation are skipped;
-device execution and validation still run.
-
-Any field accepted by pypto is available without adding glue here.
+Public entry point: :func:`run`.
 """
 
 import time
@@ -134,6 +118,7 @@ def run(
     config: RunConfig | None = None,
     golden_fn: Callable | None = None,
     golden_data: str | None = None,
+    runtime_dir: str | None = None,
 ) -> RunResult:
     """Compile *program*, run on device, and optionally validate goldens.
 
@@ -149,6 +134,10 @@ def run(
             ``out/{name}.pt``.  When set, :func:`run` loads tensors from it
             instead of generating inputs or computing goldens (read-only).
             Takes precedence over *golden_fn* when both are provided.
+        runtime_dir: Optional path to a pre-compiled build_output directory.
+            When set, compilation is skipped and execution runs against this
+            directory; ``config.compile`` is ignored and ``compile_only`` is
+            rejected.
 
     Returns:
         :class:`RunResult` with ``passed=True`` on success, or ``passed=False``
@@ -181,17 +170,27 @@ def run(
         return RunResult(passed=False, error=error, execution_time=time.time() - start)
 
     # Compile
-    with _stage("compile"):
-        compile_kwargs = dict(config.compile)
-        platform = config.runtime.get("platform")
-        if platform is not None:
-            compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
-        compiled = ir.compile(program, **compile_kwargs)
+    if runtime_dir is not None:
+        if config.compile_only:
+            return _fail("runtime_dir is incompatible with config.compile_only")
+        work_dir = Path(runtime_dir)
+        if not work_dir.is_dir():
+            return _fail(f"runtime_dir does not exist: {work_dir}")
+        print(f"[RUN] runtime_only: skipping compile, using {work_dir}", flush=True)
+    else:
+        with _stage("compile"):
+            compile_kwargs = dict(config.compile)
+            platform = config.runtime.get("platform")
+            if platform is not None:
+                compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
+            compiled = ir.compile(program, **compile_kwargs)
 
-    if config.compile_only:
-        total = time.time() - start
-        print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-        return RunResult(passed=True, execution_time=total)
+        if config.compile_only:
+            total = time.time() - start
+            print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+            return RunResult(passed=True, execution_time=total)
+
+        work_dir = compiled.output_dir
 
     # Generate Inputs
     with _stage("generate inputs"):
@@ -218,12 +217,12 @@ def run(
                 for spec in tensor_specs
                 if not spec.is_output or spec.init_value is not None
             }
-            _save_tensors(compiled.output_dir / "data" / "in", input_snapshot)
+            _save_tensors(work_dir / "data" / "in", input_snapshot)
 
     # Runtime
     with _stage("runtime"):
         ordered = [tensors[spec.name] for spec in tensor_specs]
-        execute_compiled(compiled.output_dir, ordered, **config.runtime)
+        execute_compiled(work_dir, ordered, **config.runtime)
 
     if golden_fn is None and golden_data is None:
         total = time.time() - start
@@ -247,7 +246,7 @@ def run(
                     scratch[spec.name] = input_snapshot[spec.name].clone()
             golden_fn(scratch)
             golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
-            _save_tensors(compiled.output_dir / "data" / "out", golden_outputs)
+            _save_tensors(work_dir / "data" / "out", golden_outputs)
 
     # Validate
     with _stage("validate"):

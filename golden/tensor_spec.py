@@ -7,12 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""
-Tensor specification for the golden testing infrastructure.
-
-Provides TensorSpec, which describes a single tensor's name, shape, dtype,
-initialisation strategy, and whether it is an output to be validated.
-"""
+"""Tensor specification for the golden testing harness."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
