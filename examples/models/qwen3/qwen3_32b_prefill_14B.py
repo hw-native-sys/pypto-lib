@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3-32B prefill Scope 1+2+3.
+"""Qwen3-14B prefill Scope 1+2+3.
 
 Fuses the full single-layer prefill path: input RMSNorm, Q/K/V projection,
 RoPE, KV cache update, causal attention, output projection, post-attention
@@ -17,15 +17,15 @@ from __future__ import annotations
 import pypto.language as pl
 
 
-# Qwen3-32B model dimensions.
+# Qwen3-14B model dimensions for initial validation.
 BATCH = 16
-MAX_SEQ = 256
-NUM_HEADS = 64
+MAX_SEQ = 4096
+NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
-HIDDEN = NUM_HEADS * HEAD_DIM       # 8192
+HIDDEN = NUM_HEADS * HEAD_DIM       # 5120
 KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
-INTERMEDIATE = 25600
+INTERMEDIATE = 17408
 
 # RMSNorm constants.
 EPS = 1e-6
@@ -36,7 +36,7 @@ K_CHUNK = 128
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 TOK_TILE = 64
-Q_HEAD_BATCH = 8        # Q heads per attention group
+Q_HEAD_BATCH = 5        # Q heads per attention group
 Q_HEAD_PAD = 16         # padded Q rows for cube alignment
 SEQ_TILE = 64           # sequence tile for attention
 SB_BATCH = 64
