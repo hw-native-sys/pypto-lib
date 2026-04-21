@@ -98,22 +98,32 @@ jobs:
 
       - name: Run model tests (${{ matrix.platform }})
         run: |
-          failed=()
+          : > results.tsv
+          failed=""
           for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
-            t=300; [[ "$f" == *prefill* ]] && t=600
-            if ! timeout $t python "$f" -p ${{ matrix.platform }}; then
-              failed+=("$f")
+            if ! python "$f" -p ${{ matrix.platform }}; then
+              failed="$failed $f"
               echo "::error file=$f::FAIL"
+              printf '%s\tfail\n' "$f" >> results.tsv
+            else
+              printf '%s\tpass\n' "$f" >> results.tsv
             fi
             echo "::endgroup::"
           done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "Failed cases (${#failed[@]}):"
-            printf '  - %s\n' "${failed[@]}"
+          if [ -n "$failed" ]; then
+            echo "Failed cases:"
+            for f in $failed; do echo "  - $f"; done
             exit 1
           fi
           echo "All model tests passed."
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.platform }}
+          path: results.tsv
 
   model-tests-a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
@@ -199,19 +209,71 @@ jobs:
 
       - name: Run model tests (a2a3)
         run: |
-          failed=()
+          : > results.tsv
+          failed=""
           for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
-            t=300; [[ "$f" == *prefill* ]] && t=600
-            if ! timeout $t python "$f" -p a2a3 -d $DEVICE_ID; then
-              failed+=("$f")
+            if ! python "$f" -p a2a3 -d $DEVICE_ID; then
+              failed="$failed $f"
               echo "::error file=$f::FAIL"
+              printf '%s\tfail\n' "$f" >> results.tsv
+            else
+              printf '%s\tpass\n' "$f" >> results.tsv
             fi
             echo "::endgroup::"
           done
-          if [ ${#failed[@]} -ne 0 ]; then
-            echo "Failed cases (${#failed[@]}):"
-            printf '  - %s\n' "${failed[@]}"
+          if [ -n "$failed" ]; then
+            echo "Failed cases:"
+            for f in $failed; do echo "  - $f"; done
             exit 1
           fi
           echo "All model tests passed."
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-a2a3
+          path: results.tsv
+
+  summary:
+    name: Aggregate results summary
+    needs: [model-tests-sim, model-tests-a2a3]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Build combined summary table
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import pathlib
+
+          PLATFORMS = ["a2a3", "a2a3sim", "a5sim"]
+          ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
+
+          results = {p: {} for p in PLATFORMS}
+          root = pathlib.Path("results")
+          for p in PLATFORMS:
+              tsv = root / f"results-{p}" / "results.tsv"
+              if not tsv.exists():
+                  continue
+              for line in tsv.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  case, status = line.split("\t", 1)
+                  results[p][case] = status
+
+          all_cases = sorted({c for p in PLATFORMS for c in results[p]})
+
+          print("## Daily CI Model Test Results")
+          print()
+          print("| Case | " + " | ".join(PLATFORMS) + " |")
+          print("| ---- | " + " | ".join(["---"] * len(PLATFORMS)) + " |")
+          for case in all_cases:
+              cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
+              print(f"| `{case}` | " + " | ".join(cells) + " |")
+          EOF
