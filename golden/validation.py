@@ -34,7 +34,7 @@ def validate_golden(
 
         ok = torch.allclose(actual, expected, rtol=rtol, atol=atol)
         if ok:
-            print(f"  [{name}] PASS  shape={tuple(actual.shape)} dtype={actual.dtype}")
+            print(f"[RUN]   '{name}' PASS  shape={tuple(actual.shape)} dtype={actual.dtype}")
             continue
 
         close_mask = torch.isclose(actual, expected, rtol=rtol, atol=atol)
@@ -48,11 +48,11 @@ def validate_golden(
             for i in idx
         ]
         msg = (
-            f"  [{name}] FAIL  shape={tuple(actual.shape)} dtype={actual.dtype}\n"
+            f"  '{name}' FAIL  shape={tuple(actual.shape)} dtype={actual.dtype}\n"
             f"    Mismatched elements: {mismatch_indices.numel()}/{actual.numel()}  rtol={rtol} atol={atol}\n"
             f"    first {n_show} mismatches:\n" + "\n".join(lines)
         )
-        print(msg)
+        print(f"[RUN]   '{name}' FAIL  shape={tuple(actual.shape)} dtype={actual.dtype}")
         failures[name] = msg
 
     if failures:
