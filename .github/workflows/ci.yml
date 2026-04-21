@@ -20,13 +20,11 @@ jobs:
       matrix:
         platform: [a2a3sim, a5sim]
         pto_isa_commit:
-          - 6eecebc5   # current pin
-          - e612db81   # ~a few commits back
-          - 83f16ef4   # Remove TPack, MOV ZZ, bf16/fp16 TQuant
-          - 554f0793   # TTrans GNC1HWC0 -> GC1HWNC0
-          - 8db2e945   # updated t row/col expand interfaces
-          - 5e55f074   # PTO ISA manual alignment
-          - 1a39845b   # a5 onboard version
+          - 6eecebc5   # current pin (HEAD)
+          - 44088da3   # ~20 commits back: allgather_gemm/gemm_ar a5 adaptation
+          - 221dab5d   # ~40 commits back: FP16->INT8 cast stride/mask fix
+          - 36344067   # ~60 commits back: Preserve BF16 CPU ST generators
+          - 7ab85cea   # ~80 commits back: docs-ux-terminology merge
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTOAS_VERSION: v0.27
