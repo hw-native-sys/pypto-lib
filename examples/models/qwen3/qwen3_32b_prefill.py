@@ -68,7 +68,7 @@ def build_prefill_scope123_program(
     hidden_inv = 1.0 / hidden
 
     @pl.program
-    class PrefillScope123Program:
+    class Prefill32BScope123Program:
         @pl.function(type=pl.FunctionType.Opaque)
         def prefill_scope123(
             self,
@@ -328,13 +328,14 @@ def build_prefill_scope123_program(
                                                 pl.row_expand_mul(oi_sb, beta))
                                     mi = mi_new
 
-                            # Finalize ctx = oi / li and extract valid Q_HEAD_BATCH rows.
+                            # Finalize ctx = oi / li and write back with single assemble.
                             with pl.at(level=pl.Level.CORE_GROUP):
                                 ctx = pl.row_expand_div(oi, li)
-                                for qi in pl.range(Q_HEAD_BATCH):
-                                    q_col = (q_base + qi) * head_dim
-                                    row_bf16 = pl.cast(pl.slice(ctx, [1, head_dim], [qi, 0]), target_type=pl.BF16)
-                                    attn_row = pl.assemble(attn_row, row_bf16, [0, q_col])
+                                ctx_flat = pl.reshape(ctx, [1, Q_HEAD_BATCH * head_dim])
+                                ctx_flat_bf16 = pl.cast(ctx_flat, target_type=pl.BF16)
+                                attn_row = pl.assemble(
+                                    attn_row, ctx_flat_bf16, [0, q_base * head_dim],
+                                )
 
                         # Keep the attention row in the local tile.
                         attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
@@ -455,7 +456,7 @@ def build_prefill_scope123_program(
 
             return out
 
-    return PrefillScope123Program
+    return Prefill32BScope123Program
 
 
 def build_tensor_specs(
