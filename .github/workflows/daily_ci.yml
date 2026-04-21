@@ -1,59 +1,14 @@
-name: CI
+name: Daily CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
 
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  pre-commit:
+  model-tests-sim:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-      - uses: pre-commit/action@v3.0.0
-        with:
-          extra_args: --all-files
-
-  unit-tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-unit-tests
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Run golden unit tests
-        run: pytest tests/golden -v
-
-  sim:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -141,17 +96,28 @@ jobs:
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
-      - name: Run ${{ matrix.platform }} tests
+      - name: Run model tests (${{ matrix.platform }})
         run: |
-          for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
+          failed=()
+          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
-            python "$f" -p ${{ matrix.platform }}
+            t=300; [[ "$f" == *prefill* ]] && t=600
+            if ! timeout $t python "$f" -p ${{ matrix.platform }}; then
+              failed+=("$f")
+              echo "::error file=$f::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All model tests passed."
 
-  a2a3:
+  model-tests-a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
@@ -231,10 +197,21 @@ jobs:
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
-      - name: Run a2a3 tests
+      - name: Run model tests (a2a3)
         run: |
-          for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
+          failed=()
+          for f in $(find examples/models -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
-            python "$f" -p a2a3 -d $DEVICE_ID
+            t=300; [[ "$f" == *prefill* ]] && t=600
+            if ! timeout $t python "$f" -p a2a3 -d $DEVICE_ID; then
+              failed+=("$f")
+              echo "::error file=$f::FAIL"
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All model tests passed."
