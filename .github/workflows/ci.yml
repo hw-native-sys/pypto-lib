@@ -63,7 +63,7 @@ jobs:
       PTOAS_VERSION: v0.27
       PTOAS_SHA256: 80cc39095abbf40af7f670a4b93a4aba2749a081df9f9b57e496d0123ba9bd2a
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 6eecebc5
+      PTO_ISA_COMMIT: 5779238f
 
     steps:
       - name: Checkout pypto-lib
@@ -161,7 +161,7 @@ jobs:
       PTOAS_VERSION: v0.27
       PTOAS_SHA256: 278db325be4503e4ab8afb7c131fecb018d7ce168192723471333d429979d401
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 6eecebc5
+      PTO_ISA_COMMIT: 5779238f
     container:
       image: localhost:5000/ci-device-py310:latest
       options: >-

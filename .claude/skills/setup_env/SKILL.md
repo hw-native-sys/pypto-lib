@@ -43,10 +43,12 @@ If pypto is already installed and up to date, skip this step.
 
 ## Step 4: Install ptoas
 
-The pinned version is in `.github/workflows/ci.yml` (`PTOAS_VERSION`).
+The pinned version is read from `.github/workflows/ci.yml` (`PTOAS_VERSION`).
+Do not hardcode a version here — always derive it from the CI config so this
+skill stays in sync when CI is bumped.
 
 ```bash
-PTOAS_VERSION=v0.27
+PTOAS_VERSION=$(grep -m1 'PTOAS_VERSION:' .github/workflows/ci.yml | awk '{print $2}')
 ARCH=$(uname -m)   # x86_64 or aarch64
 curl --fail --location --retry 3 --retry-all-errors \
   -o /tmp/ptoas-bin-${ARCH}.tar.gz \
@@ -62,9 +64,12 @@ download from GitHub releases to `~/Downloads`, then extract from there.
 
 ## Step 5: Clone pto-isa
 
+The pinned commit is read from `.github/workflows/ci.yml` (`PTO_ISA_COMMIT`).
+
 ```bash
-git clone https://github.com/PTO-ISA/pto-isa.git "$WORKSPACE_DIR/pto-isa"
-git -C "$WORKSPACE_DIR/pto-isa" checkout a652804
+PTO_ISA_COMMIT=$(grep -m1 'PTO_ISA_COMMIT:' .github/workflows/ci.yml | awk '{print $2}')
+git clone https://github.com/hw-native-sys/pto-isa.git "$WORKSPACE_DIR/pto-isa"
+git -C "$WORKSPACE_DIR/pto-isa" checkout "$PTO_ISA_COMMIT"
 export PTO_ISA_ROOT="$WORKSPACE_DIR/pto-isa"
 ```
 

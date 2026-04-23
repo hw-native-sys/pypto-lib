@@ -18,7 +18,7 @@ jobs:
       PTOAS_VERSION: v0.27
       PTOAS_SHA256: 80cc39095abbf40af7f670a4b93a4aba2749a081df9f9b57e496d0123ba9bd2a
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 6eecebc5
+      PTO_ISA_COMMIT: 5779238f
 
     steps:
       - name: Checkout pypto-lib
@@ -66,6 +66,9 @@ jobs:
         if: steps.cache-pypto.outputs.cache-hit != 'true'
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
+          sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
+            /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
           pip wheel /tmp/pypto -w /tmp/pypto-wheels --no-deps
           pip wheel /tmp/pypto/runtime -w /tmp/pypto-wheels --no-deps
 
@@ -137,7 +140,7 @@ jobs:
       PTOAS_VERSION: v0.27
       PTOAS_SHA256: 278db325be4503e4ab8afb7c131fecb018d7ce168192723471333d429979d401
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 6eecebc5
+      PTO_ISA_COMMIT: 5779238f
     container:
       image: localhost:5000/ci-device-py310:latest
       options: >-
@@ -179,6 +182,9 @@ jobs:
         if: steps.cache-pypto.outputs.cache-hit != 'true'
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
+          sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
+            /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
           pip wheel /tmp/pypto -w /tmp/pypto-wheels --no-deps
           pip wheel /tmp/pypto/runtime -w /tmp/pypto-wheels --no-deps
 
