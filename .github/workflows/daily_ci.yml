@@ -51,29 +51,14 @@ jobs:
           pip install nanobind
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Get pypto HEAD commit
-        id: pypto-hash
-        run: echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
-      - name: Cache pypto wheels
-        id: cache-pypto
-        uses: actions/cache@v4
-        with:
-          path: /tmp/pypto-wheels
-          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
-
-      - name: Build pypto wheels
-        if: steps.cache-pypto.outputs.cache-hit != 'true'
+      - name: Build and install pypto and simpler
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
           # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
           sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
             /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
-          pip wheel /tmp/pypto -w /tmp/pypto-wheels --no-deps
-          pip wheel /tmp/pypto/runtime -w /tmp/pypto-wheels --no-deps
-
-      - name: Install pypto and simpler
-        run: pip install /tmp/pypto-wheels/*.whl
+          pip install /tmp/pypto
+          pip install /tmp/pypto/runtime
 
       - name: Cache ptoas binary
         id: cache-ptoas
@@ -167,29 +152,14 @@ jobs:
       - name: Add Ascend tools to PATH
         run: echo "$ASCEND_HOME_PATH/bin" >> $GITHUB_PATH
 
-      - name: Get pypto HEAD commit
-        id: pypto-hash
-        run: echo "hash=$(git ls-remote https://github.com/hw-native-sys/pypto.git HEAD | cut -f1)" >> $GITHUB_OUTPUT
-
-      - name: Cache pypto wheels
-        id: cache-pypto
-        uses: actions/cache@v4
-        with:
-          path: /tmp/pypto-wheels
-          key: pypto-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ steps.pypto-hash.outputs.hash }}
-
-      - name: Build pypto wheels
-        if: steps.cache-pypto.outputs.cache-hit != 'true'
+      - name: Build and install pypto and simpler
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
           # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
           sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
             /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
-          pip wheel /tmp/pypto -w /tmp/pypto-wheels --no-deps
-          pip wheel /tmp/pypto/runtime -w /tmp/pypto-wheels --no-deps
-
-      - name: Install pypto and simpler
-        run: pip install /tmp/pypto-wheels/*.whl
+          pip install /tmp/pypto
+          pip install /tmp/pypto/runtime
 
       - name: Cache ptoas binary
         id: cache-ptoas
