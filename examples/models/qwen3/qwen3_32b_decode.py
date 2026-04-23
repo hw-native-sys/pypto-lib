@@ -111,7 +111,7 @@ def build_qwen3_decode_program(
             v_proj = pl.create_tensor([batch, kv_hidden], dtype=pl.FP32)
 
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
-            for b0 in pl.range(0, batch, BATCH_TILE):
+            for b0 in pl.parallel(0, batch, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
                 with pl.at(level=pl.Level.CORE_GROUP):
@@ -191,7 +191,7 @@ def build_qwen3_decode_program(
                     )
 
             attn_out = pl.create_tensor([batch, hidden], dtype=pl.BF16)
-            for b in pl.range(batch):
+            for b in pl.parallel(batch):
                 ctx_len = pl.tensor.read(seq_lens, [b])
                 pos = ctx_len - 1
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
@@ -334,7 +334,7 @@ def build_qwen3_decode_program(
                 attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
             # ── Scope 3: output projection + residual + post RMSNorm + MLP + residual ──
-            for b0 in pl.range(0, batch, BATCH_TILE):
+            for b0 in pl.parallel(0, batch, BATCH_TILE):
                 resid1_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.FP32)
 
                 # Stage 1: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK.
