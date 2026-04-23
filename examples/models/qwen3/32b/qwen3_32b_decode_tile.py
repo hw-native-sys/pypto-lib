@@ -16,8 +16,6 @@ Scope 2, and Scope 3 tile kernels:
   3. Scope 3: output projection + residual + post RMSNorm + MLP
 """
 
-from __future__ import annotations
-
 import pypto.language as pl
 
 BATCH = 16
@@ -1400,11 +1398,6 @@ def golden_qwen3_decode(tensors: dict, params: dict | None = None) -> None:
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

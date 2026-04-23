@@ -60,11 +60,11 @@ def build_qwen3_scope3_program(
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
             out: pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16],
         ) -> pl.Tensor[[BATCH_CFG, HIDDEN_CFG], pl.BF16]:
-            for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
+            for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE):
                 resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
 
                 # Stage 0 & 1: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK & Residual addition with hidden_states
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
                     for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=4):
                         o0 = ob * Q_OUT_CHUNK
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
@@ -72,7 +72,12 @@ def build_qwen3_scope3_program(
                         hidden_chunk = pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0])
 
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+
+                        a_chunk_1 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, K_CHUNK])
+                        w_chunk_1 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [K_CHUNK, o0])
+                        o_acc = pl.matmul_acc(o_acc, a_chunk_1, w_chunk_1)
+
+                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
                             w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
@@ -87,15 +92,15 @@ def build_qwen3_scope3_program(
 
                 # Stage 2: Post-attention RMSNorm
                 post_norm_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.BF16)
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rmsnorm"):
                     sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    for kb in pl.range(HIDDEN_BLOCKS):
+                    for kb in pl.pipeline(HIDDEN_BLOCKS, stage=2):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_TILE]))
                     inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)))
 
-                    for kb in pl.range(HIDDEN_BLOCKS):
+                    for kb in pl.pipeline(HIDDEN_BLOCKS, stage=2):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                         gamma = pl.slice(post_rms_weight, [1, K_CHUNK], [0, k0])
@@ -105,31 +110,40 @@ def build_qwen3_scope3_program(
 
                 # Stage 3 & 4 & 5: MLP: gate/up projections + SiLU
                 mlp_tile = pl.create_tensor([BATCH_TILE, INTER_CFG], dtype=pl.BF16)
-                for ob in pl.range(MLP_OUT_BLOCKS):
+                for ob in pl.parallel(0, MLP_OUT_BLOCKS, 1):
                     o0 = ob * MLP_OUT_CHUNK
 
                     post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
+                    post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
                     wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                     wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
                         # Gate projection
                         gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+
+                        wg_1 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
+                        gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
+
+                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
                         # Up projection
                         up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+
+                        wu_1 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
+                        up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
+
+                        for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
                             up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="silu"):
                         # SiLU activation
                         sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
@@ -138,7 +152,7 @@ def build_qwen3_scope3_program(
                     mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
                 # Stage 6 & 7: Down projection + final residual writeback (fused with chunked_loop_optimizer)
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
                     for dob in pl.parallel(0, HIDDEN_BLOCKS, chunk=2):
                         d0 = dob * K_CHUNK
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
@@ -146,7 +160,12 @@ def build_qwen3_scope3_program(
                         resid1_tile_chunk = pl.slice(resid1_tile, [BATCH_TILE, K_CHUNK], [0, d0])
 
                         down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
-                        for ob in pl.range(1, MLP_OUT_BLOCKS):
+
+                        mlp_chunk_1 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, MLP_OUT_CHUNK])
+                        w_down_chunk_1 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [MLP_OUT_CHUNK, d0])
+                        down_acc = pl.matmul_acc(down_acc, mlp_chunk_1, w_down_chunk_1)
+
+                        for ob in pl.pipeline(2, MLP_OUT_BLOCKS, stage=2):
                             o0 = ob * MLP_OUT_CHUNK
                             down_mlp_chunk_bf16 = pl.slice(
                                 mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, o0]
@@ -256,11 +275,6 @@ def build_tensor_specs(
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

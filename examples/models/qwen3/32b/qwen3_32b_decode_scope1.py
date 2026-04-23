@@ -64,13 +64,13 @@ def build_qwen3_scope1_program(
             pl.Tensor[[batch, kv_hidden], pl.FP32],
             pl.Tensor[[batch, kv_hidden], pl.FP32],
         ]:
-            for b0 in pl.range(0, batch, BATCH_TILE):
+            for b0 in pl.parallel(0, batch, BATCH_TILE):
                 normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
                 # Stage 1: RMSNorm + apply weights (vector ops only).
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
                     partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-                    for kb in pl.range(hidden_blocks):
+                    for kb in pl.pipeline(hidden_blocks, stage=2):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
@@ -89,7 +89,7 @@ def build_qwen3_scope1_program(
 
                     inv_rms = pl.recip(pl.sqrt(variance))
 
-                    for kb in pl.range(hidden_blocks):
+                    for kb in pl.pipeline(hidden_blocks, stage=2):
                         k0 = kb * K_CHUNK
                         x_chunk = pl.cast(
                             pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0]),
@@ -100,7 +100,7 @@ def build_qwen3_scope1_program(
                         normed_tile = pl.assemble(normed_tile, pl.cast(normed, target_type=pl.BF16), [0, k0])
 
                 # Stage 2: Q projection (matmul + matmul_acc in single incore).
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_proj"):
                     for ob in pl.parallel(q_out_blocks, chunk=4):
                         q0 = ob * Q_OUT_CHUNK
 
@@ -108,7 +108,11 @@ def build_qwen3_scope1_program(
                         tile_b = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
                         q_acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
 
-                        for kb in pl.range(1, hidden_blocks):
+                        tile_a_1 = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
+                        tile_b_1 = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [K_CHUNK, q0])
+                        q_acc = pl.matmul_acc(q_acc, tile_a_1, tile_b_1)
+
+                        for kb in pl.pipeline(2, hidden_blocks, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_b_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
@@ -117,7 +121,7 @@ def build_qwen3_scope1_program(
                         q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 # Stage 3: K/V projection (matmul + matmul_acc in single incore).
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="kv_proj"):
                     for ob in pl.parallel(kv_out_blocks, chunk=4):
                         kv0 = ob * KV_OUT_CHUNK
 
@@ -125,7 +129,11 @@ def build_qwen3_scope1_program(
                         tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
 
-                        for kb in pl.range(1, hidden_blocks):
+                        tile_a_k1 = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
+                        tile_wk_1 = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [K_CHUNK, kv0])
+                        k_acc = pl.matmul_acc(k_acc, tile_a_k1, tile_wk_1)
+
+                        for kb in pl.pipeline(2, hidden_blocks, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
@@ -137,7 +145,11 @@ def build_qwen3_scope1_program(
                         tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
 
-                        for kb in pl.range(1, hidden_blocks):
+                        tile_a_v1 = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
+                        tile_wv_1 = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [K_CHUNK, kv0])
+                        v_acc = pl.matmul_acc(v_acc, tile_a_v1, tile_wv_1)
+
+                        for kb in pl.pipeline(2, hidden_blocks, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, k0])
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
@@ -235,11 +247,6 @@ def golden_qwen3_scope1(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

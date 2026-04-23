@@ -143,6 +143,8 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run ${{ matrix.platform }} tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"
@@ -233,6 +235,8 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run a2a3 tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           for f in $(find examples/beginner examples/intermediate -name '*.py' ! -name '*draft*' | sort); do
             echo "::group::$f"

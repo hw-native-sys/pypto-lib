@@ -6,8 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-from __future__ import annotations
-
 """
 DeepSeek V3.2-EXP single-layer decode FRONT part — Scope 4 only.
 
@@ -290,7 +288,7 @@ def build_deepseek_v3_2_decode_front_scope4_program(
     return DeepSeekV32DecodeFrontScope4
 
 
-def build_inputs(
+def build_tensor_specs(
     batch: int = BATCH,
     max_seq_len: int = MAX_SEQ,
     num_heads: int = NUM_HEADS,
@@ -301,7 +299,8 @@ def build_inputs(
     index_topk: int = INDEX_TOPK,
     ep_nodes: int = EP_NODES,
 ):
-    import torch
+    import torch  # type: ignore[import]
+    from golden import TensorSpec
 
     torch.manual_seed(4242)
 
@@ -310,43 +309,53 @@ def build_inputs(
     attn_out = num_heads * v_head_dim
     sparse_k = min(max_seq_len, index_topk)
 
-    q_proj = (torch.rand(batch, num_heads * qk_head_dim, dtype=torch.float32) - 0.5).to(torch.bfloat16)
-    kv_cache = (torch.rand(cache_rows, kv_lora_rank, dtype=torch.float32) - 0.5).to(torch.bfloat16)
-    pe_cache = (torch.rand(cache_rows, qk_rope_head_dim, dtype=torch.float32) - 0.5).to(torch.bfloat16)
+    def init_q_proj():
+        return (torch.rand(batch, num_heads * qk_head_dim, dtype=torch.float32) - 0.5)
 
-    topk_idx = torch.full((batch, index_topk), -1, dtype=torch.int32)
-    for b in range(batch):
-        topk_row = torch.randperm(max_seq_len, dtype=torch.int64)[:sparse_k].to(torch.int32)
-        topk_idx[b, :sparse_k] = torch.sort(topk_row).values
+    def init_kv_cache():
+        return (torch.rand(cache_rows, kv_lora_rank, dtype=torch.float32) - 0.5)
 
-    seq_lens = torch.full((batch,), sparse_k, dtype=torch.int32)
-    layer_id_t = torch.tensor([0], dtype=torch.int32)
-    w_q_nope_to_latent = (
-        (torch.rand(num_heads, qk_nope_head_dim, kv_lora_rank, dtype=torch.float32) - 0.5)
-        / (qk_nope_head_dim ** 0.5)
-    ).to(torch.bfloat16)
-    w_latent_to_v = (
-        (torch.rand(num_heads, kv_lora_rank, v_head_dim, dtype=torch.float32) - 0.5)
-        / (kv_lora_rank ** 0.5)
-    ).to(torch.bfloat16)
-    dispatch_buf = torch.zeros(ep_nodes, batch, attn_out, dtype=torch.bfloat16)
+    def init_pe_cache():
+        return (torch.rand(cache_rows, qk_rope_head_dim, dtype=torch.float32) - 0.5)
 
-    return (
-        q_proj,
-        kv_cache,
-        pe_cache,
-        topk_idx,
-        seq_lens,
-        layer_id_t,
-        w_q_nope_to_latent,
-        w_latent_to_v,
-        dispatch_buf,
-    )
+    def init_topk_idx():
+        topk_idx = torch.full((batch, index_topk), -1, dtype=torch.int32)
+        for b in range(batch):
+            topk_row = torch.randperm(max_seq_len, dtype=torch.int64)[:sparse_k].to(torch.int32)
+            topk_idx[b, :sparse_k] = torch.sort(topk_row).values
+        return topk_idx
+
+    def init_seq_lens():
+        return torch.full((batch,), sparse_k, dtype=torch.int32)
+
+    layer_id_data = torch.tensor([0], dtype=torch.int32)
+
+    def init_w_q_nope_to_latent():
+        return (
+            (torch.rand(num_heads, qk_nope_head_dim, kv_lora_rank, dtype=torch.float32) - 0.5)
+            / (qk_nope_head_dim ** 0.5)
+        )
+
+    def init_w_latent_to_v():
+        return (
+            (torch.rand(num_heads, kv_lora_rank, v_head_dim, dtype=torch.float32) - 0.5)
+            / (kv_lora_rank ** 0.5)
+        )
+
+    return [
+        TensorSpec("q_proj", [batch, num_heads * qk_head_dim], torch.bfloat16, init_value=init_q_proj),
+        TensorSpec("kv_cache", [cache_rows, kv_lora_rank], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("pe_cache", [cache_rows, qk_rope_head_dim], torch.bfloat16, init_value=init_pe_cache),
+        TensorSpec("topk_idx", [batch, index_topk], torch.int32, init_value=init_topk_idx),
+        TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
+        TensorSpec("layer_id_t", [1], torch.int32, init_value=layer_id_data),
+        TensorSpec("w_q_nope_to_latent", [num_heads, qk_nope_head_dim, kv_lora_rank], torch.bfloat16, init_value=init_w_q_nope_to_latent),
+        TensorSpec("w_latent_to_v", [num_heads, kv_lora_rank, v_head_dim], torch.bfloat16, init_value=init_w_latent_to_v),
+        TensorSpec("dispatch_buf", [ep_nodes, batch, attn_out], torch.bfloat16, is_output=True),
+    ]
 
 
-def golden_decode_front_scope4(tensors, params=None):
-    del params
-
+def golden_decode_front_scope4(tensors):
     import torch
 
     q_proj = tensors["q_proj"].float()
@@ -421,126 +430,9 @@ def golden_decode_front_scope4(tensors, params=None):
         dispatch_buf[target_node, b].copy_(attn_front[b].to(torch.bfloat16))
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq_len: int = MAX_SEQ,
-    num_heads: int = NUM_HEADS,
-    kv_lora_rank: int = KV_LORA_RANK,
-    qk_nope_head_dim: int = QK_NOPE_HEAD_DIM,
-    qk_rope_head_dim: int = QK_ROPE_HEAD_DIM,
-    v_head_dim: int = V_HEAD_DIM,
-    index_topk: int = INDEX_TOPK,
-    ep_nodes: int = EP_NODES,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    dump_passes: bool = True,
-    runtime_profiling: bool = False,
-):
-    import time
-
-    import torch
-
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, RunResult, run
-
-    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-
-    print(
-        "Scope4 profile:",
-        {
-            "batch": batch,
-            "max_seq": max_seq_len,
-            "num_heads": num_heads,
-            "kv_lora_rank": kv_lora_rank,
-            "index_topk": index_topk,
-            "ep_nodes": ep_nodes,
-        },
-    )
-
-    program = build_deepseek_v3_2_decode_front_scope4_program(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        num_heads=num_heads,
-        kv_lora_rank=kv_lora_rank,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-        index_topk=index_topk,
-        ep_nodes=ep_nodes,
-    )
-
-    (
-        q_proj,
-        kv_cache,
-        pe_cache,
-        topk_idx,
-        seq_lens,
-        layer_id_t,
-        w_q_nope_to_latent,
-        w_latent_to_v,
-        dispatch_buf,
-    ) = build_inputs(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        num_heads=num_heads,
-        kv_lora_rank=kv_lora_rank,
-        qk_nope_head_dim=qk_nope_head_dim,
-        qk_rope_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
-        index_topk=index_topk,
-        ep_nodes=ep_nodes,
-    )
-
-    expected_tensors = {
-        "q_proj": q_proj.detach().clone(),
-        "kv_cache": kv_cache.detach().clone(),
-        "pe_cache": pe_cache.detach().clone(),
-        "topk_idx": topk_idx.detach().clone(),
-        "seq_lens": seq_lens.detach().clone(),
-        "layer_id_t": layer_id_t.detach().clone(),
-        "w_q_nope_to_latent": w_q_nope_to_latent.detach().clone(),
-        "w_latent_to_v": w_latent_to_v.detach().clone(),
-        "dispatch_buf": dispatch_buf.detach().clone(),
-    }
-    golden_decode_front_scope4(expected_tensors, None)
-
-    start = time.perf_counter()
-
-    run(
-        program,
-        q_proj,
-        kv_cache,
-        pe_cache,
-        topk_idx,
-        seq_lens,
-        layer_id_t,
-        w_q_nope_to_latent,
-        w_latent_to_v,
-        dispatch_buf,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=1e-3,
-            atol=1e-3,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=backend,
-            runtime_profiling=runtime_profiling,
-        ),
-    )
-    execution_time = time.perf_counter() - start
-
-    try:
-        torch.testing.assert_close(dispatch_buf, expected_tensors["dispatch_buf"], rtol=1e-3, atol=1e-3)
-    except AssertionError as exc:
-        return RunResult(passed=False, error=str(exc), execution_time=execution_time)
-
-    return RunResult(passed=True, execution_time=execution_time)
-
-
 if __name__ == "__main__":
     import argparse
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -557,20 +449,23 @@ if __name__ == "__main__":
 
     profile = REDUCED_PROFILE if args.profile == "reduced" else FULL_PROFILE
 
-    result = compile_and_run(
-        batch=profile["batch"],
-        max_seq_len=profile["max_seq_len"],
-        num_heads=profile["num_heads"],
-        kv_lora_rank=profile["kv_lora_rank"],
-        qk_nope_head_dim=profile["qk_nope_head_dim"],
-        qk_rope_head_dim=profile["qk_rope_head_dim"],
-        v_head_dim=profile["v_head_dim"],
-        index_topk=profile["index_topk"],
-        ep_nodes=profile["ep_nodes"],
-        platform=args.platform,
-        device_id=args.device,
-        dump_passes=True,
-        runtime_profiling=args.runtime_profiling,
+    program = build_deepseek_v3_2_decode_front_scope4_program(**profile)
+    tensor_specs = build_tensor_specs(**profile)
+
+    result = run(
+        program=program,
+        tensor_specs=tensor_specs,
+        golden_fn=golden_decode_front_scope4,
+        config=RunConfig(
+            rtol=1e-3,
+            atol=1e-3,
+            compile=dict(dump_passes=True),
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:

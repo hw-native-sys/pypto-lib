@@ -26,8 +26,6 @@ Input projections are FP32; q_norm/k_norm weights are FP32; KV caches are BF16.
 Output attention is BF16.
 """
 
-from __future__ import annotations
-
 import pypto.language as pl
 
 BATCH = 16
@@ -532,11 +530,6 @@ def golden_qwen3_scope2(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

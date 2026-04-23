@@ -16,8 +16,6 @@ Stage 0 (matmul: attn_out x wo) and Stage 1 (residual add) can be:
 
 Input and hidden_states are BF16; wo is BF16; output is FP32.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 # ---------------------------------------------------------------------------
@@ -149,11 +147,6 @@ def golden_gemm_eltwise(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

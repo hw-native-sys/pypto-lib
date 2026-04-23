@@ -14,8 +14,6 @@ For each batch element with variable-length tokens (processed in TOK_TILE chunks
   3. MLP gate/up projections, SiLU activation, down projection
   4. Final residual addition -> BF16 output
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 BATCH = 16
@@ -304,11 +302,6 @@ def build_tensor_specs(
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

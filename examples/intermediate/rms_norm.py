@@ -20,8 +20,6 @@ hidden dimension exceeds on-chip buffer capacity.
 
 Input and output are FP32; gamma is a [1, hidden] weight vector.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 ROWS = 512              # batch / sequence length
@@ -107,11 +105,6 @@ def golden_rms_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

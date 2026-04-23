@@ -6,8 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-from __future__ import annotations
-
 """
 DeepSeek V3.2-EXP single-layer decode BACK part (batch=16, max_seq=4096).
 
@@ -299,11 +297,6 @@ def golden_deepseek_v3_2_decode_back(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

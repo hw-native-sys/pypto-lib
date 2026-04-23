@@ -6,8 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-from __future__ import annotations
-
 """
 DeepSeek V3.2-EXP single-layer prefill BACK part (batch=16, max_seq=4096).
 [NOTE] Current test is reduced to batch=4, max_seq=128 for faster iteration and dodge HBM OOM issue.
@@ -16,8 +14,6 @@ BACK boundary:
 - read combine tensor
 - run complete residual + MLP + output path
 """
-
-import os
 
 import pypto.language as pl
 
@@ -233,7 +229,7 @@ def build_tensor_specs(
     ep_nodes: int = EP_NODES,
 ):
     import torch  # type: ignore[import]
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     def init_seq_lens():
         n_blocks = max_seq_len // TOK_TILE
@@ -274,7 +270,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_prefill_back(tensors, params):
+def golden_prefill_back(tensors):
     """Reference computation for DeepSeek V3.2 prefill back.
 
     Steps:
@@ -338,65 +334,9 @@ def golden_prefill_back(tensors, params):
         out_t[b, sl, :] = (down + resid1).bfloat16()
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq_len: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    intermediate_size: int = INTERMEDIATE,
-    attn_out_size: int = ATTN_OUT,
-    ep_nodes: int = EP_NODES,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    work_dir: str | None = None,
-    dump_passes: bool = True,
-    runtime_profiling: bool = False,
-):
-    from pypto.backend import BackendType
-    from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.runtime import RunConfig, run
-
-    backend = BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
-
-    program = build_deepseek_v3_2_prefill_back_program(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        attn_out_size=attn_out_size,
-        ep_nodes=ep_nodes,
-    )
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        max_seq_len=max_seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        attn_out_size=attn_out_size,
-        ep_nodes=ep_nodes,
-    )
-
-    if work_dir is None:
-        work_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "deepseek_v3_2_prefill_back_dump"))
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden=golden_prefill_back,
-        config=RunConfig(
-            platform=platform,
-            device_id=device_id,
-            rtol=3e-3,
-            atol=3e-3,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=dump_passes,
-            backend_type=backend,
-            runtime_profiling=runtime_profiling,
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -405,10 +345,20 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        runtime_profiling=args.runtime_profiling,
+    result = run(
+        program=build_deepseek_v3_2_prefill_back_program(),
+        tensor_specs=build_tensor_specs(),
+        golden_fn=golden_prefill_back,
+        config=RunConfig(
+            rtol=3e-3,
+            atol=3e-3,
+            compile=dict(dump_passes=True),
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:

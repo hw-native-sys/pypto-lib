@@ -16,8 +16,6 @@ keeping the kernel simple and single-pass friendly.
 
 Input and output are FP32; gamma and beta are [1, hidden] weight vectors.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 ROWS = 512              # batch / sequence length
@@ -105,11 +103,6 @@ def golden_layer_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

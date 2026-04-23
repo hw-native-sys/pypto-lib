@@ -12,8 +12,6 @@ Fuses the full single-layer prefill path: input RMSNorm, Q/K/V projection,
 RoPE, KV cache update, causal attention, output projection, post-attention
 RMSNorm, SwiGLU MLP, and the final residual path.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 
@@ -743,72 +741,9 @@ def golden_prefill_scope123(tensors):
     tensors["out"][:] = out_t.to(torch.bfloat16)
 
 
-def compile_and_run(
-    batch: int = BATCH,
-    max_seq: int = MAX_SEQ,
-    hidden_size: int = HIDDEN,
-    num_heads: int = NUM_HEADS,
-    num_kv_heads: int = NUM_KV_HEADS,
-    head_dim: int = HEAD_DIM,
-    intermediate_size: int = INTERMEDIATE,
-    use_max_seq: bool = False,
-    platform: str = "a2a3",
-    device_id: int = 0,
-    dump_passes: bool = True,
-    runtime_profiling: bool = False,
-    runtime_dir: str | None = None,
-):
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
-    from golden import RunConfig, run
-
-    program = build_prefill_scope123_program(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        intermediate_size=intermediate_size,
-    )
-    tensor_specs = build_tensor_specs(
-        batch=batch,
-        max_seq=max_seq,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        intermediate_size=intermediate_size,
-        use_max_seq=use_max_seq,
-    )
-
-    golden_data = str(Path(runtime_dir) / "data") if runtime_dir else None
-
-    result = run(
-        program=program,
-        tensor_specs=tensor_specs,
-        golden_fn=golden_prefill_scope123,
-        runtime_dir=runtime_dir,
-        golden_data=golden_data,
-        config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
-            compile=dict(dump_passes=dump_passes),
-            runtime=dict(
-                platform=platform,
-                device_id=device_id,
-                runtime_profiling=runtime_profiling,
-            ),
-        ),
-    )
-    return result
-
-
 if __name__ == "__main__":
     import argparse
+    from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -816,20 +751,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
-    parser.add_argument(
-        "--runtime-dir", type=str, default=None, help="reuse a previous build_output dir and golden data"
-    )
     parser.add_argument("--max-seq", action="store_true", default=False, help="set all seq_lens to MAX_SEQ")
     args = parser.parse_args()
 
-    result = compile_and_run(
-        platform=args.platform,
-        device_id=args.device,
-        use_max_seq=args.max_seq,
-        runtime_profiling=args.runtime_profiling,
-        runtime_dir=args.runtime_dir,
+    result = run(
+        program=build_prefill_scope123_program(),
+        tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
+        golden_fn=golden_prefill_scope123,
+        config=RunConfig(
+            rtol=3e-3,
+            atol=3e-3,
+            compile=dict(dump_passes=True),
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
     )
     if not result.passed:
         if result.error:
-            print(f"Result: {result.error}")
+            print(result.error)
         raise SystemExit(1)

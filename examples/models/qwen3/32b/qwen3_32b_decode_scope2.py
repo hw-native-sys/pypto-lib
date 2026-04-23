@@ -16,8 +16,6 @@
 Input projections are FP32; cos/sin tables are FP32; KV caches are BF16.
 Output attention is BF16.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 BATCH = 16
@@ -66,15 +64,15 @@ def build_qwen3_scope2_program(
         ) -> pl.Tensor[[batch, hidden], pl.BF16]:
             # Padding q
             all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-            with pl.at(level=pl.Level.CORE_GROUP):
-                for idx in pl.range(batch * total_q_groups):
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_pad_init"):
+                for idx in pl.parallel(batch * total_q_groups, chunk=8):
                     all_q_padded = pl.assemble(
                         all_q_padded,
                         pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                         [idx * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
                     )
 
-            for b in pl.range(batch):
+            for b in pl.parallel(0, batch, 1):
                 ctx_len = pl.tensor.read(seq_lens, [b])
                 pos = ctx_len - 1
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
@@ -86,7 +84,7 @@ def build_qwen3_scope2_program(
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="rope_kv_cache"):
                     for ki in pl.parallel(0, num_kv_heads, chunk=8):
                         # K RoPE + cache update.
                         kv_col = ki * head_dim
@@ -144,7 +142,7 @@ def build_qwen3_scope2_program(
                             all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, half_dim])
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
-                for gi in pl.range(total_q_groups):
+                for gi in pl.parallel(0, total_q_groups, 1):
                     kvh = gi // q_groups
                     qg = gi - kvh * q_groups
                     q_base = kvh * q_per_kv + qg * Q_HEAD_BATCH
@@ -156,7 +154,7 @@ def build_qwen3_scope2_program(
                     all_oi_tmp = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, head_dim], dtype=pl.FP32)
                     all_cur_mi = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
                     all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_BATCH, 1], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="qk_matmul"):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
                             cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
@@ -169,7 +167,7 @@ def build_qwen3_scope2_program(
                             all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
                     # Stage 3: softmax for all active sb blocks.
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="softmax"):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
                             valid_len = pl.min(SEQ_TILE, ctx_len - s0)
@@ -191,7 +189,7 @@ def build_qwen3_scope2_program(
                             all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_BATCH, 0])
 
                     # Stage 4: SV matmul for all active sb blocks.
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="sv_matmul"):
                         for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                             s0 = sb * SEQ_TILE
                             cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
@@ -209,7 +207,7 @@ def build_qwen3_scope2_program(
                             all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                     # Stage 5: online softmax accumulation and normalisation.
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="online_softmax"):
                         oi = pl.slice(all_oi_tmp, [Q_HEAD_BATCH, head_dim], [0, 0])
                         mi = pl.slice(all_cur_mi, [Q_HEAD_BATCH, 1], [0, 0])
                         li = pl.slice(all_cur_li, [Q_HEAD_BATCH, 1], [0, 0])
@@ -433,11 +431,6 @@ def golden_qwen3_scope2(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

@@ -16,8 +16,6 @@ Input hidden states are BF16; weights are BF16; projections output FP32.
 This aligns with decode_scope1 so that scope 2 receives FP32 projections
 for RoPE, avoiding an extra BF16 round-trip.
 """
-from __future__ import annotations
-
 import pypto.language as pl
 
 
@@ -272,11 +270,6 @@ def golden_prefill_projection(tensors):
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from pathlib import Path
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
     from golden import RunConfig, run
 
     parser = argparse.ArgumentParser()

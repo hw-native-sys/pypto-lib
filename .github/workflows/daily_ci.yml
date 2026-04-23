@@ -98,6 +98,8 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run model tests (${{ matrix.platform }})
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           : > results.tsv
           failed=""
@@ -209,6 +211,8 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Run model tests (a2a3)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           : > results.tsv
           failed=""
