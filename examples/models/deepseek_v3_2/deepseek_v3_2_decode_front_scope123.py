@@ -11,9 +11,11 @@ DeepSeek V3.2-EXP decode front fused kernel (scope1 + scope2 + scope3).
 
 Fused pipeline:
 - Scope1: RMSNorm + Q/KV projection + RoPE + KV/PE cache update
-- Scope2: indexer projection + indexer RoPE + weight reduction + k_cache_idx update
+- Scope2: indexer projection + indexer RoPE + INT8 quant/dequant + weight
+  reduction + k_cache_idx update
 - Scope3: q_idx x k_cache_idx scoring + topk
 """
+
 
 import pypto.language as pl
 
@@ -51,6 +53,10 @@ K_CHUNK = 128
 IDX_OUT_CHUNK = 128
 WEIGHTS_OUT_CHUNK = 64
 HADAMARD_SCALE = INDEX_HEAD_DIM ** -0.5
+INT8_GROUP_SIZE = 128
+INT8_SCALE_MAX = 127.0
+INT8_AMAX_EPS = 1e-4
+INT8_SCALE_PACK = 8
 
 # Scope3 tiles
 SEQ_TILE = 64
@@ -61,7 +67,7 @@ SORT_LEN = 8192
 FP32_NEG_INF = -3.4028234663852886e38
 
 
-def build_deepseek_v3_2_decode_front_scope123_program(
+def build_deepseek_v3_2_decode_front_scope123_int8_quant_program(
     batch: int = BATCH,
     max_seq_len: int = MAX_SEQ,
     hidden_size: int = HIDDEN,
@@ -93,6 +99,12 @@ def build_deepseek_v3_2_decode_front_scope123_program(
     INDEX_Q_OUT_CFG = index_heads * index_head_dim
     INDEX_HEAD_DIM_INV = 1.0 / index_head_dim
     WEIGHT_SCALE = (index_heads ** -0.5) * (index_head_dim ** -0.5)
+    if INDEX_HEAD_DIM_CFG != INT8_GROUP_SIZE:
+        raise ValueError(
+            f"INT8 quant path expects index_head_dim == {INT8_GROUP_SIZE}, "
+            f"got {INDEX_HEAD_DIM_CFG}"
+        )
+    INDEX_Q_ROWS_CFG = batch * index_heads
 
     RMSNORM_BLOCKS = (HIDDEN_CFG + RMSNORM_K - 1) // RMSNORM_K
     PROJ_BLOCKS = (HIDDEN_CFG + PROJ_K - 1) // PROJ_K
@@ -107,7 +119,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
     Q_LORA_INV_CFG = 1.0 / q_lora_rank
 
     @pl.program
-    class DeepSeekV32DecodeFrontScope123:
+    class DeepSeekV32DecodeFrontScope123Int8Quant:
         @pl.function(type=pl.FunctionType.Opaque)
         def deepseek_v3_2_decode_front_scope123(
             self,
@@ -125,7 +137,8 @@ def build_deepseek_v3_2_decode_front_scope123_program(
             q_proj_out: pl.Tensor[[BATCH_CFG, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], pl.BF16],
             kv_cache: pl.Tensor[[CACHE_ROWS_CFG, KV_LORA_RANK_CFG], pl.BF16],
             pe_cache: pl.Tensor[[CACHE_ROWS_CFG, QK_ROPE_HEAD_DIM_CFG], pl.BF16],
-            k_cache_idx: pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.BF16],
+            k_cache_idx_i8: pl.Tensor[[CACHE_ROWS_CFG, INDEX_HEAD_DIM_CFG], pl.INT8],
+            k_cache_idx_scale: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG], pl.FP32],
             topk_idx_out: pl.Tensor[[BATCH_CFG, INDEX_TOPK], pl.INT32],
         ) -> pl.Tensor[[BATCH_CFG, INDEX_TOPK], pl.INT32]:
             # Unpack packed inputs into logical weights to stay within runtime tensor-arg limits.
@@ -224,6 +237,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                 # Stage 1.4: Project qr_out -> q_nope (no-pe slice for each head).
                 for h in pl.parallel(0, NUM_HEADS_CFG, 1):
                     for q_loop in pl.parallel(0, QK_NOPE_HEAD_DIM_CFG, Q_OUT_CHUNK):
+                        # Stage 1.4a: Accumulate one q_nope head chunk in an InCore matmul loop.
                         with pl.at(level=pl.Level.CORE_GROUP):
                             q_base = h * QK_HEAD_DIM_CFG
                             q0 = q_base + q_loop
@@ -238,6 +252,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
 
                 # Stage 1.5: Project qr_out -> q_pe (pe slice for each head, before RoPE).
                 for h in pl.parallel(0, NUM_HEADS_CFG, 1):
+                    # Stage 1.5a: Accumulate one q_pe head chunk before RoPE.
                     with pl.at(level=pl.Level.CORE_GROUP):
                         q_base = h * QK_HEAD_DIM_CFG
                         q_pe_acc = pl.full([BATCH_TILE, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
@@ -252,6 +267,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
 
                 # Stage 1.6: Apply RoPE on q_pe using scope1's per-row update pattern.
                 for h in pl.parallel(0, NUM_HEADS_CFG, 1):
+                    # Stage 1.6a: Rotate one q_pe head across the batch tile.
                     with pl.at(level=pl.Level.CORE_GROUP):
                         q_pe_col = h * QK_ROPE_HEAD_DIM_CFG
                         for b in pl.range(BATCH_TILE):
@@ -337,6 +353,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
 
             # Stage 1.9: Apply kv_norm on the first KV_LORA_RANK channels of KV latent.
             kv_normed_out = pl.create_tensor([BATCH_CFG, KV_LORA_RANK_CFG], dtype=pl.BF16)
+            # Stage 1.9a: Normalize the KV latent rows with RMSNorm in one InCore block.
             with pl.at(level=pl.Level.CORE_GROUP):
                 kv_rows = pl.cast(pl.slice(kv_a_out, [BATCH_CFG, KV_LORA_RANK_CFG], [0, 0]), target_type=pl.FP32)
                 kv_partial_sq = pl.reshape(pl.row_sum(pl.mul(kv_rows, kv_rows)), [1, BATCH_CFG])
@@ -394,12 +411,14 @@ def build_deepseek_v3_2_decode_front_scope123_program(
 
             # ===== scope2: indexer path (prepare q_idx/k_cache_idx) =====
             # Outputs:
-            # - q_idx_out: [B, INDEX_HEAD_DIM] aggregated index query vector
-            # - k_cache_idx: index key cache row for current decode token
-            q_idx_out = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
+            # - k_cache_idx_i8: INT8 index key cache row for current decode token
             q_idx_full = pl.create_tensor([BATCH_CFG, INDEX_Q_OUT_CFG], dtype=pl.BF16)
             k_idx = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
+            q_idx_full_i8 = pl.create_tensor([INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
+            k_idx_i8 = pl.create_tensor([BATCH_CFG, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
+            k_idx_scale = pl.create_tensor([BATCH_CFG, INT8_SCALE_PACK], dtype=pl.FP32)
             weights = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
+            q_idx_scale_heads = pl.create_tensor([BATCH_CFG, INDEX_HEADS_CFG], dtype=pl.FP32)
 
             # Stage 2.1: q_idx_full = wq_b_idx(qr_out).
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
@@ -467,7 +486,11 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                             target_type=pl.FP32,
                         )
                         s2_q_hi = pl.cast(
-                            pl.slice(q_idx_full, [1, QK_ROPE_HEAD_DIM_CFG // 2], [b, q_col + QK_ROPE_HEAD_DIM_CFG // 2]),
+                            pl.slice(
+                                q_idx_full,
+                                [1, QK_ROPE_HEAD_DIM_CFG // 2],
+                                [b, q_col + QK_ROPE_HEAD_DIM_CFG // 2],
+                            ),
                             target_type=pl.FP32,
                         )
                         s2_q_rot_lo = pl.sub(pl.col_expand_mul(s2_q_lo, cos_lo), pl.col_expand_mul(s2_q_hi, sin_lo))
@@ -487,28 +510,15 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                     s2_k_rot_lo = pl.sub(pl.col_expand_mul(s2_k_lo, cos_lo), pl.col_expand_mul(s2_k_hi, sin_lo))
                     s2_k_rot_hi = pl.add(pl.col_expand_mul(s2_k_hi, cos_hi), pl.col_expand_mul(s2_k_lo, sin_hi))
                     k_idx = pl.assemble(k_idx, pl.cast(s2_k_rot_lo, target_type=pl.BF16), [b, 0])
-                    k_idx = pl.assemble(k_idx, pl.cast(s2_k_rot_hi, target_type=pl.BF16), [b, QK_ROPE_HEAD_DIM_CFG // 2])
-
-            # Stage 2.5: Apply Hadamard scale (aligned with reference indexer behavior).
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    for ob in pl.parallel(0, IDX_OUT_BLOCKS, 1, chunk=8):
-                        q0 = ob * IDX_OUT_CHUNK
-                        s2_q_tile = pl.cast(
-                            pl.slice(q_idx_full, [BATCH_TILE, IDX_OUT_CHUNK], [b0, q0]),
-                            target_type=pl.FP32,
-                        )
-                        s2_q_scaled = pl.mul(s2_q_tile, HADAMARD_SCALE)
-                        q_idx_full = pl.assemble(q_idx_full, pl.cast(s2_q_scaled, target_type=pl.BF16), [b0, q0])
-
-                    s2_k_tile = pl.cast(
-                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [b0, 0]),
-                        target_type=pl.FP32,
+                    k_idx = pl.assemble(
+                        k_idx,
+                        pl.cast(s2_k_rot_hi, target_type=pl.BF16),
+                        [b, QK_ROPE_HEAD_DIM_CFG // 2],
                     )
-                    s2_k_scaled = pl.mul(s2_k_tile, HADAMARD_SCALE)
-                    k_idx = pl.assemble(k_idx, pl.cast(s2_k_scaled, target_type=pl.BF16), [b0, 0])
 
-            # Stage 2.6: Compute per-index-head weights.
+            # Stage 2.5: TODO: Apply Hadamard transform.
+
+            # Stage 2.5b: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
                     for ob in pl.parallel(0, WEIGHTS_BLOCKS, 1, chunk=1):
@@ -522,84 +532,216 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                                 s2_w_acc,
                                 pl.matmul(s2_x_chunk, pl.cast(wp_chunk, target_type=pl.BF16), out_dtype=pl.FP32),
                             )
-                        w_scaled = pl.mul(s2_w_acc, WEIGHT_SCALE)
-                        weights = pl.assemble(weights, w_scaled, [b0, w0])
+                        weights = pl.assemble(weights, pl.mul(s2_w_acc, WEIGHT_SCALE), [b0, w0])
 
-            # Stage 2.7: Write current-token k_idx into k_cache_idx.
+            # Stage 2.6: Quantize indexer q/k tensors and keep INT8 outputs for later stages.
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
+                q_idx_grouped = pl.reshape(q_idx_full, [INDEX_Q_ROWS_CFG, INDEX_HEAD_DIM_CFG])
+                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
+                    for h0 in pl.range(0, INDEX_HEADS_CFG, BATCH_TILE):
+                        r0 = b * INDEX_HEADS_CFG + h0
+                        s2_q_block = pl.cast(
+                            pl.slice(q_idx_grouped, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                            target_type=pl.FP32,
+                            mode="none",
+                        )
+                        s2_q_abs = pl.maximum(s2_q_block, pl.neg(s2_q_block))
+                        s2_q_amax_row = pl.reshape(pl.row_max(s2_q_abs), [1, BATCH_TILE])
+                        s2_q_amax_row = pl.maximum(
+                            s2_q_amax_row,
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                        )
+                        s2_q_scale_quant_row = pl.div(
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                            s2_q_amax_row,
+                        )
+                        s2_q_scale_dequant_row = pl.div(
+                            pl.full([1, BATCH_TILE], dtype=pl.FP32, value=1.0),
+                            s2_q_scale_quant_row,
+                        )
+                        s2_q_scale_quant = pl.reshape(s2_q_scale_quant_row, [BATCH_TILE, 1])
+                        s2_q_scaled = pl.row_expand_mul(s2_q_block, s2_q_scale_quant)
+                        s2_q_i32 = pl.cast(s2_q_scaled, target_type=pl.INT32, mode="round")
+                        s2_q_half = pl.cast(s2_q_i32, target_type=pl.FP16, mode="round")
+                        s2_q_i8 = pl.cast(s2_q_half, target_type=pl.INT8, mode="trunc")
+                        q_idx_full_i8 = pl.assemble(q_idx_full_i8, s2_q_i8, [r0, 0])
+                        q_idx_scale_heads = pl.assemble(q_idx_scale_heads, s2_q_scale_dequant_row, [b, h0])
+
+                for r0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
+                    s2_k_block = pl.cast(
+                        pl.slice(k_idx, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [r0, 0]),
+                        target_type=pl.FP32,
+                        mode="none",
+                    )
+                    s2_k_abs = pl.maximum(s2_k_block, pl.neg(s2_k_block))
+                    s2_k_amax_row = pl.reshape(pl.row_max(s2_k_abs), [1, BATCH_TILE])
+                    s2_k_amax_row = pl.maximum(
+                        s2_k_amax_row,
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                    )
+                    s2_k_scale_quant_row = pl.div(
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX),
+                        s2_k_amax_row,
+                    )
+                    s2_k_scale_dequant_row = pl.div(
+                        pl.full([1, BATCH_TILE], dtype=pl.FP32, value=1.0),
+                        s2_k_scale_quant_row,
+                    )
+                    s2_k_scale_quant = pl.reshape(s2_k_scale_quant_row, [BATCH_TILE, 1])
+                    s2_k_scale_dequant = pl.reshape(s2_k_scale_dequant_row, [BATCH_TILE, 1])
+                    s2_k_scale_pack_target = pl.full([BATCH_TILE, INT8_SCALE_PACK], dtype=pl.FP32, value=0.0)
+                    s2_k_scale_pack = pl.row_expand(s2_k_scale_pack_target, s2_k_scale_dequant)
+                    s2_k_scaled = pl.row_expand_mul(s2_k_block, s2_k_scale_quant)
+                    s2_k_i32 = pl.cast(s2_k_scaled, target_type=pl.INT32, mode="round")
+                    s2_k_half = pl.cast(s2_k_i32, target_type=pl.FP16, mode="round")
+                    s2_k_i8 = pl.cast(s2_k_half, target_type=pl.INT8, mode="trunc")
+                    k_idx_i8 = pl.assemble(k_idx_i8, s2_k_i8, [r0, 0])
+                    k_idx_scale = pl.assemble(k_idx_scale, s2_k_scale_pack, [r0, 0])
+
+            # Stage 2.8: Write current-token k_idx into INT8 cache form.
+            k_idx_scale_flat = pl.reshape(k_idx_scale, [BATCH_CFG * INT8_SCALE_PACK])
+            k_cache_idx_scale_flat = pl.reshape(k_cache_idx_scale, [BATCH_CFG * MAX_SEQ_CFG])
             with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
                     pos = pl.tensor.read(seq_lens, [b]) - 1
                     cache_row = b * MAX_SEQ_CFG + pos
-                    s2_k_row = pl.slice(k_idx, [1, INDEX_HEAD_DIM_CFG], [b, 0])
-                    k_cache_idx = pl.assemble(k_cache_idx, s2_k_row, [cache_row, 0])
-
-            # Stage 2.8: Reduce q_idx_full across heads with weights to get q_idx_out.
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                s2_weights_t = pl.transpose(weights, axis1=0, axis2=1)
-                for b0 in pl.parallel(0, BATCH_CFG, BATCH_TILE, chunk=1):
-                    s2_q_idx_acc = pl.full([BATCH_TILE, INDEX_HEAD_DIM_CFG], dtype=pl.FP32, value=0.0)
-                    for h in pl.range(INDEX_HEADS_CFG):
-                        s2_q_h = pl.cast(
-                            pl.slice(q_idx_full, [BATCH_TILE, INDEX_HEAD_DIM_CFG], [b0, h * INDEX_HEAD_DIM_CFG]),
-                            target_type=pl.FP32,
-                        )
-                        s2_w_h_t = pl.slice(s2_weights_t, [1, BATCH_TILE], [h, b0])
-                        s2_w_h = pl.reshape(s2_w_h_t, [BATCH_TILE, 1])
-                        s2_q_idx_acc = pl.add(s2_q_idx_acc, pl.row_expand_mul(s2_q_h, s2_w_h))
-                    q_idx_out = pl.assemble(q_idx_out, pl.cast(s2_q_idx_acc, target_type=pl.BF16), [b0, 0])
-
-            # ===== scope3: index score + topk =====
-            # Inputs: q_idx_out, k_cache_idx
-            # Output: topk_idx_out (top-k positions per batch)
-            topk_vals_out = pl.create_tensor([BATCH_CFG, INDEX_TOPK], dtype=pl.FP32)
-            s3_q_padded = pl.create_tensor([BATCH_CFG * Q_PAD, INDEX_HEAD_DIM_CFG], dtype=pl.BF16)
-            # Stage 3.1: Pad q_idx_out to Q_PAD rows for backend matmul row-alignment constraints.
-            with pl.at(level=pl.Level.CORE_GROUP):
-                for b in pl.range(BATCH_CFG):
-                    s3_q_row = pl.slice(q_idx_out, [1, INDEX_HEAD_DIM_CFG], [b, 0])
-                    s3_q_padded = pl.assemble(s3_q_padded, s3_q_row, [b * Q_PAD, 0])
-                    s3_q_padded = pl.assemble(
-                        s3_q_padded,
-                        pl.cast(pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM_CFG], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                        [b * Q_PAD + Q_VALID, 0],
+                    s2_k_row_i8 = pl.slice(k_idx_i8, [1, INDEX_HEAD_DIM_CFG], [b, 0])
+                    s2_k_row_scale = pl.tensor.read(k_idx_scale_flat, [b * INT8_SCALE_PACK])
+                    k_cache_idx_i8 = pl.assemble(k_cache_idx_i8, s2_k_row_i8, [cache_row, 0])
+                    pl.tensor.write(
+                        k_cache_idx_scale_flat,
+                        [b * MAX_SEQ_CFG + pos],
+                        s2_k_row_scale,
                     )
 
-            s3_scores = pl.create_tensor([BATCH_CFG, SORT_LEN], dtype=pl.FP32)
-            s3_sorted_gm = pl.create_tensor([BATCH_CFG, 2 * SORT_LEN], dtype=pl.FP32)
+            # ===== scope3: index score + topk =====
+            # Inputs: q_idx_full_i8, k_cache_idx_i8
+            # Output: topk_idx_out (top-k positions per batch)
+            topk_vals_out = pl.create_tensor([BATCH_CFG, INDEX_TOPK], dtype=pl.FP32)
+            scores_out = pl.create_tensor([BATCH_CFG, SORT_LEN], dtype=pl.FP32)
             s3_raw_idx_gm = pl.create_tensor([BATCH_CFG, INDEX_TOPK], dtype=pl.INT32)
+            s3_q_i8_padded = pl.create_tensor([BATCH_CFG * INDEX_HEADS_CFG * Q_PAD, INDEX_HEAD_DIM_CFG], dtype=pl.INT8)
+            s3_q_s_padded = pl.create_tensor([BATCH_CFG * Q_PAD, INDEX_HEADS_CFG], dtype=pl.FP32)
 
-            for b in pl.range(0, BATCH_CFG, 1):
-                s3_ctx_len = pl.tensor.read(seq_lens, [b])
-                s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+            # Stage 3.0: Pad q_idx_full_i8 to Q_PAD rows per (batch, head) for INT8 qk validation.
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for b in pl.parallel(BATCH_CFG):
+                    for h in pl.parallel(INDEX_HEADS_CFG):
+                        q_row0 = b * INDEX_HEADS_CFG + h
+                        s3_q_i8_valid = pl.slice(
+                            q_idx_full_i8,
+                            [1, INDEX_HEAD_DIM_CFG],
+                            [q_row0, 0],
+                        )
+                        s3_q_i8_padded = pl.assemble(s3_q_i8_padded, s3_q_i8_valid, [q_row0 * Q_PAD, 0])
+                        s3_q_i8_zero_pad = pl.cast(
+                            pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM_CFG], dtype=pl.INT16, value=0),
+                            target_type=pl.INT8,
+                        )
+                        s3_q_i8_padded = pl.assemble(
+                            s3_q_i8_padded,
+                            s3_q_i8_zero_pad,
+                            [q_row0 * Q_PAD + Q_VALID, 0],
+                        )
 
-                # Stage 3.2: Prefill full score row with -inf; only valid context range will be overwritten.
-                with pl.at(level=pl.Level.CORE_GROUP):
+                for b in pl.parallel(BATCH_CFG):
                     s3_neg_inf_row = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-                    s3_scores = pl.assemble(s3_scores, s3_neg_inf_row, [b, 0])
+                    scores_out = pl.assemble(scores_out, s3_neg_inf_row, [b, 0])
+                    s3_weights_row = pl.slice(weights, [1, INDEX_HEADS_CFG], [b, 0])
+                    s3_q_scales_row = pl.slice(q_idx_scale_heads, [1, INDEX_HEADS_CFG], [b, 0])
+                    s3_q_s_row = pl.mul(s3_weights_row, s3_q_scales_row)
+                    s3_q_s_padded = pl.assemble(s3_q_s_padded, s3_q_s_row, [b * Q_PAD, 0])
+                    s3_q_s_padded = pl.assemble(
+                        s3_q_s_padded,
+                        pl.full([Q_PAD - Q_VALID, INDEX_HEADS_CFG], dtype=pl.FP32, value=0.0),
+                        [b * Q_PAD + Q_VALID, 0],
+                    )
+            s3_sorted_gm = pl.create_tensor([BATCH_CFG, 2 * SORT_LEN], dtype=pl.FP32)
+            s3_all_scores_i8 = pl.create_tensor(
+                [BATCH_CFG * MAX_SEQ_BLOCKS * INDEX_HEADS * Q_PAD, SEQ_TILE],
+                dtype=pl.INT32,
+            )
+            s3_relu_rows = pl.create_tensor(
+                [BATCH_CFG * MAX_SEQ_BLOCKS * INDEX_HEADS, SEQ_TILE],
+                dtype=pl.FP32,
+            )
+            s3_weighted_scores = pl.create_tensor(
+                [BATCH_CFG * MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE],
+                dtype=pl.FP32,
+            )
+            s3_score_tiles = pl.create_tensor([BATCH_CFG * MAX_SEQ_BLOCKS, SEQ_TILE], dtype=pl.FP32)
 
-                s3_all_scores = pl.create_tensor([MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE], dtype=pl.FP32)
-                # Stage 3.3: Compute tiled dot-product scores between q_idx_out and k_cache_idx.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            # Stage 3.3i8: Compute tiled INT8 qk logits between q_idx_full_i8 and k_cache_idx_i8.
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                for b in pl.parallel(0, BATCH_CFG, 1):
+                    s3_ctx_len = pl.tensor.read(seq_lens, [b])
+                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
                     for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
                         s0 = sb * SEQ_TILE
                         cache_row0 = b * MAX_SEQ_CFG + s0
-                        s3_q_b = pl.slice(s3_q_padded, [Q_PAD, INDEX_HEAD_DIM_CFG], [b * Q_PAD, 0])
-                        s3_k_tile = pl.slice(k_cache_idx, [SEQ_TILE, INDEX_HEAD_DIM_CFG], [cache_row0, 0])
-                        s3_score_tile = pl.matmul(s3_q_b, s3_k_tile, b_trans=True, out_dtype=pl.FP32)
-                        s3_all_scores = pl.assemble(s3_all_scores, s3_score_tile, [sb * Q_PAD, 0])
+                        s3_k_tile_i8 = pl.slice(k_cache_idx_i8, [SEQ_TILE, INDEX_HEAD_DIM_CFG], [cache_row0, 0])
+                        for h in pl.range(INDEX_HEADS):
+                            q_row0 = (b * INDEX_HEADS_CFG + h) * Q_PAD
+                            tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
+                            s3_q_tile_i8 = pl.slice(s3_q_i8_padded, [Q_PAD, INDEX_HEAD_DIM_CFG], [q_row0, 0])
+                            s3_logits_i32 = pl.matmul(s3_q_tile_i8, s3_k_tile_i8, b_trans=True, out_dtype=pl.INT32)
+                            s3_all_scores_i8 = pl.assemble(s3_all_scores_i8, s3_logits_i32, [tile_row0, 0])
 
-                # Stage 3.4: Fillpad each tile by valid_len, then write back to the global score row.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            # Stage 3.4/3.5i8: Cast staged INT32 logits to FP32, then extract q row and apply ReLU.
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                for b in pl.parallel(0, BATCH_CFG, 1):
+                    s3_ctx_len = pl.tensor.read(seq_lens, [b])
+                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                        for h in pl.range(INDEX_HEADS):
+                            tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
+                            s3_logits_row_i32 = pl.slice(s3_all_scores_i8, [1, SEQ_TILE], [tile_row0, 0])
+                            s3_logits_row_f32 = pl.cast(s3_logits_row_i32, target_type=pl.FP32, mode="none")
+                            s3_relu_logits = pl.maximum(s3_logits_row_f32, pl.mul(s3_logits_row_f32, 0.0))
+                            relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h
+                            s3_relu_rows = pl.assemble(s3_relu_rows, s3_relu_logits, [relu_row0, 0])
+
+            # Stage 3.6i8: Reduce per-head ReLU logits with q_s weights.
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                for b in pl.parallel(0, BATCH_CFG, 1):
+                    s3_ctx_len = pl.tensor.read(seq_lens, [b])
+                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                    for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                        s3_q_s_tile = pl.slice(s3_q_s_padded, [Q_PAD, INDEX_HEADS_CFG], [b * Q_PAD, 0])
+                        s3_relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS
+                        s3_relu_tile = pl.slice(s3_relu_rows, [INDEX_HEADS, SEQ_TILE], [s3_relu_row0, 0])
+                        s3_weighted_tile = pl.matmul(s3_q_s_tile, s3_relu_tile, out_dtype=pl.FP32)
+                        weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
+                        s3_weighted_scores = pl.assemble(s3_weighted_scores, s3_weighted_tile, [weighted_row0, 0])
+
+            # Stage 3.7i8: Apply k scale and write valid score tiles to scores_out.
+            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                for b in pl.parallel(0, BATCH_CFG, 1):
+                    s3_ctx_len = pl.tensor.read(seq_lens, [b])
+                    s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
                     for sb in pl.parallel(s3_ctx_blocks, chunk=MAX_SEQ_BLOCKS):
                         s0 = sb * SEQ_TILE
                         s3_valid_len = pl.min(SEQ_TILE, s3_ctx_len - s0)
-                        s3_tile_valid = pl.slice(s3_all_scores, [1, SEQ_TILE], [sb * Q_PAD, 0], valid_shape=[1, s3_valid_len])
-                        s3_tile_padded = pl.fillpad(s3_tile_valid, pad_value=pl.PadValue.min)
-                        s3_scores = pl.assemble(s3_scores, s3_tile_padded, [b, s0])
+                        weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
+                        s3_k_scale = pl.slice(k_cache_idx_scale, [1, SEQ_TILE], [b, s0])
+                        s3_score_acc = pl.slice(s3_weighted_scores, [1, SEQ_TILE], [weighted_row0, 0])
+                        s3_score_tile = pl.mul(s3_score_acc, s3_k_scale)
+                        score_row0 = b * MAX_SEQ_BLOCKS + sb
+                        s3_score_tiles = pl.assemble(s3_score_tiles, s3_score_tile, [score_row0, 0])
+                        s3_score_valid = pl.slice(
+                            s3_score_tiles,
+                            [1, SEQ_TILE],
+                            [score_row0, 0],
+                            valid_shape=[1, s3_valid_len],
+                        )
+                        scores_out = pl.assemble(scores_out, s3_score_valid, [b, s0])
 
-                # Stage 3.5: Run sort32 + multi-pass merge sort to produce (score, idx) pairs.
+            for b in pl.range(0, BATCH_CFG, 1):
+                s3_ctx_len = pl.tensor.read(seq_lens, [b])
+
+                # Stage 3.8: Run sort32 + multi-pass merge sort to produce (score, idx) pairs.
                 with pl.at(level=pl.Level.CORE_GROUP):
-                    s3_score_row = pl.slice(s3_scores, [1, SORT_LEN], [b, 0])
+                    s3_score_row = pl.slice(scores_out, [1, SORT_LEN], [b, 0])
                     s3_sorted_t = pl.tensor.sort32(s3_score_row, idx_init)
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=64)
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=256)
@@ -607,7 +749,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=4096)
                     s3_sorted_gm = pl.assemble(s3_sorted_gm, s3_sorted_t, [b, 0])
 
-                # Stage 3.6: Split top-k values and raw indices from interleaved pairs.
+                # Stage 3.9: Split top-k values and raw indices from interleaved pairs.
                 with pl.at(level=pl.Level.CORE_GROUP):
                     s3_topk_pairs = pl.slice(s3_sorted_gm, [1, 2 * INDEX_TOPK], [b, 0])
                     s3_topk_v = pl.tensor.gather(s3_topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
@@ -619,7 +761,7 @@ def build_deepseek_v3_2_decode_front_scope123_program(
                     topk_vals_out = pl.assemble(topk_vals_out, s3_topk_v, [b, 0])
                     s3_raw_idx_gm = pl.assemble(s3_raw_idx_gm, s3_topk_i_raw, [b, 0])
 
-                # Stage 3.7: Mark top-k slots beyond ctx_len with PadValue.min.
+                # Stage 3.10: Mark top-k slots beyond ctx_len with PadValue.min.
                 with pl.at(level=pl.Level.CORE_GROUP):
                     s3_valid_topk = pl.min(INDEX_TOPK, s3_ctx_len)
                     s3_idx_valid = pl.slice(s3_raw_idx_gm, [1, INDEX_TOPK], [b, 0], valid_shape=[1, s3_valid_topk])
@@ -628,11 +770,25 @@ def build_deepseek_v3_2_decode_front_scope123_program(
 
             return topk_idx_out
 
-    return DeepSeekV32DecodeFrontScope123
+    return DeepSeekV32DecodeFrontScope123Int8Quant
 
 
-def golden_decode_front_scope123(tensors):
+def golden_decode_front_scope123_int8_quant(tensors):
     import torch  # type: ignore[import]
+
+    def round_half_away_from_zero(x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+    def int8_quant_groups(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = x.reshape(-1, INDEX_HEAD_DIM).float()
+        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = rows * scale_quant
+        out_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        out_half = out_i32.to(torch.float16)
+        out_i8 = out_half.to(torch.int8)
+        scale_dequant = 1.0 / scale_quant
+        return out_i8.reshape_as(x), scale_dequant
 
     hidden_states = tensors["hidden_states"].float()
     norm_affine_pack = tensors["norm_affine_pack"].float()
@@ -649,13 +805,13 @@ def golden_decode_front_scope123(tensors):
 
     wq_b_idx = tensors["wq_b_idx"].float()
     wk_idx = tensors["wk_idx"].float()
+    weights_proj = tensors["weights_proj"].float()
     k_norm_weight = norm_affine_pack[1:2, :INDEX_HEAD_DIM]
     k_norm_bias = norm_affine_pack[2:3, :INDEX_HEAD_DIM]
-    weights_proj = tensors["weights_proj"].float()
-
     kv_cache = tensors["kv_cache"]
     pe_cache = tensors["pe_cache"]
-    k_cache_idx = tensors["k_cache_idx"]
+    k_cache_idx_i8 = tensors["k_cache_idx_i8"]
+    k_cache_idx_scale = tensors["k_cache_idx_scale"]
 
     sq_sum = torch.sum(hidden_states * hidden_states, dim=1, keepdim=True)
     inv_rms = torch.rsqrt(sq_sum * (1.0 / HIDDEN) + EPS)
@@ -725,28 +881,41 @@ def golden_decode_front_scope123(tensors):
         k_idx[b : b + 1, :half] = k_lo * cos_lo - k_hi * sin_lo
         k_idx[b : b + 1, half:QK_ROPE_HEAD_DIM] = k_hi * cos_hi + k_lo * sin_hi
 
-    q_idx_full = q_view.reshape(BATCH, INDEX_HEADS * INDEX_HEAD_DIM)
-    q_idx_full = (q_idx_full * HADAMARD_SCALE).to(torch.bfloat16).float()
-    k_idx = (k_idx * HADAMARD_SCALE).to(torch.bfloat16).float()
+    q_idx_full = q_view.reshape(BATCH, INDEX_HEADS * INDEX_HEAD_DIM).to(torch.bfloat16).float()
+    k_idx = k_idx.to(torch.bfloat16).float()
+    weights = (hidden_states @ weights_proj.to(torch.bfloat16).float()) * (
+        INDEX_HEADS ** -0.5 * INDEX_HEAD_DIM ** -0.5
+    )
+    q_idx_full_pre_quant = q_idx_full.clone()
+    k_idx_pre_quant = k_idx.clone()
+    q_idx_i8_golden, q_idx_scale_golden = int8_quant_groups(q_idx_full_pre_quant)
+    k_idx_i8_golden, k_idx_scale_golden = int8_quant_groups(k_idx_pre_quant)
 
-    weights = (hidden_states @ weights_proj.to(torch.bfloat16).float()) * (INDEX_HEADS ** -0.5 * INDEX_HEAD_DIM ** -0.5)
     for b in range(BATCH):
         pos = int(seq_lens[b].item()) - 1
-        k_cache_idx[b * MAX_SEQ + pos, :].copy_(k_idx[b].to(torch.bfloat16))
+        k_cache_idx_i8[b * MAX_SEQ + pos, :].copy_(k_idx_i8_golden[b])
+        k_cache_idx_scale[b, pos].copy_(k_idx_scale_golden[b, 0])
 
-    q_heads = q_idx_full.view(BATCH, INDEX_HEADS, INDEX_HEAD_DIM)
-    q_idx = torch.einsum("bhd,bh->bd", q_heads, weights)
+    q_idx_i8_view = q_idx_i8_golden.view(BATCH, INDEX_HEADS, INDEX_HEAD_DIM).to(torch.int32)
     scores = torch.full((BATCH, SORT_LEN), FP32_NEG_INF, dtype=torch.float32)
+    q_scale = q_idx_scale_golden.view(BATCH, INDEX_HEADS)
+    q_s = weights * q_scale
     for b in range(BATCH):
         ctx_len = int(seq_lens[b].item())
-        q_b = q_idx[b : b + 1]
-        k_b = k_cache_idx[b * MAX_SEQ : b * MAX_SEQ + ctx_len].float()
-        scores[b, :ctx_len] = (q_b @ k_b.T).squeeze(0)
+        ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+        for sb in range(ctx_blocks):
+            s0 = sb * SEQ_TILE
+            valid_len = min(SEQ_TILE, ctx_len - s0)
+            cache_row0 = b * MAX_SEQ + s0
+            k_tile = k_cache_idx_i8[cache_row0 : cache_row0 + SEQ_TILE].to(torch.int32)
+            logits = torch.matmul(q_idx_i8_view[b, :INDEX_HEADS], k_tile.transpose(0, 1)).float()
+            score = (torch.relu(logits[:, :valid_len]) * q_s[b, :INDEX_HEADS, None]).sum(dim=0)
+            score = score * k_cache_idx_scale[b, s0 : s0 + valid_len].float()
+            scores[b, s0 : s0 + valid_len] = score
 
-    vals, idx = torch.topk(scores, INDEX_TOPK, dim=1, largest=True, sorted=True)
-    del vals
+    sorted_vals, sorted_idx = torch.sort(scores, dim=1, descending=True, stable=True)
 
-    idx = idx.to(torch.int32)
+    idx = sorted_idx[:, :INDEX_TOPK].to(torch.int32)
     for b in range(BATCH):
         ctx_len = int(seq_lens[b].item())
         valid_topk = min(INDEX_TOPK, ctx_len)
@@ -809,14 +978,14 @@ def build_tensor_specs(
     def init_wk_idx():
         return (torch.rand(hidden_size, index_head_dim) - 0.5) / hidden_size ** 0.5
 
+    def init_weights_proj():
+        return (torch.rand(hidden_size, index_heads) - 0.5) / hidden_size ** 0.5
+
     def init_k_norm_weight():
         return torch.rand(1, index_head_dim) - 0.5
 
     def init_k_norm_bias():
         return torch.rand(1, index_head_dim) - 0.5
-
-    def init_weights_proj():
-        return (torch.rand(hidden_size, index_heads) - 0.5) / hidden_size ** 0.5
 
     def init_rope():
         return torch.rand(max_seq_len, qk_rope_head_dim) - 0.5
@@ -830,8 +999,11 @@ def build_tensor_specs(
     def init_cache_pe():
         return torch.zeros(cache_rows, qk_rope_head_dim)
 
-    def init_k_cache_idx():
-        return torch.rand(cache_rows, index_head_dim) - 0.5
+    def init_k_cache_idx_i8():
+        return torch.randint(-128, 128, (cache_rows, index_head_dim), dtype=torch.int8)
+
+    def init_k_cache_idx_scale():
+        return torch.rand((batch, max_seq_len), dtype=torch.float32) / 127.0
 
     def init_idx_init():
         return torch.arange(SORT_LEN, dtype=torch.int32).unsqueeze(0)
@@ -858,9 +1030,16 @@ def build_tensor_specs(
         TensorSpec("idx_init", [1, SORT_LEN], torch.int32, init_value=init_idx_init),
         TensorSpec("q_proj_out", [batch, num_heads * qk_head_dim], torch.bfloat16, is_output=True),
         TensorSpec("kv_cache", [cache_rows, kv_lora_rank], torch.bfloat16, init_value=init_cache_kv, is_output=True),
-        TensorSpec("pe_cache", [cache_rows, qk_rope_head_dim], torch.bfloat16, init_value=init_cache_pe, is_output=True),
-        TensorSpec("k_cache_idx", [cache_rows, index_head_dim], torch.bfloat16, init_value=init_k_cache_idx, is_output=True),
-        TensorSpec("topk_idx_out", [batch, INDEX_TOPK], torch.int32, init_value=init_topk_idx_out),
+        TensorSpec(
+            "pe_cache",
+            [cache_rows, qk_rope_head_dim],
+            torch.bfloat16,
+            init_value=init_cache_pe,
+            is_output=True,
+        ),
+        TensorSpec("k_cache_idx_i8", [cache_rows, index_head_dim], torch.int8, init_value=init_k_cache_idx_i8),
+        TensorSpec("k_cache_idx_scale", [batch, max_seq_len], torch.float32, init_value=init_k_cache_idx_scale),
+        TensorSpec("topk_idx_out", [batch, INDEX_TOPK], torch.int32, init_value=init_topk_idx_out, is_output=True),
     ]
 
 
@@ -875,9 +1054,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        program=build_deepseek_v3_2_decode_front_scope123_program(),
+        program=build_deepseek_v3_2_decode_front_scope123_int8_quant_program(),
         tensor_specs=build_tensor_specs(),
-        golden_fn=golden_decode_front_scope123,
+        golden_fn=golden_decode_front_scope123_int8_quant,
         config=RunConfig(
             rtol=4e-3,
             atol=4e-3,
