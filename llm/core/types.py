@@ -17,6 +17,16 @@ import torch
 from .tokenizer import TokenizerAdapter
 
 
+BATCH_SIZE_ALIGNMENT = 16
+
+
+def padded_batch_size(batch_size: int) -> int:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    rounded = ((batch_size + BATCH_SIZE_ALIGNMENT - 1) // BATCH_SIZE_ALIGNMENT) * BATCH_SIZE_ALIGNMENT
+    return max(BATCH_SIZE_ALIGNMENT, rounded)
+
+
 @dataclass(frozen=True)
 class GenerateConfig:
     max_new_tokens: int = 256

@@ -26,46 +26,49 @@ class ModelExecutor:
         return model.embed_tokens.index_select(0, token_ids.view(-1)).view(*token_ids.shape, model.config.hidden_size)
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
-        if len(batch.kv_allocations) != 1:
-            raise NotImplementedError("Current reference executor supports one request per prefill batch.")
-        hidden = batch.input_embeddings[0].to(model.runtime.device).float()
-        seq_len = int(batch.seq_lens[0].item())
-        alloc = batch.kv_allocations[0]
-        positions = torch.arange(seq_len, device=model.runtime.device, dtype=torch.long)
+        last_hidden_rows: list[torch.Tensor] = []
+        logits_rows: list[torch.Tensor] = []
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            hidden = batch.input_embeddings[batch_idx].to(model.runtime.device).float()
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            hidden = hidden[:seq_len]
+            positions = torch.arange(seq_len, device=model.runtime.device, dtype=torch.long)
 
-        for layer_idx, layer in enumerate(model.layers):
-            hidden = self._layer_prefill(
-                model=model,
-                layer_idx=layer_idx,
-                layer=layer,
-                hidden_states=hidden,
-                positions=positions,
-                alloc=alloc,
-            )
+            for layer_idx, layer in enumerate(model.layers):
+                hidden = self._layer_prefill(
+                    model=model,
+                    layer_idx=layer_idx,
+                    layer=layer,
+                    hidden_states=hidden,
+                    positions=positions,
+                    alloc=alloc,
+                )
 
-        last_hidden = hidden[-1]
-        logits = self._project_logits(model, last_hidden)
-        return PrefillResult(last_hidden=last_hidden, logits=logits)
+            last_hidden = hidden[-1]
+            last_hidden_rows.append(last_hidden)
+            logits_rows.append(self._project_logits(model, last_hidden))
+        return PrefillResult(last_hidden=torch.stack(last_hidden_rows), logits=torch.stack(logits_rows))
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        if len(batch.kv_allocations) != 1:
-            raise NotImplementedError("Current reference executor supports one request per decode batch.")
-        hidden = batch.hidden_states[0].to(model.runtime.device).float()
-        alloc = batch.kv_allocations[0]
-        position = int(batch.seq_lens[0].item()) - 1
+        hidden_rows: list[torch.Tensor] = []
+        logits_rows: list[torch.Tensor] = []
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            hidden = batch.hidden_states[batch_idx].to(model.runtime.device).float()
+            position = int(batch.seq_lens[batch_idx].item()) - 1
 
-        for layer_idx, layer in enumerate(model.layers):
-            hidden = self._layer_decode(
-                model=model,
-                layer_idx=layer_idx,
-                layer=layer,
-                hidden_state=hidden,
-                position=position,
-                alloc=alloc,
-            )
+            for layer_idx, layer in enumerate(model.layers):
+                hidden = self._layer_decode(
+                    model=model,
+                    layer_idx=layer_idx,
+                    layer=layer,
+                    hidden_state=hidden,
+                    position=position,
+                    alloc=alloc,
+                )
 
-        logits = self._project_logits(model, hidden)
-        return DecodeResult(hidden_states=hidden, logits=logits)
+            hidden_rows.append(hidden)
+            logits_rows.append(self._project_logits(model, hidden))
+        return DecodeResult(hidden_states=torch.stack(hidden_rows), logits=torch.stack(logits_rows))
 
     def _layer_prefill(
         self,
@@ -130,8 +133,11 @@ class ModelExecutor:
         return attn_resid + self._linear(mlp, layer.w_down).squeeze(0)
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
-        normed = self._rms_norm(hidden.unsqueeze(0), model.final_norm_weight, model.config.rms_norm_eps).squeeze(0)
-        return self._linear(normed.unsqueeze(0), model.lm_head).squeeze(0)
+        squeeze = hidden.dim() == 1
+        hidden_2d = hidden.unsqueeze(0) if squeeze else hidden
+        normed = self._rms_norm(hidden_2d, model.final_norm_weight, model.config.rms_norm_eps)
+        logits = self._linear(normed, model.lm_head)
+        return logits.squeeze(0) if squeeze else logits
 
     @staticmethod
     def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

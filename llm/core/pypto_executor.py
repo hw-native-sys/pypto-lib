@@ -17,7 +17,16 @@ import torch
 
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
-from .types import DecodeBatch, DecodeResult, ModelRecord, PrefillBatch, PrefillResult, RuntimeModel
+from .types import (
+    DecodeBatch,
+    DecodeResult,
+    KvAllocation,
+    ModelRecord,
+    PrefillBatch,
+    PrefillResult,
+    RuntimeModel,
+    padded_batch_size,
+)
 
 
 def _ensure_pypto_import(pypto_root: str | None) -> None:
@@ -71,6 +80,26 @@ class _CompiledKernels:
     decode: object
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
+    batch: int
+
+
+@dataclass
+class _PaddedPrefillInputs:
+    actual_batch: int
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+@dataclass
+class _PaddedDecodeInputs:
+    actual_batch: int
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+    pad_allocation: KvAllocation | None = None
 
 
 class PyptoQwen14BExecutor(ModelExecutor):
@@ -94,39 +123,29 @@ class PyptoQwen14BExecutor(ModelExecutor):
         self._compiled[model_id] = self._compile_model(record.runtime_model)
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
-        if len(batch.kv_allocations) != 1:
-            raise NotImplementedError("Current PyPTO kernel executor supports one request per batch.")
         compiled = self._compiled[model.config.model_id]
-        seq_len = int(batch.seq_lens[0].item())
-        alloc = batch.kv_allocations[0]
-        max_seq = model.runtime.max_seq_len
-        hidden_size = model.config.hidden_size
-        max_blocks = max_seq // model.runtime.page_size
-
-        seq_lens = torch.tensor([seq_len], dtype=torch.int32)
-        block_table = torch.full((max_blocks,), -1, dtype=torch.int32)
-        slot_mapping = self._kv_cache_manager.slot_mapping_for_positions(alloc, seq_len, max_tokens=max_seq)
-        if alloc.page_ids:
-            block_table[: len(alloc.page_ids)] = torch.tensor(alloc.page_ids, dtype=torch.int32)
-        hidden = torch.zeros((1, max_seq, hidden_size), dtype=torch.bfloat16)
-        hidden[0, :seq_len, :] = batch.input_embeddings[0, :seq_len, :].to(torch.bfloat16).cpu()
+        padded = self._pad_prefill_inputs(model, batch, compiled.batch)
+        hidden = padded.hidden
 
         for layer_idx, layer in enumerate(model.layers):
-            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(model.config.model_id, layer_idx)
+            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
+                model.config.model_id,
+                layer_idx,
+            )
             out = torch.zeros_like(hidden)
             compiled.prefill(
                 hidden,
+                padded.seq_lens,
                 layer.input_rms_weight.view(1, -1).float().cpu(),
                 self._kernel_weight(layer.wq),
                 self._kernel_weight(layer.wk),
                 self._kernel_weight(layer.wv),
                 layer.q_norm_weight.view(1, -1).float().cpu(),
                 layer.k_norm_weight.view(1, -1).float().cpu(),
-                seq_lens,
-                block_table,
-                slot_mapping,
                 compiled.rope_cos,
                 compiled.rope_sin,
+                padded.block_table,
+                padded.slot_mapping,
                 k_cache,
                 v_cache,
                 self._kernel_weight(layer.wo),
@@ -138,56 +157,60 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 config=self._run_config(codegen_only=False),
             )
             hidden = out
-        alloc.tokens_used = max(alloc.tokens_used, seq_len)
 
-        last_hidden = hidden[0, seq_len - 1].float()
+        last_hidden_rows: list[torch.Tensor] = []
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            alloc.tokens_used = max(alloc.tokens_used, seq_len)
+            last_hidden_rows.append(hidden[batch_idx, seq_len - 1].float())
+        last_hidden = torch.stack(last_hidden_rows)
         logits = self._project_logits(model, last_hidden)
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        if len(batch.kv_allocations) != 1:
-            raise NotImplementedError("Current PyPTO kernel executor supports one request per batch.")
         compiled = self._compiled[model.config.model_id]
-        hidden = batch.hidden_states.to(torch.bfloat16).cpu()
-        seq_lens = batch.seq_lens.to(torch.int32).cpu()
-        slot_mapping = batch.slot_mapping.to(torch.int32).cpu()
-        max_blocks = model.runtime.max_seq_len // model.runtime.page_size
-        block_table = torch.full((max_blocks,), -1, dtype=torch.int32)
-        alloc = batch.kv_allocations[0]
-        if alloc.page_ids:
-            block_table[: len(alloc.page_ids)] = torch.tensor(alloc.page_ids, dtype=torch.int32)
+        padded = self._pad_decode_inputs(model, batch, compiled.batch)
+        hidden = padded.hidden
 
-        for layer_idx, layer in enumerate(model.layers):
-            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(model.config.model_id, layer_idx)
-            out = torch.zeros_like(hidden)
-            compiled.decode(
-                hidden,
-                layer.input_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.wq),
-                self._kernel_weight(layer.wk),
-                self._kernel_weight(layer.wv),
-                layer.q_norm_weight.view(1, -1).float().cpu(),
-                layer.k_norm_weight.view(1, -1).float().cpu(),
-                seq_lens,
-                block_table,
-                slot_mapping,
-                compiled.rope_cos,
-                compiled.rope_sin,
-                k_cache,
-                v_cache,
-                self._kernel_weight(layer.wo),
-                layer.post_rms_weight.view(1, -1).float().cpu(),
-                self._kernel_weight(layer.w_gate),
-                self._kernel_weight(layer.w_up),
-                self._kernel_weight(layer.w_down),
-                out,
-                config=self._run_config(codegen_only=False),
-            )
-            hidden = out
+        try:
+            for layer_idx, layer in enumerate(model.layers):
+                k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
+                    model.config.model_id,
+                    layer_idx,
+                )
+                out = torch.zeros_like(hidden)
+                compiled.decode(
+                    hidden,
+                    layer.input_rms_weight.view(1, -1).float().cpu(),
+                    self._kernel_weight(layer.wq),
+                    self._kernel_weight(layer.wk),
+                    self._kernel_weight(layer.wv),
+                    layer.q_norm_weight.view(1, -1).float().cpu(),
+                    layer.k_norm_weight.view(1, -1).float().cpu(),
+                    padded.seq_lens,
+                    padded.block_table,
+                    padded.slot_mapping,
+                    compiled.rope_cos,
+                    compiled.rope_sin,
+                    k_cache,
+                    v_cache,
+                    self._kernel_weight(layer.wo),
+                    layer.post_rms_weight.view(1, -1).float().cpu(),
+                    self._kernel_weight(layer.w_gate),
+                    self._kernel_weight(layer.w_up),
+                    self._kernel_weight(layer.w_down),
+                    out,
+                    config=self._run_config(codegen_only=False),
+                )
+                hidden = out
+        finally:
+            if padded.pad_allocation is not None:
+                self._kv_cache_manager.free(padded.pad_allocation)
 
-        final_hidden = hidden[0].float()
+        final_hidden = hidden[: padded.actual_batch].float()
         logits = self._project_logits(model, final_hidden)
-        alloc.tokens_used = max(alloc.tokens_used, int(seq_lens[0].item()))
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -201,9 +224,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
             from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
 
         self._validate_supported_shape(model)
+        compile_batch = self._kernel_batch_size(model)
+        self._validate_total_kv_pages(model, compile_batch)
 
         prefill_program = build_qwen3_14b_prefill_program(
-            batch=1,
+            batch=compile_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
             num_heads=model.config.num_attention_heads,
@@ -212,7 +237,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             intermediate_size=model.config.intermediate_size,
         )
         decode_program = build_qwen3_decode_program(
-            batch=1,
+            batch=compile_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
             intermediate_size=model.config.intermediate_size,
@@ -222,8 +247,153 @@ class PyptoQwen14BExecutor(ModelExecutor):
         )
         prefill = run(prefill_program, config=self._run_config(codegen_only=True))
         decode = run(decode_program, config=self._run_config(codegen_only=True))
-        rope_cos, rope_sin = _rope_tables(model.runtime.max_seq_len, model.config.head_dim, model.config.rope_theta)
-        return _CompiledKernels(prefill=prefill, decode=decode, rope_cos=rope_cos, rope_sin=rope_sin)
+        rope_cos, rope_sin = _rope_tables(
+            model.runtime.max_seq_len,
+            model.config.head_dim,
+            model.config.rope_theta,
+        )
+        return _CompiledKernels(
+            prefill=prefill,
+            decode=decode,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+            batch=compile_batch,
+        )
+
+    def _pad_prefill_inputs(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        compile_batch: int,
+    ) -> _PaddedPrefillInputs:
+        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations), compile_batch)
+        max_seq = model.runtime.max_seq_len
+        hidden_size = model.config.hidden_size
+        max_blocks = self._max_blocks_per_seq(model)
+
+        hidden = torch.zeros((compile_batch, max_seq, hidden_size), dtype=torch.bfloat16)
+        seq_lens = torch.zeros((compile_batch,), dtype=torch.int32)
+        block_table = torch.full((compile_batch * max_blocks,), -1, dtype=torch.int32)
+        slot_mapping = torch.full((compile_batch * max_seq,), -1, dtype=torch.int32)
+
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            if seq_len <= 0:
+                raise ValueError("prefill seq_lens must be positive")
+            if seq_len > max_seq:
+                raise ValueError(f"prefill seq_len {seq_len} exceeds max_seq_len {max_seq}")
+            seq_lens[batch_idx] = seq_len
+            hidden[batch_idx, :seq_len, :] = (
+                batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
+            )
+            self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
+            slot_row = self._kv_cache_manager.slot_mapping_for_positions(alloc, seq_len, max_tokens=max_seq)
+            slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
+
+        return _PaddedPrefillInputs(
+            actual_batch=actual_batch,
+            hidden=hidden,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+        )
+
+    def _pad_decode_inputs(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        compile_batch: int,
+    ) -> _PaddedDecodeInputs:
+        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations), compile_batch)
+        hidden_size = model.config.hidden_size
+        max_blocks = self._max_blocks_per_seq(model)
+
+        hidden = torch.zeros((compile_batch, hidden_size), dtype=torch.bfloat16)
+        seq_lens = torch.ones((compile_batch,), dtype=torch.int32)
+        block_table = torch.full((compile_batch * max_blocks,), -1, dtype=torch.int32)
+        slot_mapping = torch.zeros((compile_batch,), dtype=torch.int32)
+
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            if seq_len <= 0:
+                raise ValueError("decode seq_lens must be positive")
+            if seq_len > model.runtime.max_seq_len:
+                raise ValueError(
+                    f"decode seq_len {seq_len} exceeds max_seq_len {model.runtime.max_seq_len}"
+                )
+            hidden[batch_idx, :] = batch.hidden_states[batch_idx].to(torch.bfloat16).cpu()
+            seq_lens[batch_idx] = seq_len
+            self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
+            slot_mapping[batch_idx] = self._kv_cache_manager.slot_mapping_for_request(alloc)
+
+        pad_allocation = None
+        if actual_batch < compile_batch:
+            pad_allocation = self._kv_cache_manager.allocate_for_prompt(
+                model.config.model_id,
+                "__pypto_batch_pad__",
+                1,
+            )
+            pad_slot = self._kv_cache_manager.slot_mapping_for_request(pad_allocation, 0)
+            for batch_idx in range(actual_batch, compile_batch):
+                self._write_block_table_row(block_table, batch_idx, max_blocks, pad_allocation)
+                slot_mapping[batch_idx] = pad_slot
+
+        return _PaddedDecodeInputs(
+            actual_batch=actual_batch,
+            hidden=hidden,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+            pad_allocation=pad_allocation,
+        )
+
+    @staticmethod
+    def _write_block_table_row(
+        block_table: torch.Tensor,
+        batch_idx: int,
+        max_blocks: int,
+        alloc: KvAllocation,
+    ) -> None:
+        row_start = batch_idx * max_blocks
+        if alloc.page_ids:
+            block_table[row_start : row_start + len(alloc.page_ids)] = torch.tensor(
+                alloc.page_ids,
+                dtype=torch.int32,
+            )
+
+    @staticmethod
+    def _kernel_batch_size(model: RuntimeModel) -> int:
+        return padded_batch_size(model.runtime.max_batch_size)
+
+    @staticmethod
+    def _validate_batch_size(model: RuntimeModel, actual_batch: int, compile_batch: int) -> int:
+        if actual_batch <= 0:
+            raise ValueError("batch must contain at least one request")
+        if actual_batch > model.runtime.max_batch_size:
+            max_batch_size = model.runtime.max_batch_size
+            raise ValueError(
+                f"batch has {actual_batch} requests, but runtime max_batch_size is {max_batch_size}"
+            )
+        if actual_batch > compile_batch:
+            raise ValueError(
+                f"batch has {actual_batch} requests, but compiled kernel batch is {compile_batch}"
+            )
+        return actual_batch
+
+    @staticmethod
+    def _max_blocks_per_seq(model: RuntimeModel) -> int:
+        return (model.runtime.max_seq_len + model.runtime.page_size - 1) // model.runtime.page_size
+
+    @classmethod
+    def _validate_total_kv_pages(cls, model: RuntimeModel, compile_batch: int) -> None:
+        if model.runtime.total_kv_pages is None:
+            return
+        expected_pages = compile_batch * cls._max_blocks_per_seq(model)
+        if model.runtime.total_kv_pages != expected_pages:
+            raise ValueError(
+                "PyPTO Qwen3-14B kernels require total_kv_pages to match the padded batch capacity: "
+                f"{model.runtime.total_kv_pages} provided, {expected_pages} required."
+            )
 
     def _run_config(self, *, codegen_only: bool):
         from pypto.runtime import RunConfig
