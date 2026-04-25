@@ -15,8 +15,8 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.27
-      PTOAS_SHA256: 80cc39095abbf40af7f670a4b93a4aba2749a081df9f9b57e496d0123ba9bd2a
+      PTOAS_VERSION: v0.31
+      PTOAS_SHA256: cd9121b768f7383f5bda702c89507dd160f539c28bbdf57a0585be9473081d07
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 5779238f
 
@@ -54,9 +54,6 @@ jobs:
       - name: Build and install pypto and simpler
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
-          sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
-            /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
           pip install /tmp/pypto
           pip install /tmp/pypto/runtime
 
@@ -88,6 +85,9 @@ jobs:
       - name: Run model tests (${{ matrix.platform }})
         env:
           PYTHONPATH: ${{ github.workspace }}
+          PTO2_RING_DEP_POOL: 131072
+          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_HEAP: 4294967296
         run: |
           : > results.tsv
           failed=""
@@ -138,8 +138,8 @@ jobs:
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.27
-      PTOAS_SHA256: 278db325be4503e4ab8afb7c131fecb018d7ce168192723471333d429979d401
+      PTOAS_VERSION: v0.31
+      PTOAS_SHA256: ca184d071cef3af989ff3f98e7ce4c7262ba1e07405738b65e9900c43065ada5
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 5779238f
     container:
@@ -171,9 +171,6 @@ jobs:
       - name: Build and install pypto and simpler
         run: |
           git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          # Workaround for simpler issue #633: bump PTO2_LOOKUP_MAX_RESULTS 16 -> 128
-          sed -i 's/^#define PTO2_LOOKUP_MAX_RESULTS 16$/#define PTO2_LOOKUP_MAX_RESULTS 128/' \
-            /tmp/pypto/runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h
           pip install /tmp/pypto
           pip install /tmp/pypto/runtime
 
@@ -205,6 +202,9 @@ jobs:
       - name: Run model tests (a2a3)
         env:
           PYTHONPATH: ${{ github.workspace }}
+          PTO2_RING_DEP_POOL: 131072
+          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_HEAP: 4294967296
         run: |
           : > results.tsv
           failed=""
