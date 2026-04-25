@@ -11,6 +11,23 @@
 Fuses the full single-layer prefill path: input RMSNorm, Q/K/V projection,
 RoPE, KV cache update, causal attention, output projection, post-attention
 RMSNorm, SwiGLU MLP, and the final residual path.
+
+Dynamic batch design
+--------------------
+Every batch-dependent kernel signature dim is a `pl.dynamic(...)` variable
+(`USER_BATCH_DYN` / `KV_CACHE_ROWS_DYN` / `BLOCK_TABLE_FLAT_DYN` /
+`SLOT_MAPPING_DYN`), so a single compiled program serves any
+`user_batch <= host KV-cache capacity`. Host allocates every
+batch-dependent tensor at the user-visible batch (no host pad / no host
+trim).
+
+Unlike the decode path, prefill iterates the batch dim with step 1 (one
+batch element per outer iteration) and every matmul tile's M dim is
+governed by `TOK_TILE` (independent of batch). Therefore prefill does
+NOT need decode's `batch_padded` round-up + `valid_shape` zero-pad +
+vec-to-vec textract trim machinery on the batch axis. The per-token
+`valid_tok = pl.min(TOK_TILE, seq_len_b - p0)` + `valid_shape` pattern
+already handles intra-batch sequence-length variation.
 """
 import pypto.language as pl
 
@@ -24,6 +41,15 @@ HEAD_DIM = 128
 HIDDEN = NUM_HEADS * HEAD_DIM       # 5120
 KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
 INTERMEDIATE = 17408
+
+# Dynamic dims for arbitrary user_batch support. Host allocates every
+# batch-dependent tensor at the user-visible batch; the prefill kernel
+# iterates the batch dim with step 1 so no batch-axis tile-alignment /
+# valid_shape pad / textract trim is needed (contrast with decode).
+USER_BATCH_DYN = pl.dynamic("USER_BATCH_DYN")
+KV_CACHE_ROWS_DYN = pl.dynamic("KV_CACHE_ROWS_DYN")
+BLOCK_TABLE_FLAT_DYN = pl.dynamic("BLOCK_TABLE_FLAT_DYN")
+SLOT_MAPPING_DYN = pl.dynamic("SLOT_MAPPING_DYN")
 
 # RMSNorm constants.
 EPS = 1e-6
@@ -53,12 +79,16 @@ def build_qwen3_14b_prefill_program(
     head_dim: int = HEAD_DIM,
     intermediate_size: int = INTERMEDIATE,
 ):
+    # The `batch` parameter is only used by build_tensor_specs to size
+    # host buffers; it is no longer baked into the program. Every
+    # batch-dependent kernel signature dim is a pl.dynamic() variable
+    # (USER_BATCH_DYN / KV_CACHE_ROWS_DYN / BLOCK_TABLE_FLAT_DYN /
+    # SLOT_MAPPING_DYN), so a single compiled program serves any
+    # user_batch <= host capacity.
     hidden = hidden_size
     kv_hidden = num_kv_heads * head_dim
     q_per_kv = num_heads // num_kv_heads
     max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
-    num_blocks = batch * max_blocks_per_seq
-    cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
     half_dim = head_dim // 2
     hidden_blocks = hidden // K_CHUNK
     q_out_blocks = hidden // Q_OUT_CHUNK
@@ -76,8 +106,8 @@ def build_qwen3_14b_prefill_program(
         @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_14b_prefill(
             self,
-            hidden_states: pl.Tensor[[batch, max_seq, hidden], pl.BF16],
-            seq_lens: pl.Tensor[[batch], pl.INT32],
+            hidden_states: pl.Tensor[[USER_BATCH_DYN, max_seq, hidden], pl.BF16],
+            seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
             input_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
             wq: pl.Tensor[[hidden, hidden], pl.BF16],
             wk: pl.Tensor[[hidden, kv_hidden], pl.BF16],
@@ -86,18 +116,22 @@ def build_qwen3_14b_prefill_program(
             k_norm_weight: pl.Tensor[[1, head_dim], pl.FP32],
             rope_cos: pl.Tensor[[max_seq, head_dim], pl.FP32],
             rope_sin: pl.Tensor[[max_seq, head_dim], pl.FP32],
-            block_table: pl.Tensor[[batch * max_blocks_per_seq], pl.INT32],
-            slot_mapping: pl.Tensor[[batch * max_seq], pl.INT32],
-            k_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
-            v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
+            block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
+            slot_mapping: pl.Tensor[[SLOT_MAPPING_DYN], pl.INT32],
+            k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, head_dim], pl.BF16],
+            v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, head_dim], pl.BF16],
             wo: pl.Tensor[[hidden, hidden], pl.BF16],
             post_rms_weight: pl.Tensor[[1, hidden], pl.FP32],
             w_gate: pl.Tensor[[hidden, intermediate_size], pl.BF16],
             w_up: pl.Tensor[[hidden, intermediate_size], pl.BF16],
             w_down: pl.Tensor[[intermediate_size, hidden], pl.BF16],
-            out: pl.Out[pl.Tensor[[batch, max_seq, hidden], pl.BF16]],
-        ) -> pl.Tensor[[batch, max_seq, hidden], pl.BF16]:
-            for b in pl.parallel(0, batch, 1):
+            out: pl.Out[pl.Tensor[[USER_BATCH_DYN, max_seq, hidden], pl.BF16]],
+        ) -> pl.Tensor[[USER_BATCH_DYN, max_seq, hidden], pl.BF16]:
+            # Runtime user_batch (host-visible batch). Outer batch loop
+            # iterates with step 1 so every matmul tile's M dim is fully
+            # determined by TOK_TILE (no batch-axis pad / trim needed).
+            user_batch = pl.tensor.dim(hidden_states, 0)
+            for b in pl.parallel(0, user_batch, 1):
                 seq_len_b = pl.tensor.read(seq_lens, [b])
                 tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
                 for p0_idx in pl.range(tok_blocks):
@@ -526,6 +560,11 @@ def build_tensor_specs(
     import torch
     from pypto.runtime import TensorSpec
 
+    # Host allocates every batch-dependent tensor at the user-visible
+    # batch (no host pad / no host trim). The kernel signature uses
+    # USER_BATCH_DYN / KV_CACHE_ROWS_DYN / BLOCK_TABLE_FLAT_DYN /
+    # SLOT_MAPPING_DYN, so a single compiled program serves any batch
+    # <= host capacity.
     kv_hidden = num_kv_heads * head_dim
     max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_blocks = batch * max_blocks_per_seq
@@ -863,13 +902,20 @@ if __name__ == "__main__":
         "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
     )
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("-b", "--batch", type=int, default=BATCH,
+                        help=("User-visible batch size. Host allocates every "
+                              "batch-dependent tensor at exactly this size; "
+                              "every kernel signature batch-axis dim is a "
+                              "pl.dynamic() variable, so a single compiled "
+                              "program serves any batch <= host KV-cache "
+                              "capacity. Default: %(default)s"))
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False, help="set all seq_lens to MAX_SEQ")
     args = parser.parse_args()
 
     result = run(
-        program=build_qwen3_14b_prefill_program(),
-        tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
+        program=build_qwen3_14b_prefill_program(batch=args.batch),
+        tensor_specs=build_tensor_specs(batch=args.batch, use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_14b_prefill,
         config=RunConfig(
             rtol=3e-3,
