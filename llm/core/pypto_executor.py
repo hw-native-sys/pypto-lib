@@ -25,7 +25,6 @@ from .types import (
     PrefillBatch,
     PrefillResult,
     RuntimeModel,
-    padded_batch_size,
 )
 
 
@@ -90,13 +89,12 @@ class _CompiledKernels:
     lm_head: object
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
-    batch: int
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
 
 
 @dataclass
-class _PaddedPrefillInputs:
+class _PrefillInputs:
     actual_batch: int
     hidden: torch.Tensor
     seq_lens: torch.Tensor
@@ -135,8 +133,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         compiled = self._compiled[model.config.model_id]
-        padded = self._pad_prefill_inputs(model, batch, compiled.batch)
-        hidden = padded.hidden
+        prefill_inputs = self._prepare_prefill_inputs(model, batch)
+        hidden = prefill_inputs.hidden
 
         for layer_idx, layer in enumerate(model.layers):
             k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache(
@@ -146,7 +144,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             out = torch.zeros_like(hidden)
             compiled.prefill(
                 hidden,
-                padded.seq_lens,
+                prefill_inputs.seq_lens,
                 layer.input_rms_weight.view(1, -1).float().cpu(),
                 self._kernel_weight(layer.wq),
                 self._kernel_weight(layer.wk),
@@ -155,8 +153,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 layer.k_norm_weight.view(1, -1).float().cpu(),
                 compiled.rope_cos,
                 compiled.rope_sin,
-                padded.block_table,
-                padded.slot_mapping,
+                prefill_inputs.block_table,
+                prefill_inputs.slot_mapping,
                 k_cache,
                 v_cache,
                 self._kernel_weight(layer.wo),
@@ -235,11 +233,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
             from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
 
         self._validate_supported_shape(model)
-        compile_batch = self._kernel_batch_size(model)
-        self._validate_total_kv_pages(model, compile_batch)
+        kernel_batch = model.runtime.max_batch_size
+        self._validate_total_kv_pages(model, kernel_batch)
 
         prefill_program = build_qwen3_14b_prefill_program(
-            batch=compile_batch,
+            batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
             num_heads=model.config.num_attention_heads,
@@ -248,7 +246,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             intermediate_size=model.config.intermediate_size,
         )
         decode_program = build_qwen3_decode_program(
-            batch=compile_batch,
+            batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
             intermediate_size=model.config.intermediate_size,
@@ -295,7 +293,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
             lm_head=lm_head,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            batch=compile_batch,
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
         )
@@ -332,21 +329,20 @@ class PyptoQwen14BExecutor(ModelExecutor):
         )
         return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
 
-    def _pad_prefill_inputs(
+    def _prepare_prefill_inputs(
         self,
         model: RuntimeModel,
         batch: PrefillBatch,
-        compile_batch: int,
-    ) -> _PaddedPrefillInputs:
-        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations), compile_batch)
+    ) -> _PrefillInputs:
+        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations))
         max_seq = model.runtime.max_seq_len
         hidden_size = model.config.hidden_size
         max_blocks = self._max_blocks_per_seq(model)
 
-        hidden = torch.zeros((compile_batch, max_seq, hidden_size), dtype=torch.bfloat16)
-        seq_lens = torch.zeros((compile_batch,), dtype=torch.int32)
-        block_table = torch.full((compile_batch * max_blocks,), -1, dtype=torch.int32)
-        slot_mapping = torch.full((compile_batch * max_seq,), -1, dtype=torch.int32)
+        hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
+        seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
+        block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
+        slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
@@ -359,10 +355,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
             )
             self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-            slot_row = self._kv_cache_manager.slot_mapping_for_positions(alloc, seq_len, max_tokens=max_seq)
+            slot_row = self._kv_cache_manager.slot_mapping_for_positions(
+                alloc,
+                seq_len,
+                max_tokens=max_seq,
+            )
             slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
 
-        return _PaddedPrefillInputs(
+        return _PrefillInputs(
             actual_batch=actual_batch,
             hidden=hidden,
             seq_lens=seq_lens,
@@ -420,14 +420,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
 
     @staticmethod
-    def _kernel_batch_size(model: RuntimeModel) -> int:
-        return padded_batch_size(model.runtime.max_batch_size)
-
-    @staticmethod
     def _validate_batch_size(
         model: RuntimeModel,
         actual_batch: int,
-        compile_batch: int | None = None,
     ) -> int:
         if actual_batch <= 0:
             raise ValueError("batch must contain at least one request")
@@ -436,10 +431,6 @@ class PyptoQwen14BExecutor(ModelExecutor):
             raise ValueError(
                 f"batch has {actual_batch} requests, but runtime max_batch_size is {max_batch_size}"
             )
-        if compile_batch is not None and actual_batch > compile_batch:
-            raise ValueError(
-                f"batch has {actual_batch} requests, but compiled kernel batch is {compile_batch}"
-            )
         return actual_batch
 
     @staticmethod
@@ -447,13 +438,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return (model.runtime.max_seq_len + model.runtime.page_size - 1) // model.runtime.page_size
 
     @classmethod
-    def _validate_total_kv_pages(cls, model: RuntimeModel, compile_batch: int) -> None:
+    def _validate_total_kv_pages(cls, model: RuntimeModel, kernel_batch: int) -> None:
         if model.runtime.total_kv_pages is None:
             return
-        expected_pages = compile_batch * cls._max_blocks_per_seq(model)
+        expected_pages = kernel_batch * cls._max_blocks_per_seq(model)
         if model.runtime.total_kv_pages != expected_pages:
             raise ValueError(
-                "PyPTO Qwen3-14B kernels require total_kv_pages to match the padded batch capacity: "
+                "PyPTO Qwen3-14B kernels require total_kv_pages to match the runtime batch capacity: "
                 f"{model.runtime.total_kv_pages} provided, {expected_pages} required."
             )
 

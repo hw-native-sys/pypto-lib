@@ -21,7 +21,6 @@ from core.types import (
     PrefillBatch,
     RuntimeConfig,
     RuntimeModel,
-    padded_batch_size,
 )
 
 
@@ -73,61 +72,59 @@ def _model(
     )
 
 
-def test_padded_batch_size_uses_multiples_of_16():
-    assert padded_batch_size(1) == 16
-    assert padded_batch_size(15) == 16
-    assert padded_batch_size(16) == 16
-    assert padded_batch_size(17) == 32
-    assert padded_batch_size(32) == 32
-
-
-def test_kv_cache_capacity_uses_padded_runtime_batch_size():
+def test_kv_cache_capacity_uses_actual_runtime_batch_size():
     model = _model(max_batch_size=1, max_seq_len=128, page_size=64)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
 
     k_cache, _ = manager.materialize_decode_cache(model.config.model_id, 0)
-    assert k_cache.shape[0] == 16 * 2 * model.config.num_key_value_heads * model.runtime.page_size
+    assert k_cache.shape[0] == 1 * 2 * model.config.num_key_value_heads * model.runtime.page_size
 
 
-def test_prefill_inputs_are_padded_to_compiled_batch_and_flattened():
+def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
     model = _model(max_batch_size=15)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     executor = PyptoQwen14BExecutor(manager)
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
-        for idx in range(model.runtime.max_batch_size)
+        for idx in range(2)
     ]
     seq_lens = torch.tensor(
-        [idx + 1 for idx in range(model.runtime.max_batch_size)],
+        [idx + 1 for idx in range(len(allocations))],
         dtype=torch.int32,
     )
     embeddings = torch.ones(
-        model.runtime.max_batch_size,
+        len(allocations),
         int(seq_lens.max().item()),
         model.config.hidden_size,
     )
 
-    padded = executor._pad_prefill_inputs(
+    prepared = executor._prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=[alloc.request_id for alloc in allocations],
-            token_ids=torch.zeros(model.runtime.max_batch_size, int(seq_lens.max().item()), dtype=torch.long),
+            token_ids=torch.zeros(
+                len(allocations),
+                int(seq_lens.max().item()),
+                dtype=torch.long,
+            ),
             input_embeddings=embeddings,
             seq_lens=seq_lens,
             kv_allocations=allocations,
         ),
-        compile_batch=16,
     )
 
-    assert padded.actual_batch == 15
-    assert padded.hidden.shape == (16, model.runtime.max_seq_len, model.config.hidden_size)
-    assert padded.seq_lens.tolist() == list(range(1, 16)) + [0]
-    assert padded.block_table.shape == (16 * 2,)
-    assert padded.block_table[0].item() == allocations[0].page_ids[0]
-    assert padded.slot_mapping.shape == (16 * model.runtime.max_seq_len,)
-    assert padded.slot_mapping[-1].item() == -1
+    assert prepared.actual_batch == 2
+    assert prepared.hidden.shape == (2, model.runtime.max_seq_len, model.config.hidden_size)
+    assert prepared.seq_lens.tolist() == [1, 2]
+    assert prepared.block_table.shape == (2 * 2,)
+    assert prepared.block_table[0].item() == allocations[0].page_ids[0]
+    assert prepared.slot_mapping.shape == (2 * model.runtime.max_seq_len,)
+    assert prepared.slot_mapping[
+        model.runtime.max_seq_len + 1
+    ].item() == manager.slot_mapping_for_request(allocations[1], 1)
+    assert prepared.slot_mapping[-1].item() == -1
 
 
 def test_decode_inputs_use_actual_user_batch_without_padding_lanes():

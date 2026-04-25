@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .types import KvAllocation, ModelConfig, RuntimeConfig, padded_batch_size
+from .types import KvAllocation, ModelConfig, RuntimeConfig
 
 
 @dataclass
@@ -38,7 +38,7 @@ class KvCacheManager:
         num_pages = runtime.total_kv_pages
         if num_pages is None:
             max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
-            num_pages = padded_batch_size(runtime.max_batch_size) * max_blocks_per_seq
+            num_pages = runtime.max_batch_size * max_blocks_per_seq
         kv_dtype = getattr(torch, runtime.kv_dtype)
         key_pages = torch.zeros(
             config.num_hidden_layers,
