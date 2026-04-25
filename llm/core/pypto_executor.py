@@ -74,13 +74,25 @@ def _rope_tables(max_seq: int, head_dim: int, theta: float) -> tuple[torch.Tenso
     return torch.cat([cos_half, cos_half], dim=-1), torch.cat([sin_half, sin_half], dim=-1)
 
 
+_VOCAB_PAD_MULTIPLE = 512  # must be a multiple of qwen3_14b_lm_head.VOCAB_CHUNK (64)
+_LOGITS_BATCH_TILE = 16
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 @dataclass
 class _CompiledKernels:
     prefill: object
     decode: object
+    final_rms: object
+    lm_head: object
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
-    prefill_batch: int
+    batch: int
+    padded_vocab: int
+    padded_lm_head_weight: torch.Tensor
 
 
 @dataclass
@@ -123,7 +135,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         compiled = self._compiled[model.config.model_id]
-        padded = self._pad_prefill_inputs(model, batch, compiled.prefill_batch)
+        padded = self._pad_prefill_inputs(model, batch, compiled.batch)
         hidden = padded.hidden
 
         for layer_idx, layer in enumerate(model.layers):
@@ -213,9 +225,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
         from pypto.runtime import run
         try:
             from ..model.qwen3_14b_decode import build_qwen3_decode_program
+            from ..model.qwen3_14b_final_rms import build_qwen3_final_rms_program
+            from ..model.qwen3_14b_lm_head import build_qwen3_lm_head_program
             from ..model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
         except ImportError:
             from model.qwen3_14b_decode import build_qwen3_decode_program
+            from model.qwen3_14b_final_rms import build_qwen3_final_rms_program
+            from model.qwen3_14b_lm_head import build_qwen3_lm_head_program
             from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
 
         self._validate_supported_shape(model)
@@ -240,20 +256,81 @@ class PyptoQwen14BExecutor(ModelExecutor):
             num_kv_heads=model.config.num_key_value_heads,
             head_dim=model.config.head_dim,
         )
+        padded_vocab = _round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
+        final_rms_program = build_qwen3_final_rms_program(
+            batch=_LOGITS_BATCH_TILE,
+            hidden_size=model.config.hidden_size,
+            eps=model.config.rms_norm_eps,
+        )
+        lm_head_program = build_qwen3_lm_head_program(
+            batch=_LOGITS_BATCH_TILE,
+            hidden_size=model.config.hidden_size,
+            vocab_size=padded_vocab,
+        )
         prefill = run(prefill_program, config=self._run_config(codegen_only=True))
         decode = run(decode_program, config=self._run_config(codegen_only=True))
+        final_rms = run(final_rms_program, config=self._run_config(codegen_only=True))
+        lm_head = run(lm_head_program, config=self._run_config(codegen_only=True))
         rope_cos, rope_sin = _rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
             model.config.rope_theta,
         )
+
+        lm_head_weight = model.lm_head
+        if padded_vocab != lm_head_weight.shape[0]:
+            pad_rows = padded_vocab - lm_head_weight.shape[0]
+            padding = torch.zeros(
+                (pad_rows, lm_head_weight.shape[1]),
+                dtype=lm_head_weight.dtype,
+                device=lm_head_weight.device,
+            )
+            lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
+        padded_lm_head_weight = lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
+            final_rms=final_rms,
+            lm_head=lm_head,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            prefill_batch=compile_batch,
+            batch=compile_batch,
+            padded_vocab=padded_vocab,
+            padded_lm_head_weight=padded_lm_head_weight,
         )
+
+    def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
+        compiled = self._compiled[model.config.model_id]
+        hidden_size = model.config.hidden_size
+        vocab_size = model.config.vocab_size
+        padded_vocab = compiled.padded_vocab
+
+        actual_batch = hidden.shape[0]
+        if actual_batch > _LOGITS_BATCH_TILE:
+            raise ValueError(
+                f"logit batch {actual_batch} exceeds _LOGITS_BATCH_TILE {_LOGITS_BATCH_TILE}"
+            )
+
+        x = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16)
+        x[:actual_batch] = hidden.to(torch.bfloat16).cpu()
+        gamma = model.final_norm_weight.view(1, hidden_size).float().cpu()
+        normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16)
+        compiled.final_rms(
+            x,
+            gamma,
+            normed,
+            config=self._run_config(codegen_only=False),
+        )
+
+        logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32)
+        compiled.lm_head(
+            normed,
+            compiled.padded_lm_head_weight,
+            logits_padded,
+            config=self._run_config(codegen_only=False),
+        )
+        return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
 
     def _pad_prefill_inputs(
         self,
