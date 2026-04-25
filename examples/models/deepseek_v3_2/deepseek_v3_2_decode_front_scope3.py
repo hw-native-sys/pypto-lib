@@ -68,7 +68,6 @@ def build_deepseek_v3_2_decode_front_scope3_program():
             k_cache_idx_i8: pl.Tensor[[CACHE_ROWS_IDX, INDEX_HEAD_DIM], pl.INT8],
             k_cache_idx_scale: pl.Tensor[[BATCH, MAX_SEQ], pl.FP32],
             seq_lens: pl.Tensor[[BATCH], pl.INT32],
-            idx_init: pl.Tensor[[1, SORT_LEN], pl.UINT32],
             topk_vals_out: pl.Tensor[[BATCH, INDEX_TOPK], pl.FP32],
             topk_idx_out: pl.Tensor[[BATCH, INDEX_TOPK], pl.INT32],
         ) -> tuple[
@@ -115,18 +114,18 @@ def build_deepseek_v3_2_decode_front_scope3_program():
             weighted_scores = pl.create_tensor([BATCH * MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE], dtype=pl.FP32)
             score_tiles = pl.create_tensor([BATCH * MAX_SEQ_BLOCKS, SEQ_TILE], dtype=pl.FP32)
 
-            # Stage 0: pre-fill scores[b, 0:SORT_LEN] with -inf.
-            with pl.at(level=pl.Level.CORE_GROUP):
-                for b in pl.parallel(BATCH):
+            for b in pl.parallel(0, BATCH, 1):
+                ctx_len = pl.read(seq_lens, [b])
+                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+
+                # Stage 0: pre-fill scores[b, 0:SORT_LEN] with -inf.
+                with pl.at(level=pl.Level.CORE_GROUP):
                     neg_inf_row = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
                     scores = pl.assemble(scores, neg_inf_row, [b, 0])
 
-            # Stage 1: Compute tiled INT8 qk logits between q_idx_full_i8 and k_cache_idx_i8.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, BATCH, 1):
-                    ctx_len = pl.tensor.read(seq_lens, [b])
-                    ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 1: Compute tiled INT8 qk logits between q_idx_full_i8 and k_cache_idx_i8.
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         cache_row0 = b * MAX_SEQ + s0
                         k_tile_i8 = pl.slice(k_cache_idx_i8, [SEQ_TILE, INDEX_HEAD_DIM], [cache_row0, 0])
@@ -137,12 +136,9 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                             logits_i32 = pl.matmul(q_tile_i8, k_tile_i8, b_trans=True, out_dtype=pl.INT32)
                             all_scores_i8 = pl.assemble(all_scores_i8, logits_i32, [tile_row0, 0])
 
-            # Stage 2: Cast staged INT32 logits to FP32, then extract q row and apply ReLU.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, BATCH, 1):
-                    ctx_len = pl.tensor.read(seq_lens, [b])
-                    ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 2: Cast staged INT32 logits to FP32, then extract q row and apply ReLU.
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for sb in pl.range(ctx_blocks):
                         for h in pl.range(INDEX_HEADS):
                             tile_row0 = ((b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h) * Q_PAD
                             logits_row_i32 = pl.slice(all_scores_i8, [1, SEQ_TILE], [tile_row0, 0])
@@ -151,12 +147,9 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                             relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS + h
                             relu_rows = pl.assemble(relu_rows, relu_logits, [relu_row0, 0])
 
-            # Stage 3: Reduce per-head ReLU logits with weights * q_scale.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, BATCH, 1):
-                    ctx_len = pl.tensor.read(seq_lens, [b])
-                    ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 3: Reduce per-head ReLU logits with weights * q_scale.
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for sb in pl.range(ctx_blocks):
                         q_s_tile = pl.slice(q_s_padded, [Q_PAD, INDEX_HEADS], [b * Q_PAD, 0])
                         relu_row0 = (b * MAX_SEQ_BLOCKS + sb) * INDEX_HEADS
                         relu_tile = pl.slice(relu_rows, [INDEX_HEADS, SEQ_TILE], [relu_row0, 0])
@@ -164,12 +157,9 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
                         weighted_scores = pl.assemble(weighted_scores, weighted_tile, [weighted_row0, 0])
 
-            # Stage 4: Apply k scale and write valid score tiles to scores.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, BATCH, 1):
-                    ctx_len = pl.tensor.read(seq_lens, [b])
-                    ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    for sb in pl.parallel(ctx_blocks, chunk=MAX_SEQ_BLOCKS):
+                # Stage 4: Apply k scale and write valid score tiles to scores.
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for sb in pl.range(ctx_blocks):
                         s0 = sb * SEQ_TILE
                         valid_len = pl.min(SEQ_TILE, ctx_len - s0)
                         weighted_row0 = (b * MAX_SEQ_BLOCKS + sb) * Q_PAD
@@ -186,14 +176,12 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                         )
                         scores = pl.assemble(scores, score_valid, [b, s0])
 
-            for b in pl.range(0, BATCH, 1):
-                ctx_len = pl.tensor.read(seq_lens, [b])
-
                 # Stage 5: sort32 + 4 mrgsort iterations (tensor-level). Operates
                 # directly on GM slices; result is [1, 2*SORT_LEN] interleaved
-                # (val, idx). Stored to sorted_gm for gather in Stage 4.
+                # (val, idx). Stored to sorted_gm for gather in Stage 6.
                 with pl.at(level=pl.Level.CORE_GROUP):
                     score_row = pl.slice(scores, [1, SORT_LEN], [b, 0])
+                    idx_init = pl.tensor.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
                     sorted_t = pl.tensor.sort32(score_row, idx_init)
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=64)
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=256)
@@ -201,13 +189,12 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                     sorted_t = pl.tensor.mrgsort(sorted_t, block_len=4096)
                     sorted_gm = pl.assemble(sorted_gm, sorted_t, [b, 0])
 
-                # Stage 6: gather P0101/P1010 to split vals / idx bits from the
-                # first INDEX_TOPK pairs (2*INDEX_TOPK cols) in sorted_gm.
+                # Stage 6+7: gather P0101/P1010 to split vals / idx, then
+                # valid_shape+fillpad to mark idx slots past ctx_len with
+                # PadValue.min (= INT32_MIN < 0).
                 with pl.at(level=pl.Level.CORE_GROUP):
                     topk_pairs = pl.slice(sorted_gm, [1, 2 * INDEX_TOPK], [b, 0])
-                    topk_v = pl.tensor.gather(
-                        topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101
-                    )
+                    topk_v = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
                     topk_i_raw = pl.tensor.gather(
                         topk_pairs,
                         mask_pattern=pl.tile.MaskPattern.P1010,
@@ -215,10 +202,6 @@ def build_deepseek_v3_2_decode_front_scope3_program():
                     )
                     topk_vals_out = pl.assemble(topk_vals_out, topk_v, [b, 0])
                     raw_idx_gm = pl.assemble(raw_idx_gm, topk_i_raw, [b, 0])
-
-                # Stage 7: GM reload + valid_shape fillpad to mark idx slots past
-                # ctx_len with PadValue.min (= INT32_MIN < 0).
-                with pl.at(level=pl.Level.CORE_GROUP):
                     valid_topk = pl.min(INDEX_TOPK, ctx_len)
                     idx_valid = pl.slice(
                         raw_idx_gm,
@@ -298,9 +281,6 @@ def build_tensor_specs():
     def init_k_cache_idx_scale():
         return torch.rand((BATCH, MAX_SEQ), dtype=torch.float32) + 0.1
 
-    def init_idx_init():
-        return torch.arange(SORT_LEN, dtype=torch.int32).unsqueeze(0)
-
     def init_topk_vals_out():
         return torch.zeros((BATCH, INDEX_TOPK), dtype=torch.float32)
 
@@ -311,29 +291,11 @@ def build_tensor_specs():
         TensorSpec("q_idx_full_i8", [INDEX_Q_ROWS, INDEX_HEAD_DIM], torch.int8, init_value=init_q_idx_full_i8),
         TensorSpec("q_idx_scale_heads", [BATCH, INDEX_HEADS], torch.float32, init_value=init_q_idx_scale_heads),
         TensorSpec("weights", [BATCH, INDEX_HEADS], torch.float32, init_value=init_weights),
-        TensorSpec(
-            "k_cache_idx_i8",
-            [CACHE_ROWS_IDX, INDEX_HEAD_DIM],
-            torch.int8,
-            init_value=init_k_cache_idx_i8,
-        ),
+        TensorSpec("k_cache_idx_i8", [CACHE_ROWS_IDX, INDEX_HEAD_DIM], torch.int8, init_value=init_k_cache_idx_i8),
         TensorSpec("k_cache_idx_scale", [BATCH, MAX_SEQ], torch.float32, init_value=init_k_cache_idx_scale),
         TensorSpec("seq_lens", [BATCH], torch.int32, init_value=seq_lens_data),
-        TensorSpec("idx_init", [1, SORT_LEN], torch.int32, init_value=init_idx_init),
-        TensorSpec(
-            "topk_vals_out",
-            [BATCH, INDEX_TOPK],
-            torch.float32,
-            init_value=init_topk_vals_out,
-            is_output=True,
-        ),
-        TensorSpec(
-            "topk_idx_out",
-            [BATCH, INDEX_TOPK],
-            torch.int32,
-            init_value=init_topk_idx_out,
-            is_output=True,
-        ),
+        TensorSpec("topk_vals_out", [BATCH, INDEX_TOPK], torch.float32, init_value=init_topk_vals_out, is_output=True),
+        TensorSpec("topk_idx_out", [BATCH, INDEX_TOPK], torch.int32, init_value=init_topk_idx_out, is_output=True),
     ]
 
 
