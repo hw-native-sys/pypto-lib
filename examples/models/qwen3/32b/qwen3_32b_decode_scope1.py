@@ -122,7 +122,7 @@ def build_qwen3_scope1_program(
 
                 # Stage 3: K/V projection (matmul + matmul_acc in single incore).
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="kv_proj"):
-                    for ob in pl.parallel(kv_out_blocks, chunk=4):
+                    for ob in pl.parallel(kv_out_blocks, chunk=1):
                         kv0 = ob * KV_OUT_CHUNK
 
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, K_CHUNK], [0, 0])

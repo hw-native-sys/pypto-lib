@@ -65,7 +65,7 @@ def build_qwen3_scope3_program(
 
                 # Stage 0 & 1: Output projection: attn_out × wo, tiled by Q_OUT_CHUNK & Residual addition with hidden_states
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=4):
+                    for ob in pl.parallel(0, Q_OUT_BLOCKS, chunk=6):
                         o0 = ob * Q_OUT_CHUNK
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
@@ -153,7 +153,7 @@ def build_qwen3_scope3_program(
 
                 # Stage 6 & 7: Down projection + final residual writeback (fused with chunked_loop_optimizer)
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
-                    for dob in pl.parallel(0, HIDDEN_BLOCKS, chunk=2):
+                    for dob in pl.parallel(0, HIDDEN_BLOCKS, chunk=1):
                         d0 = dob * K_CHUNK
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])

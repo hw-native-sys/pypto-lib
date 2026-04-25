@@ -62,15 +62,7 @@ def build_qwen3_scope2_program(
             v_cache: pl.Tensor[[cache_rows, head_dim], pl.BF16],
             attn_out: pl.Out[pl.Tensor[[batch, hidden], pl.BF16]],
         ) -> pl.Tensor[[batch, hidden], pl.BF16]:
-            # Padding q
             all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_pad_init"):
-                for idx in pl.parallel(batch * total_q_groups, chunk=8):
-                    all_q_padded = pl.assemble(
-                        all_q_padded,
-                        pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                        [idx * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
-                    )
 
             for b in pl.parallel(0, batch, 1):
                 ctx_len = pl.tensor.read(seq_lens, [b])
@@ -84,8 +76,8 @@ def build_qwen3_scope2_program(
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="rope_kv_cache"):
-                    for ki in pl.parallel(0, num_kv_heads, chunk=8):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
+                    for ki in pl.range(num_kv_heads):
                         # K RoPE + cache update.
                         kv_col = ki * head_dim
                         k_lo = pl.slice(k_proj, [1, half_dim], [b, kv_col])
@@ -120,26 +112,34 @@ def build_qwen3_scope2_program(
                         )
                         # Q RoPE + pad (ki == kvh since q_groups == 1).
                         q_base = ki * q_per_kv
-                        for qi in pl.range(Q_HEAD_BATCH):
-                            q_col = (q_base + qi) * head_dim
-                            q_lo = pl.slice(q_proj, [1, half_dim], [b, q_col])
-                            q_hi = pl.slice(q_proj, [1, half_dim], [b, q_col + half_dim])
-                            rot_lo_bf16 = pl.cast(
-                                pl.sub(
-                                    pl.col_expand_mul(q_lo, cos_lo),
-                                    pl.col_expand_mul(q_hi, sin_lo),
-                                ),
-                                target_type=pl.BF16,
-                            )
-                            rot_hi_bf16 = pl.cast(
-                                pl.add(
-                                    pl.col_expand_mul(q_hi, cos_hi),
-                                    pl.col_expand_mul(q_lo, sin_hi),
-                                ),
-                                target_type=pl.BF16,
-                            )
-                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, 0])
-                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, half_dim])
+                        q_block = pl.reshape(
+                            pl.slice(q_proj, [1, Q_HEAD_BATCH * head_dim], [b, q_base * head_dim]),
+                            [Q_HEAD_BATCH, head_dim],
+                        )
+                        q_lo = pl.slice(q_block, [Q_HEAD_BATCH, half_dim], [0, 0])
+                        q_hi = pl.slice(q_block, [Q_HEAD_BATCH, half_dim], [0, half_dim])
+                        rot_lo_bf16 = pl.cast(
+                            pl.sub(
+                                pl.col_expand_mul(q_lo, cos_lo),
+                                pl.col_expand_mul(q_hi, sin_lo),
+                            ),
+                            target_type=pl.BF16,
+                        )
+                        rot_hi_bf16 = pl.cast(
+                            pl.add(
+                                pl.col_expand_mul(q_hi, cos_hi),
+                                pl.col_expand_mul(q_lo, sin_hi),
+                            ),
+                            target_type=pl.BF16,
+                        )
+                        all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD, 0])
+                        all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD, half_dim])
+                        # Pad the trailing rows of this Q_HEAD_PAD block with zeros.
+                        all_q_padded = pl.assemble(
+                            all_q_padded,
+                            pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                            [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
+                        )
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
                 for gi in pl.parallel(0, total_q_groups, 1):

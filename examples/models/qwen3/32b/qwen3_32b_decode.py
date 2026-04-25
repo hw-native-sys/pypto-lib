@@ -163,7 +163,7 @@ def build_qwen3_decode_program(
                         q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                 with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="kv_proj"):
-                    for ob in pl.parallel(kv_out_blocks, chunk=4):
+                    for ob in pl.parallel(kv_out_blocks, chunk=1):
                         kv0 = ob * KV_OUT_CHUNK
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
                         tile_wk = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
@@ -196,15 +196,7 @@ def build_qwen3_decode_program(
                         v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
-            # Pad q
             all_q_padded = pl.create_tensor([batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_pad_init"):
-                for idx in pl.parallel(batch * total_q_groups, chunk=8):
-                    all_q_padded = pl.assemble(
-                        all_q_padded,
-                        pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
-                        [idx * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
-                    )
 
             attn_out = pl.create_tensor([batch, hidden], dtype=pl.BF16)
             for b in pl.parallel(batch):
@@ -219,8 +211,8 @@ def build_qwen3_decode_program(
                 sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                 # Stage 1: K RoPE + cache update + V cache + Q RoPE + pad.
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="rope_kv_cache"):
-                    for ki in pl.parallel(0, num_kv_heads, chunk=8):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
+                    for ki in pl.range(num_kv_heads):
                         # K RoPE + cache update.
                         kv_col = ki * head_dim
                         k_lo = pl.slice(k_proj, [1, half_dim], [b, kv_col])
@@ -244,20 +236,28 @@ def build_qwen3_decode_program(
                         )
                         # Q RoPE + pad (ki == kvh since q_groups == 1).
                         q_base = ki * q_per_kv
-                        for qi in pl.range(Q_HEAD_BATCH):
-                            q_col = (q_base + qi) * head_dim
-                            q_lo = pl.slice(q_proj, [1, half_dim], [b, q_col])
-                            q_hi = pl.slice(q_proj, [1, half_dim], [b, q_col + half_dim])
-                            rot_lo_bf16 = pl.cast(
-                                pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)),
-                                target_type=pl.BF16,
-                            )
-                            rot_hi_bf16 = pl.cast(
-                                pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
-                                target_type=pl.BF16,
-                            )
-                            all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, 0])
-                            all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + qi, half_dim])
+                        q_block = pl.reshape(
+                            pl.slice(q_proj, [1, Q_HEAD_BATCH * head_dim], [b, q_base * head_dim]),
+                            [Q_HEAD_BATCH, head_dim],
+                        )
+                        q_lo = pl.slice(q_block, [Q_HEAD_BATCH, half_dim], [0, 0])
+                        q_hi = pl.slice(q_block, [Q_HEAD_BATCH, half_dim], [0, half_dim])
+                        rot_lo_bf16 = pl.cast(
+                            pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)),
+                            target_type=pl.BF16,
+                        )
+                        rot_hi_bf16 = pl.cast(
+                            pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
+                            target_type=pl.BF16,
+                        )
+                        all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD, 0])
+                        all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD, half_dim])
+                        # Pad the trailing rows of this Q_HEAD_PAD block with zeros.
+                        all_q_padded = pl.assemble(
+                            all_q_padded,
+                            pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
+                            [b * total_q_groups * Q_HEAD_PAD + ki * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
+                        )
 
                 attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
                 for gi in pl.parallel(total_q_groups):
@@ -355,7 +355,7 @@ def build_qwen3_decode_program(
 
                 # Stage 1 & 2: Output projection + residual addition with hidden_states
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
-                    for ob in pl.parallel(0, q_out_blocks, chunk=4):
+                    for ob in pl.parallel(0, q_out_blocks, chunk=6):
                         o0 = ob * Q_OUT_CHUNK
                         a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                         w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
@@ -441,7 +441,7 @@ def build_qwen3_decode_program(
 
                 # Stage 7 & 8: Down projection + final residual writeback.
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
-                    for dob in pl.parallel(0, hidden_blocks, chunk=2):
+                    for dob in pl.parallel(0, hidden_blocks, chunk=1):
                         d0 = dob * K_CHUNK
                         mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
