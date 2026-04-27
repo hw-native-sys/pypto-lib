@@ -50,11 +50,12 @@ BATCH_TILE = 16
 # Scope 2 tiling constants.
 Q_HEAD_BATCH = 8
 Q_HEAD_PAD = 16
-SEQ_TILE = 64
+SEQ_TILE = 256
 SB_BATCH = 64
 
 # Scope 3 tiling constants.
 K_CHUNK = 128
+OUT_PROJ_K_CHUNK = 512  # out_proj K block: large value to fully utilize L0B (K*N*2 = 64KB)
 MLP_OUT_CHUNK = 256
 
 
@@ -71,6 +72,7 @@ def build_qwen3_decode_program(
     kv_hidden = num_kv_heads * head_dim
     inter = intermediate_size
     scope1_hidden_blocks = hidden // SCOPE1_K_CHUNK
+    out_proj_k_blocks = hidden // OUT_PROJ_K_CHUNK
     hidden_blocks = hidden // K_CHUNK
     q_out_blocks = hidden // Q_OUT_CHUNK
     kv_out_blocks = kv_hidden // KV_OUT_CHUNK
@@ -167,32 +169,24 @@ def build_qwen3_decode_program(
                         kv0 = ob * KV_OUT_CHUNK
                         tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
                         tile_wk = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                        tile_wv = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
+                        v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
 
-                        tile_a_k1 = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, SCOPE1_K_CHUNK])
+                        tile_a_1 = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, SCOPE1_K_CHUNK])
                         tile_wk_1 = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [SCOPE1_K_CHUNK, kv0])
-                        k_acc = pl.matmul_acc(k_acc, tile_a_k1, tile_wk_1)
+                        tile_wv_1 = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [SCOPE1_K_CHUNK, kv0])
+                        k_acc = pl.matmul_acc(k_acc, tile_a_1, tile_wk_1)
+                        v_acc = pl.matmul_acc(v_acc, tile_a_1, tile_wv_1)
 
                         for kb in pl.pipeline(2, scope1_hidden_blocks, stage=2):
                             k0 = kb * SCOPE1_K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
                             tile_wk_i = pl.slice(wk, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
-
-                        tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
-                        tile_wv = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [0, kv0])
-                        v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-
-                        tile_a_v1 = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, SCOPE1_K_CHUNK])
-                        tile_wv_1 = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [SCOPE1_K_CHUNK, kv0])
-                        v_acc = pl.matmul_acc(v_acc, tile_a_v1, tile_wv_1)
-
-                        for kb in pl.pipeline(2, scope1_hidden_blocks, stage=2):
-                            k0 = kb * SCOPE1_K_CHUNK
-                            tile_a_i = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, k0])
                             tile_wv_i = pl.slice(wv, [SCOPE1_K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                            k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
                             v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                        k_proj = pl.assemble(k_proj, k_acc, [b0, kv0])
                         v_proj = pl.assemble(v_proj, v_acc, [b0, kv0])
 
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
@@ -357,20 +351,20 @@ def build_qwen3_decode_program(
                 with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
                     for ob in pl.parallel(0, q_out_blocks, chunk=6):
                         o0 = ob * Q_OUT_CHUNK
-                        a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
-                        w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
+                        a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, 0])
+                        w_chunk_0 = pl.slice(wo, [OUT_PROJ_K_CHUNK, Q_OUT_CHUNK], [0, o0])
                         hidden_chunk = pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0])
 
                         o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
 
-                        a_chunk_1 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, K_CHUNK])
-                        w_chunk_1 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [K_CHUNK, o0])
+                        a_chunk_1 = pl.slice(attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, OUT_PROJ_K_CHUNK])
+                        w_chunk_1 = pl.slice(wo, [OUT_PROJ_K_CHUNK, Q_OUT_CHUNK], [OUT_PROJ_K_CHUNK, o0])
                         o_acc = pl.matmul_acc(o_acc, a_chunk_1, w_chunk_1)
 
-                        for kb in pl.pipeline(2, hidden_blocks, stage=2):
-                            k0 = kb * K_CHUNK
-                            a_chunk = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                        for kb in pl.pipeline(2, out_proj_k_blocks, stage=2):
+                            k0 = kb * OUT_PROJ_K_CHUNK
+                            a_chunk = pl.slice(attn_out, [BATCH_TILE, OUT_PROJ_K_CHUNK], [b0, k0])
+                            w_chunk = pl.slice(wo, [OUT_PROJ_K_CHUNK, Q_OUT_CHUNK], [k0, o0])
                             o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
                         resid = pl.cast(hidden_chunk, target_type=pl.FP32)
