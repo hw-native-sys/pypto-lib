@@ -383,26 +383,25 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program():
             # ===== scope3: index score + topk =====
             # Inputs: q_idx_full_i8, k_cache_idx_i8
             # Output: topk_idx_out (top-k positions per batch)
-            scores = pl.create_tensor([BATCH, SORT_LEN], dtype=pl.FP32)
-            s3_q_s_padded = pl.create_tensor([BATCH * Q_PAD, INDEX_HEADS], dtype=pl.FP32)
-            s3_score_tiles = pl.create_tensor([BATCH * MAX_SEQ_BLOCKS, SEQ_TILE], dtype=pl.FP32)
 
             for b in pl.parallel(BATCH):
                 # Stage 3.0: Pad q_idx_full_i8 and pre-fill scores.
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_prefill_scores"):
+                    scores = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
                 s3_q_i8_padded = pl.create_tensor([INDEX_HEADS * Q_PAD, INDEX_HEAD_DIM], dtype=pl.INT8)
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_init"):
+                s3_q_s_padded = pl.create_tensor([Q_PAD, INDEX_HEADS], dtype=pl.FP32)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_q_i8_init"):
                     for q_row0 in pl.range(INDEX_HEADS):
                         s3_q_i8_valid = q_idx_full_i8[b * INDEX_HEADS + q_row0, :]
                         s3_q_i8_padded = pl.assemble(s3_q_i8_padded, s3_q_i8_valid, [q_row0 * Q_PAD, 0])
                         s3_q_i8_zero_pad = pl.cast(pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM], dtype=pl.INT16, value=0), target_type=pl.INT8)
                         s3_q_i8_padded = pl.assemble(s3_q_i8_padded, s3_q_i8_zero_pad, [q_row0 * Q_PAD + Q_VALID, 0])
-                    s3_neg_inf_row = pl.full([1, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-                    scores = pl.assemble(scores, s3_neg_inf_row, [b, 0])
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_q_s_init"):
                     s3_weights_row = weights[b, :]
                     s3_q_scales_row = q_idx_scale_heads[b, :]
                     s3_q_s_row = pl.mul(s3_weights_row, s3_q_scales_row)
-                    s3_q_s_padded = pl.assemble(s3_q_s_padded, s3_q_s_row, [b * Q_PAD, 0])
-                    s3_q_s_padded = pl.assemble(s3_q_s_padded, pl.full([Q_PAD - Q_VALID, INDEX_HEADS], dtype=pl.FP32, value=0.0), [b * Q_PAD + Q_VALID, 0])
+                    s3_q_s_padded = pl.assemble(s3_q_s_padded, s3_q_s_row, [0, 0])
+                    s3_q_s_padded = pl.assemble(s3_q_s_padded, pl.full([Q_PAD - Q_VALID, INDEX_HEADS], dtype=pl.FP32, value=0.0), [Q_VALID, 0])
 
                 s3_ctx_len = pl.read(seq_lens, [b])
                 s3_ctx_blocks = (s3_ctx_len + SEQ_TILE - 1) // SEQ_TILE
@@ -437,7 +436,7 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program():
                 s3_weighted_scores = pl.create_tensor([MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE], dtype=pl.FP32)
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_head_reduce"):
                     for sb in pl.range(s3_ctx_blocks):
-                        s3_q_s_tile = s3_q_s_padded[b * Q_PAD : b * Q_PAD + Q_PAD, :]
+                        s3_q_s_tile = s3_q_s_padded[:, :]
                         s3_relu_row0 = sb * INDEX_HEADS
                         s3_relu_tile = s3_relu_rows[s3_relu_row0 : s3_relu_row0 + INDEX_HEADS, :]
                         s3_weighted_tile = pl.matmul(s3_q_s_tile, s3_relu_tile, out_dtype=pl.FP32)
@@ -453,20 +452,19 @@ def build_deepseek_v3_2_decode_front_scope123_int8_quant_program():
                         s3_k_scale = k_cache_idx_scale[b, s0 : s0 + SEQ_TILE]
                         s3_score_acc = s3_weighted_scores[weighted_row0, :]
                         s3_score_tile = pl.mul(s3_score_acc, s3_k_scale)
-                        score_row0 = b * MAX_SEQ_BLOCKS + sb
-                        s3_score_tiles = pl.assemble(s3_score_tiles, s3_score_tile, [score_row0, 0])
+                        s3_score_2d = pl.reshape(s3_score_tile, [1, SEQ_TILE])
                         s3_score_valid = pl.slice(
-                            s3_score_tiles,
+                            s3_score_2d,
                             [1, SEQ_TILE],
-                            [score_row0, 0],
+                            [0, 0],
                             valid_shape=[1, s3_valid_len],
                         )
-                        scores = pl.assemble(scores, s3_score_valid, [b, s0])
+                        scores = pl.assemble(scores, s3_score_valid, [0, s0])
 
                 s3_sorted_gm = pl.create_tensor([1, 2 * SORT_LEN], dtype=pl.FP32)
                 # Stage 3.5: Run sort32 + mrgsort.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_sort"):
-                    s3_score_row = scores[b, :]
+                    s3_score_row = scores[0, :]
                     idx_init = pl.tensor.arange(0, [1, SORT_LEN], dtype=pl.UINT32)
                     s3_sorted_t = pl.tensor.sort32(s3_score_row, idx_init)
                     s3_sorted_t = pl.tensor.mrgsort(s3_sorted_t, block_len=64)
