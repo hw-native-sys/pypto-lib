@@ -76,7 +76,7 @@ def main() -> None:
         model_dir=str(model_dir),
         model_format="huggingface",
         runtime_config=RuntimeConfig(
-            page_size=64,
+            page_size=256,
             max_batch_size=1,
             max_seq_len=args.max_seq_len,
             device="cpu",

@@ -75,6 +75,7 @@ def _rope_tables(max_seq: int, head_dim: int, theta: float) -> tuple[torch.Tenso
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of qwen3_14b_lm_head.VOCAB_CHUNK (64)
 _LOGITS_BATCH_TILE = 16
+_QWEN14B_PAGE_SIZE = 256
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -485,4 +486,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
             mismatch = ", ".join(f"{k}={actual[k]} (expected {v})" for k, v in expected.items() if actual[k] != v)
             raise ValueError(
                 "Bundled kernels under model/ currently support Qwen3-14B layer shapes only: " + mismatch
+            )
+        if model.runtime.page_size != _QWEN14B_PAGE_SIZE:
+            raise ValueError(
+                "PyPTO Qwen3-14B kernels require runtime page_size "
+                f"{_QWEN14B_PAGE_SIZE}, got {model.runtime.page_size}."
             )

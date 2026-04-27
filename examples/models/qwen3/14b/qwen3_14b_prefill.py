@@ -64,7 +64,7 @@ TOK_TILE = 64
 Q_HEAD_BATCH = 5        # Q heads per attention group
 Q_HEAD_BATCH_PAD = 8    # padded to 32-byte alignment (8 * 4 = 32)
 Q_HEAD_PAD = 16         # padded Q rows for cube alignment
-SEQ_TILE = 64           # sequence tile for attention
+SEQ_TILE = 256          # sequence tile for attention
 SB_BATCH = 64
 BLOCK_SIZE = SEQ_TILE   # paged attention block size (matches decode)
 MLP_OUT_CHUNK = 128
