@@ -19,12 +19,6 @@ Decode contract:
 - `seq_lens[b]` must be in `[1, MAX_SEQ]` for active rows.
 - Zero-length rows are invalid for this fused decode kernel because scope1/scope2
     write the current token at `pos = seq_len - 1` before scope4 runs.
-
-[NOTE] (sjduan) This standalone scope1234 test time is expected to 5 mins (most of it is on compute golden);
-        please consider either enable the caching feature or reduce the test scale.
-[NOTE] (sjduan) In scope 4, the device path keeps duplicated 16-row intermediates (MATMUL_ROW_PAD = 16) through 
-        q-nope projection, online softmax state, and latent-to-V projection, while actually 1-row computation is
-        be done; because that is the backend-safe lowering shape on a2a3 (1-row lowering is not allowed on a2a3).
 """
 
 import pypto.language as pl
@@ -49,7 +43,6 @@ INDEX_Q_OUT = INDEX_HEADS * INDEX_HEAD_DIM
 INDEX_TOPK = 2048
 EP_NODES = 128
 ATTN_OUT = NUM_HEADS * V_HEAD_DIM
-TOPK_FLAT_ELEMS = BATCH * INDEX_TOPK
 
 EPS = 1e-6
 HIDDEN_INV = 1.0 / HIDDEN
@@ -69,6 +62,7 @@ K_CHUNK = 128
 IDX_OUT_CHUNK = 128
 KIDX_OUT_CHUNK = 64
 QREDUCE_OUT_CHUNK = 64
+QREDUCE_BATCH_TILE = 16
 WEIGHTS_OUT_CHUNK = 16
 
 # Scope3 tiles
@@ -83,8 +77,6 @@ FP32_NEG_INF = -3.4028234663852886e38
 ATTN_SCALE = 1.0 / (QK_HEAD_DIM**0.5)
 Q_LATENT_CHUNK = 128
 V_OUT_CHUNK = 16
-HEAD_CHUNK = 8
-BATCH_CHUNK = 4
 MATMUL_ROW_PAD = 16
 
 
@@ -332,24 +324,24 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Stage 2.5: Apply Hadamard transform (full matrix multiplication).
             # For q_idx_full [B, H*D], reshape conceptually to [B, H, D] and apply Hadamard per head.
             # For k_idx [B, D], apply hadamard_k directly.
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_hadamard"):
-                for h in pl.parallel(0, INDEX_HEADS, 1, chunk=8):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_hadamard"):
+                for h in pl.parallel(INDEX_HEADS):
                     h_offset = h * INDEX_HEAD_DIM
                     for n0 in pl.range(0, INDEX_HEAD_DIM, IDX_OUT_CHUNK):
                         hadamard_q_acc = pl.full([BATCH, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for k0 in pl.range(0, INDEX_HEAD_DIM, K_CHUNK):
-                            q_tile = pl.slice(q_idx_full, [BATCH, K_CHUNK], [0, h_offset + k0])
-                            hadamard_q_tile = pl.slice(hadamard_q, [K_CHUNK, IDX_OUT_CHUNK], [k0, n0])
+                            q_tile = q_idx_full[:, h_offset + k0 : h_offset + k0 + K_CHUNK]
+                            hadamard_q_tile = hadamard_q[k0 : k0 + K_CHUNK, n0 : n0 + IDX_OUT_CHUNK]
                             q_h_tile = pl.matmul(q_tile, hadamard_q_tile, out_dtype=pl.FP32)
                             hadamard_q_acc = pl.add(hadamard_q_acc, q_h_tile)
                         q_idx_full = pl.assemble(q_idx_full, pl.cast(hadamard_q_acc, target_type=pl.BF16), [0, h_offset + n0])
 
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_k_hadamard"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_hadamard"):
                 for n0 in pl.parallel(0, INDEX_HEAD_DIM, IDX_OUT_CHUNK):
                     hadamard_k_acc = pl.full([BATCH, IDX_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                     for k0 in pl.range(0, INDEX_HEAD_DIM, K_CHUNK):
-                        k_tile = pl.slice(k_idx, [BATCH, K_CHUNK], [0, k0])
-                        hadamard_k_tile = pl.slice(hadamard_k, [K_CHUNK, IDX_OUT_CHUNK], [k0, n0])
+                        k_tile = k_idx[:, k0 : k0 + K_CHUNK]
+                        hadamard_k_tile = hadamard_k[k0 : k0 + K_CHUNK, n0 : n0 + IDX_OUT_CHUNK]
                         k_h_tile = pl.matmul(k_tile, hadamard_k_tile, out_dtype=pl.FP32)
                         hadamard_k_acc = pl.add(hadamard_k_acc, k_h_tile)
                     k_idx = pl.assemble(k_idx, pl.cast(hadamard_k_acc, target_type=pl.BF16), [0, n0])
@@ -417,7 +409,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
                 # Stage 3.0: Pad q_idx_out and pre-fill scores.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_init"):
-                    s3_q_row = pl.slice(q_idx_out, [1, INDEX_HEAD_DIM], [b, 0])
+                    s3_q_row = q_idx_out[b : b + 1, 0 : INDEX_HEAD_DIM]
                     s3_q_padded = pl.assemble(s3_q_padded, s3_q_row, [b * Q_PAD, 0])
                     s3_q_zero_pad = pl.cast(pl.full([Q_PAD - Q_VALID, INDEX_HEAD_DIM], dtype=pl.FP32, value=0.0), target_type=pl.BF16)
                     s3_q_padded = pl.assemble(s3_q_padded, s3_q_zero_pad, [b * Q_PAD + Q_VALID, 0])
@@ -475,7 +467,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Inputs: q_proj, kv_cache, pe_cache, topk_idx
             # Output: dispatch_buf (cross-node dispatch buffer)
             attn_front = pl.create_tensor([BATCH, ATTN_OUT], dtype=pl.BF16)
-            topk_idx_flat = pl.reshape(topk_idx, [TOPK_FLAT_ELEMS])
+            topk_idx_flat = pl.reshape(topk_idx, [BATCH * INDEX_TOPK])
 
             for b in pl.parallel(BATCH):
                 attn_row = pl.create_tensor([1, ATTN_OUT], dtype=pl.FP32)
@@ -504,7 +496,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_q_nope_latent_proj"):
                         for q0 in pl.range(0, KV_LORA_RANK, Q_LATENT_CHUNK):
                             w_qn_h = pl.reshape(
-                                pl.slice(w_q_nope_to_latent, [1, QK_NOPE_HEAD_DIM, Q_LATENT_CHUNK], [h, 0, q0]),
+                                w_q_nope_to_latent[h : h + 1, 0 : QK_NOPE_HEAD_DIM, q0 : q0 + Q_LATENT_CHUNK],
                                 [QK_NOPE_HEAD_DIM, Q_LATENT_CHUNK],
                             )
                             q_nope_latent_part = pl.matmul(q_nope_padded, w_qn_h, out_dtype=pl.FP32)
@@ -514,8 +506,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                         # Stage 4.3: Initialize online softmax state with the first topk entry.
                         topk_pos0 = pl.read(topk_idx_flat, [topk_base])
                         cache_s0 = b * MAX_SEQ + topk_pos0
-                        kv_s0 = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK], [cache_s0, 0]), target_type=pl.FP32)
-                        pe_s0 = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM], [cache_s0, 0]), target_type=pl.FP32)
+                        kv_s0 = pl.cast(kv_cache[cache_s0 : cache_s0 + 1, 0 : KV_LORA_RANK], target_type=pl.FP32)
+                        pe_s0 = pl.cast(pe_cache[cache_s0 : cache_s0 + 1, 0 : QK_ROPE_HEAD_DIM], target_type=pl.FP32)
                         oi = pl.col_expand(pl.full([MATMUL_ROW_PAD, KV_LORA_RANK], dtype=pl.FP32, value=0.0), kv_s0)
                         pe_batch0 = pl.col_expand(pl.full([MATMUL_ROW_PAD, QK_ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), pe_s0)
                         score_nope0 = pl.row_sum(pl.mul(q_nope_latent_batch, oi))
@@ -528,8 +520,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_softmax_accum"):
                             topk_pos = pl.read(topk_idx_flat, [topk_base + kk])
                             cache_s = b * MAX_SEQ + topk_pos
-                            kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK], [cache_s, 0]), target_type=pl.FP32)
-                            pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM], [cache_s, 0]), target_type=pl.FP32)
+                            kv_s = pl.cast(kv_cache[cache_s : cache_s + 1, 0 : KV_LORA_RANK], target_type=pl.FP32)
+                            pe_s = pl.cast(pe_cache[cache_s : cache_s + 1, 0 : QK_ROPE_HEAD_DIM], target_type=pl.FP32)
                             kv_batch = pl.col_expand(pl.full([MATMUL_ROW_PAD, KV_LORA_RANK], dtype=pl.FP32, value=0.0), kv_s)
                             pe_batch = pl.col_expand(pl.full([MATMUL_ROW_PAD, QK_ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), pe_s)
                             score_nope = pl.row_sum(pl.mul(q_nope_latent_batch, kv_batch))
@@ -551,7 +543,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                         ctx_v_batch = pl.full([MATMUL_ROW_PAD, V_HEAD_DIM], dtype=pl.FP32, value=0.0)
                         for v0 in pl.range(0, V_HEAD_DIM, V_OUT_CHUNK):
                             wv_tile = pl.reshape(
-                                pl.slice(w_latent_to_v, [1, KV_LORA_RANK, V_OUT_CHUNK], [h, 0, v0]),
+                                w_latent_to_v[h : h + 1, 0 : KV_LORA_RANK, v0 : v0 + V_OUT_CHUNK],
                                 [KV_LORA_RANK, V_OUT_CHUNK],
                             )
                             v_part_batch = pl.matmul(pl.cast(ctx_latent_batch, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
@@ -559,7 +551,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
                     # Stage 4.7: Extract the leading V row and assemble it into attn_row.
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_v_assemble"):
-                        ctx_v = pl.slice(ctx_v_batch, [1, V_HEAD_DIM], [0, 0])
+                        ctx_v = ctx_v_batch[0 : 1, 0 : V_HEAD_DIM]
                         attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
 
                 # Stage 4.8: Cast and stash the finished attention row for this batch.
@@ -567,11 +559,11 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     attn_front = pl.assemble(attn_front, pl.cast(attn_row, target_type=pl.BF16), [b, 0])
 
             # Stage 4.9: Route finished attention rows into the cross-node dispatch buffer.
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="s4_dispatch"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_dispatch"):
                 layer_id = pl.read(layer_id_t, [0])
-                for b in pl.parallel(0, BATCH, 1, chunk=BATCH_CHUNK):
+                for b in pl.parallel(BATCH):
                     target_node = (b + layer_id) % EP_NODES
-                    token_row = pl.slice(attn_front, [1, ATTN_OUT], [b, 0])
+                    token_row = attn_front[b : b + 1, 0 : ATTN_OUT]
                     dispatch_buf = pl.assemble(dispatch_buf, token_row, [target_node, b, 0])
 
             return dispatch_buf
