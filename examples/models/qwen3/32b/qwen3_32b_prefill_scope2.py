@@ -458,7 +458,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_prefill_scope2_program(),
-        tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
+        specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_prefill_scope2,
         config=RunConfig(
             rtol=2e-3,

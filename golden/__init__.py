@@ -8,16 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Golden testing infrastructure for PyPTO-Lib.
 
-Provides tensor specification, result validation, and a runner that compiles
-and executes PyPTO programs with golden reference comparison.
+Provides tensor and scalar specifications, result validation, and a runner
+that compiles and executes PyPTO programs with golden reference comparison.
 """
 
 from .runner import RunConfig, RunResult, run
-from .tensor_spec import TensorSpec
+from .spec import ScalarSpec, TensorSpec
 from .validation import validate_golden
 
 __all__ = [
     "TensorSpec",
+    "ScalarSpec",
     "validate_golden",
     "RunConfig",
     "RunResult",

@@ -88,7 +88,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_deepseek_v4_decode_o_proj_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_o_proj,
         config=RunConfig(
             rtol=3e-3,

@@ -8,10 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Hello World — the simplest PyPTO-Lib example.
 
-Demonstrates the simplest use of auto_incore with a single parallel loop:
-a large matrix is split into row chunks, and each chunk adds 1 elementwise.
+Demonstrates the simplest use of auto_incore with a single parallel loop and a
+scalar runtime parameter: a large matrix is split into row chunks, and each
+chunk adds the same scalar ``a`` elementwise.
 
-    output[r, c] = input[r, c] + 1     for all (r, c)
+    output[r, c] = input[r, c] + a     for all (r, c)
 
 The parallel loop with chunk= lets the compiler split the iteration space
 into (chunk_loop, in_chunk_loop) and place the incore boundary automatically.
@@ -31,15 +32,16 @@ def build_hello_world_program(
     @pl.program
     class HelloWorldProgram:
         @pl.function(type=pl.FunctionType.Opaque)
-        def add_one(
+        def add_scalar(
             self,
             x: pl.Tensor[[rows, cols], pl.FP32],
+            a: pl.Scalar[pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
             with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
                 for r in pl.parallel(0, rows, 1, chunk=row_chunk):
                     tile_x = pl.slice(x, [1, cols], [r, 0])
-                    tile_y = pl.add(tile_x, 1.0)
+                    tile_y = pl.add(tile_x, a)
                     y = pl.assemble(y, tile_y, [r, 0])
 
             return y
@@ -47,21 +49,23 @@ def build_hello_world_program(
     return HelloWorldProgram
 
 
-def build_tensor_specs(
+def build_specs(
     rows: int = ROWS,
     cols: int = COLS,
+    a: float = 1.0,
 ):
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     return [
         TensorSpec("x", [rows, cols], torch.float32, init_value=torch.randn),
+        ScalarSpec("a", torch.float32, a),
         TensorSpec("y", [rows, cols], torch.float32, is_output=True),
     ]
 
 
-def golden_hello_world(tensors):
-    tensors["y"][:] = tensors["x"] + 1.0
+def golden_hello_world(values):
+    values["y"][:] = values["x"] + values["a"]
 
 
 if __name__ == "__main__":
@@ -77,7 +81,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_hello_world_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_specs(),
         golden_fn=golden_hello_world,
         config=RunConfig(
             rtol=1e-5,

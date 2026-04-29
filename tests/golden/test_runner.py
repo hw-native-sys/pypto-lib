@@ -13,12 +13,13 @@ These tests mock out ``pypto.ir.compile`` and ``pypto.runtime.execute_compiled``
 so they run without a device.
 """
 
+import ctypes
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import torch
-from golden import RunConfig, TensorSpec, run
+from golden import RunConfig, ScalarSpec, TensorSpec, run
 from golden.runner import RunResult, _backend_for_platform, _save_tensors
 
 
@@ -52,7 +53,12 @@ def populated_cache(tmp_path):
     return tmp_path
 
 
-def _patch_compile_and_execute(compiled_dir: Path, write_outputs_positional=None):
+def _patch_compile_and_execute(
+    compiled_dir: Path,
+    write_outputs_positional=None,
+    *,
+    fake_execute=None,
+):
     """Build context managers that stub out ``ir.compile`` and
     ``pypto.runtime.execute_compiled``.
 
@@ -60,17 +66,23 @@ def _patch_compile_and_execute(compiled_dir: Path, write_outputs_positional=None
         compiled_dir: What `compiled.output_dir` should resolve to.
         write_outputs_positional: Optional list whose entries correspond 1:1 to
             the tensors passed to execute_compiled (matching the order of
-            ``tensor_specs``).  Non-None entries are copied in-place into the
-            corresponding tensor, simulating a correct kernel.
+            ``specs``).  Non-None entries are copied in-place into the
+            corresponding tensor, simulating a correct kernel.  Ignored when
+            ``fake_execute`` is given.
+        fake_execute: Optional fully custom ``execute_compiled`` side effect
+            ``(work_dir, args, **kwargs) -> None``.  Use when a test needs to
+            observe args or run logic beyond the simple per-position copy that
+            ``write_outputs_positional`` supports.
     """
     fake = _FakeCompiled(compiled_dir)
 
-    def fake_execute(work_dir, tensors, **kwargs):
-        if write_outputs_positional is None:
-            return
-        for tensor, value in zip(tensors, write_outputs_positional):
-            if value is not None:
-                tensor[:] = value
+    if fake_execute is None:
+        def fake_execute(work_dir, tensors, **kwargs):
+            if write_outputs_positional is None:
+                return
+            for tensor, value in zip(tensors, write_outputs_positional, strict=True):
+                if value is not None:
+                    tensor[:] = value
 
     return (
         patch("pypto.ir.compile", return_value=fake),
@@ -102,7 +114,7 @@ class TestGoldenDataCacheHit:
         with compile_p, exec_p, patch.object(TensorSpec, "create_tensor", _no_create_tensor):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn_should_not_run,
                 golden_data=str(populated_cache),
             )
@@ -127,7 +139,7 @@ class TestGoldenDataCacheHit:
         with compile_p, exec_p:
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
             )
@@ -149,7 +161,7 @@ class TestGoldenDataCacheHit:
         with compile_p, exec_p:
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
             )
@@ -180,7 +192,7 @@ class TestGoldenDataCacheHit:
              patch("pypto.runtime.execute_compiled", side_effect=capture_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(populated_cache),
             )
@@ -203,7 +215,7 @@ class TestGoldenDataCacheMiss:
         with compile_p, exec_p:
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=lambda t: None,
                 golden_data=str(empty),
             )
@@ -227,7 +239,7 @@ class TestGoldenDataCacheMiss:
         with compile_p, exec_p:
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=str(partial),
             )
@@ -265,7 +277,7 @@ class TestGoldenFnPath:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
 
@@ -304,7 +316,7 @@ class TestGoldenFnPath:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
 
@@ -330,7 +342,7 @@ class TestGoldenFnPath:
              patch("pypto.runtime.execute_compiled", side_effect=bad_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn,
             )
 
@@ -355,7 +367,7 @@ class TestNoValidation:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=None,
             )
@@ -386,7 +398,7 @@ class TestCompileOnly:
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 config=RunConfig(compile_only=True),
                 golden_fn=golden_fn_must_not_run,
             )
@@ -419,7 +431,7 @@ class TestRuntimeDir:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 runtime_dir=str(prebuilt),
             )
 
@@ -445,7 +457,7 @@ class TestRuntimeDir:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn,
                 runtime_dir=str(prebuilt),
             )
@@ -469,7 +481,7 @@ class TestRuntimeDir:
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 runtime_dir=str(missing),
             )
 
@@ -492,7 +504,7 @@ class TestRuntimeDir:
              patch("pypto.runtime.execute_compiled", side_effect=exec_must_not_run):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 config=RunConfig(compile_only=True),
                 runtime_dir=str(prebuilt),
             )
@@ -523,7 +535,7 @@ class TestRuntimeDir:
              patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
             r = run(
                 program=object(),
-                tensor_specs=three_kinds_specs,
+                specs=three_kinds_specs,
                 golden_fn=golden_fn_should_not_run,
                 golden_data=str(populated_cache),
                 runtime_dir=str(prebuilt),
@@ -568,6 +580,191 @@ class TestRunResultStr:
 
     def test_fail_without_error(self):
         assert str(RunResult(passed=False)) == "FAIL"
+
+
+@pytest.fixture
+def mixed_specs():
+    """Mix of TensorSpec input + ScalarSpec + TensorSpec output."""
+    return [
+        TensorSpec("x", [4], torch.float32, init_value=torch.randn),
+        ScalarSpec("alpha", torch.float32, 2.5),
+        TensorSpec("y", [4], torch.float32, is_output=True),
+    ]
+
+
+class TestScalarMixedSpecs:
+    """Mixed TensorSpec + ScalarSpec exercises the scalar path through run()."""
+
+    def test_scalar_passed_as_ctypes_to_execute(self, mixed_specs, tmp_path):
+        """run() buckets tensors before scalars regardless of their order in
+        ``specs``: for ``[Tensor x, Scalar alpha, Tensor y]`` the args list
+        passed to execute_compiled is ``[x, y, alpha]`` (tensor pool first,
+        scalar pool after — matching simpler's ChipStorageTaskArgs contract)."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        observed: dict[str, object] = {}
+
+        def fake_execute(work_dir, args, **_kwargs):
+            observed["arg0"] = args[0]
+            observed["arg1"] = args[1]
+            observed["arg2"] = args[2]
+            # Make validation pass: y = x + alpha (via ctypes scalar)
+            args[1][:] = args[0] + args[2].value
+
+        def golden_fn(scratch):
+            scratch["y"][:] = scratch["x"] + scratch["alpha"]
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        # Bucketed: x (input tensor), y (output tensor), alpha (scalar)
+        assert isinstance(observed["arg0"], torch.Tensor)
+        assert isinstance(observed["arg1"], torch.Tensor)
+        assert isinstance(observed["arg2"], ctypes.c_float)
+        assert observed["arg2"].value == pytest.approx(2.5)
+
+    def test_scalar_persisted_to_pt(self, mixed_specs, tmp_path):
+        """After a successful run, work_dir/data/in/{name}.pt must exist with
+        the spec's value as a 0-dim tensor of the spec's dtype."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        def fake_execute(_work_dir, args, **_kwargs):
+            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
+            args[1][:] = args[0] + args[2].value
+
+        def golden_fn(scratch):
+            scratch["y"][:] = scratch["x"] + scratch["alpha"]
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        scalar_path = compiled_dir / "data" / "in" / "alpha.pt"
+        assert scalar_path.is_file()
+        loaded = torch.load(scalar_path, weights_only=True)
+        assert loaded.ndim == 0
+        assert loaded.dtype == torch.float32
+        assert loaded.item() == pytest.approx(2.5)
+
+    def test_scalar_pt_loaded_from_cache(self, mixed_specs, tmp_path):
+        """When golden_data has {name}.pt, the cached value (not the spec
+        value) must be used for ctypes encoding."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        # Pre-populate the cache: x, y, alpha.pt — alpha=10.0 (different from spec's 2.5)
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([11.0, 12.0, 13.0, 14.0])  # x + 10.0
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        _save_tensors(cache / "in", {"alpha": torch.tensor(10.0, dtype=torch.float32)})
+
+        observed_alpha: dict[str, object] = {}
+
+        def fake_execute(_work_dir, args, **_kwargs):
+            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
+            observed_alpha["scalar"] = args[2]
+            # Device writes y = x + alpha so cache golden matches
+            args[1][:] = args[0] + args[2].value
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with compile_p, exec_p:
+            r = run(
+                program=object(),
+                specs=mixed_specs,
+                golden_data=str(cache),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        # Cached alpha=10.0 must override spec.value=2.5
+        assert isinstance(observed_alpha["scalar"], ctypes.c_float)
+        assert observed_alpha["scalar"].value == pytest.approx(10.0)
+
+    def test_missing_scalar_pt_in_cache_fails(self, mixed_specs, tmp_path):
+        """golden_data with a ScalarSpec must include {name}.pt — missing it
+        should produce a ``missing files`` error."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([3.5, 4.5, 5.5, 6.5])
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        # Note: no alpha.pt
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+
+        assert not r.passed
+        assert "alpha.pt" in (r.error or "")
+
+    def test_scalar_pt_non_zero_dim_fails(self, mixed_specs, tmp_path):
+        """A non-0-dim tensor in {name}.pt must fail via RunResult, not raise."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([3.5, 4.5, 5.5, 6.5])
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        # Save a 1-D tensor under alpha — wrong rank.
+        _save_tensors(cache / "in", {"alpha": torch.tensor([2.5], dtype=torch.float32)})
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+
+        assert not r.passed
+        assert "0-dim" in (r.error or "")
+
+    def test_scalar_pt_dtype_mismatch_fails(self, mixed_specs, tmp_path):
+        """If {name}.pt has a different dtype than the spec, fail loudly."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        cache = tmp_path / "cache"
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        y_golden = torch.tensor([3.5, 4.5, 5.5, 6.5])
+        _save_tensors(cache / "in", {"x": x})
+        _save_tensors(cache / "out", {"y": y_golden})
+        # Save alpha as int32 — spec says fp32
+        _save_tensors(cache / "in", {"alpha": torch.tensor(2, dtype=torch.int32)})
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_data=str(cache))
+
+        assert not r.passed
+        assert "dtype mismatch" in (r.error or "")
+
+    def test_golden_fn_receives_scalar_python_value(self, mixed_specs, tmp_path):
+        """golden_fn(scratch) must see the scalar as a python float keyed by name."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        captured: dict[str, object] = {}
+
+        def golden_fn(scratch):
+            captured["alpha"] = scratch["alpha"]
+            captured["alpha_type"] = type(scratch["alpha"]).__name__
+            scratch["y"][:] = scratch["x"] + scratch["alpha"]
+
+        def fake_execute(_work_dir, args, **_kwargs):
+            # Bucketed args: [x (in tensor), y (out tensor), alpha (scalar)]
+            args[1][:] = args[0] + args[2].value
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with compile_p, exec_p:
+            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        assert captured["alpha"] == pytest.approx(2.5)
+        assert captured["alpha_type"] == "float"
 
 
 if __name__ == "__main__":

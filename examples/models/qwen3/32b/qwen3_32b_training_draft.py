@@ -960,7 +960,7 @@ def compile_and_run(
 
     result = run(
         program=program,
-        tensor_specs=tensor_specs,
+        specs=tensor_specs,
         golden=None,
         config=RunConfig(
             platform=platform,

@@ -454,7 +454,7 @@ if __name__ == "__main__":
 
     result = run(
         program=program,
-        tensor_specs=tensor_specs,
+        specs=tensor_specs,
         golden_fn=golden_decode_front_scope4,
         config=RunConfig(
             rtol=1e-3,

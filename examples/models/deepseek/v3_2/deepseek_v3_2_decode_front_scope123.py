@@ -734,7 +734,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_deepseek_v3_2_decode_front_scope123_int8_quant_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_decode_front_scope123_int8_quant,
         config=RunConfig(
             rtol=3e-3,
