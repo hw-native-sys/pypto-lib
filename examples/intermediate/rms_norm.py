@@ -116,7 +116,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_rms_norm_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_rms_norm,
         config=RunConfig(
             rtol=1e-2,

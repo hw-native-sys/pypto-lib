@@ -281,7 +281,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_prefill_projection_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_prefill_projection,
         config=RunConfig(
             rtol=1e-3,

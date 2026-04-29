@@ -915,7 +915,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_qwen3_14b_prefill_program(batch=args.batch),
-        tensor_specs=build_tensor_specs(batch=args.batch, use_max_seq=args.max_seq),
+        specs=build_tensor_specs(batch=args.batch, use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_14b_prefill,
         config=RunConfig(
             rtol=3e-3,

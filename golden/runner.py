@@ -20,7 +20,7 @@ from typing import Any
 
 import torch
 
-from .tensor_spec import TensorSpec
+from .spec import ScalarSpec, TensorSpec
 from .validation import validate_golden
 
 
@@ -77,13 +77,18 @@ def _load_tensors(src_dir: Path, subdir: str, names: list[str]) -> dict[str, tor
     return {n: torch.load(src_dir / subdir / f"{n}.pt", weights_only=True) for n in names}
 
 
-def _required_files(spec: TensorSpec) -> list[tuple[str, str]]:
+def _required_files(spec: TensorSpec | ScalarSpec) -> list[tuple[str, str]]:
     """Return ``[(subdir, filename), ...]`` required for *spec* in a golden-data dir.
 
-    - Pure input: ``in/{name}.pt``
-    - Pure output: ``out/{name}.pt``
-    - Inout (is_output + init_value): both ``in/{name}.pt`` and ``out/{name}.pt``
+    - :class:`ScalarSpec`: ``in/{name}.pt`` (the 0-dim
+      :attr:`ScalarSpec.value` tensor).
+    - :class:`TensorSpec` pure input: ``in/{name}.pt``.
+    - :class:`TensorSpec` pure output: ``out/{name}.pt``.
+    - :class:`TensorSpec` inout (``is_output`` + ``init_value``):
+      both ``in/{name}.pt`` and ``out/{name}.pt``.
     """
+    if isinstance(spec, ScalarSpec):
+        return [("in", f"{spec.name}.pt")]
     files: list[tuple[str, str]] = []
     if not spec.is_output:
         files.append(("in", f"{spec.name}.pt"))
@@ -114,7 +119,7 @@ def _backend_for_platform(platform: str) -> Any:
 
 def run(
     program: Any,
-    tensor_specs: list[TensorSpec],
+    specs: list[TensorSpec | ScalarSpec],
     config: RunConfig | None = None,
     golden_fn: Callable | None = None,
     golden_data: str | None = None,
@@ -124,16 +129,19 @@ def run(
 
     Args:
         program: A ``@pl.program`` decorated class or an ``ir.Program``.
-        tensor_specs: Ordered list of tensor specifications matching the
-            orchestration function's parameter order.
+        specs: Ordered list of :class:`TensorSpec` and :class:`ScalarSpec`
+            entries matching the orchestration function's parameter order.
         config: Run configuration.  Uses default :class:`RunConfig` if ``None``.
-        golden_fn: Optional callable ``golden_fn(tensors)`` that computes
-            expected outputs in-place.  When ``None``, golden is sourced from
-            *golden_data* if set; if neither is provided, validation is skipped.
+        golden_fn: Optional callable ``golden_fn(values)`` that computes
+            expected outputs in-place.  ``values`` is a dict containing both
+            tensor clones and scalar Python values keyed by spec name.  When
+            ``None``, golden is sourced from *golden_data* if set; if neither
+            is provided, validation is skipped.
         golden_data: Optional directory with persisted ``in/{name}.pt`` and
-            ``out/{name}.pt``.  When set, :func:`run` loads tensors from it
-            instead of generating inputs or computing goldens (read-only).
-            Takes precedence over *golden_fn* when both are provided.
+            ``out/{name}.pt`` files (scalars are stored as 0-dim tensors in
+            the same format).  When set, :func:`run` loads inputs from it
+            instead of generating them (read-only).  Takes precedence over
+            *golden_fn* when both are provided.
         runtime_dir: Optional path to a pre-compiled build_output directory.
             When set, compilation is skipped and execution runs against this
             directory; ``config.compile`` is ignored and ``compile_only`` is
@@ -150,6 +158,9 @@ def run(
         config = RunConfig()
 
     data_dir = Path(golden_data) if golden_data is not None else None
+
+    tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
+    scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
 
     start = time.time()
 
@@ -193,35 +204,64 @@ def run(
         work_dir = compiled.output_dir
 
     # Generate Inputs
+    input_snapshot: dict[str, torch.Tensor] = {}
+    scalar_specs_eff: dict[str, ScalarSpec] = {}
     with _stage("generate inputs"):
         if data_dir is not None:
+            required: list[tuple[str, str]] = []
+            for spec in (*tensor_specs, *scalar_specs):
+                required.extend(_required_files(spec))
             missing = [
                 str(data_dir / sub / name)
-                for spec in tensor_specs
-                for sub, name in _required_files(spec)
+                for sub, name in required
                 if not (data_dir / sub / name).is_file()
             ]
             if missing:
                 return _fail(f"golden_data is missing files: {missing}")
             print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
             # Load inputs + inout initial values from {dir}/in/; pure outputs stay zero-init.
-            input_names = [s.name for s in tensor_specs if not s.is_output or s.init_value is not None]
+            input_names = [
+                s.name for s in tensor_specs
+                if not s.is_output or s.init_value is not None
+            ]
             tensors = _load_tensors(data_dir, "in", input_names)
             for spec in tensor_specs:
                 if spec.is_output and spec.init_value is None:
                     tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+            # Load each scalar from its own {name}.pt; verify dtype matches the
+            # spec, then reconstruct a ScalarSpec (cached value overrides the
+            # spec value, dtype must be identical).
+            for s in scalar_specs:
+                cached = torch.load(data_dir / "in" / f"{s.name}.pt", weights_only=True)
+                if not isinstance(cached, torch.Tensor) or cached.ndim != 0:
+                    shape = tuple(cached.shape) if isinstance(cached, torch.Tensor) else type(cached).__name__
+                    return _fail(
+                        f"{s.name}.pt must contain a 0-dim torch.Tensor, got {shape}"
+                    )
+                if cached.dtype != s.dtype:
+                    return _fail(
+                        f"{s.name}.pt dtype mismatch: spec={s.dtype} cache={cached.dtype}"
+                    )
+                scalar_specs_eff[s.name] = ScalarSpec(
+                    name=s.name, dtype=s.dtype, value=cached
+                )
         else:
             tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
+            scalar_specs_eff = {s.name: s for s in scalar_specs}
             input_snapshot = {
                 spec.name: tensors[spec.name].clone()
                 for spec in tensor_specs
                 if not spec.is_output or spec.init_value is not None
             }
-            _save_tensors(work_dir / "data" / "in", input_snapshot)
+            in_dir = work_dir / "data" / "in"
+            _save_tensors(in_dir, input_snapshot)
+            _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
 
     # Runtime
     with _stage("runtime"):
-        ordered = [tensors[spec.name] for spec in tensor_specs]
+        # All tensors before any scalar — required by simpler's ChipStorageTaskArgs.
+        ordered: list[Any] = [tensors[s.name] for s in tensor_specs]
+        ordered.extend(scalar_specs_eff[s.name].to_ctypes() for s in scalar_specs)
         execute_compiled(work_dir, ordered, **config.runtime)
 
     if golden_fn is None and golden_data is None:
@@ -238,9 +278,11 @@ def run(
             output_names = [s.name for s in tensor_specs if s.is_output]
             golden_outputs = _load_tensors(data_dir, "out", output_names)
         else:
-            scratch: dict[str, torch.Tensor] = {}
-            for spec in tensor_specs:
-                if spec.is_output and spec.init_value is None:
+            scratch: dict[str, Any] = {}
+            for spec in specs:
+                if isinstance(spec, ScalarSpec):
+                    scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
+                elif spec.is_output and spec.init_value is None:
                     scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
                 else:
                     scratch[spec.name] = input_snapshot[spec.name].clone()

@@ -1415,7 +1415,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_qwen3_decode_program(),
-        tensor_specs=build_tensor_specs(use_max_seq=args.max_seq),
+        specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_decode,
         config=RunConfig(
             rtol=3e-3,

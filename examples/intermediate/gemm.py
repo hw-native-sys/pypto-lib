@@ -105,7 +105,7 @@ if __name__ == "__main__":
 
     result = run(
         program=build_gemm_program(),
-        tensor_specs=build_tensor_specs(),
+        specs=build_tensor_specs(),
         golden_fn=golden_gemm,
         config=RunConfig(
             rtol=1e-3,
