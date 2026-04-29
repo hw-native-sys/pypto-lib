@@ -1,3 +1,8 @@
+---
+name: setup_env
+description: Set up the pypto-lib development environment, including pypto, ptoas, torch, CANN/device checks, and runtime variables. Use when preparing to run examples, tests, codegen, or CI-equivalent local validation.
+---
+
 # Setup Environment
 
 Automated environment setup for pypto-lib development. Follows the same steps
