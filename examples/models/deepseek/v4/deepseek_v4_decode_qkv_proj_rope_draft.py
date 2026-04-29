@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 single-token decode attn_norm + MLA prolog (fused): produces (q, kv, qr) for the
+"""DeepSeek-V4 single-token decode attn_norm fused + Q/KV LoRA + RoPE: produces (q, kv, qr) for the
 attention body, with attn_norm fused at the front to save one GM round-trip."""
 
 
@@ -27,11 +27,11 @@ Q_LORA      = 1024             # v4-pro 1536
 EPS         = 1e-6
 
 
-def build_deepseek_v4_decode_mla_program():
+def build_deepseek_v4_decode_qkv_proj_rope_program():
     @pl.program
-    class DeepSeekV4DecodeMla:
+    class DeepSeekV4DecodeQkvProjRope:
         @pl.function(type=pl.FunctionType.Opaque)
-        def deepseek_v4_decode_mla(
+        def deepseek_v4_decode_qkv_proj_rope(
             self,
             x:         pl.Tensor[[B, S, D],              pl.BF16],
             norm_w:    pl.Tensor[[D],                    pl.FP32],
@@ -49,11 +49,11 @@ def build_deepseek_v4_decode_mla_program():
             # TODO: kernel implementation
             return q, kv, qr
 
-    return DeepSeekV4DecodeMla
+    return DeepSeekV4DecodeQkvProjRope
 
 
-def golden_deepseek_v4_decode_mla(tensors):
-    """Torch reference: attn_norm fused, then MLA prolog (model.py 692, 496-504)."""
+def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
+    """Torch reference: attn_norm fused, then Q/KV LoRA + RoPE (model.py 692, 495-504)."""
     import torch
 
     x         = tensors["x"].float()              # [B, S, D]
@@ -159,9 +159,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        program=build_deepseek_v4_decode_mla_program(),
+        program=build_deepseek_v4_decode_qkv_proj_rope_program(),
         tensor_specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_mla,
+        golden_fn=golden_deepseek_v4_decode_qkv_proj_rope,
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,

@@ -34,11 +34,11 @@ CMP_RATIO       = 128                    # 4 or 128 (placeholder default)
 SOFTMAX_SCALE   = HEAD_DIM ** -0.5
 
 
-def build_deepseek_v4_decode_cfa_program():
+def build_deepseek_v4_decode_sparse_attn_program():
     @pl.program
-    class DeepSeekV4DecodeCfa:
+    class DeepSeekV4DecodeSparseAttn:
         @pl.function(type=pl.FunctionType.Opaque)
-        def deepseek_v4_decode_cfa(
+        def deepseek_v4_decode_sparse_attn(
             self,
             q:                  pl.Tensor[[T, H, HEAD_DIM],                               pl.BF16],
             ori_kv:             pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],       pl.BF16],
@@ -55,10 +55,10 @@ def build_deepseek_v4_decode_cfa_program():
             # TODO: kernel implementation
             return o
 
-    return DeepSeekV4DecodeCfa
+    return DeepSeekV4DecodeSparseAttn
 
 
-def golden_deepseek_v4_decode_cfa(tensors):
+def golden_deepseek_v4_decode_sparse_attn(tensors):
     """Torch reference: gather KV via block tables, run masked-softmax with sink, inverse RoPE."""
     import torch
 
@@ -189,9 +189,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        program=build_deepseek_v4_decode_cfa_program(),
+        program=build_deepseek_v4_decode_sparse_attn_program(),
         tensor_specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_cfa,
+        golden_fn=golden_deepseek_v4_decode_sparse_attn,
         config=RunConfig(
             rtol=3e-3,
             atol=3e-3,

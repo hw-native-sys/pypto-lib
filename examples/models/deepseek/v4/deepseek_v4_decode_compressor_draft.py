@@ -6,24 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 KV Compressor (decode incremental, main attention path: ratio=4, head_dim=512,
-rotate=False, overlap=True). Updates state buffers and emits one compressed KV every `ratio` steps."""
+"""DeepSeek-V4 KV Compressor (decode incremental). Mirrors model.py Compressor (line 279-377);
+golden is a direct port of forward's decode branch (prefill `start_pos == 0` path is omitted).
+Configurable for compress_ratio ∈ {0, 4, 128} and rotate ∈ {False, True}."""
 
 
 import pypto.language as pl
 
 
-B           = 16                      # demo 4
-S           = 1
-D           = 4096                    # v4-pro 7168
-HEAD_DIM    = 512
-ROPE_DIM    = 64
-NOPE_DIM    = HEAD_DIM - ROPE_DIM
-RATIO       = 4
-COFF        = 2                      # 1 + (ratio == 4)
-STATE_LEN   = COFF * RATIO           # 8
-OUT_DIM     = COFF * HEAD_DIM        # 1024
-EPS         = 1e-6
+B = 16  # demo 4
+S = 1
+EPS = 1e-6
+
+COMPRESS_RATIO = 4  # 0 / 4 / 128
+HEAD_DIM = 512
+ROTATE = False
+
+D = 4096  # v4-pro 7168
+ROPE_HEAD_DIM = 64
+NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
+OVERLAP = COMPRESS_RATIO == 4
+COFF = 1 + int(OVERLAP)
+
+OUT_DIM = COFF * HEAD_DIM
+STATE_LEN = COFF * COMPRESS_RATIO
+
+START_POS = 3  # >0 (decode), and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
+SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
 
 
 def build_deepseek_v4_decode_compressor_program():
@@ -32,18 +41,17 @@ def build_deepseek_v4_decode_compressor_program():
         @pl.function(type=pl.FunctionType.Opaque)
         def deepseek_v4_decode_compressor(
             self,
-            x:               pl.Tensor[[B, S, D],                       pl.BF16],
-            kv_state:        pl.InOut[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
-            score_state:     pl.InOut[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
-            wkv:             pl.Tensor[[OUT_DIM, D],                    pl.BF16],
-            wgate:           pl.Tensor[[OUT_DIM, D],                    pl.BF16],
-            ape:             pl.Tensor[[RATIO, OUT_DIM],                pl.FP32],
-            weight:          pl.Tensor[[HEAD_DIM],                      pl.BF16],
-            cos:             pl.Tensor[[1, ROPE_DIM],                   pl.BF16],
-            sin:             pl.Tensor[[1, ROPE_DIM],                   pl.BF16],
-            start_pos:       pl.Tensor[[B],                             pl.INT32],
-            should_compress: pl.Tensor[[1],                             pl.INT32],
-            out:             pl.Out[pl.Tensor[[B, HEAD_DIM],            pl.BF16]],
+            x: pl.Tensor[[B, S, D], pl.BF16],
+            kv_state: pl.InOut[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
+            score_state: pl.InOut[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
+            wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+            wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+            ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+            norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+            cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos+1-ratio]
+            sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # same as cos
+            hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
+            out: pl.Out[pl.Tensor[[B, HEAD_DIM], pl.BF16]],
         ):
             # TODO: kernel implementation
             return out
@@ -52,62 +60,72 @@ def build_deepseek_v4_decode_compressor_program():
 
 
 def golden_deepseek_v4_decode_compressor(tensors):
-    """Torch reference, direct port of model.py Compressor.forward 343-377 (decode branch)."""
+    """Torch reference for Compressor.forward (decode branch; prefill omitted, quant identity on A3)."""
     import torch
 
-    x         = tensors["x"].float()                       # [B, S, D]
-    kv_state  = tensors["kv_state"]                        # InOut
-    score_state = tensors["score_state"]                   # InOut
-    wkv       = tensors["wkv"].float()                     # [OUT_DIM, D]
-    wgate     = tensors["wgate"].float()                   # [OUT_DIM, D]
-    ape       = tensors["ape"].float()                     # [RATIO, OUT_DIM]
-    weight    = tensors["weight"].float()                  # [HEAD_DIM]
-    cos       = tensors["cos"].float()                     # [1, ROPE_DIM]
-    sin       = tensors["sin"].float()                     # [1, ROPE_DIM]
-    start_pos = int(tensors["start_pos"][0].item())        # all batches at same step
-    should_compress = bool(tensors["should_compress"][0].item())
+    x = tensors["x"]
+    kv_state = tensors["kv_state"]
+    score_state = tensors["score_state"]
+    wkv = tensors["wkv"].float()
+    wgate = tensors["wgate"].float()
+    ape = tensors["ape"].float()
+    norm_w = tensors["norm_w"].float()
+    cos = tensors["cos"].float()
+    sin = tensors["sin"].float()
+    hadamard = tensors["hadamard"].float()
 
-    # 1. Project (kv, score) and add positional bias for the current slot
-    kv    = (x.view(B, -1) @ wkv.T)                        # [B, OUT_DIM]
-    score = (x.view(B, -1) @ wgate.T) + ape[start_pos % RATIO]
+    start_pos = START_POS
+    compress_ratio = COMPRESS_RATIO
 
-    # 2. Update state buffers (overlap branch, model.py 346-348)
-    slot = RATIO + start_pos % RATIO
-    kv_state[:, slot]    = kv
-    score_state[:, slot] = score
+    bsz, _, _ = x.shape
+    ratio, overlap, rotate, d, rd = compress_ratio, OVERLAP, ROTATE, HEAD_DIM, ROPE_HEAD_DIM
+    dtype = x.dtype
+    x = x.float()
+    kv = x.view(bsz, -1) @ wkv.T
+    score = x.view(bsz, -1) @ wgate.T
 
-    out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
+    if start_pos == 0:
+        return
 
-    if should_compress:
-        # 3. Concat overlapping halves: state[:, :ratio, :head_dim] + state[:, ratio:, head_dim:]
-        kv_view    = torch.cat([kv_state[:, :RATIO, :HEAD_DIM],
-                                kv_state[:, RATIO:, HEAD_DIM:]], dim=1)
-        score_view = torch.cat([score_state[:, :RATIO, :HEAD_DIM],
-                                score_state[:, RATIO:, HEAD_DIM:]], dim=1)
-        kv_c = (kv_view * torch.softmax(score_view, dim=1)).sum(dim=1)   # [B, HEAD_DIM]
+    should_compress = (start_pos + 1) % ratio == 0
+    score = score + ape[start_pos % ratio]
+    if overlap:
+        kv_state[:bsz, ratio + start_pos % ratio] = kv
+        score_state[:bsz, ratio + start_pos % ratio] = score
+        if should_compress:
+            kvs = torch.cat([kv_state[:bsz, :ratio, :d], kv_state[:bsz, ratio:, d:]], dim=1)
+            scs = torch.cat([score_state[:bsz, :ratio, :d], score_state[:bsz, ratio:, d:]], dim=1)
+            kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
+            kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
+            score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
+    else:
+        kv_state[:bsz, start_pos % ratio] = kv
+        score_state[:bsz, start_pos % ratio] = score
+        if should_compress:
+            kv = (kv_state[:bsz] * score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
 
-        # State shift: state[:ratio] <- state[ratio:]
-        kv_state[:, :RATIO]    = kv_state[:, RATIO:]
-        score_state[:, :RATIO] = score_state[:, RATIO:]
+    if not should_compress:
+        tensors["out"][:] = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
+        return
 
-        # 4. RMSNorm (gamma = weight)
-        inv = torch.rsqrt(kv_c.square().mean(-1, keepdim=True) + EPS)
-        kv_c = kv_c * inv * weight
+    kv_c = kv.squeeze(1)
+    kv_c = kv_c * torch.rsqrt(kv_c.square().mean(-1, keepdim=True) + EPS) * norm_w
+    kv_c = kv_c.to(dtype).float()
 
-        # 5. RoPE on the last rope_dim of head_dim (interleaved pairs)
-        x_pair = kv_c[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-        x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        cos_v = cos.view(-1)
-        sin_v = sin.view(-1)
-        y0 = x0 * cos_v - x1 * sin_v
-        y1 = x0 * sin_v + x1 * cos_v
-        kv_c = torch.cat([kv_c[..., :NOPE_DIM],
-                          torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
+    x_pair = kv_c[..., -rd:].unflatten(-1, (-1, 2))
+    x0, x1 = x_pair[..., 0], x_pair[..., 1]
+    cos_v, sin_v = cos.view(-1), sin.view(-1)
+    y0 = x0 * cos_v - x1 * sin_v
+    y1 = x0 * sin_v + x1 * cos_v
+    kv_c = torch.cat([kv_c[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-        # 6. FP8 quant simulation on nope dims is identity in skeleton
-        out = kv_c.to(torch.bfloat16)
+    if rotate:
+        kv_c = (kv_c @ hadamard).to(torch.bfloat16).float()  # rotate_activation: full Hadamard matmul (v3_2 style)
+        # fp4_act_quant — A3-skipped
+    else:
+        pass  # act_quant — A3-skipped
 
-    tensors["out"][:] = out
+    tensors["out"][:] = kv_c.to(torch.bfloat16)
 
 
 def build_tensor_specs():
@@ -125,31 +143,27 @@ def build_tensor_specs():
     def init_wgate():
         return torch.randn(OUT_DIM, D) / D ** 0.5
     def init_ape():
-        return torch.randn(RATIO, OUT_DIM) * 0.01
-    def init_weight():
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.01
+    def init_norm_w():
         return torch.ones(HEAD_DIM)
     def init_cos():
-        return torch.cos(torch.arange(ROPE_DIM).reshape(1, ROPE_DIM) * 1e-3)
+        return torch.cos(torch.arange(ROPE_HEAD_DIM).reshape(1, ROPE_HEAD_DIM) * 1e-3)
     def init_sin():
-        return torch.sin(torch.arange(ROPE_DIM).reshape(1, ROPE_DIM) * 1e-3)
-    def init_start_pos():
-        return torch.tensor([RATIO - 1] * B, dtype=torch.int32)
-    def init_should_compress():
-        return torch.tensor([1], dtype=torch.int32)
-
+        return torch.sin(torch.arange(ROPE_HEAD_DIM).reshape(1, ROPE_HEAD_DIM) * 1e-3)
+    def init_hadamard():
+        return torch.eye(HEAD_DIM)
     return [
-        TensorSpec("x",               [B, S, D],                  torch.bfloat16, init_value=init_x),
-        TensorSpec("kv_state",        [B, STATE_LEN, OUT_DIM],    torch.float32,  init_value=init_kv_state),
-        TensorSpec("score_state",     [B, STATE_LEN, OUT_DIM],    torch.float32,  init_value=init_score_state),
-        TensorSpec("wkv",             [OUT_DIM, D],               torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate",           [OUT_DIM, D],               torch.bfloat16, init_value=init_wgate),
-        TensorSpec("ape",             [RATIO, OUT_DIM],           torch.float32,  init_value=init_ape),
-        TensorSpec("weight",          [HEAD_DIM],                 torch.bfloat16, init_value=init_weight),
-        TensorSpec("cos",             [1, ROPE_DIM],              torch.bfloat16, init_value=init_cos),
-        TensorSpec("sin",             [1, ROPE_DIM],              torch.bfloat16, init_value=init_sin),
-        TensorSpec("start_pos",       [B],                        torch.int32,    init_value=init_start_pos),
-        TensorSpec("should_compress", [1],                        torch.int32,    init_value=init_should_compress),
-        TensorSpec("out",             [B, HEAD_DIM],              torch.bfloat16, is_output=True),
+        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("kv_state", [B, STATE_LEN, OUT_DIM], torch.float32, init_value=init_kv_state),
+        TensorSpec("score_state", [B, STATE_LEN, OUT_DIM], torch.float32, init_value=init_score_state),
+        TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
+        TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
+        TensorSpec("cos", [1, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cos),
+        TensorSpec("sin", [1, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_sin),
+        TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
+        TensorSpec("out", [B, HEAD_DIM], torch.bfloat16, is_output=True),
     ]
 
 
@@ -169,8 +183,8 @@ if __name__ == "__main__":
         tensor_specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_compressor,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

@@ -117,8 +117,9 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
               │
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  mla.py  (attn_norm fused + MLA prolog)                                     ║
-║  model.py:692, 496-504                                                      ║
+║  qkv_proj_rope.py  (attn_norm fused + Q/KV LoRA + RoPE)                     ║
+║  model.py:692, 495-504                                                      ║
+║  NOTE: line 506 act_quant (FP8 QAT sim) is skipped on A3.                   ║
 ║                                                                             ║
 ║  IN :  x [B, S, D]                    bf16  (hc_pre output)                 ║
 ║        norm_w [D]                     fp32  (attn_norm gamma, fused)        ║
@@ -140,55 +141,26 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
          │                 │                      │
          │             ori_kv (PA)                │
          │                 │                      │
-         │      ┌──────────┘  (ratio==4 only)     │
-         │      │                                 │
-         │      │          ╔══════════════════════════════════════════════╗
-         │      │          ║  indexer.py                                  ║
-         │      │          ║  model.py:402-433                            ║
-         │      │          ║                                              ║
-         │      │          ║  IN : x [B,1,D], qr [T,Q_LORA]               ║
-         │      │          ║       idx_wq_b, weights_proj, cos/sin        ║
-         │      │          ║       hadamard_q                             ║
-         │      │          ║       inner compressor weights + state(InOut)║
-         │      │          ║       idx_kv_cache (InOut,PA), start_pos…    ║
-         │      │          ║  OUT: topk_idxs [T, IDX_TOPK=1024]  int32    ║
-         │      │          ╚══════════════════════════════════════════════╝
-         │      │                      │ topk_idxs
-         │      │                      │
-         │  (ratio ∈ {4,128})          │
-         │      ▼                      │
-         │  ╔════════════════════════════════════════════════════════════╗
-         │  ║  compressor.py  (main)                                     ║
-         │  ║  model.py:316-377                                          ║
-         │  ║                                                            ║
-         │  ║  IN : x [B,1,D], kv_state/score_state (InOut)              ║
-         │  ║       wkv, wgate, ape, weight, cos/sin                     ║
-         │  ║       start_pos [B], should_compress [1]                   ║
-         │  ║  OUT: cmp_kv_slot [B, HEAD_DIM]  bf16                      ║
-         │  ║       ★ orch writes cmp_kv_slot → cmp_kv PA pool           ║
-         │  ╚════════════════════════════════════════════════════════════╝
-         │              │ cmp_kv (PA pool, updated by orch)
-         │              │
-         │    [orch]  concat window_topk + topk_idxs
-         │    → cmp_sparse_indices [T, WIN+IDX_TOPK=1152]  model.py:507-515
-         │              │
-         ├─(ratio>0)────┴────────────────────┐
-         │                                   │
-         ▼ q                                 ▼ q
-╔══════════════════════════════════╗  ╔═══════════════════════════════════════╗
-║  cfa.py  (ratio ∈ {4, 128})      ║  ║  win_attn.py  (ratio == 0)            ║
-║  model.py:528-534                ║  ║  model.py:528-534                     ║
-║                                  ║  ║                                       ║
-║  IN : q [T,H,HEAD_DIM]           ║  ║  IN : q [T,H,HEAD_DIM]                ║
-║       ori_kv/cmp_kv (PA)         ║  ║       ori_kv (PA)                     ║
-║       cmp_sparse_indices         ║  ║       window_topk_idxs                ║
-║       attn_sink [H]  fp32        ║  ║       attn_sink [H]  fp32             ║
-║       seqused_kv [B]             ║  ║       seqused_kv [B]                  ║
-║       freqs_cos/sin              ║  ║       freqs_cos/sin                   ║
-║  OUT: o [T, H, HEAD_DIM]  bf16   ║  ║  OUT: o [T, H, HEAD_DIM]  bf16        ║
-║       (inverse RoPE fused)       ║  ║       (inverse RoPE fused)            ║
-╚══════════════════════════════════╝  ╚═══════════════════════════════════════╝
-         │ o (both branches merge)
+         │  ┌──── cmp_kv (PA, ratio>0 only) ──────┤
+         │  │                                     │
+         │  │   topk_idxs (built by orch,         │
+         │  │   ratio-dependent, see § below) ────┤
+         ▼  ▼                                     ▼
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  sparse_attn.py  (always called; ratio ∈ {0, 4, 128})                       ║
+║  model.py:533-534                                                           ║
+║                                                                             ║
+║  IN : q [T,H,HEAD_DIM]                                                      ║
+║       ori_kv (PA)              — always                                     ║
+║       cmp_kv (PA)              — ratio>0 only                               ║
+║       topk_idxs                — ratio-dependent, see § below               ║
+║       attn_sink [H]  fp32                                                   ║
+║       seqused_kv [B]                                                        ║
+║       freqs_cos/sin                                                         ║
+║  OUT: o [T, H, HEAD_DIM]  bf16                                              ║
+║       (line 534 inverse RoPE fused)                                         ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+         │ o
          │
          ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
@@ -219,18 +191,119 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 
 ---
 
+## ratio-dependent inputs to sparse_attn
+
+The main diagram treats `cmp_kv` and `topk_idxs` as black-box inputs. Their
+construction depends on `compress_ratio`.
+
+### Kernels involved (only when called)
+
+```
+╔════════════════════════════════════════════════════════════════════╗
+║  compressor.py  (Attention.compressor, decode part)                ║
+║  model.py:532 (call), 316-377 (impl)                               ║
+║                                                                    ║
+║  IN    : x [B,1,D], start_pos                                      ║
+║          wkv, wgate, ape, norm_w, cos/sin                          ║
+║  InOut : kv_state, score_state          (persistent state buffers) ║
+║          cmp_kv (PA pool slot)          (kernel-internal write,    ║
+║                                          line 376, conditional on  ║
+║                                          should_compress)          ║
+║  OUT   : (return value discarded by decode caller)                 ║
+║                                                                    ║
+║  rotate=False, BF16 path                                           ║
+╚════════════════════════════════════════════════════════════════════╝
+
+╔════════════════════════════════════════════════════════════════════╗
+║  indexer.py  (Indexer.forward, decode part)                        ║
+║  model.py:511 (call), 402-433 (impl)                               ║
+║                                                                    ║
+║  IN    : x [B,1,D], qr [T,Q_LORA], start_pos, offset               ║
+║          idx_wq_b, weights_proj, cos/sin, hadamard_q               ║
+║  InOut : indexer's own kv_cache (PA pool, separate from cmp_kv)    ║
+║          internal Compressor's kv_state/score_state                ║
+║  OUT   : indexer_topk [T, IDX_TOPK=1024]  int32                    ║
+║                                                                    ║
+║  Internal: instantiates its own Compressor (rotate=True, FP4),     ║
+║  distinct from Attention.compressor — different weights, different ║
+║  KV pool, called inside indexer.py at model.py:417.                ║
+╚════════════════════════════════════════════════════════════════════╝
+```
+
+### Per-ratio wiring
+
+```
+ratio == 0  (SWA)
+─────────────────────────────────────────────────────────
+                 ┌────────────────┐
+            x ──►│ qkv_proj_rope  │──► q ───────────────┐
+                 └────────────────┘──► kv ─►[orch]──┐   │
+                                  └─► qr (unused)   │   │
+                                                    ▼   │
+                                                ori_kv  │
+              [orch] window_topk_idxs ──► topk_idxs ──► │
+                                                        ▼
+                                                ┌──────────────┐
+                                                │ sparse_attn  │──► o
+                                                └──────────────┘
+
+
+ratio == 4  (CSA)
+─────────────────────────────────────────────────────────
+                 ┌────────────────┐
+            x ──►│ qkv_proj_rope  │──► q ─────────────────────────┐
+            │    └────────────────┘──► kv ─►[orch] ori_kv ─────┐  │
+            │                       └► qr ─┐                   │  │
+            │                              │                   │  │
+            ├───────────────────────►┌─────▼──────┐            │  │
+            │                        │  indexer   │─►idx_topk─┐│  │
+            │                        └────────────┘           ││  │
+            │                                                 ││  │
+            └─────────►┌──────────────┐                       ││  │
+                       │  compressor  │──►(internal write)──► cmp_kv
+                       └──────────────┘                       ││  │
+                                                              ▼▼  ▼
+        [orch] window_topk_idxs ⧺ idx_topk ──► topk_idxs ─►┌──────────────┐
+                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► o
+                                                            └──────────────┘
+
+
+ratio == 128  (HCA)
+─────────────────────────────────────────────────────────
+                 ┌────────────────┐
+            x ──►│ qkv_proj_rope  │──► q ─────────────────────────┐
+            │    └────────────────┘──► kv ─►[orch] ori_kv ─────┐  │
+            │                       └► qr (unused)             │  │
+            │                                                  │  │
+            └─────────►┌──────────────┐                        │  │
+                       │  compressor  │──►(internal write)──► cmp_kv
+                       └──────────────┘                        │  │
+                                                               ▼  ▼
+        [orch] window_topk_idxs ⧺ get_compress_topk_idxs ──► topk_idxs
+                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► o
+                                                              └──────────────┘
+```
+
+`window_topk_idxs` (line 507) and `get_compress_topk_idxs` (line 513) are pure
+index computations from `(win, ratio, bsz, seqlen, start_pos)`; they live
+inline in the orch and are NOT separate kernels.
+
+---
+
 ## Draft file coverage
 
 | Step | model.py | Draft file | Status |
 |---|---|---|---|
 | hc_pre (attn) | 691 | `hc_pre.py` | skeleton |
-| mla (attn_norm fused + MLA prolog) | 692, 496-504 | `mla.py` | skeleton |
+| qkv_proj_rope (attn_norm fused + Q/KV LoRA + RoPE) | 692, 495-504 | `qkv_proj_rope.py` | skeleton |
+| act_quant (FP8 QAT sim) | 506 | — | skipped on A3 |
 | kv → ori_kv write | 530 | [orch] scatter | — |
-| indexer | 402-433 | `indexer.py` | skeleton |
-| compressor (main) | 316-377 | `compressor.py` | skeleton |
-| window+idx concat | 507-515 | [orch] | — |
-| cfa | 528-534 | `cfa.py` | skeleton |
-| win_attn | 528-534 | `win_attn.py` | skeleton |
+| indexer (decode) | 511 (call), 402-433 (impl) | `indexer.py` | skeleton |
+| compressor (decode) | 532 (call), 316-377 (impl) | `compressor.py` | skeleton |
+| window_topk_idxs | 507 | [orch] inline in sparse_attn caller | — |
+| get_compress_topk_idxs (HCA) | 513 | [orch] inline in sparse_attn caller | — |
+| topk_idxs concat | 514-515 | [orch] | — |
+| sparse_attn (+ inverse RoPE fused) | 533-534 | `sparse_attn.py` | skeleton |
 | o_proj | 537-542 | `o_proj.py` | skeleton |
 | hc_post (attn) | 694 | `hc_post.py` | skeleton |
 | moe_router (hc_pre ffn + ffn_norm + gate) | 697-698, 564-584 | `moe_router.py` | skeleton |
@@ -242,11 +315,11 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 
 ## Layer-type conditional (compress_ratio)
 
-| compress_ratio | Compressor | Indexer | Attention kernel |
+| compress_ratio | Compressor | Indexer | sparse_attn topk source |
 |---|---|---|---|
-| 0 | not called | not called | win_attn.py |
-| 4 | called (ratio=4) | called | cfa.py |
-| 128 | called (ratio=128) | not called | cfa.py |
+| 0   | not called      | not called | window_topk_idxs |
+| 4   | called (ratio=4)   | called  | window_topk_idxs ⧺ indexer_topk |
+| 128 | called (ratio=128) | not called | window_topk_idxs ⧺ get_compress_topk_idxs (HCA) |
 
 ## EP topology notes
 

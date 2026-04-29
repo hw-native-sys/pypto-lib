@@ -6,61 +6,69 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 attention sublayer orchestration (decode): chains hc_pre, mla, compressor,
-indexer, cfa/win_attn, o_proj, hc_post into the full attention half of Block.forward."""
+"""DeepSeek-V4 Attention sublayer orchestration (decode). Composes per-step goldens
+(hc_pre, qkv_proj_rope, compressor, indexer, sparse_attn, o_proj, hc_post). Steps without a
+dedicated draft (ori_kv scatter, cmp_kv scatter, window_topk_idxs, topk concat) are inlined.
+Inner goldens are invoked as placeholders; each callee uses its own module constants, so the
+chain is structural rather than runnable end-to-end."""
 
 
 import pypto.language as pl
 
 
-B               = 16                      # demo 4
-S               = 1
-T               = B * S
-# Hidden / Attention
-D               = 4096                    # v4-pro 7168
-H               = 64                      # v4-pro 128
-HEAD_DIM        = 512
-ROPE_DIM        = 64
-NOPE_DIM        = HEAD_DIM - ROPE_DIM
-Q_LORA          = 1024                    # v4-pro 1536
-O_LORA          = 1024
-O_GROUPS        = 8                       # v4-pro 16
-O_GROUP_IN      = H * HEAD_DIM // O_GROUPS
-WIN             = 128
-EPS             = 1e-6
+B = 16  # demo 4
+S = 1
+T = B * S
+EPS = 1e-6
 
-# Hyper-Connections
-HC_MULT          = 4
-MIX_HC           = (2 + HC_MULT) * HC_MULT
-HC_DIM           = HC_MULT * D
+D = 4096  # v4-pro 7168
+H = 64  # v4-pro 128
+HEAD_DIM = 512
+ROPE_HEAD_DIM = 64
+NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
+Q_LORA = 1024  # v4-pro 1536
+WIN = 128
+SOFTMAX_SCALE = HEAD_DIM ** -0.5
+
+HC_MULT = 4
+MIX_HC = (2 + HC_MULT) * HC_MULT
+HC_DIM = HC_MULT * D
 HC_SINKHORN_ITER = 20
-HC_EPS           = 1e-6
+HC_EPS = 1e-6
 
-# Indexer
-IDX_HEADS    = 64
+IDX_N_HEADS = 64
 IDX_HEAD_DIM = 128
-IDX_NOPE     = IDX_HEAD_DIM - ROPE_DIM
-IDX_TOPK     = 512                        # v4-pro 1024
+IDX_TOPK = 512  # v4-pro 1024
+IDX_SOFTMAX_SCALE = IDX_HEAD_DIM ** -0.5
+MAX_SEQ_LEN = 4096
 
-# Compressor (main path defaults: ratio=4, head_dim=512, rotate=False)
-RATIO            = 4
-COFF             = 2
-STATE_LEN        = COFF * RATIO
-CMP_OUT_DIM      = COFF * HEAD_DIM
-# Inner compressor for indexer (rotate=True, ratio=4, head_dim=128)
-INNER_OUT_DIM    = COFF * IDX_HEAD_DIM
+COMPRESS_RATIO = 4  # 0 / 4 / 128 (this orch handles ratio>0; ratio==0 path skips compressor + indexer)
+ROTATE_MAIN = False
+ROTATE_INNER = True
+OVERLAP = COMPRESS_RATIO == 4
+COFF = 1 + int(OVERLAP)
 
-# PagedAttention pools
-BLOCK_SIZE       = 128
-ORI_MAX_BLOCKS   = 1
-ORI_BLOCK_NUM    = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS   = 64
-CMP_BLOCK_NUM    = B * CMP_MAX_BLOCKS
-IDX_MAX_BLOCKS   = 64
-IDX_BLOCK_NUM    = B * IDX_MAX_BLOCKS
+MAIN_OUT_DIM = COFF * HEAD_DIM
+MAIN_STATE_LEN = COFF * COMPRESS_RATIO
+INNER_OUT_DIM = COFF * IDX_HEAD_DIM
+INNER_STATE_LEN = COFF * COMPRESS_RATIO
+IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 
-SOFTMAX_SCALE    = HEAD_DIM ** -0.5
-TOPK             = WIN + IDX_TOPK
+O_LORA = 1024
+O_GROUPS = 8  # v4-pro 16
+O_GROUP_IN = H * HEAD_DIM // O_GROUPS
+
+BLOCK_SIZE = 128
+ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
+CMP_MAX_BLOCKS = 64
+MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS               # logical block layout: [0..ORI) ori, [ORI..MAX) cmp
+BLOCK_NUM = B * MAX_BLOCKS
+
+TOPK = WIN + IDX_TOPK
+
+START_POS = 3  # >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
+SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
+OFFSET = WIN  # added to indexer topk_idxs (model.py:432, attention.py:509)
 
 
 def build_deepseek_v4_decode_attention_program():
@@ -69,318 +77,232 @@ def build_deepseek_v4_decode_attention_program():
         @pl.function(type=pl.FunctionType.Orchestration)
         def deepseek_v4_decode_attention(
             self,
-            x_hc:               pl.Tensor[[B, S, HC_MULT, D],                        pl.BF16],
+            x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
             # hc_pre weights
-            hc_attn_fn:         pl.Tensor[[MIX_HC, HC_DIM],                          pl.FP32],
-            hc_attn_scale:      pl.Tensor[[3],                                       pl.FP32],
-            hc_attn_base:       pl.Tensor[[MIX_HC],                                  pl.FP32],
-            # attn_norm
-            norm_w:             pl.Tensor[[D],                                       pl.FP32],
-            # mla weights
-            wq_a:               pl.Tensor[[D, Q_LORA],                               pl.BF16],
-            wq_b:               pl.Tensor[[Q_LORA, H * HEAD_DIM],                    pl.BF16],
-            wkv:                pl.Tensor[[D, HEAD_DIM],                             pl.BF16],
-            gamma_cq:           pl.Tensor[[Q_LORA],                                  pl.BF16],
-            gamma_ckv:          pl.Tensor[[HEAD_DIM],                                pl.BF16],
-            rope_cos:           pl.Tensor[[T, ROPE_DIM],                             pl.BF16],
-            rope_sin:           pl.Tensor[[T, ROPE_DIM],                             pl.BF16],
-            # compressor weights / state (main path: ratio=4, head_dim=512, rotate=False)
-            cmp_wkv:            pl.Tensor[[CMP_OUT_DIM, D],                          pl.BF16],
-            cmp_wgate:          pl.Tensor[[CMP_OUT_DIM, D],                          pl.BF16],
-            cmp_ape:            pl.Tensor[[RATIO, CMP_OUT_DIM],                      pl.FP32],
-            cmp_weight:         pl.Tensor[[HEAD_DIM],                                pl.BF16],
-            cmp_cos:            pl.Tensor[[1, ROPE_DIM],                             pl.BF16],
-            cmp_sin:            pl.Tensor[[1, ROPE_DIM],                             pl.BF16],
-            cmp_kv_state:       pl.InOut[pl.Tensor[[B, STATE_LEN, CMP_OUT_DIM],      pl.FP32]],
-            cmp_score_state:    pl.InOut[pl.Tensor[[B, STATE_LEN, CMP_OUT_DIM],      pl.FP32]],
-            # indexer weights / state
-            idx_wq_b:           pl.Tensor[[Q_LORA, IDX_HEADS * IDX_HEAD_DIM],        pl.BF16],
-            weights_proj:       pl.Tensor[[D, IDX_HEADS],                            pl.BF16],
-            hadamard_q:         pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM],              pl.BF16],
-            inner_wkv:          pl.Tensor[[INNER_OUT_DIM, D],                        pl.BF16],
-            inner_wgate:        pl.Tensor[[INNER_OUT_DIM, D],                        pl.BF16],
-            inner_ape:          pl.Tensor[[RATIO, INNER_OUT_DIM],                    pl.FP32],
-            inner_weight:       pl.Tensor[[IDX_HEAD_DIM],                            pl.BF16],
-            inner_hadamard:     pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM],              pl.BF16],
-            inner_kv_state:     pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM],    pl.FP32]],
-            inner_score_state:  pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM],    pl.FP32]],
-            # PagedAttention pools and tables
-            ori_kv:             pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-            ori_block_table:    pl.Tensor[[B, ORI_MAX_BLOCKS],                       pl.INT32],
-            cmp_kv:             pl.InOut[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-            cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                       pl.INT32],
-            idx_kv_cache:       pl.InOut[pl.Tensor[[IDX_BLOCK_NUM, BLOCK_SIZE, IDX_HEAD_DIM], pl.BF16]],
-            idx_block_table:    pl.Tensor[[B, IDX_MAX_BLOCKS],                       pl.INT32],
-            seqused_kv:         pl.Tensor[[B],                                       pl.INT32],
-            # o_proj weights
-            wo_a:               pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN],            pl.BF16],
-            wo_b:               pl.Tensor[[D, O_GROUPS * O_LORA],                    pl.BF16],
-            # cfa / win_attn shared
-            attn_sink:          pl.Tensor[[H],                                       pl.FP32],
-            # control
-            start_pos:          pl.Tensor[[B],                                       pl.INT32],
-            should_compress:    pl.Tensor[[1],                                       pl.INT32],
-            offset:             pl.Tensor[[1],                                       pl.INT32],
-            x_out:              pl.Out[pl.Tensor[[B, S, HC_MULT, D],                 pl.BF16]],
+            hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+            hc_attn_scale: pl.Tensor[[3], pl.FP32],
+            hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+            # qkv_proj_rope weights
+            attn_norm_w: pl.Tensor[[D], pl.FP32],            # Block.attn_norm.weight (model.py:680)
+            wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+            wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+            wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+            gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+            gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+            freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],  # Attention.freqs_cis (model.py:480-482)
+            freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+            # main compressor (rotate=False, head_dim=HEAD_DIM)
+            cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+            cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+            cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+            cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+            cmp_kv_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
+            cmp_score_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
+            # indexer + inner compressor (rotate=True, head_dim=IDX_HEAD_DIM)
+            idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.BF16],
+            weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+            hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by indexer's q rotation and inner Compressor
+            inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+            inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+            inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+            inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
+            inner_kv_state: pl.InOut[pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32]],
+            inner_score_state: pl.InOut[pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32]],
+            # KV cache (single PA pool: [0, WIN) is ori sliding window, [WIN, WIN+max_seq//ratio) is cmp)
+            kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+            block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+            idx_kv_cache: pl.InOut[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
+            # sparse_attn
+            attn_sink: pl.Tensor[[H], pl.FP32],
+            # o_proj
+            wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+            wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+            x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
         ):
-            # TODO: orchestration body. Pseudo-code:
-            #   x_mixed, post, comb = self.hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base)
-            #   q, kv, qr = self.mla(x_mixed, norm_w, wq_a, wq_b, wkv, rope_cos, rope_sin,
-            #                        gamma_cq, gamma_ckv)   # attn_norm fused
-            #   pl.scatter(ori_kv, ori_block_table, write_slot=start_pos % WIN, kv)
-            #   cmp_out = self.compressor(x_mixed, cmp_kv_state, cmp_score_state, cmp_wkv, cmp_wgate,
-            #                             cmp_ape, cmp_weight, cmp_cos, cmp_sin, start_pos, should_compress)
-            #   pl.scatter(cmp_kv, cmp_block_table, cache_slot=start_pos // RATIO, cmp_out)
-            #   topk_idxs = self.indexer(x_mixed, qr, idx_wq_b, weights_proj, rope_cos, rope_sin,
-            #                            hadamard_q, inner_*, inner_kv_state, inner_score_state,
-            #                            idx_kv_cache, idx_block_table, seqused_kv,
-            #                            start_pos, should_compress, offset)
-            #   sparse_indices = pl.cat([window_topk_idxs(start_pos), topk_idxs], dim=-1)
-            #   o = self.cfa(q, ori_kv, ori_block_table, cmp_kv, cmp_block_table,
-            #                sparse_indices, attn_sink, seqused_kv, rope_cos, rope_sin)
-            #   attn_out = self.o_proj(o, wo_a, wo_b)
-            #   x_out = self.hc_post(attn_out, x_hc, post, comb)
+            # TODO: orchestration body (dispatches the per-step kernels)
             return x_out
 
     return DeepSeekV4DecodeAttention
 
 
 def golden_deepseek_v4_decode_attention(tensors):
-    """End-to-end torch reference for the attention sublayer.
-
-    Composes the goldens of hc_pre, mla, compressor, indexer, cfa, o_proj
-    and the inline hc_post. Each sub-step is a faithful port of the
-    matching model.py function.
-    """
+    """End-to-end orchestration. Mirrors Block.hc_pre + Attention.forward (decode branch)
+    + Block.hc_post; all control flow from Attention.forward (model.py:484-543) is preserved."""
     import torch
 
-    # ---- inputs ----
-    x_hc           = tensors["x_hc"].float()                              # [B,S,hc,D]
-    hc_attn_fn     = tensors["hc_attn_fn"].float()
-    hc_attn_scale  = tensors["hc_attn_scale"].float()
-    hc_attn_base   = tensors["hc_attn_base"].float()
-    norm_w         = tensors["norm_w"].float()
-    wq_a           = tensors["wq_a"].float()
-    wq_b           = tensors["wq_b"].float()
-    wkv            = tensors["wkv"].float()
-    gamma_cq       = tensors["gamma_cq"].float()
-    gamma_ckv      = tensors["gamma_ckv"].float()
-    rope_cos       = tensors["rope_cos"].float()
-    rope_sin       = tensors["rope_sin"].float()
-    cmp_wkv        = tensors["cmp_wkv"].float()
-    cmp_wgate      = tensors["cmp_wgate"].float()
-    cmp_ape        = tensors["cmp_ape"].float()
-    cmp_weight     = tensors["cmp_weight"].float()
-    cmp_cos        = tensors["cmp_cos"].float()
-    cmp_sin        = tensors["cmp_sin"].float()
-    cmp_kv_state   = tensors["cmp_kv_state"]
-    cmp_score_state = tensors["cmp_score_state"]
-    idx_wq_b       = tensors["idx_wq_b"].float()
-    weights_proj   = tensors["weights_proj"].float()
-    hadamard_q     = tensors["hadamard_q"].float()
-    inner_wkv      = tensors["inner_wkv"].float()
-    inner_wgate    = tensors["inner_wgate"].float()
-    inner_ape      = tensors["inner_ape"].float()
-    inner_weight   = tensors["inner_weight"].float()
-    inner_hadamard = tensors["inner_hadamard"].float()
-    inner_kv_state = tensors["inner_kv_state"]
-    inner_score_state = tensors["inner_score_state"]
-    ori_kv         = tensors["ori_kv"]
-    ori_block_table = tensors["ori_block_table"]
-    cmp_kv         = tensors["cmp_kv"]
-    cmp_block_table = tensors["cmp_block_table"]
-    idx_kv_cache   = tensors["idx_kv_cache"]
-    idx_block_table = tensors["idx_block_table"]
-    seqused_kv     = tensors["seqused_kv"]
-    wo_a           = tensors["wo_a"].float()
-    wo_b           = tensors["wo_b"].float()
-    attn_sink      = tensors["attn_sink"].float()
-    start_pos      = int(tensors["start_pos"][0].item())
-    should_compress = bool(tensors["should_compress"][0].item())
-    offset         = int(tensors["offset"][0].item())
+    from deepseek_v4_decode_hc_pre_draft import golden_deepseek_v4_decode_hc_pre
+    from deepseek_v4_decode_qkv_proj_rope_draft import golden_deepseek_v4_decode_qkv_proj_rope
+    from deepseek_v4_decode_compressor_draft import golden_deepseek_v4_decode_compressor
+    from deepseek_v4_decode_indexer_draft import golden_deepseek_v4_decode_indexer
+    from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
+    from deepseek_v4_decode_o_proj_draft import golden_deepseek_v4_decode_o_proj
+    from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
 
-    # ---- hc_pre (model.py 674-682) ----
-    x_flat = x_hc.flatten(2)
-    rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + EPS)
-    mixes = (x_flat @ hc_attn_fn.T) * rsqrt
-    pre  = torch.sigmoid(mixes[..., :HC_MULT] * hc_attn_scale[0] + hc_attn_base[:HC_MULT]) + HC_EPS
-    post = 2 * torch.sigmoid(mixes[..., HC_MULT:HC_MULT * 2] * hc_attn_scale[1] + hc_attn_base[HC_MULT:HC_MULT * 2])
-    comb = (mixes[..., HC_MULT * 2:] * hc_attn_scale[2] + hc_attn_base[HC_MULT * 2:]
-            ).view(*mixes.shape[:-1], HC_MULT, HC_MULT)
-    comb = torch.softmax(comb, dim=-1) + HC_EPS
-    comb = comb / (comb.sum(-2, keepdim=True) + HC_EPS)
-    for _ in range(HC_SINKHORN_ITER - 1):
-        comb = comb / (comb.sum(-1, keepdim=True) + HC_EPS)
-        comb = comb / (comb.sum(-2, keepdim=True) + HC_EPS)
-    x_mixed = (pre.unsqueeze(-1) * x_hc).sum(dim=2)                       # [B,S,D]
+    # ---- Block.hc_pre (model.py:691) ----
+    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
+    post_t = torch.zeros(B, S, HC_MULT)
+    comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
+    golden_deepseek_v4_decode_hc_pre({
+        "x": tensors["x_hc"],
+        "hc_fn": tensors["hc_attn_fn"],
+        "hc_scale": tensors["hc_attn_scale"],
+        "hc_base": tensors["hc_attn_base"],
+        "x_mixed": x_mixed,
+        "post": post_t,
+        "comb": comb_t,
+    })
 
-    # ---- attn_norm fused into mla (model.py 692) ----
-    inv = torch.rsqrt(x_mixed.square().mean(-1, keepdim=True) + EPS)
-    x_norm = (x_mixed * inv * norm_w).contiguous()                       # [B,S,D]
-    x_norm_t = x_norm.view(T, D)
+    # ===== Attention.forward (model.py:484-543) =====
+    start_pos = START_POS
+    bsz, seqlen, _ = x_mixed.shape
+    win = WIN
+    ratio = COMPRESS_RATIO
+    rd = ROPE_HEAD_DIM
 
-    def apply_rope(x_rope, cos, sin):
-        x_pair = x_rope.unflatten(-1, (-1, 2))
-        x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        cos_ = cos.view(cos.size(0), -1)
-        sin_ = sin.view(sin.size(0), -1)
-        while cos_.ndim < x0.ndim:
-            cos_ = cos_.unsqueeze(-2)
-            sin_ = sin_.unsqueeze(-2)
-        y0 = x0 * cos_ - x1 * sin_
-        y1 = x0 * sin_ + x1 * cos_
-        return torch.stack([y0, y1], dim=-1).flatten(-2)
+    if start_pos == 0:
+        return  # prefill — decode-only orchestration skips
 
-    # ---- mla (model.py 496-504) ----
-    qr = (x_norm_t @ wq_a)
-    qr_inv = torch.rsqrt(qr.square().mean(-1, keepdim=True) + EPS)
-    qr = qr * qr_inv * gamma_cq                                            # [T, Q_LORA]
-    q_full = (qr @ wq_b).view(T, H, HEAD_DIM)
-    q_full = q_full * torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
-    q_nope = q_full[..., :NOPE_DIM]
-    q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos, rope_sin)
-    q = torch.cat([q_nope, q_rope], dim=-1)                                # [T, H, HEAD_DIM]
+    # Slice freqs_cis at the positions used by each call site (model.py:486, 366, 404).
+    freqs_cos = tensors["freqs_cos"]
+    freqs_sin = tensors["freqs_sin"]
+    step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
+    step_sin = freqs_sin[start_pos:start_pos + 1]
+    rope_cos_T = step_cos.expand(T, rd).contiguous()                          # qkv_proj_rope / sparse_attn want [T, rd]
+    rope_sin_T = step_sin.expand(T, rd).contiguous()
+    cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio] if ratio else step_cos  # Compressor.forward line 366
+    cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio] if ratio else step_sin
 
-    kv_full = x_norm_t @ wkv
-    kv_full = kv_full * torch.rsqrt(kv_full.square().mean(-1, keepdim=True) + EPS) * gamma_ckv
-    kv_nope = kv_full[..., :NOPE_DIM]
-    kv_rope = apply_rope(kv_full[..., NOPE_DIM:].unsqueeze(1), rope_cos, rope_sin).squeeze(1)
-    kv = torch.cat([kv_nope, kv_rope], dim=-1)                             # [T, HEAD_DIM]
+    # q + win kv (model.py:495-504); attn_norm fused at input.
+    q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
+    kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
+    qr = torch.zeros(T, Q_LORA, dtype=torch.bfloat16)
+    golden_deepseek_v4_decode_qkv_proj_rope({
+        "x": x_mixed,
+        "norm_w": tensors["attn_norm_w"],
+        "wq_a": tensors["wq_a"],
+        "wq_b": tensors["wq_b"],
+        "wkv": tensors["wkv"],
+        "rope_cos": rope_cos_T,
+        "rope_sin": rope_sin_T,
+        "gamma_cq": tensors["gamma_cq"],
+        "gamma_ckv": tensors["gamma_ckv"],
+        "q": q,
+        "kv": kv,
+        "qr": qr,
+    })
+    # line 506 act_quant on kv non-rope dims — A3-skipped
 
-    # ---- write kv to ori_kv via block_table (model.py:530) ----
-    write_slot = start_pos % WIN
+    # window topk + (optional) compress topk (model.py:507-515)
+    topk_idxs = torch.full((T, TOPK), -1, dtype=torch.int32)
+    topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)             # line 507: get_window_topk_idxs
+    if ratio:                                                              # line 508
+        offset = win                                                       # line 509 (decode: kv.size(1) is N/A)
+        if ratio == 4:                                                     # line 510 (indexer is not None)
+            indexer_topk = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+            golden_deepseek_v4_decode_indexer({                            # line 511
+                "x": x_mixed,
+                "qr": qr,
+                "wq_b": tensors["idx_wq_b"],
+                "weights_proj": tensors["weights_proj"],
+                "cos": step_cos,
+                "sin": step_sin,
+                "hadamard": tensors["hadamard_idx"],
+                "inner_wkv": tensors["inner_wkv"],
+                "inner_wgate": tensors["inner_wgate"],
+                "inner_ape": tensors["inner_ape"],
+                "inner_norm_w": tensors["inner_norm_w"],
+                "inner_cos": cmp_cos,
+                "inner_sin": cmp_sin,
+                "inner_kv_state": tensors["inner_kv_state"],
+                "inner_score_state": tensors["inner_score_state"],
+                "idx_kv_cache": tensors["idx_kv_cache"],
+                "topk_idxs": indexer_topk,
+            })
+            compress_topk_idxs = indexer_topk
+        else:                                                              # line 512: ratio == 128, HCA path
+            # line 513: get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset) — decode branch (line 270-271)
+            cache_len = (start_pos + 1) // ratio
+            compress_topk_idxs = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+            if cache_len > 0:
+                k = min(cache_len, IDX_TOPK)
+                compress_topk_idxs[:, :k] = torch.arange(k, dtype=torch.int32) + offset
+        topk_idxs[:, win:win + IDX_TOPK] = compress_topk_idxs              # line 514
+    topk_idxs = topk_idxs.int()                                            # line 515
+
+    # compress kv & attn — decode branch (model.py:529-534)
+    # Single merged PA pool: logical block layout per batch is [0..ORI_MAX_BLOCKS) ori, [ORI_MAX_BLOCKS..MAX) cmp.
+    kv_cache = tensors["kv_cache"]
+    block_table = tensors["block_table"]
+
+    # line 530: self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1) — ori sliding-window scatter
+    ori_slot = start_pos % win
     for b in range(B):
-        blk_id = int(ori_block_table[b, write_slot // BLOCK_SIZE].item())
-        intra  = write_slot % BLOCK_SIZE
-        ori_kv[blk_id, intra, 0] = kv[b].to(torch.bfloat16)
+        blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
+        intra = ori_slot % BLOCK_SIZE
+        kv_cache[blk_id, intra, 0] = kv[b]
 
-    # ---- compressor (main, model.py 343-377 decode branch) ----
-    cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
-    cmp_kv_proj    = (x_norm_t @ cmp_wkv.T)
-    cmp_score_proj = (x_norm_t @ cmp_wgate.T) + cmp_ape[start_pos % RATIO]
-    slot = RATIO + start_pos % RATIO
-    cmp_kv_state[:, slot]    = cmp_kv_proj
-    cmp_score_state[:, slot] = cmp_score_proj
-    if should_compress:
-        kv_view = torch.cat([cmp_kv_state[:, :RATIO, :HEAD_DIM],
-                             cmp_kv_state[:, RATIO:, HEAD_DIM:]], dim=1)
-        sc_view = torch.cat([cmp_score_state[:, :RATIO, :HEAD_DIM],
-                             cmp_score_state[:, RATIO:, HEAD_DIM:]], dim=1)
-        kv_c = (kv_view * torch.softmax(sc_view, dim=1)).sum(dim=1)
-        cmp_kv_state[:, :RATIO]    = cmp_kv_state[:, RATIO:]
-        cmp_score_state[:, :RATIO] = cmp_score_state[:, RATIO:]
-        kv_c = kv_c * torch.rsqrt(kv_c.square().mean(-1, keepdim=True) + EPS) * cmp_weight
-        kv_c_rope = apply_rope(kv_c[..., NOPE_DIM:].unsqueeze(1), cmp_cos, cmp_sin).squeeze(1)
-        kv_c = torch.cat([kv_c[..., :NOPE_DIM], kv_c_rope], dim=-1)
-        cmp_out = kv_c.to(torch.bfloat16)
+    if ratio:                                                              # line 531
+        # line 532: self.compressor(x, start_pos) — Compressor.forward writes cmp_kv internally (line 376),
+        # we externalize that slot write to the orch below.
+        cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
+        golden_deepseek_v4_decode_compressor({
+            "x": x_mixed,
+            "kv_state": tensors["cmp_kv_state"],
+            "score_state": tensors["cmp_score_state"],
+            "wkv": tensors["cmp_wkv"],
+            "wgate": tensors["cmp_wgate"],
+            "ape": tensors["cmp_ape"],
+            "norm_w": tensors["cmp_norm_w"],
+            "cos": cmp_cos,
+            "sin": cmp_sin,
+            "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),         # main compressor is rotate=False; unused, identity placeholder
+            "out": cmp_out,
+        })
+        if SHOULD_COMPRESS:                                                # Compressor.forward line 360 short-circuit
+            # cmp portion starts at ORI_MAX_BLOCKS in the logical block table
+            cmp_slot_rel = start_pos // ratio                              # relative to cmp portion
+            for b in range(B):
+                blk_id = int(block_table[b, ORI_MAX_BLOCKS + cmp_slot_rel // BLOCK_SIZE].item())
+                intra = cmp_slot_rel % BLOCK_SIZE
+                kv_cache[blk_id, intra, 0] = cmp_out[b]
 
-        # Write into cmp_kv pool
-        cache_slot = start_pos // RATIO
-        for b in range(B):
-            blk_id = int(cmp_block_table[b, cache_slot // BLOCK_SIZE].item())
-            intra  = cache_slot % BLOCK_SIZE
-            cmp_kv[blk_id, intra, 0] = cmp_out[b]
+    # line 533: o = sparse_attn(q, self.kv_cache[:bsz], attn_sink, topk_idxs, softmax_scale)
+    # line 534: apply_rotary_emb(o[..., -rd:], freqs_cis, True) — fused inside sparse_attn
+    # sparse_attn still expects two views; share the physical pool, split block_table at ORI_MAX_BLOCKS.
+    o = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
+    golden_deepseek_v4_decode_sparse_attn({
+        "q": q,
+        "ori_kv": kv_cache,
+        "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
+        "cmp_kv": kv_cache,
+        "cmp_block_table": block_table[:, ORI_MAX_BLOCKS:],
+        "cmp_sparse_indices": topk_idxs,
+        "attn_sink": tensors["attn_sink"],
+        "freqs_cos": rope_cos_T,
+        "freqs_sin": rope_sin_T,
+        "o": o,
+    })
 
-    # ---- indexer (model.py 402-433) ----
-    q_idx = (qr @ idx_wq_b).view(T, IDX_HEADS, IDX_HEAD_DIM)
-    q_idx_rope = apply_rope(q_idx[..., IDX_NOPE:], rope_cos, rope_sin)
-    q_idx = torch.cat([q_idx[..., :IDX_NOPE], q_idx_rope], dim=-1)
-    q_idx = (q_idx.view(-1, IDX_HEAD_DIM) @ hadamard_q).view(T, IDX_HEADS, IDX_HEAD_DIM) \
-            * (IDX_HEAD_DIM ** -0.5)
+    # o_proj (model.py:537-542)
+    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
+    golden_deepseek_v4_decode_o_proj({
+        "o": o,
+        "wo_a": tensors["wo_a"],
+        "wo_b": tensors["wo_b"],
+        "attn_out": attn_out,
+    })
 
-    inner_kv = (x_norm_t @ inner_wkv.T)
-    inner_score = (x_norm_t @ inner_wgate.T) + inner_ape[start_pos % RATIO]
-    inner_kv_state[:, slot]    = inner_kv
-    inner_score_state[:, slot] = inner_score
-    if should_compress:
-        kv_view = torch.cat([inner_kv_state[:, :RATIO, :IDX_HEAD_DIM],
-                             inner_kv_state[:, RATIO:, IDX_HEAD_DIM:]], dim=1)
-        sc_view = torch.cat([inner_score_state[:, :RATIO, :IDX_HEAD_DIM],
-                             inner_score_state[:, RATIO:, IDX_HEAD_DIM:]], dim=1)
-        inner_c = (kv_view * torch.softmax(sc_view, dim=1)).sum(dim=1)
-        inner_kv_state[:, :RATIO]    = inner_kv_state[:, RATIO:]
-        inner_score_state[:, :RATIO] = inner_score_state[:, RATIO:]
-        inner_c = inner_c * torch.rsqrt(inner_c.square().mean(-1, keepdim=True) + EPS) * inner_weight
-        inner_c = (inner_c @ inner_hadamard) * (IDX_HEAD_DIM ** -0.5)
-        cache_slot = start_pos // RATIO
-        for b in range(B):
-            blk_id = int(idx_block_table[b, cache_slot // BLOCK_SIZE].item())
-            intra  = cache_slot % BLOCK_SIZE
-            idx_kv_cache[blk_id, intra] = inner_c[b].to(torch.bfloat16)
+    # ===== Block.hc_post (model.py:694) =====
+    y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
+    golden_deepseek_v4_decode_hc_post({
+        "x": attn_out.view(B, S, D),
+        "residual": tensors["x_hc"],
+        "post": post_t,
+        "comb": comb_t,
+        "y": y,
+    })
 
-    end_pos = start_pos + 1
-    cache_len = end_pos // RATIO
-    if cache_len > 0:
-        dense_kv = torch.zeros(B, cache_len, IDX_HEAD_DIM)
-        for b in range(B):
-            for j in range(cache_len):
-                blk_id = int(idx_block_table[b, j // BLOCK_SIZE].item())
-                intra  = j % BLOCK_SIZE
-                dense_kv[b, j] = idx_kv_cache[blk_id, intra].float()
-        weights_idx = (x_norm_t @ weights_proj) * (IDX_HEAD_DIM ** -0.5 * IDX_HEADS ** -0.5)
-        weights_idx = weights_idx.view(B, IDX_HEADS)
-        score = torch.einsum("thd,btd->bht", q_idx, dense_kv)
-        score = (torch.relu(score) * weights_idx.view(B, IDX_HEADS, 1)).sum(dim=1)
-        k = min(IDX_TOPK, cache_len)
-        _, idx = score.topk(k, dim=-1)
-        idx = idx.to(torch.int32) + offset
-        pad = torch.full((B, IDX_TOPK - k), -1, dtype=torch.int32)
-        cmp_topk_idxs = torch.cat([idx, pad], dim=-1)
-    else:
-        cmp_topk_idxs = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
-
-    # ---- window topk indices (model.py:255-265) ----
-    win_idxs = torch.arange(WIN, dtype=torch.int32).unsqueeze(0).expand(T, -1).contiguous()
-    sparse_indices = torch.cat([win_idxs, cmp_topk_idxs.view(T, IDX_TOPK)], dim=-1)
-
-    # ---- cfa (model.py 528 / 533 + 534) ----
-    out_attn = torch.zeros(T, H, HEAD_DIM)
-    for b in range(B):
-        idxs = sparse_indices[b]
-        valid = idxs >= 0
-        valid_idxs = idxs[valid]
-        if valid_idxs.numel() == 0:
-            continue
-        gathered = []
-        for raw in valid_idxs.tolist():
-            if raw < WIN:
-                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-                intra  = raw % BLOCK_SIZE
-                gathered.append(ori_kv[blk_id, intra, 0].float())
-            else:
-                cmp_slot = raw - WIN
-                blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
-                intra  = cmp_slot % BLOCK_SIZE
-                gathered.append(cmp_kv[blk_id, intra, 0].float())
-        kv_b = torch.stack(gathered, dim=0)
-        scores = (q[b] @ kv_b.T) * SOFTMAX_SCALE
-        scores = torch.cat([scores, attn_sink.unsqueeze(-1)], dim=-1)
-        probs = torch.softmax(scores, dim=-1)[..., :-1]
-        out_attn[b] = probs @ kv_b
-
-    # Inverse RoPE on rope dims (model.py:534)
-    o_rope = out_attn[..., NOPE_DIM:]
-    x_pair = o_rope.unflatten(-1, (-1, 2))
-    x0, x1 = x_pair[..., 0], x_pair[..., 1]
-    cos_v = rope_cos.unsqueeze(1)
-    sin_v = rope_sin.unsqueeze(1)
-    y0 = x0 * cos_v + x1 * sin_v
-    y1 = -x0 * sin_v + x1 * cos_v
-    out_attn = torch.cat([out_attn[..., :NOPE_DIM],
-                          torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
-
-    # ---- o_proj (model.py 537-542) ----
-    o_g = out_attn.view(T, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("tgd,grd->tgr", o_g, wo_a)
-    attn_out = (o_r.flatten(1) @ wo_b.T).view(B, S, D)                     # [B,S,D]
-
-    # ---- hc_post (model.py 684-687) ----
-    # Calls hc_post.py kernel: post * attn_out + sum(comb * residual)
-    term1 = post.unsqueeze(-1) * attn_out.unsqueeze(-2)
-    term2 = (comb.unsqueeze(-1) * x_hc.unsqueeze(-2)).sum(dim=2)
-    x_after = (term1 + term2)                                              # [B,S,hc,D]
-
-    tensors["x_out"][:] = x_after.to(torch.bfloat16)
+    tensors["x_out"][:] = y
 
 
 def build_tensor_specs():
@@ -395,7 +317,7 @@ def build_tensor_specs():
         return torch.ones(3) * 0.5
     def init_hc_attn_base():
         return torch.zeros(MIX_HC)
-    def init_norm_w():
+    def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
         return torch.randn(D, Q_LORA) / D ** 0.5
@@ -407,134 +329,94 @@ def build_tensor_specs():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
-    def init_rope_cos():
-        return torch.cos(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
-    def init_rope_sin():
-        return torch.sin(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
+    def init_freqs_cos():
+        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+    def init_freqs_sin():
+        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
     def init_cmp_wkv():
-        return torch.randn(CMP_OUT_DIM, D) / D ** 0.5
+        return torch.randn(MAIN_OUT_DIM, D) / D ** 0.5
     def init_cmp_wgate():
-        return torch.randn(CMP_OUT_DIM, D) / D ** 0.5
+        return torch.randn(MAIN_OUT_DIM, D) / D ** 0.5
     def init_cmp_ape():
-        return torch.randn(RATIO, CMP_OUT_DIM) * 0.01
-    def init_cmp_weight():
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.01
+    def init_cmp_norm_w():
         return torch.ones(HEAD_DIM)
-    def init_cmp_cos():
-        return torch.cos(torch.arange(ROPE_DIM).reshape(1, ROPE_DIM) * 1e-3)
-    def init_cmp_sin():
-        return torch.sin(torch.arange(ROPE_DIM).reshape(1, ROPE_DIM) * 1e-3)
     def init_cmp_kv_state():
-        return torch.zeros(B, STATE_LEN, CMP_OUT_DIM)
+        return torch.zeros(B, MAIN_STATE_LEN, MAIN_OUT_DIM)
     def init_cmp_score_state():
-        return torch.full((B, STATE_LEN, CMP_OUT_DIM), float("-inf"))
+        return torch.full((B, MAIN_STATE_LEN, MAIN_OUT_DIM), float("-inf"))
     def init_idx_wq_b():
-        return torch.randn(Q_LORA, IDX_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
+        return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
     def init_weights_proj():
-        return torch.randn(D, IDX_HEADS) / D ** 0.5
-    def init_hadamard_q():
+        return torch.randn(D, IDX_N_HEADS) / D ** 0.5
+    def init_hadamard_idx():
         return torch.eye(IDX_HEAD_DIM)
     def init_inner_wkv():
         return torch.randn(INNER_OUT_DIM, D) / D ** 0.5
     def init_inner_wgate():
         return torch.randn(INNER_OUT_DIM, D) / D ** 0.5
     def init_inner_ape():
-        return torch.randn(RATIO, INNER_OUT_DIM) * 0.01
-    def init_inner_weight():
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.01
+    def init_inner_norm_w():
         return torch.ones(IDX_HEAD_DIM)
-    def init_inner_hadamard():
-        return torch.eye(IDX_HEAD_DIM)
     def init_inner_kv_state():
-        return torch.zeros(B, STATE_LEN, INNER_OUT_DIM)
+        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
     def init_inner_score_state():
-        return torch.full((B, STATE_LEN, INNER_OUT_DIM), float("-inf"))
-    def init_ori_kv():
-        return torch.randn(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) * 0.05
-    def init_cmp_kv():
-        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return torch.full((B, INNER_STATE_LEN, INNER_OUT_DIM), float("-inf"))
+    def init_kv_cache():
+        return torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_idx_kv_cache():
-        return torch.zeros(IDX_BLOCK_NUM, BLOCK_SIZE, IDX_HEAD_DIM)
+        return torch.zeros(B, IDX_KV_LEN, IDX_HEAD_DIM)
 
-    def init_ori_block_table():
-        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
+    def init_block_table():
+        tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(B):
-            for j in range(ORI_MAX_BLOCKS):
-                tbl[b, j] = b * ORI_MAX_BLOCKS + j
+            for j in range(MAX_BLOCKS):
+                tbl[b, j] = b * MAX_BLOCKS + j
         return tbl
 
-    def init_cmp_block_table():
-        tbl = torch.full((B, CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(CMP_MAX_BLOCKS):
-                tbl[b, j] = b * CMP_MAX_BLOCKS + j
-        return tbl
-
-    def init_idx_block_table():
-        tbl = torch.full((B, IDX_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(IDX_MAX_BLOCKS):
-                tbl[b, j] = b * IDX_MAX_BLOCKS + j
-        return tbl
-
-    def init_seqused_kv():
-        return torch.tensor([WIN] * B, dtype=torch.int32)
+    def init_attn_sink():
+        return torch.zeros(H)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
         return torch.randn(D, O_GROUPS * O_LORA) / (O_GROUPS * O_LORA) ** 0.5
-    def init_attn_sink():
-        return torch.zeros(H)
-    def init_start_pos():
-        return torch.tensor([RATIO - 1] * B, dtype=torch.int32)
-    def init_should_compress():
-        return torch.tensor([1], dtype=torch.int32)
-    def init_offset():
-        return torch.tensor([0], dtype=torch.int32)
 
     return [
-        TensorSpec("x_hc",              [B, S, HC_MULT, D],                              torch.bfloat16, init_value=init_x_hc),
-        TensorSpec("hc_attn_fn",        [MIX_HC, HC_DIM],                                torch.float32,  init_value=init_hc_attn_fn),
-        TensorSpec("hc_attn_scale",     [3],                                             torch.float32,  init_value=init_hc_attn_scale),
-        TensorSpec("hc_attn_base",      [MIX_HC],                                        torch.float32,  init_value=init_hc_attn_base),
-        TensorSpec("norm_w",            [D],                                             torch.float32,  init_value=init_norm_w),
-        TensorSpec("wq_a",              [D, Q_LORA],                                     torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b",              [Q_LORA, H * HEAD_DIM],                          torch.bfloat16, init_value=init_wq_b),
-        TensorSpec("wkv",               [D, HEAD_DIM],                                   torch.bfloat16, init_value=init_wkv),
-        TensorSpec("gamma_cq",          [Q_LORA],                                        torch.bfloat16, init_value=init_gamma_cq),
-        TensorSpec("gamma_ckv",         [HEAD_DIM],                                      torch.bfloat16, init_value=init_gamma_ckv),
-        TensorSpec("rope_cos",          [T, ROPE_DIM],                                   torch.bfloat16, init_value=init_rope_cos),
-        TensorSpec("rope_sin",          [T, ROPE_DIM],                                   torch.bfloat16, init_value=init_rope_sin),
-        TensorSpec("cmp_wkv",           [CMP_OUT_DIM, D],                                torch.bfloat16, init_value=init_cmp_wkv),
-        TensorSpec("cmp_wgate",         [CMP_OUT_DIM, D],                                torch.bfloat16, init_value=init_cmp_wgate),
-        TensorSpec("cmp_ape",           [RATIO, CMP_OUT_DIM],                            torch.float32,  init_value=init_cmp_ape),
-        TensorSpec("cmp_weight",        [HEAD_DIM],                                      torch.bfloat16, init_value=init_cmp_weight),
-        TensorSpec("cmp_cos",           [1, ROPE_DIM],                                   torch.bfloat16, init_value=init_cmp_cos),
-        TensorSpec("cmp_sin",           [1, ROPE_DIM],                                   torch.bfloat16, init_value=init_cmp_sin),
-        TensorSpec("cmp_kv_state",      [B, STATE_LEN, CMP_OUT_DIM],                     torch.float32,  init_value=init_cmp_kv_state),
-        TensorSpec("cmp_score_state",   [B, STATE_LEN, CMP_OUT_DIM],                     torch.float32,  init_value=init_cmp_score_state),
-        TensorSpec("idx_wq_b",          [Q_LORA, IDX_HEADS * IDX_HEAD_DIM],              torch.bfloat16, init_value=init_idx_wq_b),
-        TensorSpec("weights_proj",      [D, IDX_HEADS],                                  torch.bfloat16, init_value=init_weights_proj),
-        TensorSpec("hadamard_q",        [IDX_HEAD_DIM, IDX_HEAD_DIM],                    torch.bfloat16, init_value=init_hadamard_q),
-        TensorSpec("inner_wkv",         [INNER_OUT_DIM, D],                              torch.bfloat16, init_value=init_inner_wkv),
-        TensorSpec("inner_wgate",       [INNER_OUT_DIM, D],                              torch.bfloat16, init_value=init_inner_wgate),
-        TensorSpec("inner_ape",         [RATIO, INNER_OUT_DIM],                          torch.float32,  init_value=init_inner_ape),
-        TensorSpec("inner_weight",      [IDX_HEAD_DIM],                                  torch.bfloat16, init_value=init_inner_weight),
-        TensorSpec("inner_hadamard",    [IDX_HEAD_DIM, IDX_HEAD_DIM],                    torch.bfloat16, init_value=init_inner_hadamard),
-        TensorSpec("inner_kv_state",    [B, STATE_LEN, INNER_OUT_DIM],                   torch.float32,  init_value=init_inner_kv_state),
-        TensorSpec("inner_score_state", [B, STATE_LEN, INNER_OUT_DIM],                   torch.float32,  init_value=init_inner_score_state),
-        TensorSpec("ori_kv",            [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],        torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("ori_block_table",   [B, ORI_MAX_BLOCKS],                             torch.int32,    init_value=init_ori_block_table),
-        TensorSpec("cmp_kv",            [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],        torch.bfloat16, init_value=init_cmp_kv),
-        TensorSpec("cmp_block_table",   [B, CMP_MAX_BLOCKS],                             torch.int32,    init_value=init_cmp_block_table),
-        TensorSpec("idx_kv_cache",      [IDX_BLOCK_NUM, BLOCK_SIZE, IDX_HEAD_DIM],       torch.bfloat16, init_value=init_idx_kv_cache),
-        TensorSpec("idx_block_table",   [B, IDX_MAX_BLOCKS],                             torch.int32,    init_value=init_idx_block_table),
-        TensorSpec("seqused_kv",        [B],                                             torch.int32,    init_value=init_seqused_kv),
-        TensorSpec("wo_a",              [O_GROUPS, O_LORA, O_GROUP_IN],                  torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b",              [D, O_GROUPS * O_LORA],                          torch.bfloat16, init_value=init_wo_b),
-        TensorSpec("attn_sink",         [H],                                             torch.float32,  init_value=init_attn_sink),
-        TensorSpec("start_pos",         [B],                                             torch.int32,    init_value=init_start_pos),
-        TensorSpec("should_compress",   [1],                                             torch.int32,    init_value=init_should_compress),
-        TensorSpec("offset",            [1],                                             torch.int32,    init_value=init_offset),
-        TensorSpec("x_out",             [B, S, HC_MULT, D],                              torch.bfloat16, is_output=True),
+        TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
+        TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
+        TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
+        TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
+        TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.bfloat16, init_value=init_wq_b),
+        TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
+        TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
+        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("cmp_wkv", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wkv),
+        TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
+        TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
+        TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
+        TensorSpec("cmp_kv_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_kv_state),
+        TensorSpec("cmp_score_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_score_state),
+        TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_wq_b),
+        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
+        TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
+        TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
+        TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
+        TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
+        TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
+        TensorSpec("inner_kv_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
+        TensorSpec("inner_score_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_score_state),
+        TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache),
+        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
+        TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
     ]
 
 
