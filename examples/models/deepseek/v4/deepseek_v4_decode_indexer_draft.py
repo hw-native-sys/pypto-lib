@@ -41,9 +41,9 @@ STATE_LEN = COFF * COMPRESS_RATIO
 MAX_SEQ_LEN = 4096
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 
-START_POS = 3  # >0 (decode), and (START_POS+1)%COMPRESS_RATIO==0 to cover the full inner-compressor path
+START_POS = 3  # default for ScalarSpec; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full inner-compressor path
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
-OFFSET = 128  # = win in attention orch; added to topk_idxs (model.py:432)
+OFFSET = 128  # default for ScalarSpec; = win in attention orch; added to topk_idxs (model.py:432)
 
 
 def build_deepseek_v4_decode_indexer_program():
@@ -68,6 +68,8 @@ def build_deepseek_v4_decode_indexer_program():
             inner_kv_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
             inner_score_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
             idx_kv_cache: pl.InOut[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
+            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
+            offset: pl.Scalar[pl.INT32],     # added to topk_idxs (= win from attention orch)
             topk_idxs: pl.Out[pl.Tensor[[T, IDX_TOPK], pl.INT32]],
         ):
             # TODO: kernel implementation
@@ -89,9 +91,9 @@ def golden_deepseek_v4_decode_indexer(tensors):
     hadamard = tensors["hadamard"].float()
     idx_kv_cache = tensors["idx_kv_cache"]
 
-    start_pos = START_POS
+    start_pos = int(tensors["start_pos"])
     compress_ratio = COMPRESS_RATIO
-    offset = OFFSET
+    offset = int(tensors["offset"])
 
     bsz, seqlen, _ = x.shape
     ratio, rd = compress_ratio, ROPE_HEAD_DIM
@@ -124,12 +126,14 @@ def golden_deepseek_v4_decode_indexer(tensors):
         "cos": tensors["inner_cos"],
         "sin": tensors["inner_sin"],
         "hadamard": tensors["hadamard"],
+        "start_pos": tensors["start_pos"],
         "out": inner_out,
     }
     # Placeholder call — compressor's golden currently uses module-level constants
     # (HEAD_DIM=512, ROTATE=False), so this won't run end-to-end without refactor.
     golden_deepseek_v4_decode_compressor(inner_tensors)
-    if SHOULD_COMPRESS:
+    should_compress = compress_ratio != 0 and ((start_pos + 1) % compress_ratio) == 0
+    if should_compress:
         idx_kv_cache[:bsz, start_pos // ratio] = inner_out
 
     weights = (x.float().view(bsz, -1) @ weights_proj) * (IDX_SOFTMAX_SCALE * IDX_N_HEADS ** -0.5)
@@ -151,7 +155,7 @@ def golden_deepseek_v4_decode_indexer(tensors):
 
 def build_tensor_specs():
     import torch  # type: ignore[import]
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def init_x():
         return torch.randn(B, S, D) * 0.1
@@ -203,6 +207,8 @@ def build_tensor_specs():
         TensorSpec("inner_kv_state", [B, STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
         TensorSpec("inner_score_state", [B, STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_score_state),
         TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache),
+        ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("offset", torch.int32, OFFSET),
         TensorSpec("topk_idxs", [T, IDX_TOPK], torch.int32, is_output=True),
     ]
 
@@ -223,8 +229,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_indexer,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

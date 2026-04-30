@@ -6,11 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 Attention sublayer orchestration (decode). Composes per-step goldens
-(hc_pre, qkv_proj_rope, compressor, indexer, sparse_attn, o_proj, hc_post). Steps without a
-dedicated draft (ori_kv scatter, cmp_kv scatter, window_topk_idxs, topk concat) are inlined.
-Inner goldens are invoked as placeholders; each callee uses its own module constants, so the
-chain is structural rather than runnable end-to-end."""
+"""DeepSeek-V4 HCA (Hierarchical Compressed Attention) decode orchestration — `compress_ratio == 128` path.
+Active in layers 3/5 of the model (2 of the 8 layers in demo). Has the main compressor (ratio=128,
+overlap=False) but NO indexer (model.py:468-471 only instantiates indexer when ratio==4); the
+compressed-portion topk for sparse_attn comes from `get_compress_topk_idxs` (a deterministic index
+computation, model.py:268-276), not from a learned indexer score.
+Companion files: deepseek_v4_decode_swa.py (ratio=0)
+                 deepseek_v4_decode_csa.py (ratio=4)."""
 
 
 import pypto.language as pl
@@ -36,23 +38,14 @@ HC_DIM = HC_MULT * D
 HC_SINKHORN_ITER = 20
 HC_EPS = 1e-6
 
-IDX_N_HEADS = 64
-IDX_HEAD_DIM = 128
-IDX_TOPK = 512  # v4-pro 1024
-IDX_SOFTMAX_SCALE = IDX_HEAD_DIM ** -0.5
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 4096  # v4-pro 1048576 (1M tokens)
 
-COMPRESS_RATIO = 4  # 0 / 4 / 128 (this orch handles ratio>0; ratio==0 path skips compressor + indexer)
+COMPRESS_RATIO = 128  # HCA
 ROTATE_MAIN = False
-ROTATE_INNER = True
-OVERLAP = COMPRESS_RATIO == 4
-COFF = 1 + int(OVERLAP)
-
+OVERLAP = COMPRESS_RATIO == 4   # always False for HCA
+COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
-INNER_OUT_DIM = COFF * IDX_HEAD_DIM
-INNER_STATE_LEN = COFF * COMPRESS_RATIO
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 
 O_LORA = 1024
 O_GROUPS = 8  # v4-pro 16
@@ -60,22 +53,21 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 BLOCK_SIZE = 128
 ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
-CMP_MAX_BLOCKS = 64
+CMP_MAX_BLOCKS = 1                                         # demo: MAX_SEQ_LEN/ratio=32 ≤ BLOCK_SIZE=128 → 1 block; v4-pro 64 (=1048576/128/128)
 MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS               # logical block layout: [0..ORI) ori, [ORI..MAX) cmp
 BLOCK_NUM = B * MAX_BLOCKS
 
-TOPK = WIN + IDX_TOPK
+CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO                   # demo =32; v4-pro =8192 (=1048576/128); max compressed positions
+TOPK = WIN + CMP_TOPK                                      # sparse_attn input topk size
 
-START_POS = 3  # >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
-OFFSET = WIN  # added to indexer topk_idxs (model.py:432, attention.py:509)
+START_POS = 127  # default for ScalarSpec; (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
 
 
-def build_deepseek_v4_decode_attention_program():
+def build_deepseek_v4_decode_hca_program():
     @pl.program
-    class DeepSeekV4DecodeAttention:
+    class DeepSeekV4DecodeHca:
         @pl.function(type=pl.FunctionType.Orchestration)
-        def deepseek_v4_decode_attention(
+        def deepseek_v4_decode_hca(
             self,
             x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
             # hc_pre weights
@@ -91,49 +83,39 @@ def build_deepseek_v4_decode_attention_program():
             gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
             freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],  # Attention.freqs_cis (model.py:480-482)
             freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-            # main compressor (rotate=False, head_dim=HEAD_DIM)
+            # main compressor (rotate=False, head_dim=HEAD_DIM, ratio=128, overlap=False)
             cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
             cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
             cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
             cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
             cmp_kv_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
             cmp_score_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
-            # indexer + inner compressor (rotate=True, head_dim=IDX_HEAD_DIM)
-            idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.BF16],
-            weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-            hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by indexer's q rotation and inner Compressor
-            inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-            inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-            inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-            inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-            inner_kv_state: pl.InOut[pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32]],
-            inner_score_state: pl.InOut[pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32]],
             # KV cache (single PA pool: [0, WIN) is ori sliding window, [WIN, WIN+max_seq//ratio) is cmp)
             kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
             block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
-            idx_kv_cache: pl.InOut[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
             # sparse_attn
             attn_sink: pl.Tensor[[H], pl.FP32],
             # o_proj
             wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
             wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
             x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
         ):
             # TODO: orchestration body (dispatches the per-step kernels)
             return x_out
 
-    return DeepSeekV4DecodeAttention
+    return DeepSeekV4DecodeHca
 
 
-def golden_deepseek_v4_decode_attention(tensors):
-    """End-to-end orchestration. Mirrors Block.hc_pre + Attention.forward (decode branch)
-    + Block.hc_post; all control flow from Attention.forward (model.py:484-543) is preserved."""
+def golden_deepseek_v4_decode_hca(tensors):
+    """End-to-end orchestration for the ratio=128 (HCA) layers.
+    Mirrors Block.hc_pre + Attention.forward (decode branch, ratio==128 path: main compressor only,
+    no indexer, compress_topk_idxs computed deterministically) + Block.hc_post."""
     import torch
 
-    from deepseek_v4_decode_hc_pre_draft import golden_deepseek_v4_decode_hc_pre
+    from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
     from deepseek_v4_decode_qkv_proj_rope_draft import golden_deepseek_v4_decode_qkv_proj_rope
     from deepseek_v4_decode_compressor_draft import golden_deepseek_v4_decode_compressor
-    from deepseek_v4_decode_indexer_draft import golden_deepseek_v4_decode_indexer
     from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
     from deepseek_v4_decode_o_proj_draft import golden_deepseek_v4_decode_o_proj
     from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
@@ -152,27 +134,27 @@ def golden_deepseek_v4_decode_attention(tensors):
         "comb": comb_t,
     })
 
-    # ===== Attention.forward (model.py:484-543) =====
-    start_pos = START_POS
+    # ===== Attention.forward (model.py:484-543), ratio==128 branch =====
+    start_pos = int(tensors["start_pos"])
     bsz, seqlen, _ = x_mixed.shape
     win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
+    should_compress = ((start_pos + 1) % ratio) == 0
 
     if start_pos == 0:
         return  # prefill — decode-only orchestration skips
 
-    # Slice freqs_cis at the positions used by each call site (model.py:486, 366, 404).
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
     step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
     step_sin = freqs_sin[start_pos:start_pos + 1]
-    rope_cos_T = step_cos.expand(T, rd).contiguous()                          # qkv_proj_rope / sparse_attn want [T, rd]
+    rope_cos_T = step_cos.expand(T, rd).contiguous()
     rope_sin_T = step_sin.expand(T, rd).contiguous()
-    cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio] if ratio else step_cos  # Compressor.forward line 366
-    cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio] if ratio else step_sin
+    cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio]         # Compressor.forward line 366
+    cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio]
 
-    # q + win kv (model.py:495-504); attn_norm fused at input.
+    # q + win kv (model.py:495-504)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.bfloat16)
@@ -188,87 +170,53 @@ def golden_deepseek_v4_decode_attention(tensors):
         "gamma_ckv": tensors["gamma_ckv"],
         "q": q,
         "kv": kv,
-        "qr": qr,
+        "qr": qr,                                                              # qr unused on HCA path
     })
-    # line 506 act_quant on kv non-rope dims — A3-skipped
 
-    # window topk + (optional) compress topk (model.py:507-515)
+    # window topk + compress topk (model.py:507, 513-514; HCA uses get_compress_topk_idxs)
     topk_idxs = torch.full((T, TOPK), -1, dtype=torch.int32)
-    topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)             # line 507: get_window_topk_idxs
-    if ratio:                                                              # line 508
-        offset = win                                                       # line 509 (decode: kv.size(1) is N/A)
-        if ratio == 4:                                                     # line 510 (indexer is not None)
-            indexer_topk = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
-            golden_deepseek_v4_decode_indexer({                            # line 511
-                "x": x_mixed,
-                "qr": qr,
-                "wq_b": tensors["idx_wq_b"],
-                "weights_proj": tensors["weights_proj"],
-                "cos": step_cos,
-                "sin": step_sin,
-                "hadamard": tensors["hadamard_idx"],
-                "inner_wkv": tensors["inner_wkv"],
-                "inner_wgate": tensors["inner_wgate"],
-                "inner_ape": tensors["inner_ape"],
-                "inner_norm_w": tensors["inner_norm_w"],
-                "inner_cos": cmp_cos,
-                "inner_sin": cmp_sin,
-                "inner_kv_state": tensors["inner_kv_state"],
-                "inner_score_state": tensors["inner_score_state"],
-                "idx_kv_cache": tensors["idx_kv_cache"],
-                "topk_idxs": indexer_topk,
-            })
-            compress_topk_idxs = indexer_topk
-        else:                                                              # line 512: ratio == 128, HCA path
-            # line 513: get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset) — decode branch (line 270-271)
-            cache_len = (start_pos + 1) // ratio
-            compress_topk_idxs = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
-            if cache_len > 0:
-                k = min(cache_len, IDX_TOPK)
-                compress_topk_idxs[:, :k] = torch.arange(k, dtype=torch.int32) + offset
-        topk_idxs[:, win:win + IDX_TOPK] = compress_topk_idxs              # line 514
-    topk_idxs = topk_idxs.int()                                            # line 515
+    topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)                  # line 507
+    offset = win                                                               # line 509
+    # line 513: get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset) decode branch (model.py:270-271)
+    cache_len = (start_pos + 1) // ratio
+    if cache_len > 0:
+        k = min(cache_len, CMP_TOPK)
+        topk_idxs[:, win:win + k] = torch.arange(k, dtype=torch.int32) + offset
+    topk_idxs = topk_idxs.int()                                                # line 515
 
-    # compress kv & attn — decode branch (model.py:529-534)
-    # Single merged PA pool: logical block layout per batch is [0..ORI_MAX_BLOCKS) ori, [ORI_MAX_BLOCKS..MAX) cmp.
+    # ori_kv scatter (model.py:530)
     kv_cache = tensors["kv_cache"]
     block_table = tensors["block_table"]
-
-    # line 530: self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1) — ori sliding-window scatter
     ori_slot = start_pos % win
     for b in range(B):
         blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
         kv_cache[blk_id, intra, 0] = kv[b]
 
-    if ratio:                                                              # line 531
-        # line 532: self.compressor(x, start_pos) — Compressor.forward writes cmp_kv internally (line 376),
-        # we externalize that slot write to the orch below.
-        cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
-        golden_deepseek_v4_decode_compressor({
-            "x": x_mixed,
-            "kv_state": tensors["cmp_kv_state"],
-            "score_state": tensors["cmp_score_state"],
-            "wkv": tensors["cmp_wkv"],
-            "wgate": tensors["cmp_wgate"],
-            "ape": tensors["cmp_ape"],
-            "norm_w": tensors["cmp_norm_w"],
-            "cos": cmp_cos,
-            "sin": cmp_sin,
-            "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),         # main compressor is rotate=False; unused, identity placeholder
-            "out": cmp_out,
-        })
-        if SHOULD_COMPRESS:                                                # Compressor.forward line 360 short-circuit
-            # cmp portion starts at ORI_MAX_BLOCKS in the logical block table
-            cmp_slot_rel = start_pos // ratio                              # relative to cmp portion
-            for b in range(B):
-                blk_id = int(block_table[b, ORI_MAX_BLOCKS + cmp_slot_rel // BLOCK_SIZE].item())
-                intra = cmp_slot_rel % BLOCK_SIZE
-                kv_cache[blk_id, intra, 0] = cmp_out[b]
+    # main compressor (model.py:532; writes cmp_kv internally on should_compress)
+    cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
+    golden_deepseek_v4_decode_compressor({
+        "x": x_mixed,
+        "kv_state": tensors["cmp_kv_state"],
+        "score_state": tensors["cmp_score_state"],
+        "wkv": tensors["cmp_wkv"],
+        "wgate": tensors["cmp_wgate"],
+        "ape": tensors["cmp_ape"],
+        "norm_w": tensors["cmp_norm_w"],
+        "cos": cmp_cos,
+        "sin": cmp_sin,
+        "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),                 # rotate=False; identity placeholder
+        "start_pos": tensors["start_pos"],
+        "out": cmp_out,
+    })
+    if should_compress:                                                        # Compressor.forward line 360 short-circuit
+        cmp_slot_rel = start_pos // ratio
+        for b in range(B):
+            blk_id = int(block_table[b, ORI_MAX_BLOCKS + cmp_slot_rel // BLOCK_SIZE].item())
+            intra = cmp_slot_rel % BLOCK_SIZE
+            kv_cache[blk_id, intra, 0] = cmp_out[b]
 
-    # line 533: o = sparse_attn(q, self.kv_cache[:bsz], attn_sink, topk_idxs, softmax_scale)
-    # line 534: apply_rotary_emb(o[..., -rd:], freqs_cis, True) — fused inside sparse_attn
-    # sparse_attn still expects two views; share the physical pool, split block_table at ORI_MAX_BLOCKS.
+    # sparse_attn (model.py:533-534)
     o = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     golden_deepseek_v4_decode_sparse_attn({
         "q": q,
@@ -307,7 +255,7 @@ def golden_deepseek_v4_decode_attention(tensors):
 
 def build_tensor_specs():
     import torch  # type: ignore[import]
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def init_x_hc():
         return torch.randn(B, S, HC_MULT, D) * 0.05
@@ -345,28 +293,8 @@ def build_tensor_specs():
         return torch.zeros(B, MAIN_STATE_LEN, MAIN_OUT_DIM)
     def init_cmp_score_state():
         return torch.full((B, MAIN_STATE_LEN, MAIN_OUT_DIM), float("-inf"))
-    def init_idx_wq_b():
-        return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
-    def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) / D ** 0.5
-    def init_hadamard_idx():
-        return torch.eye(IDX_HEAD_DIM)
-    def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) / D ** 0.5
-    def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) / D ** 0.5
-    def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.01
-    def init_inner_norm_w():
-        return torch.ones(IDX_HEAD_DIM)
-    def init_inner_kv_state():
-        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
-    def init_inner_score_state():
-        return torch.full((B, INNER_STATE_LEN, INNER_OUT_DIM), float("-inf"))
     def init_kv_cache():
         return torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-    def init_idx_kv_cache():
-        return torch.zeros(B, IDX_KV_LEN, IDX_HEAD_DIM)
 
     def init_block_table():
         tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
@@ -401,21 +329,12 @@ def build_tensor_specs():
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec("cmp_kv_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_kv_state),
         TensorSpec("cmp_score_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_score_state),
-        TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_wq_b),
-        TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
-        TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
-        TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
-        TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
-        TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
-        TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("inner_kv_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
-        TensorSpec("inner_score_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_score_state),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
-        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
+        ScalarSpec("start_pos", torch.int32, START_POS),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
     ]
 
@@ -432,12 +351,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run(
-        program=build_deepseek_v4_decode_attention_program(),
+        program=build_deepseek_v4_decode_hca_program(),
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_attention,
+        golden_fn=golden_deepseek_v4_decode_hca,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

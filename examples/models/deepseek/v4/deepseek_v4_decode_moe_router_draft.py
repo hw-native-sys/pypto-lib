@@ -132,8 +132,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_moe_router,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

@@ -31,7 +31,7 @@ COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 
-START_POS = 3  # >0 (decode), and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
+START_POS = 3  # default for ScalarSpec; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
 
 
@@ -51,6 +51,7 @@ def build_deepseek_v4_decode_compressor_program():
             cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos+1-ratio]
             sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # same as cos
             hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
+            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
             out: pl.Out[pl.Tensor[[B, HEAD_DIM], pl.BF16]],
         ):
             # TODO: kernel implementation
@@ -74,7 +75,7 @@ def golden_deepseek_v4_decode_compressor(tensors):
     sin = tensors["sin"].float()
     hadamard = tensors["hadamard"].float()
 
-    start_pos = START_POS
+    start_pos = int(tensors["start_pos"])
     compress_ratio = COMPRESS_RATIO
 
     bsz, _, _ = x.shape
@@ -130,7 +131,7 @@ def golden_deepseek_v4_decode_compressor(tensors):
 
 def build_tensor_specs():
     import torch  # type: ignore[import]
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def init_x():
         return torch.randn(B, S, D) * 0.1
@@ -163,6 +164,7 @@ def build_tensor_specs():
         TensorSpec("cos", [1, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("sin", [1, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
+        ScalarSpec("start_pos", torch.int32, START_POS),
         TensorSpec("out", [B, HEAD_DIM], torch.bfloat16, is_output=True),
     ]
 
