@@ -171,6 +171,13 @@ class KvCacheManager:
             pool.value_pages[layer_idx].reshape(-1, pool.head_dim),
         )
 
+    def materialize_decode_cache_all_layers(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+        pool = self._pool(model_id)
+        return (
+            pool.key_pages.reshape(-1, pool.head_dim),
+            pool.value_pages.reshape(-1, pool.head_dim),
+        )
+
     def free(self, alloc: KvAllocation) -> None:
         pool = self._pool(alloc.model_id)
         pool.free_pages.extend(alloc.page_ids)

@@ -19,7 +19,7 @@ _KERNEL_PATH = (
     / "models"
     / "qwen3"
     / "14b"
-    / "qwen3_14b_decode.py"
+    / "qwen3_14b_decode_full.py"
 )
 _SPEC = importlib.util.spec_from_file_location("_qwen3_14b_decode_kernel", _KERNEL_PATH)
 if _SPEC is None or _SPEC.loader is None:
