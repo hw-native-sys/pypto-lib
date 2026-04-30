@@ -17,6 +17,10 @@ B       = 16                 # demo 4
 S       = 1
 D       = 4096               # v4-pro 7168
 HC_MULT = 4
+T       = B * S
+D_CHUNK = 512
+D_BLOCKS = D // D_CHUNK
+HC_DIM  = HC_MULT * D
 
 
 def build_deepseek_v4_decode_hc_post_program():
@@ -31,7 +35,39 @@ def build_deepseek_v4_decode_hc_post_program():
             comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
             y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
         ):
-            # TODO: kernel implementation
+            x_flat = pl.reshape(x, [T, D])
+            residual_flat = pl.reshape(residual, [T, HC_DIM])
+            post_flat = pl.reshape(post, [T * HC_MULT])
+            comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
+            y_flat = pl.reshape(y, [T, HC_DIM])
+
+            for out_h in pl.parallel(HC_MULT):
+                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hc_post"):
+                    for t in pl.parallel(0, T, 1, chunk=16):
+                        post_w = pl.read(post_flat, [t * HC_MULT + out_h])
+                        for db in pl.range(D_BLOCKS):
+                            d0 = db * D_CHUNK
+                            x_row = pl.cast(
+                                pl.slice(x_flat, [1, D_CHUNK], [t, d0]),
+                                target_type=pl.FP32,
+                            )
+                            y_row = pl.mul(x_row, post_w)
+                            for in_h in pl.range(HC_MULT):
+                                comb_w = pl.read(
+                                    comb_flat,
+                                    [t * HC_MULT * HC_MULT + in_h * HC_MULT + out_h],
+                                )
+                                residual_row = pl.cast(
+                                    pl.slice(residual_flat, [1, D_CHUNK], [t, in_h * D + d0]),
+                                    target_type=pl.FP32,
+                                )
+                                y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
+                            y_flat = pl.assemble(
+                                y_flat,
+                                pl.cast(y_row, target_type=pl.BF16),
+                                [t, out_h * D + d0],
+                            )
+            y = pl.reshape(y_flat, [B, S, HC_MULT, D])
             return y
 
     return DeepSeekV4DecodeHcPost
@@ -96,8 +132,8 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_hc_post,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            rtol=1e-3,
+            atol=1e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
