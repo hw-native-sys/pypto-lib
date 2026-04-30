@@ -100,7 +100,7 @@ def golden_deepseek_v4_decode_swa(tensors):
     from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
     from deepseek_v4_decode_qkv_proj_rope_draft import golden_deepseek_v4_decode_qkv_proj_rope
     from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
-    from deepseek_v4_decode_o_proj_draft import golden_deepseek_v4_decode_o_proj
+    from deepseek_v4_decode_o_proj import golden_deepseek_v4_decode_o_proj
     from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
