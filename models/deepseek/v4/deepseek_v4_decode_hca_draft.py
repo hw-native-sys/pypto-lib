@@ -23,12 +23,12 @@ S = 1
 T = B * S
 EPS = 1e-6
 
-D = 4096  # v4-pro 7168
-H = 64  # v4-pro 128
+D = 4096  # flash:4096 pro:7168
+H = 64  # flash:64 pro:128
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-Q_LORA = 1024  # v4-pro 1536
+Q_LORA = 1024  # flash:1024 pro:1536
 WIN = 128
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
@@ -38,7 +38,7 @@ HC_DIM = HC_MULT * D
 HC_SINKHORN_ITER = 20
 HC_EPS = 1e-6
 
-MAX_SEQ_LEN = 4096  # v4-pro 1048576 (1M tokens)
+MAX_SEQ_LEN = 4096  # demo 4096; flash/pro 1048576 (1M tokens, original_seq_len*rope_factor)
 
 COMPRESS_RATIO = 128  # HCA
 ROTATE_MAIN = False
@@ -48,16 +48,16 @@ MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 
 O_LORA = 1024
-O_GROUPS = 8  # v4-pro 16
+O_GROUPS = 8  # flash:8 pro:16
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 BLOCK_SIZE = 128
 ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
-CMP_MAX_BLOCKS = 1                                         # demo: MAX_SEQ_LEN/ratio=32 ≤ BLOCK_SIZE=128 → 1 block; v4-pro 64 (=1048576/128/128)
+CMP_MAX_BLOCKS = 1                                         # demo: MAX_SEQ_LEN/ratio=32 ≤ BLOCK_SIZE=128 → 1 block; flash/pro 64 (=1048576/128/128)
 MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS               # logical block layout: [0..ORI) ori, [ORI..MAX) cmp
 BLOCK_NUM = B * MAX_BLOCKS
 
-CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO                   # demo =32; v4-pro =8192 (=1048576/128); max compressed positions
+CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO                   # demo =32; flash/pro =8192 (=1048576/128); max compressed positions
 TOPK = WIN + CMP_TOPK                                      # sparse_attn input topk size
 
 START_POS = 127  # default for ScalarSpec; (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path

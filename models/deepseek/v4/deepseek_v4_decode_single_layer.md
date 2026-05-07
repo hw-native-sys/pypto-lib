@@ -1,8 +1,11 @@
 # DeepSeek-V4 Single-Layer Decode Flow
 
 One full `Block.forward` pass (model.py:689-701), single card, decode step
-(S=1). Tensor shapes use real model dimensions: B=batch, T=B×1, D=7168,
-H=128, HEAD_DIM=512, ROPE_DIM=64, Q_LORA=1536, HC=4.
+(S=1). Tensor shapes use real model dimensions for **DeepSeek-V4-Flash**:
+B=batch, T=B×1, D=4096, H=64, HEAD_DIM=512, ROPE_DIM=64, Q_LORA=1024, HC=4.
+
+Pro values differ: D=7168, H=128, Q_LORA=1536, O_GROUPS=16, IDX_TOPK=1024,
+N_EXPERTS=384.
 
 Legend:
 - `[orch]`    — orchestrator-only operation (no separate pypto kernel)
@@ -14,7 +17,7 @@ Legend:
 
 ```
 ═══════════════════════════════════════════════════════════════════════════════
-  ENTRY: x  [B, 1, HC=4, D=7168]  bf16
+  ENTRY: x  [B, 1, HC=4, D=4096]  bf16
          input_ids  [B, 1]  int64
 ═══════════════════════════════════════════════════════════════════════════════
                               │
@@ -97,7 +100,7 @@ Legend:
               ╚═══════════════════════════════════════════╝
                               │
 ═══════════════════════════════════════════════════════════════════════════════
-  EXIT: x_next [B, 1, HC=4, D=7168]  bf16
+  EXIT: x_next [B, 1, HC=4, D=4096]  bf16
         → next Block (×61) → MTPBlock → ParallelHead → logits
 ═══════════════════════════════════════════════════════════════════════════════
 ```
@@ -135,15 +138,15 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 ║                                                                             ║
 ║  IN :  x [B, S, D]                    bf16  (hc_pre output)                 ║
 ║        norm_w [D]                     fp32  (attn_norm gamma, fused)        ║
-║        wq_a [D, Q_LORA=1536]          bf16                                  ║
+║        wq_a [D, Q_LORA=1024]          bf16                                  ║
 ║        wq_b [Q_LORA, H*HEAD_DIM]      bf16                                  ║
 ║        wkv  [D, HEAD_DIM=512]         bf16                                  ║
 ║        rope_cos/sin [T, ROPE_DIM=64]  bf16                                  ║
 ║        gamma_cq [Q_LORA]              bf16                                  ║
 ║        gamma_ckv [HEAD_DIM]           bf16                                  ║
-║  OUT:  q   [T, H=128, HEAD_DIM=512]   bf16  (RoPE applied)                  ║
+║  OUT:  q   [T, H=64, HEAD_DIM=512]    bf16  (RoPE applied)                  ║
 ║        kv  [T, HEAD_DIM=512]          bf16  (RoPE applied)                  ║
-║        qr  [T, Q_LORA=1536]           bf16  (reused by indexer)             ║
+║        qr  [T, Q_LORA=1024]           bf16  (reused by indexer)             ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
          │ q               │ kv                   │ qr
          │                 │                      │
@@ -179,10 +182,10 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 ║  o_proj.py  (grouped output LoRA)                                           ║
 ║  model.py:537-542                                                           ║
 ║                                                                             ║
-║  IN :  o    [T, H=128, HEAD_DIM=512]              bf16                      ║
-║        wo_a [O_GROUPS=16, O_LORA=1024, 4096]      bf16                      ║
-║        wo_b [D=7168, O_GROUPS*O_LORA=16384]        bf16                     ║
-║  OUT:  attn_out  [T, D=7168]  bf16                                          ║
+║  IN :  o    [T, H=64, HEAD_DIM=512]               bf16                      ║
+║        wo_a [O_GROUPS=8, O_LORA=1024, 4096]       bf16                      ║
+║        wo_b [D=4096, O_GROUPS*O_LORA=8192]         bf16                     ║
+║  OUT:  attn_out  [T, D=4096]  bf16                                          ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
               │ attn_out [T, D]
               │
@@ -234,7 +237,7 @@ construction depends on `compress_ratio`.
 ║          idx_wq_b, weights_proj, cos/sin, hadamard_q               ║
 ║  InOut : indexer's own kv_cache (PA pool, separate from cmp_kv)    ║
 ║          internal Compressor's kv_state/score_state                ║
-║  OUT   : indexer_topk [T, IDX_TOPK=1024]  int32                    ║
+║  OUT   : indexer_topk [T, IDX_TOPK=512]   int32                    ║
 ║                                                                    ║
 ║  Internal: instantiates its own Compressor (rotate=True, FP4),     ║
 ║  distinct from Attention.compressor — different weights, different ║
@@ -336,7 +339,7 @@ inline in the orch and are NOT separate kernels.
 ## EP topology notes
 
 - **moe_router**: runs on every card with replicated `gate_w`; indices cover
-  global expert space `[0, N_EXPERTS=384)`. Also produces `x_norm` (post
+  global expert space `[0, N_EXPERTS=256)`. Also produces `x_norm` (post
   ffn_norm hidden state) which is the source for both dispatch's `recv_x`
   and moe_expert's `x_local`.
 - **moe_expert**: each card holds `N_LOCAL_EXPERTS = N_EXPERTS / EP_WORLD_SIZE`

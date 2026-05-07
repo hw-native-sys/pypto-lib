@@ -15,7 +15,7 @@ import pypto.language as pl
 
 B                = 16               # demo 4
 S                = 1
-D                = 4096             # v4-pro 7168
+D                = 4096             # flash:4096 pro:7168
 HC_MULT          = 4
 MIX_HC           = (2 + HC_MULT) * HC_MULT
 MIX_PAD          = 32

@@ -23,12 +23,12 @@ S = 1
 T = B * S
 EPS = 1e-6
 
-D = 4096  # v4-pro 7168
-H = 64  # v4-pro 128
+D = 4096  # flash:4096 pro:7168
+H = 64  # flash:64 pro:128
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-Q_LORA = 1024  # v4-pro 1536
+Q_LORA = 1024  # flash:1024 pro:1536
 WIN = 128
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
@@ -38,10 +38,10 @@ HC_DIM = HC_MULT * D
 HC_SINKHORN_ITER = 20
 HC_EPS = 1e-6
 
-MAX_SEQ_LEN = 4096  # v4-pro 1048576 (1M tokens)
+MAX_SEQ_LEN = 4096  # demo 4096; flash/pro 1048576 (1M tokens, original_seq_len*rope_factor)
 
 O_LORA = 1024
-O_GROUPS = 8  # v4-pro 16
+O_GROUPS = 8  # flash:8 pro:16
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 BLOCK_SIZE = 128

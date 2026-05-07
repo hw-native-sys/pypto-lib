@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 CSA (Compressed Sparse Attention) decode orchestration — `compress_ratio == 4` path.
-Active in layers 2/4/6 of the model (3 of the 8 layers in demo, 4 of 60 in v4-pro).
+Active in layers 2/4/6 of the demo (3 of 8 layers); flash uses ratio=4 in 21 of 43 layers, pro in 30 of 61.
 Composes hc_pre + qkv_proj_rope + main compressor (ratio=4, overlap=True) + indexer (ratio=4)
 + sparse_attn + o_proj + hc_post. Topk for sparse_attn is window_topk ⧺ indexer_topk.
 Companion files: deepseek_v4_decode_swa.py (ratio=0, no compressor/indexer)
@@ -22,12 +22,12 @@ S = 1
 T = B * S
 EPS = 1e-6
 
-D = 4096  # v4-pro 7168
-H = 64  # v4-pro 128
+D = 4096  # flash:4096 pro:7168
+H = 64  # flash:64 pro:128
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-Q_LORA = 1024  # v4-pro 1536
+Q_LORA = 1024  # flash:1024 pro:1536
 WIN = 128
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 
@@ -39,9 +39,9 @@ HC_EPS = 1e-6
 
 IDX_N_HEADS = 64
 IDX_HEAD_DIM = 128
-IDX_TOPK = 512  # v4-pro 1024
+IDX_TOPK = 512  # flash:512 pro:1024
 IDX_SOFTMAX_SCALE = IDX_HEAD_DIM ** -0.5
-MAX_SEQ_LEN = 4096  # v4-pro 1048576 (1M tokens)
+MAX_SEQ_LEN = 4096  # demo 4096; flash/pro 1048576 (1M tokens, original_seq_len*rope_factor)
 
 COMPRESS_RATIO = 4  # CSA
 ROTATE_MAIN = False
@@ -56,12 +56,12 @@ INNER_STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 
 O_LORA = 1024
-O_GROUPS = 8  # v4-pro 16
+O_GROUPS = 8  # flash:8 pro:16
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 BLOCK_SIZE = 128
 ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
-CMP_MAX_BLOCKS = 64  # v4-pro 2048 (=MAX_SEQ_LEN/ratio/BLOCK_SIZE = 1048576/4/128)
+CMP_MAX_BLOCKS = 64  # demo 64; flash/pro 2048 (=MAX_SEQ_LEN/ratio/BLOCK_SIZE = 1048576/4/128)
 MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS               # logical block layout: [0..ORI) ori, [ORI..MAX) cmp
 BLOCK_NUM = B * MAX_BLOCKS
 

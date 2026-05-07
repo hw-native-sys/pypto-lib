@@ -16,18 +16,18 @@ B = 16  # demo 4
 S = 1
 T = B * S
 
-D = 4096            # v4-pro 7168
-MOE_INTER = 4096    # v4-pro 3072
-TOPK = 2            # v4-pro 6
-SWIGLU_LIMIT = 0.0  # v4-pro 10.0
+D = 4096            # flash:4096 pro:7168
+MOE_INTER = 4096    # flash:2048 pro:3072
+TOPK = 2            # flash:6 pro:6 (n_activated_experts)
+SWIGLU_LIMIT = 0.0  # flash:10.0 pro:10.0 (pro drops it on shared experts)
 
-EP_WORLD_SIZE = 1   # v4-pro 16
+EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
 EP_RANK = 0
-N_EXPERTS = 8       # v4-pro 384
+N_EXPERTS = 8       # flash:256 pro:384
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS  # global id offset; recv_expert_id carries global ids
 
-RECV_TOTAL_MAX = 32  # v4-pro 32 (avg T*TOPK/EP=1.5, padded with imbalance headroom)
+RECV_TOTAL_MAX = 32  # demo 32; sized as T*TOPK/EP plus imbalance headroom
 
 K_CHUNK = 256
 INTER_K = 256
@@ -99,7 +99,7 @@ def moe_expert(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu"):
                 # TODO: re-enable once pl.mins/maxs accept TensorType (currently
                 # tile-only). Demo config has SWIGLU_LIMIT=0.0 so this is a no-op,
-                # but v4-pro config (SWIGLU_LIMIT=10.0) needs the clamp.
+                # but flash/pro configs (SWIGLU_LIMIT=10.0) need the clamp.
                 # if SWIGLU_LIMIT > 0.0:
                 #     gate_2d = pl.mins(gate_2d, SWIGLU_LIMIT)
                 #     up_2d = pl.maxs(pl.mins(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)

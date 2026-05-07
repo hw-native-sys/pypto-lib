@@ -19,19 +19,19 @@ import pypto.language as pl
 B           = 16               # demo 4
 S           = 1
 T           = B * S
-D           = 4096             # v4-pro 7168
+D           = 4096             # flash:4096 pro:7168
 NORM_EPS    = 1e-6
 
-N_EXPERTS   = 8                # v4-pro 384
-TOPK        = 2                # v4-pro 6
-ROUTE_SCALE = 1.0              # v4-pro 2.5
+N_EXPERTS   = 8                # flash:256 pro:384
+TOPK        = 2                # flash:6 pro:6 (n_activated_experts)
+ROUTE_SCALE = 1.0              # flash:1.5 pro:2.5
 VOCAB       = 129280
 
 # Per-layer routing mode is fixed at build time: layers with LAYER_ID < N_HASH_LAYERS
 # do tid2eid lookup (no scores, no bias, no topk); the rest do learned-score + bias + topk.
 # Mirrors `Gate.hash = layer_id < args.n_hash_layers` (model.py:556).
 LAYER_ID      = 1               # this layer's index in the Transformer stack
-N_HASH_LAYERS = 0               # v4-pro ModelArgs default; raise to make the first few layers hash-routed
+N_HASH_LAYERS = 0               # demo 0; flash:3 pro:3 (raise to make the first few layers hash-routed)
 
 # hc_pre (ffn)
 HC_MULT          = 4

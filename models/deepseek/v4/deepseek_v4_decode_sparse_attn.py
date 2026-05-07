@@ -42,13 +42,13 @@ import pypto.language as pl
 
 B           = 16                        # demo 4
 T           = B
-H           = 128                       # demo 64
+H           = 128                       # flash:64 pro:128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
 WIN         = 128
 MAX_SEQ_LEN = 4096                    # demo value used by the other v4 standalone drafts
-IDX_TOPK    = 1024                      # demo 512
+IDX_TOPK    = 1024                      # flash:512 pro:1024
 TOPK        = WIN + IDX_TOPK            # 1152
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 128

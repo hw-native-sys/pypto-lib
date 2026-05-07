@@ -18,13 +18,13 @@ B           = 16               # demo 4
 S           = 1
 T           = B * S
 # Hidden / Attention
-D           = 4096             # v4-pro 7168
-H           = 64               # v4-pro 128
+D           = 4096             # flash:4096 pro:7168
+H           = 64               # flash:64 pro:128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 ROPE_HALF   = ROPE_DIM // 2
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
-Q_LORA      = 1024             # v4-pro 1536
+Q_LORA      = 1024             # flash:1024 pro:1536
 HEAD_CHUNK  = 64
 Q_LORA_TILE = 32
 EPS         = 1e-6

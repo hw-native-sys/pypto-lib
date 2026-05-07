@@ -20,13 +20,13 @@ import pypto.language as pl
 B          = 16                 # demo 4
 S          = 1
 T          = B * S
-D          = 4096               # v4-pro 7168
-H          = 64                 # v4-pro 128
+D          = 4096               # flash:4096 pro:7168
+H          = 64                 # flash:64 pro:128
 HEAD_DIM   = 512
 O_LORA     = 1024
-O_GROUPS   = 8                  # v4-pro 16
-HEADS_PER_GROUP = H // O_GROUPS          # 8 heads per group
-O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM  # 4096 (matches v4-pro by coincidence)
+O_GROUPS   = 8                  # flash:8 pro:16
+HEADS_PER_GROUP = H // O_GROUPS          # 8 heads per group (same in flash & pro)
+O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM  # 4096 in both flash & pro
 
 # Stage A tile shape (M=T; K over O_GROUP_IN; N over O_LORA).
 A_K_CHUNK  = 128
