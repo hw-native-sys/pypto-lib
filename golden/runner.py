@@ -105,6 +105,24 @@ def _required_files(spec: TensorSpec | ScalarSpec) -> list[tuple[str, str]]:
     return files
 
 
+class _Stage:
+    """Context manager: print begin/done around a stage block."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._t0 = 0.0
+
+    def __enter__(self) -> "_Stage":
+        print(f"[RUN] {self._name} ...", flush=True)
+        self._t0 = time.time()
+        return self
+
+    def __exit__(self, *_exc: Any) -> bool:
+        dt = time.time() - self._t0
+        print(f"[RUN] {self._name} done ({dt:.2f}s)", flush=True)
+        return False
+
+
 def _backend_for_platform(platform: str) -> Any:
     """Return the :class:`pypto.backend.BackendType` for a platform string."""
     from pypto.backend import BackendType
@@ -169,19 +187,7 @@ def run(
     scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
 
     start = time.time()
-
-    def _stage(name: str):
-        """Context manager-like helper: print begin/done around a block."""
-        class _Ctx:
-            def __enter__(self_):
-                print(f"[RUN] {name} ...", flush=True)
-                self_._t0 = time.time()
-                return self_
-            def __exit__(self_, *_exc):
-                dt = time.time() - self_._t0
-                print(f"[RUN] {name} done ({dt:.2f}s)", flush=True)
-                return False
-        return _Ctx()
+    _stage = _Stage  # local alias so the with-statement reads `_stage(...)`
 
     def _fail(error: str) -> RunResult:
         return RunResult(passed=False, error=error, execution_time=time.time() - start)
@@ -300,6 +306,275 @@ def run(
     with _stage("validate"):
         try:
             input_tensors = {spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output}
+            validate_golden(
+                device_outputs,
+                golden_outputs,
+                rtol=config.rtol,
+                atol=config.atol,
+                compare_fn=config.compare_fn,
+                inputs=input_tensors,
+            )
+        except AssertionError as e:
+            return _fail(str(e))
+
+    total = time.time() - start
+    print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+    return RunResult(passed=True, execution_time=total)
+
+
+def _resolve_jit_work_dir(fn: Any) -> Path:
+    """Return the most recently compiled :class:`CompiledProgram`'s output dir
+    from a :class:`pypto.jit.JITFunction`'s L1 cache.
+
+    Used after a JIT call to locate ``data/in`` and ``data/out`` for snapshot
+    persistence.
+    """
+    cache = getattr(fn, "_cache", None)
+    if not cache:
+        raise RuntimeError(
+            f"@pl.jit function {getattr(fn, '__name__', fn)!r} has no cached "
+            "CompiledProgram; was it executed?"
+        )
+    compiled = next(reversed(cache.values()))
+    return Path(compiled.output_dir)
+
+
+def _jit_compile_only(fn: Any, jit_args: list[Any], platform: str | None) -> Path:
+    """Drive the JIT decorator's compile step without executing on device.
+
+    ``CompiledProgram.__call__`` always dispatches to ``execute_compiled`` —
+    ``codegen_only`` is only honored by the higher-level
+    :func:`pypto.runtime.run` entry point.  To get a true compile-only path
+    on the JIT side we replicate :meth:`JITFunction.__call__`'s prelude
+    (bind args → cache key → ``_compile``) and stop there, populating the
+    JIT's L1 cache so a subsequent call hits and runs end-to-end.
+    """
+    import pypto.language as pl_mod  # noqa: PLC0415
+    from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+
+    param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = (
+        fn._bind_args(tuple(jit_args), {})
+    )
+    key = make_cache_key(
+        source_hash=fn._get_source_hash(),
+        param_names=param_names,
+        tensor_shapes={n: m.shape for n, m in tensor_meta.items()},
+        tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
+        dynamic_dims=dynamic_dims,
+        scalar_values=scalar_values,
+        platform=platform,
+    )
+    if key not in fn._cache:
+        fn._cache[key] = fn._compile(
+            tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod, platform=platform
+        )
+    return Path(fn._cache[key].output_dir)
+
+
+def run_jit(
+    fn: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    config: RunConfig | None = None,
+    golden_fn: Callable | None = None,
+    golden_data: str | None = None,
+    runtime_dir: str | None = None,
+) -> RunResult:
+    """Run a ``@pl.jit`` entry under the same harness as :func:`run`.
+
+    The JIT decorator owns compilation + caching; this wrapper layers
+    :class:`TensorSpec`-driven input generation, ``golden_fn`` validation,
+    and persistence to ``data/in`` / ``data/out`` on top.
+
+    Args:
+        fn: A ``@pl.jit`` decorated callable (``JITFunction``).
+        specs: Ordered list of :class:`TensorSpec` and :class:`ScalarSpec`,
+            matching the JIT function's parameter order.
+        config: Run configuration.  Both ``config.compile`` and
+            ``config.runtime`` are merged and forwarded into a single
+            :class:`pypto.runtime.RunConfig`, since the JIT decorator owns
+            both compile and execute under one call.  Putting compile-side
+            knobs (``dump_passes``, ``save_kernels``, ``codegen_only``,
+            ``backend_type``, ``strategy``) in ``config.compile`` keeps the
+            split symmetric with :func:`run`.  Conflicts between the two
+            dicts raise an error.
+        golden_fn: Optional ``golden_fn(values)`` for in-place reference
+            computation (same contract as :func:`run`).
+        golden_data: Optional cached-data directory (same contract as
+            :func:`run`).
+        runtime_dir: Optional pre-compiled ``build_output`` directory.  When
+            set, bypasses the JIT and dispatches via
+            :func:`pypto.runtime.execute_compiled`.
+
+    Returns:
+        :class:`RunResult` matching :func:`run`'s convention.
+    """
+    from pypto.runtime import RunConfig as RTRunConfig  # noqa: PLC0415
+    from pypto.runtime import execute_compiled  # noqa: PLC0415
+
+    if config is None:
+        config = RunConfig()
+    if config.compile_only and runtime_dir is not None:
+        return RunResult(
+            passed=False,
+            error="runtime_dir is incompatible with config.compile_only",
+        )
+
+    data_dir = Path(golden_data) if golden_data is not None else None
+    tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
+    scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
+
+    start = time.time()
+    _stage = _Stage
+
+    def _fail(error: str) -> RunResult:
+        return RunResult(passed=False, error=error, execution_time=time.time() - start)
+
+    # Compile (or pick runtime_dir) — done first so stage order matches run().
+    # We feed JIT a set of zero-cost dummy tensors derived from the specs, just
+    # to satisfy _bind_args's tensor-meta extraction.  Real tensors with the
+    # same shape/dtype hit the same cache key on the later execute call.
+    if runtime_dir is not None:
+        work_dir = Path(runtime_dir)
+        if not work_dir.is_dir():
+            return _fail(f"runtime_dir does not exist: {work_dir}")
+        print(f"[RUN] runtime_only: skipping JIT compile, using {work_dir}", flush=True)
+        rt_kwargs: dict[str, Any] = {}
+    else:
+        with _stage("compile"):
+            rt_kwargs = {**config.compile, **config.runtime}
+            overlap = config.compile.keys() & config.runtime.keys()
+            if overlap:
+                return _fail(
+                    f"config.compile and config.runtime both set: {sorted(overlap)}"
+                )
+            rt_kwargs.setdefault("rtol", config.rtol)
+            rt_kwargs.setdefault("atol", config.atol)
+            dummy_args: list[Any] = []
+            for spec in specs:
+                if isinstance(spec, ScalarSpec):
+                    dummy_args.append(spec.value.item())
+                else:
+                    dummy_args.append(torch.empty(spec.shape, dtype=spec.dtype))
+            work_dir = _jit_compile_only(fn, dummy_args, platform=rt_kwargs.get("platform"))
+
+    if config.compile_only:
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+        return RunResult(passed=True, execution_time=total)
+
+    # Generate Inputs
+    input_snapshot: dict[str, torch.Tensor] = {}
+    scalar_specs_eff: dict[str, ScalarSpec] = {}
+    with _stage("generate inputs"):
+        if data_dir is not None:
+            required: list[tuple[str, str]] = []
+            for spec in (*tensor_specs, *scalar_specs):
+                required.extend(_required_files(spec))
+            missing = [
+                str(data_dir / sub / name)
+                for sub, name in required
+                if not (data_dir / sub / name).is_file()
+            ]
+            if missing:
+                return _fail(f"golden_data is missing files: {missing}")
+            print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
+            input_names = [
+                s.name for s in tensor_specs
+                if not s.is_output or s.init_value is not None
+            ]
+            tensors = _load_tensors(data_dir, "in", input_names)
+            for spec in tensor_specs:
+                if spec.is_output and spec.init_value is None:
+                    tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+            for s in scalar_specs:
+                cached = torch.load(data_dir / "in" / f"{s.name}.pt", weights_only=True)
+                if not isinstance(cached, torch.Tensor) or cached.ndim != 0:
+                    shape = (
+                        tuple(cached.shape) if isinstance(cached, torch.Tensor)
+                        else type(cached).__name__
+                    )
+                    return _fail(
+                        f"{s.name}.pt must contain a 0-dim torch.Tensor, got {shape}"
+                    )
+                if cached.dtype != s.dtype:
+                    return _fail(
+                        f"{s.name}.pt dtype mismatch: spec={s.dtype} cache={cached.dtype}"
+                    )
+                scalar_specs_eff[s.name] = ScalarSpec(name=s.name, dtype=s.dtype, value=cached)
+            input_snapshot = {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
+        else:
+            tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
+            scalar_specs_eff = {s.name: s for s in scalar_specs}
+            input_snapshot = {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
+            in_dir = work_dir / "data" / "in"
+            _save_tensors(in_dir, input_snapshot)
+            _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+
+    # Runtime
+    with _stage("runtime"):
+        if runtime_dir is not None:
+            ordered: list[Any] = [tensors[s.name] for s in tensor_specs]
+            ordered.extend(scalar_specs_eff[s.name].to_ctypes() for s in scalar_specs)
+            # execute_compiled only accepts a subset of pypto.runtime.RunConfig
+            # fields — strip the compile-only ones (dump_passes, codegen_only,
+            # rtol, atol, etc.) before forwarding.
+            exec_kwargs = {
+                k: v for k, v in config.runtime.items()
+                if k in {"platform", "device_id", "pto_isa_commit", "runtime_profiling", "level"}
+            }
+            execute_compiled(work_dir, ordered, **exec_kwargs)
+        else:
+            jit_args: list[Any] = []
+            for spec in specs:
+                if isinstance(spec, ScalarSpec):
+                    jit_args.append(scalar_specs_eff[spec.name].to_python())
+                else:
+                    jit_args.append(tensors[spec.name])
+            fn(*jit_args, config=RTRunConfig(**rt_kwargs))
+
+    if golden_fn is None and golden_data is None:
+        total = time.time() - start
+        print(
+            f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)",
+            flush=True,
+        )
+        return RunResult(passed=True, execution_time=total)
+
+    device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+
+    with _stage("compute golden"):
+        if data_dir is not None:
+            print(f"[RUN]   cache hit: {data_dir / 'out'}", flush=True)
+            output_names = [s.name for s in tensor_specs if s.is_output]
+            golden_outputs = _load_tensors(data_dir, "out", output_names)
+        else:
+            scratch: dict[str, Any] = {}
+            for spec in specs:
+                if isinstance(spec, ScalarSpec):
+                    scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
+                elif spec.is_output and spec.init_value is None:
+                    scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+                else:
+                    scratch[spec.name] = input_snapshot[spec.name].clone()
+            golden_fn(scratch)
+            golden_outputs = {
+                spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output
+            }
+            _save_tensors(work_dir / "data" / "out", golden_outputs)
+
+    with _stage("validate"):
+        try:
+            input_tensors = {
+                spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output
+            }
             validate_golden(
                 device_outputs,
                 golden_outputs,

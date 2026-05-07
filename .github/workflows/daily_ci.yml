@@ -88,6 +88,8 @@ jobs:
           PTO2_RING_DEP_POOL: 131072
           PTO2_RING_TASK_WINDOW: 131072
           PTO2_RING_HEAP: 4294967296
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
         run: |
           : > results.tsv
           failed=""
@@ -205,6 +207,8 @@ jobs:
           PTO2_RING_DEP_POOL: 131072
           PTO2_RING_TASK_WINDOW: 131072
           PTO2_RING_HEAP: 4294967296
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
         run: |
           : > results.tsv
           failed=""
