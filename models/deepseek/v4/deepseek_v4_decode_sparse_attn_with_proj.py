@@ -1,0 +1,508 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""DeepSeek-V4 sparse attention with grouped output projection (decode).
+
+Corresponds to model.py Attention.forward decode branch lines 533-542:
+    o = sparse_attn(q, kv_cache, attn_sink, topk_idxs, softmax_scale)
+    apply_rotary_emb(o[..., -rope_dim:], freqs_cis, inverse=True)
+    o = o.view(bsz, seqlen, self.n_local_groups, -1)
+    wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+    o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+    x = self.wo_b(o.flatten(2))
+
+Inputs:
+- q                 : query tensor from MLA prolog (RoPE already applied)
+- ori_kv / cmp_kv   : paged sliding-window and paged compressed KV pools
+- cmp_sparse_indices: per-token absolute indices (window + compressed concat)
+                      computed by orchestrator (window topk + indexer/HCA topk)
+- attn_sink         : per-head sink term added inside softmax
+- freqs_cos/sin     : split-half inverse-RoPE tables for the sparse-attn output
+- wo_a / wo_b       : grouped output-projection weights from model.py:537-542
+
+Standalone contract:
+- `cmp_sparse_indices[t, :]` may contain `-1` pads.
+- entries in `[0, WIN)` address the logical sliding-window ring slots.
+- entries in `[WIN, WIN + cmp_valid)` address compressed cache slots, where
+    `cmp_valid = max(seqused_kv[b] - min(WIN, seqused_kv[b]), 0)`.
+- the grouped projection layout matches:
+    `o.view(bsz, seqlen, self.n_local_groups, -1)` with
+    `self.n_local_groups == O_GROUPS` and `-1 == O_GROUP_IN`.
+
+The standalone harness exposes `--compress-ratio {0,4,128}` for testing.
+"""
+
+
+import pypto.language as pl
+
+
+B = 16
+T = B
+H = 64
+HEAD_DIM = 512
+ROPE_DIM = 64
+NOPE_DIM = HEAD_DIM - ROPE_DIM
+WIN = 128
+MAX_SEQ_LEN = 4096
+IDX_TOPK = 512
+TOPK = WIN + IDX_TOPK
+SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
+DEFAULT_COMPRESS_RATIO = 128
+
+BLOCK_SIZE = 128
+ORI_MAX_BLOCKS = 1
+ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
+CMP_MAX_BLOCKS = 64
+CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+
+SOFTMAX_SCALE = HEAD_DIM ** -0.5
+HALF_ROPE = ROPE_DIM // 2
+MATMUL_ROW_PAD = 16
+
+D = 4096
+O_LORA = 1024
+O_GROUPS = 8
+HEADS_PER_GROUP = H // O_GROUPS
+O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
+
+A_K_CHUNK = 128
+A_N_CHUNK = 128
+B_K_CHUNK = 128
+B_N_CHUNK = 256
+
+
+def get_standalone_cmp_valid(compress_ratio: int) -> int:
+    """Map demo compress-ratio modes to the valid compressed-cache tail length."""
+    if compress_ratio == 0:
+        return 0
+    if compress_ratio == 4:
+        return IDX_TOPK
+    if compress_ratio == 128:
+        return MAX_SEQ_LEN // compress_ratio
+    raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
+
+
+def build_deepseek_v4_decode_sparse_attn_with_proj_program():
+    """Build the decode standalone that fuses sparse attention and grouped o_proj."""
+    assert H % O_GROUPS == 0, (
+        f"H ({H}) must be divisible by O_GROUPS ({O_GROUPS})"
+    )
+    assert O_GROUP_IN % A_K_CHUNK == 0, (
+        f"O_GROUP_IN ({O_GROUP_IN}) must be divisible by A_K_CHUNK ({A_K_CHUNK})"
+    )
+    assert O_LORA % A_N_CHUNK == 0, (
+        f"O_LORA ({O_LORA}) must be divisible by A_N_CHUNK ({A_N_CHUNK})"
+    )
+    assert (O_GROUPS * O_LORA) % B_K_CHUNK == 0, (
+        f"O_GROUPS * O_LORA ({O_GROUPS * O_LORA}) must be divisible by B_K_CHUNK ({B_K_CHUNK})"
+    )
+    assert D % B_N_CHUNK == 0, (
+        f"D ({D}) must be divisible by B_N_CHUNK ({B_N_CHUNK})"
+    )
+
+    A_K_BLOCKS = O_GROUP_IN // A_K_CHUNK
+    A_N_BLOCKS = O_LORA // A_N_CHUNK
+    B_K_BLOCKS = (O_GROUPS * O_LORA) // B_K_CHUNK
+    B_N_BLOCKS = D // B_N_CHUNK
+
+    @pl.program
+    class DeepSeekV4DecodeSparseAttnWithProj:
+        @pl.function(type=pl.FunctionType.Opaque)
+        def deepseek_v4_decode_sparse_attn_with_proj(
+            self,
+            q:                  pl.Tensor[[T, H, HEAD_DIM],                               pl.BF16],
+            ori_kv:             pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],       pl.BF16],
+            ori_block_table:    pl.Tensor[[B, ORI_MAX_BLOCKS],                            pl.INT32],
+            cmp_kv:             pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],       pl.BF16],
+            cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                            pl.INT32],
+            cmp_sparse_indices: pl.Tensor[[T, TOPK],                                      pl.INT32],
+            attn_sink:          pl.Tensor[[H],                                            pl.FP32],
+            seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
+            freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
+            freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
+            wo_a:               pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN],                 pl.BF16],
+            wo_b:               pl.Tensor[[D, O_GROUPS * O_LORA],                         pl.BF16],
+            attn_out:           pl.Out[pl.Tensor[[T, D],                                  pl.BF16]],
+        ):
+            """Run sparse decode attention, inverse RoPE, and grouped output projection."""
+            q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+            ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+            ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
+            cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+            cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+            cmp_sparse_indices_flat = pl.reshape(cmp_sparse_indices, [T * TOPK])
+            attn_stage = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.BF16)
+            o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
+
+            for b in pl.range(B):
+                seq_used = pl.read(seqused_kv, [b])
+                window_valid = pl.min(WIN, seq_used)
+                cmp_valid = seq_used - window_valid
+                cmp_topk_valid = pl.min(IDX_TOPK, cmp_valid)
+                sparse_k = window_valid + cmp_topk_valid
+                ori_block_base = b * ORI_MAX_BLOCKS
+                cmp_block_base = b * CMP_MAX_BLOCKS
+                kv_topk_batch = pl.create_tensor([TOPK, HEAD_DIM], dtype=pl.BF16)
+
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_gather_window_kv_topk"):
+                    for kk, (kv_topk_iter,) in pl.range(window_valid, init_values=(kv_topk_batch,)):
+                        raw_idx_pos = b * TOPK + kk
+                        raw_idx = pl.read(cmp_sparse_indices_flat, [raw_idx_pos])
+                        ori_slot = raw_idx // BLOCK_SIZE
+                        ori_block_pos = ori_block_base + ori_slot
+                        ori_blk = pl.cast(pl.read(ori_block_table_flat, [ori_block_pos]), pl.INDEX)
+                        ori_intra = raw_idx % BLOCK_SIZE
+                        ori_row = ori_blk * BLOCK_SIZE + ori_intra
+                        kv_row = ori_kv_flat[ori_row : ori_row + 1, 0 : HEAD_DIM]
+                        kv_topk_batch_next = pl.assemble(kv_topk_iter, kv_row, [kk, 0])
+                        (kv_topk_batch_carry,) = pl.yield_(kv_topk_batch_next)
+                    kv_topk_batch = kv_topk_batch_carry
+
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_gather_cmp_kv_topk"):
+                    for kk, (kv_topk_iter,) in pl.range(cmp_topk_valid, init_values=(kv_topk_batch,)):
+                        raw_idx_pos = b * TOPK + window_valid + kk
+                        raw_idx = pl.read(cmp_sparse_indices_flat, [raw_idx_pos])
+                        cmp_slot = raw_idx - WIN
+                        cmp_block_slot = cmp_slot // BLOCK_SIZE
+                        cmp_block_pos = cmp_block_base + cmp_block_slot
+                        cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [cmp_block_pos]), pl.INDEX)
+                        cmp_intra = cmp_slot % BLOCK_SIZE
+                        cmp_row = cmp_blk * BLOCK_SIZE + cmp_intra
+                        kv_row = cmp_kv_flat[cmp_row : cmp_row + 1, 0 : HEAD_DIM]
+                        kv_topk_batch_next = pl.assemble(kv_topk_iter, kv_row, [window_valid + kk, 0])
+                        (kv_topk_batch_carry,) = pl.yield_(kv_topk_batch_next)
+                    kv_topk_batch = kv_topk_batch_carry
+
+                for h in pl.parallel(0, H, 1):
+                    head_row = b * H + h
+                    group_idx = h // HEADS_PER_GROUP
+                    head_in_group = h % HEADS_PER_GROUP
+                    packed_row = group_idx * T + b
+                    packed_col = head_in_group * HEAD_DIM
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_init"):
+                        q_batch = pl.col_expand(
+                            pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                            pl.cast(q_flat[head_row : head_row + 1, 0 : HEAD_DIM], target_type=pl.FP32),
+                        )
+
+                        kv_batch = pl.col_expand(
+                            pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                            pl.cast(kv_topk_batch[0 : 1, 0 : HEAD_DIM], target_type=pl.FP32),
+                        )
+                        oi = kv_batch
+                        score0 = pl.row_sum(pl.mul(q_batch, kv_batch))
+                        mi = pl.mul(score0, SOFTMAX_SCALE)
+                        li = pl.exp(pl.sub(mi, mi))
+
+                    for kk in pl.range(1, sparse_k):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_accum"):
+                            kv_batch = pl.col_expand(
+                                pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                                pl.cast(kv_topk_batch[kk : kk + 1, 0 : HEAD_DIM], target_type=pl.FP32),
+                            )
+                            cur_score = pl.row_sum(pl.mul(q_batch, kv_batch))
+                            cur_mi = pl.mul(cur_score, SOFTMAX_SCALE)
+                            mi_new = pl.maximum(mi, cur_mi)
+                            alpha = pl.exp(pl.sub(mi, mi_new))
+                            beta = pl.exp(pl.sub(cur_mi, mi_new))
+                            li = pl.add(pl.mul(alpha, li), beta)
+                            oi = pl.add(
+                                pl.row_expand_mul(oi, alpha),
+                                pl.row_expand_mul(kv_batch, beta),
+                            )
+                            mi = mi_new
+
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_norm"):
+                        sink_tile = pl.add(pl.sub(mi, mi), pl.read(attn_sink, [h]))
+                        denom = pl.add(li, pl.exp(pl.sub(sink_tile, mi)))
+                        oi_out = pl.row_expand_div(oi, denom)
+                        attn_stage_row = pl.cast(
+                            oi_out[0 : 1, 0 : HEAD_DIM],
+                            target_type=pl.BF16,
+                        )
+                        attn_stage = pl.assemble(
+                            attn_stage,
+                            attn_stage_row,
+                            [head_row, 0],
+                        )
+
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_inverse_rope"):
+                        o_nope = attn_stage[head_row : head_row + 1, 0 : NOPE_DIM]
+                        cos_lo = pl.cast(freqs_cos[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+                        cos_hi = pl.cast(freqs_cos[b : b + 1, HALF_ROPE : ROPE_DIM], target_type=pl.FP32)
+                        sin_lo = pl.cast(freqs_sin[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+                        sin_hi = pl.cast(freqs_sin[b : b + 1, HALF_ROPE : ROPE_DIM], target_type=pl.FP32)
+                        x_lo = pl.cast(attn_stage[head_row : head_row + 1, NOPE_DIM : NOPE_DIM + HALF_ROPE], target_type=pl.FP32)
+                        x_hi = pl.cast(attn_stage[head_row : head_row + 1, NOPE_DIM + HALF_ROPE : HEAD_DIM], target_type=pl.FP32)
+                        y_lo = pl.add(
+                            pl.col_expand_mul(x_lo, cos_lo),
+                            pl.col_expand_mul(x_hi, sin_lo),
+                        )
+                        y_hi = pl.sub(
+                            pl.col_expand_mul(x_hi, cos_hi),
+                            pl.col_expand_mul(x_lo, sin_hi),
+                        )
+                        o_packed = pl.assemble(o_packed, o_nope, [packed_row, packed_col])
+                        o_packed = pl.assemble(
+                            o_packed,
+                            pl.cast(y_lo, target_type=pl.BF16),
+                            [packed_row, packed_col + NOPE_DIM],
+                        )
+                        o_packed = pl.assemble(
+                            o_packed,
+                            pl.cast(y_hi, target_type=pl.BF16),
+                            [packed_row, packed_col + NOPE_DIM + HALF_ROPE],
+                        )
+
+            o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
+
+            for g in pl.parallel(0, O_GROUPS, 1):
+                row_base_o = g * T
+                out_col_g = g * O_LORA
+
+                for nb in pl.parallel(0, A_N_BLOCKS, 1):
+                    n0 = nb * A_N_CHUNK
+
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_accum"):
+                        xa0_chunk = o_packed[row_base_o:row_base_o + T, 0:A_K_CHUNK]
+                        wa0_chunk = wo_a[g:g + 1, n0:n0 + A_N_CHUNK, 0:A_K_CHUNK]
+                        acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
+                        for kb in pl.range(1, A_K_BLOCKS):
+                            k0 = kb * A_K_CHUNK
+                            xa_k_chunk = o_packed[row_base_o:row_base_o + T, k0:k0 + A_K_CHUNK]
+                            wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_CHUNK, k0:k0 + A_K_CHUNK]
+                            acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_a_store"):
+                        acc_a_2d = pl.reshape(acc_a, [T, A_N_CHUNK])
+                        o_r[:, out_col_g + n0:out_col_g + n0 + A_N_CHUNK] = pl.cast(
+                            acc_a_2d,
+                            target_type=pl.BF16,
+                        )
+
+            for nb in pl.parallel(0, B_N_BLOCKS, 1):
+                n0 = nb * B_N_CHUNK
+
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_accum"):
+                    xb0_chunk = o_r[:, 0:B_K_CHUNK]
+                    wb0_chunk = wo_b[n0:n0 + B_N_CHUNK, 0:B_K_CHUNK]
+                    acc_b = pl.matmul(xb0_chunk, wb0_chunk, b_trans=True, out_dtype=pl.FP32)
+                    for kb in pl.range(1, B_K_BLOCKS):
+                        k0 = kb * B_K_CHUNK
+                        xb_k_chunk = o_r[:, k0:k0 + B_K_CHUNK]
+                        wb_k_chunk = wo_b[n0:n0 + B_N_CHUNK, k0:k0 + B_K_CHUNK]
+                        acc_b = pl.matmul_acc(acc_b, xb_k_chunk, wb_k_chunk, b_trans=True)
+
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_stage_b_store"):
+                    attn_out[:, n0:n0 + B_N_CHUNK] = pl.cast(acc_b, target_type=pl.BF16)
+
+            return attn_out
+
+    return DeepSeekV4DecodeSparseAttnWithProj
+
+
+def golden_deepseek_v4_decode_sparse_attn_with_proj(tensors):
+    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
+    import torch
+
+    q = tensors["q"].float()
+    ori_kv = tensors["ori_kv"].float()
+    ori_block_table = tensors["ori_block_table"]
+    cmp_kv = tensors["cmp_kv"].float()
+    cmp_block_table = tensors["cmp_block_table"]
+    cmp_sparse_indices = tensors["cmp_sparse_indices"]
+    attn_sink = tensors["attn_sink"].float()
+    seqused_kv = tensors["seqused_kv"]
+    cos = tensors["freqs_cos"].float()
+    sin = tensors["freqs_sin"].float()
+    wo_a = tensors["wo_a"].float()
+    wo_b = tensors["wo_b"].float()
+
+    o = torch.zeros(T, H, HEAD_DIM)
+
+    for b in range(B):
+        seq_used = int(seqused_kv[b].item())
+        window_valid = min(WIN, seq_used)
+        cmp_valid = max(seq_used - window_valid, 0)
+        gathered = []
+
+        for raw in cmp_sparse_indices[b].tolist():
+            if raw < 0:
+                continue
+            if raw < WIN:
+                if raw >= window_valid:
+                    continue
+                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
+                intra = raw % BLOCK_SIZE
+                gathered.append(ori_kv[blk_id, intra, 0])
+            else:
+                cmp_slot = raw - WIN
+                if cmp_slot >= cmp_valid:
+                    continue
+                blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
+                intra = cmp_slot % BLOCK_SIZE
+                gathered.append(cmp_kv[blk_id, intra, 0])
+
+        if not gathered:
+            continue
+
+        kv_b = torch.stack(gathered, dim=0)
+        q_b = q[b]
+        scores = (q_b @ kv_b.T) * SOFTMAX_SCALE
+        score_max = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - score_max)
+        oi_num = exp_scores @ kv_b
+        li = exp_scores.sum(dim=-1, keepdim=True)
+        denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
+        o[b] = oi_num / denom
+
+    rope_lo = o[..., NOPE_DIM : NOPE_DIM + HALF_ROPE]
+    rope_hi = o[..., NOPE_DIM + HALF_ROPE :]
+    cos_lo = cos[:, :HALF_ROPE].unsqueeze(1)
+    cos_hi = cos[:, HALF_ROPE:].unsqueeze(1)
+    sin_lo = sin[:, :HALF_ROPE].unsqueeze(1)
+    sin_hi = sin[:, HALF_ROPE:].unsqueeze(1)
+    inv_lo = rope_lo * cos_lo + rope_hi * sin_lo
+    inv_hi = rope_hi * cos_hi - rope_lo * sin_hi
+    o = torch.cat([o[..., :NOPE_DIM], inv_lo, inv_hi], dim=-1).to(torch.bfloat16)
+
+    seq_per_batch = T // B
+    o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
+    o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
+    o_r = o_r.to(torch.bfloat16).float()
+    out = o_r.flatten(2).view(T, O_GROUPS * O_LORA) @ wo_b.T
+
+    tensors["attn_out"][:] = out.to(torch.bfloat16)
+
+
+def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
+    """Build deterministic demo tensors for the merged standalone harness."""
+    import torch
+    from golden import TensorSpec
+
+    cmp_valid = get_standalone_cmp_valid(compress_ratio)
+    sparse_k = WIN + cmp_valid
+
+    def seeded_uniform(shape, seed):
+        """Create a deterministic centered uniform tensor for repeatable tests."""
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.rand(*shape, generator=generator) - 0.5
+
+    def init_q():
+        """Initialize the query tensor used by the decode attention stage."""
+        return seeded_uniform((T, H, HEAD_DIM), 1)
+
+    def init_ori_kv():
+        """Initialize the sliding-window KV cache pages."""
+        return seeded_uniform((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 2)
+
+    def init_cmp_kv():
+        """Initialize the compressed-cache KV pages."""
+        return seeded_uniform((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 3)
+
+    def init_attn_sink():
+        """Initialize the per-head sink logits to zero."""
+        return torch.zeros(H)
+
+    def init_ori_block_table():
+        """Build the demo block table for the sliding-window cache pages."""
+        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(ORI_MAX_BLOCKS):
+                tbl[b, j] = b * ORI_MAX_BLOCKS + j
+        return tbl
+
+    def init_cmp_block_table():
+        """Build the demo block table for the compressed-cache pages."""
+        tbl = torch.full((B, CMP_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(CMP_MAX_BLOCKS):
+                tbl[b, j] = b * CMP_MAX_BLOCKS + j
+        return tbl
+
+    def init_cmp_sparse_indices():
+        """Build the sparse index list with a full window prefix and padded compressed tail."""
+        win_part = torch.arange(WIN, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+        cmp_part = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+        cmp_part[:, :cmp_valid] = (torch.arange(cmp_valid, dtype=torch.int32) + WIN).unsqueeze(0).expand(T, -1)
+        return torch.cat([win_part, cmp_part], dim=-1).contiguous()
+
+    def init_seqused_kv():
+        """Expose the demo sequence-used length that matches the chosen ratio mode."""
+        return torch.tensor([sparse_k] * B, dtype=torch.int32)
+
+    def init_cos():
+        """Build the split-half cosine table used by the inverse-RoPE reference."""
+        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
+        cos_half = torch.cos(angles)
+        return torch.cat([cos_half, cos_half], dim=-1)
+
+    def init_sin():
+        """Build the split-half sine table used by the inverse-RoPE reference."""
+        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
+        sin_half = torch.sin(angles)
+        return torch.cat([sin_half, sin_half], dim=-1)
+
+    def init_wo_a():
+        """Initialize the grouped first-stage output-projection weights."""
+        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 4) / (O_GROUP_IN ** 0.5)
+
+    def init_wo_b():
+        """Initialize the second-stage output-projection weights."""
+        return seeded_uniform((D, O_GROUPS * O_LORA), 5) / ((O_GROUPS * O_LORA) ** 0.5)
+
+    return [
+        TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
+        TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
+        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
+        TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
+        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
+        TensorSpec("attn_out", [T, D], torch.bfloat16, is_output=True),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+    from golden import RunConfig, run
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
+                        choices=list(SUPPORTED_COMPRESS_RATIOS))
+    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    args = parser.parse_args()
+
+    result = run(
+        program=build_deepseek_v4_decode_sparse_attn_with_proj_program(),
+        specs=build_tensor_specs(args.compress_ratio),
+        golden_fn=golden_deepseek_v4_decode_sparse_attn_with_proj,
+        config=RunConfig(
+            rtol=1e-3,
+            atol=1e-3,
+            compile=dict(dump_passes=True),
+            runtime=dict(
+                platform=args.platform,
+                device_id=args.device,
+                runtime_profiling=args.runtime_profiling,
+            ),
+        ),
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
