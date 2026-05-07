@@ -860,8 +860,36 @@ class PyptoQwen14BExecutor(ModelExecutor):
         _kv_manager = self._kv_cache_manager
         _prefill_batch = prefill_batch
 
+        # L3 tracing: enabled when env var PYPTO_L3_TRACE is set to a truthy
+        # value ("1"/"true"/"yes"/"on", case-insensitive). When disabled, all
+        # per-stage timestamp prints are suppressed AND the per-stage
+        # `_submit_ts` callback chain is skipped (saving sub-worker IPC + 3
+        # extra sub-workers per dispatch).
+        import os as _os  # noqa: PLC0415
+        _l3_trace_enabled = _os.environ.get("PYPTO_L3_TRACE", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
+        # Shared-memory anchors so forked sub-worker callbacks can print times
+        # relative to a common start (set at prefill submit_start in the parent).
+        # Slot 0: start anchor (perf_counter seconds).
+        # Slot 1: timestamp of the previous printed event (for Δprev).
+        _t_anchors = torch.zeros(2, dtype=torch.float64).share_memory_()
+
+        def _fmt_rel(t_now: float) -> str:
+            t0 = float(_t_anchors[0].item())
+            t_prev = float(_t_anchors[1].item())
+            if t0 <= 0.0:
+                return f"t=+0.000ms (Δ+0.000ms)"
+            rel_ms = (t_now - t0) * 1000.0
+            d_ms = (t_now - t_prev) * 1000.0 if t_prev > 0.0 else 0.0
+            _t_anchors[1] = t_now
+            return f"t=+{rel_ms:.2f}ms (Δ+{d_ms:.2f}ms)"
+
         def sample_and_prepare_fn(task_args):
             """Sub-worker: sample token from logits, prepare next decode inputs."""
+            import time as _time  # noqa: PLC0415
+            _t_now = _time.perf_counter()
             if _done_flag[0].item():
                 return  # EOS already hit, no-op.
 
@@ -870,6 +898,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
             token_id = int(logits.argmax().item())
 
             step = int(_token_count[0].item())
+            if _l3_trace_enabled:
+                print(
+                    f"[L3-step] step={step:02d} sample_callback {_fmt_rel(_t_now)}",
+                    flush=True,
+                )
             _generated_ids[step] = token_id
             _token_count[0] = step + 1
 
@@ -947,6 +980,16 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _keep.append(ta)
             orch.submit_sub(sample_cid, ta)
 
+        def _submit_ts(orch, ts_cid, dep_tensor, _keep):
+            """Diagnostic: timestamp callback that waits for dep_tensor's writer
+            (the preceding chip task) to finish. Adds a few ms of sub-worker IPC
+            but is harmless because subsequent submits already serialize via
+            the same tensor dependency."""
+            ta = TaskArgs()
+            ta.add_tensor(make_tensor_arg(dep_tensor), TensorArgType.INPUT)
+            _keep.append(ta)
+            orch.submit_sub(ts_cid, ta)
+
         def _build_full_tensors(is_prefill, decode_in_tensor):
             """Build the tensor dict for one gen_chunked dispatch (all layers)."""
             prefill_in = prefill_hidden if is_prefill else dummy_prefill
@@ -984,19 +1027,31 @@ class PyptoQwen14BExecutor(ModelExecutor):
             return td
 
         def generate_orch_fn(orch, _args, _cfg):
+            import time as _time  # noqa: PLC0415
             _keep: list = []
             call_config = CallConfig()
             call_config.block_dim = gc_dc.block_dim
             call_config.aicpu_thread_num = gc_dc.aicpu_thread_num
 
             # ── Step 0: Prefill (has_prefill=True) — single dispatch ──
+            _t_pf = _time.perf_counter()
+            _t_anchors[0] = _t_pf
+            _t_anchors[1] = _t_pf
+            if _l3_trace_enabled:
+                print(f"[L3-step] prefill submit_start {_fmt_rel(_t_pf)}", flush=True)
             td = _build_full_tensors(is_prefill=True, decode_in_tensor=decode_hidden_buf)
             _submit_gen_chunked(orch, call_config, td, _keep)
+            if _l3_trace_enabled:
+                _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
 
             # decode_out and rms_x share _decode_out_storage, so final_rms can
             # read rms_x directly after gen_chunked finishes — no copy needed.
             _submit_final_rms(orch, call_config, _keep)
+            if _l3_trace_enabled:
+                _submit_ts(orch, ts_final_rms_cid, rms_normed, _keep)
             _submit_lm_head(orch, call_config, _keep)
+            if _l3_trace_enabled:
+                _submit_ts(orch, ts_lm_head_cid, logits_padded, _keep)
             _submit_sample(orch, sample_cid, _keep)
 
             # ── Steps 1..max_new_tokens: Decode (has_prefill=False) — single dispatch each ──
@@ -1005,15 +1060,28 @@ class PyptoQwen14BExecutor(ModelExecutor):
             for step in range(max_new_tokens):
                 td = _build_full_tensors(is_prefill=False, decode_in_tensor=decode_hidden_buf)
                 _submit_gen_chunked(orch, call_config, td, _keep)
+                if _l3_trace_enabled:
+                    _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
 
                 _submit_final_rms(orch, call_config, _keep)
+                if _l3_trace_enabled:
+                    _submit_ts(orch, ts_final_rms_cid, rms_normed, _keep)
                 _submit_lm_head(orch, call_config, _keep)
+                if _l3_trace_enabled:
+                    _submit_ts(orch, ts_lm_head_cid, logits_padded, _keep)
                 _submit_sample(orch, sample_cid, _keep)
+            if _l3_trace_enabled:
+                print(f"[L3-step] all submits done {_fmt_rel(_time.perf_counter())}", flush=True)
 
         # ── Create Worker and execute ──
 
         gc_sub_fns = dict(compiled.gen_chunked_sub_worker_fns or {})
-        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + 1  # +1 for our sub_worker
+        # +1 for sample_and_prepare_fn, plus +3 for L3-trace timestamp callbacks
+        # (decode_done / final_rms_done / lm_head_done) when tracing is enabled.
+        # Tracing adds a few ms of sub-worker IPC per stage and 3 sub-workers,
+        # so it is gated behind the PYPTO_L3_TRACE env var.
+        _ts_extra = 3 if _l3_trace_enabled else 0
+        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + 1 + _ts_extra
 
         worker = Worker(
             level=3,
@@ -1031,9 +1099,41 @@ class PyptoQwen14BExecutor(ModelExecutor):
         # Register our custom callables.
         sample_cid = worker.register(sample_and_prepare_fn)
 
+        # ── L3 dispatch-latency diagnostic (gated by PYPTO_L3_TRACE) ──
+        # One sub_worker per chip-task type that prints a timestamp on completion.
+        # The dependency tracker forces each ts callback to wait until its
+        # target chip task finishes (via the input-tensor dep). Sub-worker IPC
+        # adds a few ms per print but is negligible compared to the ~5s/step
+        # overhead we are localizing.
+        ts_decode_cid = ts_final_rms_cid = ts_lm_head_cid = -1
+        if _l3_trace_enabled:
+            import time as _trace_time  # noqa: PLC0415
+
+            def _make_ts_fn(label):
+                def _fn(task_args):
+                    _t = _trace_time.perf_counter()
+                    s = int(_token_count[0])
+                    print(
+                        f"[L3-trace] step={s:02d} {label} done {_fmt_rel(_t)}",
+                        flush=True,
+                    )
+                return _fn
+
+            ts_decode_cid = worker.register(_make_ts_fn("decode"))
+            ts_final_rms_cid = worker.register(_make_ts_fn("final_rms"))
+            ts_lm_head_cid = worker.register(_make_ts_fn("lm_head"))
+
         worker.init()
         try:
+            import time as _time  # noqa: PLC0415
+            _t_run_start = _time.perf_counter()
             worker.run(generate_orch_fn)
+            _t_run_end = _time.perf_counter()
+            print(
+                f"[L3-timer] worker.run total wall-clock: "
+                f"{(_t_run_end-_t_run_start)*1000:.1f}ms",
+                flush=True,
+            )
         finally:
             worker.close()
 
