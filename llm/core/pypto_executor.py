@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from dataclasses import dataclass
@@ -113,6 +114,12 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
+    # L3 gen_chunked artefacts. Populated only when l3_mode=True.
+    # ONE host_orch (L3) interleaves qwen3_prefill_layer + qwen3_decode_layer (L2)
+    # per layer. Python loops over num_layers // chunk_size chunks.
+    gen_chunked: object | None = None
+    stacked_weight_chunks: list[dict[str, torch.Tensor]] | None = None
+    chunk_size: int | None = None
 
 
 @dataclass
@@ -133,6 +140,30 @@ class _DecodeInputs:
     slot_mapping: torch.Tensor
 
 
+class _StackedLayerView:
+    """Adapter exposing HF-format LayerWeights in kernel orientation.
+
+    stack_layer_weights() expects each per-layer weight already in the
+    orientation the kernel ingests (transposed BF16 contiguous CPU). This
+    view computes that view lazily per attribute access so the stacker can
+    iterate ``getattr(layer, attr)`` against the standard LayerWeights.
+    """
+
+    _KERNEL_2D_ATTRS = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down")
+
+    def __init__(self, layer) -> None:
+        self._layer = layer
+
+    def __getattr__(self, name: str) -> torch.Tensor:
+        weight = getattr(self._layer, name)
+        if name in self._KERNEL_2D_ATTRS:
+            return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
+        # Norm gammas (input_rms_weight, q/k/post norm). The stacker
+        # flattens to [dim] then re-stacks; cast to FP32 to match the
+        # kernel signature ([num_layers, dim], FP32).
+        return weight.view(-1).float().contiguous().cpu()
+
+
 class PyptoQwen14BExecutor(ModelExecutor):
     def __init__(
         self,
@@ -142,12 +173,24 @@ class PyptoQwen14BExecutor(ModelExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         save_kernels_dir: str | None = None,
+        l3_mode: bool = False,
+        decode_chunk_size: int = 4,
+        # Deprecated alias kept for backward compatibility.
+        l3_decode: bool = False,
     ) -> None:
         super().__init__(kv_cache_manager)
         self._pypto_root = pypto_root
         self._platform = platform
         self._device_id = device_id
         self._save_kernels_dir = save_kernels_dir
+        # When True, BOTH prefill and decode are dispatched in
+        # `decode_chunk_size`-layer chunks via the chunked kernels, and all
+        # dispatches share a single Worker(level=3) opened by session().
+        # Python loops over num_layers // chunk_size chunks per prefill/token,
+        # swapping per-chunk weights and bumping kv_layer_offset_base each
+        # call. KV cache is a single flat tensor (zero-copy view from pool).
+        self._l3_mode = l3_mode or l3_decode
+        self._decode_chunk_size = decode_chunk_size
         self._compiled: dict[str, _CompiledKernels] = {}
 
     def register_model(self, model_id: str, record: ModelRecord) -> None:
@@ -156,6 +199,17 @@ class PyptoQwen14BExecutor(ModelExecutor):
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         compiled = self._compiled[model.config.model_id]
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
+
+        if self._l3_mode:
+            decode_hidden = self._run_gen_chunked_prefill(model, compiled, prefill_inputs)
+            final_hidden = decode_hidden.float()
+            logits = self._project_logits(model, final_hidden)
+            for batch_idx, alloc in enumerate(batch.kv_allocations):
+                alloc.tokens_used = max(
+                    alloc.tokens_used, int(prefill_inputs.seq_lens[batch_idx].item())
+                )
+            return PrefillResult(last_hidden=final_hidden, logits=logits)
+
         hidden = prefill_inputs.hidden
         t_prefill_start = time.perf_counter()
 
@@ -217,40 +271,199 @@ class PyptoQwen14BExecutor(ModelExecutor):
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
 
-        k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
-            model.config.model_id,
-        )
-        out = torch.zeros_like(hidden)
+        if self._l3_mode:
+            hidden = self._run_gen_chunked_decode(model, compiled, decode_inputs)
+            final_hidden = hidden.float()
+        else:
+            k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
+                model.config.model_id,
+            )
+            out = torch.zeros_like(hidden)
 
-        compiled.decode(
-            hidden,
-            dw["decode_input_rms_weight"],
-            dw["decode_wq"],
-            dw["decode_wk"],
-            dw["decode_wv"],
-            dw["decode_q_norm_weight"],
-            dw["decode_k_norm_weight"],
-            decode_inputs.seq_lens,
-            decode_inputs.block_table,
-            decode_inputs.slot_mapping,
-            compiled.rope_cos,
-            compiled.rope_sin,
-            k_cache,
-            v_cache,
-            dw["decode_wo"],
-            dw["decode_post_rms_weight"],
-            dw["decode_w_gate"],
-            dw["decode_w_up"],
-            dw["decode_w_down"],
-            out,
-            config=self._run_config(codegen_only=False),
-        )
+            compiled.decode(
+                hidden,
+                dw["decode_input_rms_weight"],
+                dw["decode_wq"],
+                dw["decode_wk"],
+                dw["decode_wv"],
+                dw["decode_q_norm_weight"],
+                dw["decode_k_norm_weight"],
+                decode_inputs.seq_lens,
+                decode_inputs.block_table,
+                decode_inputs.slot_mapping,
+                compiled.rope_cos,
+                compiled.rope_sin,
+                k_cache,
+                v_cache,
+                dw["decode_wo"],
+                dw["decode_post_rms_weight"],
+                dw["decode_w_gate"],
+                dw["decode_w_up"],
+                dw["decode_w_down"],
+                out,
+                config=self._run_config(codegen_only=False),
+            )
 
-        final_hidden = out.float()
+            final_hidden = out.float()
+
         logits = self._project_logits(model, final_hidden)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(hidden_states=final_hidden, logits=logits)
+
+    def _run_gen_chunked_prefill(
+        self,
+        model: RuntimeModel,
+        compiled: _CompiledKernels,
+        prefill_inputs: _PrefillInputs,
+    ) -> torch.Tensor:
+        """Combined prefill + first-decode dispatch (has_prefill=1).
+
+        For each layer chunk the ONE host_orch (L3) runs:
+          1. qwen3_prefill_layer (L2) — writes KV cache for all prompt positions.
+          2. qwen3_decode_layer  (L2) — attends to full KV cache just written;
+             output is the decode hidden state that predicts the first new token.
+
+        The decode input is the last prompt token's embedding extracted from the
+        prefill hidden tensor. decode_seq_lens = prefill_seq_lens (= N) so the
+        decode kernel uses RoPE position N-1 and attends to all N KV entries.
+        """
+        if compiled.gen_chunked is None or compiled.stacked_weight_chunks is None:
+            raise RuntimeError(
+                "L3 gen_chunked prefill requested but artefacts not compiled. "
+                "Construct the executor with l3_mode=True."
+            )
+        chunks = compiled.stacked_weight_chunks
+        chunk_size = compiled.chunk_size
+        num_chunks = len(chunks)
+        actual_batch = prefill_inputs.actual_batch
+        hidden_size = model.config.hidden_size
+        max_seq = model.runtime.max_seq_len
+
+        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
+            model.config.model_id,
+        )
+
+        # Build initial decode hidden: last prompt token embedding per batch item.
+        decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
+        decode_slot_mapping = torch.zeros((actual_batch,), dtype=torch.int32)
+        for b in range(actual_batch):
+            seq_len_b = int(prefill_inputs.seq_lens[b].item())
+            decode_hidden[b] = prefill_inputs.hidden[b, seq_len_b - 1, :]
+            decode_slot_mapping[b] = int(
+                prefill_inputs.slot_mapping[b * max_seq + seq_len_b - 1].item()
+            )
+
+        has_prefill = torch.tensor(True, dtype=torch.bool)
+        prefill_out = torch.zeros_like(prefill_inputs.hidden)
+        decode_out = torch.zeros_like(decode_hidden)
+
+        for c in range(num_chunks):
+            sw = chunks[c]
+            kv_offset_scalar = torch.tensor(c * chunk_size, dtype=torch.int32)
+            prefill_in = prefill_inputs.hidden if c == 0 else prefill_out
+            decode_in = decode_hidden if c == 0 else decode_out
+            compiled.gen_chunked(
+                prefill_in,
+                prefill_inputs.seq_lens,
+                prefill_inputs.slot_mapping,
+                decode_in,
+                prefill_inputs.seq_lens,   # decode_seq_lens = prefill_seq_lens (= N)
+                decode_slot_mapping,
+                sw["input_rms_chunk"],
+                sw["wq_chunk_flat"],
+                sw["wk_chunk_flat"],
+                sw["wv_chunk_flat"],
+                sw["q_norm_chunk"],
+                sw["k_norm_chunk"],
+                compiled.rope_cos,
+                compiled.rope_sin,
+                prefill_inputs.block_table,
+                k_cache_all,
+                v_cache_all,
+                sw["wo_chunk_flat"],
+                sw["post_rms_chunk"],
+                sw["w_gate_chunk_flat"],
+                sw["w_up_chunk_flat"],
+                sw["w_down_chunk_flat"],
+                kv_offset_scalar,
+                has_prefill,
+                prefill_out,
+                decode_out,
+                config=self._run_config(codegen_only=False),
+            )
+        return decode_out
+
+    def _run_gen_chunked_decode(
+        self,
+        model: RuntimeModel,
+        compiled: _CompiledKernels,
+        decode_inputs: _DecodeInputs,
+    ) -> torch.Tensor:
+        """Pure-decode dispatch (has_prefill=0).
+
+        The ONE host_orch (L3) skips qwen3_prefill_layer; only qwen3_decode_layer
+        (L2) runs for each layer in the chunk. Prefill tensors are dummies.
+        """
+        if compiled.gen_chunked is None or compiled.stacked_weight_chunks is None:
+            raise RuntimeError(
+                "L3 gen_chunked decode requested but artefacts not compiled. "
+                "Construct the executor with l3_mode=True."
+            )
+        chunks = compiled.stacked_weight_chunks
+        chunk_size = compiled.chunk_size
+        num_chunks = len(chunks)
+        actual_batch = decode_inputs.actual_batch
+        hidden_size = model.config.hidden_size
+        max_seq = model.runtime.max_seq_len
+
+        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
+            model.config.model_id,
+        )
+
+        # Dummy prefill tensors — passed but not read by the kernel (has_prefill=0).
+        dummy_prefill = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
+        dummy_seq_lens = decode_inputs.seq_lens
+        dummy_slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
+        dummy_prefill_out = torch.zeros_like(dummy_prefill)
+
+        has_prefill = torch.tensor(False, dtype=torch.bool)
+        decode_out = torch.zeros_like(decode_inputs.hidden)
+
+        for c in range(num_chunks):
+            sw = chunks[c]
+            kv_offset_scalar = torch.tensor(c * chunk_size, dtype=torch.int32)
+            decode_in = decode_inputs.hidden if c == 0 else decode_out
+            compiled.gen_chunked(
+                dummy_prefill,
+                dummy_seq_lens,
+                dummy_slot_mapping,
+                decode_in,
+                decode_inputs.seq_lens,
+                decode_inputs.slot_mapping,
+                sw["input_rms_chunk"],
+                sw["wq_chunk_flat"],
+                sw["wk_chunk_flat"],
+                sw["wv_chunk_flat"],
+                sw["q_norm_chunk"],
+                sw["k_norm_chunk"],
+                compiled.rope_cos,
+                compiled.rope_sin,
+                decode_inputs.block_table,
+                k_cache_all,
+                v_cache_all,
+                sw["wo_chunk_flat"],
+                sw["post_rms_chunk"],
+                sw["w_gate_chunk_flat"],
+                sw["w_up_chunk_flat"],
+                sw["w_down_chunk_flat"],
+                kv_offset_scalar,
+                has_prefill,
+                dummy_prefill_out,
+                decode_out,
+                config=self._run_config(codegen_only=False),
+            )
+        return decode_out
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         _ensure_pypto_import(self._pypto_root)
@@ -258,11 +471,19 @@ class PyptoQwen14BExecutor(ModelExecutor):
         try:
             from ..model.qwen3_14b_decode import build_qwen3_decode_program
             from ..model.qwen3_14b_final_rms import build_qwen3_final_rms_program
+            from ..model.qwen3_14b_gen_chunked import (
+                build_qwen3_14b_gen_chunked_program,
+                stack_layer_weights_chunked,
+            )
             from ..model.qwen3_14b_lm_head import build_qwen3_lm_head_program
             from ..model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
         except ImportError:
             from model.qwen3_14b_decode import build_qwen3_decode_program
             from model.qwen3_14b_final_rms import build_qwen3_final_rms_program
+            from model.qwen3_14b_gen_chunked import (
+                build_qwen3_14b_gen_chunked_program,
+                stack_layer_weights_chunked,
+            )
             from model.qwen3_14b_lm_head import build_qwen3_lm_head_program
             from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
 
@@ -310,6 +531,63 @@ class PyptoQwen14BExecutor(ModelExecutor):
             model.config.rope_theta,
         )
 
+        # L3 gen_chunked artefacts (built only when l3_mode=True).
+        # ONE host_orch (L3) interleaves prefill+decode or decode-only per chunk.
+        gen_chunked: object | None = None
+        stacked_weight_chunks: list[dict[str, torch.Tensor]] | None = None
+        if self._l3_mode:
+            gen_chunked_program = build_qwen3_14b_gen_chunked_program(
+                num_layers=model.config.num_hidden_layers,
+                chunk_size=self._decode_chunk_size,
+                batch=kernel_batch,
+                max_seq=model.runtime.max_seq_len,
+                hidden_size=model.config.hidden_size,
+                intermediate_size=model.config.intermediate_size,
+                num_heads=model.config.num_attention_heads,
+                num_kv_heads=model.config.num_key_value_heads,
+                head_dim=model.config.head_dim,
+            )
+            # gen_chunked uses in-place pl.unroll with consecutive dispatches sharing
+            # the same output tensor handles (WAW).  The simpler scheduler resolves WAW
+            # ordering only via tensor addresses (scalars like local_layer_idx are
+            # ignored), so block_dim=3 + aicpu_thread_num=4 are required — exactly the
+            # DistributedConfig that makes l3_two_l2._build_with_flag pass.
+            # pypto.runtime.run hard-codes DistributedConfig(block_dim=1), so we call
+            # ir.compile directly to override it.
+            from pypto import ir  # noqa: PLC0415
+            from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+
+            _rc = self._run_config(codegen_only=True)
+            gen_chunked = ir.compile(
+                gen_chunked_program,
+                output_dir=_rc.save_kernels_dir,
+                strategy=_rc.strategy,
+                backend_type=_rc.backend_type,
+                dump_passes=_rc.dump_passes,
+                diagnostic_phase=_rc.diagnostic_phase,
+                disabled_diagnostics=_rc.disabled_diagnostics,
+                platform=_rc.platform,
+                profiling=_rc.compile_profiling,
+                distributed_config=DistributedConfig(
+                    device_ids=[self._device_id],
+                    block_dim=3,
+                    num_sub_workers=0,
+                    aicpu_thread_num=4,
+                ),
+            )
+            # stack_layer_weights_chunked expects each weight already in
+            # kernel orientation ([in_dim, out_dim] for 2D matmul weights).
+            # Adapt via a per-layer view that mirrors _kernel_weight().
+            stacked_layers = [_StackedLayerView(layer) for layer in model.layers]
+            stacked_weight_chunks = stack_layer_weights_chunked(
+                stacked_layers,
+                chunk_size=self._decode_chunk_size,
+                hidden=model.config.hidden_size,
+                kv_hidden=model.config.num_key_value_heads * model.config.head_dim,
+                inter=model.config.intermediate_size,
+                head_dim=model.config.head_dim,
+            )
+
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
             pad_rows = padded_vocab - lm_head_weight.shape[0]
@@ -340,6 +618,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
             decode_weights=decode_weights,
+            gen_chunked=gen_chunked,
+            stacked_weight_chunks=stacked_weight_chunks,
+            chunk_size=self._decode_chunk_size if self._l3_mode else None,
         )
 
     @staticmethod
@@ -516,6 +797,50 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 "PyPTO Qwen3-14B kernels require total_kv_pages to match the runtime batch capacity: "
                 f"{model.runtime.total_kv_pages} provided, {expected_pages} required."
             )
+
+    @contextlib.contextmanager
+    def session(self):
+        """Lifecycle context spanning one full generate sequence.
+
+        For L3 mode: the chunked kernels (prefill_chunked, decode_chunked)
+        dispatch via chip_process internally — the parent process must NOT
+        hold an active device context when chip_process is spawned, so this
+        context is intentionally a no-op for L3 mode.  When pypto adds user-
+        API support for a persistent Worker(level=3), this is where it would
+        be opened.
+
+        For baseline mode: also a no-op; each run_prefill / run_decode
+        manages its own _l2_device_context.
+
+        The engine calls executor.session() unconditionally so that the
+        generate lifecycle is ready for the future persistent-Worker upgrade.
+        """
+        yield
+
+    @contextlib.contextmanager
+    def _l2_device_context(self):
+        """Hold a single level-2 device context open across all inner run() calls.
+
+        Used by the baseline (non-L3) paths for prefill and decode. Without
+        this wrapper every compiled(...) call creates and destroys its own
+        Worker(level=2), resulting in repeated aclrtSetDevice / aclrtResetDevice
+        cycles that can deplete the AICPU stream pool (error 507899).
+
+        Inside this block all execute_on_device calls detect the active Worker
+        via _PyptoWorker.current() and reuse its already-initialised device
+        context, so only one SetDevice / ResetDevice pair occurs regardless of
+        how many kernel dispatches happen within the block.
+
+        Do NOT use this wrapper when l3_mode=True: the L3 chunked paths
+        (_run_prefill_l3_chunked, _run_decode_l3_chunked) dispatch via
+        execute_distributed (level=3 chip_process subprocess) inside the
+        shared Worker opened by session(), and must not have a level-2
+        context active on entry.
+        """
+        from pypto.runtime import Worker  # noqa: PLC0415
+
+        with Worker(config=self._run_config(codegen_only=False)):
+            yield
 
     def _run_config(self, *, codegen_only: bool):
         from pypto.runtime import RunConfig

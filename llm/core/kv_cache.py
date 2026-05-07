@@ -194,6 +194,18 @@ class KvCacheManager:
         )
 
     def materialize_decode_cache_all_layers(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return KV cache as a single flat-stacked tensor across all layers.
+
+        Used by L3 stacked decode where the kernel selects layer i via an
+        arithmetic offset (layer_idx * cache_rows_per_layer) on a single
+        cache tensor. The pool is already laid out as
+        ``[num_layers, num_pages, num_kv_heads, page_size, head_dim]`` so the
+        flat view is zero-copy.
+
+        Returns:
+            (key_cache_all, value_cache_all) each shaped
+            [num_layers * num_pages * num_kv_heads * page_size, head_dim].
+        """
         pool = self._pool(model_id)
         return (
             pool.key_pages.reshape(-1, pool.head_dim),

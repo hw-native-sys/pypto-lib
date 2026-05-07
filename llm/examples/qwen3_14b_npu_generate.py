@@ -10,12 +10,20 @@
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
 import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
+
+# R4 mitigation: PTO2_RING_HEAP nominal value is multiplied ×4 by the
+# runtime, so 2 GiB nominal → 8 GiB actual GM heap. This leaves HBM
+# headroom for chunk_size=4 stacked weights (~2.14 GiB) + KV cache
+# (~4 GiB) + shared mem (~23 GiB) on a 62 GiB device. Override via env
+# in the launching shell if you need a different value.
+os.environ.setdefault("PTO2_RING_HEAP", str(2 * 1024 ** 3))
 
 
 def _bootstrap_package_root() -> None:
@@ -39,6 +47,8 @@ _bootstrap_package_root()
 from llm.core import GenerateConfig, LLMEngine, RuntimeConfig
 from llm.core.kv_cache import KvCacheManager
 from llm.core.pypto_executor import PyptoQwen14BExecutor
+from llm.core.types import LoadedModel
+import dataclasses
 
 
 # -----------------------------------------------------------------------------
@@ -95,6 +105,41 @@ class _TimingCollector:
         return self._decode_step_idx + 1
 
 
+def _install_num_layers_override(engine: LLMEngine, n: int) -> None:
+    """Monkey-patch the loader to truncate the model to N layers post-load.
+
+    Validation-only knob. Must be installed BEFORE engine.init_model so the
+    truncation lands before the executor compiles kernels for the wrong layer
+    count (decode_stacked program is parameterised on num_layers).
+    """
+    if n <= 0:
+        raise ValueError(f"--num-layers-override must be positive, got {n}")
+    orig_load = engine._model_loader.load
+
+    def load_truncated(*args, **kwargs):
+        loaded = orig_load(*args, **kwargs)
+        if n >= loaded.config.num_hidden_layers:
+            return loaded
+        new_config = dataclasses.replace(loaded.config, num_hidden_layers=n)
+        loaded.runtime_model.layers = loaded.runtime_model.layers[:n]
+        loaded.runtime_model.config = new_config
+        print(
+            f"[override] num_hidden_layers: "
+            f"{loaded.config.num_hidden_layers} -> {n}",
+            flush=True,
+        )
+        return LoadedModel(
+            model_id=loaded.model_id,
+            model_dir=loaded.model_dir,
+            config=new_config,
+            tokenizer=loaded.tokenizer,
+            layer_specs=loaded.layer_specs[:n],
+            runtime_model=loaded.runtime_model,
+        )
+
+    engine._model_loader.load = load_truncated
+
+
 def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollector) -> None:
     """Wrap executor.run_prefill / run_decode and the four compiled kernels so
     timings flow into `collector`. Must run AFTER engine.init_model().
@@ -103,13 +148,19 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
     compiled = executor._compiled[model_id]  # type: ignore[attr-defined]
 
     # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
-    # once per transformer layer inside run_prefill / run_decode respectively.
+    # once per transformer layer inside run_prefill / run_decode respectively
+    # (baseline non-L3 path only).
     compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_layer")
     compiled.decode = collector.WrapKernel(
         compiled.decode, "kernel.decode_layer", group_by_decode_step=True
     )
     compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
     compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
+    # L3 gen_chunked: one dispatch per chunk_size layers (prefill+decode or decode-only).
+    if compiled.gen_chunked is not None:
+        compiled.gen_chunked = collector.WrapKernel(
+            compiled.gen_chunked, "kernel.gen_chunked", group_by_decode_step=True
+        )
 
     # Top-level executor API wrappers.
     orig_prefill = executor.run_prefill
@@ -174,6 +225,7 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
     for kname in (
         "kernel.prefill_layer",
         "kernel.decode_layer",
+        "kernel.gen_chunked",
         "kernel.final_rms",
         "kernel.lm_head",
     ):
@@ -227,6 +279,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", action="store_true", default=False)
     parser.add_argument("--save-kernels-dir", default=None)
     parser.add_argument(
+        "--l3",
+        action="store_true",
+        dest="l3_mode",
+        help="Enable L3 mode: both prefill and decode are dispatched in "
+             "--decode-chunk-size layer chunks inside a single shared "
+             "Worker(level=3) per generate call.",
+    )
+    parser.add_argument(
+        "--l3-decode",
+        action="store_true",
+        dest="l3_mode",
+        help="Deprecated alias for --l3.",
+    )
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=4,
+        help="Layers per chunked dispatch when --l3 is active. "
+             "num_hidden_layers must be divisible by this. "
+             "Default 4 (10 dispatches/call for 40-layer Qwen3-14B). "
+             "Lower values reduce HBM peak; higher values reduce dispatch "
+             "overhead.",
+    )
+    parser.add_argument(
+        "--num-layers-override",
+        type=int,
+        default=None,
+        help="Validation knob: truncate the loaded model to N transformer "
+             "layers before compile/dispatch. Used to reduce HBM footprint "
+             "while validating the L3 stacked-decode path on Qwen3-14B "
+             "(40 layers won't fit alongside 23 GiB of PTO2 shared memory).",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Print phase / executor-API / per-kernel timing summary at the end.",
@@ -255,11 +340,16 @@ def main() -> None:
         platform=args.platform,
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,
+        l3_mode=args.l3_mode,
+        decode_chunk_size=args.decode_chunk_size,
     )
     engine = LLMEngine(
         kv_cache_manager=kv_cache_manager,
         executor=executor,
     )
+
+    if args.num_layers_override is not None:
+        _install_num_layers_override(engine, args.num_layers_override)
 
     init_t0 = time.perf_counter()
     engine.init_model(

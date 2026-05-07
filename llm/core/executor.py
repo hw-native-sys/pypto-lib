@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -20,6 +21,16 @@ from .types import DecodeBatch, DecodeResult, LayerWeights, PrefillBatch, Prefil
 class ModelExecutor:
     def __init__(self, kv_cache_manager: KvCacheManager) -> None:
         self._kv_cache_manager = kv_cache_manager
+
+    @contextlib.contextmanager
+    def session(self):
+        """No-op session context for the baseline CPU executor.
+
+        Subclasses (e.g. PyptoQwen14BExecutor in L3 mode) override this to
+        hold a shared Worker(level=3) open across one prefill + all decode
+        calls of a single generate sequence.
+        """
+        yield
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids = token_ids.to(device=model.runtime.device, dtype=torch.long)
