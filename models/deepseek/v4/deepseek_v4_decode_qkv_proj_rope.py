@@ -296,6 +296,8 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
 
     # Q path
     qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
+    # W8A8C16: wq_b W8 per-channel int8; qr_out A8 per-token int8.
+    # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
     q_full = matmul_bf16_input_fp32(qr_out, wq_b).view(T, H, HEAD_DIM)   # [T, H, HEAD_DIM]
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
     q_full = q_full * inv                                            # per-head RMSNorm (no gamma)

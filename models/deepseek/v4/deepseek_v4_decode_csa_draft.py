@@ -194,7 +194,7 @@ def golden_deepseek_v4_decode_csa(tensors):
         "kv": kv,
         "qr": qr,
     })
-    # line 506 act_quant on kv non-rope dims — A3-skipped
+    # W8A8C16: kv stays BF16, written to attn KV Cache C16. flash: act_quant on non-rope dims (KV cache C8 simulation, model.py:506).
 
     # window topk + (optional) compress topk (model.py:507-515)
     topk_idxs = torch.full((T, TOPK), -1, dtype=torch.int32)

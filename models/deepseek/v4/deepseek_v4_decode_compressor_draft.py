@@ -61,7 +61,7 @@ def build_deepseek_v4_decode_compressor_program():
 
 
 def golden_deepseek_v4_decode_compressor(tensors):
-    """Torch reference for Compressor.forward (decode branch; prefill omitted, quant identity on A3)."""
+    """Torch reference for Compressor.forward (decode branch; prefill omitted; W8A8C16 quant ops are identity in golden)."""
     import torch
 
     x = tensors["x"]
@@ -122,9 +122,11 @@ def golden_deepseek_v4_decode_compressor(tensors):
 
     if rotate:
         kv_c = (kv_c @ hadamard).to(torch.bfloat16).float()  # rotate_activation: full Hadamard matmul (v3_2 style)
-        # fp4_act_quant — A3-skipped
+        # W8A8C16: A8 per-token-head int8 quant of kv_c (writes to Indexer Cache C8). flash: fp4_act_quant.
     else:
-        pass  # act_quant — A3-skipped
+        # W8A8C16: not quantized in attn-mode (output written to attn KV Cache C16/BF16).
+        # flash: act_quant on non-rope dims (KV cache C8 simulation).
+        pass
 
     tensors["out"][:] = kv_c.to(torch.bfloat16)
 

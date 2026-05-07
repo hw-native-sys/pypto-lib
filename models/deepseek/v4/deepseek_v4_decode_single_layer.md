@@ -134,7 +134,8 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 ╔═════════════════════════════════════════════════════════════════════════════╗
 ║  qkv_proj_rope.py  (attn_norm fused + Q/KV LoRA + RoPE)                     ║
 ║  model.py:692, 495-504                                                      ║
-║  NOTE: line 506 act_quant (FP8 QAT sim) is skipped on A3.                   ║
+║  NOTE: W8A8C16: kv stays BF16 (attn KV Cache C16).                          ║
+║        flash: act_quant on kv non-rope dims (L506, KV cache C8 sim).        ║
 ║                                                                             ║
 ║  IN :  x [B, S, D]                    bf16  (hc_pre output)                 ║
 ║        norm_w [D]                     fp32  (attn_norm gamma, fused)        ║
@@ -226,7 +227,9 @@ construction depends on `compress_ratio`.
 ║                                          should_compress)          ║
 ║  OUT   : (return value discarded by decode caller)                 ║
 ║                                                                    ║
-║  rotate=False, BF16 path                                           ║
+║  rotate=False (attn-mode).                                         ║
+║  W8A8C16: not quantized (output BF16 to attn KV Cache C16).        ║
+║  flash: act_quant on kv non-rope dims (KV cache C8 sim).           ║
 ╚════════════════════════════════════════════════════════════════════╝
 
 ╔════════════════════════════════════════════════════════════════════╗
@@ -239,9 +242,11 @@ construction depends on `compress_ratio`.
 ║          internal Compressor's kv_state/score_state                ║
 ║  OUT   : indexer_topk [T, IDX_TOPK=512]   int32                    ║
 ║                                                                    ║
-║  Internal: instantiates its own Compressor (rotate=True, FP4),     ║
+║  Internal: instantiates its own Compressor (rotate=True),          ║
 ║  distinct from Attention.compressor — different weights, different ║
 ║  KV pool, called inside indexer.py at model.py:417.                ║
+║  W8A8C16: A8 per-token-head int8 output (writes Indexer Cache C8). ║
+║  flash: FP4 simulation (full Hadamard + fp4_act_quant).            ║
 ╚════════════════════════════════════════════════════════════════════╝
 ```
 
@@ -311,7 +316,7 @@ inline in the orch and are NOT separate kernels.
 |---|---|---|---|
 | hc_pre (attn) | 691 | `hc_pre.py` | skeleton |
 | qkv_proj_rope (attn_norm fused + Q/KV LoRA + RoPE) | 692, 495-504 | `qkv_proj_rope.py` | skeleton |
-| act_quant (FP8 QAT sim) | 506 | — | skipped on A3 |
+| act_quant on kv non-rope dims | 506 | — | not in W8A8C16 (KV Cache C16); flash: C8 sim |
 | kv → ori_kv write | 530 | [orch] scatter | — |
 | indexer (decode) | 511 (call), 402-433 (impl) | `indexer.py` | skeleton |
 | compressor (decode) | 532 (call), 316-377 (impl) | `compressor.py` | skeleton |

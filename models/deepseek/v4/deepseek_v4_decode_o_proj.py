@@ -166,6 +166,7 @@ def golden_deepseek_v4_decode_o_proj(tensors):
     # Match kernel's internal BF16 workspace precision before Stage B.
     o_r = o_r.to(torch.bfloat16).float()
     # Stage B: wo_b expansion back to model dim.
+    # W8A8C16: wo_b W8 per-channel int8; o_r A8 per-token int8.
     out = o_r.flatten(2).view(T, O_GROUPS * O_LORA) @ wo_b.T   # [T, D]
 
     tensors["attn_out"][:] = out.to(torch.bfloat16)

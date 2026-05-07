@@ -166,7 +166,12 @@ def moe_expert(
 
 def golden_moe_expert(tensors):
     """Torch reference (model.py 596-644). recv_y is the partial routed contribution
-    only; AllToAllv combine and `+sh` happen in the host orchestrator."""
+    only; AllToAllv combine and `+sh` happen in the host orchestrator.
+
+    W8A8C16: all six weight matmuls (routed w1/w2/w3, shared sw1/sw2/sw3) use W8
+    per-channel int8 weights with A8 per-token int8 activations; silu*up output
+    is re-quantized to A8 before each w2 matmul. flash: same six matmuls run
+    fp8 (default Linear dtype), with routed experts optionally fp4."""
     import torch
     import torch.nn.functional as F
 

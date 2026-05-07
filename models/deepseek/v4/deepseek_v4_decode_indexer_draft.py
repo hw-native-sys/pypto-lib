@@ -79,7 +79,7 @@ def build_deepseek_v4_decode_indexer_program():
 
 
 def golden_deepseek_v4_decode_indexer(tensors):
-    """Torch reference for Indexer.forward (decode branch; prefill omitted, fp4_act_quant identity on A3)."""
+    """Torch reference for Indexer.forward (decode branch; prefill omitted; W8A8C16 quant ops are identity in golden)."""
     import torch
 
     x = tensors["x"]
@@ -102,6 +102,7 @@ def golden_deepseek_v4_decode_indexer(tensors):
     if start_pos == 0:
         return
 
+    # W8A8C16: wq_b W8 per-channel int8; qr A8 per-token int8.
     q = (qr @ wq_b).view(T, IDX_N_HEADS, IDX_HEAD_DIM)
 
     x_pair = q[..., -rd:].unflatten(-1, (-1, 2))
@@ -112,7 +113,8 @@ def golden_deepseek_v4_decode_indexer(tensors):
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
     q = (q.view(-1, IDX_HEAD_DIM) @ hadamard).view(T, IDX_N_HEADS, IDX_HEAD_DIM)
-    # fp4_act_quant — A3-skipped
+    # W8A8C16: A8 per-token-head int8 quant of q here (consumed by LI batch_matmul below).
+    # flash: fp4_act_quant on q (FP4 simulation).
 
     inner_out = torch.zeros(bsz, IDX_HEAD_DIM, dtype=torch.bfloat16)
     inner_tensors = {
@@ -141,6 +143,8 @@ def golden_deepseek_v4_decode_indexer(tensors):
 
     cache_len = end_pos // ratio
     kv_view = idx_kv_cache[:bsz, :cache_len].float()
+    # W8A8C16: LI batch_matmul Int8. q A8 per-token-head int8; kv_view (Indexer Cache) C8 per-token-head int8.
+    # flash: q/kv via FP4 simulation (full Hadamard rotation + fp4_act_quant).
     score = torch.einsum("thd,btd->bht", q, kv_view)
     score = (torch.relu(score) * weights.view(bsz, IDX_N_HEADS, 1)).sum(dim=1)
 
