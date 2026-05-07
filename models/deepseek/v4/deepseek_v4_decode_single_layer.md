@@ -5,7 +5,7 @@ One full `Block.forward` pass (model.py:689-701), single card, decode step
 B=batch, T=B×1, D=4096, H=64, HEAD_DIM=512, ROPE_DIM=64, Q_LORA=1024, HC=4.
 
 Pro values differ: D=7168, H=128, Q_LORA=1536, O_GROUPS=16, IDX_TOPK=1024,
-N_EXPERTS=384.
+N_EXPERTS=384, N_BLOCKS=61.
 
 Legend:
 - `[orch]`    — orchestrator-only operation (no separate pypto kernel)
@@ -101,7 +101,7 @@ Legend:
                               │
 ═══════════════════════════════════════════════════════════════════════════════
   EXIT: x_next [B, 1, HC=4, D=4096]  bf16
-        → next Block (×61) → MTPBlock → ParallelHead → logits
+        → next Block (×43) → MTPBlock → ParallelHead → logits
 ═══════════════════════════════════════════════════════════════════════════════
 ```
 
