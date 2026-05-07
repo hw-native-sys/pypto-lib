@@ -12,7 +12,7 @@ Provides tensor and scalar specifications, result validation, and a runner
 that compiles and executes PyPTO programs with golden reference comparison.
 """
 
-from .runner import RunConfig, RunResult, run
+from .runner import RunConfig, RunResult, run, run_jit
 from .spec import ScalarSpec, TensorSpec
 from .validation import topk_pair_compare, validate_golden
 
@@ -24,4 +24,5 @@ __all__ = [
     "RunConfig",
     "RunResult",
     "run",
+    "run_jit",
 ]
