@@ -139,7 +139,7 @@ def golden_deepseek_v4_decode_csa(tensors):
     from deepseek_v4_decode_indexer_draft import golden_deepseek_v4_decode_indexer
     from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
     from deepseek_v4_decode_o_proj import golden_deepseek_v4_decode_o_proj
-    from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
+    from deepseek_v4_decode_hc_post import golden_deepseek_v4_decode_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
