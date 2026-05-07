@@ -152,6 +152,46 @@ class LLMEngine:
                     row_tokens,
                 )
 
+            # L3-wrapped generate: entire prefill + decode loop in one worker.run().
+            run_generate_l3 = getattr(self._executor, "run_generate_l3", None)
+            if callable(run_generate_l3) and getattr(self._executor, "_l3_mode", False):
+                prefill_batch = PrefillBatch(
+                    request_ids=[request.request_id for request in requests],
+                    token_ids=token_tensor,
+                    input_embeddings=embeddings,
+                    seq_lens=torch.tensor(
+                        [len(token_ids) for token_ids in prompt_token_ids],
+                        dtype=torch.int32,
+                        device=runtime_model.runtime.device,
+                    ),
+                    kv_allocations=allocations,
+                )
+                generated_ids, _ = run_generate_l3(
+                    runtime_model,
+                    prefill_batch,
+                    max_new_tokens=generate_config.max_new_tokens,
+                    eos_token_id=record.config.eos_token_id,
+                )
+                for request in requests:
+                    request.generated_token_ids = list(generated_ids)
+                    request.output_text = tokenizer.decode(generated_ids)
+                finish_reasons = []
+                for _ in requests:
+                    if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
+                        finish_reasons.append("eos")
+                    elif len(generated_ids) >= generate_config.max_new_tokens:
+                        finish_reasons.append("length")
+                    else:
+                        finish_reasons.append("length")
+                return [
+                    GenerateResult(
+                        text=requests[i].output_text,
+                        token_ids=list(requests[i].generated_token_ids),
+                        finish_reason=finish_reasons[i],
+                    )
+                    for i in range(len(requests))
+                ]
+
             # Hold one shared L3 Worker across prefill + all decode steps.
             # For the baseline executor, session() is a no-op.
             with self._executor.session():

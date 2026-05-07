@@ -120,6 +120,17 @@ class _CompiledKernels:
     gen_chunked: object | None = None
     stacked_weight_chunks: list[dict[str, torch.Tensor]] | None = None
     chunk_size: int | None = None
+    # L3-wrapped generate: chip callables for final_rms/lm_head + gen_chunked
+    # setup artifacts.  Populated only when l3_mode=True.
+    gen_chunked_chip_callables: dict[str, object] | None = None
+    gen_chunked_entry_fn: object | None = None
+    gen_chunked_sub_worker_fns: dict[str, object] | None = None
+    gen_chunked_dc: object | None = None  # DistributedConfig
+    gen_chunked_platform: str | None = None
+    gen_chunked_runtime_name: str | None = None
+    gen_chunked_param_infos: object | None = None
+    final_rms_chip_callable: object | None = None
+    lm_head_chip_callable: object | None = None
 
 
 @dataclass
@@ -588,6 +599,77 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 head_dim=model.config.head_dim,
             )
 
+        # L3-wrapped generate: compile final_rms/lm_head as ChipCallable and
+        # pre-extract gen_chunked setup artifacts (expensive compile_and_assemble
+        # + module loading done once, reused per generate call).
+        final_rms_chip_callable: object | None = None
+        lm_head_chip_callable: object | None = None
+        gen_chunked_chip_callables: dict[str, object] | None = None
+        gen_chunked_entry_fn: object | None = None
+        gen_chunked_sub_worker_fns: dict[str, object] | None = None
+        gen_chunked_dc: object | None = None
+        gen_chunked_platform: str | None = None
+        gen_chunked_runtime_name: str | None = None
+        gen_chunked_param_infos: object | None = None
+        if self._l3_mode:
+            from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+            from pypto.runtime.distributed_runner import _load_generated_module  # noqa: PLC0415
+            from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
+
+            # Compile final_rms and lm_head as ChipCallable.
+            final_rms_chip_callable, _ = compile_and_assemble(
+                final_rms.output_dir, _rc.platform,
+            )
+            lm_head_chip_callable, _ = compile_and_assemble(
+                lm_head.output_dir, _rc.platform,
+            )
+
+            # Pre-extract gen_chunked setup artifacts.
+            gc_dc = gen_chunked._distributed_config
+            gc_output_dir = gen_chunked.output_dir
+            gc_chip_callables: dict[str, object] = {}
+            gc_runtime_name = "tensormap_and_ringbuffer"
+            gc_next_levels_dir = gc_output_dir / "next_levels"
+            for func in gen_chunked._program.functions.values():
+                if func.func_type == FunctionType.Orchestration:
+                    chip_dir = gc_next_levels_dir / func.name
+                    if chip_dir.exists():
+                        cc, gc_runtime_name = compile_and_assemble(
+                            chip_dir, gen_chunked.platform,
+                        )
+                        gc_chip_callables[func.name] = cc
+            gc_orch_path = gc_output_dir / "orchestration" / "host_orch.py"
+            gc_orch_module = _load_generated_module(gc_orch_path)
+            gc_entry_fn = None
+            for attr_name in ("entry", "host_orch"):
+                gc_entry_fn = getattr(gc_orch_module, attr_name, None)
+                if gc_entry_fn is not None:
+                    break
+            if gc_entry_fn is None:
+                for name in dir(gc_orch_module):
+                    obj = getattr(gc_orch_module, name)
+                    if callable(obj) and not name.startswith("_"):
+                        gc_entry_fn = obj
+                        break
+            gc_sub_worker_fns: dict[str, object] = {}
+            gc_sub_workers_dir = gc_output_dir / "sub_workers"
+            if gc_sub_workers_dir.exists():
+                for py_file in sorted(gc_sub_workers_dir.glob("*.py")):
+                    mod = _load_generated_module(py_file)
+                    fn_name = py_file.stem
+                    fn = getattr(mod, fn_name, None)
+                    if fn is not None:
+                        gc_sub_worker_fns[fn_name] = fn
+            gc_param_infos, _, _ = gen_chunked._get_metadata()
+
+            gen_chunked_chip_callables = gc_chip_callables
+            gen_chunked_entry_fn = gc_entry_fn
+            gen_chunked_sub_worker_fns = gc_sub_worker_fns
+            gen_chunked_dc = gc_dc
+            gen_chunked_platform = gen_chunked.platform
+            gen_chunked_runtime_name = gc_runtime_name
+            gen_chunked_param_infos = gc_param_infos
+
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
             pad_rows = padded_vocab - lm_head_weight.shape[0]
@@ -621,6 +703,15 @@ class PyptoQwen14BExecutor(ModelExecutor):
             gen_chunked=gen_chunked,
             stacked_weight_chunks=stacked_weight_chunks,
             chunk_size=self._decode_chunk_size if self._l3_mode else None,
+            gen_chunked_chip_callables=gen_chunked_chip_callables,
+            gen_chunked_entry_fn=gen_chunked_entry_fn,
+            gen_chunked_sub_worker_fns=gen_chunked_sub_worker_fns,
+            gen_chunked_dc=gen_chunked_dc,
+            gen_chunked_platform=gen_chunked_platform,
+            gen_chunked_runtime_name=gen_chunked_runtime_name,
+            gen_chunked_param_infos=gen_chunked_param_infos,
+            final_rms_chip_callable=final_rms_chip_callable,
+            lm_head_chip_callable=lm_head_chip_callable,
         )
 
     @staticmethod
@@ -678,6 +769,327 @@ class PyptoQwen14BExecutor(ModelExecutor):
             config=self._run_config(codegen_only=False),
         )
         return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
+
+    # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──
+
+    def run_generate_l3(
+        self,
+        model: RuntimeModel,
+        prefill_batch: PrefillBatch,
+        max_new_tokens: int,
+        eos_token_id: int | None,
+    ) -> tuple[list[int], torch.Tensor]:
+        """Run the full generate loop inside a single Worker(level=3).
+
+        Dispatches prefill chunks + final_rms + lm_head + decode loop entirely
+        within one worker.run() call, using sub_worker for CPU-side sampling
+        and embedding lookup between device dispatches.
+
+        Returns (generated_token_ids, final_hidden).
+        """
+        from simpler.task_interface import CallConfig, TaskArgs, TensorArgType  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
+        from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
+
+        compiled = self._compiled[model.config.model_id]
+        if compiled.gen_chunked_chip_callables is None:
+            raise RuntimeError("L3 generate artifacts not compiled.")
+
+        prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
+        chunks = compiled.stacked_weight_chunks
+        chunk_size = compiled.chunk_size
+        num_chunks = len(chunks)
+        actual_batch = prefill_inputs.actual_batch
+        hidden_size = model.config.hidden_size
+        max_seq = model.runtime.max_seq_len
+        vocab_size = model.config.vocab_size
+        padded_vocab = compiled.padded_vocab
+
+        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all(
+            model.config.model_id,
+        )
+
+        # Build initial decode hidden: last prompt token embedding per batch.
+        decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
+        decode_slot_mapping = torch.zeros((actual_batch,), dtype=torch.int32)
+        for b in range(actual_batch):
+            seq_len_b = int(prefill_inputs.seq_lens[b].item())
+            decode_hidden[b] = prefill_inputs.hidden[b, seq_len_b - 1, :]
+            decode_slot_mapping[b] = int(
+                prefill_inputs.slot_mapping[b * max_seq + seq_len_b - 1].item()
+            )
+
+        # Pre-allocate all shared-memory tensors for the full generate loop.
+        prefill_out = torch.zeros_like(prefill_inputs.hidden).share_memory_()
+        # decode_out and rms_x share one padded buffer so no CPU copy is needed
+        # between them.  gen_chunked writes to decode_out (the first actual_batch
+        # rows); final_rms reads rms_x (all _LOGITS_BATCH_TILE rows).  The padding
+        # rows stay zero throughout, satisfying the zero-pad contract of final_rms.
+        _decode_out_storage = torch.zeros(
+            (_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16
+        ).share_memory_()
+        decode_out = _decode_out_storage[:actual_batch, :]   # [actual_batch, hidden_size]
+        rms_x = _decode_out_storage                          # [_LOGITS_BATCH_TILE, hidden_size]
+        # Dummy prefill tensors for decode-only dispatches (has_prefill=False).
+        # Pre-allocated once to avoid creating new shared-memory tensors per chunk.
+        dummy_prefill = torch.zeros(
+            (actual_batch, max_seq, hidden_size), dtype=torch.bfloat16,
+        ).share_memory_()
+        dummy_slot_mapping = torch.full(
+            (actual_batch * max_seq,), -1, dtype=torch.int32,
+        ).share_memory_()
+        dummy_prefill_out = torch.zeros_like(dummy_prefill).share_memory_()
+        # final_rms / lm_head intermediates.
+        rms_gamma = model.final_norm_weight.view(1, hidden_size).float().cpu().share_memory_()
+        rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
+        lm_head_weight = compiled.padded_lm_head_weight.share_memory_()
+        logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
+        # Sub-worker communication tensors.
+        embed_tokens = model.embed_tokens.to(torch.bfloat16).cpu().share_memory_()
+        done_flag = torch.zeros((1,), dtype=torch.int32).share_memory_()
+        generated_ids = torch.full((max_new_tokens,), -1, dtype=torch.int64).share_memory_()
+        token_count = torch.zeros((1,), dtype=torch.int32).share_memory_()
+        # Mutable decode inputs (updated by sub_worker between steps).
+        decode_hidden_buf = decode_hidden.clone().share_memory_()
+        decode_seq_lens = prefill_inputs.seq_lens.clone().share_memory_()
+        decode_slot_mapping_buf = decode_slot_mapping.clone().share_memory_()
+
+        # Ensure all prefill inputs are in shared memory.
+        prefill_hidden = prefill_inputs.hidden.share_memory_()
+        prefill_seq_lens = prefill_inputs.seq_lens.share_memory_()
+        prefill_slot_mapping = prefill_inputs.slot_mapping.share_memory_()
+        block_table = prefill_inputs.block_table.share_memory_()
+        rope_cos = compiled.rope_cos.share_memory_()
+        rope_sin = compiled.rope_sin.share_memory_()
+        k_cache_all = k_cache_all.share_memory_()
+        v_cache_all = v_cache_all.share_memory_()
+
+        # Ensure stacked weights are in shared memory.
+        sm_chunks = []
+        for sw in chunks:
+            sm_sw = {}
+            for k, v in sw.items():
+                sm_sw[k] = v.share_memory_() if not v.is_shared() else v
+            sm_chunks.append(sm_sw)
+
+        # ── Sub-worker callable ──
+        # Runs in a forked child process. Reads logits → argmax → embedding lookup
+        # → writes decode_hidden_buf / decode_seq_lens / decode_slot_mapping_buf.
+        _eos_id = eos_token_id
+        _vocab = vocab_size
+        _actual_batch = actual_batch
+        _hidden_size = hidden_size
+        _max_blocks = self._max_blocks_per_seq(model)
+        _page_size = model.runtime.page_size
+
+        # Pre-capture references for the sub_worker closure.
+        # These are shared-memory tensors visible in the forked child.
+        _embed_tokens = embed_tokens
+        _done_flag = done_flag
+        _generated_ids = generated_ids
+        _token_count = token_count
+        _decode_hidden_buf = decode_hidden_buf
+        _decode_seq_lens = decode_seq_lens
+        _decode_slot_mapping_buf = decode_slot_mapping_buf
+        _logits_padded = logits_padded
+        _block_table = block_table
+        _kv_manager = self._kv_cache_manager
+        _prefill_batch = prefill_batch
+
+        def sample_and_prepare_fn(task_args):
+            """Sub-worker: sample token from logits, prepare next decode inputs."""
+            if _done_flag[0].item():
+                return  # EOS already hit, no-op.
+
+            # Read logits (written by lm_head chip task into logits_padded).
+            logits = _logits_padded[0, :_vocab]
+            token_id = int(logits.argmax().item())
+
+            step = int(_token_count[0].item())
+            _generated_ids[step] = token_id
+            _token_count[0] = step + 1
+
+            if _eos_id is not None and token_id == _eos_id:
+                _done_flag[0] = 1
+                return
+
+            if step + 1 >= max_new_tokens:
+                _done_flag[0] = 1
+                return
+
+            # Embedding lookup.
+            _decode_hidden_buf[0, :] = _embed_tokens[token_id]
+
+            # Update seq_lens.
+            for b in range(_actual_batch):
+                new_seq_len = int(_decode_seq_lens[b].item()) + 1
+                _decode_seq_lens[b] = new_seq_len
+                # Update slot_mapping for next position.
+                alloc = _prefill_batch.kv_allocations[b]
+                page_idx = (new_seq_len - 1) // _page_size
+                slot_in_page = (new_seq_len - 1) % _page_size
+                if page_idx < len(alloc.page_ids):
+                    _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
+
+        # ── Build the orchestrator function ──
+
+        gc_entry_fn = compiled.gen_chunked_entry_fn
+        gc_chip_callables = compiled.gen_chunked_chip_callables
+        gc_dc = compiled.gen_chunked_dc
+        gc_param_infos = compiled.gen_chunked_param_infos
+        final_rms_cc = compiled.final_rms_chip_callable
+        lm_head_cc = compiled.lm_head_chip_callable
+
+        def _submit_gen_chunked(orch, config, tensors_dict, _keep):
+            """Submit one gen_chunked entry_fn call (dispatches chunk_size L2 tasks)."""
+            gc_entry_fn(
+                orch, None, config,
+                tensors=tensors_dict,
+                callables=gc_chip_callables,
+                sub_ids=sub_ids,
+                _keep=_keep,
+            )
+
+        def _submit_final_rms(orch, config, _keep):
+            ta = TaskArgs()
+            ta.add_tensor(make_tensor_arg(rms_x), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rms_gamma), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rms_normed), TensorArgType.OUTPUT_EXISTING)
+            _keep.append(ta)
+            orch.submit_next_level(final_rms_cc, ta, config)
+
+        def _submit_lm_head(orch, config, _keep):
+            ta = TaskArgs()
+            ta.add_tensor(make_tensor_arg(rms_normed), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(lm_head_weight), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(logits_padded), TensorArgType.OUTPUT_EXISTING)
+            _keep.append(ta)
+            orch.submit_next_level(lm_head_cc, ta, config)
+
+        def _submit_sample(orch, sample_cid, _keep):
+            ta = TaskArgs()
+            # Depend on logits_padded (written by lm_head).
+            ta.add_tensor(make_tensor_arg(logits_padded), TensorArgType.INPUT)
+            # Declare all tensors written by sample_and_prepare_fn so the
+            # dependency tracker waits for the sub-worker to finish before the
+            # next gen_chunked chip task reads them.  Without these declarations
+            # the tracker only knows about decode_hidden_buf, so decode_seq_lens
+            # and decode_slot_mapping_buf could be read with stale values by the
+            # next decode step, causing wrong RoPE positions and KV-cache slot
+            # overwrites (visible as repetitive degenerate output).
+            ta.add_tensor(make_tensor_arg(_decode_hidden_buf), TensorArgType.OUTPUT_EXISTING)
+            ta.add_tensor(make_tensor_arg(decode_seq_lens), TensorArgType.OUTPUT_EXISTING)
+            ta.add_tensor(make_tensor_arg(decode_slot_mapping_buf), TensorArgType.OUTPUT_EXISTING)
+            _keep.append(ta)
+            orch.submit_sub(sample_cid, ta)
+
+        def _build_chunk_tensors(c, is_prefill):
+            """Build the tensor dict for one gen_chunked dispatch."""
+            sw = sm_chunks[c]
+            kv_offset = torch.tensor(c * chunk_size, dtype=torch.int32).share_memory_()
+            # For prefill: chunk 0 reads initial embeddings, subsequent chunks
+            # read the accumulated output (prefill_out) — matching the baseline
+            # _run_gen_chunked_prefill: prefill_in = hidden if c==0 else prefill_out.
+            if is_prefill:
+                prefill_in = prefill_hidden if c == 0 else prefill_out
+            else:
+                prefill_in = dummy_prefill
+            td = {}
+            for info, val in zip(gc_param_infos, [
+                prefill_in,  # prefill_hidden
+                prefill_seq_lens if is_prefill else decode_seq_lens,  # prefill_seq_lens
+                prefill_slot_mapping if is_prefill else dummy_slot_mapping,  # prefill_slot_mapping
+                decode_hidden_buf if c == 0 else decode_out,  # decode_hidden
+                prefill_seq_lens if is_prefill else decode_seq_lens,  # decode_seq_lens
+                decode_slot_mapping_buf,  # decode_slot_mapping
+                sw["input_rms_chunk"],
+                sw["wq_chunk_flat"],
+                sw["wk_chunk_flat"],
+                sw["wv_chunk_flat"],
+                sw["q_norm_chunk"],
+                sw["k_norm_chunk"],
+                rope_cos,
+                rope_sin,
+                block_table,
+                k_cache_all,
+                v_cache_all,
+                sw["wo_chunk_flat"],
+                sw["post_rms_chunk"],
+                sw["w_gate_chunk_flat"],
+                sw["w_up_chunk_flat"],
+                sw["w_down_chunk_flat"],
+                kv_offset,
+                torch.tensor(is_prefill, dtype=torch.bool).share_memory_(),
+                prefill_out if is_prefill else dummy_prefill_out,  # prefill_out
+                decode_out,
+            ]):
+                if not val.is_shared():
+                    val = val.share_memory_()
+                td[info.name] = val
+            return td
+
+        def generate_orch_fn(orch, _args, _cfg):
+            _keep: list = []
+            call_config = CallConfig()
+            call_config.block_dim = gc_dc.block_dim
+            call_config.aicpu_thread_num = gc_dc.aicpu_thread_num
+
+            # ── Step 0: Prefill (has_prefill=True) ──
+            for c in range(num_chunks):
+                td = _build_chunk_tensors(c, is_prefill=True)
+                _submit_gen_chunked(orch, call_config, td, _keep)
+
+            # decode_out and rms_x share _decode_out_storage, so final_rms can
+            # read rms_x directly after gen_chunked finishes — no copy needed.
+            _submit_final_rms(orch, call_config, _keep)
+            _submit_lm_head(orch, call_config, _keep)
+            _submit_sample(orch, sample_cid, _keep)
+
+            # ── Steps 1..max_new_tokens: Decode (has_prefill=False) ──
+            for step in range(max_new_tokens):
+                for c in range(num_chunks):
+                    td = _build_chunk_tensors(c, is_prefill=False)
+                    _submit_gen_chunked(orch, call_config, td, _keep)
+
+                _submit_final_rms(orch, call_config, _keep)
+                _submit_lm_head(orch, call_config, _keep)
+                _submit_sample(orch, sample_cid, _keep)
+
+        # ── Create Worker and execute ──
+
+        gc_sub_fns = dict(compiled.gen_chunked_sub_worker_fns or {})
+        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + 1  # +1 for our sub_worker
+
+        worker = Worker(
+            level=3,
+            device_ids=[self._device_id],
+            num_sub_workers=num_sub,
+            platform=compiled.gen_chunked_platform,
+            runtime=compiled.gen_chunked_runtime_name,
+        )
+
+        # Register gen_chunked sub-worker callables (if any).
+        sub_ids: dict[str, int] = {}
+        for name, fn in gc_sub_fns.items():
+            sub_ids[name] = worker.register(fn)
+
+        # Register our custom callables.
+        sample_cid = worker.register(sample_and_prepare_fn)
+
+        worker.init()
+        try:
+            worker.run(generate_orch_fn)
+        finally:
+            worker.close()
+
+        # Update KV allocations.
+        final_token_count = int(token_count[0].item())
+        for batch_idx, alloc in enumerate(prefill_batch.kv_allocations):
+            base_seq = int(prefill_inputs.seq_lens[batch_idx].item())
+            alloc.tokens_used = max(alloc.tokens_used, base_seq + final_token_count)
+
+        ids = generated_ids[:final_token_count].tolist()
+        return ids, decode_out[:actual_batch].float()
 
     def _prepare_prefill_inputs(
         self,
