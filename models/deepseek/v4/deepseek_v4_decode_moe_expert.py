@@ -40,7 +40,7 @@ INT8_AMAX_EPS = 1e-4  # amax floor: keeps padding/all-zero rows from producing 1
 QUANT_CHUNK = 256  # column chunk size for two-pass per-row INT8 quant (vec budget aware)
 
 
-@pl.jit
+@pl.jit.inline
 def moe_expert(
     recv_x: pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16],
     # Global expert id per row; padding rows must carry an id outside
@@ -60,8 +60,8 @@ def moe_expert(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_y: pl.Out[pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16]],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    recv_y: pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16],
+    sh: pl.Tensor[[T, D], pl.BF16],
 ):
     # Stage 0: zero-init recv_y so cross-expert accumulation is exact.
     for d0 in pl.parallel(0, D, RECV_Y_INIT_CHUNK):
@@ -153,12 +153,9 @@ def moe_expert(
                 up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu"):
-                # TODO: re-enable once pl.mins/maxs accept TensorType (currently
-                # tile-only). Demo config has SWIGLU_LIMIT=0.0 so this is a no-op,
-                # but flash/pro configs (SWIGLU_LIMIT=10.0) need the clamp.
-                # if SWIGLU_LIMIT > 0.0:
-                #     gate_2d = pl.mins(gate_2d, SWIGLU_LIMIT)
-                #     up_2d = pl.maxs(pl.mins(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                if SWIGLU_LIMIT > 0.0:
+                    gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
+                    up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
                 silu = pl.mul(gate_2d, sigmoid)
                 gated = pl.mul(silu, up_2d)
@@ -274,6 +271,36 @@ def moe_expert(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_write"):
             sh[:, d0 : d0 + D_OUT_CHUNK] = pl.cast(sh_y, target_type=pl.BF16)
 
+
+@pl.jit
+def moe_expert_test(
+    recv_x: pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16],
+    recv_expert_id: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.INT32],
+    recv_weights: pl.Tensor[[RECV_TOTAL_MAX, 1], pl.FP32],
+    x_local: pl.Tensor[[T, D], pl.BF16],
+    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    recv_y: pl.Out[pl.Tensor[[RECV_TOTAL_MAX, D], pl.BF16]],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    moe_expert(
+        recv_x, recv_expert_id, recv_weights, x_local,
+        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
+        expert_w2, expert_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        recv_y, sh,
+    )
     return recv_y, sh
 
 
@@ -438,7 +465,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_expert,
+        fn=moe_expert_test,
         specs=build_tensor_specs(),
         golden_fn=golden_moe_expert,
         config=RunConfig(

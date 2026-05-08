@@ -85,8 +85,8 @@ jobs:
       - name: Run model tests (${{ matrix.platform }})
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_DEP_POOL: 1048576
+          PTO2_RING_TASK_WINDOW: 1048576
           PTO2_RING_HEAP: 4294967296
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
@@ -204,8 +204,8 @@ jobs:
       - name: Run model tests (a2a3)
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_DEP_POOL: 1048576
+          PTO2_RING_TASK_WINDOW: 1048576
           PTO2_RING_HEAP: 4294967296
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
