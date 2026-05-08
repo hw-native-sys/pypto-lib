@@ -130,6 +130,7 @@ class _CompiledKernels:
     gen_chunked_param_infos: object | None = None
     final_rms_chip_callable: object | None = None
     lm_head_chip_callable: object | None = None
+    decode_chip_callable: object | None = None  # baseline decode Opaque kernel
 
 
 @dataclass
@@ -575,6 +576,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         # + module loading done once, reused per generate call).
         final_rms_chip_callable: object | None = None
         lm_head_chip_callable: object | None = None
+        decode_chip_callable: object | None = None
         gen_chunked_chip_callables: dict[str, object] | None = None
         gen_chunked_entry_fn: object | None = None
         gen_chunked_sub_worker_fns: dict[str, object] | None = None
@@ -587,12 +589,15 @@ class PyptoQwen14BExecutor(ModelExecutor):
             from pypto.runtime.distributed_runner import _load_generated_module  # noqa: PLC0415
             from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
 
-            # Compile final_rms and lm_head as ChipCallable.
+            # Compile final_rms, lm_head, and baseline decode as ChipCallable.
             final_rms_chip_callable, _ = compile_and_assemble(
                 final_rms.output_dir, _rc.platform,
             )
             lm_head_chip_callable, _ = compile_and_assemble(
                 lm_head.output_dir, _rc.platform,
+            )
+            decode_chip_callable, _ = compile_and_assemble(
+                decode.output_dir, _rc.platform,
             )
 
             # Pre-extract gen_chunked setup artifacts.
@@ -682,6 +687,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             gen_chunked_param_infos=gen_chunked_param_infos,
             final_rms_chip_callable=final_rms_chip_callable,
             lm_head_chip_callable=lm_head_chip_callable,
+            decode_chip_callable=decode_chip_callable,
         )
 
     @staticmethod
@@ -836,6 +842,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
         for k, v in compiled.stacked_weights.items():
             sm_sw[k] = v.share_memory_() if not v.is_shared() else v
 
+        # Baseline decode weights in shared memory (for direct baseline chip callable).
+        sm_dw = {}
+        for k, v in compiled.decode_weights.items():
+            sm_dw[k] = v.share_memory_() if not v.is_shared() else v
+
         # ── Sub-worker callable ──
         # Runs in a forked child process. Reads logits → argmax → embedding lookup
         # → writes decode_hidden_buf / decode_seq_lens / decode_slot_mapping_buf.
@@ -940,6 +951,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
         # Extract individual chip callables for direct submit_next_level.
         _prefill_all_cc = gc_chip_callables.get("qwen3_prefill_all")
         _decode_all_cc = gc_chip_callables.get("qwen3_decode_all")
+        # Prefer baseline decode chip callable (better compiler optimization).
+        _baseline_decode_cc = compiled.decode_chip_callable
 
         def _submit_gen_chunked(orch, config, tensors_dict, _keep):
             """Submit one gen_chunked entry_fn call (dispatches all-layers L2 tasks)."""
@@ -952,16 +965,24 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
 
         def _submit_decode_direct(orch, config, _keep):
-            """Submit qwen3_decode_all directly via submit_next_level,
-            bypassing the generated host_orch indirection."""
+            """Submit baseline decode kernel directly via submit_next_level.
+
+            Uses the baseline qwen3_decode Opaque chip callable (same kernel
+            that achieves ~2424ms/step) instead of gen_chunked's decode_all.
+            Parameter order matches qwen3_14b_decode_full.py::qwen3_decode.
+            """
+            _cc = _baseline_decode_cc or _decode_all_cc
+            _w = sm_dw if _baseline_decode_cc is not None else sm_sw
+            # Baseline weight keys have "decode_" prefix; gen_chunked doesn't.
+            _pfx = "decode_" if _baseline_decode_cc is not None else ""
             ta = TaskArgs()
             ta.add_tensor(make_tensor_arg(decode_hidden_buf), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["input_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wq"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wk"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wv"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["q_norm_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["k_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}input_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wq"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wk"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wv"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}q_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}k_norm_weight"]), TensorArgType.INPUT)
             ta.add_tensor(make_tensor_arg(decode_seq_lens), TensorArgType.INPUT)
             ta.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
             ta.add_tensor(make_tensor_arg(decode_slot_mapping_buf), TensorArgType.INPUT)
@@ -969,14 +990,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
             ta.add_tensor(make_tensor_arg(rope_sin), TensorArgType.INPUT)
             ta.add_tensor(make_tensor_arg(k_cache_all), TensorArgType.INOUT)
             ta.add_tensor(make_tensor_arg(v_cache_all), TensorArgType.INOUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wo"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["post_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_gate"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_up"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_down"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wo"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}post_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_gate"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_up"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_down"]), TensorArgType.INPUT)
             ta.add_tensor(make_tensor_arg(decode_out), TensorArgType.OUTPUT_EXISTING)
             _keep.append(ta)
-            orch.submit_next_level(_decode_all_cc, ta, config)
+            orch.submit_next_level(_cc, ta, config)
 
         def _submit_prefill_direct(orch, config, _keep):
             """Submit qwen3_prefill_all directly via submit_next_level."""
@@ -1096,7 +1117,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _t_anchors[1] = _t_pf
             if _l3_trace_enabled:
                 print(f"[L3-step] prefill submit_start {_fmt_rel(_t_pf)}", flush=True)
-            if _prefill_all_cc is not None and _decode_all_cc is not None:
+            _has_direct_cc = (_prefill_all_cc is not None
+                              and (_baseline_decode_cc is not None or _decode_all_cc is not None))
+            if _has_direct_cc:
                 _submit_prefill_direct(orch, call_config, _keep)
                 _submit_decode_direct(orch, call_config, _keep)
             else:
@@ -1119,7 +1142,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             # decode_hidden_buf is updated by sample_and_prepare_fn (sub-worker)
             # with the embedding of the newly sampled token before each step.
             for step in range(max_new_tokens):
-                if _decode_all_cc is not None:
+                if _baseline_decode_cc is not None or _decode_all_cc is not None:
                     _submit_decode_direct(orch, call_config, _keep)
                 else:
                     td = _build_full_tensors(is_prefill=False, decode_in_tensor=decode_hidden_buf)
