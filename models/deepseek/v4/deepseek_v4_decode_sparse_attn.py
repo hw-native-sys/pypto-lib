@@ -337,6 +337,10 @@ def golden_deepseek_v4_decode_sparse_attn_with_proj(tensors):
     wo_a = tensors["wo_a"].float()
     wo_b = tensors["wo_b"].float()
 
+    def _to_device_bf16(value):
+        rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
+        return rounded.view(torch.float32).to(torch.bfloat16)
+
     o = torch.zeros(T, H, HEAD_DIM)
 
     for b in range(B):
@@ -375,23 +379,39 @@ def golden_deepseek_v4_decode_sparse_attn_with_proj(tensors):
         denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
         o[b] = oi_num / denom
 
-    rope_lo = o[..., NOPE_DIM : NOPE_DIM + HALF_ROPE]
-    rope_hi = o[..., NOPE_DIM + HALF_ROPE :]
+    attn_stage = _to_device_bf16(o)
+    rope_lo = attn_stage[..., NOPE_DIM : NOPE_DIM + HALF_ROPE].float()
+    rope_hi = attn_stage[..., NOPE_DIM + HALF_ROPE :].float()
     cos_lo = cos[:, :HALF_ROPE].unsqueeze(1)
     cos_hi = cos[:, HALF_ROPE:].unsqueeze(1)
     sin_lo = sin[:, :HALF_ROPE].unsqueeze(1)
     sin_hi = sin[:, HALF_ROPE:].unsqueeze(1)
     inv_lo = rope_lo * cos_lo + rope_hi * sin_lo
     inv_hi = rope_hi * cos_hi - rope_lo * sin_hi
-    o = torch.cat([o[..., :NOPE_DIM], inv_lo, inv_hi], dim=-1).to(torch.bfloat16)
+    o = torch.cat(
+        [attn_stage[..., :NOPE_DIM], _to_device_bf16(inv_lo), _to_device_bf16(inv_hi)],
+        dim=-1,
+    )
 
     seq_per_batch = T // B
     o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
-    o_r = o_r.to(torch.bfloat16).float()
-    out = o_r.flatten(2).view(T, O_GROUPS * O_LORA) @ wo_b.T
+    o_r = torch.zeros(B, seq_per_batch, O_GROUPS, O_LORA, dtype=torch.float32)
+    for g in range(O_GROUPS):
+        for n0 in range(0, O_LORA, A_N_CHUNK):
+            acc = o_model[:, :, g, 0:A_K_CHUNK] @ wo_a[g, n0:n0 + A_N_CHUNK, 0:A_K_CHUNK].T
+            for k0 in range(A_K_CHUNK, O_GROUP_IN, A_K_CHUNK):
+                acc += o_model[:, :, g, k0:k0 + A_K_CHUNK] @ wo_a[g, n0:n0 + A_N_CHUNK, k0:k0 + A_K_CHUNK].T
+            o_r[:, :, g, n0:n0 + A_N_CHUNK] = acc
+    o_r_flat = _to_device_bf16(o_r).float().flatten(2).view(T, O_GROUPS * O_LORA)
 
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
+    out = torch.zeros(T, D, dtype=torch.float32)
+    for n0 in range(0, D, B_N_CHUNK):
+        acc = o_r_flat[:, 0:B_K_CHUNK] @ wo_b[n0:n0 + B_N_CHUNK, 0:B_K_CHUNK].T
+        for k0 in range(B_K_CHUNK, O_GROUPS * O_LORA, B_K_CHUNK):
+            acc += o_r_flat[:, k0:k0 + B_K_CHUNK] @ wo_b[n0:n0 + B_N_CHUNK, k0:k0 + B_K_CHUNK].T
+        out[:, n0:n0 + B_N_CHUNK] = acc
+
+    tensors["attn_out"][:] = _to_device_bf16(out)
 
 
 def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):

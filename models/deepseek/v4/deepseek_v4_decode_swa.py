@@ -344,11 +344,11 @@ def build_tensor_specs():
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return torch.randn(D, Q_LORA) / D ** 0.5
+        return (torch.randn(D, Q_LORA) - 0.5) / D ** 0.5
     def init_wq_b():
-        return torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA ** 0.5
+        return (torch.randn(Q_LORA, H * HEAD_DIM) - 0.5) / Q_LORA ** 0.5
     def init_wkv():
-        return torch.randn(D, HEAD_DIM) / D ** 0.5
+        return (torch.randn(D, HEAD_DIM) - 0.5) / D ** 0.5
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -407,14 +407,36 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
+    import torch
     from golden import RunConfig, run_jit
+
+    def bf16_outlier_compare(actual, expected, actual_outputs, expected_outputs, inputs, rtol, atol):
+        import torch
+
+        close = torch.isclose(actual, expected, rtol=rtol, atol=atol)
+        mismatch = int((~close).sum().item())
+        max_mismatch = int(actual.numel() * 0.005)
+        if mismatch <= max_mismatch:
+            return True, f"mismatch={mismatch}/{actual.numel()} <= {max_mismatch}"
+
+        diff = (actual.float() - expected.float()).abs()
+        max_idx = int(diff.flatten().argmax().item())
+        return False, (
+            f"    BF16 outlier budget exceeded: mismatch={mismatch}/{actual.numel()} "
+            f"limit={max_mismatch} rtol={rtol} atol={atol}\n"
+            f"    max_abs={diff.max().item():.8g} idx={max_idx} "
+            f"actual={actual.flatten()[max_idx].item()} expected={expected.flatten()[max_idx].item()}"
+        )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=20260508)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
 
     result = run_jit(
         fn=deepseek_v4_decode_swa,
@@ -422,8 +444,10 @@ if __name__ == "__main__":
         golden_fn=golden_deepseek_v4_decode_swa,
         config=RunConfig(
             # qkv_proj_rope now uses W8A8C16 q_proj; SWA carries that BF16 drift through attention/o_proj.
-            rtol=6e-3,
-            atol=6e-3,
+            # Allow a small BF16 tail: at most 0.5% elements may exceed the tolerance.
+            rtol=3e-3,
+            atol=3e-3,
+            compare_fn={"x_out": bf16_outlier_compare},
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

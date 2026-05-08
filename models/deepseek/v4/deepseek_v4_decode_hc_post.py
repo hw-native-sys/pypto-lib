@@ -94,7 +94,11 @@ def golden_deepseek_v4_decode_hc_post(tensors):
         for in_h in range(HC_MULT):
             y_row = y_row + residual[:, :, in_h, :] * comb[:, :, in_h, out_h:out_h + 1]
         y_fp32[:, :, out_h, :] = y_row
-    y = y_fp32.to(torch.bfloat16)
+    def _to_device_bf16(value):
+        rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
+        return rounded.view(torch.float32).to(torch.bfloat16)
+
+    y = _to_device_bf16(y_fp32)
 
     tensors["y"][:] = y
 
