@@ -26,19 +26,27 @@ ROPE_HALF   = ROPE_DIM // 2
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
 Q_LORA      = 1024             # flash:1024 pro:1536
 HEAD_CHUNK  = 64
+Q_PROJ_OUT_CHUNK = 128
 Q_LORA_TILE = 32
+Q_PROJ_CHUNK = 128
 EPS         = 1e-6
 # Derived constants for multi-function type annotations
 Q_BLOCKS      = Q_LORA // Q_LORA_TILE
+Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
 HEAD_GROUP    = 8
 assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
     "HEAD_BLOCKS must be divisible by HEAD_GROUP"
+HEAD_BLOCKS = (H * HEAD_DIM) // HEAD_CHUNK
+Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 HEAD_GROUP_BLOCKS = (H * HEAD_DIM) // (HEAD_CHUNK * HEAD_GROUP)
 D_CHUNK = 512
 Q_LORA_CHUNK = Q_LORA_TILE
 KV_CHUNK = 32
 D_BLOCKS = D // D_CHUNK
 KV_BLOCKS = HEAD_DIM // KV_CHUNK
+INT8_SCALE_MAX = 127.0
+INT8_AMAX_EPS = 1e-4
+QUANT_CHUNK = 256
 
 
 @pl.jit.inline
@@ -46,7 +54,8 @@ def deepseek_v4_decode_qkv_proj_rope(
     x:         pl.Tensor[[B, S, D],              pl.BF16],
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
-    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
     rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
@@ -54,7 +63,8 @@ def deepseek_v4_decode_qkv_proj_rope(
     gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
     q:         pl.Tensor[[T, H, HEAD_DIM],        pl.BF16],
     kv:        pl.Tensor[[T, HEAD_DIM],           pl.BF16],
-    qr:        pl.Tensor[[T, Q_LORA],             pl.BF16],
+    qr:        pl.Tensor[[T, Q_LORA],             pl.INT8],
+    qr_scale:  pl.Tensor[[T, 1],                  pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, D])
 
@@ -121,33 +131,54 @@ def deepseek_v4_decode_qkv_proj_rope(
             qr_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_chunk)
             qr_fp32 = pl.assemble(qr_fp32, qr_normed, [0, qr_norm_col0])
 
-    # NOTE: Stage 2.2 must follow normalization, because qr_fp32 now stores
-    # normalized values (after the pl.assemble above). Reordering these
-    # blocks would cast un-normalized accumulators and corrupt q_proj.
-    # Stage 2.2: pre-cast qr for split AIV->AIC flow.
+    # Stage 2.2: pre-cast normalized qr for the W8A8 dynamic activation path.
+    qr_bf16 = pl.create_tensor([T, Q_LORA], dtype=pl.BF16)
     for qb in pl.parallel(0, Q_BLOCKS, 1):
         with pl.at(level=pl.Level.CORE_GROUP):
             qr_store_col0 = qb * Q_LORA_CHUNK
             qr_chunk_fp32 = pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, qr_store_col0])
-            qr = pl.assemble(qr, pl.cast(qr_chunk_fp32, target_type=pl.BF16), [0, qr_store_col0])
+            qr_bf16 = pl.assemble(qr_bf16, pl.cast(qr_chunk_fp32, target_type=pl.BF16), [0, qr_store_col0])
 
-    # Stage 3: q_proj = qr @ wq_b (matmul + matmul_acc)
+    # Stage 2.3: W8A8C16 activation path: quantize normalized qr per token.
+    qr_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP):
+        qr_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for q0 in pl.range(0, Q_LORA, QUANT_CHUNK):
+            qr_a_f32 = pl.cast(pl.slice(qr_bf16, [T, QUANT_CHUNK], [0, q0]), target_type=pl.FP32)
+            qr_a_abs = pl.maximum(qr_a_f32, pl.neg(qr_a_f32))
+            qr_a_max = pl.reshape(pl.row_max(qr_a_abs), [1, T])
+            qr_amax = pl.maximum(qr_amax, qr_a_max)
+        qr_scale_quant_row = pl.div(pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_amax)
+        qr_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T, 1])
+        qr_scale = pl.assemble(qr_scale, qr_scale_dq, [0, 0])
+        qr_scale_quant = pl.reshape(qr_scale_quant_row, [T, 1])
+        for q1 in pl.range(0, Q_LORA, QUANT_CHUNK):
+            qr_q_f32 = pl.cast(pl.slice(qr_bf16, [T, QUANT_CHUNK], [0, q1]), target_type=pl.FP32)
+            qr_q_scaled = pl.row_expand_mul(qr_q_f32, qr_scale_quant)
+            qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="round")
+            qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
+            qr = pl.assemble(qr, pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc"), [0, q1])
+
+    # Stage 3: W8A8C16 q_proj = qr_i8 @ wq_b, then dequantize to FP32.
     q_proj_fp32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.FP32)
-    for hgb in pl.parallel(0, HEAD_GROUP_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-            for hi in pl.range(HEAD_GROUP):
-                hb = hgb * HEAD_GROUP + hi
-                h0 = hb * HEAD_CHUNK
-                q0_0 = 0
-                qr_bf_0 = pl.slice(qr, [T, Q_LORA_CHUNK], [0, q0_0])
-                wq_0 = pl.slice(wq_b, [Q_LORA_CHUNK, HEAD_CHUNK], [q0_0, h0])
-                col_acc = pl.matmul(qr_bf_0, wq_0, out_dtype=pl.FP32)
-                for qb in pl.range(1, Q_BLOCKS):
-                    qr_proj_col0 = qb * Q_LORA_CHUNK
-                    qr_bf16_chunk = pl.slice(qr, [T, Q_LORA_CHUNK], [0, qr_proj_col0])
-                    wq_chunk = pl.slice(wq_b, [Q_LORA_CHUNK, HEAD_CHUNK], [qr_proj_col0, h0])
-                    col_acc = pl.matmul_acc(col_acc, qr_bf16_chunk, wq_chunk)
-                q_proj_fp32 = pl.assemble(q_proj_fp32, col_acc, [0, h0])
+    for hb in pl.parallel(0, Q_PROJ_HEAD_BLOCKS, 1):
+        h0 = hb * Q_PROJ_OUT_CHUNK
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qproj_matmul", optimization=pl.chunked_loop_optimizer):
+            q0_0 = 0
+            qr_i8_0 = pl.slice(qr, [T, Q_PROJ_CHUNK], [0, q0_0])
+            wq_0 = pl.slice(wq_b, [Q_PROJ_CHUNK, Q_PROJ_OUT_CHUNK], [q0_0, h0])
+            col_acc = pl.matmul(qr_i8_0, wq_0, out_dtype=pl.INT32)
+            for qb in pl.range(1, Q_PROJ_BLOCKS):
+                qr_proj_col0 = qb * Q_PROJ_CHUNK
+                qr_i8_chunk = pl.slice(qr, [T, Q_PROJ_CHUNK], [0, qr_proj_col0])
+                wq_chunk = pl.slice(wq_b, [Q_PROJ_CHUNK, Q_PROJ_OUT_CHUNK], [qr_proj_col0, h0])
+                col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qproj_dequant", optimization=pl.chunked_loop_optimizer):
+            col_fp32 = pl.cast(col_acc, target_type=pl.FP32, mode="none")
+            w_scale = pl.slice(wq_b_scale, [1, Q_PROJ_OUT_CHUNK], [hb, 0])
+            col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_dq), w_scale)
+            q_proj_fp32 = pl.assemble(q_proj_fp32, col_dequant, [0, h0])
 
     # Stage 4: per-head RMSNorm + RoPE on q
     q_flat = pl.reshape(q, [T, H * HEAD_DIM])
@@ -248,7 +279,8 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     x:         pl.Tensor[[B, S, D],              pl.BF16],
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
-    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
     rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
@@ -256,9 +288,12 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
     q:         pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
     kv:        pl.Out[pl.Tensor[[T, HEAD_DIM],    pl.BF16]],
-    qr:        pl.Out[pl.Tensor[[T, Q_LORA],      pl.BF16]],
+    qr:        pl.Out[pl.Tensor[[T, Q_LORA],      pl.INT8]],
+    qr_scale:  pl.Out[pl.Tensor[[T, 1],           pl.FP32]],
 ):
-    q = deepseek_v4_decode_qkv_proj_rope(x, norm_w, wq_a, wq_b, wkv, rope_cos, rope_sin, gamma_cq, gamma_ckv, q, kv, qr)
+    q = deepseek_v4_decode_qkv_proj_rope(
+        x, norm_w, wq_a, wq_b, wq_b_scale, wkv, rope_cos, rope_sin, gamma_cq, gamma_ckv, q, kv, qr, qr_scale
+    )
     return q
 
 
@@ -269,12 +304,26 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
     x         = tensors["x"].float()              # [B, S, D]
     norm_w    = tensors["norm_w"].float()          # [D]
     wq_a      = tensors["wq_a"].float()
-    wq_b      = tensors["wq_b"].float()
+    wq_b      = tensors["wq_b"]
+    wq_b_scale = tensors["wq_b_scale"].float().view(-1)
     wkv       = tensors["wkv"].float()
     rope_cos  = tensors["rope_cos"].float()
     rope_sin  = tensors["rope_sin"].float()
     gamma_cq  = tensors["gamma_cq"].float()
     gamma_ckv = tensors["gamma_ckv"].float()
+
+    def round_half_away_from_zero(x):
+        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+    def int8_quant_per_row(x):
+        rows = x.reshape(-1, x.shape[-1]).float()
+        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = rows * scale_quant
+        out_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        out_half = out_i32.to(torch.float16)
+        out_i8 = out_half.to(torch.int8)
+        return out_i8.reshape_as(x), (1.0 / scale_quant).reshape(*x.shape[:-1], 1)
 
     def rms_norm(x, gamma, eps=EPS):
         inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -308,9 +357,12 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
 
     # Q path
     qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
-    # W8A8C16: wq_b W8 per-channel int8; qr_out A8 per-token int8.
+    # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
-    q_full = matmul_bf16_input_fp32(qr_out, wq_b).view(T, H, HEAD_DIM)   # [T, H, HEAD_DIM]
+    qr_out_bf16 = qr_out.to(torch.bfloat16)
+    qr_i8, qr_scale = int8_quant_per_row(qr_out_bf16.float())
+    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
+    q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(T, H, HEAD_DIM)
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
     q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
     q_nope = q_full[..., :NOPE_DIM]
@@ -326,21 +378,34 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
 
     tensors["q"][:]  = q_out.to(torch.bfloat16)
     tensors["kv"][:] = kv_out.to(torch.bfloat16)
-    tensors["qr"][:] = qr_out.to(torch.bfloat16)
+    tensors["qr"][:] = qr_i8
+    tensors["qr_scale"][:] = qr_scale
 
 
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
+    def round_half_away_from_zero(x):
+        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+    def quant_w_per_output_channel(w):
+        amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = w.float() * scale_quant.view(1, H * HEAD_DIM)
+        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+        w_i8 = w_i32.to(torch.float16).to(torch.int8)
+        return w_i8, (1.0 / scale_quant).float()
+
     def init_x():
-        return torch.randn(B, S, D) * 0.02
+        return (torch.randn(B, S, D) - 0.5)
     def init_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return torch.randn(D, Q_LORA) / (D ** 0.5)
+        return (torch.randn(D, Q_LORA) - 0.5) / (D ** 0.5)
     def init_wq_b():
-        return torch.randn(Q_LORA, H * HEAD_DIM) / (Q_LORA ** 0.5)
+        return (torch.randn(Q_LORA, H * HEAD_DIM) - 0.5) / ((H * HEAD_DIM) ** 0.5)
     def init_wkv():
         return torch.randn(D, HEAD_DIM) / (D ** 0.5)
     def init_cos():
@@ -352,11 +417,16 @@ def build_tensor_specs():
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
 
+    wq_b_bf16 = init_wq_b().to(torch.bfloat16)
+    wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
+    wq_b_scale = wq_b_scale.view(Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK)
+
     return [
         TensorSpec("x",         [B, S, D],              torch.bfloat16, init_value=init_x),
         TensorSpec("norm_w",    [D],                    torch.float32,  init_value=init_norm_w),
         TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.bfloat16, init_value=init_wq_b),
+        TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b_scale", [Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
@@ -364,13 +434,22 @@ def build_tensor_specs():
         TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),
         TensorSpec("kv",        [T, HEAD_DIM],          torch.bfloat16, is_output=True),
-        TensorSpec("qr",        [T, Q_LORA],            torch.bfloat16, is_output=True),
+        TensorSpec("qr",        [T, Q_LORA],            torch.int8,     is_output=True),
+        TensorSpec("qr_scale",  [T, 1],                 torch.float32,  is_output=True),
     ]
 
 
 if __name__ == "__main__":
     import argparse
     from golden import RunConfig, run_jit
+
+    def int8_lsb_compare(actual, expected, actual_outputs, expected_outputs, inputs, rtol, atol):
+        import torch
+
+        diff = torch.abs(actual.to(torch.int16) - expected.to(torch.int16))
+        if torch.max(diff) <= 1:
+            return True, ""
+        return False, "max INT8 diff > 1"
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -384,10 +463,10 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_qkv_proj_rope,
         config=RunConfig(
-            # Tightened after fixing KV RoPE gamma_ckv application.
-            # On-board a2a3 validation still shows small q-path BF16 drift at 5e-3.
-            rtol=6e-3,
-            atol=6e-3,
+            # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
+            rtol=5e-3,
+            atol=5e-3,
+            compare_fn={"qr": int8_lsb_compare},
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

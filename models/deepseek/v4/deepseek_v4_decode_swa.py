@@ -19,9 +19,8 @@ import pypto.language as pl
 
 from deepseek_v4_decode_hc_pre import deepseek_v4_decode_hc_pre
 from deepseek_v4_decode_hc_post import deepseek_v4_decode_hc_post
-from deepseek_v4_decode_o_proj import deepseek_v4_decode_o_proj
 from deepseek_v4_decode_qkv_proj_rope import deepseek_v4_decode_qkv_proj_rope
-from deepseek_v4_decode_sparse_attn import deepseek_v4_decode_sparse_attn
+from deepseek_v4_decode_sparse_attn import deepseek_v4_decode_sparse_attn_with_proj
 
 
 B = 16  # demo 4
@@ -35,8 +34,12 @@ HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 Q_LORA = 1024  # flash:1024 pro:1536
+Q_PROJ_OUT_CHUNK = 128
+Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 WIN = 128
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
+INT8_SCALE_MAX = 127.0
+INT8_AMAX_EPS = 1e-4
 
 HC_MULT = 4
 MIX_HC = (2 + HC_MULT) * HC_MULT
@@ -56,9 +59,9 @@ MAX_BLOCKS = ORI_MAX_BLOCKS                                # SWA: only ori, no c
 BLOCK_NUM = B * MAX_BLOCKS
 
 TOPK = WIN                                                 # SWA: sparse_attn topk = window only
-SPARSE_IDX_TOPK = 1024
+SPARSE_IDX_TOPK = 512
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-SPARSE_CMP_MAX_BLOCKS = 8
+SPARSE_CMP_MAX_BLOCKS = 64
 SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 
 START_POS = 3  # default for ScalarSpec; >0 (decode); SWA path has no compression-related constraint
@@ -74,7 +77,8 @@ def deepseek_v4_decode_swa(
     # qkv_proj_rope weights
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -85,7 +89,7 @@ def deepseek_v4_decode_swa(
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B, 1], pl.INT32],
+    seqused_kv: pl.Tensor[[B], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
@@ -124,12 +128,14 @@ def deepseek_v4_decode_swa(
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.BF16)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     q = deepseek_v4_decode_qkv_proj_rope(
         x_mixed,
         attn_norm_w,
         wq_a,
         wq_b,
+        wq_b_scale,
         wkv,
         rope_cos_t,
         rope_sin_t,
@@ -138,6 +144,7 @@ def deepseek_v4_decode_swa(
         q,
         kv,
         qr,
+        qr_scale,
     )
 
     kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -169,8 +176,8 @@ def deepseek_v4_decode_swa(
     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
         cmp_block_table_dummy = pl.full([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
 
-    o = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    o = deepseek_v4_decode_sparse_attn(
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    deepseek_v4_decode_sparse_attn_with_proj(
         q,
         kv_cache,
         block_table,
@@ -181,11 +188,11 @@ def deepseek_v4_decode_swa(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
-        o,
+        wo_a,
+        wo_b,
+        attn_out,
     )
 
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = deepseek_v4_decode_o_proj(o, wo_a, wo_b, attn_out)
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
     x_out = deepseek_v4_decode_hc_post(
@@ -206,8 +213,7 @@ def golden_deepseek_v4_decode_swa(tensors):
 
     from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
     from deepseek_v4_decode_qkv_proj_rope import golden_deepseek_v4_decode_qkv_proj_rope
-    from deepseek_v4_decode_sparse_attn import golden_deepseek_v4_decode_sparse_attn
-    from deepseek_v4_decode_o_proj import golden_deepseek_v4_decode_o_proj
+    from deepseek_v4_decode_sparse_attn import golden_deepseek_v4_decode_sparse_attn_with_proj
     from deepseek_v4_decode_hc_post import golden_deepseek_v4_decode_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
@@ -243,12 +249,14 @@ def golden_deepseek_v4_decode_swa(tensors):
     # q + win kv (model.py:495-504)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
-    qr = torch.zeros(T, Q_LORA, dtype=torch.bfloat16)
+    qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
+    qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     golden_deepseek_v4_decode_qkv_proj_rope({
         "x": x_mixed,
         "norm_w": tensors["attn_norm_w"],
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
+        "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
         "rope_cos": rope_cos_T,
         "rope_sin": rope_sin_T,
@@ -257,6 +265,7 @@ def golden_deepseek_v4_decode_swa(tensors):
         "q": q,
         "kv": kv,
         "qr": qr,                                                              # qr unused on SWA path
+        "qr_scale": qr_scale,
     })
 
     # window topk only (model.py:507; ratio==0 skips lines 508-514)
@@ -276,10 +285,10 @@ def golden_deepseek_v4_decode_swa(tensors):
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     sparse_topk[:, :WIN] = topk_idxs
     seqused_kv = tensors["seqused_kv"]
-    o = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
+    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     cmp_kv_dummy = torch.zeros(SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-    golden_deepseek_v4_decode_sparse_attn({
+    golden_deepseek_v4_decode_sparse_attn_with_proj({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
@@ -287,16 +296,9 @@ def golden_deepseek_v4_decode_swa(tensors):
         "cmp_block_table": cmp_block_table_dummy,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": seqused_kv,
+        "seqused_kv": seqused_kv.view(B),
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
-        "o": o,
-    })
-
-    # o_proj (model.py:537-542)
-    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_o_proj({
-        "o": o,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "attn_out": attn_out,
@@ -318,6 +320,18 @@ def golden_deepseek_v4_decode_swa(tensors):
 def build_tensor_specs():
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
+
+    def round_half_away_from_zero(x):
+        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
+
+    def quant_w_per_output_channel(w):
+        amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = w.float() * scale_quant.view(1, H * HEAD_DIM)
+        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+        w_i8 = w_i32.to(torch.float16).to(torch.int8)
+        return w_i8, (1.0 / scale_quant).float()
 
     def init_x_hc():
         return torch.randn(B, S, HC_MULT, D) * 0.05
@@ -356,11 +370,15 @@ def build_tensor_specs():
     def init_attn_sink():
         return torch.zeros(H)
     def init_seqused_kv():
-        return torch.full((B, 1), min(WIN, START_POS + 1), dtype=torch.int32)
+        return torch.full((B,), min(WIN, START_POS + 1), dtype=torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
         return torch.randn(D, O_GROUPS * O_LORA) / (O_GROUPS * O_LORA) ** 0.5
+
+    wq_b_bf16 = init_wq_b().to(torch.bfloat16)
+    wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
+    wq_b_scale = wq_b_scale.view(Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK)
 
     return [
         TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
@@ -369,7 +387,8 @@ def build_tensor_specs():
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
         TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.bfloat16, init_value=init_wq_b),
+        TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b_scale", [Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
@@ -378,7 +397,7 @@ def build_tensor_specs():
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B, 1], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
@@ -402,8 +421,9 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_swa,
         config=RunConfig(
-            rtol=7e-3,
-            atol=7e-3,
+            # qkv_proj_rope now uses W8A8C16 q_proj; SWA carries that BF16 drift through attention/o_proj.
+            rtol=6e-3,
+            atol=6e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
