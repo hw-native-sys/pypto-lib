@@ -138,7 +138,8 @@ jobs:
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
+            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
@@ -155,6 +156,9 @@ jobs:
   a2a3:
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 30
+    concurrency:
+      group: a2a3-serial
+      cancel-in-progress: false
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
@@ -208,6 +212,8 @@ jobs:
             echo "Cache hit — updating pypto"
             git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD
             git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+            git -C "$PYPTO_SRC" clean -ffdx
+            git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
           else
             echo "Cache miss — cloning pypto"
             git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"
@@ -242,6 +248,7 @@ jobs:
             mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
           else
             echo "Cache hit — using $CACHE_ARCHIVE"
+            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -
           fi
           mkdir -p "$GITHUB_WORKSPACE/ptoas-bin"
           tar -xzf "$CACHE_ARCHIVE" -C "$GITHUB_WORKSPACE/ptoas-bin"
@@ -250,7 +257,8 @@ jobs:
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
+            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
           cd $GITHUB_WORKSPACE/pto-isa
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
