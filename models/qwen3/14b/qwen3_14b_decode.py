@@ -675,6 +675,7 @@ def build_tensor_specs(
     max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_blocks = batch * max_blocks_per_seq
     cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
+    synthetic_proj_scale = 0.5
 
     if use_max_seq:
         seq_lens_seed = torch.full((batch,), max_seq, dtype=torch.int32)
@@ -694,7 +695,7 @@ def build_tensor_specs(
         return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_wv():
-        return torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
+        return synthetic_proj_scale * torch.rand(hidden_size, kv_hidden) / hidden_size ** 0.5
 
     def init_q_norm_weight():
         return torch.ones(1, head_dim)
@@ -728,22 +729,22 @@ def build_tensor_specs(
         return torch.rand(cache_rows, head_dim) - 0.5
 
     def init_v_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
+        return synthetic_proj_scale * (torch.rand(cache_rows, head_dim) - 0.5)
 
     def init_wo():
-        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
+        return synthetic_proj_scale * (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
     def init_post_rms_weight():
         return torch.ones(1, hidden_size)
 
     def init_w_gate():
-        return (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
+        return synthetic_proj_scale * (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
 
     def init_w_up():
-        return (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
+        return synthetic_proj_scale * (torch.rand(hidden_size, inter) - 0.5) / hidden_size ** 0.5
 
     def init_w_down():
-        return (torch.rand(inter, hidden_size) - 0.5) / inter ** 0.5
+        return synthetic_proj_scale * (torch.rand(inter, hidden_size) - 0.5) / inter ** 0.5
 
     return [
         TensorSpec("hidden_states", [batch, hidden_size], torch.bfloat16,
@@ -828,6 +829,25 @@ def golden_qwen3_decode(tensors):
     eps = 1e-6
     max_ctx_blocks = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
 
+    def tiled_matmul(lhs, rhs, k_chunk, n_chunk):
+        out = torch.zeros(lhs.shape[0], rhs.shape[1], dtype=torch.float32)
+        for n0 in range(0, rhs.shape[1], n_chunk):
+            acc = torch.zeros(lhs.shape[0], n_chunk, dtype=torch.float32)
+            for k0 in range(0, lhs.shape[1], k_chunk):
+                acc = acc + lhs[:, k0 : k0 + k_chunk].float() @ rhs[
+                    k0 : k0 + k_chunk,
+                    n0 : n0 + n_chunk,
+                ].float()
+            out[:, n0 : n0 + n_chunk] = acc
+        return out
+
+    def chunked_row_sq_sum(x, k_chunk):
+        acc = torch.zeros(x.shape[0], 1, dtype=torch.float32)
+        for k0 in range(0, x.shape[1], k_chunk):
+            x_chunk = x[:, k0 : k0 + k_chunk]
+            acc = acc + (x_chunk * x_chunk).sum(dim=-1, keepdim=True)
+        return acc
+
     q_proj = torch.zeros(batch, hidden_size, dtype=torch.float32)
     k_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
     v_proj = torch.zeros(batch, kv_hidden, dtype=torch.float32)
@@ -844,9 +864,9 @@ def golden_qwen3_decode(tensors):
         rms = torch.sqrt(variance)
         normed = (x_tile / rms * input_rms_weight.float()).bfloat16()
 
-        q_proj[b0:b_end, :] = (normed.float() @ wq.float()).float()
-        k_proj[b0:b_end, :] = (normed.float() @ wk.float()).float()
-        v_proj[b0:b_end, :] = (normed.float() @ wv.float()).float()
+        q_proj[b0:b_end, :] = tiled_matmul(normed, wq, INPUT_PROJ_K_CHUNK, Q_OUT_CHUNK)
+        k_proj[b0:b_end, :] = tiled_matmul(normed, wk, KV_PROJ_K_CHUNK, KV_OUT_CHUNK)
+        v_proj[b0:b_end, :] = tiled_matmul(normed, wv, KV_PROJ_K_CHUNK, KV_OUT_CHUNK)
 
     attn_out = torch.zeros(batch, hidden_size, dtype=torch.bfloat16)
 
@@ -936,17 +956,17 @@ def golden_qwen3_decode(tensors):
 
         attn_out[b : b + 1, :] = attn_row
 
-    o_proj = torch.matmul(attn_out.float(), wo.float())
+    o_proj = tiled_matmul(attn_out, wo, OUT_PROJ_K_CHUNK, OUT_PROJ_N_CHUNK)
     resid1 = o_proj + hidden_states.float()
 
-    variance = resid1.pow(2).mean(dim=-1, keepdim=True)
+    variance = chunked_row_sq_sum(resid1, K_CHUNK) / hidden_size
     inv_rms = torch.rsqrt(variance + eps)
     normed_bf16 = (resid1 * inv_rms * post_rms_weight).bfloat16()
 
-    gate = torch.matmul(normed_bf16.float(), w_gate.float())
-    up = torch.matmul(normed_bf16.float(), w_up.float())
+    gate = tiled_matmul(normed_bf16, w_gate, K_CHUNK, MLP_OUT_CHUNK)
+    up = tiled_matmul(normed_bf16, w_up, K_CHUNK, MLP_OUT_CHUNK)
     mlp_bf16 = (gate * torch.sigmoid(gate) * up).bfloat16()
-    down = torch.matmul(mlp_bf16.float(), w_down.float())
+    down = tiled_matmul(mlp_bf16, w_down, DOWN_MLP_CHUNK, DOWN_OUT_CHUNK)
 
     tensors["out"][:] = (down + resid1).bfloat16()
 
