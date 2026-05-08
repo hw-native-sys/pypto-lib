@@ -602,7 +602,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             gc_runtime_name = "tensormap_and_ringbuffer"
             gc_next_levels_dir = gc_output_dir / "next_levels"
             for func in gen_chunked._program.functions.values():
-                if func.func_type == FunctionType.Orchestration:
+                if func.func_type in (FunctionType.Orchestration, FunctionType.Opaque):
                     chip_dir = gc_next_levels_dir / func.name
                     if chip_dir.exists():
                         cc, gc_runtime_name = compile_and_assemble(
@@ -880,7 +880,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             t0 = float(_t_anchors[0].item())
             t_prev = float(_t_anchors[1].item())
             if t0 <= 0.0:
-                return f"t=+0.000ms (Δ+0.000ms)"
+                return "t=+0.000ms (Δ+0.000ms)"
             rel_ms = (t_now - t0) * 1000.0
             d_ms = (t_now - t_prev) * 1000.0 if t_prev > 0.0 else 0.0
             _t_anchors[1] = t_now
@@ -937,6 +937,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
         final_rms_cc = compiled.final_rms_chip_callable
         lm_head_cc = compiled.lm_head_chip_callable
 
+        # Extract individual chip callables for direct submit_next_level.
+        _prefill_all_cc = gc_chip_callables.get("qwen3_prefill_all")
+        _decode_all_cc = gc_chip_callables.get("qwen3_decode_all")
+
         def _submit_gen_chunked(orch, config, tensors_dict, _keep):
             """Submit one gen_chunked entry_fn call (dispatches all-layers L2 tasks)."""
             gc_entry_fn(
@@ -946,6 +950,59 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 sub_ids=sub_ids,
                 _keep=_keep,
             )
+
+        def _submit_decode_direct(orch, config, _keep):
+            """Submit qwen3_decode_all directly via submit_next_level,
+            bypassing the generated host_orch indirection."""
+            ta = TaskArgs()
+            ta.add_tensor(make_tensor_arg(decode_hidden_buf), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["input_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wq"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wk"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wv"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["q_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["k_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(decode_seq_lens), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(decode_slot_mapping_buf), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rope_cos), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rope_sin), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(k_cache_all), TensorArgType.INOUT)
+            ta.add_tensor(make_tensor_arg(v_cache_all), TensorArgType.INOUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wo"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["post_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_gate"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_up"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_down"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(decode_out), TensorArgType.OUTPUT_EXISTING)
+            _keep.append(ta)
+            orch.submit_next_level(_decode_all_cc, ta, config)
+
+        def _submit_prefill_direct(orch, config, _keep):
+            """Submit qwen3_prefill_all directly via submit_next_level."""
+            ta = TaskArgs()
+            ta.add_tensor(make_tensor_arg(prefill_hidden), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(prefill_seq_lens), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["input_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wq"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wk"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wv"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["q_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["k_norm_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rope_cos), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(rope_sin), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(prefill_slot_mapping), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(k_cache_all), TensorArgType.INOUT)
+            ta.add_tensor(make_tensor_arg(v_cache_all), TensorArgType.INOUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["wo"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["post_rms_weight"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_gate"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_up"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(sm_sw["w_down"]), TensorArgType.INPUT)
+            ta.add_tensor(make_tensor_arg(prefill_out), TensorArgType.OUTPUT_EXISTING)
+            _keep.append(ta)
+            orch.submit_next_level(_prefill_all_cc, ta, config)
 
         def _submit_final_rms(orch, config, _keep):
             ta = TaskArgs()
@@ -1039,8 +1096,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _t_anchors[1] = _t_pf
             if _l3_trace_enabled:
                 print(f"[L3-step] prefill submit_start {_fmt_rel(_t_pf)}", flush=True)
-            td = _build_full_tensors(is_prefill=True, decode_in_tensor=decode_hidden_buf)
-            _submit_gen_chunked(orch, call_config, td, _keep)
+            if _prefill_all_cc is not None and _decode_all_cc is not None:
+                _submit_prefill_direct(orch, call_config, _keep)
+                _submit_decode_direct(orch, call_config, _keep)
+            else:
+                td = _build_full_tensors(is_prefill=True, decode_in_tensor=decode_hidden_buf)
+                _submit_gen_chunked(orch, call_config, td, _keep)
             if _l3_trace_enabled:
                 _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
 
@@ -1058,8 +1119,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
             # decode_hidden_buf is updated by sample_and_prepare_fn (sub-worker)
             # with the embedding of the newly sampled token before each step.
             for step in range(max_new_tokens):
-                td = _build_full_tensors(is_prefill=False, decode_in_tensor=decode_hidden_buf)
-                _submit_gen_chunked(orch, call_config, td, _keep)
+                if _decode_all_cc is not None:
+                    _submit_decode_direct(orch, call_config, _keep)
+                else:
+                    td = _build_full_tensors(is_prefill=False, decode_in_tensor=decode_hidden_buf)
+                    _submit_gen_chunked(orch, call_config, td, _keep)
                 if _l3_trace_enabled:
                     _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
 

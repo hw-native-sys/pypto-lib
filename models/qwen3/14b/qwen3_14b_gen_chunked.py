@@ -126,7 +126,7 @@ def build_qwen3_14b_gen_chunked_program(
 
         # ── L2: per-layer prefill ──────────────────────────────────────────────
         # ── L2: all-layers prefill ─────────────────────────────────────────────
-        @pl.function(type=pl.FunctionType.Orchestration)
+        @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_prefill_all(
             self,
             hidden_states: pl.Tensor[[USER_BATCH_DYN, max_seq, hidden], pl.BF16],
@@ -712,7 +712,7 @@ def build_qwen3_14b_gen_chunked_program(
             return out
 
         # ── L2: all-layers decode ──────────────────────────────────────────────
-        @pl.function(type=pl.FunctionType.Orchestration)
+        @pl.function(type=pl.FunctionType.Opaque)
         def qwen3_decode_all(
             self,
             hidden_states: pl.Tensor[[USER_BATCH_DYN, hidden], pl.BF16],

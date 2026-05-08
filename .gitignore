@@ -13,3 +13,4 @@ pa_build/
 .cursor/
 .env/
 KNOWN_ISSUES.md
+*.log
