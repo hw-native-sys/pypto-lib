@@ -535,6 +535,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 num_heads=model.config.num_attention_heads,
                 num_kv_heads=model.config.num_key_value_heads,
                 head_dim=model.config.head_dim,
+                max_new_tokens=model.runtime.max_new_tokens,
+                padded_vocab=padded_vocab,
             )
             # pypto.runtime.run hard-codes DistributedConfig(block_dim=1), so we call
             # ir.compile directly to override it.
@@ -897,10 +899,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _t_anchors[1] = t_now
             return f"t=+{rel_ms:.2f}ms (Δ+{d_ms:.2f}ms)"
 
+        # Track when each sample_and_prepare finishes so we can split
+        # chip-task time vs sub-worker IPC + work time.
+        _sample_done_ts = [0.0]  # timestamp of last sample_and_prepare return
+
         def sample_and_prepare_fn(task_args):
             """Sub-worker: sample token from logits, prepare next decode inputs."""
             import time as _time  # noqa: PLC0415
-            _t_now = _time.perf_counter()
+            _t_enter = _time.perf_counter()
             if _done_flag[0].item():
                 return  # EOS already hit, no-op.
 
@@ -910,8 +916,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             step = int(_token_count[0].item())
             if _l3_trace_enabled:
+                _prev_done = _sample_done_ts[0]
+                chip_ms = (_t_enter - _prev_done) * 1000.0 if _prev_done > 0.0 else 0.0
                 print(
-                    f"[L3-step] step={step:02d} sample_callback {_fmt_rel(_t_now)}",
+                    f"[L3-step] step={step:02d} sample_enter {_fmt_rel(_t_enter)}"
+                    f"  chip_tasks={chip_ms:.1f}ms",
                     flush=True,
                 )
             _generated_ids[step] = token_id
@@ -919,10 +928,28 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             if _eos_id is not None and token_id == _eos_id:
                 _done_flag[0] = 1
+                _t_exit = _time.perf_counter()
+                _sample_done_ts[0] = _t_exit
+                if _l3_trace_enabled:
+                    work_ms = (_t_exit - _t_enter) * 1000.0
+                    print(
+                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
+                        f"  sample_work={work_ms:.1f}ms",
+                        flush=True,
+                    )
                 return
 
             if step + 1 >= max_new_tokens:
                 _done_flag[0] = 1
+                _t_exit = _time.perf_counter()
+                _sample_done_ts[0] = _t_exit
+                if _l3_trace_enabled:
+                    work_ms = (_t_exit - _t_enter) * 1000.0
+                    print(
+                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
+                        f"  sample_work={work_ms:.1f}ms",
+                        flush=True,
+                    )
                 return
 
             # Embedding lookup.
@@ -938,6 +965,16 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 slot_in_page = (new_seq_len - 1) % _page_size
                 if page_idx < len(alloc.page_ids):
                     _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
+
+            _t_exit = _time.perf_counter()
+            _sample_done_ts[0] = _t_exit
+            if _l3_trace_enabled:
+                work_ms = (_t_exit - _t_enter) * 1000.0
+                print(
+                    f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
+                    f"  sample_work={work_ms:.1f}ms",
+                    flush=True,
+                )
 
         # ── Build the orchestrator function ──
 
@@ -1068,16 +1105,23 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _keep.append(ta)
             orch.submit_sub(ts_cid, ta)
 
-        def _build_full_tensors(is_prefill, decode_in_tensor):
-            """Build the tensor dict for one gen_chunked dispatch (all layers)."""
-            prefill_in = prefill_hidden if is_prefill else dummy_prefill
+        _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
+
+        def _build_full_tensors():
+            """Build the tensor dict for the single gen_chunked dispatch.
+
+            host_orch now owns the full generation loop (prefill step 0 +
+            pl.unroll(max_new_tokens) decode steps), so this is called once.
+            has_prefill is always True: step 0 inside host_orch runs prefill_all
+            then the first decode; subsequent iterations run decode-only.
+            """
             td = {}
             for info, val in zip(gc_param_infos, [
-                prefill_in,  # prefill_hidden
-                prefill_seq_lens if is_prefill else decode_seq_lens,  # prefill_seq_lens
-                prefill_slot_mapping if is_prefill else dummy_slot_mapping,  # prefill_slot_mapping
-                decode_in_tensor,  # decode_hidden
-                prefill_seq_lens if is_prefill else decode_seq_lens,  # decode_seq_lens
+                prefill_hidden,           # prefill_hidden
+                prefill_seq_lens,         # prefill_seq_lens
+                prefill_slot_mapping,     # prefill_slot_mapping
+                decode_hidden_buf,        # decode_hidden
+                decode_seq_lens,          # decode_seq_lens (mutated by sample_and_prepare sub-worker)
                 decode_slot_mapping_buf,  # decode_slot_mapping
                 sm_sw["input_rms_weight"],
                 sm_sw["wq"],
@@ -1095,9 +1139,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 sm_sw["w_gate"],
                 sm_sw["w_up"],
                 sm_sw["w_down"],
-                torch.tensor(is_prefill, dtype=torch.bool).share_memory_(),
-                prefill_out if is_prefill else dummy_prefill_out,  # prefill_out
-                decode_out,
+                _has_prefill_tensor,      # has_prefill = True
+                prefill_out,              # prefill_out
+                decode_out,               # decode_out
+                rms_x,                    # rms_x  (shares storage with decode_out)
+                rms_gamma,                # final_norm_weight
+                rms_normed,               # rms_normed
+                lm_head_weight,           # lm_head_weight_t
+                logits_padded,            # logits_padded
             ]):
                 if not val.is_shared():
                     val = val.share_memory_()
@@ -1111,64 +1160,32 @@ class PyptoQwen14BExecutor(ModelExecutor):
             call_config.block_dim = gc_dc.block_dim
             call_config.aicpu_thread_num = gc_dc.aicpu_thread_num
 
-            # ── Step 0: Prefill (has_prefill=True) — single dispatch ──
             _t_pf = _time.perf_counter()
             _t_anchors[0] = _t_pf
             _t_anchors[1] = _t_pf
+            _sample_done_ts[0] = _t_pf  # baseline for step 0 chip_tasks measurement
             if _l3_trace_enabled:
-                print(f"[L3-step] prefill submit_start {_fmt_rel(_t_pf)}", flush=True)
-            _has_direct_cc = (_prefill_all_cc is not None
-                              and (_baseline_decode_cc is not None or _decode_all_cc is not None))
-            if _has_direct_cc:
-                _submit_prefill_direct(orch, call_config, _keep)
-                _submit_decode_direct(orch, call_config, _keep)
-            else:
-                td = _build_full_tensors(is_prefill=True, decode_in_tensor=decode_hidden_buf)
-                _submit_gen_chunked(orch, call_config, td, _keep)
-            if _l3_trace_enabled:
-                _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
+                print(f"[L3-step] host_orch submit_start {_fmt_rel(_t_pf)}", flush=True)
 
-            # decode_out and rms_x share _decode_out_storage, so final_rms can
-            # read rms_x directly after gen_chunked finishes — no copy needed.
-            _submit_final_rms(orch, call_config, _keep)
-            if _l3_trace_enabled:
-                _submit_ts(orch, ts_final_rms_cid, rms_normed, _keep)
-            _submit_lm_head(orch, call_config, _keep)
-            if _l3_trace_enabled:
-                _submit_ts(orch, ts_lm_head_cid, logits_padded, _keep)
-            _submit_sample(orch, sample_cid, _keep)
+            # Single dispatch: host_orch drives prefill + all decode steps
+            # (pl.unroll(max_new_tokens) inside host_orch).
+            td = _build_full_tensors()
+            _submit_gen_chunked(orch, call_config, td, _keep)
 
-            # ── Steps 1..max_new_tokens: Decode (has_prefill=False) — single dispatch each ──
-            # decode_hidden_buf is updated by sample_and_prepare_fn (sub-worker)
-            # with the embedding of the newly sampled token before each step.
-            for step in range(max_new_tokens):
-                if _baseline_decode_cc is not None or _decode_all_cc is not None:
-                    _submit_decode_direct(orch, call_config, _keep)
-                else:
-                    td = _build_full_tensors(is_prefill=False, decode_in_tensor=decode_hidden_buf)
-                    _submit_gen_chunked(orch, call_config, td, _keep)
-                if _l3_trace_enabled:
-                    _submit_ts(orch, ts_decode_cid, _decode_out_storage, _keep)
-
-                _submit_final_rms(orch, call_config, _keep)
-                if _l3_trace_enabled:
-                    _submit_ts(orch, ts_final_rms_cid, rms_normed, _keep)
-                _submit_lm_head(orch, call_config, _keep)
-                if _l3_trace_enabled:
-                    _submit_ts(orch, ts_lm_head_cid, logits_padded, _keep)
-                _submit_sample(orch, sample_cid, _keep)
             if _l3_trace_enabled:
                 print(f"[L3-step] all submits done {_fmt_rel(_time.perf_counter())}", flush=True)
 
         # ── Create Worker and execute ──
 
         gc_sub_fns = dict(compiled.gen_chunked_sub_worker_fns or {})
-        # +1 for sample_and_prepare_fn, plus +3 for L3-trace timestamp callbacks
-        # (decode_done / final_rms_done / lm_head_done) when tracing is enabled.
-        # Tracing adds a few ms of sub-worker IPC per stage and 3 sub-workers,
-        # so it is gated behind the PYPTO_L3_TRACE env var.
+        # Override the placeholder sample_and_prepare sub-worker emitted by the
+        # gen_chunked compiler with the real closure that reads shared-memory
+        # tensors and performs argmax → embedding lookup → slot-map update.
+        gc_sub_fns["sample_and_prepare"] = sample_and_prepare_fn
+
+        # +3 for L3-trace timestamp callbacks when tracing is enabled.
         _ts_extra = 3 if _l3_trace_enabled else 0
-        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + 1 + _ts_extra
+        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + _ts_extra
 
         worker = Worker(
             level=3,
@@ -1178,13 +1195,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
             runtime=compiled.gen_chunked_runtime_name,
         )
 
-        # Register gen_chunked sub-worker callables (if any).
+        # Register gen_chunked sub-worker callables (including sample_and_prepare).
         sub_ids: dict[str, int] = {}
         for name, fn in gc_sub_fns.items():
             sub_ids[name] = worker.register(fn)
-
-        # Register our custom callables.
-        sample_cid = worker.register(sample_and_prepare_fn)
 
         # ── L3 dispatch-latency diagnostic (gated by PYPTO_L3_TRACE) ──
         # One sub_worker per chip-task type that prints a timestamp on completion.

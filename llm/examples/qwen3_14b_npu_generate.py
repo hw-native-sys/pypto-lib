@@ -360,6 +360,7 @@ def main() -> None:
             page_size=256,
             max_batch_size=16,
             max_seq_len=args.max_seq_len,
+            max_new_tokens=args.max_new_tokens,
             device="cpu",
             kv_dtype="bfloat16",
             weight_dtype="float32",
