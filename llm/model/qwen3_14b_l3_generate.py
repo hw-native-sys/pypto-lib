@@ -18,16 +18,16 @@ _KERNEL_PATH = (
     / "models"
     / "qwen3"
     / "14b"
-    / "qwen3_14b_gen_chunked.py"
+    / "qwen3_14b_l3_generate.py"
 )
-_SPEC = importlib.util.spec_from_file_location("_qwen3_14b_gen_chunked_kernel", _KERNEL_PATH)
+_SPEC = importlib.util.spec_from_file_location("_qwen3_14b_l3_generate_kernel", _KERNEL_PATH)
 if _SPEC is None or _SPEC.loader is None:
-    raise ImportError(f"Unable to load Qwen3-14B gen_chunked kernel from {_KERNEL_PATH}")
+    raise ImportError(f"Unable to load Qwen3-14B l3_generate kernel from {_KERNEL_PATH}")
 
 _KERNEL = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_KERNEL)
 
-build_qwen3_14b_gen_chunked_program = _KERNEL.build_qwen3_14b_gen_chunked_program
+build_qwen3_14b_l3_generate_program = _KERNEL.build_qwen3_14b_l3_generate_program
 stack_layer_weights_full = _KERNEL.stack_layer_weights_full
 
-__all__ = ["build_qwen3_14b_gen_chunked_program", "stack_layer_weights_full"]
+__all__ = ["build_qwen3_14b_l3_generate_program", "stack_layer_weights_full"]

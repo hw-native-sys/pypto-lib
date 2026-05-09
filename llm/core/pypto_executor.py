@@ -114,23 +114,20 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
-    # L3 gen_chunked artefacts. Populated only when l3_mode=True.
+    # L3 l3_generate artefacts. Populated only when l3_mode=True.
     # ONE host_orch (L3) dispatches qwen3_prefill_all + qwen3_decode_all (L2),
     # each iterating all layers internally via pl.range(num_layers).
-    gen_chunked: object | None = None
+    l3_generate: object | None = None
     stacked_weights: dict[str, torch.Tensor] | None = None
-    # L3-wrapped generate: chip callables for final_rms/lm_head + gen_chunked
+    # L3-wrapped generate: chip callables for final_rms/lm_head + l3_generate
     # setup artifacts.  Populated only when l3_mode=True.
-    gen_chunked_chip_callables: dict[str, object] | None = None
-    gen_chunked_entry_fn: object | None = None
-    gen_chunked_sub_worker_fns: dict[str, object] | None = None
-    gen_chunked_dc: object | None = None  # DistributedConfig
-    gen_chunked_platform: str | None = None
-    gen_chunked_runtime_name: str | None = None
-    gen_chunked_param_infos: object | None = None
-    final_rms_chip_callable: object | None = None
-    lm_head_chip_callable: object | None = None
-    decode_chip_callable: object | None = None  # baseline decode Opaque kernel
+    l3_generate_chip_callables: dict[str, object] | None = None
+    l3_generate_entry_fn: object | None = None
+    l3_generate_sub_worker_fns: dict[str, object] | None = None
+    l3_generate_dc: object | None = None  # DistributedConfig
+    l3_generate_platform: str | None = None
+    l3_generate_runtime_name: str | None = None
+    l3_generate_param_infos: object | None = None
 
 
 @dataclass
@@ -185,9 +182,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         device_id: int = 0,
         save_kernels_dir: str | None = None,
         l3_mode: bool = False,
-        decode_chunk_size: int = 4,
-        # Deprecated alias kept for backward compatibility.
-        l3_decode: bool = False,
+        l3_trace: bool = False,
     ) -> None:
         super().__init__(kv_cache_manager)
         self._pypto_root = pypto_root
@@ -195,10 +190,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
         self._device_id = device_id
         self._save_kernels_dir = save_kernels_dir
         # When True, BOTH prefill and decode are dispatched via the L3
-        # gen_chunked kernel, where each L2 function iterates all layers
+        # l3_generate kernel, where each L2 function iterates all layers
         # internally via pl.range(num_layers). Single dispatch per step.
-        self._l3_mode = l3_mode or l3_decode
-        self._decode_chunk_size = decode_chunk_size
+        self._l3_mode = l3_mode
+        # When True, run_generate_l3 emits per-stage timestamp prints from
+        # both the host_orch submit thread and the sample_and_prepare
+        # sub-worker callback (relative timestamps + Δprev + per-step
+        # chip_tasks vs sample_work split).
+        self._l3_trace = l3_trace
         self._compiled: dict[str, _CompiledKernels] = {}
 
     def register_model(self, model_id: str, record: ModelRecord) -> None:
@@ -209,7 +208,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
 
         if self._l3_mode:
-            decode_hidden = self._run_gen_chunked_prefill(model, compiled, prefill_inputs)
+            decode_hidden = self._run_l3_generate_prefill(model, compiled, prefill_inputs)
             final_hidden = decode_hidden.float()
             logits = self._project_logits(model, final_hidden)
             for batch_idx, alloc in enumerate(batch.kv_allocations):
@@ -280,7 +279,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         dw = compiled.decode_weights
 
         if self._l3_mode:
-            hidden = self._run_gen_chunked_decode(model, compiled, decode_inputs)
+            hidden = self._run_l3_generate_decode(model, compiled, decode_inputs)
             final_hidden = hidden.float()
         else:
             k_cache, v_cache = self._kv_cache_manager.materialize_decode_cache_all_layers(
@@ -319,7 +318,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
-    def _run_gen_chunked_prefill(
+    def _run_l3_generate_prefill(
         self,
         model: RuntimeModel,
         compiled: _CompiledKernels,
@@ -332,9 +331,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
           2. qwen3_decode_all  (L2) — all layers, attends to full KV cache;
              output is the decode hidden state that predicts the first new token.
         """
-        if compiled.gen_chunked is None or compiled.stacked_weights is None:
+        if compiled.l3_generate is None or compiled.stacked_weights is None:
             raise RuntimeError(
-                "L3 gen_chunked prefill requested but artefacts not compiled. "
+                "L3 l3_generate prefill requested but artefacts not compiled. "
                 "Construct the executor with l3_mode=True."
             )
         sw = compiled.stacked_weights
@@ -360,7 +359,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         prefill_out = torch.zeros_like(prefill_inputs.hidden)
         decode_out = torch.zeros_like(decode_hidden)
 
-        compiled.gen_chunked(
+        compiled.l3_generate(
             prefill_inputs.hidden,
             prefill_inputs.seq_lens,
             prefill_inputs.slot_mapping,
@@ -390,7 +389,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         )
         return decode_out
 
-    def _run_gen_chunked_decode(
+    def _run_l3_generate_decode(
         self,
         model: RuntimeModel,
         compiled: _CompiledKernels,
@@ -401,9 +400,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
         ONE host_orch (L3) dispatches qwen3_decode_all (L2) which iterates
         all layers internally. Prefill tensors are dummies.
         """
-        if compiled.gen_chunked is None or compiled.stacked_weights is None:
+        if compiled.l3_generate is None or compiled.stacked_weights is None:
             raise RuntimeError(
-                "L3 gen_chunked decode requested but artefacts not compiled. "
+                "L3 l3_generate decode requested but artefacts not compiled. "
                 "Construct the executor with l3_mode=True."
             )
         sw = compiled.stacked_weights
@@ -424,7 +423,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         has_prefill = torch.tensor(False, dtype=torch.bool)
         decode_out = torch.zeros_like(decode_inputs.hidden)
 
-        compiled.gen_chunked(
+        compiled.l3_generate(
             dummy_prefill,
             dummy_seq_lens,
             dummy_slot_mapping,
@@ -460,8 +459,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
         try:
             from ..model.qwen3_14b_decode import build_qwen3_decode_program
             from ..model.qwen3_14b_final_rms import build_qwen3_final_rms_program
-            from ..model.qwen3_14b_gen_chunked import (
-                build_qwen3_14b_gen_chunked_program,
+            from ..model.qwen3_14b_l3_generate import (
+                build_qwen3_14b_l3_generate_program,
                 stack_layer_weights_full,
             )
             from ..model.qwen3_14b_lm_head import build_qwen3_lm_head_program
@@ -469,8 +468,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
         except ImportError:
             from model.qwen3_14b_decode import build_qwen3_decode_program
             from model.qwen3_14b_final_rms import build_qwen3_final_rms_program
-            from model.qwen3_14b_gen_chunked import (
-                build_qwen3_14b_gen_chunked_program,
+            from model.qwen3_14b_l3_generate import (
+                build_qwen3_14b_l3_generate_program,
                 stack_layer_weights_full,
             )
             from model.qwen3_14b_lm_head import build_qwen3_lm_head_program
@@ -520,13 +519,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
             model.config.rope_theta,
         )
 
-        # L3 gen_chunked artefacts (built only when l3_mode=True).
-        # L3 gen_chunked: ONE host_orch dispatches prefill_all + decode_all,
+        # L3 l3_generate artefacts (built only when l3_mode=True).
+        # L3 l3_generate: ONE host_orch dispatches prefill_all + decode_all,
         # each iterating all layers internally via pl.range(num_layers).
-        gen_chunked: object | None = None
+        l3_generate: object | None = None
         stacked_weights: dict[str, torch.Tensor] | None = None
         if self._l3_mode:
-            gen_chunked_program = build_qwen3_14b_gen_chunked_program(
+            l3_generate_program = build_qwen3_14b_l3_generate_program(
                 num_layers=model.config.num_hidden_layers,
                 batch=kernel_batch,
                 max_seq=model.runtime.max_seq_len,
@@ -544,8 +543,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
             from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
 
             _rc = self._run_config(codegen_only=True)
-            gen_chunked = ir.compile(
-                gen_chunked_program,
+            l3_generate = ir.compile(
+                l3_generate_program,
                 output_dir=_rc.save_kernels_dir,
                 strategy=_rc.strategy,
                 backend_type=_rc.backend_type,
@@ -573,80 +572,66 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 head_dim=model.config.head_dim,
             )
 
-        # L3-wrapped generate: compile final_rms/lm_head as ChipCallable and
-        # pre-extract gen_chunked setup artifacts (expensive compile_and_assemble
-        # + module loading done once, reused per generate call).
-        final_rms_chip_callable: object | None = None
-        lm_head_chip_callable: object | None = None
-        decode_chip_callable: object | None = None
-        gen_chunked_chip_callables: dict[str, object] | None = None
-        gen_chunked_entry_fn: object | None = None
-        gen_chunked_sub_worker_fns: dict[str, object] | None = None
-        gen_chunked_dc: object | None = None
-        gen_chunked_platform: str | None = None
-        gen_chunked_runtime_name: str | None = None
-        gen_chunked_param_infos: object | None = None
+        # L3-wrapped generate: pre-extract l3_generate setup artifacts
+        # (expensive compile_and_assemble + module loading done once,
+        # reused per generate call).
+        l3_generate_chip_callables: dict[str, object] | None = None
+        l3_generate_entry_fn: object | None = None
+        l3_generate_sub_worker_fns: dict[str, object] | None = None
+        l3_generate_dc: object | None = None
+        l3_generate_platform: str | None = None
+        l3_generate_runtime_name: str | None = None
+        l3_generate_param_infos: object | None = None
         if self._l3_mode:
             from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
             from pypto.runtime.distributed_runner import _load_generated_module  # noqa: PLC0415
             from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
 
-            # Compile final_rms, lm_head, and baseline decode as ChipCallable.
-            final_rms_chip_callable, _ = compile_and_assemble(
-                final_rms.output_dir, _rc.platform,
-            )
-            lm_head_chip_callable, _ = compile_and_assemble(
-                lm_head.output_dir, _rc.platform,
-            )
-            decode_chip_callable, _ = compile_and_assemble(
-                decode.output_dir, _rc.platform,
-            )
-
-            # Pre-extract gen_chunked setup artifacts.
-            gc_dc = gen_chunked._distributed_config
-            gc_output_dir = gen_chunked.output_dir
-            gc_chip_callables: dict[str, object] = {}
-            gc_runtime_name = "tensormap_and_ringbuffer"
-            gc_next_levels_dir = gc_output_dir / "next_levels"
-            for func in gen_chunked._program.functions.values():
+            # Pre-extract l3_generate setup artifacts.
+            lg_dc = l3_generate._distributed_config
+            lg_output_dir = l3_generate.output_dir
+            lg_chip_callables: dict[str, object] = {}
+            lg_runtime_name = "tensormap_and_ringbuffer"
+            lg_next_levels_dir = lg_output_dir / "next_levels"
+            for func in l3_generate._program.functions.values():
                 if func.func_type in (FunctionType.Orchestration, FunctionType.Opaque):
-                    chip_dir = gc_next_levels_dir / func.name
+                    chip_dir = lg_next_levels_dir / func.name
                     if chip_dir.exists():
-                        cc, gc_runtime_name = compile_and_assemble(
-                            chip_dir, gen_chunked.platform,
+                        cc, lg_runtime_name = compile_and_assemble(
+                            chip_dir, l3_generate.platform,
                         )
-                        gc_chip_callables[func.name] = cc
-            gc_orch_path = gc_output_dir / "orchestration" / "host_orch.py"
-            gc_orch_module = _load_generated_module(gc_orch_path)
-            gc_entry_fn = None
+                        lg_chip_callables[func.name] = cc
+            lg_orch_path = lg_output_dir / "orchestration" / "host_orch.py"
+            lg_orch_module = _load_generated_module(lg_orch_path)
+            lg_entry_fn = None
             for attr_name in ("entry", "host_orch"):
-                gc_entry_fn = getattr(gc_orch_module, attr_name, None)
-                if gc_entry_fn is not None:
+                lg_entry_fn = getattr(lg_orch_module, attr_name, None)
+                if lg_entry_fn is not None:
                     break
-            if gc_entry_fn is None:
-                for name in dir(gc_orch_module):
-                    obj = getattr(gc_orch_module, name)
+            if lg_entry_fn is None:
+                for name in dir(lg_orch_module):
+                    obj = getattr(lg_orch_module, name)
                     if callable(obj) and not name.startswith("_"):
-                        gc_entry_fn = obj
+                        lg_entry_fn = obj
                         break
-            gc_sub_worker_fns: dict[str, object] = {}
-            gc_sub_workers_dir = gc_output_dir / "sub_workers"
-            if gc_sub_workers_dir.exists():
-                for py_file in sorted(gc_sub_workers_dir.glob("*.py")):
+            lg_sub_worker_fns: dict[str, object] = {}
+            lg_sub_workers_dir = lg_output_dir / "sub_workers"
+            if lg_sub_workers_dir.exists():
+                for py_file in sorted(lg_sub_workers_dir.glob("*.py")):
                     mod = _load_generated_module(py_file)
                     fn_name = py_file.stem
                     fn = getattr(mod, fn_name, None)
                     if fn is not None:
-                        gc_sub_worker_fns[fn_name] = fn
-            gc_param_infos, _, _ = gen_chunked._get_metadata()
+                        lg_sub_worker_fns[fn_name] = fn
+            lg_param_infos, _, _ = l3_generate._get_metadata()
 
-            gen_chunked_chip_callables = gc_chip_callables
-            gen_chunked_entry_fn = gc_entry_fn
-            gen_chunked_sub_worker_fns = gc_sub_worker_fns
-            gen_chunked_dc = gc_dc
-            gen_chunked_platform = gen_chunked.platform
-            gen_chunked_runtime_name = gc_runtime_name
-            gen_chunked_param_infos = gc_param_infos
+            l3_generate_chip_callables = lg_chip_callables
+            l3_generate_entry_fn = lg_entry_fn
+            l3_generate_sub_worker_fns = lg_sub_worker_fns
+            l3_generate_dc = lg_dc
+            l3_generate_platform = l3_generate.platform
+            l3_generate_runtime_name = lg_runtime_name
+            l3_generate_param_infos = lg_param_infos
 
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
@@ -678,18 +663,15 @@ class PyptoQwen14BExecutor(ModelExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
             decode_weights=decode_weights,
-            gen_chunked=gen_chunked,
+            l3_generate=l3_generate,
             stacked_weights=stacked_weights,
-            gen_chunked_chip_callables=gen_chunked_chip_callables,
-            gen_chunked_entry_fn=gen_chunked_entry_fn,
-            gen_chunked_sub_worker_fns=gen_chunked_sub_worker_fns,
-            gen_chunked_dc=gen_chunked_dc,
-            gen_chunked_platform=gen_chunked_platform,
-            gen_chunked_runtime_name=gen_chunked_runtime_name,
-            gen_chunked_param_infos=gen_chunked_param_infos,
-            final_rms_chip_callable=final_rms_chip_callable,
-            lm_head_chip_callable=lm_head_chip_callable,
-            decode_chip_callable=decode_chip_callable,
+            l3_generate_chip_callables=l3_generate_chip_callables,
+            l3_generate_entry_fn=l3_generate_entry_fn,
+            l3_generate_sub_worker_fns=l3_generate_sub_worker_fns,
+            l3_generate_dc=l3_generate_dc,
+            l3_generate_platform=l3_generate_platform,
+            l3_generate_runtime_name=l3_generate_runtime_name,
+            l3_generate_param_infos=l3_generate_param_infos,
         )
 
     @staticmethod
@@ -765,12 +747,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         Returns (generated_token_ids, final_hidden).
         """
-        from simpler.task_interface import CallConfig, TaskArgs, TensorArgType  # noqa: PLC0415
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
         from simpler.worker import Worker  # noqa: PLC0415
-        from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
 
         compiled = self._compiled[model.config.model_id]
-        if compiled.gen_chunked_chip_callables is None:
+        if compiled.l3_generate_chip_callables is None:
             raise RuntimeError("L3 generate artifacts not compiled.")
 
         prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
@@ -797,7 +778,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         # Pre-allocate all shared-memory tensors for the full generate loop.
         prefill_out = torch.zeros_like(prefill_inputs.hidden).share_memory_()
         # decode_out and rms_x share one padded buffer so no CPU copy is needed
-        # between them.  gen_chunked writes to decode_out (the first actual_batch
+        # between them.  l3_generate writes to decode_out (the first actual_batch
         # rows); final_rms reads rms_x (all _LOGITS_BATCH_TILE rows).  The padding
         # rows stay zero throughout, satisfying the zero-pad contract of final_rms.
         _decode_out_storage = torch.zeros(
@@ -844,19 +825,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
         for k, v in compiled.stacked_weights.items():
             sm_sw[k] = v.share_memory_() if not v.is_shared() else v
 
-        # Baseline decode weights in shared memory (for direct baseline chip callable).
-        sm_dw = {}
-        for k, v in compiled.decode_weights.items():
-            sm_dw[k] = v.share_memory_() if not v.is_shared() else v
-
         # ── Sub-worker callable ──
         # Runs in a forked child process. Reads logits → argmax → embedding lookup
         # → writes decode_hidden_buf / decode_seq_lens / decode_slot_mapping_buf.
         _eos_id = eos_token_id
         _vocab = vocab_size
         _actual_batch = actual_batch
-        _hidden_size = hidden_size
-        _max_blocks = self._max_blocks_per_seq(model)
         _page_size = model.runtime.page_size
 
         # Pre-capture references for the sub_worker closure.
@@ -873,15 +847,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
         _kv_manager = self._kv_cache_manager
         _prefill_batch = prefill_batch
 
-        # L3 tracing: enabled when env var PYPTO_L3_TRACE is set to a truthy
-        # value ("1"/"true"/"yes"/"on", case-insensitive). When disabled, all
-        # per-stage timestamp prints are suppressed AND the per-stage
-        # `_submit_ts` callback chain is skipped (saving sub-worker IPC + 3
-        # extra sub-workers per dispatch).
-        import os as _os  # noqa: PLC0415
-        _l3_trace_enabled = _os.environ.get("PYPTO_L3_TRACE", "0").strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+        # L3 tracing: enabled by the executor's l3_trace flag (typically wired
+        # to --profile-verbose). When disabled, all per-stage timestamp prints
+        # are suppressed.
+        _l3_trace_enabled = self._l3_trace
 
         # Shared-memory anchors so forked sub-worker callbacks can print times
         # relative to a common start (set at prefill submit_start in the parent).
@@ -978,137 +947,25 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         # ── Build the orchestrator function ──
 
-        gc_entry_fn = compiled.gen_chunked_entry_fn
-        gc_chip_callables = compiled.gen_chunked_chip_callables
-        gc_dc = compiled.gen_chunked_dc
-        gc_param_infos = compiled.gen_chunked_param_infos
-        final_rms_cc = compiled.final_rms_chip_callable
-        lm_head_cc = compiled.lm_head_chip_callable
+        lg_entry_fn = compiled.l3_generate_entry_fn
+        lg_chip_callables = compiled.l3_generate_chip_callables
+        lg_dc = compiled.l3_generate_dc
+        lg_param_infos = compiled.l3_generate_param_infos
 
-        # Extract individual chip callables for direct submit_next_level.
-        _prefill_all_cc = gc_chip_callables.get("qwen3_prefill_all")
-        _decode_all_cc = gc_chip_callables.get("qwen3_decode_all")
-        # Prefer baseline decode chip callable (better compiler optimization).
-        _baseline_decode_cc = compiled.decode_chip_callable
-
-        def _submit_gen_chunked(orch, config, tensors_dict, _keep):
-            """Submit one gen_chunked entry_fn call (dispatches all-layers L2 tasks)."""
-            gc_entry_fn(
+        def _submit_l3_generate(orch, config, tensors_dict, _keep):
+            """Submit one l3_generate entry_fn call (dispatches all-layers L2 tasks)."""
+            lg_entry_fn(
                 orch, None, config,
                 tensors=tensors_dict,
-                callables=gc_chip_callables,
+                callables=lg_chip_callables,
                 sub_ids=sub_ids,
                 _keep=_keep,
             )
 
-        def _submit_decode_direct(orch, config, _keep):
-            """Submit baseline decode kernel directly via submit_next_level.
-
-            Uses the baseline qwen3_decode Opaque chip callable (same kernel
-            that achieves ~2424ms/step) instead of gen_chunked's decode_all.
-            Parameter order matches qwen3_14b_decode_full.py::qwen3_decode.
-            """
-            _cc = _baseline_decode_cc or _decode_all_cc
-            _w = sm_dw if _baseline_decode_cc is not None else sm_sw
-            # Baseline weight keys have "decode_" prefix; gen_chunked doesn't.
-            _pfx = "decode_" if _baseline_decode_cc is not None else ""
-            ta = TaskArgs()
-            ta.add_tensor(make_tensor_arg(decode_hidden_buf), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}input_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wq"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wk"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wv"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}q_norm_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}k_norm_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(decode_seq_lens), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(decode_slot_mapping_buf), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rope_cos), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rope_sin), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(k_cache_all), TensorArgType.INOUT)
-            ta.add_tensor(make_tensor_arg(v_cache_all), TensorArgType.INOUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}wo"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}post_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_gate"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_up"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(_w[f"{_pfx}w_down"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(decode_out), TensorArgType.OUTPUT_EXISTING)
-            _keep.append(ta)
-            orch.submit_next_level(_cc, ta, config)
-
-        def _submit_prefill_direct(orch, config, _keep):
-            """Submit qwen3_prefill_all directly via submit_next_level."""
-            ta = TaskArgs()
-            ta.add_tensor(make_tensor_arg(prefill_hidden), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(prefill_seq_lens), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["input_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wq"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wk"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wv"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["q_norm_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["k_norm_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rope_cos), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rope_sin), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(block_table), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(prefill_slot_mapping), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(k_cache_all), TensorArgType.INOUT)
-            ta.add_tensor(make_tensor_arg(v_cache_all), TensorArgType.INOUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["wo"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["post_rms_weight"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_gate"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_up"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(sm_sw["w_down"]), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(prefill_out), TensorArgType.OUTPUT_EXISTING)
-            _keep.append(ta)
-            orch.submit_next_level(_prefill_all_cc, ta, config)
-
-        def _submit_final_rms(orch, config, _keep):
-            ta = TaskArgs()
-            ta.add_tensor(make_tensor_arg(rms_x), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rms_gamma), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(rms_normed), TensorArgType.OUTPUT_EXISTING)
-            _keep.append(ta)
-            orch.submit_next_level(final_rms_cc, ta, config)
-
-        def _submit_lm_head(orch, config, _keep):
-            ta = TaskArgs()
-            ta.add_tensor(make_tensor_arg(rms_normed), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(lm_head_weight), TensorArgType.INPUT)
-            ta.add_tensor(make_tensor_arg(logits_padded), TensorArgType.OUTPUT_EXISTING)
-            _keep.append(ta)
-            orch.submit_next_level(lm_head_cc, ta, config)
-
-        def _submit_sample(orch, sample_cid, _keep):
-            ta = TaskArgs()
-            # Depend on logits_padded (written by lm_head).
-            ta.add_tensor(make_tensor_arg(logits_padded), TensorArgType.INPUT)
-            # Declare all tensors written by sample_and_prepare_fn so the
-            # dependency tracker waits for the sub-worker to finish before the
-            # next gen_chunked chip task reads them.  Without these declarations
-            # the tracker only knows about decode_hidden_buf, so decode_seq_lens
-            # and decode_slot_mapping_buf could be read with stale values by the
-            # next decode step, causing wrong RoPE positions and KV-cache slot
-            # overwrites (visible as repetitive degenerate output).
-            ta.add_tensor(make_tensor_arg(_decode_hidden_buf), TensorArgType.OUTPUT_EXISTING)
-            ta.add_tensor(make_tensor_arg(decode_seq_lens), TensorArgType.OUTPUT_EXISTING)
-            ta.add_tensor(make_tensor_arg(decode_slot_mapping_buf), TensorArgType.OUTPUT_EXISTING)
-            _keep.append(ta)
-            orch.submit_sub(sample_cid, ta)
-
-        def _submit_ts(orch, ts_cid, dep_tensor, _keep):
-            """Diagnostic: timestamp callback that waits for dep_tensor's writer
-            (the preceding chip task) to finish. Adds a few ms of sub-worker IPC
-            but is harmless because subsequent submits already serialize via
-            the same tensor dependency."""
-            ta = TaskArgs()
-            ta.add_tensor(make_tensor_arg(dep_tensor), TensorArgType.INPUT)
-            _keep.append(ta)
-            orch.submit_sub(ts_cid, ta)
-
         _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
 
         def _build_full_tensors():
-            """Build the tensor dict for the single gen_chunked dispatch.
+            """Build the tensor dict for the single l3_generate dispatch.
 
             host_orch now owns the full generation loop (prefill step 0 +
             pl.unroll(max_new_tokens) decode steps), so this is called once.
@@ -1116,7 +973,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             then the first decode; subsequent iterations run decode-only.
             """
             td = {}
-            for info, val in zip(gc_param_infos, [
+            for info, val in zip(lg_param_infos, [
                 prefill_hidden,           # prefill_hidden
                 prefill_seq_lens,         # prefill_seq_lens
                 prefill_slot_mapping,     # prefill_slot_mapping
@@ -1157,8 +1014,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
             import time as _time  # noqa: PLC0415
             _keep: list = []
             call_config = CallConfig()
-            call_config.block_dim = gc_dc.block_dim
-            call_config.aicpu_thread_num = gc_dc.aicpu_thread_num
+            call_config.block_dim = lg_dc.block_dim
+            call_config.aicpu_thread_num = lg_dc.aicpu_thread_num
 
             _t_pf = _time.perf_counter()
             _t_anchors[0] = _t_pf
@@ -1170,59 +1027,33 @@ class PyptoQwen14BExecutor(ModelExecutor):
             # Single dispatch: host_orch drives prefill + all decode steps
             # (pl.unroll(max_new_tokens) inside host_orch).
             td = _build_full_tensors()
-            _submit_gen_chunked(orch, call_config, td, _keep)
+            _submit_l3_generate(orch, call_config, td, _keep)
 
             if _l3_trace_enabled:
                 print(f"[L3-step] all submits done {_fmt_rel(_time.perf_counter())}", flush=True)
 
         # ── Create Worker and execute ──
 
-        gc_sub_fns = dict(compiled.gen_chunked_sub_worker_fns or {})
+        lg_sub_fns = dict(compiled.l3_generate_sub_worker_fns or {})
         # Override the placeholder sample_and_prepare sub-worker emitted by the
-        # gen_chunked compiler with the real closure that reads shared-memory
+        # l3_generate compiler with the real closure that reads shared-memory
         # tensors and performs argmax → embedding lookup → slot-map update.
-        gc_sub_fns["sample_and_prepare"] = sample_and_prepare_fn
+        lg_sub_fns["sample_and_prepare"] = sample_and_prepare_fn
 
-        # +3 for L3-trace timestamp callbacks when tracing is enabled.
-        _ts_extra = 3 if _l3_trace_enabled else 0
-        num_sub = max(gc_dc.num_sub_workers, len(gc_sub_fns)) + _ts_extra
+        num_sub = max(lg_dc.num_sub_workers, len(lg_sub_fns))
 
         worker = Worker(
             level=3,
             device_ids=[self._device_id],
             num_sub_workers=num_sub,
-            platform=compiled.gen_chunked_platform,
-            runtime=compiled.gen_chunked_runtime_name,
+            platform=compiled.l3_generate_platform,
+            runtime=compiled.l3_generate_runtime_name,
         )
 
-        # Register gen_chunked sub-worker callables (including sample_and_prepare).
+        # Register l3_generate sub-worker callables (including sample_and_prepare).
         sub_ids: dict[str, int] = {}
-        for name, fn in gc_sub_fns.items():
+        for name, fn in lg_sub_fns.items():
             sub_ids[name] = worker.register(fn)
-
-        # ── L3 dispatch-latency diagnostic (gated by PYPTO_L3_TRACE) ──
-        # One sub_worker per chip-task type that prints a timestamp on completion.
-        # The dependency tracker forces each ts callback to wait until its
-        # target chip task finishes (via the input-tensor dep). Sub-worker IPC
-        # adds a few ms per print but is negligible compared to the ~5s/step
-        # overhead we are localizing.
-        ts_decode_cid = ts_final_rms_cid = ts_lm_head_cid = -1
-        if _l3_trace_enabled:
-            import time as _trace_time  # noqa: PLC0415
-
-            def _make_ts_fn(label):
-                def _fn(task_args):
-                    _t = _trace_time.perf_counter()
-                    s = int(_token_count[0])
-                    print(
-                        f"[L3-trace] step={s:02d} {label} done {_fmt_rel(_t)}",
-                        flush=True,
-                    )
-                return _fn
-
-            ts_decode_cid = worker.register(_make_ts_fn("decode"))
-            ts_final_rms_cid = worker.register(_make_ts_fn("final_rms"))
-            ts_lm_head_cid = worker.register(_make_ts_fn("lm_head"))
 
         worker.init()
         try:
@@ -1370,45 +1201,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
     def session(self):
         """Lifecycle context spanning one full generate sequence.
 
-        For L3 mode: the chunked kernels (prefill_chunked, decode_chunked)
-        dispatch via chip_process internally — the parent process must NOT
-        hold an active device context when chip_process is spawned, so this
-        context is intentionally a no-op for L3 mode.  When pypto adds user-
-        API support for a persistent Worker(level=3), this is where it would
-        be opened.
-
-        For baseline mode: also a no-op; each run_prefill / run_decode
-        manages its own _l2_device_context.
-
-        The engine calls executor.session() unconditionally so that the
-        generate lifecycle is ready for the future persistent-Worker upgrade.
+        Currently a no-op for both L3 and baseline modes — the engine calls
+        executor.session() unconditionally so that the generate lifecycle is
+        ready for a future persistent-Worker upgrade.
         """
         yield
-
-    @contextlib.contextmanager
-    def _l2_device_context(self):
-        """Hold a single level-2 device context open across all inner run() calls.
-
-        Used by the baseline (non-L3) paths for prefill and decode. Without
-        this wrapper every compiled(...) call creates and destroys its own
-        Worker(level=2), resulting in repeated aclrtSetDevice / aclrtResetDevice
-        cycles that can deplete the AICPU stream pool (error 507899).
-
-        Inside this block all execute_on_device calls detect the active Worker
-        via _PyptoWorker.current() and reuse its already-initialised device
-        context, so only one SetDevice / ResetDevice pair occurs regardless of
-        how many kernel dispatches happen within the block.
-
-        Do NOT use this wrapper when l3_mode=True: the L3 chunked paths
-        (_run_prefill_l3_chunked, _run_decode_l3_chunked) dispatch via
-        execute_distributed (level=3 chip_process subprocess) inside the
-        shared Worker opened by session(), and must not have a level-2
-        context active on entry.
-        """
-        from pypto.runtime import Worker  # noqa: PLC0415
-
-        with Worker(config=self._run_config(codegen_only=False)):
-            yield
 
     def _run_config(self, *, codegen_only: bool):
         from pypto.runtime import RunConfig

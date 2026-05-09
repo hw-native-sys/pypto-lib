@@ -87,7 +87,7 @@ SCOPE1_K_CHUNK = 512
 MLP_OUT_CHUNK_DECODE = 256
 
 
-def build_qwen3_14b_gen_chunked_program(
+def build_qwen3_14b_l3_generate_program(
     num_layers: int = 40,
     batch: int = BATCH,
     max_seq: int = MAX_SEQ,
@@ -96,7 +96,6 @@ def build_qwen3_14b_gen_chunked_program(
     num_heads: int = NUM_HEADS,
     num_kv_heads: int = NUM_KV_HEADS,
     head_dim: int = HEAD_DIM,
-    chunk_size: int | None = None,  # deprecated, ignored
     # Generation loop parameters.
     # max_new_tokens is compile-time so pl.unroll can expand the decode loop.
     max_new_tokens: int = 128,

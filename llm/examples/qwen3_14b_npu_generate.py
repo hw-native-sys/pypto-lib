@@ -20,7 +20,7 @@ from pathlib import Path
 
 # R4 mitigation: PTO2_RING_HEAP nominal value is multiplied ×4 by the
 # runtime, so 2 GiB nominal → 8 GiB actual GM heap. This leaves HBM
-# headroom for chunk_size=4 stacked weights (~2.14 GiB) + KV cache
+# headroom for the all-layers stacked weights (~2.14 GiB) + KV cache
 # (~4 GiB) + shared mem (~23 GiB) on a 62 GiB device. Override via env
 # in the launching shell if you need a different value.
 os.environ.setdefault("PTO2_RING_HEAP", str(2 * 1024 ** 3))
@@ -156,10 +156,10 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
     )
     compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
     compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
-    # L3 gen_chunked: one dispatch per chunk_size layers (prefill+decode or decode-only).
-    if compiled.gen_chunked is not None:
-        compiled.gen_chunked = collector.WrapKernel(
-            compiled.gen_chunked, "kernel.gen_chunked", group_by_decode_step=True
+    # L3 l3_generate: one dispatch drives prefill_all + decode_all (all-layers L2).
+    if compiled.l3_generate is not None:
+        compiled.l3_generate = collector.WrapKernel(
+            compiled.l3_generate, "kernel.l3_generate", group_by_decode_step=True
         )
 
     # Top-level executor API wrappers.
@@ -225,7 +225,7 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
     for kname in (
         "kernel.prefill_layer",
         "kernel.decode_layer",
-        "kernel.gen_chunked",
+        "kernel.l3_generate",
         "kernel.final_rms",
         "kernel.lm_head",
     ):
@@ -282,25 +282,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--l3",
         action="store_true",
         dest="l3_mode",
-        help="Enable L3 mode: both prefill and decode are dispatched in "
-             "--decode-chunk-size layer chunks inside a single shared "
-             "Worker(level=3) per generate call.",
-    )
-    parser.add_argument(
-        "--l3-decode",
-        action="store_true",
-        dest="l3_mode",
-        help="Deprecated alias for --l3.",
-    )
-    parser.add_argument(
-        "--decode-chunk-size",
-        type=int,
-        default=4,
-        help="Layers per chunked dispatch when --l3 is active. "
-             "num_hidden_layers must be divisible by this. "
-             "Default 4 (10 dispatches/call for 40-layer Qwen3-14B). "
-             "Lower values reduce HBM peak; higher values reduce dispatch "
-             "overhead.",
+        help="Enable L3 mode: prefill and decode are dispatched as a single "
+             "all-layers L2 program inside a shared Worker(level=3) per "
+             "generate call.",
     )
     parser.add_argument(
         "--num-layers-override",
@@ -341,7 +325,7 @@ def main() -> None:
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,
         l3_mode=args.l3_mode,
-        decode_chunk_size=args.decode_chunk_size,
+        l3_trace=args.profile_verbose,
     )
     engine = LLMEngine(
         kv_cache_manager=kv_cache_manager,
