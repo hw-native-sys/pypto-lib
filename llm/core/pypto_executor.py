@@ -709,13 +709,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
         decode_weights = self._stack_decode_weights(layers)
 
         # l3_device_weights / l3_device_worker: reserved for future persistent
-        # weight residency on the step-by-step _run_l3_generate_prefill/decode
-        # path.  Currently always None — the run_generate_l3 path pre-uploads
-        # weights inside generate_orch_fn via orch.malloc/copy_to which is safe
-        # because it runs inside the already-open chip worker context.  Opening
-        # a separate pypto.runtime.Worker here (compile time) is avoided: it
-        # would conflict with the level-3 Worker created later and may hang
-        # when device memory pools (PTO2_DEVICE_MEM_POOL) are active.
+        # weight residency across generate calls.  Currently always None —
+        # the run_generate_l3 path pre-uploads weights inside generate_orch_fn
+        # via orch.malloc/copy_to which is safe because it runs inside the
+        # already-open level-3 Worker context.  Creating a second Worker here
+        # at compile time is avoided: two concurrent Worker instances share
+        # the same device context and conflict, causing a hang on init.
         l3_device_weights: dict[str, object] | None = None
         l3_device_worker: object | None = None
 
@@ -1088,6 +1087,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 td[info.name] = val
             return td
 
+        # KV cache device pointers collected inside generate_orch_fn so the
+        # post-run sync-back step can copy updated K/V values back to host.
+        # Format: list of (host_ptr: int, dev_ptr: int, nbytes: int).
+        _kv_dev_ptrs: list[tuple[int, int, int]] = []
+
         def generate_orch_fn(orch, _args, _cfg):
             import time as _time  # noqa: PLC0415
             _keep: list = []
@@ -1106,15 +1110,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
             # (pl.unroll(max_new_tokens) inside host_orch).
             td = _build_full_tensors()
 
-            # Pre-upload static weight tensors to the chip device once per
-            # generate call using child_memory=True.  The runtime then skips
-            # H2D + D2H for those buffers on every subsequent dispatch, turning
-            # ~3 400 ms of init_runtime overhead per step into ~11 ms.
-            # device memory is reclaimed automatically when the worker closes.
             from simpler.task_interface import ContinuousTensor as _CT  # noqa: PLC0415
             from simpler_setup.torch_interop import (  # noqa: PLC0415
                 torch_dtype_to_datatype as _td2dt,
             )
+
+            # Pre-upload static weight tensors once per generate call.
+            # child_memory=True → runtime skips H2D + D2H on every dispatch.
+            # ~3 400 ms of init_runtime per step reduced to ~11 ms.
             for _pname, _t in list(td.items()):
                 if not isinstance(_t, torch.Tensor):
                     continue
@@ -1122,12 +1125,29 @@ class PyptoQwen14BExecutor(ModelExecutor):
                     continue
                 _nbytes = int(_t.nbytes)
                 _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
-                orch.copy_to(
-                    worker_id=0, dst=_dev_ptr,
-                    src=_t.data_ptr(), size=_nbytes,
-                )
+                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
                 _shapes = tuple(int(s) for s in _t.shape)
                 _dt = _td2dt(_t.dtype)
+                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
+
+            # Pre-upload KV cache (k_cache_all / v_cache_all) once per
+            # generate call.  The kernel writes updated K/V values in-place on
+            # device; child_memory=True skips H2D and D2H on every decode step,
+            # saving ~280 ms H2D + ~360 ms D2H per step (~640 ms × 16 steps).
+            # After worker.run() drains (all tasks done), a second worker.run()
+            # call copies the final device state back to the host KV cache via
+            # orch.copy_from so subsequent generate calls see updated values.
+            for _pname, _t in list(td.items()):
+                if not isinstance(_t, torch.Tensor):
+                    continue
+                if "k_cache_all" not in _pname and "v_cache_all" not in _pname:
+                    continue
+                _nbytes = int(_t.nbytes)
+                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
+                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
+                _shapes = tuple(int(s) for s in _t.shape)
+                _dt = _td2dt(_t.dtype)
+                _kv_dev_ptrs.append((_t.data_ptr(), _dev_ptr, _nbytes))
                 td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
 
             _submit_l3_generate(orch, call_config, td, _keep)
@@ -1163,6 +1183,20 @@ class PyptoQwen14BExecutor(ModelExecutor):
             import time as _time  # noqa: PLC0415
             _t_run_start = _time.perf_counter()
             worker.run(generate_orch_fn)
+
+            # Sync KV cache back to host.  worker.run() above calls _drain()
+            # internally, so all chip tasks (including the last decode step)
+            # have completed by the time we reach here.  The child_memory
+            # buffers are still live (worker.close() not yet called), so a
+            # second worker.run() can copy them back to the host tensors.
+            if _kv_dev_ptrs:
+                def _kv_sync_orch_fn(orch, _args, _cfg):  # noqa: E306
+                    for _host_ptr, _dev_ptr, _nbytes in _kv_dev_ptrs:
+                        orch.copy_from(
+                            worker_id=0, dst=_host_ptr, src=_dev_ptr, size=_nbytes,
+                        )
+                worker.run(_kv_sync_orch_fn)
+
             _t_run_end = _time.perf_counter()
             print(
                 f"[L3-timer] worker.run total wall-clock: "
