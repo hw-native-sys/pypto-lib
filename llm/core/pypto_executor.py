@@ -81,9 +81,49 @@ _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of qwen3_14b_lm_head.VOCAB_CHUNK
 _LOGITS_BATCH_TILE = 16
 _QWEN14B_PAGE_SIZE = 256
 
+# Substrings matched against SSA-renamed parameter names to identify static
+# weight tensors that can be pre-uploaded to device (child_memory=True).
+# These are the model weight matrices plus the RoPE tables and output-head
+# weight that are constant throughout a generate call.
+_STATIC_WEIGHT_SUBSTRINGS: frozenset[str] = frozenset({
+    "input_rms_weight", "wq", "wk", "wv", "wo",
+    "q_norm_weight", "k_norm_weight", "post_rms_weight",
+    "w_gate", "w_up", "w_down",
+    "rope_cos", "rope_sin",
+    "final_norm_weight", "lm_head_weight",
+})
+
 
 def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
+
+
+def _patch_orch_make_tensor_arg(module: object) -> None:
+    """Allow ``make_tensor_arg`` in a generated orchestration module to pass
+    ``ContinuousTensor`` objects through unchanged.
+
+    The generated ``host_orch.py`` always calls ``make_tensor_arg(t)`` for
+    every entry in the ``tensors`` dict.  When we pre-upload static weights
+    and replace them with ``ContinuousTensor(child_memory=True)`` objects,
+    the default ``make_tensor_arg`` (which expects a ``torch.Tensor``) would
+    crash.  Patching it here lets child_memory tensors pass through as-is
+    so the runtime skips H2D/D2H for those buffers.
+    """
+    try:
+        from simpler.task_interface import ContinuousTensor  # noqa: PLC0415
+    except ImportError:
+        return
+    _orig = getattr(module, "make_tensor_arg", None)
+    if _orig is None or getattr(_orig, "_child_memory_patched", False):
+        return
+
+    def _patched(tensor: object) -> object:
+        if isinstance(tensor, ContinuousTensor):
+            return tensor
+        return _orig(tensor)  # type: ignore[misc]
+
+    _patched._child_memory_patched = True  # type: ignore[attr-defined]
+    module.make_tensor_arg = _patched  # type: ignore[attr-defined]
 
 
 @dataclass
@@ -128,6 +168,10 @@ class _CompiledKernels:
     l3_generate_platform: str | None = None
     l3_generate_runtime_name: str | None = None
     l3_generate_param_infos: object | None = None
+    # Reserved for future device-resident weight handles on the step-by-step
+    # L3 dispatch path.  Currently always None — see comment in _compile_model.
+    l3_device_weights: dict[str, object] | None = None
+    l3_device_worker: object | None = None
 
 
 @dataclass
@@ -336,7 +380,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 "L3 l3_generate prefill requested but artefacts not compiled. "
                 "Construct the executor with l3_mode=True."
             )
-        sw = compiled.stacked_weights
+        # Use device-resident DeviceTensor for static weights when available
+        # to skip H2D copy inside execute_compiled (child_memory=True path).
+        dw = compiled.l3_device_weights or compiled.stacked_weights
+        rope_cos = (dw.get("rope_cos") or compiled.rope_cos)
+        rope_sin = (dw.get("rope_sin") or compiled.rope_sin)
         actual_batch = prefill_inputs.actual_batch
         hidden_size = model.config.hidden_size
         max_seq = model.runtime.max_seq_len
@@ -366,22 +414,22 @@ class PyptoQwen14BExecutor(ModelExecutor):
             decode_hidden,
             prefill_inputs.seq_lens,   # decode_seq_lens = prefill_seq_lens (= N)
             decode_slot_mapping,
-            sw["input_rms_weight"],
-            sw["wq"],
-            sw["wk"],
-            sw["wv"],
-            sw["q_norm_weight"],
-            sw["k_norm_weight"],
-            compiled.rope_cos,
-            compiled.rope_sin,
+            dw["input_rms_weight"],
+            dw["wq"],
+            dw["wk"],
+            dw["wv"],
+            dw["q_norm_weight"],
+            dw["k_norm_weight"],
+            rope_cos,
+            rope_sin,
             prefill_inputs.block_table,
             k_cache_all,
             v_cache_all,
-            sw["wo"],
-            sw["post_rms_weight"],
-            sw["w_gate"],
-            sw["w_up"],
-            sw["w_down"],
+            dw["wo"],
+            dw["post_rms_weight"],
+            dw["w_gate"],
+            dw["w_up"],
+            dw["w_down"],
             has_prefill,
             prefill_out,
             decode_out,
@@ -405,7 +453,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 "L3 l3_generate decode requested but artefacts not compiled. "
                 "Construct the executor with l3_mode=True."
             )
-        sw = compiled.stacked_weights
+        # Use device-resident DeviceTensor for static weights when available
+        # to skip H2D copy inside execute_compiled (child_memory=True path).
+        dw = compiled.l3_device_weights or compiled.stacked_weights
+        rope_cos = (dw.get("rope_cos") or compiled.rope_cos)
+        rope_sin = (dw.get("rope_sin") or compiled.rope_sin)
         actual_batch = decode_inputs.actual_batch
         hidden_size = model.config.hidden_size
         max_seq = model.runtime.max_seq_len
@@ -430,22 +482,22 @@ class PyptoQwen14BExecutor(ModelExecutor):
             decode_inputs.hidden,
             decode_inputs.seq_lens,
             decode_inputs.slot_mapping,
-            sw["input_rms_weight"],
-            sw["wq"],
-            sw["wk"],
-            sw["wv"],
-            sw["q_norm_weight"],
-            sw["k_norm_weight"],
-            compiled.rope_cos,
-            compiled.rope_sin,
+            dw["input_rms_weight"],
+            dw["wq"],
+            dw["wk"],
+            dw["wv"],
+            dw["q_norm_weight"],
+            dw["k_norm_weight"],
+            rope_cos,
+            rope_sin,
             decode_inputs.block_table,
             k_cache_all,
             v_cache_all,
-            sw["wo"],
-            sw["post_rms_weight"],
-            sw["w_gate"],
-            sw["w_up"],
-            sw["w_down"],
+            dw["wo"],
+            dw["post_rms_weight"],
+            dw["w_gate"],
+            dw["w_up"],
+            dw["w_down"],
             has_prefill,
             dummy_prefill_out,
             decode_out,
@@ -603,6 +655,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
                         lg_chip_callables[func.name] = cc
             lg_orch_path = lg_output_dir / "orchestration" / "host_orch.py"
             lg_orch_module = _load_generated_module(lg_orch_path)
+            # Patch make_tensor_arg so pre-uploaded ContinuousTensor objects
+            # (child_memory=True) are passed through unchanged instead of
+            # triggering a crash when the generated code calls make_tensor_arg
+            # on a non-torch.Tensor value.
+            _patch_orch_make_tensor_arg(lg_orch_module)
             lg_entry_fn = None
             for attr_name in ("entry", "host_orch"):
                 lg_entry_fn = getattr(lg_orch_module, attr_name, None)
@@ -651,6 +708,17 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         decode_weights = self._stack_decode_weights(layers)
 
+        # l3_device_weights / l3_device_worker: reserved for future persistent
+        # weight residency on the step-by-step _run_l3_generate_prefill/decode
+        # path.  Currently always None — the run_generate_l3 path pre-uploads
+        # weights inside generate_orch_fn via orch.malloc/copy_to which is safe
+        # because it runs inside the already-open chip worker context.  Opening
+        # a separate pypto.runtime.Worker here (compile time) is avoided: it
+        # would conflict with the level-3 Worker created later and may hang
+        # when device memory pools (PTO2_DEVICE_MEM_POOL) are active.
+        l3_device_weights: dict[str, object] | None = None
+        l3_device_worker: object | None = None
+
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
@@ -672,6 +740,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
             l3_generate_platform=l3_generate_platform,
             l3_generate_runtime_name=l3_generate_runtime_name,
             l3_generate_param_infos=l3_generate_param_infos,
+            l3_device_weights=l3_device_weights,
+            l3_device_worker=l3_device_worker,
         )
 
     @staticmethod
@@ -824,6 +894,14 @@ class PyptoQwen14BExecutor(ModelExecutor):
         sm_sw = {}
         for k, v in compiled.stacked_weights.items():
             sm_sw[k] = v.share_memory_() if not v.is_shared() else v
+
+        # SSA-name substrings that identify static weight parameters in the
+        # tensors_dict built by _build_full_tensors().  Used in
+        # generate_orch_fn to pre-upload these tensors once per generate call
+        # (child_memory=True) so all decode dispatches skip H2D re-upload.
+        _sw_substrings: frozenset[str] = frozenset(sm_sw.keys()) | {
+            "rope_cos", "rope_sin", "final_norm_weight", "lm_head_weight",
+        }
 
         # ── Sub-worker callable ──
         # Runs in a forked child process. Reads logits → argmax → embedding lookup
@@ -1027,6 +1105,31 @@ class PyptoQwen14BExecutor(ModelExecutor):
             # Single dispatch: host_orch drives prefill + all decode steps
             # (pl.unroll(max_new_tokens) inside host_orch).
             td = _build_full_tensors()
+
+            # Pre-upload static weight tensors to the chip device once per
+            # generate call using child_memory=True.  The runtime then skips
+            # H2D + D2H for those buffers on every subsequent dispatch, turning
+            # ~3 400 ms of init_runtime overhead per step into ~11 ms.
+            # device memory is reclaimed automatically when the worker closes.
+            from simpler.task_interface import ContinuousTensor as _CT  # noqa: PLC0415
+            from simpler_setup.torch_interop import (  # noqa: PLC0415
+                torch_dtype_to_datatype as _td2dt,
+            )
+            for _pname, _t in list(td.items()):
+                if not isinstance(_t, torch.Tensor):
+                    continue
+                if not any(_sub in _pname for _sub in _sw_substrings):
+                    continue
+                _nbytes = int(_t.nbytes)
+                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
+                orch.copy_to(
+                    worker_id=0, dst=_dev_ptr,
+                    src=_t.data_ptr(), size=_nbytes,
+                )
+                _shapes = tuple(int(s) for s in _t.shape)
+                _dt = _td2dt(_t.dtype)
+                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
+
             _submit_l3_generate(orch, call_config, td, _keep)
 
             if _l3_trace_enabled:
