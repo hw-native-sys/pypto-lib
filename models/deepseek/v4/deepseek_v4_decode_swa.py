@@ -84,6 +84,8 @@ def deepseek_v4_decode_swa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
@@ -92,7 +94,8 @@ def deepseek_v4_decode_swa(
     seqused_kv: pl.Tensor[[B], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
 ):
@@ -139,6 +142,8 @@ def deepseek_v4_decode_swa(
         wkv,
         rope_cos_t,
         rope_sin_t,
+        even_select_t,
+        odd_select_t,
         gamma_cq,
         gamma_ckv,
         q,
@@ -190,6 +195,7 @@ def deepseek_v4_decode_swa(
         rope_sin_t,
         wo_a,
         wo_b,
+        wo_b_scale,
         attn_out,
     )
 
@@ -301,6 +307,7 @@ def golden_deepseek_v4_decode_swa(tensors):
         "freqs_sin": rope_sin_T,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
+        "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
 
@@ -333,6 +340,15 @@ def build_tensor_specs():
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
 
+    def quant_w_per_row(w):
+        amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = w.float() * scale_quant.unsqueeze(-1)
+        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+        w_i8 = w_i32.to(torch.float16).to(torch.int8)
+        return w_i8, (1.0 / scale_quant).float()
+
     def init_x_hc():
         return torch.randn(B, S, HC_MULT, D) * 0.05
     def init_hc_attn_fn():
@@ -357,6 +373,16 @@ def build_tensor_specs():
         return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
     def init_freqs_sin():
         return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+    def init_even_select_t():
+        m = torch.zeros((ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM))
+        for i in range(ROPE_HEAD_DIM // 2):
+            m[i, 2 * i] = 1
+        return m
+    def init_odd_select_t():
+        m = torch.zeros((ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM))
+        for i in range(ROPE_HEAD_DIM // 2):
+            m[i, 2 * i + 1] = 1
+        return m
     def init_kv_cache():
         return torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
 
@@ -379,6 +405,8 @@ def build_tensor_specs():
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
     wq_b_scale = wq_b_scale.view(Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK)
+    wo_b_bf16 = init_wo_b().to(torch.bfloat16)
+    wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
         TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
@@ -394,12 +422,15 @@ def build_tensor_specs():
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
+        TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.bfloat16, init_value=init_wo_b),
+        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
+        TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
         ScalarSpec("start_pos", torch.int32, START_POS),
     ]
@@ -421,9 +452,9 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v4_decode_swa,
         config=RunConfig(
-            # qkv_proj_rope now uses W8A8C16 q_proj; SWA carries that BF16 drift through attention/o_proj.
-            rtol=6e-3,
-            atol=6e-3,
+            # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; SWA carries that drift through attention/o_proj.
+            rtol=1.3e-2,
+            atol=1.3e-2,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

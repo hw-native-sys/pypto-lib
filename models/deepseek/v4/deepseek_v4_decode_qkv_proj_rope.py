@@ -23,6 +23,8 @@ H           = 64               # flash:64 pro:128
 HEAD_DIM    = 512
 ROPE_DIM    = 64
 ROPE_HALF   = ROPE_DIM // 2
+ROPE_CHUNK  = 32
+ROPE_PAIR_CHUNK = ROPE_CHUNK // 2
 NOPE_DIM    = HEAD_DIM - ROPE_DIM
 Q_LORA      = 1024             # flash:1024 pro:1536
 HEAD_CHUNK  = 64
@@ -59,6 +61,8 @@ def deepseek_v4_decode_qkv_proj_rope(
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
     rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+    even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
+    odd_select_t:  pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
     gamma_cq:  pl.Tensor[[Q_LORA],               pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
     q:         pl.Tensor[[T, H, HEAD_DIM],        pl.BF16],
@@ -199,18 +203,36 @@ def deepseek_v4_decode_qkv_proj_rope(
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
                 q_flat = pl.assemble(q_flat, pl.cast(q_normed, target_type=pl.BF16), [0, h0 + n0])
 
-            q_lo = pl.slice(q_proj_fp32, [T, ROPE_HALF], [0, h0 + NOPE_DIM])
-            q_hi = pl.slice(q_proj_fp32, [T, ROPE_HALF], [0, h0 + NOPE_DIM + ROPE_HALF])
-            q_lo_norm = pl.row_expand_mul(q_lo, q_head_inv_rms_t)
-            q_hi_norm = pl.row_expand_mul(q_hi, q_head_inv_rms_t)
-            cos_lo = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
-            cos_hi = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
-            sin_lo = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
-            sin_hi = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
-            q_rot_lo = pl.sub(pl.mul(q_lo_norm, cos_lo), pl.mul(q_hi_norm, sin_lo))
-            q_rot_hi = pl.add(pl.mul(q_hi_norm, cos_hi), pl.mul(q_lo_norm, sin_hi))
-            q_flat = pl.assemble(q_flat, pl.cast(q_rot_lo, target_type=pl.BF16), [0, h0 + NOPE_DIM])
-            q_flat = pl.assemble(q_flat, pl.cast(q_rot_hi, target_type=pl.BF16), [0, h0 + NOPE_DIM + ROPE_HALF])
+            q_rope = pl.slice(q_proj_fp32, [T, ROPE_DIM], [0, h0 + NOPE_DIM])
+            q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
+            q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+            q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+            cos = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+            sin = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+            q_rot_even = pl.sub(pl.mul(q_even, cos), pl.mul(q_odd, sin))
+            q_rot_odd = pl.add(pl.mul(q_even, sin), pl.mul(q_odd, cos))
+            q_rot_even_bf16 = pl.cast(q_rot_even, target_type=pl.BF16)
+            q_rot_odd_bf16 = pl.cast(q_rot_odd, target_type=pl.BF16)
+
+        for rope_col in pl.range(0, ROPE_DIM, ROPE_CHUNK):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_rope_reassemble"):
+                pair_col = rope_col // 2
+                q_rot_even_chunk = pl.slice(q_rot_even_bf16, [T, ROPE_PAIR_CHUNK], [0, pair_col])
+                q_rot_odd_chunk = pl.slice(q_rot_odd_bf16, [T, ROPE_PAIR_CHUNK], [0, pair_col])
+                q_rot_chunk = pl.matmul(
+                    q_rot_even_chunk,
+                    pl.slice(even_select_t, [ROPE_PAIR_CHUNK, ROPE_CHUNK], [pair_col, rope_col]),
+                    out_dtype=pl.FP32,
+                )
+                q_rot_chunk = pl.matmul_acc(
+                    q_rot_chunk,
+                    q_rot_odd_chunk,
+                    pl.slice(odd_select_t, [ROPE_PAIR_CHUNK, ROPE_CHUNK], [pair_col, rope_col]),
+                )
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_rope_write"):
+                h0 = h * HEAD_DIM
+                q_flat = pl.assemble(q_flat, pl.cast(q_rot_chunk, target_type=pl.BF16), [0, h0 + NOPE_DIM + rope_col])
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
 
@@ -249,27 +271,42 @@ def deepseek_v4_decode_qkv_proj_rope(
             )
             kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
             kv = pl.assemble(kv, pl.cast(kv_normed, target_type=pl.BF16), [0, n0])
+    kv_rot_even_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
+    kv_rot_odd_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP):
-        kv_lo = pl.slice(kv_fp32, [T, ROPE_HALF], [0, NOPE_DIM])
-        kv_hi = pl.slice(kv_fp32, [T, ROPE_HALF], [0, NOPE_DIM + ROPE_HALF])
-        gamma_lo = pl.reshape(
-            pl.cast(pl.slice(gamma_ckv, [ROPE_HALF], [NOPE_DIM]), target_type=pl.FP32),
-            [1, ROPE_HALF],
+        kv_rope = pl.slice(kv_fp32, [T, ROPE_DIM], [0, NOPE_DIM])
+        gamma_rope = pl.reshape(
+            pl.cast(pl.slice(gamma_ckv, [ROPE_DIM], [NOPE_DIM]), target_type=pl.FP32),
+            [1, ROPE_DIM],
         )
-        gamma_hi = pl.reshape(
-            pl.cast(pl.slice(gamma_ckv, [ROPE_HALF], [NOPE_DIM + ROPE_HALF]), target_type=pl.FP32),
-            [1, ROPE_HALF],
-        )
-        kv_lo_norm = pl.col_expand_mul(pl.row_expand_mul(kv_lo, kv_inv_rms_t), gamma_lo)
-        kv_hi_norm = pl.col_expand_mul(pl.row_expand_mul(kv_hi, kv_inv_rms_t), gamma_hi)
-        cos_lo = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
-        cos_hi = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
-        sin_lo = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
-        sin_hi = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, ROPE_HALF]), target_type=pl.FP32)
-        kv_rot_lo = pl.sub(pl.mul(kv_lo_norm, cos_lo), pl.mul(kv_hi_norm, sin_lo))
-        kv_rot_hi = pl.add(pl.mul(kv_hi_norm, cos_hi), pl.mul(kv_lo_norm, sin_hi))
-        kv = pl.assemble(kv, pl.cast(kv_rot_lo, target_type=pl.BF16), [0, NOPE_DIM])
-        kv = pl.assemble(kv, pl.cast(kv_rot_hi, target_type=pl.BF16), [0, NOPE_DIM + ROPE_HALF])
+        kv_rope_norm = pl.col_expand_mul(pl.row_expand_mul(kv_rope, kv_inv_rms_t), gamma_rope)
+        kv_even = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+        kv_odd = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+        cos = pl.cast(pl.slice(rope_cos, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+        sin = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
+        kv_rot_even = pl.sub(pl.mul(kv_even, cos), pl.mul(kv_odd, sin))
+        kv_rot_odd = pl.add(pl.mul(kv_even, sin), pl.mul(kv_odd, cos))
+        kv_rot_even_tmp = pl.assemble(kv_rot_even_tmp, pl.cast(kv_rot_even, target_type=pl.BF16), [0, 0])
+        kv_rot_odd_tmp = pl.assemble(kv_rot_odd_tmp, pl.cast(kv_rot_odd, target_type=pl.BF16), [0, 0])
+
+    for rope_col in pl.range(0, ROPE_DIM, ROPE_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_reassemble"):
+            pair_col = rope_col // 2
+            kv_rot_even_chunk = pl.slice(kv_rot_even_tmp, [T, ROPE_PAIR_CHUNK], [0, pair_col])
+            kv_rot_odd_chunk = pl.slice(kv_rot_odd_tmp, [T, ROPE_PAIR_CHUNK], [0, pair_col])
+            kv_rot_chunk = pl.matmul(
+                kv_rot_even_chunk,
+                pl.slice(even_select_t, [ROPE_PAIR_CHUNK, ROPE_CHUNK], [pair_col, rope_col]),
+                out_dtype=pl.FP32,
+            )
+            kv_rot_chunk = pl.matmul_acc(
+                kv_rot_chunk,
+                kv_rot_odd_chunk,
+                pl.slice(odd_select_t, [ROPE_PAIR_CHUNK, ROPE_CHUNK], [pair_col, rope_col]),
+            )
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_write"):
+            kv = pl.assemble(kv, pl.cast(kv_rot_chunk, target_type=pl.BF16), [0, NOPE_DIM + rope_col])
 
     return q
 
@@ -284,6 +321,8 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
     rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+    even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
+    odd_select_t:  pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
     gamma_cq:  pl.Tensor[[Q_LORA],               pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
     q:         pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
@@ -292,7 +331,22 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     qr_scale:  pl.Out[pl.Tensor[[T, 1],           pl.FP32]],
 ):
     q = deepseek_v4_decode_qkv_proj_rope(
-        x, norm_w, wq_a, wq_b, wq_b_scale, wkv, rope_cos, rope_sin, gamma_cq, gamma_ckv, q, kv, qr, qr_scale
+        x,
+        norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        rope_cos,
+        rope_sin,
+        even_select_t,
+        odd_select_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
     )
     return q
 
@@ -335,22 +389,17 @@ def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
         return torch.matmul(a_fp32, b_fp32).float()
 
     def apply_rope(x_rope, cos, sin):
-        # x_rope: [T, ..., ROPE_DIM] using lo/hi half split.
-        half = ROPE_DIM // 2
-        x_lo = x_rope[..., :half]
-        x_hi = x_rope[..., half:]
-        cos_lo = cos[..., :half]
-        cos_hi = cos[..., half:]
-        sin_lo = sin[..., :half]
-        sin_hi = sin[..., half:]
-        while cos_lo.ndim < x_lo.ndim:
-            cos_lo = cos_lo.unsqueeze(-2)
-            cos_hi = cos_hi.unsqueeze(-2)
-            sin_lo = sin_lo.unsqueeze(-2)
-            sin_hi = sin_hi.unsqueeze(-2)
-        rot_lo = x_lo * cos_lo - x_hi * sin_lo
-        rot_hi = x_hi * cos_hi + x_lo * sin_hi
-        return torch.cat([rot_lo, rot_hi], dim=-1)
+        # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
+        x_pair = x_rope.unflatten(-1, (-1, 2))
+        x_even, x_odd = x_pair[..., 0], x_pair[..., 1]
+        cos_v = cos[..., :ROPE_HALF]
+        sin_v = sin[..., :ROPE_HALF]
+        while cos_v.ndim < x_even.ndim:
+            cos_v = cos_v.unsqueeze(-2)
+            sin_v = sin_v.unsqueeze(-2)
+        y_even = (x_even * cos_v - x_odd * sin_v).to(torch.bfloat16)
+        y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
+        return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
 
     # attn_norm fused (model.py:692)
     token_x = rms_norm(x.view(T, D), norm_w)                        # [T, D]
@@ -412,6 +461,16 @@ def build_tensor_specs():
         return torch.cos(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
     def init_sin():
         return torch.sin(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
+    def init_even_select_t():
+        m = torch.zeros((ROPE_HALF, ROPE_DIM))
+        for i in range(ROPE_HALF):
+            m[i, 2 * i] = 1
+        return m
+    def init_odd_select_t():
+        m = torch.zeros((ROPE_HALF, ROPE_DIM))
+        for i in range(ROPE_HALF):
+            m[i, 2 * i + 1] = 1
+        return m
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -430,6 +489,8 @@ def build_tensor_specs():
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
+        TensorSpec("even_select_t", [ROPE_HALF, ROPE_DIM], torch.bfloat16, init_value=init_even_select_t),
+        TensorSpec("odd_select_t",  [ROPE_HALF, ROPE_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),
