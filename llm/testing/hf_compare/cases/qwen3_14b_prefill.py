@@ -18,51 +18,30 @@ Port of ``examples/models/qwen3/14b/compare_prefill_with_hf.py``. Run via:
 """
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
 
 from ..base import ComparisonCase, InputSpec, OutputSelector, TensorSpec, Tolerance, register_case
 from ..input_sampler import build_rope_tables, int_fill, uniform
+from ..paged_kv import (
+    compute_prefill_slot_mapping,
+    gather_prefill_kv,
+    init_block_table_identity,
+)
 from ..reference import CallableReference
 from ..target import CallableTarget, PyPTOKernelTarget
-from ..weight_adapter import Cast, Contiguous, DictAdapter, Map, Transpose, View
-
-
-DEFAULT_MODEL_PATH = "/data/linyifan/models/Qwen3-14B"
-
-# Qwen3-14B layer constants (mirrors qwen3_14b_prefill.py).
-HIDDEN = 5120
-HEAD_DIM = 128
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
-
-# Spec order must match qwen3_14b_prefill.qwen3_14b_prefill signature.
-SPEC_ORDER = [
-    "hidden_states",
-    "seq_lens",
-    "input_rms_weight",
-    "wq",
-    "wk",
-    "wv",
-    "q_norm_weight",
-    "k_norm_weight",
-    "rope_cos",
-    "rope_sin",
-    "block_table",
-    "slot_mapping",
-    "k_cache",
-    "v_cache",
-    "wo",
-    "post_rms_weight",
-    "w_gate",
-    "w_up",
-    "w_down",
-    "out",
-]
+from ._qwen3_14b_common import (
+    DEFAULT_MODEL_PATH,
+    HEAD_DIM,
+    HIDDEN,
+    NUM_KV_HEADS,
+    PREFILL_SPEC_ORDER as SPEC_ORDER,
+    coerce_bool,
+    load_kernel_module,
+    single_layer_adapter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,45 +107,9 @@ def _select_npu_layer_out(
     return flat.view(batch, max_seq, HIDDEN)[:, :seq_len, :].clone()
 
 
-def _select_npu_kv(
-    flat: torch.Tensor,
-    *,
-    slot_mapping: torch.Tensor,
-    block_size: int,
-    batch: int,
-    max_seq: int,
-    seq_len: int,
-) -> torch.Tensor:
-    # The kernel writes KV into a paged cache using slot_mapping, not a simple
-    # [B, nkv, S, D] contiguous layout. Reconstruct the logical [B, nkv, S, D]
-    # view by gathering the written rows.
-    #
-    # cache_row = (slot_block * nkv + kvh) * BLOCK_SIZE + slot_offset
-    #
-    # slot = slot_mapping[b * max_seq + pos]
-    # slot_block = slot // BLOCK_SIZE
-    # slot_offset = slot % BLOCK_SIZE
-    out = torch.empty((batch, NUM_KV_HEADS, seq_len, HEAD_DIM), dtype=flat.dtype, device=flat.device)
-    for b in range(batch):
-        for pos in range(seq_len):
-            slot = int(slot_mapping[b * max_seq + pos].item())
-            slot_block = slot // block_size
-            slot_off = slot - slot_block * block_size
-            base = slot_block * NUM_KV_HEADS * block_size + slot_off
-            for kvh in range(NUM_KV_HEADS):
-                out[b, kvh, pos, :] = flat[base + kvh * block_size, :]
-    return out.clone()
-
-
 # ---------------------------------------------------------------------------
 # Case factory
 # ---------------------------------------------------------------------------
-def _coerce_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    return str(v).lower() in {"1", "true", "yes", "on"}
-
-
 @register_case("qwen3_14b.prefill")
 def build(
     hf_model_path: str = DEFAULT_MODEL_PATH,
@@ -181,7 +124,7 @@ def build(
     rtol: float = 5e-3,
     hf_dtype: str = "fp32",
 ) -> ComparisonCase:
-    cpu_only = _coerce_bool(cpu_only)
+    cpu_only = coerce_bool(cpu_only)
     device_id = int(device_id) if device_id is not None else None
     batch = int(batch)
     seed = int(seed)
@@ -191,14 +134,10 @@ def build(
     rtol = float(rtol)
     hf_dtype_t = torch.float32 if hf_dtype == "fp32" else torch.bfloat16
 
-    repo_root = Path(__file__).resolve().parents[4]
-    # Load the kernel directly from examples (bypass llm.model shim).
-    _KERNEL_PATH = repo_root / "examples" / "models" / "qwen3" / "14b" / "qwen3_14b_prefill.py"
-    _SPEC = importlib.util.spec_from_file_location("_qwen3_14b_prefill_kernel", _KERNEL_PATH)
-    if _SPEC is None or _SPEC.loader is None:
-        raise ImportError(f"Cannot load Qwen3-14B prefill kernel from {_KERNEL_PATH}")
-    prefill = importlib.util.module_from_spec(_SPEC)
-    _SPEC.loader.exec_module(prefill)
+    prefill = load_kernel_module(
+        "models/qwen3/14b/qwen3_14b_prefill.py",
+        "_qwen3_14b_prefill_kernel",
+    )
 
     if batch <= 0:
         raise ValueError(f"batch must be positive, got {batch}")
@@ -238,33 +177,7 @@ def build(
     )
 
     # ---- weight adapter (identical layout to decode case) ------------------
-    adapter = DictAdapter(
-        prefix="model.layers.0.",
-        mapping={
-            "input_rms_weight": Map("input_layernorm.weight",
-                                    ops=[View([1, HIDDEN]), Cast(torch.float32)]),
-            "wq": Map("self_attn.q_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "wk": Map("self_attn.k_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "wv": Map("self_attn.v_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "q_norm_weight": Map("self_attn.q_norm.weight",
-                                 ops=[View([1, HEAD_DIM]), Cast(torch.float32)]),
-            "k_norm_weight": Map("self_attn.k_norm.weight",
-                                 ops=[View([1, HEAD_DIM]), Cast(torch.float32)]),
-            "wo": Map("self_attn.o_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "post_rms_weight": Map("post_attention_layernorm.weight",
-                                   ops=[View([1, HIDDEN]), Cast(torch.float32)]),
-            "w_gate": Map("mlp.gate_proj.weight",
-                          ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "w_up": Map("mlp.up_proj.weight",
-                        ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "w_down": Map("mlp.down_proj.weight",
-                          ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-        },
-    )
+    adapter = single_layer_adapter(layer_idx=0)
 
     # ---- reference ---------------------------------------------------------
     reference = CallableReference(
@@ -276,18 +189,19 @@ def build(
 
     # ---- target ------------------------------------------------------------
     def _post_run(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        slot_mapping = tensors["slot_mapping"]
+        kv_kwargs = dict(
+            batch=batch, max_seq=max_seq_eff, seq_len=seq_len,
+            num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM, block_size=_block_size,
+        )
         return {
             "layer_out": _select_npu_layer_out(
                 tensors["out"], batch=batch, max_seq=max_seq_eff, seq_len=seq_len,
             ),
-            "k_cache_written": _select_npu_kv(
-                tensors["k_cache"], slot_mapping=slot_mapping, block_size=_block_size,
-                batch=batch, max_seq=max_seq_eff, seq_len=seq_len,
+            "k_cache_written": gather_prefill_kv(
+                tensors["k_cache"], tensors["slot_mapping"], **kv_kwargs,
             ),
-            "v_cache_written": _select_npu_kv(
-                tensors["v_cache"], slot_mapping=slot_mapping, block_size=_block_size,
-                batch=batch, max_seq=max_seq_eff, seq_len=seq_len,
+            "v_cache_written": gather_prefill_kv(
+                tensors["v_cache"], tensors["slot_mapping"], **kv_kwargs,
             ),
         }
 
@@ -350,15 +264,11 @@ def _init_paged_attention_inputs(
     block_size: int,
     max_blocks_per_seq: int,
 ) -> None:
-    # Identity mapping: logical blocks map to physical blocks in order.
-    tensors["block_table"][:] = torch.arange(batch * max_blocks_per_seq, dtype=torch.int32)
-
-    # slot_mapping maps each (b, pos) -> (phys_block * block_size + offset).
-    slot = tensors["slot_mapping"]
-    for b in range(batch):
-        base_block = b * max_blocks_per_seq
-        for pos in range(max_seq):
-            logical_block = pos // block_size
-            page_off = pos - logical_block * block_size
-            phys_block = base_block + logical_block
-            slot[b * max_seq + pos] = phys_block * block_size + page_off
+    init_block_table_identity(
+        tensors["block_table"], batch=batch, max_blocks_per_seq=max_blocks_per_seq,
+    )
+    compute_prefill_slot_mapping(
+        tensors["slot_mapping"],
+        batch=batch, max_seq=max_seq,
+        block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
+    )

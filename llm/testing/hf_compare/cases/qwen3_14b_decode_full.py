@@ -11,56 +11,32 @@ Run via:
 """
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
 
 from ..base import ComparisonCase, InputSpec, OutputSelector, TensorSpec, Tolerance, register_case
-from ..input_sampler import build_rope_tables, int_fill, uniform
-from ..reference import CallableReference
 from ..base import WeightAdapter
+from ..input_sampler import build_rope_tables, int_fill, uniform
+from ..paged_kv import (
+    compute_decode_slot_mapping,
+    init_block_table_identity,
+    paged_to_dense_history,
+    select_kv_at_decode_slot,
+)
+from ..reference import CallableReference
 from ..target import PyPTOKernelTarget
-
-
-DEFAULT_MODEL_PATH = "/data/linyifan/models/Qwen3-14B"
-
-HIDDEN = 5120
-HEAD_DIM = 128
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
-INTER = 17408
-
-SPEC_ORDER = [
-    "hidden_states",
-    "input_rms_weight",
-    "wq",
-    "wk",
-    "wv",
-    "q_norm_weight",
-    "k_norm_weight",
-    "seq_lens",
-    "block_table",
-    "slot_mapping",
-    "rope_cos",
-    "rope_sin",
-    "k_cache",
-    "v_cache",
-    "wo",
-    "post_rms_weight",
-    "w_gate",
-    "w_up",
-    "w_down",
-    "out",
-]
-
-
-def _coerce_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    return str(v).lower() in {"1", "true", "yes", "on"}
+from ._qwen3_14b_common import (
+    DECODE_SPEC_ORDER as SPEC_ORDER,
+    DEFAULT_MODEL_PATH,
+    HEAD_DIM,
+    HIDDEN,
+    INTER,
+    NUM_HEADS,
+    NUM_KV_HEADS,
+    load_kernel_module,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +49,7 @@ def _hf_decode_full_forward(
     model_path: str,
     max_seq: int,
     num_layers: int,
+    block_size: int,
     hf_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     from transformers import AutoConfig
@@ -99,27 +76,19 @@ def _hf_decode_full_forward(
     pos = seq_len - 1
 
     block_table = inputs["block_table"]
-    block_size = 64
     max_blocks_per_seq = (max_seq + block_size - 1) // block_size
-    ctx_blocks = (seq_len + block_size - 1) // block_size
     layer_cache_rows = batch * max_blocks_per_seq * NUM_KV_HEADS * block_size
 
     cache = DynamicCache()
     for li in range(num_layers):
-        base = li * layer_cache_rows
-        k_hist = torch.empty((batch, NUM_KV_HEADS, pos, HEAD_DIM), dtype=hf_dtype)
-        v_hist = torch.empty((batch, NUM_KV_HEADS, pos, HEAD_DIM), dtype=hf_dtype)
-        for b in range(batch):
-            for kvh in range(NUM_KV_HEADS):
-                stitched_k: list[torch.Tensor] = []
-                stitched_v: list[torch.Tensor] = []
-                for sb in range(ctx_blocks):
-                    pbid = int(block_table[b * max_blocks_per_seq + sb].item())
-                    cache_row0 = base + (pbid * NUM_KV_HEADS + kvh) * block_size
-                    stitched_k.append(inputs["k_cache"][cache_row0:cache_row0 + block_size, :])
-                    stitched_v.append(inputs["v_cache"][cache_row0:cache_row0 + block_size, :])
-                k_hist[b, kvh, :, :] = torch.cat(stitched_k, dim=0)[:pos, :].to(hf_dtype)
-                v_hist[b, kvh, :, :] = torch.cat(stitched_v, dim=0)[:pos, :].to(hf_dtype)
+        k_hist, v_hist = paged_to_dense_history(
+            inputs["k_cache"], inputs["v_cache"], block_table,
+            batch=batch, ctx_len=pos,
+            num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+            block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
+            hf_dtype=hf_dtype,
+            layer_offset_rows=li * layer_cache_rows,
+        )
         cache.update(k_hist, v_hist, layer_idx=li)
 
     cos = inputs["rope_cos"][pos:pos + 1].to(hf_dtype).unsqueeze(0).expand(batch, -1, -1)
@@ -154,27 +123,6 @@ def _hf_decode_full_forward(
         result[f"layer{li:02d}_k_pos"] = per_layer_k[li]
         result[f"layer{li:02d}_v_pos"] = per_layer_v[li]
     return result
-
-
-def _select_k_pos_at_layer(
-    cache_flat: torch.Tensor,
-    *,
-    slot_mapping: torch.Tensor,
-    batch: int,
-    block_size: int,
-    layer_idx: int,
-    layer_cache_rows: int,
-) -> torch.Tensor:
-    base = layer_idx * layer_cache_rows
-    out = torch.empty((batch, NUM_KV_HEADS, HEAD_DIM), dtype=cache_flat.dtype, device=cache_flat.device)
-    for b in range(batch):
-        slot = int(slot_mapping[b].item())
-        slot_block = slot // block_size
-        slot_off = slot - slot_block * block_size
-        ofs = base + slot_block * NUM_KV_HEADS * block_size + slot_off
-        for kvh in range(NUM_KV_HEADS):
-            out[b, kvh, :] = cache_flat[ofs + kvh * block_size, :]
-    return out.clone()
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +181,16 @@ def build(
     seq_len: int | None = None,
     max_seq: int | None = None,
     num_layers: int = 4,
-    atol: float = 5e-3,
-    rtol: float = 5e-3,
+    atol: float = 1.5e-2,
+    rtol: float = 1.5e-2,
+    pass_rate: float = 0.99,
     hf_dtype: str = "fp32",
 ) -> ComparisonCase:
+    # Tolerance defaults are sized for the BF16-faithful NPU path vs FP32 HF
+    # reference. K-cache (after K-norm + RoPE) sees ~3e-3 mean / ~0.2 max
+    # absolute error from intermediate BF16 round-trips on UB boundaries; a
+    # ~2x BF16 ulp budget (1.5e-2) absorbs that, and 0.99 pass_rate accepts
+    # the BF16 long-tail outliers. Override via -k atol/-k rtol/-k pass_rate.
     device_id = int(device_id) if device_id is not None else None
     batch = int(batch)
     seed = int(seed)
@@ -245,15 +199,13 @@ def build(
     max_seq = int(max_seq) if max_seq is not None else None
     atol = float(atol)
     rtol = float(rtol)
+    pass_rate = float(pass_rate)
     hf_dtype_t = torch.float32 if hf_dtype == "fp32" else torch.bfloat16
 
-    repo_root = Path(__file__).resolve().parents[4]
-    _KERNEL_PATH = repo_root / "examples" / "models" / "qwen3" / "14b" / "qwen3_14b_decode_full.py"
-    _SPEC = importlib.util.spec_from_file_location("_qwen3_14b_decode_full_kernel", _KERNEL_PATH)
-    if _SPEC is None or _SPEC.loader is None:
-        raise ImportError(f"Cannot load fused decode kernel from {_KERNEL_PATH}")
-    dec = importlib.util.module_from_spec(_SPEC)
-    _SPEC.loader.exec_module(dec)
+    dec = load_kernel_module(
+        "models/qwen3/14b/qwen3_14b_decode_full.py",
+        "_qwen3_14b_decode_full_kernel",
+    )
 
     if batch <= 0:
         raise ValueError(f"batch must be positive, got {batch}")
@@ -292,22 +244,24 @@ def build(
         fn=lambda inp, st: _hf_decode_full_forward(
             inp, st,
             model_path=hf_model_path, max_seq=max_seq_eff,
-            num_layers=num_layers, hf_dtype=hf_dtype_t,
+            num_layers=num_layers, block_size=block_size, hf_dtype=hf_dtype_t,
         ),
     )
 
     def _post_run(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         result: dict[str, torch.Tensor] = {"layer_out": tensors["out"].clone()}
+        kv_kwargs = dict(
+            num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM, block_size=block_size,
+        )
         for li in range(num_layers):
-            result[f"layer{li:02d}_k_pos"] = _select_k_pos_at_layer(
-                tensors["k_cache"], slot_mapping=tensors["slot_mapping"],
-                batch=batch, block_size=block_size,
-                layer_idx=li, layer_cache_rows=layer_cache_rows,
+            offset = li * layer_cache_rows
+            result[f"layer{li:02d}_k_pos"] = select_kv_at_decode_slot(
+                tensors["k_cache"], tensors["slot_mapping"],
+                layer_offset_rows=offset, **kv_kwargs,
             )
-            result[f"layer{li:02d}_v_pos"] = _select_k_pos_at_layer(
-                tensors["v_cache"], slot_mapping=tensors["slot_mapping"],
-                batch=batch, block_size=block_size,
-                layer_idx=li, layer_cache_rows=layer_cache_rows,
+            result[f"layer{li:02d}_v_pos"] = select_kv_at_decode_slot(
+                tensors["v_cache"], tensors["slot_mapping"],
+                layer_offset_rows=offset, **kv_kwargs,
             )
         return result
 
@@ -342,7 +296,7 @@ def build(
         input_spec=input_spec,
         weight_adapter=adapter,
         selectors=selectors,
-        tolerance=Tolerance(atol=atol, rtol=rtol),
+        tolerance=Tolerance(atol=atol, rtol=rtol, pass_rate_threshold=pass_rate),
         hf_weights=hf_model_path,
         on_inputs=lambda t: _init_paged_attention_inputs(
             t, batch=batch, block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
@@ -357,12 +311,10 @@ def _init_paged_attention_inputs(
     block_size: int,
     max_blocks_per_seq: int,
 ) -> None:
-    tensors["block_table"][:] = torch.arange(batch * max_blocks_per_seq, dtype=torch.int32)
-    slots = tensors["slot_mapping"]
-    seq_lens = tensors["seq_lens"]
-    for b in range(batch):
-        pos = int(seq_lens[b].item()) - 1
-        logical_block = pos // block_size
-        page_off = pos - logical_block * block_size
-        phys_block = b * max_blocks_per_seq + logical_block
-        slots[b] = phys_block * block_size + page_off
+    init_block_table_identity(
+        tensors["block_table"], batch=batch, max_blocks_per_seq=max_blocks_per_seq,
+    )
+    compute_decode_slot_mapping(
+        tensors["slot_mapping"], tensors["seq_lens"],
+        batch=batch, block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
+    )

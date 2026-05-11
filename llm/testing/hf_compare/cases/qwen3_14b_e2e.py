@@ -39,11 +39,11 @@ EPS = 1e-6
 
 
 def _load_qwen3_modules() -> tuple[Any, Any]:
+    """Load the decode + prefill kernel modules from ``models/qwen3/14b/``."""
     repo_root = Path(__file__).resolve().parents[4]
-    base_dir = repo_root / "examples" / "models" / "qwen3" / "14b"
 
-    def _load(name: str, filename: str) -> Any:
-        module_path = base_dir / filename
+    def _load(name: str, rel_path: str) -> Any:
+        module_path = repo_root / rel_path
         spec = importlib.util.spec_from_file_location(name, module_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load Qwen3-14B helper from {module_path}")
@@ -52,8 +52,8 @@ def _load_qwen3_modules() -> tuple[Any, Any]:
         return module
 
     return (
-        _load("_qwen3_14b_decode_kernel", "qwen3_14b_decode.py"),
-        _load("_qwen3_14b_prefill_kernel", "qwen3_14b_prefill.py"),
+        _load("_qwen3_14b_decode_kernel", "models/qwen3/14b/qwen3_14b_decode.py"),
+        _load("_qwen3_14b_prefill_kernel", "models/qwen3/14b/qwen3_14b_prefill.py"),
     )
 
 

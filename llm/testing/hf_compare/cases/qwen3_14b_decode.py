@@ -22,51 +22,31 @@ Port of ``examples/models/qwen3/14b/compare_with_hf.py`` onto the
 """
 from __future__ import annotations
 
-import importlib.util
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import torch
 
 from ..base import ComparisonCase, InputSpec, OutputSelector, TensorSpec, Tolerance, register_case
 from ..input_sampler import build_rope_tables, int_fill, uniform
+from ..paged_kv import (
+    compute_decode_slot_mapping,
+    init_block_table_identity,
+    paged_to_dense_history,
+    select_kv_at_decode_slot,
+)
 from ..reference import CallableReference
 from ..target import CallableTarget, PyPTOKernelTarget
-from ..weight_adapter import Cast, Contiguous, DictAdapter, Map, Transpose, View
-
-
-DEFAULT_MODEL_PATH = "/data/linyifan/models/Qwen3-14B"
-
-# Qwen3-14B layer constants (mirrors qwen3_14b_decode.py).
-HIDDEN = 5120
-HEAD_DIM = 128
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
-
-# Spec order must match qwen3_14b_decode.qwen3_decode signature.
-SPEC_ORDER = [
-    "hidden_states",
-    "input_rms_weight",
-    "wq",
-    "wk",
-    "wv",
-    "q_norm_weight",
-    "k_norm_weight",
-    "seq_lens",
-    "block_table",
-    "slot_mapping",
-    "rope_cos",
-    "rope_sin",
-    "k_cache",
-    "v_cache",
-    "wo",
-    "post_rms_weight",
-    "w_gate",
-    "w_up",
-    "w_down",
-    "out",
-]
+from ._qwen3_14b_common import (
+    DECODE_SPEC_ORDER as SPEC_ORDER,
+    DEFAULT_MODEL_PATH,
+    HEAD_DIM,
+    HIDDEN,
+    NUM_KV_HEADS,
+    coerce_bool,
+    load_kernel_module,
+    single_layer_adapter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +58,7 @@ def _hf_decode_forward(
     *,
     model_path: str,
     max_seq: int,
+    block_size: int,
     hf_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     """Run Qwen3DecoderLayer for layer 0 with the given inputs / KV history."""
@@ -101,31 +82,15 @@ def _hf_decode_forward(
     seq_len = int(inputs["seq_lens"][0].item())
     pos = seq_len - 1
 
-    # Convert paged KV cache -> HF [B, nkv, S, head_dim] history.
-    # The cache is laid out as:
-    #   cache_row0 = (pbid * nkv + kvh) * BLOCK_SIZE
-    # where pbid comes from block_table[b, sb].
     block_table = inputs["block_table"]
-    block_size = 64  # matches qwen3_14b_decode.BLOCK_SIZE / SEQ_TILE
     max_blocks_per_seq = (max_seq + block_size - 1) // block_size
-    ctx_blocks = (seq_len + block_size - 1) // block_size
-
-    k_hist = torch.empty((batch, NUM_KV_HEADS, pos, HEAD_DIM), dtype=hf_dtype)
-    v_hist = torch.empty((batch, NUM_KV_HEADS, pos, HEAD_DIM), dtype=hf_dtype)
-    for b in range(batch):
-        for kvh in range(NUM_KV_HEADS):
-            # Stitch blocks then truncate to pos.
-            stitched_k: list[torch.Tensor] = []
-            stitched_v: list[torch.Tensor] = []
-            for sb in range(ctx_blocks):
-                pbid = int(block_table[b * max_blocks_per_seq + sb].item())
-                cache_row0 = (pbid * NUM_KV_HEADS + kvh) * block_size
-                stitched_k.append(inputs["k_cache"][cache_row0:cache_row0 + block_size, :])
-                stitched_v.append(inputs["v_cache"][cache_row0:cache_row0 + block_size, :])
-            k_full = torch.cat(stitched_k, dim=0)[:pos, :].to(hf_dtype)
-            v_full = torch.cat(stitched_v, dim=0)[:pos, :].to(hf_dtype)
-            k_hist[b, kvh, :, :] = k_full
-            v_hist[b, kvh, :, :] = v_full
+    k_hist, v_hist = paged_to_dense_history(
+        inputs["k_cache"], inputs["v_cache"], block_table,
+        batch=batch, ctx_len=pos,
+        num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+        block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
+        hf_dtype=hf_dtype,
+    )
 
     cache = DynamicCache()
     cache.update(k_hist, v_hist, layer_idx=0)
@@ -154,36 +119,8 @@ def _hf_decode_forward(
 
 
 # ---------------------------------------------------------------------------
-# Output selectors that pull the new KV row from the kernel's mutated cache.
-# ---------------------------------------------------------------------------
-def _select_k_pos(
-    cache_flat: torch.Tensor,
-    *,
-    slot_mapping: torch.Tensor,
-    batch: int,
-    block_size: int,
-) -> torch.Tensor:
-    # slot_mapping[b] = phys_block * BLOCK_SIZE + offset for the *current* token.
-    out = torch.empty((batch, NUM_KV_HEADS, HEAD_DIM), dtype=cache_flat.dtype, device=cache_flat.device)
-    for b in range(batch):
-        slot = int(slot_mapping[b].item())
-        slot_block = slot // block_size
-        slot_off = slot - slot_block * block_size
-        base = slot_block * NUM_KV_HEADS * block_size + slot_off
-        for kvh in range(NUM_KV_HEADS):
-            out[b, kvh, :] = cache_flat[base + kvh * block_size, :]
-    return out.clone()
-
-
-# ---------------------------------------------------------------------------
 # Case factory
 # ---------------------------------------------------------------------------
-def _coerce_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    return str(v).lower() in {"1", "true", "yes", "on"}
-
-
 @register_case("qwen3_14b.decode")
 def build(
     hf_model_path: str = DEFAULT_MODEL_PATH,
@@ -199,7 +136,7 @@ def build(
     rtol: float = 5e-3,
     hf_dtype: str = "fp32",
 ) -> ComparisonCase:
-    cpu_only = _coerce_bool(cpu_only)
+    cpu_only = coerce_bool(cpu_only)
     device_id = int(device_id) if device_id is not None else None
     batch = int(batch)
     seed = int(seed)
@@ -210,14 +147,10 @@ def build(
     rtol = float(rtol)
     hf_dtype_t = torch.float32 if hf_dtype == "fp32" else torch.bfloat16
 
-    repo_root = Path(__file__).resolve().parents[4]
-    # Load the kernel directly from examples (bypass llm.model shim).
-    _KERNEL_PATH = repo_root / "examples" / "models" / "qwen3" / "14b" / "qwen3_14b_decode.py"
-    _SPEC = importlib.util.spec_from_file_location("_qwen3_14b_decode_kernel", _KERNEL_PATH)
-    if _SPEC is None or _SPEC.loader is None:
-        raise ImportError(f"Cannot load Qwen3-14B decode kernel from {_KERNEL_PATH}")
-    dec = importlib.util.module_from_spec(_SPEC)
-    _SPEC.loader.exec_module(dec)
+    dec = load_kernel_module(
+        "models/qwen3/14b/qwen3_14b_decode.py",
+        "_qwen3_14b_decode_kernel",
+    )
 
     if batch <= 0:
         raise ValueError(f"batch must be positive, got {batch}")
@@ -255,57 +188,30 @@ def build(
     )
 
     # ---- weight adapter ----------------------------------------------------
-    adapter = DictAdapter(
-        prefix="model.layers.0.",
-        mapping={
-            "input_rms_weight": Map("input_layernorm.weight",
-                                    ops=[View([1, HIDDEN]), Cast(torch.float32)]),
-            "wq": Map("self_attn.q_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "wk": Map("self_attn.k_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "wv": Map("self_attn.v_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "q_norm_weight": Map("self_attn.q_norm.weight",
-                                 ops=[View([1, HEAD_DIM]), Cast(torch.float32)]),
-            "k_norm_weight": Map("self_attn.k_norm.weight",
-                                 ops=[View([1, HEAD_DIM]), Cast(torch.float32)]),
-            "wo": Map("self_attn.o_proj.weight",
-                      ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "post_rms_weight": Map("post_attention_layernorm.weight",
-                                   ops=[View([1, HIDDEN]), Cast(torch.float32)]),
-            "w_gate": Map("mlp.gate_proj.weight",
-                          ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "w_up": Map("mlp.up_proj.weight",
-                        ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-            "w_down": Map("mlp.down_proj.weight",
-                          ops=[Transpose(), Contiguous(), Cast(torch.bfloat16)]),
-        },
-    )
+    adapter = single_layer_adapter(layer_idx=0)
 
     # ---- reference ---------------------------------------------------------
     reference = CallableReference(
         name="hf.Qwen3DecoderLayer",
         fn=lambda inp, st: _hf_decode_forward(
-            inp, st, model_path=hf_model_path, max_seq=max_seq_eff, hf_dtype=hf_dtype_t,
+            inp, st, model_path=hf_model_path, max_seq=max_seq_eff,
+            block_size=int(dec.BLOCK_SIZE), hf_dtype=hf_dtype_t,
         ),
     )
 
     # ---- target ------------------------------------------------------------
     def _post_run(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        kv_kwargs = dict(
+            num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+            block_size=int(dec.BLOCK_SIZE),
+        )
         return {
             "layer_out": tensors["out"].clone(),
-            "k_pos": _select_k_pos(
-                tensors["k_cache"],
-                slot_mapping=tensors["slot_mapping"],
-                batch=batch,
-                block_size=int(dec.BLOCK_SIZE),
+            "k_pos": select_kv_at_decode_slot(
+                tensors["k_cache"], tensors["slot_mapping"], **kv_kwargs,
             ),
-            "v_pos": _select_k_pos(
-                tensors["v_cache"],
-                slot_mapping=tensors["slot_mapping"],
-                batch=batch,
-                block_size=int(dec.BLOCK_SIZE),
+            "v_pos": select_kv_at_decode_slot(
+                tensors["v_cache"], tensors["slot_mapping"], **kv_kwargs,
             ),
         }
 
@@ -314,19 +220,17 @@ def build(
         def _golden(inp: Mapping[str, torch.Tensor], _w: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             ref_inputs = {**_w, **inp}
             dec.golden_qwen3_decode(ref_inputs)
+            kv_kwargs = dict(
+                num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+                block_size=int(dec.BLOCK_SIZE),
+            )
             return {
                 "layer_out": ref_inputs["out"].clone(),
-                "k_pos": _select_k_pos(
-                    ref_inputs["k_cache"],
-                    slot_mapping=ref_inputs["slot_mapping"],
-                    batch=batch,
-                    block_size=int(dec.BLOCK_SIZE),
+                "k_pos": select_kv_at_decode_slot(
+                    ref_inputs["k_cache"], ref_inputs["slot_mapping"], **kv_kwargs,
                 ),
-                "v_pos": _select_k_pos(
-                    ref_inputs["v_cache"],
-                    slot_mapping=ref_inputs["slot_mapping"],
-                    batch=batch,
-                    block_size=int(dec.BLOCK_SIZE),
+                "v_pos": select_kv_at_decode_slot(
+                    ref_inputs["v_cache"], ref_inputs["slot_mapping"], **kv_kwargs,
                 ),
             }
         target = CallableTarget(name="pytorch.golden_qwen3_decode", fn=_golden)
@@ -362,7 +266,6 @@ def build(
         on_inputs=lambda t: _init_paged_attention_decode_inputs(
             t,
             batch=batch,
-            max_seq=max_seq_eff,
             block_size=int(dec.BLOCK_SIZE),
             max_blocks_per_seq=max_blocks_per_seq,
         ),
@@ -373,19 +276,13 @@ def _init_paged_attention_decode_inputs(
     tensors: dict[str, torch.Tensor],
     *,
     batch: int,
-    max_seq: int,
     block_size: int,
     max_blocks_per_seq: int,
 ) -> None:
-    # Identity mapping for blocks.
-    tensors["block_table"][:] = torch.arange(batch * max_blocks_per_seq, dtype=torch.int32)
-
-    # slot_mapping points to the *current* token position (pos = seq_len - 1).
-    slots = tensors["slot_mapping"]
-    seq_lens = tensors["seq_lens"]
-    for b in range(batch):
-        pos = int(seq_lens[b].item()) - 1
-        logical_block = pos // block_size
-        page_off = pos - logical_block * block_size
-        phys_block = b * max_blocks_per_seq + logical_block
-        slots[b] = phys_block * block_size + page_off
+    init_block_table_identity(
+        tensors["block_table"], batch=batch, max_blocks_per_seq=max_blocks_per_seq,
+    )
+    compute_decode_slot_mapping(
+        tensors["slot_mapping"], tensors["seq_lens"],
+        batch=batch, block_size=block_size, max_blocks_per_seq=max_blocks_per_seq,
+    )
