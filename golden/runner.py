@@ -301,11 +301,16 @@ def run(
                 _arg_map[p.name.split("__ssa_")[0]] for p in _param_infos
             ]
             _platform = config.runtime.get("platform", "a2a3")
-            _run_cfg = _PRC(
-                platform=_platform,
-                device_id=config.runtime.get("device_id", 0),
-                backend_type=_backend_for_platform(_platform),
-            )
+            # Forward every RunConfig field the caller supplied so L3 behaves
+            # consistently with the non-L3 path (which forwards via run_jit's
+            # whitelist).  Unknown keys fail fast inside RunConfig(**...).
+            import dataclasses as _dc  # noqa: PLC0415
+            _allowed = {f.name for f in _dc.fields(_PRC)}
+            _kwargs = {k: v for k, v in config.runtime.items() if k in _allowed}
+            _kwargs.setdefault("platform", _platform)
+            _kwargs.setdefault("device_id", 0)
+            _kwargs["backend_type"] = _backend_for_platform(_platform)
+            _run_cfg = _PRC(**_kwargs)
             compiled(*_ordered_l3, config=_run_cfg)
         else:
             ordered: list[Any] = [

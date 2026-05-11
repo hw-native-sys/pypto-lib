@@ -120,6 +120,13 @@ class LLMEngine:
                 "L3 generate fast path currently supports batch_size=1; "
                 f"got {len(prompts)} prompts."
             )
+        # The L3 device-side loop cannot evaluate Python stop strings mid-flight,
+        # so reject them up-front rather than silently ignoring.
+        if is_l3 and any(generate_config.stop):
+            raise NotImplementedError(
+                "L3 generate fast path does not support generate_config.stop; "
+                "the device-side decode loop cannot break on host-side string matches."
+            )
 
         requests: list[RequestState] = []
         allocations = []
@@ -191,10 +198,10 @@ class LLMEngine:
                 request.output_text = tokenizer.decode(generated_ids)
                 if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
                     finish_reason = "eos"
-                elif len(generated_ids) >= generate_config.max_new_tokens:
-                    finish_reason = "length"
                 else:
-                    finish_reason = "stop"
+                    # The L3 loop only exits on EOS or after producing
+                    # max_new_tokens; stop strings are rejected at entry above.
+                    finish_reason = "length"
                 return [
                     GenerateResult(
                         text=request.output_text,
