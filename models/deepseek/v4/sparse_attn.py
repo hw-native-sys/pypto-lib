@@ -64,6 +64,8 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 SOFTMAX_SCALE = HEAD_DIM ** -0.5
 HALF_ROPE = ROPE_DIM // 2
 MATMUL_ROW_PAD = 16
+ROPE_CHUNK = 16
+ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 
 D = 4096
 O_LORA = 1024
@@ -104,6 +106,8 @@ def sparse_attn(
     seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
+    even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
+    odd_select_local:   pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
     wo_a:               pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN],                 pl.BF16],
     wo_b:               pl.Tensor[[D, O_GROUPS * O_LORA],                         pl.INT8],
     wo_b_scale:         pl.Tensor[[D],                                            pl.FP32],
@@ -122,6 +126,11 @@ def sparse_attn(
     cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
     cmp_sparse_indices_flat = pl.reshape(cmp_sparse_indices, [T * TOPK])
     attn_stage = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.BF16)
+    o_proj_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
+    o_proj_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
+    rope_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
+    rope_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
+    o_rope_interleave = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
     for b in pl.range(B):
@@ -167,15 +176,11 @@ def sparse_attn(
                 )
 
         for h in pl.parallel(0, H, 1):
-            head_row = b * H + h
-            group_idx = h // HEADS_PER_GROUP
-            head_in_group = h % HEADS_PER_GROUP
-            packed_row = group_idx * T + b
-            packed_col = head_in_group * HEAD_DIM
+            attn_head_row = b * H + h
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_init"):
                 q_batch = pl.col_expand(
                     pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                    pl.cast(q_flat[head_row : head_row + 1, 0 : HEAD_DIM], target_type=pl.FP32),
+                    pl.cast(q_flat[attn_head_row : attn_head_row + 1, 0 : HEAD_DIM], target_type=pl.FP32),
                 )
 
                 kv_batch = pl.col_expand(
@@ -216,35 +221,84 @@ def sparse_attn(
                 attn_stage = pl.assemble(
                     attn_stage,
                     attn_stage_row,
-                    [head_row, 0],
+                    [attn_head_row, 0],
                 )
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_inverse_rope"):
-                o_nope = attn_stage[head_row : head_row + 1, 0 : NOPE_DIM]
-                cos_lo = pl.cast(freqs_cos[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                cos_hi = pl.cast(freqs_cos[b : b + 1, HALF_ROPE : ROPE_DIM], target_type=pl.FP32)
-                sin_lo = pl.cast(freqs_sin[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                sin_hi = pl.cast(freqs_sin[b : b + 1, HALF_ROPE : ROPE_DIM], target_type=pl.FP32)
-                x_lo = pl.cast(attn_stage[head_row : head_row + 1, NOPE_DIM : NOPE_DIM + HALF_ROPE], target_type=pl.FP32)
-                x_hi = pl.cast(attn_stage[head_row : head_row + 1, NOPE_DIM + HALF_ROPE : HEAD_DIM], target_type=pl.FP32)
-                y_lo = pl.add(
-                    pl.col_expand_mul(x_lo, cos_lo),
-                    pl.col_expand_mul(x_hi, sin_lo),
+    for b in pl.range(B):
+        rope_head_row = b * H
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_slice"):
+            for r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
+                rope_col = NOPE_DIM + 2 * r0
+                rope_tile = attn_stage[
+                    rope_head_row : rope_head_row + H,
+                    rope_col : rope_col + ROPE_INTERLEAVE_CHUNK,
+                ]
+                even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
+                odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
+                o_proj_even = pl.assemble(o_proj_even, even_chunk, [rope_head_row, r0])
+                o_proj_odd = pl.assemble(o_proj_odd, odd_chunk, [rope_head_row, r0])
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply"):
+            cos_tile = pl.cast(freqs_cos[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            sin_tile = pl.cast(freqs_sin[b : b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            even_tile = o_proj_even[rope_head_row : rope_head_row + H, :]
+            odd_tile = o_proj_odd[rope_head_row : rope_head_row + H, :]
+            rope_even_acc = pl.add(
+                pl.col_expand_mul(even_tile, cos_tile),
+                pl.col_expand_mul(odd_tile, sin_tile),
+            )
+            rope_odd_acc = pl.sub(
+                pl.col_expand_mul(odd_tile, cos_tile),
+                pl.col_expand_mul(even_tile, sin_tile),
+            )
+            rope_even = pl.assemble(rope_even, pl.cast(rope_even_acc, target_type=pl.BF16), [rope_head_row, 0])
+            rope_odd = pl.assemble(rope_odd, pl.cast(rope_odd_acc, target_type=pl.BF16), [rope_head_row, 0])
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble"):
+            for r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
+                rope_even_chunk = rope_even[rope_head_row : rope_head_row + H, r0 : r0 + ROPE_CHUNK]
+                rope_odd_chunk = rope_odd[rope_head_row : rope_head_row + H, r0 : r0 + ROPE_CHUNK]
+                rope_even_interleave = pl.matmul(
+                    rope_even_chunk,
+                    even_select_local,
+                    b_trans=True,
+                    out_dtype=pl.FP32,
                 )
-                y_hi = pl.sub(
-                    pl.col_expand_mul(x_hi, cos_hi),
-                    pl.col_expand_mul(x_lo, sin_hi),
+                rope_odd_interleave = pl.matmul(
+                    rope_odd_chunk,
+                    odd_select_local,
+                    b_trans=True,
+                    out_dtype=pl.FP32,
                 )
-                o_packed = pl.assemble(o_packed, o_nope, [packed_row, packed_col])
+                rope_chunk = pl.cast(
+                    pl.add(rope_even_interleave, rope_odd_interleave),
+                    target_type=pl.BF16,
+                )
+                o_rope_interleave = pl.assemble(
+                    o_rope_interleave,
+                    rope_chunk,
+                    [rope_head_row, 2 * r0],
+                )
+
+    for b in pl.range(B):
+        for h in pl.parallel(0, H, 1):
+            pack_head_row = b * H + h
+            pack_group_idx = h // HEADS_PER_GROUP
+            pack_head_in_group = h % HEADS_PER_GROUP
+            pack_row = pack_group_idx * T + b
+            pack_col = pack_head_in_group * HEAD_DIM
+
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_pack_o_packed"):
                 o_packed = pl.assemble(
                     o_packed,
-                    pl.cast(y_lo, target_type=pl.BF16),
-                    [packed_row, packed_col + NOPE_DIM],
+                    attn_stage[pack_head_row : pack_head_row + 1, 0 : NOPE_DIM],
+                    [pack_row, pack_col],
                 )
                 o_packed = pl.assemble(
                     o_packed,
-                    pl.cast(y_hi, target_type=pl.BF16),
-                    [packed_row, packed_col + NOPE_DIM + HALF_ROPE],
+                    o_rope_interleave[pack_head_row : pack_head_row + 1, 0 : ROPE_DIM],
+                    [pack_row, pack_col + NOPE_DIM],
                 )
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
@@ -325,6 +379,8 @@ def sparse_attn_test(
     seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
+    even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
+    odd_select_local:   pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
     wo_a:               pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN],                 pl.BF16],
     wo_b:               pl.Tensor[[D, O_GROUPS * O_LORA],                         pl.INT8],
     wo_b_scale:         pl.Tensor[[D],                                            pl.FP32],
@@ -341,6 +397,8 @@ def sparse_attn_test(
         seqused_kv,
         freqs_cos,
         freqs_sin,
+        even_select_local,
+        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -435,15 +493,15 @@ def golden_sparse_attn(tensors):
         denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
         o[b] = oi_num / denom
 
-    rope_lo = o[..., NOPE_DIM : NOPE_DIM + HALF_ROPE]
-    rope_hi = o[..., NOPE_DIM + HALF_ROPE :]
-    cos_lo = cos[:, :HALF_ROPE].unsqueeze(1)
-    cos_hi = cos[:, HALF_ROPE:].unsqueeze(1)
-    sin_lo = sin[:, :HALF_ROPE].unsqueeze(1)
-    sin_hi = sin[:, HALF_ROPE:].unsqueeze(1)
-    inv_lo = rope_lo * cos_lo + rope_hi * sin_lo
-    inv_hi = rope_hi * cos_hi - rope_lo * sin_hi
-    o = torch.cat([o[..., :NOPE_DIM], inv_lo, inv_hi], dim=-1).to(torch.bfloat16)
+    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    rope_even = rope_pair[..., 0]
+    rope_odd = rope_pair[..., 1]
+    cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
+    sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
+    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
+    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
+    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
     seq_per_batch = T // B
     o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
@@ -526,6 +584,20 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         sin_half = torch.sin(angles)
         return torch.cat([sin_half, sin_half], dim=-1)
 
+    def init_odd_select_local():
+        """Build the chunk-local selector that extracts odd rope lanes from interleaved inputs."""
+        matrix = torch.zeros((ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK))
+        for i in range(ROPE_CHUNK):
+            matrix[2 * i + 1, i] = 1
+        return matrix
+
+    def init_even_select_local():
+        """Build the chunk-local selector that extracts even rope lanes from interleaved inputs."""
+        matrix = torch.zeros((ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK))
+        for i in range(ROPE_CHUNK):
+            matrix[2 * i, i] = 1
+        return matrix
+
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
         return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 4) / (O_GROUP_IN ** 0.5)
@@ -552,6 +624,8 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
+        TensorSpec("even_select_local", [ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
+        TensorSpec("odd_select_local", [ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
