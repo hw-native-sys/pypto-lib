@@ -52,7 +52,7 @@ QUANT_CHUNK = 256
 
 
 @pl.jit.inline
-def deepseek_v4_decode_qkv_proj_rope(
+def qkv_proj_rope(
     x:         pl.Tensor[[B, S, D],              pl.BF16],
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
@@ -312,7 +312,7 @@ def deepseek_v4_decode_qkv_proj_rope(
 
 
 @pl.jit
-def deepseek_v4_decode_qkv_proj_rope_test(
+def qkv_proj_rope_test(
     x:         pl.Tensor[[B, S, D],              pl.BF16],
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
@@ -330,7 +330,7 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     qr:        pl.Out[pl.Tensor[[T, Q_LORA],      pl.INT8]],
     qr_scale:  pl.Out[pl.Tensor[[T, 1],           pl.FP32]],
 ):
-    q = deepseek_v4_decode_qkv_proj_rope(
+    q = qkv_proj_rope(
         x,
         norm_w,
         wq_a,
@@ -351,7 +351,7 @@ def deepseek_v4_decode_qkv_proj_rope_test(
     return q
 
 
-def golden_deepseek_v4_decode_qkv_proj_rope(tensors):
+def golden_qkv_proj_rope(tensors):
     """Torch reference: attn_norm fused, then Q/KV LoRA + RoPE (model.py 692, 495-504)."""
     import torch
 
@@ -520,9 +520,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_qkv_proj_rope_test,
+        fn=qkv_proj_rope_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_qkv_proj_rope,
+        golden_fn=golden_qkv_proj_rope,
         config=RunConfig(
             # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
             rtol=5e-3,

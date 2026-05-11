@@ -35,7 +35,7 @@ D_BLOCKS         = D // D_CHUNK
 
 
 @pl.jit.inline
-def deepseek_v4_decode_hc_pre(
+def hc_pre(
     x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     hc_fn:    pl.Tensor[[MIX_HC, HC_DIM],   pl.FP32],
     hc_scale: pl.Tensor[[3],                pl.FP32],
@@ -248,7 +248,7 @@ def deepseek_v4_decode_hc_pre(
     return x_mixed
 
 @pl.jit
-def deepseek_v4_decode_hc_pre_test(
+def hc_pre_test(
     x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     hc_fn:    pl.Tensor[[MIX_HC, HC_DIM],   pl.FP32],
     hc_scale: pl.Tensor[[3],                pl.FP32],
@@ -257,10 +257,10 @@ def deepseek_v4_decode_hc_pre_test(
     post:     pl.Out[pl.Tensor[[B, S, HC_MULT],      pl.FP32]],
     comb:     pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
 ):
-    x_mixed = deepseek_v4_decode_hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+    x_mixed = hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
 
-def golden_deepseek_v4_decode_hc_pre(tensors):
+def golden_hc_pre(tensors):
     """Torch reference, direct port of model.py Block.hc_pre 674-682 + hc_split_sinkhorn."""
     import torch
 
@@ -353,9 +353,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_hc_pre_test,
+        fn=hc_pre_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_hc_pre,
+        golden_fn=golden_hc_pre,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,

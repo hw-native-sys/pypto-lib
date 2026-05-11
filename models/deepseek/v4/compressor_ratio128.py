@@ -6,51 +6,48 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 KV Compressor (decode incremental, ratio=4 overlap).
+"""DeepSeek-V4 KV Compressor (decode incremental, ratio=128 non-overlap).
 
-Uses overlapping state layout with 8 slots.
-Front slots 0-3 at columns [0:HEAD_DIM], back slots 4-7 at columns [HEAD_DIM:OUT_DIM].
-Tree reduction for softmax+pool. State shift after compression."""
-
+Uses non-overlapping state layout with 128 slots. Loop-based softmax+pool
+over all slots. No state shift needed."""
 
 import pypto.language as pl
-
 
 B = 16
 S = 1
 EPS = 1e-6
 
-COMPRESS_RATIO = 4
+COMPRESS_RATIO = 128
 HEAD_DIM = 512
 ROTATE = False
 
 D = 4096
 ROPE_HEAD_DIM = 64
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-OVERLAP = COMPRESS_RATIO == 4
-COFF = 1 + int(OVERLAP)
+OVERLAP = False
+COFF = 1
 
-OUT_DIM = COFF * HEAD_DIM
-STATE_LEN = COFF * COMPRESS_RATIO
+OUT_DIM = COFF * HEAD_DIM   # 512
+STATE_LEN = COFF * COMPRESS_RATIO  # 128
 
-START_POS = 3
+START_POS = 127
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
-APE_ROW = START_POS % COMPRESS_RATIO if COMPRESS_RATIO != 0 else 0
-SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
+APE_ROW = START_POS % COMPRESS_RATIO  # 127
+SCATTER_SLOT = APE_ROW  # 127 (no overlap)
 
 HEAD_DIM_INV = 1.0 / HEAD_DIM
 
 K_CHUNK = 512
 OUT_CHUNK = 64
-K_BLOCKS = D // K_CHUNK
-OUT_BLOCKS = OUT_DIM // OUT_CHUNK
+K_BLOCKS = D // K_CHUNK  # 8
+OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 8
 
 HEAD_CHUNK = 128
-HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
+HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK  # 4
 
 
 @pl.jit.inline
-def deepseek_v4_decode_compressor(
+def compressor(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv_state: pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32],
@@ -116,88 +113,33 @@ def deepseek_v4_decode_compressor(
     kv_state_per_row = pl.reshape(kv_state_flat, [B * STATE_LEN, OUT_DIM])
     score_state_per_row = pl.reshape(score_state_flat, [B * STATE_LEN, OUT_DIM])
 
-    # Block 5+6 (Vector): softmax+pool over STATE_LEN slots via tree reduction.
+    # Block 5+6 (Vector): softmax+pool over 128 slots via loop.
     pooled = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for b_idx in pl.parallel(0, B, 1):
-        row_b = b_idx * STATE_LEN
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool_loop"):
+            row_b = b_idx * STATE_LEN
             for hb in pl.range(HEAD_BLOCKS):
                 h0 = hb * HEAD_CHUNK
+                # Max via loop over all 128 slots.
+                s_max = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b, h0])
+                for s in pl.range(1, STATE_LEN):
+                    sr_max = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + s, h0])
+                    s_max = pl.maximum(s_max, sr_max)
 
-                s0 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 0, h0])
-                s1 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 1, h0])
-                s2 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 2, h0])
-                s3 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 3, h0])
-                s4 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 4, HEAD_DIM + h0])
-                s5 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 5, HEAD_DIM + h0])
-                s6 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 6, HEAD_DIM + h0])
-                s7 = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + 7, HEAD_DIM + h0])
+                # Exp sum and weighted sum via loop.
+                e_sum = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+                weighted = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+                for s in pl.range(STATE_LEN):
+                    sr_exp = pl.slice(score_state_per_row, [1, HEAD_CHUNK], [row_b + s, h0])
+                    kv_row = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + s, h0])
+                    e_row = pl.exp(pl.sub(sr_exp, s_max))
+                    e_sum = pl.add(e_sum, e_row)
+                    weighted = pl.add(weighted, pl.mul(e_row, kv_row))
 
-                # Max via tree of pl.maximum.
-                m01 = pl.maximum(s0, s1)
-                m23 = pl.maximum(s2, s3)
-                m45 = pl.maximum(s4, s5)
-                m67 = pl.maximum(s6, s7)
-                m0123 = pl.maximum(m01, m23)
-                m4567 = pl.maximum(m45, m67)
-                s_max = pl.maximum(m0123, m4567)
-
-                # Exp(s - max) tree.
-                e0 = pl.exp(pl.sub(s0, s_max))
-                e1 = pl.exp(pl.sub(s1, s_max))
-                e2 = pl.exp(pl.sub(s2, s_max))
-                e3 = pl.exp(pl.sub(s3, s_max))
-                e4 = pl.exp(pl.sub(s4, s_max))
-                e5 = pl.exp(pl.sub(s5, s_max))
-                e6 = pl.exp(pl.sub(s6, s_max))
-                e7 = pl.exp(pl.sub(s7, s_max))
-
-                es01 = pl.add(e0, e1)
-                es23 = pl.add(e2, e3)
-                es45 = pl.add(e4, e5)
-                es67 = pl.add(e6, e7)
-                es0123 = pl.add(es01, es23)
-                es4567 = pl.add(es45, es67)
-                e_sum = pl.add(es0123, es4567)
-
-                # Weighted kv tree.
-                kv_s0 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 0, h0])
-                kv_s1 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 1, h0])
-                kv_s2 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 2, h0])
-                kv_s3 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 3, h0])
-                kv_s4 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 4, HEAD_DIM + h0])
-                kv_s5 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 5, HEAD_DIM + h0])
-                kv_s6 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 6, HEAD_DIM + h0])
-                kv_s7 = pl.slice(kv_state_per_row, [1, HEAD_CHUNK], [row_b + 7, HEAD_DIM + h0])
-
-                w0 = pl.mul(e0, kv_s0)
-                w1 = pl.mul(e1, kv_s1)
-                w2 = pl.mul(e2, kv_s2)
-                w3 = pl.mul(e3, kv_s3)
-                w4 = pl.mul(e4, kv_s4)
-                w5 = pl.mul(e5, kv_s5)
-                w6 = pl.mul(e6, kv_s6)
-                w7 = pl.mul(e7, kv_s7)
-
-                ws01 = pl.add(w0, w1)
-                ws23 = pl.add(w2, w3)
-                ws45 = pl.add(w4, w5)
-                ws67 = pl.add(w6, w7)
-                ws0123 = pl.add(ws01, ws23)
-                ws4567 = pl.add(ws45, ws67)
-                pooled_acc = pl.add(ws0123, ws4567)
-
-                pooled_chunk = pl.div(pooled_acc, e_sum)
+                pooled_chunk = pl.div(weighted, e_sum)
                 pooled = pl.assemble(pooled, pooled_chunk, [b_idx, h0])
 
-    # Block 7 (Vector): shift state down -- state[:, :ratio] = state[:, ratio:]
-    for b_sh in pl.parallel(0, B, 1):
-        row_sh = b_sh * STATE_LEN
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift"):
-            kv_src = pl.slice(kv_state_per_row, [COMPRESS_RATIO, OUT_DIM], [row_sh + COMPRESS_RATIO, 0])
-            kv_state_per_row = pl.assemble(kv_state_per_row, kv_src, [row_sh, 0])
-            sc_src = pl.slice(score_state_per_row, [COMPRESS_RATIO, OUT_DIM], [row_sh + COMPRESS_RATIO, 0])
-            score_state_per_row = pl.assemble(score_state_per_row, sc_src, [row_sh, 0])
+    # No block 7 (no shift in non-overlap mode).
 
     # Reshape state back to 3D
     kv_state = pl.reshape(kv_state_per_row, [B, STATE_LEN, OUT_DIM])
@@ -250,7 +192,7 @@ def deepseek_v4_decode_compressor(
 
 
 @pl.jit
-def deepseek_v4_decode_compressor_test(
+def compressor_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv_state: pl.Out[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
     score_state: pl.Out[pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32]],
@@ -264,14 +206,14 @@ def deepseek_v4_decode_compressor_test(
     start_pos: pl.Scalar[pl.INT32],
     out: pl.Out[pl.Tensor[[B, HEAD_DIM], pl.BF16]],
 ):
-    out = deepseek_v4_decode_compressor(
+    out = compressor(
         x, kv_state, score_state, wkv, wgate, ape, norm_w, cos, sin, hadamard, start_pos, out,
     )
     return out
 
 
-def golden_deepseek_v4_decode_compressor(tensors):
-    """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
+def golden_compressor(tensors):
+    """Torch reference for Compressor.forward (decode branch, ratio=128)."""
     import torch
 
     x = tensors["x"]
@@ -294,15 +236,11 @@ def golden_deepseek_v4_decode_compressor(tensors):
 
     should_compress = (START_POS + 1) % ratio == 0
     score = score + ape[START_POS % ratio]
-    if overlap:
-        kv_state[:bsz, ratio + START_POS % ratio] = kv
-        score_state[:bsz, ratio + START_POS % ratio] = score
-        if should_compress:
-            kvs = torch.cat([kv_state[:bsz, :ratio, :d], kv_state[:bsz, ratio:, d:]], dim=1)
-            scs = torch.cat([score_state[:bsz, :ratio, :d], score_state[:bsz, ratio:, d:]], dim=1)
-            kv = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
-            kv_state[:bsz, :ratio] = kv_state[:bsz, ratio:]
-            score_state[:bsz, :ratio] = score_state[:bsz, ratio:]
+    # Non-overlap path
+    kv_state[:bsz, START_POS % ratio] = kv
+    score_state[:bsz, START_POS % ratio] = score
+    if should_compress:
+        kv = (kv_state[:bsz] * score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
 
     if not should_compress:
         tensors["out"][:] = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
@@ -381,12 +319,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_compressor_test,
+        fn=compressor_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_compressor,
+        golden_fn=golden_compressor,
         config=RunConfig(
-            rtol=4e-3,
-            atol=4e-3,
+            rtol=2e-3,
+            atol=2e-3,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

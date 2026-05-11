@@ -11,16 +11,16 @@ Active in layers 0/1/7 of the model (3 of the 8 layers in demo). No KV compressi
 compressor nor indexer is invoked; topk for sparse_attn is window_topk_idxs only and the KV cache
 holds only the sliding window (no compressed portion). YaRN frequency scaling is also disabled
 in this path (model.py:478-479 selects base rope_theta when compress_ratio==0).
-Companion files: deepseek_v4_decode_csa.py (ratio=4)
-                 deepseek_v4_decode_hca.py (ratio=128)."""
+Companion files: attention_csa_draft.py (ratio=4)
+                 attention_hca_draft.py (ratio=128)."""
 
 
 import pypto.language as pl
 
-from deepseek_v4_decode_hc_pre import deepseek_v4_decode_hc_pre
-from deepseek_v4_decode_hc_post import deepseek_v4_decode_hc_post
-from deepseek_v4_decode_qkv_proj_rope import deepseek_v4_decode_qkv_proj_rope
-from deepseek_v4_decode_sparse_attn import deepseek_v4_decode_sparse_attn_with_proj
+from hc_pre import hc_pre
+from hc_post import hc_post
+from qkv_proj_rope import qkv_proj_rope
+from sparse_attn import sparse_attn
 
 
 B = 16  # demo 4
@@ -67,8 +67,8 @@ SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 START_POS = 3  # default for ScalarSpec; >0 (decode); SWA path has no compression-related constraint
 
 
-@pl.jit
-def deepseek_v4_decode_swa(
+@pl.jit.inline
+def attention_swa(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -96,13 +96,13 @@ def deepseek_v4_decode_swa(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+    x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_mixed = deepseek_v4_decode_hc_pre(
+    x_mixed = hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -133,7 +133,7 @@ def deepseek_v4_decode_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = deepseek_v4_decode_qkv_proj_rope(
+    q = qkv_proj_rope(
         x_mixed,
         attn_norm_w,
         wq_a,
@@ -182,7 +182,7 @@ def deepseek_v4_decode_swa(
         cmp_block_table_dummy = pl.full([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    deepseek_v4_decode_sparse_attn_with_proj(
+    sparse_attn(
         q,
         kv_cache,
         block_table,
@@ -201,7 +201,7 @@ def deepseek_v4_decode_swa(
 
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
-    x_out = deepseek_v4_decode_hc_post(
+    x_out = hc_post(
         attn_out_3d,
         x_hc,
         post_t,
@@ -211,22 +211,69 @@ def deepseek_v4_decode_swa(
     return x_out
 
 
-def golden_deepseek_v4_decode_swa(tensors):
+@pl.jit
+def attention_swa_test(
+    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    # hc_pre weights
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    # qkv_proj_rope weights
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
+    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    # sparse_attn
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    seqused_kv: pl.Tensor[[B], pl.INT32],
+    # o_proj
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+    start_pos: pl.Scalar[pl.INT32],
+):
+    x_out = attention_swa(
+        x_hc,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
+        gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin, even_select_t, odd_select_t,
+        kv_cache, block_table,
+        attn_sink, seqused_kv,
+        wo_a, wo_b, wo_b_scale,
+        x_out,
+        start_pos,
+    )
+    return x_out
+
+
+def golden_attention_swa(tensors):
     """End-to-end orchestration for the ratio=0 (SWA) layers.
     Mirrors Block.hc_pre + Attention.forward (decode branch, ratio==0 path: no compressor,
     no indexer, no cmp_kv) + Block.hc_post."""
     import torch
 
-    from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
-    from deepseek_v4_decode_qkv_proj_rope import golden_deepseek_v4_decode_qkv_proj_rope
-    from deepseek_v4_decode_sparse_attn import golden_deepseek_v4_decode_sparse_attn_with_proj
-    from deepseek_v4_decode_hc_post import golden_deepseek_v4_decode_hc_post
+    from hc_pre import golden_hc_pre
+    from qkv_proj_rope import golden_qkv_proj_rope
+    from sparse_attn import golden_sparse_attn
+    from hc_post import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post_t = torch.zeros(B, S, HC_MULT)
     comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
-    golden_deepseek_v4_decode_hc_pre({
+    golden_hc_pre({
         "x": tensors["x_hc"],
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
@@ -257,7 +304,7 @@ def golden_deepseek_v4_decode_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    golden_deepseek_v4_decode_qkv_proj_rope({
+    golden_qkv_proj_rope({
         "x": x_mixed,
         "norm_w": tensors["attn_norm_w"],
         "wq_a": tensors["wq_a"],
@@ -294,7 +341,7 @@ def golden_deepseek_v4_decode_swa(tensors):
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     cmp_kv_dummy = torch.zeros(SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-    golden_deepseek_v4_decode_sparse_attn_with_proj({
+    golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
@@ -313,7 +360,7 @@ def golden_deepseek_v4_decode_swa(tensors):
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_hc_post({
+    golden_hc_post({
         "x": attn_out.view(B, S, D),
         "residual": tensors["x_hc"],
         "post": post_t,
@@ -448,9 +495,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_swa,
+        fn=attention_swa_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_swa,
+        golden_fn=golden_attention_swa,
         config=RunConfig(
             # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; SWA carries that drift through attention/o_proj.
             rtol=1.3e-2,

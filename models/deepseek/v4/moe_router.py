@@ -14,7 +14,7 @@ expert indices/weights, and the post/comb tensors required by FFN hc_post."""
 
 import pypto.language as pl
 
-from deepseek_v4_decode_hc_pre import deepseek_v4_decode_hc_pre
+from hc_pre import hc_pre
 
 
 B           = 16               # demo 4
@@ -54,7 +54,7 @@ FP32_NEG_INF     = -1.0e30
 
 
 @pl.jit.inline
-def _deepseek_v4_decode_moe_router_kernel(
+def _moe_router_kernel(
     x_mixed:      pl.Tensor[[B, S, D],                    pl.BF16],
     norm_w:       pl.Tensor[[D],                           pl.FP32],
     gate_w:       pl.Tensor[[N_EXPERTS, D],                pl.FP32],
@@ -207,7 +207,7 @@ def _deepseek_v4_decode_moe_router_kernel(
 
 
 @pl.jit
-def deepseek_v4_decode_moe_router(
+def moe_router(
     x_hc:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
     hc_ffn_fn:    pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
     hc_ffn_scale: pl.Tensor[[3],                           pl.FP32],
@@ -227,7 +227,7 @@ def deepseek_v4_decode_moe_router(
     # Discard the returned reshape-view; pl.write side-effects already wrote
     # post_ffn / comb_ffn / x_mixed in-place on the underlying buffers.
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    deepseek_v4_decode_hc_pre(
+    hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         x_mixed, post_ffn, comb_ffn,
     )
@@ -235,7 +235,7 @@ def deepseek_v4_decode_moe_router(
     # Stage 2: ffn_norm + Gate.forward + topk + weight normalize + scatter.
     # tid2eid/input_ids are intentionally unused by the learned-score branch but
     # remain on the public signature for hash-routing compatibility.
-    _deepseek_v4_decode_moe_router_kernel(
+    _moe_router_kernel(
         x_mixed,
         norm_w, gate_w, gate_bias,
         x_norm, indices, weights,
@@ -244,18 +244,18 @@ def deepseek_v4_decode_moe_router(
 
 
 
-def golden_deepseek_v4_decode_moe_router(tensors):
+def golden_moe_router(tensors):
     """Expected-output generator for the decode MoE router path."""
     import torch
     import torch.nn.functional as F
 
-    from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
+    from hc_pre import golden_hc_pre
 
     # ---- FFN half-compress pre-processing. ----
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post_t = torch.zeros(B, S, HC_MULT)
     comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
-    golden_deepseek_v4_decode_hc_pre({
+    golden_hc_pre({
         "x": tensors["x_hc"],
         "hc_fn": tensors["hc_ffn_fn"],
         "hc_scale": tensors["hc_ffn_scale"],
@@ -375,9 +375,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_moe_router,
+        fn=moe_router,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_moe_router,
+        golden_fn=golden_moe_router,
         config=RunConfig(
             # Two per-output relaxations are intrinsic to the data path:
             #   - `x_norm` is BF16: 7-bit mantissa caps relative precision at

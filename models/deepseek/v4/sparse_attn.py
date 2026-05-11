@@ -93,7 +93,7 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
 
 
 @pl.jit.inline
-def deepseek_v4_decode_sparse_attn_with_proj(
+def sparse_attn(
     q:                  pl.Tensor[[T, H, HEAD_DIM],                               pl.BF16],
     ori_kv:             pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],       pl.BF16],
     ori_block_table:    pl.Tensor[[B, ORI_MAX_BLOCKS],                            pl.INT32],
@@ -314,7 +314,7 @@ def deepseek_v4_decode_sparse_attn_with_proj(
 
 
 @pl.jit
-def deepseek_v4_decode_sparse_attn_with_proj_test(
+def sparse_attn_test(
     q:                  pl.Tensor[[T, H, HEAD_DIM],                               pl.BF16],
     ori_kv:             pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],       pl.BF16],
     ori_block_table:    pl.Tensor[[B, ORI_MAX_BLOCKS],                            pl.INT32],
@@ -330,7 +330,7 @@ def deepseek_v4_decode_sparse_attn_with_proj_test(
     wo_b_scale:         pl.Tensor[[D],                                            pl.FP32],
     attn_out:           pl.Out[pl.Tensor[[T, D],                                  pl.BF16]],
 ):
-    attn_out = deepseek_v4_decode_sparse_attn_with_proj(
+    attn_out = sparse_attn(
         q,
         ori_kv,
         ori_block_table,
@@ -379,7 +379,7 @@ def _quant_w_per_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def golden_deepseek_v4_decode_sparse_attn_with_proj(tensors):
+def golden_sparse_attn(tensors):
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""
     import torch
 
@@ -573,9 +573,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_sparse_attn_with_proj_test,
+        fn=sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio),
-        golden_fn=golden_deepseek_v4_decode_sparse_attn_with_proj,
+        golden_fn=golden_sparse_attn,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,

@@ -11,8 +11,8 @@ Active in layers 3/5 of the model (2 of the 8 layers in demo). Has the main comp
 overlap=False) but NO indexer (model.py:468-471 only instantiates indexer when ratio==4); the
 compressed-portion topk for sparse_attn comes from `get_compress_topk_idxs` (a deterministic index
 computation, model.py:268-276), not from a learned indexer score.
-Companion files: deepseek_v4_decode_swa.py (ratio=0)
-                 deepseek_v4_decode_csa.py (ratio=4)."""
+Companion files: attention_swa.py (ratio=0)
+                 attention_csa_draft.py (ratio=4)."""
 
 
 import pypto.language as pl
@@ -63,68 +63,106 @@ TOPK = WIN + CMP_TOPK                                      # sparse_attn input t
 START_POS = 127  # default for ScalarSpec; (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
 
 
-def build_deepseek_v4_decode_hca_program():
-    @pl.program
-    class DeepSeekV4DecodeHca:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def deepseek_v4_decode_hca(
-            self,
-            x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-            # hc_pre weights
-            hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-            hc_attn_scale: pl.Tensor[[3], pl.FP32],
-            hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-            # qkv_proj_rope weights
-            attn_norm_w: pl.Tensor[[D], pl.FP32],            # Block.attn_norm.weight (model.py:680)
-            wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-            wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
-            wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-            gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-            gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-            freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],  # Attention.freqs_cis (model.py:480-482)
-            freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-            # main compressor (rotate=False, head_dim=HEAD_DIM, ratio=128, overlap=False)
-            cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-            cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
-            cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-            cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-            cmp_kv_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
-            cmp_score_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
-            # KV cache (single PA pool: [0, WIN) is ori sliding window, [WIN, WIN+max_seq//ratio) is cmp)
-            kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-            block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
-            # sparse_attn
-            attn_sink: pl.Tensor[[H], pl.FP32],
-            # o_proj
-            wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-            wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
-            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
-            x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-        ):
-            # TODO: orchestration body (dispatches the per-step kernels)
-            return x_out
-
-    return DeepSeekV4DecodeHca
+@pl.jit.inline
+def attention_hca(
+    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    # hc_pre weights
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    # qkv_proj_rope weights
+    attn_norm_w: pl.Tensor[[D], pl.FP32],            # Block.attn_norm.weight (model.py:680)
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],  # Attention.freqs_cis (model.py:480-482)
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    # main compressor (rotate=False, head_dim=HEAD_DIM, ratio=128, overlap=False)
+    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    # KV cache (single PA pool: [0, WIN) is ori sliding window, [WIN, WIN+max_seq//ratio) is cmp)
+    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    # sparse_attn
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    # o_proj
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+    start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
+    x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+):
+    # TODO: orchestration body (dispatches the per-step kernels)
+    return x_out
 
 
-def golden_deepseek_v4_decode_hca(tensors):
+@pl.jit
+def attention_hca_test(
+    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.BF16],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
+    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    cmp_kv_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
+    cmp_score_state: pl.InOut[pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.BF16],
+    start_pos: pl.Scalar[pl.INT32],
+    x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+):
+    x_out = attention_hca(
+        x_hc,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_kv_state, cmp_score_state,
+        kv_cache, block_table,
+        attn_sink,
+        wo_a, wo_b,
+        start_pos,
+        x_out,
+    )
+    return x_out
+
+
+def golden_attention_hca(tensors):
     """End-to-end orchestration for the ratio=128 (HCA) layers.
     Mirrors Block.hc_pre + Attention.forward (decode branch, ratio==128 path: main compressor only,
     no indexer, compress_topk_idxs computed deterministically) + Block.hc_post."""
     import torch
 
-    from deepseek_v4_decode_hc_pre import golden_deepseek_v4_decode_hc_pre
-    from deepseek_v4_decode_qkv_proj_rope_draft import golden_deepseek_v4_decode_qkv_proj_rope
-    from deepseek_v4_decode_compressor_draft import golden_deepseek_v4_decode_compressor
-    from deepseek_v4_decode_sparse_attn_draft import golden_deepseek_v4_decode_sparse_attn
-    from deepseek_v4_decode_o_proj import golden_deepseek_v4_decode_o_proj
-    from deepseek_v4_decode_hc_post_draft import golden_deepseek_v4_decode_hc_post
+    from hc_pre import golden_hc_pre
+    from qkv_proj_rope_draft import golden_qkv_proj_rope
+    from compressor_draft import golden_compressor
+    from sparse_attn_draft import golden_sparse_attn
+    from o_proj import golden_o_proj
+    from hc_post_draft import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post_t = torch.zeros(B, S, HC_MULT)
     comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
-    golden_deepseek_v4_decode_hc_pre({
+    golden_hc_pre({
         "x": tensors["x_hc"],
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
@@ -158,7 +196,7 @@ def golden_deepseek_v4_decode_hca(tensors):
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_qkv_proj_rope({
+    golden_qkv_proj_rope({
         "x": x_mixed,
         "norm_w": tensors["attn_norm_w"],
         "wq_a": tensors["wq_a"],
@@ -195,7 +233,7 @@ def golden_deepseek_v4_decode_hca(tensors):
 
     # main compressor (model.py:532; writes cmp_kv internally on should_compress)
     cmp_out = torch.zeros(B, HEAD_DIM, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_compressor({
+    golden_compressor({
         "x": x_mixed,
         "kv_state": tensors["cmp_kv_state"],
         "score_state": tensors["cmp_score_state"],
@@ -218,7 +256,7 @@ def golden_deepseek_v4_decode_hca(tensors):
 
     # sparse_attn (model.py:533-534)
     o = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_sparse_attn({
+    golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
@@ -233,7 +271,7 @@ def golden_deepseek_v4_decode_hca(tensors):
 
     # o_proj (model.py:537-542)
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_o_proj({
+    golden_o_proj({
         "o": o,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
@@ -242,7 +280,7 @@ def golden_deepseek_v4_decode_hca(tensors):
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
-    golden_deepseek_v4_decode_hc_post({
+    golden_hc_post({
         "x": attn_out.view(B, S, D),
         "residual": tensors["x_hc"],
         "post": post_t,
@@ -341,7 +379,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -350,10 +388,10 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_deepseek_v4_decode_hca_program(),
+    result = run_jit(
+        fn=attention_hca_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_hca,
+        golden_fn=golden_attention_hca,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,

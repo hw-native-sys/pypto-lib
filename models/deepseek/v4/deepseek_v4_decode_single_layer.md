@@ -23,7 +23,7 @@ Legend:
                               │
                               ▼
               ╔═══════════════════════════════════════════╗
-              ║  attention.py                             ║
+              ║  attention_{swa,csa,hca}.py               ║
               ║  model.py:691-694  (see breakdown below)  ║
               ║                                           ║
               ║  IN : x [B,1,4,D]  bf16                   ║
@@ -56,22 +56,24 @@ Legend:
               │  [EP-orch]  dispatch                      │
               │  inputs : x_norm, indices, weights        │
               │  pack tokens by dest expert rank          │
-              │  AllToAllv → recv_x, recv_expert_id,      │
-              │              recv_weights                 │
+              │  AllToAllv → recv_x, recv_weights,        │
+              │              recv_expert_count, recv_idx  │
+              │  (per-expert 3D layout, see moe_expert)   │
               └───────────────────────────────────────────┘
                               │
                               ▼
               ╔═══════════════════════════════════════════╗
               ║  moe_expert.py                            ║
               ║  model.py:636-644                         ║
-              ║  (local routed + shared)                  ║
+              ║  (local routed + shared; W8A8 GEMM)       ║
               ║                                           ║
-              ║  IN : recv_x  [RECV_TOTAL, D]             ║
-              ║       recv_expert_id, recv_weights        ║
+              ║  IN : recv_x [N_LOCAL_EXPERTS, RECV_MAX,D]║
+              ║       recv_weights  [N_LOCAL_EXPERTS,…]   ║
+              ║       recv_expert_count [N_LOCAL_EXPERTS] ║
               ║       x_local [T, D]  (= x_norm; shared)  ║
               ║       expert_w1/w2/w3 [N_LOCAL_EXPERTS,…] ║
               ║       shared_w1/w2/w3                     ║
-              ║  OUT: recv_y [RECV_TOTAL, D]  bf16        ║
+              ║  OUT: recv_y [N_LOCAL_EXPERTS, RECV_MAX,D]║
               ║       sh     [T, D]           bf16        ║
               ╚═══════════════════════════════════════════╝
                               │
@@ -163,8 +165,8 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
          │  │   ratio-dependent, see § below) ────┤
          ▼  ▼                                     ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  sparse_attn.py  (always called; ratio ∈ {0, 4, 128})                       ║
-║  model.py:533-534                                                           ║
+║  sparse_attn.py  (always called; ratio ∈ {0, 4, 128}; o_proj fused)         ║
+║  model.py:533-534, 537-542                                                  ║
 ║                                                                             ║
 ║  IN : q [T,H,HEAD_DIM]                                                      ║
 ║       ori_kv (PA)              — always                                     ║
@@ -173,20 +175,11 @@ Corresponds to `Block.hc_pre` + `self.attn_norm` + `Attention.forward` +
 ║       attn_sink [H]  fp32                                                   ║
 ║       seqused_kv [B]                                                        ║
 ║       freqs_cos/sin                                                         ║
-║  OUT: o [T, H, HEAD_DIM]  bf16                                              ║
-║       (line 534 inverse RoPE fused)                                         ║
-╚═════════════════════════════════════════════════════════════════════════════╝
-         │ o
-         │
-         ▼
-╔═════════════════════════════════════════════════════════════════════════════╗
-║  o_proj.py  (grouped output LoRA)                                           ║
-║  model.py:537-542                                                           ║
-║                                                                             ║
-║  IN :  o    [T, H=64, HEAD_DIM=512]               bf16                      ║
-║        wo_a [O_GROUPS=8, O_LORA=1024, 4096]       bf16                      ║
-║        wo_b [D=4096, O_GROUPS*O_LORA=8192]         bf16                     ║
-║  OUT:  attn_out  [T, D=4096]  bf16                                          ║
+║       wo_a [O_GROUPS=8, O_LORA=1024, 4096]   bf16   (grouped output LoRA)   ║
+║       wo_b [D=4096, O_GROUPS*O_LORA=8192]    int8                           ║
+║       wo_b_scale [D]                         fp32                           ║
+║  OUT: attn_out [T, D=4096]  bf16                                            ║
+║       (line 534 inverse RoPE + line 537-542 o_proj fused)                   ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
               │ attn_out [T, D]
               │
@@ -216,7 +209,7 @@ construction depends on `compress_ratio`.
 
 ```
 ╔════════════════════════════════════════════════════════════════════╗
-║  compressor.py  (Attention.compressor, decode part)                ║
+║  compressor_ratio{4,128}.py  (Attention.compressor, decode part)   ║
 ║  model.py:532 (call), 316-377 (impl)                               ║
 ║                                                                    ║
 ║  IN    : x [B,1,D], start_pos                                      ║
@@ -264,7 +257,7 @@ ratio == 0  (SWA)
               [orch] window_topk_idxs ──► topk_idxs ──► │
                                                         ▼
                                                 ┌──────────────┐
-                                                │ sparse_attn  │──► o
+                                                │ sparse_attn  │──► attn_out
                                                 └──────────────┘
 
 
@@ -284,7 +277,7 @@ ratio == 4  (CSA)
                        └──────────────┘                       ││  │
                                                               ▼▼  ▼
         [orch] window_topk_idxs ⧺ idx_topk ──► topk_idxs ─►┌──────────────┐
-                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► o
+                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► attn_out
                                                             └──────────────┘
 
 
@@ -300,7 +293,7 @@ ratio == 128  (HCA)
                        └──────────────┘                        │  │
                                                                ▼  ▼
         [orch] window_topk_idxs ⧺ get_compress_topk_idxs ──► topk_idxs
-                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► o
+                                              ori_kv ⧺ cmp_kv │ sparse_attn │──► attn_out
                                                               └──────────────┘
 ```
 
@@ -309,29 +302,6 @@ index computations from `(win, ratio, bsz, seqlen, start_pos)`; they live
 inline in the orch and are NOT separate kernels.
 
 ---
-
-## Draft file coverage
-
-| Step | model.py | Draft file | Status |
-|---|---|---|---|
-| hc_pre (attn) | 691 | `hc_pre.py` | skeleton |
-| qkv_proj_rope (attn_norm fused + Q/KV LoRA + RoPE) | 692, 495-504 | `qkv_proj_rope.py` | skeleton |
-| act_quant on kv non-rope dims | 506 | — | not in W8A8C16 (KV Cache C16); flash: C8 sim |
-| kv → ori_kv write | 530 | [orch] scatter | — |
-| indexer (decode) | 511 (call), 402-433 (impl) | `indexer.py` | skeleton |
-| compressor (decode) | 532 (call), 316-377 (impl) | `compressor.py` | skeleton |
-| window_topk_idxs | 507 | [orch] inline in sparse_attn caller | — |
-| get_compress_topk_idxs (HCA) | 513 | [orch] inline in sparse_attn caller | — |
-| topk_idxs concat | 514-515 | [orch] | — |
-| sparse_attn (+ inverse RoPE fused) | 533-534 | `sparse_attn.py` | skeleton |
-| o_proj | 537-542 | `o_proj.py` | skeleton |
-| hc_post (attn) | 694 | `hc_post.py` | skeleton |
-| moe_router (hc_pre ffn + ffn_norm + gate) | 697-698, 564-584 | `moe_router.py` (reuses `hc_pre.py` with hc_ffn_*) | skeleton |
-| EP dispatch | — | [EP-orch] HCCL AllToAllv | — |
-| moe_expert | 636-644 | `moe_expert.py` | skeleton |
-| EP combine | — | [EP-orch] HCCL AllToAllv | — |
-| routed_y + sh | 644-645 | [orch] elementwise add | — |
-| hc_post (ffn) | 700 | `hc_post.py` | skeleton |
 
 ## Layer-type conditional (compress_ratio)
 
@@ -342,6 +312,29 @@ inline in the orch and are NOT separate kernels.
 | 128 | called (ratio=128) | not called | window_topk_idxs ⧺ get_compress_topk_idxs (HCA) |
 
 ## EP topology notes
+
+**Reference implementation**: `simpler/examples/workers/l3/ep_dispatch_combine/`.
+simpler already runs end-to-end dispatch + combine on 2-card hardware
+via a single orchestration kernel + three AIV children over a shared
+HCCL window scratch:
+
+- `kernels/aiv/dispatch.cpp` — count exchange + 3-channel push
+  (x BF16, weight FP32 1×W_PAD, idx INT32 1×IDX_PAD) + stage-out
+  → `recv_x`, `recv_w`, `recv_idx`, `recv_count`.
+- `kernels/aiv/local_expert.cpp` — placeholder for the production
+  `moe_expert` kernel.
+- `kernels/aiv/combine.cpp` — TPUT scatter `recv_y` by `recv_idx` into
+  `routed_y_buf[t, k, :]` (relies on HCCL window zero-init), then
+  reduce_sum along TOPK → `routed_y` FP32.
+- `kernels/orchestration/ep_dispatch_combine_orch.cpp` — phase scheduler
+  (histogram → publish → prefix_sum → payload_push → stage_out).
+
+**pypto has not yet adapted** this path. The diagrams above mark these
+stages `[EP-orch]` as a placeholder; once the equivalent DSL primitives
+(TPUT/TNOTIFY barriers + HCCL window) are exposed in pypto, the
+dispatch/combine boxes can be filled in following the simpler reference.
+
+EP semantics around the MoE kernels:
 
 - **moe_router**: runs on every card with replicated `gate_w`; indices cover
   global expert space `[0, N_EXPERTS=256)`. Also produces `x_norm` (post
@@ -354,5 +347,3 @@ inline in the orch and are NOT separate kernels.
   token populations from the same global x_norm.
 - **shared expert**: computed locally on `x_local` with no communication;
   result `sh` stays on the card and is added after combine.
-- **hc_post** (both attn and ffn): same draft file, called twice per Block
-  with different post/comb tensors from the respective hc_pre call.

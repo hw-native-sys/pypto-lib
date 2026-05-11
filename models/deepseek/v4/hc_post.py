@@ -24,7 +24,7 @@ HC_DIM  = HC_MULT * D
 
 
 @pl.jit.inline
-def deepseek_v4_decode_hc_post(
+def hc_post(
     x:        pl.Tensor[[B, S, D],                    pl.BF16],
     residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
     post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
@@ -68,18 +68,18 @@ def deepseek_v4_decode_hc_post(
 
 
 @pl.jit
-def deepseek_v4_decode_hc_post_test(
+def hc_post_test(
     x:        pl.Tensor[[B, S, D],                    pl.BF16],
     residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
     post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
     comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
     y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
 ):
-    y = deepseek_v4_decode_hc_post(x, residual, post, comb, y)
+    y = hc_post(x, residual, post, comb, y)
     return y
 
 
-def golden_deepseek_v4_decode_hc_post(tensors):
+def golden_hc_post(tensors):
     """Torch reference, direct port of model.py Block.hc_post 684-687."""
     import torch
 
@@ -135,9 +135,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=deepseek_v4_decode_hc_post_test,
+        fn=hc_post_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_hc_post,
+        golden_fn=golden_hc_post,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,

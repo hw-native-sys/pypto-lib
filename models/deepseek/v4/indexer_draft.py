@@ -8,12 +8,12 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 Indexer (decode). Mirrors model.py Indexer (line 380-433);
 golden is a port of forward's decode branch (prefill `start_pos == 0` path is omitted).
-The inner Compressor is invoked via golden_deepseek_v4_decode_compressor (placeholder)."""
+The inner Compressor is invoked via golden_compressor (placeholder)."""
 
 
 import pypto.language as pl
 
-from deepseek_v4_decode_compressor_draft import golden_deepseek_v4_decode_compressor
+from compressor_draft import golden_compressor
 
 
 B = 16  # demo 4
@@ -46,39 +46,66 @@ SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 
 OFFSET = 128  # default for ScalarSpec; = win in attention orch; added to topk_idxs (model.py:432)
 
 
-def build_deepseek_v4_decode_indexer_program():
-    @pl.program
-    class DeepSeekV4DecodeIndexer:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def deepseek_v4_decode_indexer(
-            self,
-            x: pl.Tensor[[B, S, D], pl.BF16],
-            qr: pl.Tensor[[T, Q_LORA], pl.BF16],
-            wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.BF16],
-            weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-            cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos]
-            sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
-            hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
-            inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-            inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
-            inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-            inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-            inner_cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos+1-ratio]
-            inner_sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
-            inner_kv_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
-            inner_score_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
-            idx_kv_cache: pl.InOut[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
-            start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
-            offset: pl.Scalar[pl.INT32],     # added to topk_idxs (= win from attention orch)
-            topk_idxs: pl.Out[pl.Tensor[[T, IDX_TOPK], pl.INT32]],
-        ):
-            # TODO: kernel implementation
-            return topk_idxs
-
-    return DeepSeekV4DecodeIndexer
+@pl.jit.inline
+def indexer(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos]
+    sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
+    inner_cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],  # caller passes freqs_cis[start_pos+1-ratio]
+    inner_sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    inner_kv_state: pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_score_state: pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    start_pos: pl.Scalar[pl.INT32],  # decode step; varies per call
+    offset: pl.Scalar[pl.INT32],     # added to topk_idxs (= win from attention orch)
+    topk_idxs: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+):
+    # TODO: kernel implementation
+    return topk_idxs
 
 
-def golden_deepseek_v4_decode_indexer(tensors):
+@pl.jit
+def indexer_test(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.BF16],
+    weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
+    cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
+    inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
+    inner_cos: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    inner_sin: pl.Tensor[[1, ROPE_HEAD_DIM], pl.BF16],
+    inner_kv_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
+    inner_score_state: pl.InOut[pl.Tensor[[B, STATE_LEN, INNER_OUT_DIM], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
+    start_pos: pl.Scalar[pl.INT32],
+    offset: pl.Scalar[pl.INT32],
+    topk_idxs: pl.Out[pl.Tensor[[T, IDX_TOPK], pl.INT32]],
+):
+    topk_idxs = indexer(
+        x, qr, wq_b, weights_proj, cos, sin, hadamard,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        inner_cos, inner_sin,
+        inner_kv_state, inner_score_state, idx_kv_cache,
+        start_pos, offset,
+        topk_idxs,
+    )
+    return topk_idxs
+
+
+def golden_indexer(tensors):
     """Torch reference for Indexer.forward (decode branch; prefill omitted; W8A8C16 quant ops are identity in golden)."""
     import torch
 
@@ -133,7 +160,7 @@ def golden_deepseek_v4_decode_indexer(tensors):
     }
     # Placeholder call — compressor's golden currently uses module-level constants
     # (HEAD_DIM=512, ROTATE=False), so this won't run end-to-end without refactor.
-    golden_deepseek_v4_decode_compressor(inner_tensors)
+    golden_compressor(inner_tensors)
     should_compress = compress_ratio != 0 and ((start_pos + 1) % compress_ratio) == 0
     if should_compress:
         idx_kv_cache[:bsz, start_pos // ratio] = inner_out
@@ -219,7 +246,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import RunConfig, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -228,10 +255,10 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_deepseek_v4_decode_indexer_program(),
+    result = run_jit(
+        fn=indexer_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_deepseek_v4_decode_indexer,
+        golden_fn=golden_indexer,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
