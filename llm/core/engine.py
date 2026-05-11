@@ -111,12 +111,26 @@ class LLMEngine:
             if not token_ids:
                 raise ValueError("Prompt tokenization produced no tokens.")
 
+        # L3 fast path currently supports batch_size=1 only.
+        is_l3 = callable(getattr(self._executor, "run_generate_l3", None)) and getattr(
+            self._executor, "_l3_mode", False
+        )
+        if is_l3 and len(prompts) > 1:
+            raise NotImplementedError(
+                "L3 generate fast path currently supports batch_size=1; "
+                f"got {len(prompts)} prompts."
+            )
+
         requests: list[RequestState] = []
         allocations = []
         try:
             for prompt, token_ids in zip(prompts, prompt_token_ids, strict=True):
                 request_id = f"req-{next(self._request_counter)}"
-                alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, len(token_ids))
+                # In L3 mode the entire decode loop runs on device without
+                # host-side ensure_one_more_slot calls, so pre-allocate KV
+                # capacity for the full prompt + max_new_tokens upfront.
+                alloc_len = len(token_ids) + generate_config.max_new_tokens if is_l3 else len(token_ids)
+                alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
                 requests.append(
                     RequestState(
@@ -153,8 +167,8 @@ class LLMEngine:
                 )
 
             # L3-wrapped generate: entire prefill + decode loop in one worker.run().
-            run_generate_l3 = getattr(self._executor, "run_generate_l3", None)
-            if callable(run_generate_l3) and getattr(self._executor, "_l3_mode", False):
+            if is_l3:
+                run_generate_l3 = self._executor.run_generate_l3
                 prefill_batch = PrefillBatch(
                     request_ids=[request.request_id for request in requests],
                     token_ids=token_tensor,
@@ -172,24 +186,21 @@ class LLMEngine:
                     max_new_tokens=generate_config.max_new_tokens,
                     eos_token_id=record.config.eos_token_id,
                 )
-                for request in requests:
-                    request.generated_token_ids = list(generated_ids)
-                    request.output_text = tokenizer.decode(generated_ids)
-                finish_reasons = []
-                for _ in requests:
-                    if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
-                        finish_reasons.append("eos")
-                    elif len(generated_ids) >= generate_config.max_new_tokens:
-                        finish_reasons.append("length")
-                    else:
-                        finish_reasons.append("length")
+                request = requests[0]
+                request.generated_token_ids = list(generated_ids)
+                request.output_text = tokenizer.decode(generated_ids)
+                if generated_ids and record.config.eos_token_id is not None and generated_ids[-1] == record.config.eos_token_id:
+                    finish_reason = "eos"
+                elif len(generated_ids) >= generate_config.max_new_tokens:
+                    finish_reason = "length"
+                else:
+                    finish_reason = "stop"
                 return [
                     GenerateResult(
-                        text=requests[i].output_text,
-                        token_ids=list(requests[i].generated_token_ids),
-                        finish_reason=finish_reasons[i],
+                        text=request.output_text,
+                        token_ids=list(request.generated_token_ids),
+                        finish_reason=finish_reason,
                     )
-                    for i in range(len(requests))
                 ]
 
             # Hold one shared L3 Worker across prefill + all decode steps.

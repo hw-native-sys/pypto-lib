@@ -98,10 +98,17 @@ def build_qwen3_14b_l3_generate_program(
     head_dim: int = HEAD_DIM,
     # Generation loop parameters.
     # max_new_tokens is compile-time so pl.unroll can expand the decode loop.
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 256,
     # padded_vocab must be a multiple of 64 (VOCAB_CHUNK alignment).
     padded_vocab: int = 152064,
+    # page_size must equal SEQ_TILE (BLOCK_SIZE) used for KV cache indexing.
+    page_size: int = SEQ_TILE,
 ):
+    if page_size != SEQ_TILE:
+        raise ValueError(
+            f"page_size={page_size} must equal SEQ_TILE={SEQ_TILE} "
+            f"(BLOCK_SIZE used for KV cache indexing in the L3 kernel)"
+        )
     hidden = hidden_size
     kv_hidden = num_kv_heads * head_dim
     inter = intermediate_size

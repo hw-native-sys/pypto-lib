@@ -588,6 +588,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 head_dim=model.config.head_dim,
                 max_new_tokens=model.runtime.max_new_tokens,
                 padded_vocab=padded_vocab,
+                page_size=model.runtime.page_size,
             )
             # pypto.runtime.run hard-codes DistributedConfig(block_dim=1), so we call
             # ir.compile directly to override it.
@@ -822,9 +823,19 @@ class PyptoQwen14BExecutor(ModelExecutor):
         compiled = self._compiled[model.config.model_id]
         if compiled.l3_generate_chip_callables is None:
             raise RuntimeError("L3 generate artifacts not compiled.")
+        if max_new_tokens > model.runtime.max_new_tokens:
+            raise ValueError(
+                f"max_new_tokens={max_new_tokens} exceeds compiled L3 limit "
+                f"{model.runtime.max_new_tokens}"
+            )
 
         prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
         actual_batch = prefill_inputs.actual_batch
+        if actual_batch != 1:
+            raise ValueError(
+                "run_generate_l3 currently supports batch_size=1 only; "
+                f"got {actual_batch} requests."
+            )
         hidden_size = model.config.hidden_size
         max_seq = model.runtime.max_seq_len
         vocab_size = model.config.vocab_size
@@ -1081,7 +1092,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 rms_normed,               # rms_normed
                 lm_head_weight,           # lm_head_weight_t
                 logits_padded,            # logits_padded
-            ]):
+            ], strict=True):
                 if not val.is_shared():
                     val = val.share_memory_()
                 td[info.name] = val

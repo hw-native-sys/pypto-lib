@@ -60,7 +60,7 @@ class RuntimeConfig:
     # All generate() calls must use max_new_tokens <= this value; the loop always
     # runs this many decode steps (sample_and_prepare no-ops after EOS or when
     # the per-call max_new_tokens cap is reached).
-    max_new_tokens: int = 128
+    max_new_tokens: int = 256
 
 
 @dataclass(frozen=True)
