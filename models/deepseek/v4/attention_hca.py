@@ -32,6 +32,8 @@ D = 4096  # flash:4096 pro:7168
 H = 64  # flash:64 pro:128
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
+SPARSE_ROPE_CHUNK = 16
+SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 Q_LORA = 1024  # flash:1024 pro:1536
 Q_PROJ_OUT_CHUNK = 128
@@ -105,6 +107,8 @@ def attention_hca(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     # main compressor (rotate=False, head_dim=HEAD_DIM, ratio=128, overlap=False)
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
@@ -289,6 +293,8 @@ def attention_hca(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
+        even_select_local,
+        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -324,6 +330,8 @@ def attention_hca_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     cmp_wkv: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -347,6 +355,7 @@ def attention_hca_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
+        even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_kv_state, cmp_score_state,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
@@ -485,6 +494,8 @@ def golden_attention_hca(tensors):
         "seqused_kv": tensors["seqused_kv"].view(B),
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
+        "even_select_local": tensors["even_select_local"],
+        "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
@@ -563,6 +574,24 @@ def build_tensor_specs():
         for i in range(ROPE_HEAD_DIM // 2):
             m[i, 2 * i + 1] = 1
         return m
+    def init_even_select_local():
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
+        for i in range(SPARSE_ROPE_CHUNK):
+            m[2 * i, i] = 1
+        return m
+    def init_odd_select_local():
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
+        for i in range(SPARSE_ROPE_CHUNK):
+            m[2 * i + 1, i] = 1
+        return m
+
+    def init_normalized_cache(shape, seed):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        cache = torch.randn(*shape, generator=generator)
+        denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
+        return (cache / denom).to(torch.bfloat16)
+
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) / D ** 0.5
     def init_cmp_wgate():
@@ -576,9 +605,9 @@ def build_tensor_specs():
     def init_cmp_score_state():
         return torch.full((B, MAIN_STATE_LEN, MAIN_OUT_DIM), float("-inf"))
     def init_kv_cache():
-        return torch.zeros(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260512)
     def init_cmp_kv():
-        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260513)
 
     def init_ori_block_table():
         tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
@@ -630,6 +659,8 @@ def build_tensor_specs():
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
+        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
+        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("cmp_wkv", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
@@ -666,8 +697,10 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_attention_hca,
         config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
+            # Random ori/cmp cache fixtures exercise non-zero history values
+            # instead of the previous all-zero cache.
+            rtol=1e-2,
+            atol=1e-2,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

@@ -32,6 +32,8 @@ D = 4096  # flash:4096 pro:7168
 H = 64  # flash:64 pro:128
 HEAD_DIM = 512
 ROPE_HEAD_DIM = 64
+SPARSE_ROPE_CHUNK = 16
+SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 Q_LORA = 1024  # flash:1024 pro:1536
 Q_PROJ_OUT_CHUNK = 128
@@ -64,7 +66,7 @@ SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = 64
 SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 
-START_POS = 3  # default for ScalarSpec; >0 (decode); SWA path has no compression-related constraint
+START_POS = 127  # default for ScalarSpec; full-window decode fixture; SWA has no compression constraint
 
 
 @pl.jit.inline
@@ -86,6 +88,8 @@ def attention_swa(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
@@ -193,6 +197,8 @@ def attention_swa(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
+        even_select_local,
+        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -230,6 +236,8 @@ def attention_swa_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
@@ -249,6 +257,7 @@ def attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
+        even_select_local, odd_select_local,
         kv_cache, block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
@@ -352,6 +361,8 @@ def golden_attention_swa(tensors):
         "seqused_kv": seqused_kv.view(B),
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
+        "even_select_local": tensors["even_select_local"],
+        "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
@@ -430,8 +441,26 @@ def build_tensor_specs():
         for i in range(ROPE_HEAD_DIM // 2):
             m[i, 2 * i + 1] = 1
         return m
+    def init_even_select_local():
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
+        for i in range(SPARSE_ROPE_CHUNK):
+            m[2 * i, i] = 1
+        return m
+    def init_odd_select_local():
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
+        for i in range(SPARSE_ROPE_CHUNK):
+            m[2 * i + 1, i] = 1
+        return m
+
+    def init_normalized_cache(shape, seed):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        cache = torch.randn(*shape, generator=generator)
+        denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
+        return (cache / denom).to(torch.bfloat16)
+
     def init_kv_cache():
-        return torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return init_normalized_cache((BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), seed=20260512)
 
     def init_block_table():
         tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
@@ -471,6 +500,8 @@ def build_tensor_specs():
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
+        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
+        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
@@ -499,9 +530,11 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_attention_swa,
         config=RunConfig(
-            # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; SWA carries that drift through attention/o_proj.
-            rtol=1.3e-2,
-            atol=1.3e-2,
+            # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; the
+            # random KV-cache fixture exercises a less diluted attention output
+            # than the previous all-zero cache.
+            rtol=1e-2,
+            atol=1e-2,
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
