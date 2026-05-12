@@ -136,6 +136,18 @@ class LLMEngine:
                 # In L3 mode the entire decode loop runs on device without
                 # host-side ensure_one_more_slot calls, so pre-allocate KV
                 # capacity for the full prompt + max_new_tokens upfront.
+                if is_l3:
+                    total_needed = len(token_ids) + generate_config.max_new_tokens
+                    max_seq = record.runtime.max_seq_len
+                    if total_needed > max_seq:
+                        raise ValueError(
+                            f"L3 mode: prompt length ({len(token_ids)}) + "
+                            f"max_new_tokens ({generate_config.max_new_tokens}) = {total_needed} "
+                            f"exceeds max_seq_len ({max_seq}). "
+                            f"Either reduce --max-new-tokens to at most "
+                            f"{max_seq - len(token_ids)}, or increase --max-seq-len to at least "
+                            f"{total_needed}."
+                        )
                 alloc_len = len(token_ids) + generate_config.max_new_tokens if is_l3 else len(token_ids)
                 alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
