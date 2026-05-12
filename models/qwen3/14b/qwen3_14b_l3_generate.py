@@ -1370,6 +1370,80 @@ def build_qwen3_14b_l3_generate_program(
                         out = pl.assemble(out, acc, [b0, o0])
             return out
 
+        # ── L2: fused final-RMSNorm + LM-head (single chip task) ───────────────
+        # Combines qwen3_final_rms and qwen3_lm_head into one dispatch, saving
+        # one full init_runtime + validate cycle (~20 ms at PTO2_RING_HEAP=512 MB).
+        # rms_normed acts as an HBM scratch buffer between the two compute phases;
+        # it is passed from host_orch but its post-call value is never read
+        # externally (write-only scratch, InOutUseDiscipline satisfied).
+        @pl.function(type=pl.FunctionType.Opaque)
+        def qwen3_rms_lmhead(
+            self,
+            x: pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
+            gamma: pl.Tensor[[1, hidden], pl.FP32],
+            lm_head_weight: pl.Tensor[[padded_vocab, hidden], pl.BF16],
+            rms_normed: pl.Out[pl.Tensor[[BATCH_TILE, hidden], pl.BF16]],
+            out: pl.Out[pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32]],
+        ) -> pl.Tuple[
+            pl.Tensor[[BATCH_TILE, hidden], pl.BF16],
+            pl.Tensor[[BATCH_TILE, padded_vocab], pl.FP32],
+        ]:
+            # Phase 1 – RMSNorm: identical body to qwen3_final_rms.
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
+                    sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
+                    for kb in pl.range(hidden_blocks):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.cast(
+                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                            target_type=pl.FP32,
+                        )
+                        sq_sum = pl.add(
+                            sq_sum,
+                            pl.reshape(
+                                pl.row_sum(pl.mul(x_chunk, x_chunk)),
+                                [1, BATCH_TILE],
+                            ),
+                        )
+                    inv_rms = pl.reshape(
+                        pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), EPS)),
+                        [BATCH_TILE, 1],
+                    )
+                    for kb in pl.range(hidden_blocks):
+                        k0 = kb * K_CHUNK
+                        x_chunk = pl.cast(
+                            pl.slice(x, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                            target_type=pl.FP32,
+                        )
+                        g = pl.slice(gamma, [1, K_CHUNK], [0, k0])
+                        normed = pl.col_expand_mul(
+                            pl.row_expand_mul(x_chunk, inv_rms),
+                            g,
+                        )
+                        rms_normed = pl.assemble(
+                            rms_normed, pl.cast(normed, target_type=pl.BF16), [b0, k0]
+                        )
+            # Phase 2 – LM-head GEMM: reads rms_normed written above (HBM).
+            # Body identical to qwen3_lm_head with hidden_in → rms_normed.
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
+                for b0 in pl.range(0, BATCH_TILE, BATCH_TILE):
+                    for ob in pl.parallel(vocab_blocks, chunk=8):
+                        o0 = ob * VOCAB_CHUNK
+                        h0 = pl.slice(rms_normed, [BATCH_TILE, K_CHUNK], [b0, 0])
+                        w0 = pl.slice(lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, 0])
+                        acc = pl.matmul(h0, w0, out_dtype=pl.FP32, b_trans=True)
+                        for kb in pl.range(1, hidden_blocks):
+                            k0 = kb * K_CHUNK
+                            h_chunk = pl.slice(
+                                rms_normed, [BATCH_TILE, K_CHUNK], [b0, k0]
+                            )
+                            w_chunk = pl.slice(
+                                lm_head_weight, [VOCAB_CHUNK, K_CHUNK], [o0, k0]
+                            )
+                            acc = pl.matmul_acc(acc, h_chunk, w_chunk, b_trans=True)
+                        out = pl.assemble(out, acc, [b0, o0])
+            return rms_normed, out
+
         # ── HOST SubWorker: sample & prepare next decode inputs ─────────────────
         # Placeholder body — the actual implementation (closure over shared-memory
         # tensors) is injected by the executor at runtime before worker.run().
@@ -1448,10 +1522,12 @@ def build_qwen3_14b_l3_generate_program(
             # pypto InOutUseDiscipline: once a variable is passed as Out/InOut,
             # its "post-call" return value must be used for all subsequent reads.
             # Convention used here:
-            #   out_d       — post-call decode_out  (updated by qwen3_decode_all)
-            #   out_rms     — post-call rms_normed  (updated by qwen3_final_rms)
-            #   out_lm      — post-call logits_padded (updated by qwen3_lm_head)
-            #   upd_hidden  — post-call decode_hidden (updated by sample_and_prepare)
+            #   out_d      — post-call decode_out    (updated by qwen3_decode_all)
+            #   out_rms    — post-call rms_normed    (returned by qwen3_rms_lmhead[0])
+            #   out_lm     — post-call logits_padded (returned by qwen3_rms_lmhead[1])
+            #   upd_hidden — post-call decode_hidden (updated by sample_and_prepare)
+            # qwen3_rms_lmhead returns (rms_normed, logits) as a pl.Tuple so that
+            # both Out params satisfy InOutUseDiscipline at the call site.
             if has_prefill:
                 self.qwen3_prefill_all(
                     prefill_hidden, prefill_seq_lens,
@@ -1475,8 +1551,9 @@ def build_qwen3_14b_l3_generate_program(
                 w_gate, w_up, w_down,
                 decode_out,
             )
-            out_rms = self.qwen3_final_rms(rms_x, final_norm_weight, rms_normed)
-            out_lm = self.qwen3_lm_head(out_rms, lm_head_weight_t, logits_padded)
+            out_rms, out_lm = self.qwen3_rms_lmhead(
+                rms_x, final_norm_weight, lm_head_weight_t, rms_normed, logits_padded
+            )
             # sample_and_prepare returns the updated decode_hidden (upd_hidden).
             # All subsequent decode_all calls use upd_hidden (not decode_hidden)
             # so that the RAW chain  sample_N.output → decode_{N+1}.input  is
@@ -1496,9 +1573,9 @@ def build_qwen3_14b_l3_generate_program(
             # InOutUseDiscipline: each iteration reads the previous Out return
             # value and passes it as the next Out argument.
             # RAW chain per step:
-            #   decode_N (writes out_d) → final_rms_N (reads rms_x, writes out_rms)
-            #   → lm_head_N (reads out_rms, writes out_lm)
-            #   → sample_N  (reads out_lm, writes upd_hidden)
+            #   decode_N     (writes out_d)
+            #   → rms_lmhead_N (reads rms_x, returns out_rms + out_lm)
+            #   → sample_N     (reads out_lm, writes upd_hidden)
             #   → decode_{N+1} (reads upd_hidden) [explicit RAW dependency]
             for _ in pl.range(max_new_tokens - 1):
                 out_d = self.qwen3_decode_all(
@@ -1512,8 +1589,9 @@ def build_qwen3_14b_l3_generate_program(
                     w_gate, w_up, w_down,
                     out_d,
                 )
-                out_rms = self.qwen3_final_rms(rms_x, final_norm_weight, out_rms)
-                out_lm = self.qwen3_lm_head(out_rms, lm_head_weight_t, out_lm)
+                out_rms, out_lm = self.qwen3_rms_lmhead(
+                    rms_x, final_norm_weight, lm_head_weight_t, out_rms, out_lm
+                )
                 upd_hidden = self.sample_and_prepare(
                     out_lm, decode_seq_lens, decode_slot_mapping, upd_hidden,
                 )

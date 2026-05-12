@@ -16,6 +16,7 @@ from typing import Protocol
 
 import torch
 
+from ._profiling import StageTimer
 from .tokenizer import TokenizerAdapter, TransformersTokenizerAdapter
 from .types import LayerSpec, LayerWeights, LoadedModel, ModelConfig, RuntimeConfig, RuntimeModel
 
@@ -152,6 +153,15 @@ class HuggingFaceDirectoryLoader:
         return False
 
     def load(self, request: ModelLoadRequest) -> LoadedModel:
+        timer = StageTimer(
+            enabled=bool(request.loader_options.get("profile_verbose", False)),
+            prefix="loader-breakdown",
+            title="HuggingFaceLoader.load stage timings",
+        )
+
+        def _mark(label: str) -> None:
+            timer.mark(label)
+
         model_path = Path(request.model_dir)
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -162,11 +172,14 @@ class HuggingFaceDirectoryLoader:
             str(model_path),
             trust_remote_code=trust_remote_code,
         )
+        _mark("load_tokenizer")
         config_data = json.loads(config_path.read_text())
         config = _build_model_config(request.model_id, config_data, tokenizer)
         runtime = request.runtime_config or RuntimeConfig(max_seq_len=config.max_position_embeddings)
         layer_specs = _build_layer_specs(config)
+        _mark("parse_config")
         state_dict = _load_safetensors_dir(model_path)
+        _mark("load_safetensors")
 
         if config.architecture.lower() not in {"qwen2forcausallm", "qwen3forcausallm", "qwen2model", "qwen3model"}:
             raise ValueError(
@@ -185,6 +198,7 @@ class HuggingFaceDirectoryLoader:
         else:
             lm_head = _cast_weight(lm_head, runtime)
 
+        _mark("embed_norm_lmhead")
         layers: list[LayerWeights] = []
         default_dtype = _torch_dtype_from_name(runtime.weight_dtype)
         for spec in layer_specs:
@@ -218,6 +232,8 @@ class HuggingFaceDirectoryLoader:
                 )
             )
 
+        _mark("cast_layer_weights")
+
         runtime_model = RuntimeModel(
             config=config,
             runtime=runtime,
@@ -226,6 +242,10 @@ class HuggingFaceDirectoryLoader:
             lm_head=lm_head,
             layers=layers,
         )
+
+        # ── loader stage breakdown report ──
+        timer.report()
+
         return LoadedModel(
             model_id=request.model_id,
             model_dir=str(model_path),

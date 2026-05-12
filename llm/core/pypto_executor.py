@@ -19,6 +19,7 @@ import torch
 
 _TIMING_ENABLED = True
 
+from ._profiling import StageTimer
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .types import (
@@ -323,6 +324,15 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
+        timer = StageTimer(
+            enabled=self._l3_trace,
+            prefix="compile-breakdown",
+            title="_compile_model stage timings",
+        )
+
+        def _mark(label: str) -> None:
+            timer.mark(label)
+
         _ensure_pypto_import(self._pypto_root)
         from pypto.runtime import run
         try:
@@ -343,6 +353,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
             from model.qwen3_14b_lm_head import build_qwen3_lm_head_program
             from model.qwen3_14b_prefill import build_qwen3_14b_prefill_program
+        _mark("imports")
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
@@ -378,15 +389,21 @@ class PyptoQwen14BExecutor(ModelExecutor):
             hidden_size=model.config.hidden_size,
             vocab_size=padded_vocab,
         )
+        _mark("build_programs")
         prefill = run(prefill_program, config=self._run_config(codegen_only=True))
+        _mark("compile_prefill")
         decode = run(decode_program, config=self._run_config(codegen_only=True))
+        _mark("compile_decode")
         final_rms = run(final_rms_program, config=self._run_config(codegen_only=True))
         lm_head = run(lm_head_program, config=self._run_config(codegen_only=True))
+        _mark("compile_final_rms_lm_head")
         rope_cos, rope_sin = _rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
             model.config.rope_theta,
         )
+
+        _mark("rope_tables")
 
         # L3 artefacts (built only when l3_mode=True).
         l3_generate: object | None = None
@@ -428,6 +445,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                     aicpu_thread_num=4,
                 ),
             )
+            _mark("compile_l3_generate")
             # stack_layer_weights_full expects each weight already in
             # kernel orientation ([in_dim, out_dim] for 2D matmul weights).
             # Adapt via a per-layer view that mirrors _kernel_weight().
@@ -439,6 +457,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 inter=model.config.intermediate_size,
                 head_dim=model.config.head_dim,
             )
+            _mark("stack_layer_weights")
 
         # L3-wrapped generate: pre-extract l3_generate setup artifacts
         # (expensive compile_and_assemble + module loading done once,
@@ -505,6 +524,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             l3_generate_platform = l3_generate.platform
             l3_generate_runtime_name = lg_runtime_name
             l3_generate_param_infos = lg_param_infos
+            _mark("l3_extract_artifacts")
 
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
@@ -516,13 +536,18 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
             lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
         padded_lm_head_weight = lm_head_weight.to(torch.bfloat16).contiguous().cpu()
+        _mark("pad_lm_head")
         layers = []
         for layer in model.layers:
             layers.append(self._kernel_layer_weights(layer))
             self._release_layer_weights(layer)
         final_norm_weight = model.final_norm_weight.view(1, -1).float().cpu()
+        _mark("kernel_layer_weights")
 
         decode_weights = self._stack_decode_weights(layers)
+        _mark("stack_decode_weights")
+
+        timer.report()
 
         return _CompiledKernels(
             prefill=prefill,
@@ -622,6 +647,16 @@ class PyptoQwen14BExecutor(ModelExecutor):
         from simpler.task_interface import CallConfig  # noqa: PLC0415
         from simpler.worker import Worker  # noqa: PLC0415
 
+        _verbose = self._l3_trace
+        timer = StageTimer(
+            enabled=_verbose,
+            prefix="L3-breakdown",
+            title="run_generate_l3 stage timings",
+        )
+
+        def _mark(label: str) -> None:
+            timer.mark(label)
+
         compiled = self._compiled[model.config.model_id]
         if compiled.l3_generate_chip_callables is None:
             raise RuntimeError("L3 generate artifacts not compiled.")
@@ -631,7 +666,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 f"{model.runtime.max_new_tokens}"
             )
 
+        _mark("entry_validate")
         prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
+        _mark("prepare_prefill_inputs")
         actual_batch = prefill_inputs.actual_batch
         if actual_batch != 1:
             raise ValueError(
@@ -646,6 +683,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
         k_cache_all, v_cache_all = self._kv_cache_manager.materialize_decode_cache_all_layers(
             model.config.model_id,
         )
+        _mark("kv_cache_materialize")
 
         # Build initial decode hidden: last prompt token embedding per batch.
         decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
@@ -673,8 +711,10 @@ class PyptoQwen14BExecutor(ModelExecutor):
         rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
         lm_head_weight = compiled.padded_lm_head_weight.share_memory_()
         logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
+        _mark("alloc_io_buffers")
         # Sub-worker communication tensors.
         embed_tokens = model.embed_tokens.to(torch.bfloat16).cpu().share_memory_()
+        _mark("embed_tokens_to_shm")
         done_flag = torch.zeros((1,), dtype=torch.int32).share_memory_()
         generated_ids = torch.full((max_new_tokens,), -1, dtype=torch.int64).share_memory_()
         token_count = torch.zeros((1,), dtype=torch.int32).share_memory_()
@@ -692,11 +732,13 @@ class PyptoQwen14BExecutor(ModelExecutor):
         rope_sin = compiled.rope_sin.share_memory_()
         k_cache_all = k_cache_all.share_memory_()
         v_cache_all = v_cache_all.share_memory_()
+        _mark("kv_and_prefill_to_shm")
 
         # Ensure stacked weights are in shared memory.
         sm_sw = {}
         for k, v in compiled.stacked_weights.items():
             sm_sw[k] = v.share_memory_() if not v.is_shared() else v
+        _mark("stacked_weights_to_shm")
 
         # SSA-name substrings that identify static weight parameters in the
         # tensors_dict built by _build_full_tensors().  Used in
@@ -753,8 +795,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         def sample_and_prepare_fn(task_args):
             """Sub-worker: sample token from logits, prepare next decode inputs."""
-            import time as _time  # noqa: PLC0415
-            _t_enter = _time.perf_counter()
+            _t_enter = time.perf_counter()
             if _done_flag[0].item():
                 return  # EOS already hit, no-op.
 
@@ -776,7 +817,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             if _eos_id is not None and token_id == _eos_id:
                 _done_flag[0] = 1
-                _t_exit = _time.perf_counter()
+                _t_exit = time.perf_counter()
                 _sample_done_ts[0] = _t_exit
                 if _l3_trace_enabled:
                     work_ms = (_t_exit - _t_enter) * 1000.0
@@ -789,7 +830,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
             if step + 1 >= max_new_tokens:
                 _done_flag[0] = 1
-                _t_exit = _time.perf_counter()
+                _t_exit = time.perf_counter()
                 _sample_done_ts[0] = _t_exit
                 if _l3_trace_enabled:
                     work_ms = (_t_exit - _t_enter) * 1000.0
@@ -814,7 +855,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 if page_idx < len(alloc.page_ids):
                     _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
 
-            _t_exit = _time.perf_counter()
+            _t_exit = time.perf_counter()
             _sample_done_ts[0] = _t_exit
             if _l3_trace_enabled:
                 work_ms = (_t_exit - _t_enter) * 1000.0
@@ -839,6 +880,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 callables=lg_chip_callables,
                 sub_ids=sub_ids,
                 _keep=_keep,
+                contexts=worker.chip_contexts,
             )
 
         _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
@@ -895,13 +937,12 @@ class PyptoQwen14BExecutor(ModelExecutor):
         _kv_dev_ptrs: list[tuple[int, int, int]] = []
 
         def generate_orch_fn(orch, _args, _cfg):
-            import time as _time  # noqa: PLC0415
             _keep: list = []
             call_config = CallConfig()
             call_config.block_dim = lg_dc.block_dim
             call_config.aicpu_thread_num = lg_dc.aicpu_thread_num
 
-            _t_pf = _time.perf_counter()
+            _t_pf = time.perf_counter()
             _t_anchors[0] = _t_pf
             _t_anchors[1] = _t_pf
             _sample_done_ts[0] = _t_pf  # baseline for step 0 chip_tasks measurement
@@ -955,7 +996,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             _submit_l3_generate(orch, call_config, td, _keep)
 
             if _l3_trace_enabled:
-                print(f"[L3-step] all submits done {_fmt_rel(_time.perf_counter())}", flush=True)
+                print(f"[L3-step] all submits done {_fmt_rel(time.perf_counter())}", flush=True)
 
         # ── Create Worker and execute ──
 
@@ -967,6 +1008,8 @@ class PyptoQwen14BExecutor(ModelExecutor):
 
         num_sub = max(lg_dc.num_sub_workers, len(lg_sub_fns))
 
+        _mark("setup_closures_and_buffers")
+
         worker = Worker(
             level=3,
             device_ids=[self._device_id],
@@ -975,16 +1018,21 @@ class PyptoQwen14BExecutor(ModelExecutor):
             runtime=compiled.l3_generate_runtime_name,
         )
 
+        _mark("Worker_ctor")
+
         # Register l3_generate sub-worker callables (including sample_and_prepare).
         sub_ids: dict[str, int] = {}
         for name, fn in lg_sub_fns.items():
             sub_ids[name] = worker.register(fn)
 
+        _mark("worker_register")
+
         worker.init()
+        _mark("worker_init")
         try:
-            import time as _time  # noqa: PLC0415
-            _t_run_start = _time.perf_counter()
+            _t_run_start = time.perf_counter()
             worker.run(generate_orch_fn)
+            _mark("worker_run_generate")
 
             # Sync KV cache back to host.  worker.run() above calls _drain()
             # internally, so all chip tasks (including the last decode step)
@@ -998,8 +1046,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
                             worker_id=0, dst=_host_ptr, src=_dev_ptr, size=_nbytes,
                         )
                 worker.run(_kv_sync_orch_fn)
+            _mark("worker_run_kv_sync")
 
-            _t_run_end = _time.perf_counter()
+            _t_run_end = time.perf_counter()
             print(
                 f"[L3-timer] worker.run total wall-clock: "
                 f"{(_t_run_end-_t_run_start)*1000:.1f}ms",
@@ -1007,6 +1056,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
             )
         finally:
             worker.close()
+            _mark("worker_close")
 
         # Update KV allocations.
         final_token_count = int(token_count[0].item())
@@ -1015,7 +1065,11 @@ class PyptoQwen14BExecutor(ModelExecutor):
             alloc.tokens_used = max(alloc.tokens_used, base_seq + final_token_count)
 
         ids = generated_ids[:final_token_count].tolist()
-        return ids, decode_out[:actual_batch].float()
+        ret_val = ids, decode_out[:actual_batch].float()
+        _mark("post_process")
+
+        timer.report()
+        return ret_val
 
     def _prepare_prefill_inputs(
         self,

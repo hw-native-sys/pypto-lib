@@ -14,6 +14,7 @@ from collections.abc import Iterator
 
 import torch
 
+from ._profiling import StageTimer
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .model_loader import ModelLoader
@@ -52,16 +53,29 @@ class LLMEngine:
         model_format: str | None = None,
         **loader_options: object,
     ) -> None:
+        _verbose = getattr(self._executor, "_l3_trace", False)
+        timer = StageTimer(
+            enabled=_verbose,
+            prefix="init-breakdown",
+            title="init_model stage timings",
+        )
+
+        # Caller-supplied loader_options["profile_verbose"] takes precedence
+        # over the executor-derived default; avoid passing the same kwarg twice.
+        effective_loader_options = dict(loader_options)
+        effective_loader_options.setdefault("profile_verbose", _verbose)
         loaded = self._model_loader.load(
             model_id=model_id,
             model_dir=model_dir,
             runtime_config=runtime_config,
             model_format=model_format,
-            **loader_options,
+            **effective_loader_options,
         )
+        timer.mark("model_loader.load")
         config = loaded.config
         runtime = loaded.runtime_model.runtime
         self._kv_cache_manager.register_model(model_id, config, runtime)
+        timer.mark("kv_cache_manager.register")
         self._models[model_id] = ModelRecord(
             config=config,
             runtime=runtime,
@@ -69,9 +83,13 @@ class LLMEngine:
             layer_specs=loaded.layer_specs,
             runtime_model=loaded.runtime_model,
         )
+        timer.mark("create_model_record")
         register_model = getattr(self._executor, "register_model", None)
         if callable(register_model):
             register_model(model_id, self._models[model_id])
+        timer.mark("executor.register_model")
+
+        timer.report()
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
         generate_config = config or GenerateConfig()
@@ -136,7 +154,33 @@ class LLMEngine:
                 # In L3 mode the entire decode loop runs on device without
                 # host-side ensure_one_more_slot calls, so pre-allocate KV
                 # capacity for the full prompt + max_new_tokens upfront.
-                alloc_len = len(token_ids) + generate_config.max_new_tokens if is_l3 else len(token_ids)
+                if is_l3:
+                    prompt_len = len(token_ids)
+                    max_seq = record.runtime.max_seq_len
+                    if generate_config.max_new_tokens < 1:
+                        raise ValueError(
+                            f"L3 mode requires max_new_tokens >= 1, got "
+                            f"{generate_config.max_new_tokens}."
+                        )
+                    if prompt_len > max_seq:
+                        raise ValueError(
+                            f"L3 mode: prompt length ({prompt_len}) exceeds "
+                            f"max_seq_len ({max_seq}). Either shorten the prompt "
+                            f"or increase --max-seq-len to at least {prompt_len}."
+                        )
+                    alloc_len = prompt_len + generate_config.max_new_tokens
+                    if alloc_len > max_seq:
+                        allowed_new_tokens = max_seq - prompt_len
+                        raise ValueError(
+                            f"L3 mode: prompt length ({prompt_len}) + "
+                            f"max_new_tokens ({generate_config.max_new_tokens}) = {alloc_len} "
+                            f"exceeds max_seq_len ({max_seq}). "
+                            f"Either reduce --max-new-tokens to at most "
+                            f"{allowed_new_tokens}, or increase --max-seq-len to at least "
+                            f"{alloc_len}."
+                        )
+                else:
+                    alloc_len = len(token_ids)
                 alloc = self._kv_cache_manager.allocate_for_prompt(model_id, request_id, alloc_len)
                 allocations.append(alloc)
                 requests.append(
