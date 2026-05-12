@@ -889,6 +889,7 @@ class PyptoQwen14BExecutor(ModelExecutor):
                 callables=lg_chip_callables,
                 sub_ids=sub_ids,
                 _keep=_keep,
+                contexts=worker.chip_contexts,
             )
 
         _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
