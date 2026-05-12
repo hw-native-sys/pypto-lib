@@ -94,7 +94,9 @@ def moe_expert(
             t0 = t * RECV_TILE
             flat_t0 = flat_base + t0
 
-            scale_col = recv_weights_flat[flat_t0 : flat_t0 + RECV_TILE, :]
+            # Valid rows in this tile (< RECV_TILE only for the tail tile).
+            # Rows beyond it are masked to zero in exp_swiglu_mask below.
+            valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
             # Per-row INT8 quant of recv_x tile.
             recv_x_tile_i8 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT8)
@@ -165,8 +167,17 @@ def moe_expert(
                     gated = pl.mul(silu, up_2d)
                     # Pre-multiply routing scale before A8 requant so the requant amax
                     # reflects the same magnitude the BF16 path produced for w2 input.
+                    scale_col = recv_weights_flat[flat_t0 : flat_t0 + RECV_TILE, :]
                     h_chunk = pl.row_expand_mul(gated, scale_col)
-                    h_tile_fp32[:, n0 : n0 + INTER_CHUNK] = h_chunk
+
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu_mask"):
+                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into
+                    # recv_y. Kept in its own pl.at (separate from row_expand_mul above)
+                    # to dodge PTOAS#660.
+                    h_chunk_sliced = pl.slice(h_chunk, [RECV_TILE, INTER_CHUNK], [0, 0])
+                    h_chunk_valid = pl.tensor.set_validshape(h_chunk_sliced, valid_rows, INTER_CHUNK)
+                    h_chunk_masked = pl.fillpad(h_chunk_valid, pad_value=pl.PadValue.zero)
+                    h_tile_fp32[:, n0 : n0 + INTER_CHUNK] = h_chunk_masked
 
             # Per-row A8 requant of h_tile (amax across full MOE_INTER row).
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
@@ -422,15 +433,19 @@ def build_tensor_specs():
         counts = torch.cat([counts, extra])
     counts_2d = counts.reshape(N_LOCAL_EXPERTS, 1)
 
+    # Poison the invalid tail rows (row >= count) of recv_x / recv_weights with
+    # large garbage — the golden ignores them and leaves recv_y[e, count:] == 0,
+    # so this only passes if exp_swiglu_mask actually zeros those rows.
     def init_recv_x():
-        return torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D) * 0.05
+        x = torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D) * 0.05
+        invalid = torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) >= counts.reshape(N_LOCAL_EXPERTS, 1, 1)
+        return torch.where(invalid, torch.randn_like(x) * 1e3, x)
 
     def init_recv_weights():
         w = torch.rand(N_LOCAL_EXPERTS, RECV_MAX) + 0.1
         w = (w / w.sum(dim=1, keepdim=True) * TOPK).float()
-        row_idx = torch.arange(RECV_MAX).reshape(1, RECV_MAX)
-        valid_mask = row_idx < counts.reshape(N_LOCAL_EXPERTS, 1)
-        return torch.where(valid_mask, w, torch.zeros_like(w))
+        valid_mask = torch.arange(RECV_MAX).reshape(1, RECV_MAX) < counts.reshape(N_LOCAL_EXPERTS, 1)
+        return torch.where(valid_mask, w, torch.randn_like(w) * 1e3)
 
     def init_recv_expert_count():
         return counts_2d
