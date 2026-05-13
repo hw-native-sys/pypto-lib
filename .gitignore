@@ -12,5 +12,6 @@ pa_build/
 .DS_Store
 .cursor/
 .env/
+.venv/
 KNOWN_ISSUES.md
 *.log

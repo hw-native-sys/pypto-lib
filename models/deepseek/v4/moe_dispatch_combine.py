@@ -17,10 +17,10 @@ local regroups; the per-expert FFN is replaced by a routing-weight scale.
     weights [T, TOPK]   fp32   per-token routing weights  --+
         -> routed_y [T, D] bf16   per-token combined expert output
 
-recv_expert_count rides in/out as a zero-initialized output (it doubles as the
-dispatch write cursor); the rest of the per-expert layout (recv_x / recv_weights
-/ recv_token / recv_y) and the [token, expert] scatter target routed_y_buf are
-kernel-internal scratch.
+The packed dispatch/combine pieces are exposed as reusable inline functions so
+full model kernels can plug in the real expert implementation between them. The
+standalone wrapper in this file keeps a routing-weight scale stand-in expert for
+focused validation of the packed dispatch/combine contract.
 """
 
 
@@ -46,6 +46,101 @@ RECV_MAX = 32       # per-(local-expert) row upper bound (must match moe_expert)
 
 # tiling
 COL_CHUNK = 512
+
+
+@pl.jit.inline
+def moe_packed_dispatch(
+    x_norm:  pl.Tensor[[T, D],    pl.BF16],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    recv_x:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
+    recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
+):
+    # recv_x is stored in moe_expert's 3-D layout. Metadata stays 1-D during
+    # packed writes so scalar load/store lowering sees a bare flat index.
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_weights_flat = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX], dtype=pl.FP32)
+    recv_token_flat = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX], dtype=pl.INT32)
+    count_flat       = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
+    indices_flat     = pl.reshape(indices, [T * TOPK])
+    weights_flat     = pl.reshape(weights, [T * TOPK])
+
+    for r0 in pl.range(0, N_LOCAL_EXPERTS * RECV_MAX, RECV_MAX):
+        for d0 in pl.range(0, D, COL_CHUNK):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_init_recv_x"):
+                recv_x_flat = pl.assemble(
+                    recv_x_flat,
+                    pl.full([RECV_MAX, COL_CHUNK], dtype=pl.BF16, value=0.0),
+                    [r0, d0],
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_dispatch"):
+        for r in pl.range(N_LOCAL_EXPERTS * RECV_MAX):
+            pl.write(recv_weights_flat, [r], 0.0)
+        for e in pl.range(N_LOCAL_EXPERTS):
+            pl.write(count_flat, [e], pl.cast(0, pl.INT32))
+        for t in pl.range(T):
+            for k in pl.unroll(TOPK):
+                p = t * TOPK + k
+                e_global = pl.read(indices_flat, [p])
+                e = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
+                slot_i32 = pl.read(count_flat, [e])
+                dst = e * RECV_MAX + pl.cast(slot_i32, pl.INDEX)
+
+                recv_x_flat = pl.assemble(recv_x_flat, pl.slice(x_norm, [1, D], [t, 0]), [dst, 0])
+                pl.write(recv_weights_flat, [dst], pl.read(weights_flat, [p]))
+                pl.write(recv_token_flat, [dst], pl.cast(t, pl.INT32))
+                pl.write(count_flat, [e], pl.cast(slot_i32 + 1, pl.INT32))
+
+    for e in pl.unroll(N_LOCAL_EXPERTS):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_materialize_metadata"):
+            w_row_1d = pl.slice(recv_weights_flat, [RECV_MAX], [e * RECV_MAX])
+            tok_row_1d = pl.slice(recv_token_flat, [RECV_MAX], [e * RECV_MAX])
+            recv_weights = pl.assemble(recv_weights, pl.reshape(w_row_1d, [1, RECV_MAX]), [e, 0])
+            recv_token = pl.assemble(recv_token, pl.reshape(tok_row_1d, [1, RECV_MAX]), [e, 0])
+
+
+@pl.jit.inline
+def moe_packed_combine(
+    recv_y:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
+    sh:                pl.Tensor[[T, D],                         pl.BF16],
+    ffn_out:           pl.Tensor[[T, D],                         pl.BF16],
+):
+    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_token_flat = pl.reshape(recv_token, [N_LOCAL_EXPERTS * RECV_MAX])
+    count_flat = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
+    routed_y_buf = pl.create_tensor([T * N_LOCAL_EXPERTS, D], dtype=pl.BF16)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine_init"):
+        for r0 in pl.range(0, T * N_LOCAL_EXPERTS, N_LOCAL_EXPERTS):
+            for d0 in pl.range(0, D, COL_CHUNK):
+                routed_y_buf[r0 : r0 + N_LOCAL_EXPERTS, d0 : d0 + COL_CHUNK] = pl.full(
+                    [N_LOCAL_EXPERTS, COL_CHUNK], dtype=pl.BF16, value=0.0
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine"):
+        for e in pl.range(N_LOCAL_EXPERTS):
+            n_rows = pl.cast(pl.read(count_flat, [e]), pl.INDEX)
+            for s in pl.range(n_rows):
+                i = e * RECV_MAX + s
+                t = pl.cast(pl.read(recv_token_flat, [i]), pl.INDEX)
+                routed_y_buf = pl.assemble(
+                    routed_y_buf,
+                    pl.slice(recv_y_flat, [1, D], [i, 0]),
+                    [t * N_LOCAL_EXPERTS + e, 0],
+                )
+        for t in pl.range(T):
+            base = t * N_LOCAL_EXPERTS
+            for d0 in pl.range(0, D, COL_CHUNK):
+                acc = pl.cast(sh[t : t + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
+                for e in pl.range(N_LOCAL_EXPERTS):
+                    row = pl.cast(routed_y_buf[base + e : base + e + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
+                    acc = pl.add(acc, row)
+                ffn_out[t : t + 1, d0 : d0 + COL_CHUNK] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit.inline
@@ -77,16 +172,18 @@ def moe_dispatch_combine(
         # the valid count. Strictly sequential over the T*TOPK routed pairs in
         # (token, k) order so a torch reference iterating that order ties slots
         # identically.
-        for p in pl.range(T * TOPK):
-            t = p // TOPK
-            e = pl.cast(pl.read(indices_flat, [p]), pl.INDEX)
-            slot_i32 = pl.read(count_flat, [e])
-            dst = e * RECV_MAX + pl.cast(slot_i32, pl.INDEX)
+        for t in pl.range(T):
+            for k in pl.unroll(TOPK):
+                p = t * TOPK + k
+                e_global = pl.read(indices_flat, [p])
+                e = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
+                slot_i32 = pl.read(count_flat, [e])
+                dst = e * RECV_MAX + pl.cast(slot_i32, pl.INDEX)
 
-            recv_x = pl.assemble(recv_x, pl.slice(x_norm, [1, D], [t, 0]), [dst, 0])
-            pl.write(recv_weights, [dst], pl.read(weights_flat, [p]))
-            pl.write(recv_token, [dst], pl.cast(t, pl.INT32))
-            pl.write(count_flat, [e], pl.cast(slot_i32 + 1, pl.INT32))
+                recv_x = pl.assemble(recv_x, pl.slice(x_norm, [1, D], [t, 0]), [dst, 0])
+                pl.write(recv_weights, [dst], pl.read(weights_flat, [p]))
+                pl.write(recv_token, [dst], pl.cast(t, pl.INT32))
+                pl.write(count_flat, [e], pl.cast(slot_i32 + 1, pl.INT32))
 
     # FFN stand-in: recv_y[e, s, :] = recv_x[e, s, :] * recv_weights[e, s]. Tail
     # rows (slot >= count[e]) are never read by combine, so left as is. Loops
