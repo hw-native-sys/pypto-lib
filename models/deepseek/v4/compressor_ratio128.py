@@ -13,36 +13,36 @@ over all slots. No state shift needed."""
 
 import pypto.language as pl
 
-B = 16
-S = 1
-EPS = 1e-6
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
 
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
+EPS = M.rms_norm_eps
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+HEAD_DIM_INV = 1.0 / HEAD_DIM
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.nope_head_dim
+
+# kernel-local (ratio-128 non-overlap compressor)
 COMPRESS_RATIO = 128
-HEAD_DIM = 512
 ROTATE = False
-
-D = 4096
-ROPE_HEAD_DIM = 64
-NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 OVERLAP = False
 COFF = 1
-
-OUT_DIM = COFF * HEAD_DIM   # 512
+OUT_DIM = COFF * HEAD_DIM          # 512
 STATE_LEN = COFF * COMPRESS_RATIO  # 128
-
-START_POS = 127
+START_POS = 127      # ScalarSpec default; (START_POS+1)%COMPRESS_RATIO==0
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
 APE_ROW = START_POS % COMPRESS_RATIO  # 127
-SCATTER_SLOT = APE_ROW  # 127 (no overlap)
+SCATTER_SLOT = APE_ROW                # 127 (no overlap)
 
-HEAD_DIM_INV = 1.0 / HEAD_DIM
-
+# tiling
 K_CHUNK = 512
 OUT_CHUNK = 64
-K_BLOCKS = D // K_CHUNK  # 8
-OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 8
-
 HEAD_CHUNK = 128
+K_BLOCKS = D // K_CHUNK            # 8
+OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 8
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK  # 4
 
 

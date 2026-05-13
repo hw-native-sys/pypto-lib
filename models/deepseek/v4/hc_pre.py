@@ -12,24 +12,31 @@ and produces the post/comb weights used by hc_post."""
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
 
-B                = 16               # demo 4
-S                = 1
-D                = 4096             # flash:4096 pro:7168
-HC_MULT          = 4
-MIX_HC           = (2 + HC_MULT) * HC_MULT
-MIX_PAD          = 32
-HC_PAD           = 8
-HC_DIM           = HC_MULT * D
-HC_SINKHORN_ITER = 20
-HC_EPS           = 1e-6
-NORM_EPS         = 1e-6
-NEG_INF          = -1e20
+
+# model config
+B                = DECODE_BATCH
+S                = DECODE_SEQ
 T                = B * S
+D                = M.hidden_size
+HC_MULT          = M.hc_mult
+MIX_HC           = M.mix_hc
+HC_DIM           = M.hc_dim
+HC_DIM_INV       = 1.0 / HC_DIM
+HC_SINKHORN_ITER = M.hc_sinkhorn_iters
+HC_EPS           = M.hc_eps
+NORM_EPS         = M.rms_norm_eps
+
+# kernel-local
+MIX_PAD          = 32       # MIX_HC padded for vector ops
+HC_PAD           = 8        # HC_MULT padded
+NEG_INF          = -1e20
+
+# tiling
 T_TILE           = 16
 K_CHUNK          = 512
 D_CHUNK          = 512
-HC_DIM_INV       = 1.0 / HC_DIM
 HC_DIM_BLOCKS    = HC_DIM // K_CHUNK
 D_BLOCKS         = D // D_CHUNK
 

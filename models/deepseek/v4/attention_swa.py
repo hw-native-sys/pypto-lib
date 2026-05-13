@@ -17,56 +17,52 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from sparse_attn import sparse_attn
 
 
-B = 16  # demo 4
-S = 1
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
-EPS = 1e-6
-
-D = 4096  # flash:4096 pro:7168
-H = 64  # flash:64 pro:128
-HEAD_DIM = 512
-ROPE_HEAD_DIM = 64
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
-NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-Q_LORA = 1024  # flash:1024 pro:1536
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-WIN = 128
-SOFTMAX_SCALE = HEAD_DIM ** -0.5
-INT8_SCALE_MAX = 127.0
-INT8_AMAX_EPS = 1e-4
-
-HC_MULT = 4
-MIX_HC = (2 + HC_MULT) * HC_MULT
-HC_DIM = HC_MULT * D
-HC_SINKHORN_ITER = 20
-HC_EPS = 1e-6
-
-MAX_SEQ_LEN = 4096  # demo 4096; flash/pro 1048576 (1M tokens, original_seq_len*rope_factor)
-
-O_LORA = 1024
-O_GROUPS = 8  # flash:8 pro:16
+EPS = M.rms_norm_eps
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.nope_head_dim
+Q_LORA = M.q_lora_rank
+WIN = M.sliding_window
+SOFTMAX_SCALE = M.softmax_scale
+HC_MULT = M.hc_mult
+MIX_HC = M.mix_hc
+HC_DIM = M.hc_dim
+HC_SINKHORN_ITER = M.hc_sinkhorn_iters
+HC_EPS = M.hc_eps
+MAX_SEQ_LEN = M.max_position_embeddings
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
-BLOCK_SIZE = 128
-ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
-MAX_BLOCKS = ORI_MAX_BLOCKS                                # SWA: only ori, no cmp portion
+# kernel-local (SWA: ratio-0, no compressor/indexer)
+ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
+MAX_BLOCKS = ORI_MAX_BLOCKS         # SWA: only ori, no cmp portion
 BLOCK_NUM = B * MAX_BLOCKS
-
-TOPK = WIN                                                 # SWA: sparse_attn topk = window only
-SPARSE_IDX_TOPK = 512
+TOPK = WIN                          # SWA: sparse_attn topk = window only
+SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-SPARSE_CMP_MAX_BLOCKS = 64
+SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
 SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
+START_POS = 127      # ScalarSpec default; full-window decode fixture; SWA has no compression constraint
 
-START_POS = 127  # default for ScalarSpec; full-window decode fixture; SWA has no compression constraint
+# tiling
+Q_PROJ_OUT_CHUNK = 128
+Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
+SPARSE_ROPE_CHUNK = 16
+SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 
 
 @pl.jit.inline

@@ -14,39 +14,38 @@ expert indices/weights, and the post/comb tensors required by FFN hc_post."""
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
 from hc_pre import hc_pre
 
 
-B           = 16               # demo 4
-S           = 1
-T           = B * S
-D           = 4096             # flash:4096 pro:7168
-NORM_EPS    = 1e-6
+# model config
+B             = DECODE_BATCH
+S             = DECODE_SEQ
+T             = B * S
+D             = M.hidden_size
+NORM_EPS      = M.rms_norm_eps
+N_EXPERTS     = M.n_routed_experts
+TOPK          = M.num_experts_per_tok
+ROUTE_SCALE   = M.routed_scaling_factor
+VOCAB         = M.vocab_size
+N_HASH_LAYERS = M.num_hash_layers
+HC_MULT       = M.hc_mult
+MIX_HC        = M.mix_hc
+HC_DIM        = M.hc_dim
 
-N_EXPERTS   = 8                # flash:256 pro:384
-TOPK        = 2                # flash:6 pro:6 (n_activated_experts)
-ROUTE_SCALE = 1.0              # flash:1.5 pro:2.5
-VOCAB       = 129280
-
-# Per-layer routing mode is fixed at build time: layers with LAYER_ID < N_HASH_LAYERS
-# do tid2eid lookup (no scores, no bias, no topk); the rest do learned-score + bias + topk.
-# This implementation currently runs the learned-score path. The public entrypoint
-# keeps tid2eid/input_ids so hash-routed layers can share the same call contract.
+# routing mode (per-layer, fixed at build time)
+# Layers with LAYER_ID < N_HASH_LAYERS do tid2eid lookup (no scores, no bias, no topk);
+# the rest do learned-score + bias + topk. This implementation currently runs the
+# learned-score path. The public entrypoint keeps tid2eid/input_ids so hash-routed
+# layers can share the same call contract.
 LAYER_ID      = 1               # this layer's index in the Transformer stack
-N_HASH_LAYERS = 0               # demo 0; flash:3 pro:3 (raise to make the first few layers hash-routed)
 
-# hc_pre (ffn)
-HC_MULT          = 4
-MIX_HC           = (2 + HC_MULT) * HC_MULT
-HC_DIM           = HC_MULT * D
-
-# ffn_norm + gate (decode chunking).
-D_CHUNK          = 512
+# tiling
+D_CHUNK          = 512          # ffn_norm + gate decode chunking
 D_BLOCKS         = D // D_CHUNK
-
-# Routing topk via sort32. SCORE_PAD == sort32 row width; PAIR_PAD covers the
-# (val, idx) interleaved output of the topk slice; FP32_NEG_INF fills the
-# unused tail so padded slots always rank below real expert scores.
+# Routing topk via sort32: SCORE_PAD == sort32 row width; PAIR_PAD covers the
+# (val, idx) interleaved topk-slice output; FP32_NEG_INF fills the unused tail
+# so padded slots always rank below real expert scores.
 SCORE_PAD        = 32
 PAIR_PAD         = 32
 TOPK_GATHER_PAD  = PAIR_PAD // 2

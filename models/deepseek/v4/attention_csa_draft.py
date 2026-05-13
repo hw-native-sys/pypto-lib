@@ -16,60 +16,54 @@ Companion files: attention_swa.py (ratio=0, no compressor/indexer)
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE
 
-B = 16  # demo 4
-S = 1
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
-EPS = 1e-6
+EPS = M.rms_norm_eps
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.nope_head_dim
+Q_LORA = M.q_lora_rank
+WIN = M.sliding_window
+SOFTMAX_SCALE = M.softmax_scale
+HC_MULT = M.hc_mult
+MIX_HC = M.mix_hc
+HC_DIM = M.hc_dim
+HC_SINKHORN_ITER = M.hc_sinkhorn_iters
+HC_EPS = M.hc_eps
+IDX_N_HEADS = M.index_n_heads
+IDX_HEAD_DIM = M.index_head_dim
+IDX_TOPK = M.index_topk
+MAX_SEQ_LEN = M.max_position_embeddings
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
+O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
-D = 4096  # flash:4096 pro:7168
-H = 64  # flash:64 pro:128
-HEAD_DIM = 512
-ROPE_HEAD_DIM = 64
-NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
-Q_LORA = 1024  # flash:1024 pro:1536
-WIN = 128
-SOFTMAX_SCALE = HEAD_DIM ** -0.5
-
-HC_MULT = 4
-MIX_HC = (2 + HC_MULT) * HC_MULT
-HC_DIM = HC_MULT * D
-HC_SINKHORN_ITER = 20
-HC_EPS = 1e-6
-
-IDX_N_HEADS = 64
-IDX_HEAD_DIM = 128
-IDX_TOPK = 512  # flash:512 pro:1024
-IDX_SOFTMAX_SCALE = IDX_HEAD_DIM ** -0.5
-MAX_SEQ_LEN = 4096  # demo 4096; flash/pro 1048576 (1M tokens, original_seq_len*rope_factor)
-
+# kernel-local (CSA: ratio-4 main + inner compressors + indexer)
 COMPRESS_RATIO = 4  # CSA
 ROTATE_MAIN = False
 ROTATE_INNER = True
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
-
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-
-O_LORA = 1024
-O_GROUPS = 8  # flash:8 pro:16
-O_GROUP_IN = H * HEAD_DIM // O_GROUPS
-
-BLOCK_SIZE = 128
-ORI_MAX_BLOCKS = 1                                         # WIN==BLOCK_SIZE → 1 block per batch for ori
-CMP_MAX_BLOCKS = 64  # demo 64; flash/pro 2048 (=MAX_SEQ_LEN/ratio/BLOCK_SIZE = 1048576/4/128)
-MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS               # logical block layout: [0..ORI) ori, [ORI..MAX) cmp
+ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
+CMP_MAX_BLOCKS = 64                 # demo 64; flash/pro 2048 (= MAX_SEQ_LEN/ratio/BLOCK_SIZE = 1048576/4/128)
+MAX_BLOCKS = ORI_MAX_BLOCKS + CMP_MAX_BLOCKS   # block layout: [0..ORI) ori, [ORI..MAX) cmp
 BLOCK_NUM = B * MAX_BLOCKS
-
 TOPK = WIN + IDX_TOPK
-
-START_POS = 3  # default for ScalarSpec; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full compression path
+START_POS = 3        # ScalarSpec default; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
-OFFSET = WIN  # added to indexer topk_idxs (model.py:432, attention.py:509)
+OFFSET = WIN         # added to indexer topk_idxs (model.py:432, attention.py:509)
 
 
 @pl.jit.inline

@@ -26,22 +26,25 @@ kernel-internal scratch.
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
 
-B = 16
-S = 1
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
+D = M.hidden_size
+TOPK = M.num_experts_per_tok
+N_EXPERTS = M.n_routed_experts
 
-D = 4096            # flash:4096 pro:7168
-TOPK = 2            # flash:6 pro:6 (n_activated_experts)
-
+# EP layout / recv buffers
 EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
 EP_RANK = 0
-N_EXPERTS = 8       # flash:256 pro:384
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
-
 RECV_MAX = 32       # per-(local-expert) row upper bound (must match moe_expert)
 
+# tiling
 COL_CHUNK = 512
 
 

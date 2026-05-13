@@ -12,43 +12,43 @@ attention body, with attn_norm fused at the front to save one GM round-trip."""
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
-# Decode batch / seq
-B           = 16               # demo 4
-S           = 1
+
+# model config
+B           = DECODE_BATCH
+S           = DECODE_SEQ
 T           = B * S
-# Hidden / Attention
-D           = 4096             # flash:4096 pro:7168
-H           = 64               # flash:64 pro:128
-HEAD_DIM    = 512
-ROPE_DIM    = 64
+D           = M.hidden_size
+H           = M.num_attention_heads
+HEAD_DIM    = M.head_dim
+ROPE_DIM    = M.qk_rope_head_dim
 ROPE_HALF   = ROPE_DIM // 2
+NOPE_DIM    = M.nope_head_dim
+Q_LORA      = M.q_lora_rank
+EPS         = M.rms_norm_eps
+
+# tiling
 ROPE_CHUNK  = 32
 ROPE_PAIR_CHUNK = ROPE_CHUNK // 2
-NOPE_DIM    = HEAD_DIM - ROPE_DIM
-Q_LORA      = 1024             # flash:1024 pro:1536
 HEAD_CHUNK  = 64
+HEAD_GROUP  = 8
 Q_PROJ_OUT_CHUNK = 128
-Q_LORA_TILE = 32
 Q_PROJ_CHUNK = 128
-EPS         = 1e-6
-# Derived constants for multi-function type annotations
-Q_BLOCKS      = Q_LORA // Q_LORA_TILE
-Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
-HEAD_GROUP    = 8
+Q_LORA_TILE = 32
+Q_LORA_CHUNK = Q_LORA_TILE
+D_CHUNK     = 512
+KV_CHUNK    = 32
+QUANT_CHUNK = 256
 assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
     "HEAD_BLOCKS must be divisible by HEAD_GROUP"
+Q_BLOCKS      = Q_LORA // Q_LORA_TILE
+Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
 HEAD_BLOCKS = (H * HEAD_DIM) // HEAD_CHUNK
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 HEAD_GROUP_BLOCKS = (H * HEAD_DIM) // (HEAD_CHUNK * HEAD_GROUP)
-D_CHUNK = 512
-Q_LORA_CHUNK = Q_LORA_TILE
-KV_CHUNK = 32
 D_BLOCKS = D // D_CHUNK
 KV_BLOCKS = HEAD_DIM // KV_CHUNK
-INT8_SCALE_MAX = 127.0
-INT8_AMAX_EPS = 1e-4
-QUANT_CHUNK = 256
 
 
 @pl.jit.inline

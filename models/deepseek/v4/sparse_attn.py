@@ -41,45 +41,44 @@ The standalone harness exposes `--compress-ratio {0,4,128}` for testing.
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 
-B = 16
+
+# model config
+B = DECODE_BATCH
 T = B
-H = 64
-HEAD_DIM = 512
-ROPE_DIM = 64
-NOPE_DIM = HEAD_DIM - ROPE_DIM
-WIN = 128
-MAX_SEQ_LEN = 4096
-IDX_TOPK = 512
-TOPK = WIN + IDX_TOPK
-SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 128
-
-BLOCK_SIZE = 128
-ORI_MAX_BLOCKS = 1
-ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = 64
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
-
-SOFTMAX_SCALE = HEAD_DIM ** -0.5
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
-MATMUL_ROW_PAD = 16
-ROPE_CHUNK = 16
-ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
-
-D = 4096
-O_LORA = 1024
-O_GROUPS = 8
+NOPE_DIM = M.nope_head_dim
+WIN = M.sliding_window
+MAX_SEQ_LEN = M.max_position_embeddings
+IDX_TOPK = M.index_topk
+TOPK = WIN + IDX_TOPK
+SOFTMAX_SCALE = M.softmax_scale
+O_LORA = M.o_lora_rank
+O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
+# kernel-local
+SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
+DEFAULT_COMPRESS_RATIO = 128
+ORI_MAX_BLOCKS = 1                 # paged-KV pool: ori (sliding-window) blocks per batch
+ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
+CMP_MAX_BLOCKS = 64                # paged-KV pool: compressed blocks per batch
+CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+
+# tiling
+MATMUL_ROW_PAD = 16
+ROPE_CHUNK = 16
+ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 A_K_CHUNK = 128
 A_N_CHUNK = 128
 B_K_CHUNK = 128
 B_N_CHUNK = 256
-
-INT8_SCALE_MAX = 127.0
-INT8_AMAX_EPS = 1e-4
 QUANT_CHUNK = 256
 
 

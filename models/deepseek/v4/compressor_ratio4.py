@@ -15,43 +15,42 @@ Tree reduction for softmax+pool. State shift after compression."""
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
 
-B = 16
-S = 1
-EPS = 1e-6
 
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
+EPS = M.rms_norm_eps
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+HEAD_DIM_INV = 1.0 / HEAD_DIM
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.nope_head_dim
+MAX_SEQ_LEN = M.max_position_embeddings
+
+# kernel-local (ratio-4 overlapping compressor)
 COMPRESS_RATIO = 4
-HEAD_DIM = 512
 ROTATE = True
-MAX_SEQ_LEN = 4096
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-FP32_NEG_INF = -3.4028234663852886e38
-
-D = 4096
-ROPE_HEAD_DIM = 64
-ROPE_CHUCK = 32
-NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
-
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-
-START_POS = 3
+IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
+START_POS = 3        # ScalarSpec default; (START_POS+1)%COMPRESS_RATIO==0
 SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + 1) % COMPRESS_RATIO) == 0
 APE_ROW = START_POS % COMPRESS_RATIO if COMPRESS_RATIO != 0 else 0
 SCATTER_SLOT = (COMPRESS_RATIO + APE_ROW) if OVERLAP else APE_ROW
 
-HEAD_DIM_INV = 1.0 / HEAD_DIM
-
+# tiling
+ROPE_CHUCK = 32
 K_CHUNK = 512
 OUT_CHUNK = 128
+HEAD_CHUNK = 128
+HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
 OUT_BLOCKS = OUT_DIM // OUT_CHUNK
-
-HEAD_CHUNK = 128
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
-HEAD_DIM_CHUCK = 128
 
 
 @pl.jit.inline

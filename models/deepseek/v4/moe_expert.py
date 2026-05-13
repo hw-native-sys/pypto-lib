@@ -11,33 +11,33 @@
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
-B = 16  # demo 4
-S = 1
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
+D = M.hidden_size
+MOE_INTER = M.moe_intermediate_size
+TOPK = M.num_experts_per_tok
+SWIGLU_LIMIT = M.swiglu_limit
+N_EXPERTS = M.n_routed_experts
 
-D = 4096            # flash:4096 pro:7168
-MOE_INTER = 4096    # flash:2048 pro:3072
-TOPK = 2            # flash:6 pro:6 (n_activated_experts)
-SWIGLU_LIMIT = 0.0  # flash:10.0 pro:10.0 (pro drops it on shared experts)
-
+# EP layout / recv buffers
 EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
 EP_RANK = 0
-N_EXPERTS = 8       # flash:256 pro:384
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
+RECV_MAX = 32       # per-(local-expert) row upper bound
 
-RECV_MAX = 32       # Per-(local-expert) row upper bound
+# tiling
 RECV_TILE = 16
-
 K_CHUNK = 512
 INTER_K = 512
 INTER_CHUNK = 256
 D_OUT_CHUNK = 512
-
-INT8_SCALE_MAX = 127.0
-INT8_AMAX_EPS = 1e-4    # amax floor: keeps all-zero rows from producing 127/0 = inf
-QUANT_CHUNK = 256       # column chunk size for two-pass per-row INT8 quant (vec budget aware)
+QUANT_CHUNK = 256   # column chunk for two-pass per-row INT8 quant (vec budget aware)
 
 
 @pl.jit.inline

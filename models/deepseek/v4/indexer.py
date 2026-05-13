@@ -13,34 +13,33 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 
 import pypto.language as pl
 
-B = 16  # demo 4
-S = 1
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF
+
+# model config
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
+D = M.hidden_size
+Q_LORA = M.q_lora_rank
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+IDX_N_HEADS = M.index_n_heads
+IDX_HEAD_DIM = M.index_head_dim
+IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
+WEIGHTS_SCALE = M.index_weights_scale  # softmax_scale folded with n_heads**-0.5 (model.py Indexer:418)
+MAX_SEQ_LEN = M.max_position_embeddings
+OFFSET = M.sliding_window  # ScalarSpec default; = win in attention orch; added to topk_idxs (model.py:432)
 
-D = 4096  # flash:4096 pro:7168
-Q_LORA = 1024  # flash:1024 pro:1536
-ROPE_HEAD_DIM = 64
-
-IDX_N_HEADS = 64
-IDX_HEAD_DIM = 128
-IDX_NOPE_HEAD_DIM = IDX_HEAD_DIM - ROPE_HEAD_DIM
-IDX_TOPK = 16  # v4-pro 1024
-IDX_SOFTMAX_SCALE = IDX_HEAD_DIM ** -0.5
-WEIGHTS_SCALE = IDX_SOFTMAX_SCALE * IDX_N_HEADS ** -0.5
-
-COMPRESS_RATIO = 4
-
-MAX_SEQ_LEN = 4096
+# kernel-local
+COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
+IDX_TOPK = 16        # standalone-test scale; model value is M.index_topk (512 flash / 1024 pro)
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SCORE_LEN = IDX_KV_LEN
-SORT_LEN = 2048
+SORT_LEN = 2048      # standalone-test sort buffer width
+START_POS = 256      # ScalarSpec default; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0
+
+# tiling
 CACHE_TILE = 32
 MAX_CACHE_BLOCKS = SCORE_LEN // CACHE_TILE
-FP32_NEG_INF = -3.4028234663852886e38
-
-START_POS = 256  # default for ScalarSpec; >0 (decode) and (START_POS+1)%COMPRESS_RATIO==0 to cover the full inner-compressor path
-OFFSET = 128  # default for ScalarSpec; = win in attention orch; added to topk_idxs (model.py:432)
-
 Q_CHUCK = 128
 Q_OUT_CHUCK = 128
 ROPE_CHUCK = 16

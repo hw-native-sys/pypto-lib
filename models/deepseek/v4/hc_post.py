@@ -12,15 +12,20 @@ into the next hc-stack via post and comb weights."""
 
 import pypto.language as pl
 
+from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
 
-B       = 16                 # demo 4
-S       = 1
-D       = 4096               # flash:4096 pro:7168
-HC_MULT = 4
+
+# model config
+B       = DECODE_BATCH
+S       = DECODE_SEQ
 T       = B * S
+D       = M.hidden_size
+HC_MULT = M.hc_mult
+HC_DIM  = M.hc_dim
+
+# tiling
 D_CHUNK = 512
 D_BLOCKS = D // D_CHUNK
-HC_DIM  = HC_MULT * D
 
 
 @pl.jit.inline
