@@ -277,11 +277,9 @@ class PyptoQwen14BExecutor(ModelExecutor):
         return PrefillResult(last_hidden=last_hidden, logits=logits)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        # The fused decode kernel (qwen3_14b_decode_full.py) processes all
-        # layers in one call: weights are pre-stacked into [num_layers * ...]
-        # tensors at compile time and the KV cache is the full multi-layer
-        # buffer. Argument order mirrors the kernel signature in
-        # build_qwen3_decode_program.qwen3_decode.
+        # The fused decode kernel processes all layers in one call: weights are
+        # pre-stacked into [num_layers * ...] tensors at compile time and the
+        # KV cache is the full multi-layer buffer.
         compiled = self._compiled[model.config.model_id]
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden

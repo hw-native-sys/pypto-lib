@@ -1,0 +1,23 @@
+{
+    "model": {
+      "model_id": "qwen3-14b",
+      "model_dir": "/data/linyifan/models/Qwen3-14B"
+    },
+    "runtime": {
+      "backend": "npu",
+      "page_size": 256,
+      "max_batch_size": 16,
+      "max_seq_len": 512,
+      "device": "cpu",
+      "kv_dtype": "bfloat16",
+      "weight_dtype": "float32"
+    },
+    "generation": {
+      "max_new_tokens": 32,
+      "temperature": 0.0
+    },
+    "npu": {
+      "platform": "a2a3",
+      "device_id": 6
+    }
+  }

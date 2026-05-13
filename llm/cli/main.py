@@ -68,8 +68,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Path to the user-written JSON config file.")
     parser.add_argument("--prompt", help="Prompt text for one-shot generation.")
     parser.add_argument("--interactive", action="store_true", help="Read prompts interactively after loading the model.")
+    parser.add_argument("--serve", action="store_true", help="Start HTTP serving mode with OpenAI-compatible API.")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
+    parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
     parser.add_argument("--stream", action="store_true", help="Override generation.stream=true for this run.")
     parser.add_argument("--l3", action="store_true", help="Override npu.l3=true for this run.")
+    parser.add_argument(
+        "--max-num-running-reqs",
+        type=int,
+        default=32,
+        help="Max concurrent requests in serving mode (default: 32).",
+    )
+    parser.add_argument(
+        "--max-num-scheduled-tokens",
+        type=int,
+        default=4096,
+        help="Max tokens scheduled per iteration in serving mode (default: 4096).",
+    )
+    parser.add_argument(
+        "--long-prefill-token-threshold",
+        type=int,
+        default=2048,
+        help="Chunked prefill threshold in serving mode (default: 2048).",
+    )
     parser.add_argument(
         "--show-startup-logs",
         action="store_true",
@@ -249,10 +270,95 @@ def run_interactive(
         generate_once(engine, config, prompt, stdout=stdout, show_role=True)
 
 
+def run_serve(
+    engine: LLMEngine,
+    config: ServingConfig,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    max_num_running_reqs: int = 32,
+    max_num_scheduled_tokens: int = 4096,
+    long_prefill_token_threshold: int = 2048,
+) -> None:
+    import asyncio
+
+    try:
+        import uvicorn
+    except ImportError as e:
+        raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
+
+    from ..core.async_engine import AsyncLLMEngine, ServingConfig as AsyncServingConfig
+    from ..core.server import create_serving_app
+    from ..core.tokenizer import TransformersTokenizerAdapter
+    from ..core.worker import WorkerConfig
+
+    model_id = config.model.model_id
+    model_dir = str(Path(config.model.model_dir).resolve())
+
+    # Load only the tokenizer in main process (lightweight)
+    tokenizer = TransformersTokenizerAdapter.from_pretrained(model_dir)
+
+    # Worker config — worker process loads model independently
+    executor_kwargs = {}
+    if config.npu.pypto_root:
+        executor_kwargs["pypto_root"] = config.npu.pypto_root
+    if config.npu.save_kernels_dir:
+        executor_kwargs["save_kernels_dir"] = config.npu.save_kernels_dir
+    if config.npu.l3_mode:
+        executor_kwargs["l3_mode"] = config.npu.l3_mode
+
+    worker_config = WorkerConfig(
+        model_id=model_id,
+        model_dir=model_dir,
+        platform=config.npu.platform,
+        device_id=config.npu.device_id,
+        runtime_config=config.runtime,
+        executor_cls="PyptoQwen14BExecutor" if config.backend == "npu" else "ModelExecutor",
+        executor_kwargs=executor_kwargs,
+    )
+
+    serving_config = AsyncServingConfig(
+        max_num_running_reqs=max_num_running_reqs,
+        max_num_scheduled_tokens=max_num_scheduled_tokens,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        max_seq_len=config.runtime.max_seq_len,
+        block_size=config.runtime.page_size,
+    )
+
+    async_engine = AsyncLLMEngine(
+        worker_config=worker_config,
+        serving_config=serving_config,
+        tokenizer=tokenizer,
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id,
+    )
+
+    app = create_serving_app(async_engine, model_id)
+
+    @app.on_event("startup")
+    async def startup():
+        await async_engine.start()
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        await async_engine.stop()
+
+    print(f"Starting PyPTO serving on {host}:{port}")
+    print(f"  Model: {model_id} (loaded in worker process)")
+    print(f"  Platform: {config.npu.platform}, Device: {config.npu.device_id}")
+    print(f"  Max running requests: {max_num_running_reqs}")
+    print(f"  Max scheduled tokens/iter: {max_num_scheduled_tokens}")
+    print(f"  Chunked prefill threshold: {long_prefill_token_threshold}")
+    print(f"  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if bool(args.prompt) == bool(args.interactive):
-        raise SystemExit("Specify exactly one of --prompt or --interactive.")
+    modes = sum([bool(args.prompt), bool(args.interactive), bool(args.serve)])
+    if modes != 1:
+        raise SystemExit("Specify exactly one of --prompt, --interactive, or --serve.")
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = load_serving_config(
@@ -260,10 +366,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             stream_override=args.stream,
             l3_override=args.l3,
         )
-        engine = create_engine(config)
-        init_engine(engine, config)
+        if not args.serve:
+            # Only load model in main process for non-serve modes.
+            # In serve mode, the worker process loads the model independently.
+            engine = create_engine(config)
+            init_engine(engine, config)
+        else:
+            engine = None
 
-    if args.interactive:
+    if args.serve:
+        run_serve(
+            engine,
+            config,
+            host=args.host,
+            port=args.port,
+            max_num_running_reqs=args.max_num_running_reqs,
+            max_num_scheduled_tokens=args.max_num_scheduled_tokens,
+            long_prefill_token_threshold=args.long_prefill_token_threshold,
+        )
+    elif args.interactive:
         run_interactive(engine, config)
     else:
         generate_once(engine, config, args.prompt)

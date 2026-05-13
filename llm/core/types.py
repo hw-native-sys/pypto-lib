@@ -188,3 +188,18 @@ class GenerateResult:
     text: str
     token_ids: list[int]
     finish_reason: str
+
+
+@dataclass
+class WorkerCommand:
+    """Command sent from main process to worker process."""
+    type: str  # "step" | "shutdown"
+    scheduler_output: object | None = None  # SchedulerOutput (avoid circular import)
+    finished_request_ids: list | None = None  # request IDs to free KV allocations
+
+
+@dataclass
+class StepOutput:
+    """Result returned from worker process after executing a batch step."""
+    new_tokens: dict  # {request_id: int} — sampled token per request
+    error: str | None = None
