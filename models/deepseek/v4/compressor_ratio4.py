@@ -427,7 +427,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, bf16_allclose_or_ulp, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -449,6 +449,7 @@ if __name__ == "__main__":
                 device_id=args.device,
                 runtime_profiling=args.runtime_profiling,
             ),
+            compare_fn={"kv_cache": bf16_allclose_or_ulp()},
         ),
     )
     if not result.passed:

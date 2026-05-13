@@ -12,7 +12,7 @@
 import pytest
 
 import torch
-from golden.validation import topk_pair_compare, validate_golden
+from golden.validation import bf16_allclose_or_ulp, topk_pair_compare, validate_golden
 
 
 class TestValidateGolden:
@@ -189,6 +189,69 @@ class TestCompareFnDispatch:
         )
         # Sanity: defaults pass when tensors match.
         validate_golden({"a": ok}, {"a": ok.clone()})
+
+
+class TestBf16AllcloseOrUlp:
+    """Tests for the BF16 ULP comparator helper."""
+
+    def test_default_one_ulp_passes(self):
+        """Adjacent BF16 values pass even when normal tolerance fails."""
+        actual = torch.tensor([1.0078125], dtype=torch.bfloat16)
+        expected = torch.tensor([1.0], dtype=torch.bfloat16)
+        validate_golden(
+            {"out": actual},
+            {"out": expected},
+            rtol=0.0,
+            atol=0.0,
+            compare_fn={"out": bf16_allclose_or_ulp()},
+        )
+
+    def test_max_ulp_parameter_controls_allowance(self):
+        """A two-ULP difference fails with max_ulp=1 and passes with max_ulp=2."""
+        actual = torch.tensor([1.015625], dtype=torch.bfloat16)
+        expected = torch.tensor([1.0], dtype=torch.bfloat16)
+        with pytest.raises(AssertionError, match="after 1-ULP allowance"):
+            validate_golden(
+                {"out": actual},
+                {"out": expected},
+                rtol=0.0,
+                atol=0.0,
+                compare_fn={"out": bf16_allclose_or_ulp(max_ulp=1)},
+            )
+        validate_golden(
+            {"out": actual},
+            {"out": expected},
+            rtol=0.0,
+            atol=0.0,
+            compare_fn={"out": bf16_allclose_or_ulp(max_ulp=2)},
+        )
+
+    def test_non_bf16_tensors_fail_with_clear_message(self):
+        """The helper is only for BF16 tensors."""
+        actual = torch.tensor([1.0], dtype=torch.float32)
+        expected = torch.tensor([1.0], dtype=torch.float32)
+        with pytest.raises(AssertionError, match="requires BF16 tensors"):
+            validate_golden(
+                {"out": actual},
+                {"out": expected},
+                compare_fn={"out": bf16_allclose_or_ulp()},
+            )
+
+    def test_nan_values_do_not_pass_via_ulp_fallback(self):
+        """NaN bit patterns should not bypass torch.isclose semantics."""
+        actual = torch.tensor([float("nan")], dtype=torch.bfloat16)
+        expected = torch.tensor([float("nan")], dtype=torch.bfloat16)
+        with pytest.raises(AssertionError, match="after 1-ULP allowance"):
+            validate_golden(
+                {"out": actual},
+                {"out": expected},
+                compare_fn={"out": bf16_allclose_or_ulp()},
+            )
+
+    def test_negative_max_ulp_rejected(self):
+        """Negative ULP allowance is invalid."""
+        with pytest.raises(ValueError, match="max_ulp must be non-negative"):
+            bf16_allclose_or_ulp(max_ulp=-1)
 
 
 class TestTopkPairCompare:
