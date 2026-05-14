@@ -230,3 +230,112 @@ def topk_pair_compare(vals_name: str) -> Callable:
         )
     cmp.__name__ = "topk_pair_compare"
     return cmp
+
+
+def ratio_allclose(
+    atol: float | None = None,
+    rtol: float | None = None,
+    max_error_ratio: float = 0.005,
+    max_show: int = 10,
+) -> Callable:
+    """Return an allclose-style comparator that tolerates a bounded outlier ratio.
+
+    Mirrors ``torch.allclose``'s per-point tolerance rule but, instead of
+    requiring every point to pass, allows up to ``max_error_ratio`` of points
+    to exceed tolerance:
+
+        tolerance = atol + rtol * |expected|
+        pass iff (count of points where |actual - expected| > tolerance) / numel
+                 <= max_error_ratio
+
+    Useful for quantized kernels where a small fraction of points may diverge
+    from the FP reference due to INT8 round-off, while the bulk of the output
+    stays within a tight per-point tolerance.
+
+    NaN / Inf in ``actual`` always fail (hard check, independent of the ratio).
+
+    Args:
+        atol: Absolute tolerance. If ``None``, falls back to ``validate_golden``'s atol.
+        rtol: Relative tolerance. If ``None``, falls back to ``validate_golden``'s rtol.
+        max_error_ratio: Fraction of points permitted to exceed tolerance
+            (default 0.5%). Set to 0.0 for strict allclose semantics.
+        max_show: Maximum number of mismatched points printed on failure.
+
+    Example — attention output with INT8 activation quant::
+
+        compare_fn = {
+            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        }
+    """
+    if max_error_ratio < 0.0 or max_error_ratio > 1.0:
+        raise ValueError(f"max_error_ratio must be in [0, 1], got {max_error_ratio}")
+
+    def cmp(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        eff_atol = atol if (cmp.atol_override is None) else cmp.atol_override
+        eff_rtol = rtol if (cmp.rtol_override is None) else cmp.rtol_override
+
+        actual_f = actual.cpu().to(torch.float32)
+        expected_f = expected.cpu().to(torch.float32)
+
+        nan_count = int(torch.isnan(actual_f).sum().item())
+        inf_count = int(torch.isinf(actual_f).sum().item())
+        if nan_count or inf_count:
+            return False, (
+                f"    illegal values in actual: NaN={nan_count} Inf={inf_count}"
+            )
+
+        diff_abs = (actual_f - expected_f).abs()
+        tolerance = eff_atol + eff_rtol * expected_f.abs()
+        bad_mask = diff_abs > tolerance
+        error_count = int(bad_mask.sum().item())
+        numel = actual_f.numel()
+        threshold = round(max_error_ratio * numel)
+
+        max_diff, flat_max_pos = torch.max(diff_abs.flatten(), dim=0)
+        max_pos = torch.unravel_index(flat_max_pos, actual_f.shape)
+        max_pos = tuple(int(i.item()) for i in max_pos)
+        max_tol = float(tolerance[max_pos].item())
+
+        if error_count <= threshold:
+            return True, ""
+
+        bad_indices = torch.where(bad_mask.flatten())[0]
+        flat_actual = actual_f.flatten()
+        flat_expected = expected_f.flatten()
+        flat_tol = tolerance.flatten()
+        flat_diff = diff_abs.flatten()
+        n_show = min(max_show, bad_indices.numel())
+        idx = bad_indices[:n_show]
+        lines = [
+            (
+                f"    [{i.item()}] actual={flat_actual[i].item():.8g}, "
+                f"expected={flat_expected[i].item():.8g}, "
+                f"diff={flat_diff[i].item():.4g}, tol={flat_tol[i].item():.4g}"
+            )
+            for i in idx
+        ]
+        return False, (
+            f"    ratio_allclose fail: error_count={error_count}/{numel} "
+            f"(ratio={error_count / numel:.4%}, allowed<={max_error_ratio:.4%}, "
+            f"threshold={threshold} pts)\n"
+            f"    atol={eff_atol} rtol={eff_rtol}\n"
+            f"    max abs diff={max_diff.item():.6g} at {max_pos} (tol={max_tol:.6g})\n"
+            f"    first {n_show} mismatches:\n" + "\n".join(lines)
+        )
+
+    cmp.atol_override = atol
+    cmp.rtol_override = rtol
+    cmp.__name__ = (
+        f"ratio_allclose(atol={atol}, rtol={rtol}, "
+        f"max_error_ratio={max_error_ratio})"
+    )
+    return cmp

@@ -510,7 +510,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -527,8 +527,15 @@ if __name__ == "__main__":
             # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; the
             # random KV-cache fixture exercises a less diluted attention output
             # than the previous all-zero cache.
+            # x_out uses ratio_allclose with the standard W8A8 attention
+            # tolerance (atol=1e-4, rtol=1/128, 0.5% outlier allowance);
+            # the RunConfig defaults below only apply to any other outputs
+            # that lack a custom comparator.
             rtol=1e-2,
             atol=1e-2,
+            compare_fn={
+                "x_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
