@@ -232,6 +232,63 @@ def topk_pair_compare(vals_name: str) -> Callable:
     return cmp
 
 
+def topk_set_compare() -> Callable:
+    """Return a comparator that checks the per-row top-k index *set* matches.
+
+    Stricter than :func:`topk_pair_compare`: it asserts that, for each row,
+    the multiset of expert indices picked by the kernel equals the multiset
+    picked by the golden, regardless of within-row order.
+
+    Use this for downstream-sensitive routing where the *identity* of the
+    picked experts — not just their score values — affects subsequent stages
+    (e.g. MoE dispatch, where different expert ids invoke different INT8
+    weight matrices and produce structurally different outputs).
+
+        compare_fn = {"indices": topk_set_compare()}
+    """
+    def cmp(
+        actual: torch.Tensor,
+        expected: torch.Tensor,
+        *,
+        actual_outputs: dict[str, torch.Tensor],
+        expected_outputs: dict[str, torch.Tensor],
+        inputs: dict[str, torch.Tensor],
+        rtol: float,
+        atol: float,
+    ) -> tuple[bool, str]:
+        if actual.shape != expected.shape:
+            return False, (
+                f"    shape mismatch: {tuple(actual.shape)} vs {tuple(expected.shape)}"
+            )
+        a = actual.cpu().to(torch.int64)
+        e = expected.cpu().to(torch.int64)
+        a_sorted = torch.sort(a, dim=-1).values
+        e_sorted = torch.sort(e, dim=-1).values
+        eq_row = (a_sorted == e_sorted).all(dim=-1)
+        if bool(eq_row.all()):
+            return True, ""
+
+        bad_rows = torch.where(~eq_row)[0]
+        n_bad = int(bad_rows.numel())
+        n_total = int(eq_row.numel())
+        a_flat = a.reshape(n_total, -1)
+        e_flat = e.reshape(n_total, -1)
+        n_show = min(10, n_bad)
+        lines = [
+            f"    row {int(idx)}: actual={a_flat[int(idx)].tolist()}, "
+            f"expected={e_flat[int(idx)].tolist()}"
+            for idx in bad_rows[:n_show]
+        ]
+        return False, (
+            f"    topk_set_compare fail: {n_bad}/{n_total} rows have a "
+            f"different top-k index set\n"
+            f"    first {n_show} mismatched rows:\n" + "\n".join(lines)
+        )
+
+    cmp.__name__ = "topk_set_compare"
+    return cmp
+
+
 def ratio_allclose(
     atol: float | None = None,
     rtol: float | None = None,

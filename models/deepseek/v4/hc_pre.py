@@ -77,7 +77,7 @@ def hc_pre(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T]),
             )
-        inv_rms_val = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)))
+        inv_rms_val = pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True)
         inv_rms = pl.assemble(inv_rms, inv_rms_val, [0, 0])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear"):

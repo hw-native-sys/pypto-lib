@@ -57,7 +57,7 @@ def moe_router(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T]),
             )
-        inv_rms_val = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
+        inv_rms_val = pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True)
         inv_rms[:, :] = inv_rms_val
 
     # Stage 1: ffn_norm apply. Doubles as the gate-dot input and as the
@@ -246,7 +246,7 @@ def build_tensor_specs():
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, run_jit, topk_pair_compare
+    from golden import RunConfig, run_jit, topk_set_compare
 
     def bf16_allclose(rtol, atol):
         """Loosened comparator for BF16 outputs whose kernel reduction order
@@ -266,13 +266,10 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_moe_router_core,
         config=RunConfig(
-            # `x_norm` is BF16 (1-ULP drift from reduction order); `indices`
-            # uses topk_pair_compare to tolerate sort32-vs-torch.topk tie-break.
-            rtol=1e-3,
-            atol=1e-3,
+            rtol=1e-5,
+            atol=1e-5,
             compare_fn={
-                "x_norm":  bf16_allclose(1e-2, 1e-2),
-                "indices": topk_pair_compare("weights"),
+                "indices": topk_set_compare(),
             },
             compile=dict(dump_passes=True),
             runtime=dict(

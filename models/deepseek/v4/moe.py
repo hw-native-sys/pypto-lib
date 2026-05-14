@@ -329,34 +329,7 @@ def build_tensor_specs():
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, run_jit
-
-    def allclose_with_tolerance(rel_tol, abs_tol):
-        def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-            actual_f = actual.float()
-            expected_f = expected.float()
-            close = torch.isclose(actual_f, expected_f, rtol=rel_tol, atol=abs_tol)
-            if bool(close.all().item()):
-                return True, ""
-
-            mismatch_indices = torch.where(~close.flatten())[0]
-            flat_actual = actual.flatten()
-            flat_expected = expected.flatten()
-            n_show = min(20, mismatch_indices.numel())
-            idx = mismatch_indices[:n_show]
-            lines = [
-                f"    [{i.item()}] actual={flat_actual[i].item()}, expected={flat_expected[i].item()}"
-                for i in idx
-            ]
-            detail = (
-                f"    Mismatched elements: {mismatch_indices.numel()}/{actual.numel()}  "
-                f"rtol={rel_tol} atol={abs_tol}\n"
-                f"    first {n_show} mismatches:\n" + "\n".join(lines)
-            )
-            return False, detail
-
-        cmp.__name__ = f"allclose_with_tolerance(rtol={rel_tol},atol={abs_tol})"
-        return cmp
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
@@ -381,8 +354,8 @@ if __name__ == "__main__":
                 runtime_profiling=args.runtime_profiling,
             ),
             compare_fn={
-                "ffn_out": allclose_with_tolerance(1e-2, 5e-2),
-                "x_next": allclose_with_tolerance(1e-2, 5e-2),
+                "ffn_out": ratio_allclose(atol=1e-2, rtol=2.0 / 128),
+                "x_next":  ratio_allclose(atol=1e-2, rtol=2.0 / 128),
             },
         ),
     )
