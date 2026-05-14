@@ -482,7 +482,6 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -496,7 +495,6 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
         ),
     )

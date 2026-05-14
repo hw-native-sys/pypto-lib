@@ -6,13 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE FFN router (decode): hc_pre + RMSNorm + gate + topk + normalize."""
+"""DeepSeek-V4 MoE FFN router (decode): RMSNorm + gate + topk + normalize."""
 
 
 import pypto.language as pl
 
 from config import DEMO as M, DECODE_BATCH, DECODE_SEQ
-from hc_pre import hc_pre
 
 
 # model config
@@ -24,16 +23,6 @@ NORM_EPS      = M.rms_norm_eps
 N_EXPERTS     = M.n_routed_experts
 TOPK          = M.num_experts_per_tok
 ROUTE_SCALE   = M.routed_scaling_factor
-VOCAB         = M.vocab_size
-N_HASH_LAYERS = M.num_hash_layers
-HC_MULT       = M.hc_mult
-MIX_HC        = M.mix_hc
-HC_DIM        = M.hc_dim
-
-# Layers with LAYER_ID < N_HASH_LAYERS do tid2eid lookup; the rest do
-# learned-score + bias + topk (the path implemented here). tid2eid/input_ids
-# stay on the public signature so hash-routed layers share the call contract.
-LAYER_ID      = 1
 
 # tiling
 D_CHUNK          = 512
@@ -56,7 +45,7 @@ def moe_router(
     indices:      pl.Tensor[[T, TOPK],                     pl.INT32],
     weights:      pl.Tensor[[T, TOPK],                     pl.FP32],
 ):
-    # Stage 0: ffn_norm RMS reduction (mirrors hc_pre rms).
+    # Stage 0: FFN RMSNorm over x_mixed.
     x_mixed_flat = pl.reshape(x_mixed, [T, D])
     inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="ffn_norm_rms"):
@@ -185,58 +174,29 @@ def moe_router(
 
 @pl.jit
 def moe_router_test(
-    x_hc:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
-    hc_ffn_fn:    pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
-    hc_ffn_scale: pl.Tensor[[3],                           pl.FP32],
-    hc_ffn_base:  pl.Tensor[[MIX_HC],                      pl.FP32],
+    x_mixed:      pl.Tensor[[B, S, D],                     pl.BF16],
     norm_w:       pl.Tensor[[D],                           pl.FP32],
     gate_w:       pl.Tensor[[N_EXPERTS, D],                pl.FP32],
     gate_bias:    pl.Tensor[[N_EXPERTS],                   pl.FP32],
-    tid2eid:      pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:    pl.Tensor[[B, S],                        pl.INT64],
     x_norm:       pl.Out[pl.Tensor[[T, D],                 pl.BF16]],
     indices:      pl.Out[pl.Tensor[[T, TOPK],              pl.INT32]],
     weights:      pl.Out[pl.Tensor[[T, TOPK],              pl.FP32]],
-    post_ffn:     pl.Out[pl.Tensor[[B, S, HC_MULT],        pl.FP32]],
-    comb_ffn:     pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
 ):
-    # hc_pre writes post_ffn / comb_ffn / x_mixed in-place via pl.write.
-    x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    hc_pre(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
-    )
-    # tid2eid/input_ids stay on the public signature for hash-routed layers.
     moe_router(
         x_mixed,
         norm_w, gate_w, gate_bias,
         x_norm, indices, weights,
     )
-    return x_norm, indices, weights, post_ffn, comb_ffn
+    return x_norm, indices, weights
 
 
-def golden_moe_router(tensors):
+def golden_moe_router_core(tensors):
     import torch
     import torch.nn.functional as F
 
-    from hc_pre import golden_hc_pre
-
-    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post_t = torch.zeros(B, S, HC_MULT)
-    comb_t = torch.zeros(B, S, HC_MULT, HC_MULT)
-    golden_hc_pre({
-        "x": tensors["x_hc"],
-        "hc_fn": tensors["hc_ffn_fn"],
-        "hc_scale": tensors["hc_ffn_scale"],
-        "hc_base": tensors["hc_ffn_base"],
-        "x_mixed": x_mixed,
-        "post": post_t,
-        "comb": comb_t,
-    })
-
     # RMSNorm; cast back to bf16 to match what downstream gate/expert see.
     norm_w = tensors["norm_w"].float()
-    x_f = x_mixed.float()
+    x_f = tensors["x_mixed"].float()
     var = x_f.square().mean(-1, keepdim=True)
     x_n = x_f * torch.rsqrt(var + NORM_EPS)
     x_normalized = (norm_w * x_n).to(torch.bfloat16)
@@ -247,13 +207,8 @@ def golden_moe_router(tensors):
     scores = F.softplus(x_flat.float() @ gate_w.T).sqrt()
     original_scores = scores
 
-    if LAYER_ID >= N_HASH_LAYERS:
-        biased = scores + gate_bias
-        indices = biased.topk(TOPK, dim=-1).indices
-    else:
-        tid2eid = tensors["tid2eid"]
-        input_ids = tensors["input_ids"]
-        indices = tid2eid[input_ids.flatten().long()]
+    biased = scores + gate_bias
+    indices = biased.topk(TOPK, dim=-1).indices
 
     weights = original_scores.gather(1, indices.long())
     weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -262,22 +217,14 @@ def golden_moe_router(tensors):
     tensors["x_norm"][:]   = x_flat
     tensors["indices"][:]  = indices.to(torch.int32)
     tensors["weights"][:]  = weights.to(torch.float32)
-    tensors["post_ffn"][:] = post_t
-    tensors["comb_ffn"][:] = comb_t
 
 
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    def init_x_hc():
-        return torch.randn(B, S, HC_MULT, D) * 0.1
-    def init_hc_ffn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
-    def init_hc_ffn_scale():
-        return torch.ones(3) * 0.5
-    def init_hc_ffn_base():
-        return torch.zeros(MIX_HC)
+    def init_x_mixed():
+        return torch.randn(B, S, D) * 0.1
     def init_norm_w():
         return torch.ones(D)
     def init_gate_w():
@@ -285,25 +232,14 @@ def build_tensor_specs():
     def init_gate_bias():
         # Pinned to zero — see bias note at `route_extract_top2`.
         return torch.zeros(N_EXPERTS)
-    def init_tid2eid():
-        return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
-    def init_input_ids():
-        return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
     return [
-        TensorSpec("x_hc",         [B, S, HC_MULT, D],         torch.bfloat16, init_value=init_x_hc),
-        TensorSpec("hc_ffn_fn",    [MIX_HC, HC_DIM],           torch.float32,  init_value=init_hc_ffn_fn),
-        TensorSpec("hc_ffn_scale", [3],                        torch.float32,  init_value=init_hc_ffn_scale),
-        TensorSpec("hc_ffn_base",  [MIX_HC],                   torch.float32,  init_value=init_hc_ffn_base),
+        TensorSpec("x_mixed",      [B, S, D],                  torch.bfloat16, init_value=init_x_mixed),
         TensorSpec("norm_w",       [D],                        torch.float32,  init_value=init_norm_w),
         TensorSpec("gate_w",       [N_EXPERTS, D],             torch.float32,  init_value=init_gate_w),
         TensorSpec("gate_bias",    [N_EXPERTS],                torch.float32,  init_value=init_gate_bias),
-        TensorSpec("tid2eid",      [VOCAB, TOPK],              torch.int32,    init_value=init_tid2eid),
-        TensorSpec("input_ids",    [B, S],                     torch.int64,    init_value=init_input_ids),
         TensorSpec("x_norm",       [T, D],                     torch.bfloat16, is_output=True),
         TensorSpec("indices",      [T, TOPK],                  torch.int32,    is_output=True),
         TensorSpec("weights",      [T, TOPK],                  torch.float32,  is_output=True),
-        TensorSpec("post_ffn",     [B, S, HC_MULT],            torch.float32,  is_output=True),
-        TensorSpec("comb_ffn",     [B, S, HC_MULT, HC_MULT],   torch.float32,  is_output=True),
     ]
 
 
@@ -323,13 +259,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=moe_router_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_router,
+        golden_fn=golden_moe_router_core,
         config=RunConfig(
             # `x_norm` is BF16 (1-ULP drift from reduction order); `indices`
             # uses topk_pair_compare to tolerate sort32-vs-torch.topk tie-break.
@@ -343,7 +278,6 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
         ),
     )

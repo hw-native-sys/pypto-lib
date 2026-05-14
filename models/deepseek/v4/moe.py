@@ -6,11 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE router + expert + hc_post end-to-end (decode, EP single-card).
+"""DeepSeek-V4 MoE end-to-end path (decode, EP single-card).
 
-Connects ``hc_pre`` + compact router + packed dispatch + full
-``moe_expert`` + token scatter combine + ``hc_post`` inside one ``@pl.jit``
-orchestration.
+Connects ``hc_pre`` + router + dispatch + expert + combine + ``hc_post`` inside
+one ``@pl.jit`` orchestration.
 The local EP=1 dispatch contract is:
 
     for p = t * TOPK + k:
@@ -41,8 +40,9 @@ from config import (
 from hc_pre import hc_pre
 from hc_post import hc_post
 from moe_router import moe_router
+from moe_dispatch import moe_dispatch
 from moe_expert import moe_expert
-from moe_dispatch_combine import moe_packed_dispatch, moe_packed_combine
+from moe_combine import moe_combine
 
 
 # --- Shared shape constants. Must agree with the imported inlines. ---
@@ -59,14 +59,11 @@ HC_DIM = M.hc_dim
 # Router
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
-VOCAB = M.vocab_size
 
 # Expert (must match moe_expert.py)
 MOE_INTER = M.moe_intermediate_size
 EP_WORLD_SIZE = 1
-EP_RANK = 0
 N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
-EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 RECV_MAX = 32
 
 # Sanity: chosen layout requires RECV_MAX >= T * TOPK.
@@ -74,7 +71,7 @@ assert RECV_MAX >= T * TOPK, "packed layout needs RECV_MAX >= T * TOPK"
 
 
 @pl.jit
-def moe_router_expert(
+def moe(
     # ---- router (hc_pre + ffn_norm + gate) inputs ----
     x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
     hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
@@ -127,7 +124,7 @@ def moe_router_expert(
     recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_token = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
     recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
-    moe_packed_dispatch(
+    moe_dispatch(
         x_norm, indices, weights,
         recv_x, recv_weights, recv_token, recv_expert_count,
     )
@@ -147,7 +144,7 @@ def moe_router_expert(
     )
 
     # Stage 5: combine routed and shared expert outputs.
-    moe_packed_combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
+    moe_combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
 
     # Stage 6: hc_post(ffn) merges the FFN output back into the HC stack.
     ffn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
@@ -161,13 +158,15 @@ def moe_router_expert(
 # =============================================================================
 # Golden (torch reference): mirrors the DSL stages.
 # =============================================================================
-def golden_moe_router_expert(tensors):
+def golden_moe(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
     from hc_post import golden_hc_post
-    from moe_router import golden_moe_router
+    from moe_router import golden_moe_router_core
+    from moe_dispatch import golden_moe_dispatch
     from moe_expert import golden_moe_expert
+    from moe_combine import golden_moe_combine
 
     # Stage 1: hc_pre.
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
@@ -183,48 +182,34 @@ def golden_moe_router_expert(tensors):
         "comb":     comb_t,
     })
 
-    # Stage 2: router (full router golden — needs all of its inputs and dummy hash inputs).
+    # Stage 2: router.
     x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
     indices = torch.zeros(T, TOPK, dtype=torch.int32)
     weights = torch.zeros(T, TOPK, dtype=torch.float32)
-    post_dummy = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
-    comb_dummy = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
-    golden_moe_router({
-        "x_hc":         tensors["x_hc"],
-        "hc_ffn_fn":    tensors["hc_ffn_fn"],
-        "hc_ffn_scale": tensors["hc_ffn_scale"],
-        "hc_ffn_base":  tensors["hc_ffn_base"],
+    golden_moe_router_core({
+        "x_mixed":      x_mixed,
         "norm_w":       tensors["norm_w"],
         "gate_w":       tensors["gate_w"],
         "gate_bias":    tensors["gate_bias"],
-        "tid2eid":      torch.zeros(VOCAB, TOPK, dtype=torch.int32),
-        "input_ids":    torch.zeros(B, S, dtype=torch.int64),
         "x_norm":       x_norm,
         "indices":      indices,
         "weights":      weights,
-        "post_ffn":     post_dummy,
-        "comb_ffn":     comb_dummy,
     })
 
     # Stage 3: packed dispatch.
     recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
     recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_token = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
-    cursor = [0] * N_LOCAL_EXPERTS
-    for t in range(T):
-        for k in range(TOPK):
-            e = int(indices[t, k].item()) - EXPERTS_START_IDX
-            s = cursor[e]
-            assert 0 <= e < N_LOCAL_EXPERTS
-            assert s < RECV_MAX, f"expert {e} received > RECV_MAX={RECV_MAX} rows"
-            recv_x[e, s, :] = x_norm[t, :]
-            recv_weights[e, s] = float(weights[t, k].item())
-            recv_token[e, s] = t
-            cursor[e] = s + 1
-
     recv_expert_count_actual = torch.zeros(N_LOCAL_EXPERTS, 1, dtype=torch.int32)
-    for e in range(N_LOCAL_EXPERTS):
-        recv_expert_count_actual[e, 0] = cursor[e]
+    golden_moe_dispatch({
+        "x_norm":            x_norm,
+        "indices":           indices,
+        "weights":           weights,
+        "recv_x":            recv_x,
+        "recv_weights":      recv_weights,
+        "recv_token":        recv_token,
+        "recv_expert_count": recv_expert_count_actual,
+    })
 
     # Stage 4: experts.
     recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
@@ -250,16 +235,15 @@ def golden_moe_router_expert(tensors):
         "sh":               sh,
     })
 
-    # Stage 5: scatter valid packed rows back to token/expert coordinates.
-    routed_y_buf = torch.zeros(T, N_LOCAL_EXPERTS, D, dtype=torch.bfloat16)
-    for e in range(N_LOCAL_EXPERTS):
-        for s in range(int(recv_expert_count_actual[e, 0].item())):
-            t = int(recv_token[e, s].item())
-            routed_y_buf[t, e, :] = recv_y[e, s, :]
-    routed = routed_y_buf[:, 0, :].float()
-    for e in range(1, N_LOCAL_EXPERTS):
-        routed = routed + routed_y_buf[:, e, :].float()
-    ffn_out = (routed + sh.float()).to(torch.bfloat16)
+    # Stage 5: combine routed and shared expert outputs.
+    ffn_out = torch.zeros(T, D, dtype=torch.bfloat16)
+    golden_moe_combine({
+        "recv_y":            recv_y,
+        "recv_token":        recv_token,
+        "recv_expert_count": recv_expert_count_actual,
+        "sh":                sh,
+        "ffn_out":           ffn_out,
+    })
 
     # Stage 6: hc_post(ffn).
     x_next = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
@@ -384,9 +368,9 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
     result = run_jit(
-        fn=moe_router_expert,
+        fn=moe,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_router_expert,
+        golden_fn=golden_moe,
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
