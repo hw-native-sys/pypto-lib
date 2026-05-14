@@ -155,9 +155,15 @@ def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     are filtered to the documented ``execute_compiled`` surface.
     """
     out: dict[str, Any] = {k: v for k, v in runtime.items() if k in _EXECUTE_COMPILED_KEYS}
-    dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if k in runtime}
+    dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
-        from pypto.runtime.runner import _DfxOpts  # noqa: PLC0415
+        try:
+            from pypto.runtime.runner import _DfxOpts  # noqa: PLC0415
+        except ImportError as exc:
+            raise ValueError(
+                "This pypto runtime does not support execute_compiled DFX flags: "
+                f"{sorted(dfx_flags)}"
+            ) from exc
 
         out["dfx"] = _DfxOpts(**dfx_flags)
     return out

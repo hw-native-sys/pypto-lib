@@ -148,7 +148,7 @@ def build_qwen3_decode_program(
             current_hidden = pl.create_tensor([batch, hidden], dtype=pl.BF16)
             for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
                 cur_valid = pl.min(BATCH_TILE, user_batch - b0)
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
                         hidden_chunk = pl.slice(
@@ -188,7 +188,7 @@ def build_qwen3_decode_program(
                     cur_valid = pl.min(BATCH_TILE, user_batch - b0)
                     normed_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
 
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
                         partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(scope1_hidden_blocks):
                             k0 = kb * SCOPE1_K_CHUNK
@@ -231,7 +231,7 @@ def build_qwen3_decode_program(
                             )
 
                     for ob_chunk in pl.parallel(0, q_out_blocks, 4):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
                             for ob in pl.range(ob_chunk, ob_chunk + 4):
                                 q0 = ob * Q_OUT_CHUNK
                                 tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
@@ -245,7 +245,7 @@ def build_qwen3_decode_program(
                                 q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
                     for ob_chunk in pl.parallel(0, kv_out_blocks, 4):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
                             for ob in pl.range(ob_chunk, ob_chunk + 4):
                                 kv0 = ob * KV_OUT_CHUNK
                                 tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
@@ -274,7 +274,7 @@ def build_qwen3_decode_program(
                 # staging with zero-init padded rows (RMSNorm of 0 stays 0),
                 # so no valid_shape is needed here.
                 for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_norm"):
                         for h in pl.range(num_heads):
                             q0 = h * head_dim
                             q_chunk = pl.slice(q_proj, [BATCH_TILE, head_dim], [b0, q0])
@@ -306,7 +306,7 @@ def build_qwen3_decode_program(
                 all_q_padded = pl.create_tensor(
                     [batch * total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16,
                 )
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_pad"):
                     for idx in pl.range(batch * total_q_groups):
                         all_q_padded = pl.assemble(
                             all_q_padded,
@@ -337,7 +337,7 @@ def build_qwen3_decode_program(
                     sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
                     for ki_chunk in pl.parallel(0, num_kv_heads, 8):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
                             for ki in pl.range(ki_chunk, ki_chunk + 8):
                                 kv_col = ki * head_dim
                                 cache_row = layer_cache_base + (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
@@ -428,7 +428,7 @@ def build_qwen3_decode_program(
 
                     # Stage 2.2: QK matmul for all (gi, sb) pairs.
                     for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul"):
                             for gi in pl.range(total_q_groups):
                                 kvh = gi // q_groups
                                 q_padded = pl.slice(
@@ -451,7 +451,7 @@ def build_qwen3_decode_program(
 
                     # Stage 2.3: softmax for all (gi, sb) pairs.
                     for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax"):
                             for gi in pl.range(total_q_groups):
                                 for si in pl.range(SB_BATCH):
                                     sb = sb_chunk + si
@@ -486,7 +486,7 @@ def build_qwen3_decode_program(
 
                     # Stage 2.4: SV matmul for all (gi, sb) pairs.
                     for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul"):
                             for gi in pl.range(total_q_groups):
                                 kvh = gi // q_groups
                                 for si in pl.range(SB_BATCH):
@@ -509,7 +509,7 @@ def build_qwen3_decode_program(
 
                     # Stage 2.5: online softmax accumulation for all gi, then
                     # finalize ctx and write to attn_row_padded.
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="online_softmax"):
                         for gi in pl.range(total_q_groups):
                             base = gi * max_ctx_blocks * Q_HEAD_PAD
                             oi = pl.slice(all_oi_tmp, [Q_HEAD_PAD, head_dim], [base, 0])
@@ -539,7 +539,7 @@ def build_qwen3_decode_program(
                             )
 
                     # Fused writeback: collapse the gi loop into a single pl.at.
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attention_writeback"):
                         for gi in pl.range(total_q_groups):
                             kvh = gi // q_groups
                             qg = gi - kvh * q_groups
@@ -575,7 +575,7 @@ def build_qwen3_decode_program(
                     for ob in pl.range(q_out_blocks):
                         o0 = ob * Q_OUT_CHUNK
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj"):
                             a_chunk_0 = pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, 0])
                             w_chunk_0 = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
                             o_acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
@@ -585,7 +585,7 @@ def build_qwen3_decode_program(
                                 w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
                                 o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj_residual"):
                             resid = pl.cast(
                                 pl.slice(
                                     current_hidden,
@@ -599,7 +599,7 @@ def build_qwen3_decode_program(
                             resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
 
                     post_norm_tile = pl.create_tensor([BATCH_TILE, hidden], dtype=pl.BF16)
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rmsnorm"):
                         sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -624,7 +624,7 @@ def build_qwen3_decode_program(
                     mlp_tile = pl.create_tensor([BATCH_TILE, inter], dtype=pl.BF16)
                     for ob in pl.range(mlp_out_blocks):
                         o0 = ob * MLP_OUT_CHUNK
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
                             post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                             wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
                             gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
@@ -634,7 +634,7 @@ def build_qwen3_decode_program(
                                 wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
                                 gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
                             post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                             wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
                             up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
@@ -644,7 +644,7 @@ def build_qwen3_decode_program(
                                 wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
                                 up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -657,7 +657,7 @@ def build_qwen3_decode_program(
                         # 8 KiB) and avoids a large pre-allocated scratch.
                         fp32_chunk_gm = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
                             mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                             w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base, d0])
                             down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
@@ -672,7 +672,7 @@ def build_qwen3_decode_program(
                                 down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
                             fp32_chunk_gm = pl.assemble(fp32_chunk_gm, down_acc, [0, 0])
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj_residual"):
                             # Vec-only incore: tload FP32 cube output as ND vec
                             # tile, add FP32 residual (also ND vec), cast to
                             # BF16 (vec-to-vec cast preserves ND layout), then
@@ -688,7 +688,7 @@ def build_qwen3_decode_program(
 
             for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
                 cur_valid = pl.min(BATCH_TILE, user_batch - b0)
-                with pl.at(level=pl.Level.CORE_GROUP):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_out"):
                     for kb in pl.range(hidden_blocks):
                         k0 = kb * K_CHUNK
                         final_out_chunk = pl.slice(

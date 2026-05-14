@@ -142,7 +142,7 @@ def build_qwen3_14b_prefill_program(
                     normed_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
 
                     # Stage 1.1: RMSNorm (vector ops).
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
                         partial_sq = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -181,7 +181,7 @@ def build_qwen3_14b_prefill_program(
                     # Stage 1.2: Q projection (matmul + matmul_acc, FP32 output).
                     q_proj_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
                     for ob_chunk in pl.parallel(0, q_out_blocks, 4):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
                             for ob in pl.range(ob_chunk, ob_chunk + 4):
                                 q0 = ob * Q_OUT_CHUNK
                                 tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
@@ -198,7 +198,7 @@ def build_qwen3_14b_prefill_program(
                     k_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
                     v_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
                     for ob_chunk in pl.parallel(0, kv_out_blocks, 4):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj"):
                             for ob in pl.range(ob_chunk, ob_chunk + 4):
                                 kv0 = ob * KV_OUT_CHUNK
 
@@ -224,7 +224,7 @@ def build_qwen3_14b_prefill_program(
 
                     # Stage 1.4: Q/K per-head RMSNorm (FP32 in-place on proj tiles).
                     for qh_chunk in pl.parallel(0, num_heads, num_heads):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_norm"):
                             for qh in pl.range(qh_chunk, qh_chunk + num_heads):
                                 q_col = qh * head_dim
                                 q_head = pl.slice(q_proj_tile, [TOK_TILE, head_dim], [0, q_col])
@@ -239,7 +239,7 @@ def build_qwen3_14b_prefill_program(
                                 )
                                 q_proj_tile = pl.assemble(q_proj_tile, q_normed, [0, q_col])
                     for kh_chunk in pl.parallel(0, num_kv_heads, num_kv_heads):
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_norm"):
                             for kh in pl.range(kh_chunk, kh_chunk + num_kv_heads):
                                 k_col = kh * head_dim
                                 k_head = pl.slice(k_proj_tile, [TOK_TILE, head_dim], [0, k_col])
@@ -270,7 +270,7 @@ def build_qwen3_14b_prefill_program(
                         # Stage 2.1: K RoPE + cache update + V cache + Q RoPE + pad.
                         all_q_padded = pl.create_tensor([total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16)
                         for gi_chunk in pl.parallel(0, total_q_groups, total_q_groups):
-                            with pl.at(level=pl.Level.CORE_GROUP):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_pad"):
                                 for gi in pl.range(gi_chunk, gi_chunk + total_q_groups):
                                     all_q_padded = pl.assemble(
                                         all_q_padded,
@@ -281,7 +281,7 @@ def build_qwen3_14b_prefill_program(
                         cache_slot_block = cache_slot // BLOCK_SIZE
                         cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
                         for ki_chunk in pl.parallel(0, num_kv_heads, 8):
-                            with pl.at(level=pl.Level.CORE_GROUP):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
                                 for ki in pl.range(ki_chunk, ki_chunk + 8):
                                     # K RoPE + cache update.
                                     kv_col = ki * head_dim
@@ -355,7 +355,7 @@ def build_qwen3_14b_prefill_program(
 
                             # Stage 2.2: QK matmul for all active sb blocks.
                             for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                                with pl.at(level=pl.Level.CORE_GROUP):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul"):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb_chunk + si
                                         if sb < ctx_blocks:
@@ -368,7 +368,7 @@ def build_qwen3_14b_prefill_program(
 
                             # Stage 2.3: softmax for all active sb blocks.
                             for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                                with pl.at(level=pl.Level.CORE_GROUP):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax"):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb_chunk + si
                                         if sb < ctx_blocks:
@@ -391,7 +391,7 @@ def build_qwen3_14b_prefill_program(
 
                             # Stage 2.4: SV matmul for all active sb blocks.
                             for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
-                                with pl.at(level=pl.Level.CORE_GROUP):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul"):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb_chunk + si
                                         if sb < ctx_blocks:
@@ -404,7 +404,7 @@ def build_qwen3_14b_prefill_program(
                                             all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.5: online softmax accumulation.
-                            with pl.at(level=pl.Level.CORE_GROUP):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="online_softmax_init"):
                                 oi = pl.full([Q_HEAD_BATCH_PAD, head_dim], dtype=pl.FP32, value=0.0)
                                 li_flat = pl.full([1, Q_HEAD_BATCH_PAD], dtype=pl.FP32, value=0.0)
                                 li = pl.reshape(li_flat, [Q_HEAD_BATCH_PAD, 1])
@@ -412,7 +412,7 @@ def build_qwen3_14b_prefill_program(
                                 mi = pl.reshape(mi_flat, [Q_HEAD_BATCH_PAD, 1])
 
                             for sb0 in pl.range(0, ctx_blocks, SB_BATCH):
-                                with pl.at(level=pl.Level.CORE_GROUP):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="online_softmax"):
                                     for si in pl.range(SB_BATCH):
                                         sb = sb0 + si
                                         if sb < ctx_blocks:
@@ -434,10 +434,10 @@ def build_qwen3_14b_prefill_program(
 
                             # Finalize ctx = oi / li and write back row by row.
                             ctx_tmp = pl.create_tensor([Q_HEAD_BATCH_PAD, head_dim], dtype=pl.FP32)
-                            with pl.at(level=pl.Level.CORE_GROUP):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="attention_context"):
                                 ctx = pl.row_expand_div(oi, li)
                                 ctx_tmp = pl.assemble(ctx_tmp, ctx, [0, 0])
-                            with pl.at(level=pl.Level.CORE_GROUP):
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="attention_writeback"):
                                 for qi in pl.range(Q_HEAD_BATCH):
                                     q_col = (q_base + qi) * head_dim
                                     row = pl.slice(ctx_tmp, [1, head_dim], [qi, 0])
@@ -452,7 +452,7 @@ def build_qwen3_14b_prefill_program(
                     for ob in pl.range(q_out_blocks):
                         o0 = ob * Q_OUT_CHUNK
                         # Cube matmul chain.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj"):
                             tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [0, o0])
                             o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
@@ -464,7 +464,7 @@ def build_qwen3_14b_prefill_program(
                             resid1_tile = pl.assemble(resid1_tile, o_acc, [0, o0])
 
                         # Add the residual path.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj_residual"):
                             resid_chunk = pl.reshape(
                                 pl.cast(
                                     pl.slice(hidden_states, [1, TOK_TILE, Q_OUT_CHUNK], [b, p0, o0],
@@ -478,7 +478,7 @@ def build_qwen3_14b_prefill_program(
 
                     # Stage 3.2: Post-attention RMSNorm.
                     post_norm_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
-                    with pl.at(level=pl.Level.CORE_GROUP):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rmsnorm"):
                         sq_sum = pl.full([1, TOK_TILE], dtype=pl.FP32, value=0.0)
                         for kb in pl.range(hidden_blocks):
                             k0 = kb * K_CHUNK
@@ -508,7 +508,7 @@ def build_qwen3_14b_prefill_program(
                         o0 = ob * MLP_OUT_CHUNK
 
                         # Gate matmul chain.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                             gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
@@ -519,7 +519,7 @@ def build_qwen3_14b_prefill_program(
                                 gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
 
                         # Up matmul chain.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
                             pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
                             wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
                             up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
@@ -530,7 +530,7 @@ def build_qwen3_14b_prefill_program(
                                 up_acc = pl.matmul_acc(up_acc, pci, wui)
 
                         # SiLU activation: silu(gate) * up -> BF16.
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -539,7 +539,7 @@ def build_qwen3_14b_prefill_program(
                     # Stage 3.3b: Down projection (matmul_acc chain) + final residual -> output.
                     for dob in pl.range(hidden_blocks):
                         d0 = dob * K_CHUNK
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
                             mlp_chunk_0 = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])
                             w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
                             down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
@@ -549,7 +549,7 @@ def build_qwen3_14b_prefill_program(
                                 w_down_chunk_i = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
                                 down_acc = pl.matmul_acc(down_acc, mlp_chunk_i, w_down_chunk_i)
 
-                        with pl.at(level=pl.Level.CORE_GROUP):
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj_residual"):
                             out_chunk = pl.add(
                                 down_acc,
                                 pl.slice(resid1_tile, [TOK_TILE, K_CHUNK], [0, d0]),
