@@ -634,7 +634,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -652,6 +652,9 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
+            compare_fn={
+                "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

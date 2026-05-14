@@ -398,7 +398,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, bf16_allclose_or_ulp, run_jit
+    from golden import RunConfig, bf16_allclose_or_ulp, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -420,7 +420,12 @@ if __name__ == "__main__":
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
             ),
-            compare_fn={"kv_cache": bf16_allclose_or_ulp()},
+            compare_fn={
+                "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+                "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+                "kv_cache":    bf16_allclose_or_ulp(),
+            },
         ),
     )
     if not result.passed:

@@ -524,13 +524,6 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_attention_swa,
         config=RunConfig(
-            # qkv_proj_rope and sparse_attn both use W8A8/BF16 stages; the
-            # random KV-cache fixture exercises a less diluted attention output
-            # than the previous all-zero cache.
-            # x_out uses ratio_allclose with the standard W8A8 attention
-            # tolerance (atol=1e-4, rtol=1/128, 0.5% outlier allowance);
-            # the RunConfig defaults below only apply to any other outputs
-            # that lack a custom comparator.
             rtol=1e-2,
             atol=1e-2,
             compare_fn={

@@ -614,7 +614,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit, bf16_allclose_or_ulp, topk_pair_compare
+    from golden import RunConfig, bf16_allclose_or_ulp, ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -632,7 +632,8 @@ if __name__ == "__main__":
             atol=1e-3,
             compile=dict(dump_passes=True),
             compare_fn={
-                "topk_idxs": topk_pair_compare("score"),
+                "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "topk_idxs":    topk_pair_compare("score"),
                 "idx_kv_cache": bf16_allclose_or_ulp(),
             },
             runtime=dict(

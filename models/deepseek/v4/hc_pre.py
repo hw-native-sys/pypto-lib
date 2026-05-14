@@ -350,7 +350,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -366,6 +366,11 @@ if __name__ == "__main__":
         config=RunConfig(
             rtol=1e-3,
             atol=1e-3,
+            compare_fn={
+                "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "comb":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,

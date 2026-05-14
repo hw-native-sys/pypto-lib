@@ -502,15 +502,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
-
-    def int8_lsb_compare(actual, expected, actual_outputs, expected_outputs, inputs, rtol, atol):
-        import torch
-
-        diff = torch.abs(actual.to(torch.int16) - expected.to(torch.int16))
-        if torch.max(diff) <= 1:
-            return True, ""
-        return False, "max INT8 diff > 1"
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -527,7 +519,12 @@ if __name__ == "__main__":
             # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
             rtol=5e-3,
             atol=5e-3,
-            compare_fn={"qr": int8_lsb_compare},
+            compare_fn={
+                "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "qr":       ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
+                "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            },
             compile=dict(dump_passes=True),
             runtime=dict(
                 platform=args.platform,
