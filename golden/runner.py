@@ -37,7 +37,7 @@ class RunConfig:
             ``backend_type``, ``dump_passes``, ``output_dir``, ``strategy``,
             ``profiling``).
         runtime: Kwargs forwarded to :func:`pypto.runtime.execute_compiled`
-            (e.g. ``platform``, ``device_id``, ``runtime_profiling``).
+            (e.g. ``platform``, ``device_id``, ``enable_l2_swimlane``).
         compare_fn: Per-output-name custom comparators that override
             ``torch.allclose`` for those tensors. See
             :func:`golden.validation.validate_golden` for the callable
@@ -573,7 +573,9 @@ def run_jit(
             # rtol, atol, etc.) before forwarding.
             exec_kwargs = {
                 k: v for k, v in config.runtime.items()
-                if k in {"platform", "device_id", "pto_isa_commit", "runtime_profiling", "level"}
+                if k in {"platform", "device_id", "pto_isa_commit",
+                         "enable_l2_swimlane", "enable_dump_tensor",
+                         "enable_pmu", "enable_dep_gen", "level"}
             }
             execute_compiled(work_dir, ordered, **exec_kwargs)
         else:

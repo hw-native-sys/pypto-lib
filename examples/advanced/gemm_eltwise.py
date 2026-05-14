@@ -157,7 +157,7 @@ if __name__ == "__main__":
                         help="Chunk size for parallel loop (smaller = more parallel tasks)")
     parser.add_argument("--mix", action="store_true",
                         help="Use fused mix version (default: split version)")
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     if args.mix:
@@ -176,7 +176,7 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
+                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
         ),
     )

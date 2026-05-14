@@ -12,7 +12,7 @@ the harness:
 ```python
 parser.add_argument("-p", "--platform", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
 parser.add_argument("-d", "--device", type=int, default=0)
-parser.add_argument("--runtime-profiling", action="store_true")
+parser.add_argument("--enable-l2-swimlane", action="store_true")
 args = parser.parse_args()
 
 result = run(
@@ -23,7 +23,7 @@ result = run(
         rtol=3e-3, atol=3e-3,
         compile=dict(dump_passes=True),
         runtime=dict(platform=args.platform, device_id=args.device,
-                     runtime_profiling=args.runtime_profiling),
+                     enable_l2_swimlane=args.enable_l2_swimlane),
     ),
 )
 ```
@@ -32,7 +32,7 @@ result = run(
 |------|---------|
 | `-p` / `--platform` | Target backend. `a2a3` is Ascend 910B/C; `a5` is Ascend 950 — both run on real NPU. `a2a3sim` / `a5sim` are the matching simulators. |
 | `-d` / `--device` | Device ID for multi-card hosts. |
-| `--runtime-profiling` | Forwarded to the runtime; collects per-task timing into the build_output. |
+| `--enable-l2-swimlane` | Forwarded to the runtime; collects per-task L2 perf records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). |
 
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
@@ -104,7 +104,7 @@ build_output/<ProgramName>_<ts>/
 ├── kernel_config.py
 ├── report/         # memory allocation + scheduling reports
 ├── data/           # populated by later phases (in/, out/)
-└── swimlane_data/  # runtime profiling traces (--runtime-profiling)
+└── dfx_outputs/    # runtime DFX artefacts (any --enable-* flag)
 ```
 
 #### Compile knobs
@@ -149,19 +149,39 @@ loads the compiled artifacts onto the target platform and runs them.
 Tensors passed by reference are mutated in place: outputs land back into
 the same Python tensors after the call returns.
 
-`config.runtime` is forwarded verbatim — `platform`, `device_id`,
-`runtime_profiling`, and any other runtime knobs. Refer to the simpler
-repo for the full set of runtime options and platform-specific behavior.
+`config.runtime` is forwarded verbatim — `platform`, `device_id`, the
+runtime DFX flags below, and any other runtime knobs. Refer to the
+simpler repo for the full set of runtime options and platform-specific
+behavior.
 
-#### Runtime profiling
+#### Runtime DFX flags
 
-Passing `--runtime-profiling` (or setting `runtime=dict(runtime_profiling=True)`
-on `RunConfig`) makes simpler emit a swimlane trace under
-`build_output/<ProgramName>_<ts>/swimlane_data/` — for example,
-`merged_swimlane_<ts>.json`. Open the file at
+PyPTO surfaces simpler's four runtime DFX (Design For X) sub-features as
+independent toggles on `RunConfig.runtime`. They share the same output
+directory but can be enabled in any combination:
+
+| Kwarg | CLI flag | Artefact under `dfx_outputs/` |
+|-------|----------|-------------------------------|
+| `enable_l2_swimlane=True` | `--enable-l2-swimlane` | `l2_perf_records.json` → `merged_swimlane_*.json` |
+| `enable_dump_tensor=True` | `--dump-tensor` | `tensor_dump/{tensor_dump.json,bin}` |
+| `enable_pmu=<N>` (int, `0`=off) | `--enable-pmu [N]` (bare = `2`) | `pmu.csv` |
+| `enable_dep_gen=True` | `--enable-dep-gen` | `deps.json` → `deps_graph.html` |
+
+Enabling any flag auto-forces `save_kernels=True` so
+`build_output/<ProgramName>_<ts>/dfx_outputs/` survives the run.
+
+For L2 swimlane: open the generated `merged_swimlane_*.json` at
 [ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
 gaps, and dependency stalls.
+
+See pypto's `docs/en/dev/03-runtime-dfx.md` and the simpler reference at
+`runtime/docs/dfx/{l2-swimlane,tensor-dump,pmu-profiling,dep_gen}.md` for
+full per-flag details.
+
+> The old single boolean `runtime_profiling` / `--runtime-profiling` is
+> a deprecated alias for `enable_l2_swimlane` / `--enable-l2-swimlane`.
+> It still works but emits a `DeprecationWarning` and will be removed.
 
 ### 4. Compute golden
 

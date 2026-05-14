@@ -924,7 +924,7 @@ if __name__ == "__main__":
                               "pl.dynamic() variable, so a single compiled "
                               "program serves any batch <= host KV-cache "
                               "capacity. Default: %(default)s"))
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False, help="set all seq_lens to MAX_SEQ")
     args = parser.parse_args()
 
@@ -939,7 +939,7 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
+                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
         ),
     )

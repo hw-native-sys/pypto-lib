@@ -1069,7 +1069,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-seq", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=NUM_LAYERS)
     parser.add_argument("--compile-only", action="store_true", default=False)
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--pass-rate", type=float, default=0.98,
                         help="Fraction of `out` elements that must satisfy atol/rtol. "
                              "Default 0.98 is sized for the 40-layer BF16 ULP long-tail at "
@@ -1105,7 +1105,7 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
+                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={"out": make_pass_rate_compare(args.pass_rate)},
         ),
