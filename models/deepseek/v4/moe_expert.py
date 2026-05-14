@@ -94,8 +94,6 @@ def moe_expert(
             t0 = t * RECV_TILE
             flat_t0 = flat_base + t0
 
-            # Valid rows in this tile (< RECV_TILE only for the tail tile).
-            # Rows beyond it are masked to zero in exp_swiglu_mask below.
             valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
             # Per-row INT8 quant of recv_x tile.
@@ -104,7 +102,7 @@ def moe_expert(
                 rx_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.range(0, D, QUANT_CHUNK):
                     rx_a_3d = pl.cast(
-                        recv_x[local_i, t0 : t0 + RECV_TILE, k0 : k0 + QUANT_CHUNK],
+                        recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + QUANT_CHUNK],
                         target_type=pl.FP32,
                     )
                     rx_a_f32 = pl.reshape(rx_a_3d, [RECV_TILE, QUANT_CHUNK])
@@ -118,7 +116,7 @@ def moe_expert(
                 rx_sq_col = pl.reshape(rx_sq_row, [RECV_TILE, 1])
                 for k1 in pl.range(0, D, QUANT_CHUNK):
                     rx_q_3d = pl.cast(
-                        recv_x[local_i, t0 : t0 + RECV_TILE, k1 : k1 + QUANT_CHUNK],
+                        recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k1 : k1 + QUANT_CHUNK],
                         target_type=pl.FP32,
                     )
                     rx_q_f32 = pl.reshape(rx_q_3d, [RECV_TILE, QUANT_CHUNK])
@@ -135,24 +133,22 @@ def moe_expert(
             for n0 in pl.parallel(0, MOE_INTER, INTER_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_gate_up_matmul"):
                     x_init = recv_x_tile_i8[:, 0 : K_CHUNK]
-                    w1_init = expert_w1[local_i, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
-                    w3_init = expert_w3[local_i, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
+                    w1_init = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
+                    w3_init = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
                     gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
                     up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
                     for k0 in pl.range(K_CHUNK, D, K_CHUNK):
                         x_k = recv_x_tile_i8[:, k0 : k0 + K_CHUNK]
-                        w1_k = expert_w1[local_i, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
-                        w3_k = expert_w3[local_i, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
+                        w1_k = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
+                        w3_k = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
                         gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
                         up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_gate_up_dequant"):
-                    # Scalar-indexed expert_w* keeps a leading size-1 dim; matmul promotes
-                    # that to a 3D batched output. Drop it so downstream stays 2D.
                     gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_CHUNK])
                     up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_CHUNK])
-                    w1_scale_chunk = expert_w1_scale[local_i, n0 : n0 + INTER_CHUNK]
-                    w3_scale_chunk = expert_w3_scale[local_i, n0 : n0 + INTER_CHUNK]
+                    w1_scale_chunk = expert_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
+                    w3_scale_chunk = expert_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
                     gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                     up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                     gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
@@ -165,17 +161,10 @@ def moe_expert(
                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
                     silu = pl.mul(gate_2d, sigmoid)
                     gated = pl.mul(silu, up_2d)
-                    # Pre-multiply routing scale before A8 requant so the requant amax
-                    # reflects the same magnitude the BF16 path produced for w2 input.
                     scale_col = recv_weights_flat[flat_t0 : flat_t0 + RECV_TILE, :]
                     h_chunk = pl.row_expand_mul(gated, scale_col)
-
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_swiglu_mask"):
-                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into
-                    # recv_y. Kept in its own pl.at (separate from row_expand_mul above)
-                    # to dodge PTOAS#660.
-                    h_chunk_sliced = pl.slice(h_chunk, [RECV_TILE, INTER_CHUNK], [0, 0])
-                    h_chunk_valid = pl.tensor.set_validshape(h_chunk_sliced, valid_rows, INTER_CHUNK)
+                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
+                    h_chunk_valid = pl.tensor.set_validshape(h_chunk, valid_rows, INTER_CHUNK)
                     h_chunk_masked = pl.fillpad(h_chunk_valid, pad_value=pl.PadValue.zero)
                     h_tile_fp32[:, n0 : n0 + INTER_CHUNK] = h_chunk_masked
 
@@ -204,16 +193,16 @@ def moe_expert(
             for d0 in pl.parallel(0, D, D_OUT_CHUNK):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_w2_matmul"):
                     h_init = h_tile_i8[:, 0 : INTER_K]
-                    w2_init = expert_w2[local_i, d0 : d0 + D_OUT_CHUNK, 0 : INTER_K]
+                    w2_init = expert_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, 0 : INTER_K]
                     y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
                     for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
                         h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                        w2_k = expert_w2[local_i, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
+                        w2_k = expert_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
                         y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_w2_dequant"):
                     y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_CHUNK])
-                    w2_scale_chunk = expert_w2_scale[local_i, d0 : d0 + D_OUT_CHUNK]
+                    w2_scale_chunk = expert_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK]
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
 
