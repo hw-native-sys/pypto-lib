@@ -182,7 +182,7 @@ make
 ## 环境要求
 
 - **CMake 版本**：≥ 3.16
-- **CANN 版本**：≥ 8.5.0
+- **CANN 版本**：≥ 9.0.0
 - **编译器**：bisheng（CANN 自带）
 - **链接器**：ld.lld（CANN 自带）
 - **环境变量**：`ASCEND_HOME_PATH` 必须设置

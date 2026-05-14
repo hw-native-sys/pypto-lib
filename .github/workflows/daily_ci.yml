@@ -144,7 +144,7 @@ jobs:
       group: a2a3-serial
       cancel-in-progress: false
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-8.5.0
+      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTOAS_VERSION: v0.38
       PTOAS_SHA256: 29e5af26f32776935bddb1b28fea5c4ce1beaa16d430f2eeac49625990e72d31
@@ -167,7 +167,7 @@ jobs:
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src:/opt/pypto-src
-        -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
+        -e ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.0.0
         -e DEVICE_ID
 
     steps:

@@ -19,7 +19,7 @@ uname -m   # x86_64 → sim environment, aarch64 → device (a2a3) environment
 | `x86_64` | sim | `pip install torch --index-url https://download.pytorch.org/whl/cpu` | `ptoas-bin-x86_64.tar.gz` |
 | `aarch64` | device (a2a3) | `pip install torch` | `ptoas-bin-aarch64.tar.gz` |
 
-Device environment additionally requires `ASCEND_HOME_PATH` (e.g. `/usr/local/Ascend/cann-8.5.0`).
+Device environment additionally requires `ASCEND_HOME_PATH` (e.g. `/usr/local/Ascend/cann-9.0.0`).
 
 ## Step 2: Install Python Dependencies
 
@@ -90,7 +90,7 @@ After setup, these must be set:
 |----------|-----------|
 | `PTOAS_ROOT` | `../ptoas-bin` |
 | `PTO_ISA_ROOT` | `../pto-isa` |
-| `ASCEND_HOME_PATH` | `/usr/local/Ascend/cann-8.5.0` (device only) |
+| `ASCEND_HOME_PATH` | `/usr/local/Ascend/cann-9.0.0` (device only) |
 
 ## Troubleshooting
 
