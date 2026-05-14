@@ -79,7 +79,7 @@ def moe_expert(
         for k1 in pl.range(0, D, QUANT_CHUNK):
             xl_q_f32 = pl.cast(x_local[:, k1 : k1 + QUANT_CHUNK], target_type=pl.FP32)
             xl_q_scaled = pl.row_expand_mul(xl_q_f32, xl_sq_col)
-            xl_q_i32 = pl.cast(xl_q_scaled, target_type=pl.INT32, mode="round")
+            xl_q_i32 = pl.cast(xl_q_scaled, target_type=pl.INT32, mode="rint")
             xl_q_half = pl.cast(xl_q_i32, target_type=pl.FP16, mode="round")
             x_local_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(xl_q_half, target_type=pl.INT8, mode="trunc")
 
@@ -123,7 +123,7 @@ def moe_expert(
                     )
                     rx_q_f32 = pl.reshape(rx_q_3d, [RECV_TILE, QUANT_CHUNK])
                     rx_q_scaled = pl.row_expand_mul(rx_q_f32, rx_sq_col)
-                    rx_q_i32 = pl.cast(rx_q_scaled, target_type=pl.INT32, mode="round")
+                    rx_q_i32 = pl.cast(rx_q_scaled, target_type=pl.INT32, mode="rint")
                     rx_q_half = pl.cast(rx_q_i32, target_type=pl.FP16, mode="round")
                     recv_x_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(
                         rx_q_half, target_type=pl.INT8, mode="trunc"
@@ -196,7 +196,7 @@ def moe_expert(
                 for k1 in pl.range(0, MOE_INTER, QUANT_CHUNK):
                     eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_CHUNK]
                     eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
-                    eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="round")
+                    eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                     h_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
@@ -267,7 +267,7 @@ def moe_expert(
         for k1 in pl.range(0, MOE_INTER, QUANT_CHUNK):
             shq_q_f32 = sh_tile_fp32[:, k1 : k1 + QUANT_CHUNK]
             shq_q_scaled = pl.row_expand_mul(shq_q_f32, shq_sq_col)
-            shq_q_i32 = pl.cast(shq_q_scaled, target_type=pl.INT32, mode="round")
+            shq_q_i32 = pl.cast(shq_q_scaled, target_type=pl.INT32, mode="rint")
             shq_q_half = pl.cast(shq_q_i32, target_type=pl.FP16, mode="round")
             sh_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(shq_q_half, target_type=pl.INT8, mode="trunc")
 
@@ -287,7 +287,7 @@ def moe_expert(
             sh_y = pl.col_expand_mul(pl.row_expand_mul(sh_y, sh_tile_scale_dq), sw2_scale_chunk)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_write"):
-            sh[:, d0 : d0 + D_OUT_CHUNK] = pl.cast(sh_y, target_type=pl.BF16)
+            sh[:, d0 : d0 + D_OUT_CHUNK] = pl.cast(sh_y, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
@@ -322,11 +322,6 @@ def moe_expert_test(
     return recv_y, sh
 
 
-def _round_half_away_from_zero(x):
-    import torch
-    return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
-
 def _int8_quant_per_row(x):
     """Per-row (per-token) INT8 symmetric quant matching v3.2 scope2 Stage 2.6."""
     import torch
@@ -334,7 +329,7 @@ def _int8_quant_per_row(x):
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
     scale_quant = INT8_SCALE_MAX / amax
     scaled = rows * scale_quant
-    out_i8 = _round_half_away_from_zero(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
@@ -348,7 +343,7 @@ def _quant_w_per_channel(w):
     amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
     scale_quant = INT8_SCALE_MAX / amax
     scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = _round_half_away_from_zero(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     return w_i8, (1.0 / scale_quant).float()
 
 

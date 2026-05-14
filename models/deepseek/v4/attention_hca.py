@@ -156,8 +156,8 @@ def attention_hca(
             pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
             sin_row,
         )
-        rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16)
-        rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16)
+        rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
+        rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
 
     # Compressor RoPE row at start_pos + 1 - ratio; half-vector layout.
     # Module-level `assert SHOULD_COMPRESS` guarantees (start_pos+1) is a positive multiple
@@ -174,8 +174,8 @@ def attention_hca(
             pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
         )
-        cmp_cos = pl.cast(cmp_cos_fp32, target_type=pl.BF16)
-        cmp_sin = pl.cast(cmp_sin_fp32, target_type=pl.BF16)
+        cmp_cos = pl.cast(cmp_cos_fp32, target_type=pl.BF16, mode="rint")
+        cmp_sin = pl.cast(cmp_sin_fp32, target_type=pl.BF16, mode="rint")
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -513,14 +513,11 @@ def build_tensor_specs():
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
 
-    def round_half_away_from_zero(x):
-        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
         scale_quant = INT8_SCALE_MAX / amax
         scaled = w.float() * scale_quant.view(1, H * HEAD_DIM)
-        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.round(scaled).to(torch.int32)
         w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
@@ -529,7 +526,7 @@ def build_tensor_specs():
         amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
         scale_quant = INT8_SCALE_MAX / amax
         scaled = w.float() * scale_quant.unsqueeze(-1)
-        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.round(scaled).to(torch.int32)
         w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()

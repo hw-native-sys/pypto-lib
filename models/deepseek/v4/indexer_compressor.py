@@ -172,7 +172,7 @@ def compressor(
             for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
                 # Golden applies rmsnorm to kv.to(torch.bfloat16), then casts to FP32 inside rmsnorm.
                 kv_rms_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16),
+                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
                     target_type=pl.FP32,
                 )
                 partial_sq = pl.add(
@@ -184,12 +184,12 @@ def compressor(
             inv_rms = pl.recip(pl.sqrt(variance))
             for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
                 kv_norm_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16),
+                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
                     target_type=pl.FP32,
                 )
                 gamma = norm_w_2d[:, k0 : k0 + HEAD_CHUNK]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16), [0, k0])
+                normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16, mode="rint"), [0, k0])
 
         kv_rope = pl.create_tensor([B * S, ROPE_HEAD_DIM], dtype=pl.BF16)
         kv_proj_even = pl.create_tensor([B * S, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
@@ -219,8 +219,8 @@ def compressor(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
             even_tile = kv_proj_even[:, :]
             odd_tile = kv_proj_odd[:, :]
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos), pl.col_expand_mul(odd_tile, sin)), target_type=pl.BF16)
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin), pl.col_expand_mul(odd_tile, cos)), target_type=pl.BF16)
+            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos), pl.col_expand_mul(odd_tile, sin)), target_type=pl.BF16, mode="rint")
+            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin), pl.col_expand_mul(odd_tile, cos)), target_type=pl.BF16, mode="rint")
             rope_even = pl.assemble(rope_even, rope_even_acc, [0, 0])
             rope_odd = pl.assemble(rope_odd, rope_odd_acc, [0, 0])
 
@@ -241,7 +241,7 @@ def compressor(
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-            normed_kv = pl.assemble(normed_kv, pl.cast(rope_acc, target_type=pl.BF16), [0, NOPE_HEAD_DIM])
+            normed_kv = pl.assemble(normed_kv, pl.cast(rope_acc, target_type=pl.BF16, mode="rint"), [0, NOPE_HEAD_DIM])
 
         if rotate:
             for o0 in pl.range(0, HEAD_DIM, OUT_CHUNK):
@@ -262,7 +262,7 @@ def compressor(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_cache_write"):
                 cache_row = b_idx * IDX_KV_LEN + cache_col
                 cache_kv_row = kv_flat[b_idx : b_idx + 1, 0 : HEAD_DIM]
-                kv_cache_flat = pl.assemble(kv_cache_flat, pl.cast(cache_kv_row, target_type=pl.BF16), [cache_row, 0])
+                kv_cache_flat = pl.assemble(kv_cache_flat, pl.cast(cache_kv_row, target_type=pl.BF16, mode="rint"), [cache_row, 0])
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
     kv_state = pl.reshape(kv_state_flat, [B, STATE_LEN, OUT_DIM])

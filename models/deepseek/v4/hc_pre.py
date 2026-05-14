@@ -266,7 +266,7 @@ def hc_pre(
                     )
                     y_row = pl.add(y_row, pl.mul(x_row, pre_th))
                 x_mixed_view = pl.store(
-                    pl.cast(y_row, target_type=pl.BF16),
+                    pl.cast(y_row, target_type=pl.BF16, mode="rint"),
                     [token_idx, d0],
                     x_mixed_view,
                 )

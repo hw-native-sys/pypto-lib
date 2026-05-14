@@ -251,8 +251,8 @@ def sparse_attn(
                 pl.col_expand_mul(odd_tile, cos_tile),
                 pl.col_expand_mul(even_tile, sin_tile),
             )
-            rope_even = pl.assemble(rope_even, pl.cast(rope_even_acc, target_type=pl.BF16), [rope_head_row, 0])
-            rope_odd = pl.assemble(rope_odd, pl.cast(rope_odd_acc, target_type=pl.BF16), [rope_head_row, 0])
+            rope_even = pl.assemble(rope_even, pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint"), [rope_head_row, 0])
+            rope_odd = pl.assemble(rope_odd, pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint"), [rope_head_row, 0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble"):
             for r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
@@ -340,7 +340,7 @@ def sparse_attn(
         for k1 in pl.range(0, O_GROUPS * O_LORA, QUANT_CHUNK):
             or_q_f32 = pl.cast(o_r[:, k1:k1 + QUANT_CHUNK], target_type=pl.FP32)
             or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
-            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="round")
+            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
             or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
             o_r_i8[:, k1:k1 + QUANT_CHUNK] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
 
@@ -361,7 +361,7 @@ def sparse_attn(
             wb_scale_chunk = pl.reshape(wo_b_scale[n0:n0 + B_N_CHUNK], [1, B_N_CHUNK])
             attn_chunk = pl.cast(acc_b, target_type=pl.FP32, mode="none")
             attn_chunk = pl.col_expand_mul(pl.row_expand_mul(attn_chunk, o_r_scale_dq), wb_scale_chunk)
-            attn_out[:, n0:n0 + B_N_CHUNK] = pl.cast(attn_chunk, target_type=pl.BF16)
+            attn_out[:, n0:n0 + B_N_CHUNK] = pl.cast(attn_chunk, target_type=pl.BF16, mode="rint")
 
     return attn_out
 
@@ -406,12 +406,6 @@ def sparse_attn_test(
     return attn_out
 
 
-def _round_half_away_from_zero(x):
-    import torch
-
-    return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
-
 def _int8_quant_per_row(x):
     """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path."""
     import torch
@@ -420,7 +414,7 @@ def _int8_quant_per_row(x):
     amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
     scale_quant = INT8_SCALE_MAX / amax
     scaled = rows * scale_quant
-    out_i8 = _round_half_away_from_zero(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
@@ -432,7 +426,7 @@ def _quant_w_per_channel(w):
     amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
     scale_quant = INT8_SCALE_MAX / amax
     scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = _round_half_away_from_zero(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     return w_i8, (1.0 / scale_quant).float()
 
 

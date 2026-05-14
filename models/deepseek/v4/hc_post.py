@@ -65,7 +65,7 @@ def hc_post(
                         y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
                     y_flat = pl.assemble(
                         y_flat,
-                        pl.cast(y_row, target_type=pl.BF16),
+                        pl.cast(y_row, target_type=pl.BF16, mode="rint"),
                         [t, out_h * D + d0],
                     )
     y = pl.reshape(y_flat, [B, S, HC_MULT, D])

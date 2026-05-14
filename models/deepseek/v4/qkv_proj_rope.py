@@ -97,7 +97,7 @@ def qkv_proj_rope(
         with pl.at(level=pl.Level.CORE_GROUP):
             d0 = db * D_CHUNK
             x_chunk_fp32 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0])
-            token_x_bf16 = pl.assemble(token_x_bf16, pl.cast(x_chunk_fp32, target_type=pl.BF16), [0, d0])
+            token_x_bf16 = pl.assemble(token_x_bf16, pl.cast(x_chunk_fp32, target_type=pl.BF16, mode="rint"), [0, d0])
 
     # Stage 1/2.1: qr = rms_norm(token_x @ wq_a, gamma_cq)
     qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
@@ -141,7 +141,7 @@ def qkv_proj_rope(
         with pl.at(level=pl.Level.CORE_GROUP):
             qr_store_col0 = qb * Q_LORA_CHUNK
             qr_chunk_fp32 = pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, qr_store_col0])
-            qr_bf16 = pl.assemble(qr_bf16, pl.cast(qr_chunk_fp32, target_type=pl.BF16), [0, qr_store_col0])
+            qr_bf16 = pl.assemble(qr_bf16, pl.cast(qr_chunk_fp32, target_type=pl.BF16, mode="rint"), [0, qr_store_col0])
 
     # Stage 2.3: W8A8C16 activation path: quantize normalized qr per token.
     qr_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
@@ -159,7 +159,7 @@ def qkv_proj_rope(
         for q1 in pl.range(0, Q_LORA, QUANT_CHUNK):
             qr_q_f32 = pl.cast(pl.slice(qr_bf16, [T, QUANT_CHUNK], [0, q1]), target_type=pl.FP32)
             qr_q_scaled = pl.row_expand_mul(qr_q_f32, qr_scale_quant)
-            qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="round")
+            qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
             qr = pl.assemble(qr, pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc"), [0, q1])
 
@@ -201,7 +201,7 @@ def qkv_proj_rope(
                 n0 = nb * HEAD_CHUNK
                 q_nope_chunk = pl.slice(q_proj_fp32, [T, HEAD_CHUNK], [0, h0 + n0])
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
-                q_flat = pl.assemble(q_flat, pl.cast(q_normed, target_type=pl.BF16), [0, h0 + n0])
+                q_flat = pl.assemble(q_flat, pl.cast(q_normed, target_type=pl.BF16, mode="rint"), [0, h0 + n0])
 
             q_rope = pl.slice(q_proj_fp32, [T, ROPE_DIM], [0, h0 + NOPE_DIM])
             q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
@@ -211,8 +211,8 @@ def qkv_proj_rope(
             sin = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
             q_rot_even = pl.sub(pl.mul(q_even, cos), pl.mul(q_odd, sin))
             q_rot_odd = pl.add(pl.mul(q_even, sin), pl.mul(q_odd, cos))
-            q_rot_even_bf16 = pl.cast(q_rot_even, target_type=pl.BF16)
-            q_rot_odd_bf16 = pl.cast(q_rot_odd, target_type=pl.BF16)
+            q_rot_even_bf16 = pl.cast(q_rot_even, target_type=pl.BF16, mode="rint")
+            q_rot_odd_bf16 = pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint")
 
         for rope_col in pl.range(0, ROPE_DIM, ROPE_CHUNK):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_rope_reassemble"):
@@ -232,7 +232,7 @@ def qkv_proj_rope(
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_rope_write"):
                 h0 = h * HEAD_DIM
-                q_flat = pl.assemble(q_flat, pl.cast(q_rot_chunk, target_type=pl.BF16), [0, h0 + NOPE_DIM + rope_col])
+                q_flat = pl.assemble(q_flat, pl.cast(q_rot_chunk, target_type=pl.BF16, mode="rint"), [0, h0 + NOPE_DIM + rope_col])
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
 
@@ -270,7 +270,7 @@ def qkv_proj_rope(
                 [1, KV_CHUNK],
             )
             kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
-            kv = pl.assemble(kv, pl.cast(kv_normed, target_type=pl.BF16), [0, n0])
+            kv = pl.assemble(kv, pl.cast(kv_normed, target_type=pl.BF16, mode="rint"), [0, n0])
     kv_rot_even_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
     kv_rot_odd_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP):
@@ -286,8 +286,8 @@ def qkv_proj_rope(
         sin = pl.cast(pl.slice(rope_sin, [T, ROPE_HALF], [0, 0]), target_type=pl.FP32)
         kv_rot_even = pl.sub(pl.mul(kv_even, cos), pl.mul(kv_odd, sin))
         kv_rot_odd = pl.add(pl.mul(kv_even, sin), pl.mul(kv_odd, cos))
-        kv_rot_even_tmp = pl.assemble(kv_rot_even_tmp, pl.cast(kv_rot_even, target_type=pl.BF16), [0, 0])
-        kv_rot_odd_tmp = pl.assemble(kv_rot_odd_tmp, pl.cast(kv_rot_odd, target_type=pl.BF16), [0, 0])
+        kv_rot_even_tmp = pl.assemble(kv_rot_even_tmp, pl.cast(kv_rot_even, target_type=pl.BF16, mode="rint"), [0, 0])
+        kv_rot_odd_tmp = pl.assemble(kv_rot_odd_tmp, pl.cast(kv_rot_odd, target_type=pl.BF16, mode="rint"), [0, 0])
 
     for rope_col in pl.range(0, ROPE_DIM, ROPE_CHUNK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_reassemble"):
@@ -306,7 +306,7 @@ def qkv_proj_rope(
             )
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_write"):
-            kv = pl.assemble(kv, pl.cast(kv_rot_chunk, target_type=pl.BF16), [0, NOPE_DIM + rope_col])
+            kv = pl.assemble(kv, pl.cast(kv_rot_chunk, target_type=pl.BF16, mode="rint"), [0, NOPE_DIM + rope_col])
 
     return q
 
@@ -366,15 +366,12 @@ def golden_qkv_proj_rope(tensors):
     gamma_cq  = tensors["gamma_cq"].float()
     gamma_ckv = tensors["gamma_ckv"].float()
 
-    def round_half_away_from_zero(x):
-        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
     def int8_quant_per_row(x):
         rows = x.reshape(-1, x.shape[-1]).float()
         amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
         scale_quant = INT8_SCALE_MAX / amax
         scaled = rows * scale_quant
-        out_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        out_i32 = torch.round(scaled).to(torch.int32)
         out_half = out_i32.to(torch.float16)
         out_i8 = out_half.to(torch.int8)
         return out_i8.reshape_as(x), (1.0 / scale_quant).reshape(*x.shape[:-1], 1)
@@ -435,14 +432,11 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    def round_half_away_from_zero(x):
-        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
         scale_quant = INT8_SCALE_MAX / amax
         scaled = w.float() * scale_quant.view(1, H * HEAD_DIM)
-        w_i32 = round_half_away_from_zero(scaled).to(torch.int32)
+        w_i32 = torch.round(scaled).to(torch.int32)
         w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
