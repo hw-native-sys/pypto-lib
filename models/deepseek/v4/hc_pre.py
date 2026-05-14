@@ -57,6 +57,7 @@ def hc_pre(
     x_flat_fp32 = pl.create_tensor([T, HC_DIM], dtype=pl.FP32)
     inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
+    mix_raw = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
 
     for kb in pl.parallel(HC_DIM_BLOCKS):
         k0 = kb * K_CHUNK
@@ -67,7 +68,7 @@ def hc_pre(
             )
             x_flat_fp32 = pl.assemble(x_flat_fp32, x_chunk_fp32, [0, k0])
 
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="rms"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms"):
         sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM_BLOCKS, stage=4):
             k0 = kb * K_CHUNK
@@ -79,31 +80,44 @@ def hc_pre(
         inv_rms_val = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)))
         inv_rms = pl.assemble(inv_rms, inv_rms_val, [0, 0])
 
-    mixes_flat = pl.reshape(mixes, [T * MIX_PAD])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="linear"):
-        for m in pl.range(MIX_HC):
-            mix_col = pl.full([1, T], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HC_DIM_BLOCKS):
-                k0 = kb * K_CHUNK
-                x_lin_chunk = pl.slice(x_flat_fp32, [T, K_CHUNK], [0, k0])
-                w_row = pl.slice(hc_fn, [1, K_CHUNK], [m, k0])
-                prod = pl.col_expand_mul(x_lin_chunk, w_row)
-                mix_col = pl.add(
-                    mix_col,
-                    pl.reshape(pl.row_sum(prod), [1, T]),
-                )
-            mix_col = pl.mul(mix_col, inv_rms)
-            mix_col_flat = pl.reshape(mix_col, [T])
-            for t in pl.unroll(T):
-                pl.write(
-                    mixes_flat,
-                    [t * MIX_PAD + m],
-                    pl.read(mix_col_flat, [t]),
-                )
-    mixes = pl.reshape(mixes_flat, [T, MIX_PAD])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear"):
+        x_lin_0_mat = pl.load(x_flat_fp32, [0, 0], [T, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+        w_lin_0_mat = pl.load(
+            hc_fn,
+            [0, 0],
+            [MIX_PAD, K_CHUNK],
+            valid_shapes=[MIX_HC, K_CHUNK],
+            target_memory=pl.MemorySpace.Mat,
+            transpose=True,
+        )
+        x_lin_0_left = pl.move(x_lin_0_mat, target_memory=pl.MemorySpace.Left)
+        w_lin_0_right = pl.move(w_lin_0_mat, target_memory=pl.MemorySpace.Right)
+        mix_acc = pl.matmul(x_lin_0_left, w_lin_0_right)
+        for kb in pl.range(1, HC_DIM_BLOCKS):
+            kl0 = kb * K_CHUNK
+            x_lin_mat = pl.load(x_flat_fp32, [0, kl0], [T, K_CHUNK], target_memory=pl.MemorySpace.Mat)
+            w_lin_mat = pl.load(
+                hc_fn,
+                [0, kl0],
+                [MIX_PAD, K_CHUNK],
+                valid_shapes=[MIX_HC, K_CHUNK],
+                target_memory=pl.MemorySpace.Mat,
+                transpose=True,
+            )
+            x_lin_left = pl.move(x_lin_mat, target_memory=pl.MemorySpace.Left)
+            w_lin_right = pl.move(w_lin_mat, target_memory=pl.MemorySpace.Right)
+            mix_acc = pl.matmul_acc(mix_acc, x_lin_left, w_lin_right)
+        mix_raw = pl.store(mix_acc, [0, 0], mix_raw)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear_scale"):
+        mixes = pl.assemble(
+            mixes,
+            pl.row_expand_mul(pl.slice(mix_raw, [T, MIX_PAD], [0, 0]), pl.reshape(inv_rms, [T, 1])),
+            [0, 0],
+        )
 
     comb_logits = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="split_pre_post"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_pre_post"):
         scale0 = pl.tensor.read(hc_scale, [0])
         scale1 = pl.tensor.read(hc_scale, [1])
         scale2 = pl.tensor.read(hc_scale, [2])
@@ -111,7 +125,7 @@ def hc_pre(
         ones_hc = pl.full([T, HC_PAD], dtype=pl.FP32, value=1.0)
         pre_base = pl.reshape(pl.slice(hc_base, [HC_PAD], [0]), [1, HC_PAD])
         pre_logits = pl.add(
-            pl.mul(pl.slice(mixes, [T, HC_PAD], [0, 0], valid_shape=[T, HC_MULT]), scale0),
+            pl.mul(pl.slice(mixes, [T, HC_PAD], [0, 0]), scale0),
             pl.col_expand_mul(ones_hc, pre_base),
         )
         pre_val = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
@@ -203,53 +217,58 @@ def hc_pre(
             row2_cur = pl.div(row2_norm, col_sum)
             row3_cur = pl.div(row3_norm, col_sum)
 
-        for t in pl.unroll(T):
+        for comb_t_idx in pl.unroll(T):
             for c in pl.unroll(HC_MULT):
                 pl.write(
                     comb_flat,
-                    [t * HC_MULT * HC_MULT + 0 * HC_MULT + c],
-                    pl.read(row0_cur, [t, c]),
+                    [comb_t_idx * HC_MULT * HC_MULT + 0 * HC_MULT + c],
+                    pl.read(row0_cur, [comb_t_idx, c]),
                 )
                 pl.write(
                     comb_flat,
-                    [t * HC_MULT * HC_MULT + 1 * HC_MULT + c],
-                    pl.read(row1_cur, [t, c]),
+                    [comb_t_idx * HC_MULT * HC_MULT + 1 * HC_MULT + c],
+                    pl.read(row1_cur, [comb_t_idx, c]),
                 )
                 pl.write(
                     comb_flat,
-                    [t * HC_MULT * HC_MULT + 2 * HC_MULT + c],
-                    pl.read(row2_cur, [t, c]),
+                    [comb_t_idx * HC_MULT * HC_MULT + 2 * HC_MULT + c],
+                    pl.read(row2_cur, [comb_t_idx, c]),
                 )
                 pl.write(
                     comb_flat,
-                    [t * HC_MULT * HC_MULT + 3 * HC_MULT + c],
-                    pl.read(row3_cur, [t, c]),
+                    [comb_t_idx * HC_MULT * HC_MULT + 3 * HC_MULT + c],
+                    pl.read(row3_cur, [comb_t_idx, c]),
                 )
 
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="write_post"):
-        for t in pl.parallel(0, T, 1, chunk=16):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_post"):
+        for token_idx in pl.range(0, T, 1):
             for h in pl.unroll(HC_MULT):
                 pl.write(
                     post_flat,
-                    [t * HC_MULT + h],
-                    pl.read(post_pad_flat, [t * HC_PAD + h]),
+                    [token_idx * HC_MULT + h],
+                    pl.read(post_pad_flat, [token_idx * HC_PAD + h]),
                 )
 
     pre_val_flat = pl.reshape(pre_val, [T * HC_PAD])
     x_mixed_view = pl.reshape(x_mixed, [T, D])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="mix_x"):
-        for t in pl.parallel(0, T, 1, chunk=16):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mix_x"):
+        for token_idx in pl.range(0, T, 1):
             for db in pl.range(D_BLOCKS):
                 d0 = db * D_CHUNK
-                y_row = pl.full([1, D_CHUNK], dtype=pl.FP32, value=0.0)
+                y_row = pl.tile.full([1, D_CHUNK], dtype=pl.FP32, value=0.0)
                 for h in pl.range(HC_MULT):
-                    pre_th = pl.read(pre_val_flat, [t * HC_PAD + h])
-                    x_row = pl.slice(x_flat_fp32, [1, D_CHUNK], [t, h * D + d0])
+                    pre_th = pl.read(pre_val_flat, [token_idx * HC_PAD + h])
+                    x_row = pl.load(
+                        x_flat_fp32,
+                        [token_idx, h * D + d0],
+                        [1, D_CHUNK],
+                        target_memory=pl.MemorySpace.Vec,
+                    )
                     y_row = pl.add(y_row, pl.mul(x_row, pre_th))
-                x_mixed_view = pl.assemble(
-                    x_mixed_view,
+                x_mixed_view = pl.store(
                     pl.cast(y_row, target_type=pl.BF16),
-                    [t, d0],
+                    [token_idx, d0],
+                    x_mixed_view,
                 )
     x_mixed = pl.reshape(x_mixed_view, [B, S, D])
     return x_mixed
