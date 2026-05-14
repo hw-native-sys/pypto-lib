@@ -59,6 +59,7 @@ HC_DIM = M.hc_dim
 # Router
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
+VOCAB = M.vocab_size
 
 # Expert (must match moe_expert.py)
 MOE_INTER = M.moe_intermediate_size
@@ -80,6 +81,9 @@ def moe(
     norm_w:         pl.Tensor[[D],                           pl.FP32],
     gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
     gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
+    layer_id:       pl.Scalar[pl.INT32],
+    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
     # ---- expert weights ----
     expert_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
     expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
@@ -116,6 +120,8 @@ def moe(
     moe_router(
         x_mixed,
         norm_w, gate_w, gate_bias,
+        layer_id,
+        tid2eid, input_ids,
         x_norm, indices, weights,
     )
 
@@ -191,6 +197,9 @@ def golden_moe(tensors):
         "norm_w":       tensors["norm_w"],
         "gate_w":       tensors["gate_w"],
         "gate_bias":    tensors["gate_bias"],
+        "layer_id":     tensors["layer_id"],
+        "tid2eid":      tensors["tid2eid"],
+        "input_ids":    tensors["input_ids"],
         "x_norm":       x_norm,
         "indices":      indices,
         "weights":      weights,
@@ -261,9 +270,9 @@ def golden_moe(tensors):
     tensors["comb_ffn"][:] = comb_t
 
 
-def build_tensor_specs():
+def build_tensor_specs(layer_id=0):
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def round_haz(x):
         return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
@@ -282,6 +291,10 @@ def build_tensor_specs():
     def init_norm_w():         return torch.ones(D)
     def init_gate_w():         return torch.randn(N_EXPERTS, D) / D ** 0.5
     def init_gate_bias():      return torch.zeros(N_EXPERTS)
+    def init_tid2eid():
+        return ((torch.arange(VOCAB).unsqueeze(1) + torch.arange(TOPK)) % N_EXPERTS).to(torch.int32)
+    def init_input_ids():
+        return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
     def init_recv_expert_count_full():
         return torch.full((N_LOCAL_EXPERTS, 1), RECV_MAX, dtype=torch.int32)
 
@@ -306,6 +319,9 @@ def build_tensor_specs():
         TensorSpec("norm_w",        [D],                torch.float32,  init_value=init_norm_w),
         TensorSpec("gate_w",        [N_EXPERTS, D],     torch.float32,  init_value=init_gate_w),
         TensorSpec("gate_bias",     [N_EXPERTS],        torch.float32,  init_value=init_gate_bias),
+        ScalarSpec("layer_id",      torch.int32,        layer_id),
+        TensorSpec("tid2eid",       [VOCAB, TOPK],      torch.int32,    init_value=init_tid2eid),
+        TensorSpec("input_ids",     [B, S],             torch.int64,    init_value=init_input_ids),
         TensorSpec("expert_w1",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w1_i8),
         TensorSpec("expert_w1_scale",  [N_LOCAL_EXPERTS, MOE_INTER],    torch.float32, init_value=lambda: w1_s),
         TensorSpec("expert_w3",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w3_i8),
@@ -362,6 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--runtime-profiling", action="store_true", default=False)
     args = parser.parse_args()
@@ -369,7 +386,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=moe,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe,
         config=RunConfig(
             rtol=1e-3,
