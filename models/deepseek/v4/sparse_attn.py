@@ -129,6 +129,8 @@ def sparse_attn(
     o_proj_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
     rope_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
     rope_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
+    rope_even_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
+    rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_rope_interleave = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
@@ -254,7 +256,7 @@ def sparse_attn(
             rope_even = pl.assemble(rope_even, pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint"), [rope_head_row, 0])
             rope_odd = pl.assemble(rope_odd, pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint"), [rope_head_row, 0])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble_matmul"):
             for r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
                 rope_even_chunk = rope_even[rope_head_row : rope_head_row + H, r0 : r0 + ROPE_CHUNK]
                 rope_odd_chunk = rope_odd[rope_head_row : rope_head_row + H, r0 : r0 + ROPE_CHUNK]
@@ -270,15 +272,29 @@ def sparse_attn(
                     b_trans=True,
                     out_dtype=pl.FP32,
                 )
-                rope_chunk = pl.cast(
-                    pl.add(rope_even_interleave, rope_odd_interleave),
-                    target_type=pl.BF16,
-                )
-                o_rope_interleave = pl.assemble(
-                    o_rope_interleave,
-                    rope_chunk,
+                rope_even_interleave_buf = pl.assemble(
+                    rope_even_interleave_buf,
+                    rope_even_interleave,
                     [rope_head_row, 2 * r0],
                 )
+                rope_odd_interleave_buf = pl.assemble(
+                    rope_odd_interleave_buf,
+                    rope_odd_interleave,
+                    [rope_head_row, 2 * r0],
+                )
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble_combine"):
+            rope_even_tile = rope_even_interleave_buf[rope_head_row : rope_head_row + H, 0 : ROPE_DIM]
+            rope_odd_tile = rope_odd_interleave_buf[rope_head_row : rope_head_row + H, 0 : ROPE_DIM]
+            rope_full = pl.cast(
+                pl.add(rope_even_tile, rope_odd_tile),
+                target_type=pl.BF16,
+            )
+            o_rope_interleave = pl.assemble(
+                o_rope_interleave,
+                rope_full,
+                [rope_head_row, 0],
+            )
 
     for b in pl.range(B):
         for h in pl.parallel(0, H, 1):
