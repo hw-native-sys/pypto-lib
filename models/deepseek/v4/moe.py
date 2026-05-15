@@ -71,7 +71,7 @@ N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 assert RECV_MAX >= T * TOPK, "packed layout needs RECV_MAX >= T * TOPK"
 
 
-@pl.jit
+@pl.jit.inline
 def moe(
     # ---- router (hc_pre + ffn_norm + gate) inputs ----
     x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
@@ -81,7 +81,6 @@ def moe(
     norm_w:         pl.Tensor[[D],                           pl.FP32],
     gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
     gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
-    layer_id:       pl.Scalar[pl.INT32],
     tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
     input_ids:      pl.Tensor[[B, S],                        pl.INT64],
     # ---- expert weights ----
@@ -98,19 +97,18 @@ def moe(
     shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
     shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
     recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1],  pl.INT32],
-    # ---- outputs ----
-    x_next:         pl.Out[pl.Tensor[[B, S, HC_MULT, D],     pl.BF16]],
-    ffn_out:        pl.Out[pl.Tensor[[T, D],                 pl.BF16]],
-    post_ffn:       pl.Out[pl.Tensor[[B, S, HC_MULT],        pl.FP32]],
-    comb_ffn:       pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
+    # ---- output ----
+    x_next:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    # ---- scalars ----
+    layer_id:       pl.Scalar[pl.INT32],
 ):
     # Stage 1: hc_pre(ffn) -> x_mixed, post_ffn, comb_ffn
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    post_ffn_tmp = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
-    comb_ffn_tmp = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
+    post_ffn = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
+    comb_ffn = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn_tmp, comb_ffn_tmp,
+        x_mixed, post_ffn, comb_ffn,
     )
 
     # Stage 2: router kernel -> x_norm and compact route tables.
@@ -150,15 +148,59 @@ def moe(
     )
 
     # Stage 5: combine routed and shared expert outputs.
+    # ``ffn_out`` is [B, S, D] so ``hc_post`` consumes it directly with no
+    # post-write reshape — avoids the codegen alias bug where reshape on
+    # the SSA-rebound output would resolve to ``routed_y_buf__rv_v2`` and
+    # trigger a runtime ``valid_reshape`` numel mismatch.
+    ffn_out = pl.create_tensor([B, S, D], dtype=pl.BF16)
     moe_combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
 
     # Stage 6: hc_post(ffn) merges the FFN output back into the HC stack.
-    ffn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    ffn_out_3d = pl.reshape(ffn_out, [B, S, D])
-    x_next = hc_post(ffn_out_3d, x_hc, post_ffn_tmp, comb_ffn_tmp, x_next)
-    post_ffn[:, :, :] = post_ffn_tmp
-    comb_ffn[:, :, :, :] = comb_ffn_tmp
-    return x_next, ffn_out, post_ffn, comb_ffn
+    x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    return x_next
+
+
+@pl.jit
+def moe_test(
+    x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
+    hc_ffn_scale:   pl.Tensor[[3],                           pl.FP32],
+    hc_ffn_base:    pl.Tensor[[MIX_HC],                      pl.FP32],
+    norm_w:         pl.Tensor[[D],                           pl.FP32],
+    gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
+    gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
+    layer_id:       pl.Scalar[pl.INT32],
+    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    expert_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w3:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
+    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
+    expert_w2:      pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER],  pl.INT8],
+    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D],            pl.FP32],
+    shared_w1:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w3:      pl.Tensor[[MOE_INTER, D],                pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
+    shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
+    shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
+    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1],  pl.INT32],
+    x_next:         pl.Out[pl.Tensor[[B, S, HC_MULT, D],     pl.BF16]],
+):
+    x_next = moe(
+        x_hc,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias,
+        tid2eid, input_ids,
+        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
+        expert_w2, expert_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        recv_expert_count_full,
+        x_next,
+        layer_id,
+    )
+    return x_next
 
 
 # =============================================================================
@@ -245,7 +287,7 @@ def golden_moe(tensors):
     })
 
     # Stage 5: combine routed and shared expert outputs.
-    ffn_out = torch.zeros(T, D, dtype=torch.bfloat16)
+    ffn_out = torch.zeros(B, S, D, dtype=torch.bfloat16)
     golden_moe_combine({
         "recv_y":            recv_y,
         "recv_token":        recv_token,
@@ -257,7 +299,7 @@ def golden_moe(tensors):
     # Stage 6: hc_post(ffn).
     x_next = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
-        "x":        ffn_out.reshape(B, S, D),
+        "x":        ffn_out,
         "residual": tensors["x_hc"],
         "post":     post_t,
         "comb":     comb_t,
@@ -265,9 +307,6 @@ def golden_moe(tensors):
     })
 
     tensors["x_next"][:]  = x_next
-    tensors["ffn_out"][:] = ffn_out
-    tensors["post_ffn"][:] = post_t
-    tensors["comb_ffn"][:] = comb_t
 
 
 def build_tensor_specs(layer_id=0):
@@ -336,9 +375,6 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("shared_w2_scale",  [D],                             torch.float32, init_value=lambda: sw2_s),
         TensorSpec("recv_expert_count_full", [N_LOCAL_EXPERTS, 1],       torch.int32,   init_value=init_recv_expert_count_full),
         TensorSpec("x_next",        [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        TensorSpec("ffn_out",       [T, D],             torch.bfloat16, is_output=True),
-        TensorSpec("post_ffn",      [B, S, HC_MULT],    torch.float32,  is_output=True),
-        TensorSpec("comb_ffn",      [B, S, HC_MULT, HC_MULT], torch.float32, is_output=True),
     ]
 
 
@@ -380,12 +416,12 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
     result = run_jit(
-        fn=moe,
+        fn=moe_test,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe,
         config=RunConfig(
@@ -395,10 +431,9 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
+                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "ffn_out": allclose_with_tolerance(1e-2, 5e-2),
                 "x_next": allclose_with_tolerance(1e-2, 5e-2),
             },
         ),

@@ -39,12 +39,16 @@ def moe_combine(
     recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
     sh:                pl.Tensor[[T, D],                         pl.BF16],
-    ffn_out:           pl.Tensor[[T, D],                         pl.BF16],
+    # ``ffn_out`` is [B, S, D] so the immediate consumer (``hc_post``'s ``x``
+    # input) can use the buffer as-is. The body reshapes to a [T, D] view
+    # before any kernel scope so the inner loop indexes flat.
+    ffn_out:           pl.Tensor[[B, S, D],                      pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_token_flat = pl.reshape(recv_token, [N_LOCAL_EXPERTS * RECV_MAX])
     count_flat = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
     routed_y_buf = pl.create_tensor([T * N_LOCAL_EXPERTS, D], dtype=pl.BF16)
+    ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine_init"):
         for r0 in pl.range(0, T * N_LOCAL_EXPERTS, N_LOCAL_EXPERTS):
@@ -71,7 +75,7 @@ def moe_combine(
                 for e in pl.range(N_LOCAL_EXPERTS):
                     row = pl.cast(routed_y_buf[base + e : base + e + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
                     acc = pl.add(acc, row)
-                ffn_out[t : t + 1, d0 : d0 + COL_CHUNK] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                ffn_out_flat[t : t + 1, d0 : d0 + COL_CHUNK] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
@@ -80,7 +84,7 @@ def moe_combine_test(
     recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
     sh:                pl.Tensor[[T, D],                         pl.BF16],
-    ffn_out:           pl.Out[pl.Tensor[[T, D],                  pl.BF16]],
+    ffn_out:           pl.Out[pl.Tensor[[B, S, D],               pl.BF16]],
 ):
     moe_combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
     return ffn_out
@@ -103,7 +107,7 @@ def golden_moe_combine(tensors):
     ffn_out = sh.float()
     for e in range(N_LOCAL_EXPERTS):
         ffn_out = ffn_out + routed_y_buf[:, e, :].float()
-    tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16)
+    tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16).reshape(B, S, D)
 
 
 def build_tensor_specs():
@@ -139,7 +143,7 @@ def build_tensor_specs():
         TensorSpec("recv_token",        [N_LOCAL_EXPERTS, RECV_MAX],    torch.int32,    init_value=init_recv_token),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1],           torch.int32,    init_value=init_recv_expert_count),
         TensorSpec("sh",                [T, D],                         torch.bfloat16, init_value=init_sh),
-        TensorSpec("ffn_out",           [T, D],                         torch.bfloat16, is_output=True),
+        TensorSpec("ffn_out",           [B, S, D],                      torch.bfloat16, is_output=True),
     ]
 
 

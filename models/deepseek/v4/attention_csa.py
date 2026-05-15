@@ -155,7 +155,6 @@ def attention_csa(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -316,6 +315,7 @@ def attention_csa(
 
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
     # fixed metadata while the CSA path still composes indexer at runtime.
+    cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     for t_idx in pl.parallel(T):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_sparse_idx"):
@@ -364,7 +364,7 @@ def attention_csa(
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
     x_out = hc_post(attn_out_3d, x_hc, post_t, comb_t, x_out)
-    return x_out, idx_kv_cache, cmp_sparse_indices
+    return x_out
 
 
 @pl.jit
@@ -410,8 +410,7 @@ def attention_csa_test_refresh(
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
-    cmp_sparse_indices: pl.Out[pl.Tensor[[T, SPARSE_TOPK], pl.INT32]],
+    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -420,7 +419,7 @@ def attention_csa_test_refresh(
     x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
 ):
-    x_out, idx_kv_cache, cmp_sparse_indices = attention_csa(
+    x_out = attention_csa(
         x_hc,
         x_indexer,
         hc_attn_fn,
@@ -463,7 +462,6 @@ def attention_csa_test_refresh(
         cmp_kv,
         cmp_block_table,
         idx_kv_cache,
-        cmp_sparse_indices,
         attn_sink,
         seqused_kv,
         wo_a,
@@ -472,7 +470,7 @@ def attention_csa_test_refresh(
         x_out,
         start_pos,
     )
-    return x_out, idx_kv_cache, cmp_sparse_indices
+    return x_out
 
 
 def golden_attention_csa(tensors):
@@ -724,7 +722,6 @@ def golden_attention_csa(tensors):
         idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :CSA_CMP_VALID_TOPK],
         dim=-1,
     ).values
-    tensors["cmp_sparse_indices"][:] = sparse_topk
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn_online({
@@ -755,119 +752,6 @@ def golden_attention_csa(tensors):
         "y": y,
     })
     tensors["x_out"][:] = y
-
-
-def make_pass_rate_compare(threshold: float):
-    def cmp(actual, expected, *, rtol, atol, **_):
-        import torch
-
-        close = torch.isclose(actual, expected, rtol=rtol, atol=atol)
-        rate = close.float().mean().item()
-        n_fail = int((~close).sum().item())
-        ok = rate >= threshold
-        msg = (
-            f"    pass_rate={rate:.6f} (threshold {threshold:.6f}), "
-            f"{n_fail}/{actual.numel()} mismatched  rtol={rtol} atol={atol}"
-        )
-        if not ok:
-            flat_a = actual.flatten()
-            flat_e = expected.flatten()
-            idx = torch.where(~close.flatten())[0][:5]
-            lines = [
-                f"    [{i.item()}] actual={flat_a[i].item()}, expected={flat_e[i].item()}"
-                for i in idx
-            ]
-            msg += "\n    first {} mismatches:\n".format(idx.numel()) + "\n".join(lines)
-        return ok, msg
-
-    cmp.__name__ = f"pass_rate>={threshold:.4f}"
-    return cmp
-
-
-def compare_idx_kv_cache(actual, expected, *, rtol, atol, **_):
-    import torch
-
-    if actual.shape != expected.shape:
-        return False, f"    shape mismatch: {tuple(actual.shape)} vs {tuple(expected.shape)}"
-    if actual.dtype != torch.bfloat16 or expected.dtype != torch.bfloat16:
-        return False, (
-            f"    compare_idx_kv_cache requires BF16 tensors, "
-            f"got actual={actual.dtype} expected={expected.dtype}"
-        )
-
-    actual_f = actual.cpu().to(torch.float32)
-    expected_f = expected.cpu().to(torch.float32)
-    close_mask = torch.isclose(actual_f, expected_f, rtol=rtol, atol=atol)
-    finite_mask = torch.isfinite(actual_f) & torch.isfinite(expected_f)
-
-    actual_bits = actual.cpu().contiguous().view(torch.int16).to(torch.int32)
-    expected_bits = expected.cpu().contiguous().view(torch.int16).to(torch.int32)
-    ulp_diff = torch.abs(actual_bits - expected_bits)
-    strict_ok = close_mask | (finite_mask & (ulp_diff <= 1))
-
-    bad_mask = ~strict_ok
-    bad_count = int(bad_mask.sum().item())
-    max_bad = round(1e-5 * actual.numel())
-    if bad_count <= max_bad:
-        return True, ""
-
-    mismatch_indices = torch.where(bad_mask.flatten())[0]
-    flat_actual = actual_f.flatten()
-    flat_expected = expected_f.flatten()
-    flat_ulp = ulp_diff.flatten()
-    n_show = min(20, mismatch_indices.numel())
-    idx = mismatch_indices[:n_show]
-    lines = [
-        (
-            f"    [{i.item()}] actual={flat_actual[i].item()}, "
-            f"expected={flat_expected[i].item()}, ulp_diff={flat_ulp[i].item()}"
-        )
-        for i in idx
-    ]
-    detail = (
-        f"    Mismatched elements after 1-ULP allowance: "
-        f"{bad_count}/{actual.numel()}  max_allowed={max_bad}  rtol={rtol} atol={atol}\n"
-        f"    first {n_show} mismatches:\n" + "\n".join(lines)
-    )
-    return False, detail
-
-
-compare_idx_kv_cache.__name__ = "bf16_allclose_or_ulp_or_tiny_tail(max_error_ratio=1e-5)"
-
-
-def compare_sparse_indices(actual, expected, *, rtol, atol, **_):
-    import torch
-
-    if actual.shape != expected.shape:
-        return False, f"    shape mismatch: {tuple(actual.shape)} vs {tuple(expected.shape)}"
-
-    cache_len = (START_POS + S) // COMPRESS_RATIO
-    valid_topk = min(IDX_TOPK, cache_len)
-
-    actual_2d = actual.reshape(T, SPARSE_TOPK)
-    expected_2d = expected.reshape(T, SPARSE_TOPK)
-    if torch.equal(actual_2d, expected_2d):
-        return True, ""
-
-    window_ok = torch.equal(actual_2d[:, :WIN], expected_2d[:, :WIN])
-    pad_ok = torch.equal(actual_2d[:, WIN + valid_topk:], expected_2d[:, WIN + valid_topk:])
-    actual_cmp = torch.sort(actual_2d[:, WIN:WIN + valid_topk], dim=-1).values
-    expected_cmp = torch.sort(expected_2d[:, WIN:WIN + valid_topk], dim=-1).values
-    topk_set_ok = torch.equal(actual_cmp, expected_cmp)
-    if window_ok and pad_ok and topk_set_ok:
-        return True, ""
-
-    mismatch_rows = torch.where((actual_cmp != expected_cmp).any(dim=-1))[0]
-    row = int(mismatch_rows[0].item()) if mismatch_rows.numel() else 0
-    return False, (
-        f"    sparse-index set mismatch: window_ok={window_ok} pad_ok={pad_ok} "
-        f"valid_topk={valid_topk}\n"
-        f"      actual_sorted[{row}]  = {actual_cmp[row].tolist()}\n"
-        f"      expected_sorted[{row}]= {expected_cmp[row].tolist()}"
-    )
-
-
-compare_sparse_indices.__name__ = "sparse_topk_set_compare"
 
 
 def build_tensor_specs():
@@ -1145,8 +1029,7 @@ def build_tensor_specs():
         TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone(), is_output=True),
-        TensorSpec("cmp_sparse_indices", [T, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices, is_output=True),
+        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
@@ -1159,18 +1042,12 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--runtime-profiling", action="store_true", default=False)
-    parser.add_argument(
-        "--pass-rate",
-        type=float,
-        default=0.999,
-        help="Fraction of x_out elements that must satisfy atol/rtol. Quantized CSA composition is allowed a small mismatch tail.",
-    )
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -1184,12 +1061,10 @@ if __name__ == "__main__":
             runtime=dict(
                 platform=args.platform,
                 device_id=args.device,
-                runtime_profiling=args.runtime_profiling,
+                enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "idx_kv_cache": compare_idx_kv_cache,
-                "cmp_sparse_indices": compare_sparse_indices,
-                "x_out": make_pass_rate_compare(args.pass_rate),
+                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
             },
         ),
     )

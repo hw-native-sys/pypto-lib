@@ -74,7 +74,7 @@ def qkv_proj_rope(
 
     # Stage 0.1: fused attn_norm -> token_x_fp32
     token_x_fp32 = pl.create_tensor([T, D], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_norm_rms"):
         x_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
         for db in pl.range(D_BLOCKS):
             d0 = db * D_CHUNK
@@ -84,7 +84,7 @@ def qkv_proj_rope(
 
     x_inv_rms_t = pl.reshape(x_inv_rms, [T, 1])
     for db in pl.parallel(0, D_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="attn_norm_apply"):
             d0 = db * D_CHUNK
             x_chunk = pl.cast(pl.slice(x_flat, [T, D_CHUNK], [0, d0]), target_type=pl.FP32)
             norm_w_chunk = pl.reshape(pl.slice(norm_w, [D_CHUNK], [d0]), [1, D_CHUNK])
@@ -94,7 +94,7 @@ def qkv_proj_rope(
     # Stage 0.2: pre-cast token_x for split AIV->AIC flow.
     token_x_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
     for db in pl.parallel(0, D_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_x_cast_bf16"):
             d0 = db * D_CHUNK
             x_chunk_fp32 = pl.slice(token_x_fp32, [T, D_CHUNK], [0, d0])
             token_x_bf16 = pl.assemble(token_x_bf16, pl.cast(x_chunk_fp32, target_type=pl.BF16, mode="rint"), [0, d0])
@@ -102,7 +102,7 @@ def qkv_proj_rope(
     # Stage 1/2.1: qr = rms_norm(token_x @ wq_a, gamma_cq)
     qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
     for qb in pl.parallel(0, Q_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_matmul"):
             q_a_col0 = qb * Q_LORA_CHUNK
             d0_0 = 0
             x_chunk_bf16_0 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0_0])
@@ -115,7 +115,7 @@ def qkv_proj_rope(
                 q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
             qr_fp32 = pl.assemble(qr_fp32, q_acc, [0, q_a_col0])
 
-    with pl.at(level=pl.Level.CORE_GROUP):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rms"):
         qr_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
         for qb in pl.range(Q_BLOCKS):
             qr_sq_col0 = qb * Q_LORA_CHUNK
@@ -125,7 +125,7 @@ def qkv_proj_rope(
 
     qr_inv_rms_t = pl.reshape(qr_inv_rms, [T, 1])
     for qb in pl.parallel(0, Q_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_norm_apply"):
             qr_norm_col0 = qb * Q_LORA_CHUNK
             qr_chunk = pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, qr_norm_col0])
             gamma_chunk = pl.reshape(
@@ -138,14 +138,14 @@ def qkv_proj_rope(
     # Stage 2.2: pre-cast normalized qr for the W8A8 dynamic activation path.
     qr_bf16 = pl.create_tensor([T, Q_LORA], dtype=pl.BF16)
     for qb in pl.parallel(0, Q_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_cast_bf16"):
             qr_store_col0 = qb * Q_LORA_CHUNK
             qr_chunk_fp32 = pl.slice(qr_fp32, [T, Q_LORA_CHUNK], [0, qr_store_col0])
             qr_bf16 = pl.assemble(qr_bf16, pl.cast(qr_chunk_fp32, target_type=pl.BF16, mode="rint"), [0, qr_store_col0])
 
     # Stage 2.3: W8A8C16 activation path: quantize normalized qr per token.
     qr_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_quant"):
         qr_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for q0 in pl.range(0, Q_LORA, QUANT_CHUNK):
             qr_a_f32 = pl.cast(pl.slice(qr_bf16, [T, QUANT_CHUNK], [0, q0]), target_type=pl.FP32)
@@ -187,7 +187,7 @@ def qkv_proj_rope(
     # Stage 4: per-head RMSNorm + RoPE on q
     q_flat = pl.reshape(q, [T, H * HEAD_DIM])
     for h in pl.parallel(0, H, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="q_head_rms_rope"):
             h0 = h * HEAD_DIM
             q_head_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
             for db in pl.range(HEAD_DIM // HEAD_CHUNK):
@@ -239,7 +239,7 @@ def qkv_proj_rope(
     # Stage 5/6: kv = rms_norm(token_x @ wkv, gamma_ckv) + RoPE
     kv_fp32 = pl.create_tensor([T, HEAD_DIM], dtype=pl.FP32)
     for kb in pl.parallel(0, KV_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_matmul"):
             kv_col0 = kb * KV_CHUNK
             d0_0 = 0
             x_chunk_bf16_0 = pl.slice(token_x_bf16, [T, D_CHUNK], [0, d0_0])
@@ -252,7 +252,7 @@ def qkv_proj_rope(
                 kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
             kv_fp32 = pl.assemble(kv_fp32, kv_acc, [0, kv_col0])
 
-    with pl.at(level=pl.Level.CORE_GROUP):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rms"):
         kv_sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
         for kb in pl.range(KV_BLOCKS):
             kv_sq_col0 = kb * KV_CHUNK
@@ -262,7 +262,7 @@ def qkv_proj_rope(
 
     kv_inv_rms_t = pl.reshape(kv_inv_rms, [T, 1])
     for nb in pl.parallel(0, NOPE_DIM // KV_CHUNK, 1):
-        with pl.at(level=pl.Level.CORE_GROUP):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_norm_nope"):
             n0 = nb * KV_CHUNK
             kv_chunk = pl.slice(kv_fp32, [T, KV_CHUNK], [0, n0])
             gamma_kv_chunk = pl.reshape(
@@ -273,7 +273,7 @@ def qkv_proj_rope(
             kv = pl.assemble(kv, pl.cast(kv_normed, target_type=pl.BF16, mode="rint"), [0, n0])
     kv_rot_even_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
     kv_rot_odd_tmp = pl.create_tensor([T, ROPE_HALF], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_apply"):
         kv_rope = pl.slice(kv_fp32, [T, ROPE_DIM], [0, NOPE_DIM])
         gamma_rope = pl.reshape(
             pl.cast(pl.slice(gamma_ckv, [ROPE_DIM], [NOPE_DIM]), target_type=pl.FP32),
