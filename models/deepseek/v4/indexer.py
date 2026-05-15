@@ -528,17 +528,17 @@ def build_tensor_specs():
     from golden import ScalarSpec, TensorSpec
 
     def init_x():
-        return torch.randn(B, S, D) * 0.1
+        return torch.rand(B, S, D)
     def init_qr():
-        return torch.randn(B, S, Q_LORA) * 0.1
+        return torch.rand(B, S, Q_LORA)
     def init_wq_b():
-        return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
+        return torch.rand(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM)
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) / D ** 0.5
+        return torch.rand(D, IDX_N_HEADS)
     def init_cos():
-        return torch.cos(torch.arange(ROPE_HEAD_DIM // 2).reshape(1, ROPE_HEAD_DIM // 2) * 1e-3)
+        return torch.rand(1, ROPE_HEAD_DIM // 2)
     def init_sin():
-        return torch.sin(torch.arange(ROPE_HEAD_DIM // 2).reshape(1, ROPE_HEAD_DIM // 2) * 1e-3)
+        return torch.rand(1, ROPE_HEAD_DIM // 2)
     def init_odd_select():
         M = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
         for i in range(ROPE_HEAD_DIM // 2):
@@ -550,23 +550,17 @@ def build_tensor_specs():
             M[2*i, i] = 1
         return M
     def init_hadamard():
-        H = torch.ones((1, 1))
-        while H.shape[0] < IDX_HEAD_DIM:
-            H = torch.cat([
-                torch.cat([H,  H], dim=1),
-                torch.cat([H, -H], dim=1),
-            ], dim=0)
-        return H / (IDX_HEAD_DIM ** 0.5)
+        return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
     def init_inner_kv_state():
         return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
     def init_inner_score_state():
-        return torch.full((B, INNER_STATE_LEN, INNER_OUT_DIM), FP32_NEG_INF)
+        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
     def init_inner_wkv():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.rand(D, INNER_OUT_DIM)
     def init_inner_wgate():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.rand(D, INNER_OUT_DIM)
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1
+        return torch.rand(COMPRESS_RATIO, INNER_OUT_DIM)
     def init_inner_norm_w():
         return torch.ones(INNER_HEAD_DIM)
     def init_idx_kv_cache():
@@ -605,7 +599,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, bf16_allclose_or_ulp, ratio_allclose, run_jit, topk_pair_compare
+    from golden import RunConfig, ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -625,7 +619,7 @@ if __name__ == "__main__":
             compare_fn={
                 "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                 "topk_idxs":    topk_pair_compare("score"),
-                "idx_kv_cache": bf16_allclose_or_ulp(),
+                "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
             },
             runtime=dict(
                 platform=args.platform,

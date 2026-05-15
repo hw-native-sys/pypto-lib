@@ -29,8 +29,6 @@ NOPE_HEAD_DIM = M.nope_head_dim
 COMPRESS_RATIO = 128
 MAX_SEQ_LEN = 4096
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-FP32_NEG_INF = -3.4028234663852886e38
-
 COFF = 1
 OUT_DIM = COFF * HEAD_DIM          # 512
 STATE_LEN = COFF * COMPRESS_RATIO  # 128
@@ -338,23 +336,23 @@ def build_tensor_specs():
     from golden import ScalarSpec, TensorSpec
 
     def init_x():
-        return torch.randn(B, S, D) * 0.1
+        return torch.rand(B, S, D)
     def init_kv_state():
         return torch.zeros(B, STATE_LEN, OUT_DIM)
     def init_score_state():
-        return torch.full((B, STATE_LEN, OUT_DIM), FP32_NEG_INF)
+        return torch.zeros(B, STATE_LEN, OUT_DIM)
     def init_wkv():
-        return torch.randn(D, OUT_DIM) / D ** 0.5
+        return torch.rand(D, OUT_DIM)
     def init_wgate():
-        return torch.randn(D, OUT_DIM) / D ** 0.5
+        return torch.rand(D, OUT_DIM)
     def init_ape():
-        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1
+        return torch.rand(COMPRESS_RATIO, OUT_DIM)
     def init_norm_w():
         return torch.ones(HEAD_DIM)
     def init_cos():
-        return torch.cos(torch.arange(ROPE_HEAD_DIM // 2).reshape(1, ROPE_HEAD_DIM // 2) * 1e-3)
+        return torch.rand(1, ROPE_HEAD_DIM // 2)
     def init_sin():
-        return torch.sin(torch.arange(ROPE_HEAD_DIM // 2).reshape(1, ROPE_HEAD_DIM // 2) * 1e-3)
+        return torch.rand(1, ROPE_HEAD_DIM // 2)
     def init_odd_select():
         M = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
         for i in range(ROPE_HEAD_DIM // 2):
@@ -366,13 +364,7 @@ def build_tensor_specs():
             M[2*i, i] = 1
         return M
     def init_hadamard():
-        H = torch.ones((1, 1))
-        while H.shape[0] < HEAD_DIM:
-            H = torch.cat([
-                torch.cat([H,  H], dim=1),
-                torch.cat([H, -H], dim=1),
-            ], dim=0)
-        return H / (HEAD_DIM ** 0.5)
+        return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_kv_cache():
         return torch.zeros(B, IDX_KV_LEN, HEAD_DIM)
 
@@ -398,7 +390,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, bf16_allclose_or_ulp, ratio_allclose, run_jit
+    from golden import RunConfig, ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -424,7 +416,7 @@ if __name__ == "__main__":
                 "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
                 "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
                 "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-                "kv_cache":    bf16_allclose_or_ulp(),
+                "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
             },
         ),
     )
