@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP_WORLD_SIZE, EP_RANK, RECV_MAX)
+                    EP_WORLD_SIZE, EP_RANK, MOE_RECV_TILE, RECV_MAX)
 
 
 # model config
@@ -30,7 +30,7 @@ N_LOCAL_EXPERTS = N_EXPERTS // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
-RECV_TILE = 16
+RECV_TILE = MOE_RECV_TILE
 K_CHUNK = 512
 INTER_K = 512
 INTER_CHUNK = 128 if T >= 64 else 256

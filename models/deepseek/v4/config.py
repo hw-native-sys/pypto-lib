@@ -244,13 +244,29 @@ DECODE_SEQ = 1             # S: one token per step
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
+MOE_RECV_TILE = 16                        # rows per routed-expert tile
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
 INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero rows
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
+
+def ceil_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def moe_recv_max(
+    config: DeepSeekV4Config,
+    batch: int = DECODE_BATCH,
+    seq: int = DECODE_SEQ,
+    recv_tile: int = MOE_RECV_TILE,
+) -> int:
+    """Single-card packed-dispatch capacity per local expert."""
+    return ceil_to_multiple(batch * seq * config.num_experts_per_tok, recv_tile)
+
+
 # EP communication constants
 EP_WORLD_SIZE = 1   # demo 1; flash/pro depend on deployment (e.g. pro 16)
 EP_RANK = 0
-RECV_MAX = 384       # per-(local-expert) row upper bound
+RECV_MAX = moe_recv_max(FLASH)  # per-(local-expert) row upper bound
