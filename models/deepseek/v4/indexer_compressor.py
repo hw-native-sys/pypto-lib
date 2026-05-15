@@ -54,7 +54,7 @@ HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 
 
 @pl.jit.inline
-def compressor(
+def indexer_compressor(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
     kv_state: pl.Tensor[[B, STATE_LEN, OUT_DIM], pl.FP32],
@@ -290,7 +290,7 @@ def compressor_test(
     start_pos: pl.Scalar[pl.INT32],
     rotate: pl.Scalar[pl.BOOL],
 ):
-    kv, kv_state, score_state, kv_cache = compressor(
+    kv, kv_state, score_state, kv_cache = indexer_compressor(
         x, kv, kv_state, score_state, wkv, wgate, ape, norm_w, cos, sin, even_select, odd_select, hadamard, kv_cache, start_pos, rotate
     )
     return kv, kv_state, score_state, kv_cache

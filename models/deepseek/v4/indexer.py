@@ -14,7 +14,7 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
-from indexer_compressor import compressor
+from indexer_compressor import indexer_compressor
 
 # model config
 B = DECODE_BATCH
@@ -32,7 +32,7 @@ OFFSET = M.sliding_window  # ScalarSpec default; = win in attention orch; added 
 
 # kernel-local
 COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
-IDX_TOPK = 16        # standalone-test scale; model value is M.index_topk (512 flash / 1024 pro)
+IDX_TOPK = M.index_topk
 
 
 INNER_ROTATE = True
@@ -238,7 +238,7 @@ def indexer(
             weights_scale = pl.mul(weights_acc, WEIGHTS_SCALE)
             weights = pl.assemble(weights, weights_scale, [0, h0])
 
-    inner_kv, inner_kv_state, inner_score_state, idx_kv_cache = compressor(
+    inner_kv, inner_kv_state, inner_score_state, idx_kv_cache = indexer_compressor(
         x,
         inner_kv,
         inner_kv_state,

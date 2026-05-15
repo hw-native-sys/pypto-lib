@@ -176,12 +176,12 @@ def sparse_attn(
                     [window_valid + kk, 0],
                 )
 
-        for h in pl.parallel(0, H, 1):
-            attn_head_row = b * H + h
+        for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
+            attn_head_row = b * H + h0
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_init"):
-                q_batch = pl.col_expand(
-                    pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                    pl.cast(q_flat[attn_head_row : attn_head_row + 1, 0 : HEAD_DIM], target_type=pl.FP32),
+                q_batch = pl.cast(
+                    q_flat[attn_head_row : attn_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM],
+                    target_type=pl.FP32,
                 )
 
                 kv_batch = pl.col_expand(
@@ -212,11 +212,12 @@ def sparse_attn(
                     mi = mi_new
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_norm"):
-                sink_tile = pl.add(pl.sub(mi, mi), pl.read(attn_sink, [h]))
+                sink_bias = pl.reshape(attn_sink[h0 : h0 + MATMUL_ROW_PAD], [MATMUL_ROW_PAD, 1])
+                sink_tile = pl.add(pl.sub(mi, mi), sink_bias)
                 denom = pl.add(li, pl.exp(pl.sub(sink_tile, mi)))
                 oi_out = pl.row_expand_div(oi, denom)
                 attn_stage_row = pl.cast(
-                    oi_out[0 : 1, 0 : HEAD_DIM],
+                    oi_out[0 : MATMUL_ROW_PAD, 0 : HEAD_DIM],
                     target_type=pl.BF16,
                 )
                 attn_stage = pl.assemble(
