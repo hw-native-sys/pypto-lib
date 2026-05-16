@@ -178,44 +178,46 @@ def sparse_attn(
 
         for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
             attn_head_row = b * H + h0
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_init"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn"):
                 q_batch = pl.cast(
                     q_flat[attn_head_row : attn_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM],
                     target_type=pl.FP32,
                 )
 
-                kv_batch = pl.col_expand(
+                kv0_batch = pl.col_expand(
                     pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
                     pl.cast(kv_topk_batch[0 : 1, 0 : HEAD_DIM], target_type=pl.FP32),
                 )
-                oi = kv_batch
-                score0 = pl.row_sum(pl.mul(q_batch, kv_batch))
-                mi = pl.mul(score0, SOFTMAX_SCALE)
-                li = pl.exp(pl.sub(mi, mi))
+                oi_init = kv0_batch
+                score0 = pl.row_sum(pl.mul(q_batch, kv0_batch))
+                mi_init = pl.mul(score0, SOFTMAX_SCALE)
+                li_init = pl.exp(pl.sub(mi_init, mi_init))
 
-            for kk in pl.range(1, sparse_k):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_accum"):
-                    kv_batch = pl.col_expand(
+                for kk, (mi_loop, li_loop, oi_loop) in pl.range(
+                    1,
+                    sparse_k,
+                    init_values=(mi_init, li_init, oi_init),
+                ):
+                    cur_kv_batch = pl.col_expand(
                         pl.full([MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0),
                         pl.cast(kv_topk_batch[kk : kk + 1, 0 : HEAD_DIM], target_type=pl.FP32),
                     )
-                    cur_score = pl.row_sum(pl.mul(q_batch, kv_batch))
+                    cur_score = pl.row_sum(pl.mul(q_batch, cur_kv_batch))
                     cur_mi = pl.mul(cur_score, SOFTMAX_SCALE)
-                    mi_new = pl.maximum(mi, cur_mi)
-                    alpha = pl.exp(pl.sub(mi, mi_new))
+                    mi_new = pl.maximum(mi_loop, cur_mi)
+                    alpha = pl.exp(pl.sub(mi_loop, mi_new))
                     beta = pl.exp(pl.sub(cur_mi, mi_new))
-                    li = pl.add(pl.mul(alpha, li), beta)
-                    oi = pl.add(
-                        pl.row_expand_mul(oi, alpha),
-                        pl.row_expand_mul(kv_batch, beta),
+                    li_new = pl.add(pl.mul(alpha, li_loop), beta)
+                    oi_new = pl.add(
+                        pl.row_expand_mul(oi_loop, alpha),
+                        pl.row_expand_mul(cur_kv_batch, beta),
                     )
-                    mi = mi_new
+                    (mi_final, li_final, oi_final) = pl.yield_(mi_new, li_new, oi_new)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_norm"):
                 sink_bias = pl.reshape(attn_sink[h0 : h0 + MATMUL_ROW_PAD], [MATMUL_ROW_PAD, 1])
-                sink_tile = pl.add(pl.sub(mi, mi), sink_bias)
-                denom = pl.add(li, pl.exp(pl.sub(sink_tile, mi)))
-                oi_out = pl.row_expand_div(oi, denom)
+                sink_tile = pl.add(pl.sub(mi_final, mi_final), sink_bias)
+                denom = pl.add(li_final, pl.exp(pl.sub(sink_tile, mi_final)))
+                oi_out = pl.row_expand_div(oi_final, denom)
                 attn_stage_row = pl.cast(
                     oi_out[0 : MATMUL_ROW_PAD, 0 : HEAD_DIM],
                     target_type=pl.BF16,
@@ -298,14 +300,13 @@ def sparse_attn(
             )
 
     for b in pl.range(B):
-        for h in pl.parallel(0, H, 1):
-            pack_head_row = b * H + h
-            pack_group_idx = h // HEADS_PER_GROUP
-            pack_head_in_group = h % HEADS_PER_GROUP
-            pack_row = pack_group_idx * T + b
-            pack_col = pack_head_in_group * HEAD_DIM
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_pack_o_packed"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_pack_o_packed"):
+            for h in pl.range(0, H, 1):
+                pack_head_row = b * H + h
+                pack_group_idx = h // HEADS_PER_GROUP
+                pack_head_in_group = h % HEADS_PER_GROUP
+                pack_row = pack_group_idx * T + b
+                pack_col = pack_head_in_group * HEAD_DIM
                 o_packed = pl.assemble(
                     o_packed,
                     attn_stage[pack_head_row : pack_head_row + 1, 0 : NOPE_DIM],
