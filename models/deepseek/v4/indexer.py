@@ -312,28 +312,31 @@ def indexer(
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
     for t in pl.parallel(T):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
-            offset_i32 = pl.cast(offset, target_type=pl.INT32)
-            score_row = score_flat[t : t + 1, :]
-            idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
-            sorted_score_tile = pl.tensor.sort32(score_row, idx_init)
-            sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=64)
-            sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=256)
-            sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_init"):
             invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
             topk_idxs_flat = pl.assemble(topk_idxs_flat, invalid_idxs, [t, 0])
-            topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
-            topk_idxs_tile = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            raw_topk_idxs = pl.create_tensor([1, IDX_TOPK], dtype=pl.INT32)
-            raw_topk_idxs = pl.assemble(raw_topk_idxs, topk_idxs_tile, [0, 0])
-            valid_topk = pl.min(IDX_TOPK, cache_len)
-            topk_idxs_valid = pl.slice(
-                raw_topk_idxs,
-                [1, IDX_TOPK],
-                [0, 0],
-                valid_shape=[1, valid_topk],
-            )
-            topk_idxs_flat = pl.assemble(topk_idxs_flat, pl.add(topk_idxs_valid, offset_i32), [t, 0])
+    if cache_len > 0:
+        for t in pl.parallel(T):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
+                offset_i32 = pl.cast(offset, target_type=pl.INT32)
+                score_row = score_flat[t : t + 1, :]
+                idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+                sorted_score_tile = pl.tensor.sort32(score_row, idx_init)
+                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=64)
+                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=256)
+                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)
+                topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
+                topk_idxs_tile = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                raw_topk_idxs = pl.create_tensor([1, IDX_TOPK], dtype=pl.INT32)
+                raw_topk_idxs = pl.assemble(raw_topk_idxs, topk_idxs_tile, [0, 0])
+                valid_topk = pl.min(IDX_TOPK, cache_len)
+                topk_idxs_valid = pl.slice(
+                    raw_topk_idxs,
+                    [1, IDX_TOPK],
+                    [0, 0],
+                    valid_shape=[1, valid_topk],
+                )
+                topk_idxs_flat = pl.assemble(topk_idxs_flat, pl.add(topk_idxs_valid, offset_i32), [t, 0])
 
     return score, idx_kv_cache, topk_idxs
 

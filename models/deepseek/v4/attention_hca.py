@@ -63,8 +63,8 @@ IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cac
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 # Non-compression-step fixture: (START_POS + 1) % COMPRESS_RATIO != 0.
-# Use START_POS >= COMPRESS_RATIO - 1 so the compressor RoPE row
-# (start_pos + 1 - ratio) stays non-negative.
+# Warmup positions before the first compressed slot are supported; seqused_kv
+# bounds the valid compressed topk range.
 START_POS = 128
 # tiling
 Q_PROJ_OUT_CHUNK = 128
@@ -154,21 +154,30 @@ def attention_hca(
         rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
         rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
 
-    # Compressor RoPE row at start_pos + 1 - ratio; half-vector layout.
-    # This fixture keeps START_POS >= COMPRESS_RATIO - 1, so cmp_pos is
-    # always non-negative even when the step is not a compression boundary.
+    # Compressor RoPE is only consumed on compression steps. Warmup positions
+    # before the first compressed slot keep a zero placeholder to avoid a
+    # negative table row.
     cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
-        cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
-        cmp_cos = pl.col_expand(
-            pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
-        )
-        cmp_sin = pl.col_expand(
-            pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
-        )
+    if START_POS + 1 >= COMPRESS_RATIO:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
+            cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos = pl.col_expand(
+                cmp_cos_base,
+                pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+            cmp_sin = pl.col_expand(
+                cmp_sin_base,
+                pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+    else:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope_zero"):
+            zero_cos = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
+            zero_sin = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
+            cmp_cos = pl.sub(zero_cos, zero_cos)
+            cmp_sin = pl.sub(zero_sin, zero_sin)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -256,9 +265,8 @@ def attention_hca(
                 )
         cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
-    # topk_idxs: [0..WIN) window ⧺ [WIN..WIN+CMP_TOPK) deterministic compressed.
+    # topk_idxs: [0..WIN) window plus deterministic compressed slots.
     # sparse_attn's static TOPK contract is SPARSE_TOPK (= WIN+IDX_TOPK = 640 in demo);
-    # HCA only fills the first WIN+CMP_TOPK=160 slots and pads the rest with -1.
     # The actual valid count is bounded by seqused_kv inside sparse_attn.
     topk_idxs = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_topk"):
@@ -400,9 +408,6 @@ def golden_attention_hca(tensors):
     rd = ROPE_HEAD_DIM
     should_compress = ((start_pos + 1) % ratio) == 0
 
-    if start_pos == 0:
-        return  # prefill — decode-only orchestration skips
-
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
     step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
@@ -410,8 +415,12 @@ def golden_attention_hca(tensors):
     rope_cos_T = step_cos.expand(T, rd).contiguous()
     rope_sin_T = step_sin.expand(T, rd).contiguous()
     half_rd = rd // 2
-    cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
-    cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    if start_pos + 1 >= ratio:
+        cmp_cos = freqs_cos[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
+        cmp_sin = freqs_sin[start_pos + 1 - ratio:start_pos + 2 - ratio, :half_rd]
+    else:
+        cmp_cos = torch.zeros(1, half_rd, dtype=torch.bfloat16)
+        cmp_sin = torch.zeros(1, half_rd, dtype=torch.bfloat16)
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -716,7 +725,11 @@ if __name__ == "__main__":
             rtol=1e-2,
             atol=1e-2,
             compare_fn={
-                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+                "x_out": ratio_allclose(
+                    atol=1e-2 if START_POS < WIN - 1 else 3e-3,
+                    rtol=2.0 / 128,
+                    max_error_ratio=0.08 if START_POS < WIN - 1 else 0.005,
+                ),
             },
             compile=dict(dump_passes=True),
             runtime=dict(

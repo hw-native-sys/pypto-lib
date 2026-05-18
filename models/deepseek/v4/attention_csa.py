@@ -102,14 +102,9 @@ ROTATE_MAIN = False
 ROTATE_INNER = True
 
 # Keep the default fixture on a full-window compression step so sparse_attn
-# exercises both the window and compressed paths without partial-window special
-# casing. The kernel still gates compressed-cache writes from runtime
-# ``start_pos``.
+# exercises both the window and compressed paths. Warmup positions before the
+# first compressed slot are also supported when START_POS is lowered.
 START_POS = 127
-assert START_POS >= WIN - 1 and START_POS >= COMPRESS_RATIO - 1, (
-    f"CSA fixture requires a full-window decode step with a valid compressor RoPE row; "
-    f"got START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}, WIN={WIN}."
-)
 CSA_CMP_VALID_TOPK = min(IDX_TOPK, (START_POS + S) // COMPRESS_RATIO)
 
 @pl.jit.inline
@@ -185,7 +180,6 @@ def attention_csa(
     cmp_sin = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         pos = pl.cast(start_pos, pl.INDEX)
-        cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
         cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
         sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
         rope_cos_fp32 = pl.col_expand(
@@ -206,14 +200,20 @@ def attention_csa(
             pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [pos, 0]), target_type=pl.FP32),
         )
-        cmp_cos = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-        )
-        cmp_sin = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-        )
+        cmp_cos_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
+        cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
+        cmp_cos = cmp_cos_base
+        cmp_sin = cmp_sin_base
+        if START_POS + 1 >= COMPRESS_RATIO:
+            cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos = pl.col_expand(
+                cmp_cos_base,
+                pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+            )
+            cmp_sin = pl.col_expand(
+                cmp_sin_base,
+                pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+            )
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -326,8 +326,9 @@ def attention_csa(
             invalid_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, invalid_row, [t_idx, 0])
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, window_row, [t_idx, 0])
-            cmp_topk_valid = pl.slice(idx_topk_flat, [1, CSA_CMP_VALID_TOPK], [t_idx, 0])
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk_valid, [t_idx, WIN])
+            if CSA_CMP_VALID_TOPK > 0:
+                cmp_topk_valid = pl.slice(idx_topk_flat, [1, CSA_CMP_VALID_TOPK], [t_idx, 0])
+                cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk_valid, [t_idx, WIN])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     attn_out = sparse_attn(
@@ -598,8 +599,6 @@ def golden_attention_csa(tensors):
     })
 
     start_pos = int(tensors["start_pos"])
-    if start_pos == 0:
-        return
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
@@ -607,8 +606,12 @@ def golden_attention_csa(tensors):
     rope_sin_t = freqs_sin[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
     step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
     step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
-    cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
-    cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    if start_pos + 1 >= COMPRESS_RATIO:
+        cmp_cos = freqs_cos[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+        cmp_sin = freqs_sin[start_pos + 1 - COMPRESS_RATIO:start_pos + 2 - COMPRESS_RATIO, :HALF_ROPE].contiguous()
+    else:
+        cmp_cos = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
+        cmp_sin = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -701,7 +704,8 @@ def golden_attention_csa(tensors):
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     sparse_topk[:, :WIN] = torch.arange(WIN, dtype=torch.int32)
-    sparse_topk[:, WIN:WIN + CSA_CMP_VALID_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :CSA_CMP_VALID_TOPK]
+    if CSA_CMP_VALID_TOPK > 0:
+        sparse_topk[:, WIN:WIN + CSA_CMP_VALID_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :CSA_CMP_VALID_TOPK]
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn_online({
@@ -917,7 +921,9 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        return torch.full((B,), WIN + ((START_POS + 1) // COMPRESS_RATIO), dtype=torch.int32)
+        win_valid = min(WIN, START_POS + 1)
+        cmp_valid = (START_POS + 1) // COMPRESS_RATIO
+        return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
 
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
@@ -1034,7 +1040,11 @@ if __name__ == "__main__":
                 enable_l2_swimlane=args.enable_l2_swimlane,
             ),
             compare_fn={
-                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+                "x_out": ratio_allclose(
+                    atol=1e-2 if START_POS < WIN - 1 else 3e-3,
+                    rtol=2.0 / 128,
+                    max_error_ratio=0.08 if START_POS < WIN - 1 else 0.005,
+                ),
             },
         ),
     )
