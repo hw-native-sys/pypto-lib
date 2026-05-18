@@ -5,14 +5,16 @@ programming framework, targeting Ascend NPUs (910B/C, 950).
 
 ```
 examples/        Self-contained kernels for learning the DSL
-  beginner/        hello_world, matmul，etc.
-  intermediate/    softmax, rms_norm, etc.
+  beginner/        hello_world, matmul, etc.
+  intermediate/    softmax, rms_norm, rope, etc.
+  advanced/        Multi-stage fused kernels (gemm_eltwise, multi_proj)
 models/          End-to-end LLM kernels organized by family
   qwen3/14b/       Qwen3-14B prefill + decode
   qwen3/32b/       Qwen3-32B decode
   deepseek/v3_2/   DeepSeek V3.2-EXP
   deepseek/v4/     DeepSeek V4
 golden/          Test harness — compile, run on device, validate against torch
+tools/           Post-build utilities (e.g. kernel-insight export)
 tests/           Lint checks and golden-fn unit tests
 docs/            Coding-style and workflow reference
 ```
@@ -45,13 +47,19 @@ Existing kernels under `examples/intermediate/` are the best reference for
 single-stage patterns; `models/qwen3/14b/qwen3_14b_decode.py` shows a
 full-model fused kernel.
 
+## Performance tuning
+
+See [docs/performance-tuning.md](docs/performance-tuning.md) for the L2
+(inter-kernel) and L1/L0 (intra-kernel) tuning workflow — L2 swimlane in
+Perfetto, PMU counters, and the per-kernel insight swimlane.
+
 ## Dependencies
 
 | Repo | Role |
 |------|------|
-| **pypto** | Tile-based programming framework — lowers Tensor → Tile → Block → Execution graphs through multi-level IR and codegen |
-| **simpler** | PTO runtime — builds and executes task dependency graphs across AICPU + AICore on Ascend devices (submodule of pypto) |
-| **ptoas** | LLVM/MLIR-based assembler/optimizer for PTO Bytecode — parses `.pto`, runs Da Vinci-specific passes, lowers to C++ |
-| **pto-isa** | PTO Tile Library — virtual tile-ISA implementations and headers shared across Ascend generations |
+| [**pypto**](https://github.com/hw-native-sys/pypto) | Tile-based programming framework — lowers Tensor → Tile → Block → Execution graphs through multi-level IR and codegen |
+| [**simpler**](https://github.com/hw-native-sys/simpler) | PTO runtime — builds and executes task dependency graphs across AICPU + AICore on Ascend devices (submodule of pypto) |
+| [**ptoas**](https://github.com/hw-native-sys/PTOAS) | LLVM/MLIR-based assembler/optimizer for PTO Bytecode — parses `.pto`, runs Da Vinci-specific passes, lowers to C++ |
+| [**pto-isa**](https://github.com/hw-native-sys/pto-isa) | PTO Tile Library — virtual tile-ISA implementations and headers shared across Ascend generations |
 
 Pinned versions live in [.github/workflows/ci.yml](.github/workflows/ci.yml).

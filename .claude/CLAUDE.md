@@ -9,8 +9,8 @@ Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
 
 ## Repository Layout
 
-- `examples/{beginner,intermediate}/` — self-contained kernels for learning the DSL
-- `models/{qwen3,deepseek,kimi,milm}/` — end-to-end LLM kernels by family
+- `examples/{beginner,intermediate,advanced}/` — self-contained kernels for learning the DSL
+- `models/{qwen3,deepseek}/` — end-to-end LLM kernels by family
 - `golden/` — test harness: compile, run on device, validate against torch
 - `tests/` — lint checks and golden-fn unit tests
 - `docs/` — coding-style and workflow reference
