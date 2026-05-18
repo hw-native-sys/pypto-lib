@@ -616,7 +616,7 @@ def build_qwen3_decode_program(
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                         mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
-                for dob in pl.range(down_out_blocks):
+                for dob in pl.parallel(0, down_out_blocks, 1):
                     d0 = dob * DOWN_OUT_CHUNK
                     fp32_chunk_gm = pl.create_tensor([BATCH_TILE, DOWN_OUT_CHUNK], dtype=pl.FP32)
 
