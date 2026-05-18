@@ -205,9 +205,9 @@ def attention_hca(
     # ori_kv scatter at slot = start_pos % WIN.
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_scatter_ori"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_ori"):
         ori_slot = start_pos % WIN
-        for b in pl.parallel(0, B, 1, chunk=1):
+        for b in pl.parallel(0, B, 1):
             blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
             dst_row = blk_id * BLOCK_SIZE + ori_slot
             kv_cache_flat = pl.assemble(
@@ -250,11 +250,11 @@ def attention_hca(
         cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
         cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
         cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_scatter_cmp"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_cmp"):
             cmp_slot_rel = start_pos // COMPRESS_RATIO
             cmp_intra = cmp_slot_rel % BLOCK_SIZE
             cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
-            for b in pl.parallel(0, B, 1, chunk=1):
+            for b in pl.parallel(0, B, 1):
                 cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
                 cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
                 cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel

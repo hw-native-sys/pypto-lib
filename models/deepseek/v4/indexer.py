@@ -84,7 +84,6 @@ def indexer(
     offset: pl.Scalar[pl.INT32],     # added to topk_idxs (= win from attention orch)
     inner_rotate: pl.Scalar[pl.BOOL],
 ):
-    # TODO: kernel implementation
     cache_len = (start_pos + S) // COMPRESS_RATIO
     cache_blocks = (cache_len + CACHE_TILE - 1) // CACHE_TILE
 
