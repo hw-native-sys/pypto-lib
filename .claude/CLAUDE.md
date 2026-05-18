@@ -4,14 +4,13 @@
 
 PyPTO-Lib hosts tensor-level kernels and end-to-end LLM model
 implementations built on the **pypto** programming framework, targeting
-Ascend NPUs (910B/C, 950). It also ships a small inference engine
-(`llm/`) and a golden-validation test harness (`golden/`).
+Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
+(`golden/`).
 
 ## Repository Layout
 
 - `examples/{beginner,intermediate}/` — self-contained kernels for learning the DSL
 - `models/{qwen3,deepseek,kimi,milm}/` — end-to-end LLM kernels by family
-- `llm/` — minimal inference engine (engine, scheduler, kv-cache, sampler)
 - `golden/` — test harness: compile, run on device, validate against torch
 - `tests/` — lint checks and golden-fn unit tests
 - `docs/` — coding-style and workflow reference

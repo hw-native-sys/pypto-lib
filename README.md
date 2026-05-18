@@ -12,8 +12,6 @@ models/          End-to-end LLM kernels organized by family
   qwen3/32b/       Qwen3-32B decode
   deepseek/v3_2/   DeepSeek V3.2-EXP
   deepseek/v4/     DeepSeek V4
-llm/             Minimal inference engine (engine, scheduler, kv-cache, sampler)
-                 with a Qwen3-14B example wiring decode + prefill + lm_head
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
 docs/            Coding-style and workflow reference
