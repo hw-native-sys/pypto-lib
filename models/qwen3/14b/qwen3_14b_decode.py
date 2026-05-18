@@ -616,34 +616,54 @@ def build_qwen3_decode_program(
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                         mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
-                for dob in pl.range(down_out_blocks):
-                    d0 = dob * DOWN_OUT_CHUNK
-                    fp32_chunk_gm = pl.create_tensor([BATCH_TILE, DOWN_OUT_CHUNK], dtype=pl.FP32)
-
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
-                        down_acc = pl.create_tensor([BATCH_TILE, DOWN_OUT_CHUNK], dtype=pl.FP32)
-                        for ob in pl.pipeline(0, down_mlp_blocks, stage=2):
-                            o0 = ob * DOWN_MLP_CHUNK
-                            down_mlp_chunk_bf16 = mlp_tile[:, o0 : o0 + DOWN_MLP_CHUNK]
-                            w_down_chunk = w_down[o0 : o0 + DOWN_MLP_CHUNK, d0 : d0 + DOWN_OUT_CHUNK]
-                            if o0 == 0:
-                                down_acc = pl.matmul(down_mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
-                            else:
+                if cur_valid == BATCH_TILE:
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.LEFT_RIGHT)],
+                        name_hint="down_proj_residual",
+                    ):
+                        for dob in pl.parallel(down_out_blocks, chunk=1):
+                            d0 = dob * DOWN_OUT_CHUNK
+                            down_mlp_chunk_bf16 = mlp_tile[:, 0:DOWN_MLP_CHUNK]
+                            w_down_chunk = w_down[0:DOWN_MLP_CHUNK, d0 : d0 + DOWN_OUT_CHUNK]
+                            down_acc = pl.matmul(down_mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
+                            for ob in pl.pipeline(1, down_mlp_blocks, stage=2):
+                                o0 = ob * DOWN_MLP_CHUNK
+                                down_mlp_chunk_bf16 = mlp_tile[:, o0 : o0 + DOWN_MLP_CHUNK]
+                                w_down_chunk = w_down[o0 : o0 + DOWN_MLP_CHUNK, d0 : d0 + DOWN_OUT_CHUNK]
                                 down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
-                        fp32_chunk_gm = pl.assemble(fp32_chunk_gm, down_acc, [0, 0])
+                            resid_chunk_fp32 = resid1_tile[:, d0 : d0 + DOWN_OUT_CHUNK]
+                            out_chunk = pl.add(down_acc, resid_chunk_fp32)
+                            out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [b0, d0])
+                else:
+                    for dob in pl.parallel(0, down_out_blocks, 1):
+                        d0 = dob * DOWN_OUT_CHUNK
+                        fp32_chunk_gm = pl.create_tensor([BATCH_TILE, DOWN_OUT_CHUNK], dtype=pl.FP32)
 
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj_residual"):
-                        down_chunk_fp32 = fp32_chunk_gm[:, 0:DOWN_OUT_CHUNK]
-                        resid_chunk_fp32 = resid1_tile[:, d0 : d0 + DOWN_OUT_CHUNK]
-                        out_chunk = pl.add(down_chunk_fp32, resid_chunk_fp32)
-                        out_chunk_cast = pl.cast(out_chunk, target_type=pl.BF16)
-                        out_chunk_trimmed = pl.slice(
-                            out_chunk_cast,
-                            [BATCH_TILE, DOWN_OUT_CHUNK],
-                            [0, 0],
-                            valid_shape=[cur_valid, DOWN_OUT_CHUNK],
-                        )
-                        out = pl.assemble(out, out_chunk_trimmed, [b0, d0])
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
+                            down_acc = pl.create_tensor([BATCH_TILE, DOWN_OUT_CHUNK], dtype=pl.FP32)
+                            for ob in pl.pipeline(0, down_mlp_blocks, stage=2):
+                                o0 = ob * DOWN_MLP_CHUNK
+                                down_mlp_chunk_bf16 = mlp_tile[:, o0 : o0 + DOWN_MLP_CHUNK]
+                                w_down_chunk = w_down[o0 : o0 + DOWN_MLP_CHUNK, d0 : d0 + DOWN_OUT_CHUNK]
+                                if o0 == 0:
+                                    down_acc = pl.matmul(down_mlp_chunk_bf16, w_down_chunk, out_dtype=pl.FP32)
+                                else:
+                                    down_acc = pl.matmul_acc(down_acc, down_mlp_chunk_bf16, w_down_chunk)
+                            fp32_chunk_gm = pl.assemble(fp32_chunk_gm, down_acc, [0, 0])
+
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj_residual_tail"):
+                            down_chunk_fp32 = fp32_chunk_gm[:, 0:DOWN_OUT_CHUNK]
+                            resid_chunk_fp32 = resid1_tile[:, d0 : d0 + DOWN_OUT_CHUNK]
+                            out_chunk = pl.add(down_chunk_fp32, resid_chunk_fp32)
+                            out_chunk_cast = pl.cast(out_chunk, target_type=pl.BF16)
+                            out_chunk_trimmed = pl.slice(
+                                out_chunk_cast,
+                                [BATCH_TILE, DOWN_OUT_CHUNK],
+                                [0, 0],
+                                valid_shape=[cur_valid, DOWN_OUT_CHUNK],
+                            )
+                            out = pl.assemble(out, out_chunk_trimmed, [b0, d0])
 
             return out
 
