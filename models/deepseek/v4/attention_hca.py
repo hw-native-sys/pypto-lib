@@ -159,7 +159,7 @@ def attention_hca(
     # negative table row.
     cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    if START_POS + 1 >= COMPRESS_RATIO:
+    if start_pos + 1 >= COMPRESS_RATIO:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
             cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
             cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)

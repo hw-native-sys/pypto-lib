@@ -105,7 +105,6 @@ ROTATE_INNER = True
 # exercises both the window and compressed paths. Warmup positions before the
 # first compressed slot are also supported when START_POS is lowered.
 START_POS = 127
-CSA_CMP_VALID_TOPK = min(IDX_TOPK, (START_POS + S) // COMPRESS_RATIO)
 
 @pl.jit.inline
 def attention_csa(
@@ -204,7 +203,7 @@ def attention_csa(
         cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
         cmp_cos = cmp_cos_base
         cmp_sin = cmp_sin_base
-        if START_POS + 1 >= COMPRESS_RATIO:
+        if start_pos + 1 >= COMPRESS_RATIO:
             cmp_pos = pl.cast(start_pos + 1 - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
@@ -326,9 +325,8 @@ def attention_csa(
             invalid_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, invalid_row, [t_idx, 0])
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, window_row, [t_idx, 0])
-            if CSA_CMP_VALID_TOPK > 0:
-                cmp_topk_valid = pl.slice(idx_topk_flat, [1, CSA_CMP_VALID_TOPK], [t_idx, 0])
-                cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk_valid, [t_idx, WIN])
+            cmp_topk = pl.slice(idx_topk_flat, [1, IDX_TOPK], [t_idx, 0])
+            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk, [t_idx, WIN])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     attn_out = sparse_attn(
@@ -704,8 +702,7 @@ def golden_attention_csa(tensors):
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     sparse_topk[:, :WIN] = torch.arange(WIN, dtype=torch.int32)
-    if CSA_CMP_VALID_TOPK > 0:
-        sparse_topk[:, WIN:WIN + CSA_CMP_VALID_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :CSA_CMP_VALID_TOPK]
+    sparse_topk[:, WIN:WIN + IDX_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :IDX_TOPK]
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn_online({
