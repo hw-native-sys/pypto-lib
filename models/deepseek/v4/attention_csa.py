@@ -114,7 +114,6 @@ CSA_CMP_VALID_TOPK = min(IDX_TOPK, (START_POS + S) // COMPRESS_RATIO)
 @pl.jit.inline
 def attention_csa(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    x_indexer: pl.Tensor[[B, S, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -133,7 +132,6 @@ def attention_csa(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    qr_indexer: pl.Tensor[[B, S, Q_LORA], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -216,8 +214,8 @@ def attention_csa(
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr_unused = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_unused = pl.create_tensor([T, 1], dtype=pl.FP32)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     q = qkv_proj_rope(
         x_mixed,
         attn_norm_w,
@@ -233,8 +231,8 @@ def attention_csa(
         gamma_ckv,
         q,
         kv,
-        qr_unused,
-        qr_scale_unused,
+        qr,
+        qr_scale,
     )
 
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -288,8 +286,9 @@ def attention_csa(
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
     idx_score_unused, idx_kv_cache, idx_topk_full = indexer(
-        x_indexer,
-        qr_indexer,
+        x_mixed,
+        qr,
+        qr_scale,
         idx_wq_b,
         idx_wq_b_scale,
         weights_proj,
@@ -370,7 +369,6 @@ def attention_csa(
 @pl.jit
 def attention_csa_test_refresh(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    x_indexer: pl.Tensor[[B, S, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -389,7 +387,6 @@ def attention_csa_test_refresh(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    qr_indexer: pl.Tensor[[B, S, Q_LORA], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -421,7 +418,6 @@ def attention_csa_test_refresh(
 ):
     x_out = attention_csa(
         x_hc,
-        x_indexer,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
@@ -440,7 +436,6 @@ def attention_csa_test_refresh(
         odd_select,
         even_select_local,
         odd_select_local,
-        qr_indexer,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -647,8 +642,6 @@ def golden_attention_csa(tensors):
         "qr_scale": qr_scale,
     })
 
-    qr_indexer = tensors["qr_indexer"]
-
     kv_cache = tensors["kv_cache"]
     ori_block_table = tensors["ori_block_table"]
     cmp_kv = tensors["cmp_kv"]
@@ -687,12 +680,12 @@ def golden_attention_csa(tensors):
         cmp_kv[blk_id, intra, 0] = cmp_out[b, 0].to(torch.bfloat16)
 
     idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
-    x_indexer = tensors["x_indexer"]
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
     idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
     golden_indexer({
-        "x": x_indexer,
-        "qr": qr_indexer,
+        "x": x_mixed,
+        "qr": qr_i8,
+        "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],
         "wq_b_scale": tensors["idx_wq_b_scale"],
         "weights_proj": tensors["weights_proj"],
@@ -945,11 +938,6 @@ def build_tensor_specs():
     def init_wo_b():
         return torch.randn(D, O_GROUPS * O_LORA) / (O_GROUPS * O_LORA) ** 0.5
 
-    def rms_norm(x, weight):
-        x_fp32 = x.float()
-        var = x_fp32.square().mean(dim=-1, keepdim=True)
-        return (x_fp32 * torch.rsqrt(var + EPS) * weight.float()).to(torch.bfloat16)
-
     shared_x_hc = init_x_hc().to(torch.bfloat16)
     shared_hc_attn_fn = init_hc_attn_fn().to(torch.float32)
     shared_hc_attn_scale = init_hc_attn_scale().to(torch.float32)
@@ -970,9 +958,6 @@ def build_tensor_specs():
         "post": shared_post,
         "comb": shared_comb,
     })
-    shared_qr_indexer = rms_norm(shared_x_mixed, shared_attn_norm_w).float() @ shared_wq_a.float()
-    shared_qr_indexer = shared_qr_indexer * torch.rsqrt(shared_qr_indexer.square().mean(dim=-1, keepdim=True) + EPS)
-    shared_qr_indexer = (shared_qr_indexer * shared_gamma_cq.float()).to(torch.bfloat16)
     shared_idx_wq_b = init_idx_wq_b().to(torch.bfloat16)
     idx_wq_b_i8, idx_wq_b_scale = quant_w_per_output_channel(shared_idx_wq_b)
     shared_weights_proj = init_weights_proj().to(torch.bfloat16)
@@ -989,7 +974,6 @@ def build_tensor_specs():
 
     return [
         TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=lambda: shared_x_hc.clone()),
-        TensorSpec("x_indexer", [B, S, D], torch.bfloat16, init_value=lambda: shared_x_mixed.clone()),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=lambda: shared_hc_attn_fn.clone()),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=lambda: shared_hc_attn_scale.clone()),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=lambda: shared_hc_attn_base.clone()),
@@ -1008,7 +992,6 @@ def build_tensor_specs():
         TensorSpec("odd_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
         TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
-        TensorSpec("qr_indexer", [B, S, Q_LORA], torch.bfloat16, init_value=lambda: shared_qr_indexer.clone()),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),

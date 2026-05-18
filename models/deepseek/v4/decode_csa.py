@@ -98,8 +98,6 @@ assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 def decode_csa(
     # ---- layer input (HC stack) ----
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    # ---- indexer-side residual stream (model.py: indexer reads pre-norm activations) ----
-    x_indexer: pl.Tensor[[B, S, D], pl.BF16],
     # ---- attention hc_pre weights ----
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -120,8 +118,6 @@ def decode_csa(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    # ---- indexer's pre-computed qr (model.py: q-side latent that drives index scoring) ----
-    qr_indexer: pl.Tensor[[B, S, Q_LORA], pl.BF16],
     # ---- main compressor (ratio=4, overlap=True, rotate=False) ----
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -187,14 +183,13 @@ def decode_csa(
     # Attention sub-block (CSA): hc_pre + attention(+main compressor + indexer) + hc_post → x_attn.
     x_attn = pl.create_tensor([B, S, HC_MULT, D], dtype=pl.BF16)
     x_attn = attention_csa(
-        x_hc, x_indexer,
+        x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select, odd_select,
         even_select_local, odd_select_local,
-        qr_indexer,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_kv_state, cmp_score_state,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -228,7 +223,6 @@ def decode_csa(
 @pl.jit
 def decode_csa_test(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    x_indexer: pl.Tensor[[B, S, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -247,7 +241,6 @@ def decode_csa_test(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    qr_indexer: pl.Tensor[[B, S, Q_LORA], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -300,14 +293,13 @@ def decode_csa_test(
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_csa(
-        x_hc, x_indexer,
+        x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select, odd_select,
         even_select_local, odd_select_local,
-        qr_indexer,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_kv_state, cmp_score_state,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -374,14 +366,13 @@ def build_tensor_specs(layer_id: int = 0):
 
     order = [
         # ---- attention inputs ----
-        "x_hc", "x_indexer",
+        "x_hc",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
         "attn_norm_w", "wq_a", "wq_b", "wq_b_scale", "wkv",
         "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin", "even_select_t", "odd_select_t",
         "even_select", "odd_select",
         "even_select_local", "odd_select_local",
-        "qr_indexer",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
         "cmp_kv_state", "cmp_score_state",
         "idx_wq_b", "idx_wq_b_scale", "weights_proj", "hadamard_idx",

@@ -60,7 +60,8 @@ QUANT_CHUNK = 128 if T >= 64 else 256
 @pl.jit.inline
 def indexer(
     x: pl.Tensor[[B, S, D], pl.BF16],
-    qr: pl.Tensor[[B, S, Q_LORA], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -87,26 +88,8 @@ def indexer(
     cache_len = (start_pos + S) // COMPRESS_RATIO
     cache_blocks = (cache_len + CACHE_TILE - 1) // CACHE_TILE
 
-    qr_flat = pl.reshape(qr, [T, Q_LORA])
-    qr_i8 = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_quant"):
-        qr_amax = pl.full([1, T], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for q0 in pl.range(0, Q_LORA, QUANT_CHUNK):
-            qr_a_f32 = pl.cast(qr_flat[:, q0 : q0 + QUANT_CHUNK], target_type=pl.FP32)
-            qr_a_abs = pl.maximum(qr_a_f32, pl.neg(qr_a_f32))
-            qr_a_max = pl.reshape(pl.row_max(qr_a_abs), [1, T])
-            qr_amax = pl.maximum(qr_amax, qr_a_max)
-        qr_scale_quant_row = pl.div(pl.full([1, T], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_amax)
-        qr_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T, 1])
-        qr_scale_quant = pl.reshape(qr_scale_quant_row, [T, 1])
-        for q1 in pl.range(0, Q_LORA, QUANT_CHUNK):
-            qr_q_f32 = pl.cast(qr_flat[:, q1 : q1 + QUANT_CHUNK], target_type=pl.FP32)
-            qr_q_scaled = pl.row_expand_mul(qr_q_f32, qr_scale_quant)
-            qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
-            qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
-            qr_i8[:, q1 : q1 + QUANT_CHUNK] = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
+    qr_i8 = qr
+    qr_scale_dq = qr_scale
 
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
     for o0 in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, Q_OUT_CHUCK):
@@ -358,7 +341,8 @@ def indexer(
 @pl.jit
 def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
-    qr: pl.Tensor[[B, S, Q_LORA], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -384,6 +368,7 @@ def indexer_test(
     score, idx_kv_cache, topk_idxs = indexer(
         x,
         qr,
+        qr_scale,
         wq_b,
         wq_b_scale,
         weights_proj,
@@ -439,7 +424,8 @@ def golden_indexer(tensors):
     from indexer_compressor import golden_compressor
 
     x = tensors["x"].float()
-    qr = tensors["qr"].float()
+    qr = tensors["qr"]
+    qr_scale = tensors["qr_scale"].float()
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float()
     weights_proj = tensors["weights_proj"].float()
@@ -457,8 +443,7 @@ def golden_indexer(tensors):
     if start_pos == 0:
         return
 
-    qr_i8, qr_scale = _int8_quant_per_row(qr.reshape(T, Q_LORA))
-    q_i32 = qr_i8.to(torch.int32) @ wq_b.to(torch.int32)
+    q_i32 = qr.to(torch.int32) @ wq_b.to(torch.int32)
     q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(B, S, IDX_N_HEADS, IDX_HEAD_DIM)
 
     x_pair = q[..., -rd:].unflatten(-1, (-1, 2))
@@ -530,7 +515,7 @@ def build_tensor_specs():
     def init_x():
         return torch.rand(B, S, D)
     def init_qr():
-        return torch.rand(B, S, Q_LORA)
+        return torch.rand(T, Q_LORA)
     def init_wq_b():
         return torch.rand(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM)
     def init_weights_proj():
@@ -567,11 +552,13 @@ def build_tensor_specs():
         return torch.zeros(B, IDX_KV_LEN, IDX_HEAD_DIM)
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
+    qr_i8, qr_scale = _int8_quant_per_row(init_qr())
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("qr", [B, S, Q_LORA], torch.bfloat16, init_value=init_qr),
+        TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
+        TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
