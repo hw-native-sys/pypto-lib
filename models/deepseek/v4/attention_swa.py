@@ -92,7 +92,7 @@ def attention_swa(
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -249,7 +249,7 @@ def attention_swa_test(
     block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -367,7 +367,7 @@ def golden_attention_swa(tensors):
         "cmp_block_table": cmp_block_table_dummy,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": seqused_kv.view(B),
+        "seqused_kv": seqused_kv.view(B, S),
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
         "even_select_local": tensors["even_select_local"],
@@ -476,7 +476,9 @@ def build_tensor_specs():
     def init_attn_sink():
         return torch.zeros(H)
     def init_seqused_kv():
-        return torch.full((B,), min(WIN, START_POS + S), dtype=torch.int32)
+        s = torch.arange(1, S + 1, dtype=torch.int32) + START_POS
+        seq = torch.minimum(torch.full_like(s, WIN), s)
+        return seq.expand(B, S).clone()
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -509,7 +511,7 @@ def build_tensor_specs():
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),

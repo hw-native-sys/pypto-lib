@@ -149,7 +149,7 @@ def attention_csa(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -399,7 +399,7 @@ def attention_csa_test_refresh(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
+    seqused_kv: pl.Tensor[[B, S], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -524,7 +524,7 @@ def golden_attention_csa(tensors):
         # Per-token gather + attention; token t belongs to batch t // S.
         for t in range(T):
             b = t // S
-            seq_used = int(seqused_kv[b].item())
+            seq_used = int(seqused_kv.view(T)[t].item())
             window_valid = min(WIN, seq_used)
             cmp_valid = max(seq_used - window_valid, 0)
             cmp_topk_valid = min(IDX_TOPK, cmp_valid)
@@ -723,7 +723,7 @@ def golden_attention_csa(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"].view(B),
+        "seqused_kv": tensors["seqused_kv"].view(B, S),
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
         "even_select_local": tensors["even_select_local"],
@@ -928,9 +928,9 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        win_valid = min(WIN, START_POS + S)
-        cmp_valid = (START_POS + S) // COMPRESS_RATIO
-        return torch.full((B,), win_valid + cmp_valid, dtype=torch.int32)
+        s = torch.arange(1, S + 1, dtype=torch.int32) + START_POS
+        seq = torch.where(s <= WIN, s, WIN + s // COMPRESS_RATIO)
+        return seq.expand(B, S).clone()
 
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
@@ -1014,7 +1014,7 @@ def build_tensor_specs():
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),

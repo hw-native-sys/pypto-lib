@@ -30,7 +30,7 @@ Standalone contract:
 - `cmp_sparse_indices[t, :]` may contain `-1` pads.
 - entries in `[0, WIN)` address the logical sliding-window ring slots.
 - entries in `[WIN, WIN + cmp_valid)` address compressed cache slots, where
-    `cmp_valid = max(seqused_kv[b] - min(WIN, seqused_kv[b]), 0)`.
+    `cmp_valid = max(seqused_kv[b, s] - min(WIN, seqused_kv[b, s]), 0)`.
 - the grouped projection layout matches:
     `o.view(bsz, seqlen, self.n_local_groups, -1)` with
     `self.n_local_groups == O_GROUPS` and `-1 == O_GROUP_IN`.
@@ -103,7 +103,7 @@ def sparse_attn(
     cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                            pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK],                                      pl.INT32],
     attn_sink:          pl.Tensor[[H],                                            pl.FP32],
-    seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
+    seqused_kv:         pl.Tensor[[B, S],                                         pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
@@ -137,7 +137,8 @@ def sparse_attn(
 
     for t in pl.range(T):
         b = t // S
-        seq_used = pl.read(seqused_kv, [b])
+        s = t % S
+        seq_used = pl.read(seqused_kv, [b, s])
         window_valid = pl.min(WIN, seq_used)
         cmp_valid = seq_used - window_valid
         cmp_topk_valid = pl.min(IDX_TOPK, cmp_valid)
@@ -394,7 +395,7 @@ def sparse_attn_test(
     cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                            pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK],                                      pl.INT32],
     attn_sink:          pl.Tensor[[H],                                            pl.FP32],
-    seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
+    seqused_kv:         pl.Tensor[[B, S],                                         pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
@@ -469,11 +470,11 @@ def golden_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
 
-    # Per-query-token attention. Each token has its own cmp_sparse_indices row;
-    # seqused_kv / block tables are per-batch (token t belongs to batch t // S).
+    # Per-query-token attention. Each token has its own cmp_sparse_indices row
+    # and its own seqused_kv entry; block tables remain per-batch.
     for t in range(T):
         b = t // S
-        seq_used = int(seqused_kv[b].item())
+        seq_used = int(seqused_kv.view(T)[t].item())
         window_valid = min(WIN, seq_used)
         cmp_valid = max(seq_used - window_valid, 0)
         gathered = []
@@ -584,8 +585,10 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         return torch.cat([win_part, cmp_part], dim=-1).contiguous()
 
     def init_seqused_kv():
-        """Expose the demo sequence-used length that matches the chosen ratio mode."""
-        return torch.tensor([sparse_k] * B, dtype=torch.int32)
+        """Expose per-token sequence-used lengths for the chosen ratio mode."""
+        s = torch.arange(S, dtype=torch.int32)
+        seq = torch.clamp(sparse_k - (S - 1 - s), min=1)
+        return seq.expand(B, S).clone()
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -636,7 +639,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("even_select_local", [ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
