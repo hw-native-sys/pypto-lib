@@ -15,8 +15,8 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.38
-      PTOAS_SHA256: 080a13124b7f0d025d6a0600919608c3d7b8efd4b5bc22c32f0144fce1814e9e
+      PTOAS_VERSION: v0.40
+      PTOAS_SHA256: 64c835839a9e1c3696617f82f3710705b3bd4b0bc0de3049d21b08885ac41c39
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 2c607938
 
@@ -146,8 +146,8 @@ jobs:
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.38
-      PTOAS_SHA256: 29e5af26f32776935bddb1b28fea5c4ce1beaa16d430f2eeac49625990e72d31
+      PTOAS_VERSION: v0.40
+      PTOAS_SHA256: 2fe83fe0c9087d40e2a4312e9816e8a1a16f63a48b0bcb21e27fb63736e0fab6
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: 2c607938
       CMAKE_BUILD_PARALLEL_LEVEL: 16
