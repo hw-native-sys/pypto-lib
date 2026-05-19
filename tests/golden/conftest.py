@@ -12,9 +12,10 @@
 Also installs stub ``pypto`` / ``pypto.ir`` / ``pypto.runtime`` modules when
 the real pypto is not importable, so the golden unit tests can run in a
 CPU-only CI job without building the compiler. The stubs expose the
-attributes the tests patch (``pypto.ir.compile`` and
-``pypto.runtime.execute_compiled``); if real pypto is installed it is used
-as-is.
+attributes the tests patch and the side-effect helpers ``runner.py`` calls
+on the runtime_dir replay path (``invalidate_binary_cache``,
+``rebuild_kernel_cpp_from_pto``, ``configure_log``). If real pypto is
+installed it is used as-is.
 """
 
 import importlib.util
@@ -31,11 +32,6 @@ def _install_pypto_stubs() -> None:
 
     import enum
 
-    pypto = types.ModuleType("pypto")
-    ir = types.ModuleType("pypto.ir")
-    runtime = types.ModuleType("pypto.runtime")
-    backend = types.ModuleType("pypto.backend")
-
     def _unavailable(*_args, **_kwargs):
         raise RuntimeError(
             "stub pypto: this function must be patched in tests"
@@ -45,16 +41,43 @@ def _install_pypto_stubs() -> None:
         Ascend910B = "Ascend910B"
         Ascend950 = "Ascend950"
 
+    pypto = types.ModuleType("pypto")
+    pypto.__path__ = []  # mark as package so submodule imports resolve
+    ir = types.ModuleType("pypto.ir")
+    runtime = types.ModuleType("pypto.runtime")
+    runtime.__path__ = []
+    log_config = types.ModuleType("pypto.runtime.log_config")
+    debug = types.ModuleType("pypto.runtime.debug")
+    debug.__path__ = []
+    replay = types.ModuleType("pypto.runtime.debug.replay")
+    pto_rebuild = types.ModuleType("pypto.runtime.debug.pto_rebuild")
+    backend = types.ModuleType("pypto.backend")
+
+    # Tests that observe these patch them; the stub defaults are silent
+    # no-ops so the runtime_dir replay path can flow through without
+    # exploding when a test doesn't care.
     ir.compile = _unavailable
     runtime.execute_compiled = _unavailable
+    log_config.configure_log = lambda *_a, **_k: None
+    replay.invalidate_binary_cache = lambda *_a, **_k: None
+    pto_rebuild.rebuild_kernel_cpp_from_pto = lambda *_a, **_k: []
     backend.BackendType = BackendType
+
     pypto.ir = ir
     pypto.runtime = runtime
     pypto.backend = backend
+    runtime.log_config = log_config
+    runtime.debug = debug
+    debug.replay = replay
+    debug.pto_rebuild = pto_rebuild
 
     sys.modules["pypto"] = pypto
     sys.modules["pypto.ir"] = ir
     sys.modules["pypto.runtime"] = runtime
+    sys.modules["pypto.runtime.log_config"] = log_config
+    sys.modules["pypto.runtime.debug"] = debug
+    sys.modules["pypto.runtime.debug.replay"] = replay
+    sys.modules["pypto.runtime.debug.pto_rebuild"] = pto_rebuild
     sys.modules["pypto.backend"] = backend
 
 
