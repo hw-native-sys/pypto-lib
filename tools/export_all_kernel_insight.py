@@ -47,14 +47,27 @@ SUCCESS_TEXT = "Profiling running finished. All task success."
 
 
 def default_ptoas_root() -> Path:
-    local = REPO_ROOT / "PTOAS"
-    if (local / "test/npu_validation/scripts/generate_testcase.py").is_file():
-        return local
-    return repo_path(os.environ.get("PTOAS_ROOT", local))
+    script = Path("test/npu_validation/scripts/generate_testcase.py")
+    if env_root := os.environ.get("PTOAS_ROOT"):
+        root = repo_path(env_root)
+        if (root / script).is_file():
+            return root
+    for local in (REPO_ROOT / "PTOAS", REPO_ROOT.parent / "PTOAS"):
+        if (local / script).is_file():
+            return local
+    fallback = REPO_ROOT / "PTOAS"
+    return repo_path(fallback)
 
 
 def default_pto_isa_root() -> Path:
-    return repo_path(os.environ.get("PTO_ISA_ROOT", str(Path.home() / "pto-isa")))
+    if env_root := os.environ.get("PTO_ISA_ROOT"):
+        root = repo_path(env_root)
+        if root.is_dir():
+            return root
+    for local in (REPO_ROOT / "pto-isa", REPO_ROOT.parent / "pto-isa"):
+        if local.exists():
+            return local
+    return repo_path(Path.home() / "pto-isa")
 
 
 class StepError(RuntimeError):

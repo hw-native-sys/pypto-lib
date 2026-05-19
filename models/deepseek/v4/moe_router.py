@@ -29,6 +29,16 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 D_CHUNK          = 128 if T >= 128 else (256 if T >= 64 else 512)
 D_BLOCKS         = D // D_CHUNK
+GATE_D_CHUNK     = 512
+GATE_N_CHUNK     = N_EXPERTS if N_EXPERTS <= 32 else 16
+if D % GATE_D_CHUNK != 0:
+    raise ValueError(f"moe_router requires D ({D}) to be divisible by GATE_D_CHUNK ({GATE_D_CHUNK})")
+if N_EXPERTS % GATE_N_CHUNK != 0:
+    raise ValueError(
+        f"moe_router requires N_EXPERTS ({N_EXPERTS}) to be divisible by GATE_N_CHUNK ({GATE_N_CHUNK})"
+    )
+GATE_D_BLOCKS    = D // GATE_D_CHUNK
+GATE_N_BLOCKS    = N_EXPERTS // GATE_N_CHUNK
 # SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
 # 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.
 if N_EXPERTS <= 32:
@@ -74,7 +84,7 @@ def moe_router(
 
     # Stage 1: ffn_norm apply. Doubles as the gate-dot input and as the
     # entry's `x_norm` output.
-    x_norm_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_norm_gate = pl.create_tensor([T, D], dtype=pl.FP32)
     for db in pl.parallel(0, D_BLOCKS, 1):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm_apply"):
             d0 = db * D_CHUNK
@@ -84,49 +94,61 @@ def moe_router(
             x_normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_col), norm_w_chunk)
             # mode="rint" = round half to even, matches torch's `.to(bfloat16)`.
             x_normed_bf16 = pl.cast(x_normed, target_type=pl.BF16, mode="rint")
-            x_norm_bf16[:, d0 : d0 + D_CHUNK] = x_normed_bf16
+            x_norm_gate[:, d0 : d0 + D_CHUNK] = pl.cast(x_normed_bf16, target_type=pl.FP32)
             x_norm[:, d0 : d0 + D_CHUNK] = x_normed_bf16
 
     # Stage 2: gate.forward — dot(x_norm, gate_w) → sqrt(softplus(.)) + bias.
-    # Single fused pl.at across all N_EXPERTS: per-expert kernels would
-    # collapse to identical outputs for tokens 1..15 on hardware.
+    gate_logits = pl.create_tensor([T, N_EXPERTS], dtype=pl.FP32)
     route_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
     biased_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    route_flat = pl.reshape(route_scores, [T * SCORE_PAD])
-    biased_flat = pl.reshape(biased_scores, [T * SCORE_PAD])
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="gate_dot"):
+    if GATE_N_BLOCKS == 1:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_dot"):
+            score_acc = pl.create_tensor([T, GATE_N_CHUNK], dtype=pl.FP32)
+            for kb in pl.range(1, GATE_D_BLOCKS + 1):
+                db = kb - 1
+                d0 = db * GATE_D_CHUNK
+                gate_x_chunk = x_norm_gate[:, d0 : d0 + GATE_D_CHUNK]
+                gate_w_chunk = gate_w[0:GATE_N_CHUNK, d0 : d0 + GATE_D_CHUNK]
+                if kb == 1:
+                    score_acc = pl.matmul(gate_x_chunk, gate_w_chunk, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    score_acc = pl.matmul_acc(score_acc, gate_x_chunk, gate_w_chunk, b_trans=True)
+            gate_logits = pl.assemble(gate_logits, score_acc, [0, 0])
+    else:
+        for expert0 in pl.parallel(0, N_EXPERTS, GATE_N_CHUNK):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_dot"):
+                score_acc = pl.create_tensor([T, GATE_N_CHUNK], dtype=pl.FP32)
+                for kb in pl.range(1, GATE_D_BLOCKS + 1):
+                    db = kb - 1
+                    d0 = db * GATE_D_CHUNK
+                    gate_x_chunk = x_norm_gate[:, d0 : d0 + GATE_D_CHUNK]
+                    gate_w_chunk = gate_w[expert0 : expert0 + GATE_N_CHUNK, d0 : d0 + GATE_D_CHUNK]
+                    if kb == 1:
+                        score_acc = pl.matmul(gate_x_chunk, gate_w_chunk, out_dtype=pl.FP32, b_trans=True)
+                    else:
+                        score_acc = pl.matmul_acc(score_acc, gate_x_chunk, gate_w_chunk, b_trans=True)
+                gate_logits = pl.assemble(gate_logits, score_acc, [0, expert0])
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_score_post"):
         # Pad-tail seeded to -inf so sort32 ranks padded slots after real
         # scores (otherwise pad-zero beats negative reals and topk picks pads).
         route_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
         biased_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
-        score_acc_buf = pl.create_tensor([1, T], dtype=pl.FP32)
-        for expert_i in pl.range(N_EXPERTS):
-            score_acc = pl.full([1, T], dtype=pl.FP32, value=0.0)
-            for db in pl.range(D_BLOCKS):
-                d0 = db * D_CHUNK
-                x_chunk = pl.cast(x_norm_bf16[:, d0 : d0 + D_CHUNK], target_type=pl.FP32)
-                w_row = gate_w[expert_i : expert_i + 1, d0 : d0 + D_CHUNK]
-                prod = pl.col_expand_mul(x_chunk, w_row)
-                score_acc = pl.add(
-                    score_acc,
-                    pl.reshape(pl.row_sum(prod), [1, T]),
-                )
-            score_acc_buf[:, :] = score_acc
-            bias = pl.read(gate_bias, [expert_i])
-            logits = pl.load(score_acc_buf, [0, 0], [1, T])
+        for expert0 in pl.range(0, N_EXPERTS, GATE_N_CHUNK):
+            logits = pl.load(gate_logits, [0, expert0], [T, GATE_N_CHUNK])
             zero = pl.mul(logits, 0.0)
             relu_logits = pl.maximum(logits, zero)
             abs_logits = pl.maximum(logits, pl.neg(logits))
             softplus = pl.add(relu_logits, pl.log(pl.add(pl.exp(pl.neg(abs_logits)), 1.0)))
             score_tile = pl.sqrt(softplus)
-            biased_tile = pl.add(score_tile, bias)
-            score_row_flat = pl.reshape(score_tile, [T])
-            biased_row_flat = pl.reshape(biased_tile, [T])
-            for t in pl.unroll(T):
-                pl.write(route_flat, [t * SCORE_PAD + expert_i], pl.read(score_row_flat, [t]))
-                pl.write(biased_flat, [t * SCORE_PAD + expert_i], pl.read(biased_row_flat, [t]))
-    route_scores = pl.reshape(route_flat, [T, SCORE_PAD])
-    biased_scores = pl.reshape(biased_flat, [T, SCORE_PAD])
+            bias_row = pl.reshape(
+                pl.load(gate_bias, [expert0], [GATE_N_CHUNK]),
+                [1, GATE_N_CHUNK],
+            )
+            bias_tile = pl.col_expand_mul(pl.add(zero, 1.0), bias_row)
+            biased_tile = pl.add(score_tile, bias_tile)
+            route_scores = pl.store(score_tile, [0, expert0], route_scores)
+            biased_scores = pl.store(biased_tile, [0, expert0], biased_scores)
 
     # Stage 3: choose routed expert ids. Hash layers take ids directly from
     # tid2eid[input_ids]; score-routed layers use biased top-k.
@@ -140,8 +162,7 @@ def moe_router(
         topk_vals_pad_flat = pl.reshape(topk_vals_pad, [T * SCORE_PAD])
         topk_idx_pad_flat = pl.reshape(topk_idx_pad, [T * SCORE_PAD])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_hash_indices_and_scores"):
-            for p in pl.range(T * SCORE_PAD):
-                pl.write(topk_vals_pad_flat, [p], 0.0)
+            topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
             for t in pl.unroll(T):
                 token_id = pl.cast(pl.read(input_ids_flat, [t]), pl.INDEX)
                 src_base = token_id * TOPK
@@ -307,21 +328,31 @@ def build_tensor_specs(layer_id=0):
 
 if __name__ == "__main__":
     import argparse
-    import torch
+    import sys
     from golden import run_jit
-
-    def bf16_allclose(rtol, atol):
-        """Loosened comparator for BF16 outputs whose kernel reduction order
-        differs from torch's, occasionally crossing a BF16 rounding boundary."""
-        def cmp(actual, expected, **_):
-            return torch.allclose(actual, expected, rtol=rtol, atol=atol), ""
-        return cmp
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument(
+        "--export-kernel-insight",
+        action="store_true",
+        default=False,
+        help=(
+            "After a successful run, export msprof op-simulator Insight traces "
+            "for all generated InCore kernels under the same build_output dir."
+        ),
+    )
+    parser.add_argument(
+        "--kernel-insight-func",
+        action="append",
+        default=[],
+        help="Only export this generated kernel function; can be repeated.",
+    )
     args = parser.parse_args()
 
     result = run_jit(
@@ -331,6 +362,8 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_pmu=args.enable_pmu,
         ),
         rtol=1e-5,
         atol=1e-5,
@@ -339,3 +372,20 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+    if args.export_kernel_insight:
+        if result.work_dir is None:
+            print("kernel insight export failed: run result has no build_output directory", file=sys.stderr)
+            raise SystemExit(1)
+        from tools.export_all_kernel_insight import StepError, main as export_kernel_insight
+
+        export_args = ["--build-dir", str(result.work_dir)]
+        for func in args.kernel_insight_func:
+            export_args.extend(["--func", func])
+        try:
+            export_rc = export_kernel_insight(export_args)
+        except StepError as exc:
+            print(f"kernel insight export failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if export_rc != 0:
+            raise SystemExit(export_rc)

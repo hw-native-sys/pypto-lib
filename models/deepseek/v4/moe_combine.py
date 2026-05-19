@@ -45,12 +45,9 @@ def moe_combine(
     ffn_out:           pl.Tensor[[B, S, D],                      pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_token_flat = pl.reshape(recv_token, [N_LOCAL_EXPERTS * RECV_MAX])
-    recv_weights_flat = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX])
-    count_flat = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
     routed_y_buf = pl.create_tensor([T * N_LOCAL_EXPERTS, D], dtype=pl.BF16)
     # Zero entries contribute nothing so accumulation can run dense.
-    routed_w_buf = pl.create_tensor([T * N_LOCAL_EXPERTS], dtype=pl.FP32)
+    routed_w_buf = pl.create_tensor([T, N_LOCAL_EXPERTS], dtype=pl.FP32)
     ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine_init"):
@@ -59,29 +56,30 @@ def moe_combine(
                 routed_y_buf[r0 : r0 + N_LOCAL_EXPERTS, d0 : d0 + COL_CHUNK] = pl.full(
                     [N_LOCAL_EXPERTS, COL_CHUNK], dtype=pl.BF16, value=0.0
                 )
-        for r in pl.range(T * N_LOCAL_EXPERTS):
-            pl.write(routed_w_buf, [r], 0.0)
+        for t in pl.range(T):
+            for e in pl.range(N_LOCAL_EXPERTS):
+                pl.write(routed_w_buf, [t, e], 0.0)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine"):
         for e in pl.range(N_LOCAL_EXPERTS):
-            n_rows = pl.cast(pl.read(count_flat, [e]), pl.INDEX)
+            n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
             for s in pl.range(n_rows):
                 i = e * RECV_MAX + s
-                t = pl.cast(pl.read(recv_token_flat, [i]), pl.INDEX)
+                t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
                 dst = t * N_LOCAL_EXPERTS + e
                 routed_y_buf = pl.assemble(
                     routed_y_buf,
                     pl.slice(recv_y_flat, [1, D], [i, 0]),
                     [dst, 0],
                 )
-                pl.write(routed_w_buf, [dst], pl.read(recv_weights_flat, [i]))
+                pl.write(routed_w_buf, [t, e], pl.read(recv_weights, [e, s]))
         for t in pl.range(T):
             base = t * N_LOCAL_EXPERTS
             for d0 in pl.range(0, D, COL_CHUNK):
                 acc = pl.cast(sh[t : t + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
                 for e in pl.range(N_LOCAL_EXPERTS):
                     row = pl.cast(routed_y_buf[base + e : base + e + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
-                    w = pl.read(routed_w_buf, [base + e])
+                    w = pl.read(routed_w_buf, [t, e])
                     acc = pl.add(acc, pl.mul(row, w))
                 ffn_out_flat[t : t + 1, d0 : d0 + COL_CHUNK] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 

@@ -75,50 +75,34 @@ def moe_dispatch(
             xn_q_half = pl.cast(xn_q_i32, target_type=pl.FP16, mode="round")
             x_norm_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(xn_q_half, target_type=pl.INT8, mode="trunc")
 
-    # recv_x is stored in moe_expert's 3-D layout. Metadata stays 1-D during
-    # packed writes so scalar load/store lowering sees a bare flat index.
+    # recv_x still uses a flat row view because its destination row is
+    # data-dependent. Small route metadata now uses the natural 2-D layout.
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    recv_scale_dq_flat = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX], dtype=pl.FP32)
-    recv_weights_flat = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX], dtype=pl.FP32)
-    recv_token_flat = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX], dtype=pl.INT32)
-    count_flat       = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
-    indices_flat     = pl.reshape(indices, [T * TOPK])
-    weights_flat     = pl.reshape(weights, [T * TOPK])
-    x_norm_scale_dq_flat = pl.reshape(x_norm_scale_dq_buf, [T])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_dispatch"):
         # recv_x tail rows (slot >= recv_expert_count[e]) intentionally left
         # uninitialized — the matching recv_scale_dq slot is 0, so garbage INT8
         # rows neutralize to 0.0 after dequant. (Skipping the i8 zero-fill also
         # works around `pto.texpands` not supporting i8 broadcast.)
-        for r in pl.range(N_LOCAL_EXPERTS * RECV_MAX):
-            pl.write(recv_scale_dq_flat, [r], 0.0)
-            pl.write(recv_weights_flat, [r], 0.0)
-            pl.write(recv_token_flat, [r], pl.cast(0, pl.INT32))
         for e in pl.range(N_LOCAL_EXPERTS):
-            pl.write(count_flat, [e], pl.cast(0, pl.INT32))
+            for s in pl.range(RECV_MAX):
+                pl.write(recv_scale_dq, [e, s], 0.0)
+                pl.write(recv_weights, [e, s], 0.0)
+                pl.write(recv_token, [e, s], pl.cast(0, pl.INT32))
+            pl.write(recv_expert_count, [e, 0], pl.cast(0, pl.INT32))
         for t in pl.range(T):
             for k in pl.unroll(TOPK):
-                p = t * TOPK + k
-                e_global = pl.read(indices_flat, [p])
+                e_global = pl.read(indices, [t, k])
                 e = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
-                slot_i32 = pl.read(count_flat, [e])
-                dst = e * RECV_MAX + pl.cast(slot_i32, pl.INDEX)
+                slot_i32 = pl.read(recv_expert_count, [e, 0])
+                slot = pl.cast(slot_i32, pl.INDEX)
+                dst = e * RECV_MAX + slot
 
                 recv_x_flat = pl.assemble(recv_x_flat, pl.slice(x_norm_i8, [1, D], [t, 0]), [dst, 0])
-                pl.write(recv_scale_dq_flat, [dst], pl.read(x_norm_scale_dq_flat, [t]))
-                pl.write(recv_weights_flat, [dst], pl.read(weights_flat, [p]))
-                pl.write(recv_token_flat, [dst], pl.cast(t, pl.INT32))
-                pl.write(count_flat, [e], pl.cast(slot_i32 + 1, pl.INT32))
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_materialize_metadata"):
-        for e in pl.range(N_LOCAL_EXPERTS):
-            sd_row_1d = pl.slice(recv_scale_dq_flat, [RECV_MAX], [e * RECV_MAX])
-            w_row_1d = pl.slice(recv_weights_flat, [RECV_MAX], [e * RECV_MAX])
-            tok_row_1d = pl.slice(recv_token_flat, [RECV_MAX], [e * RECV_MAX])
-            recv_scale_dq = pl.assemble(recv_scale_dq, pl.reshape(sd_row_1d, [1, RECV_MAX]), [e, 0])
-            recv_weights = pl.assemble(recv_weights, pl.reshape(w_row_1d, [1, RECV_MAX]), [e, 0])
-            recv_token = pl.assemble(recv_token, pl.reshape(tok_row_1d, [1, RECV_MAX]), [e, 0])
+                pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale_dq_buf, [t, 0]))
+                pl.write(recv_weights, [e, slot], pl.read(weights, [t, k]))
+                pl.write(recv_token, [e, slot], pl.cast(t, pl.INT32))
+                pl.write(recv_expert_count, [e, 0], pl.cast(slot_i32 + 1, pl.INT32))
 
 
 @pl.jit

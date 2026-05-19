@@ -12,11 +12,11 @@ Connects ``hc_pre`` + router + dispatch + expert + combine + ``hc_post`` inside
 one ``@pl.jit`` orchestration.
 The local EP=1 dispatch contract is:
 
-    for p = t * TOPK + k:
-        e = indices_flat[p]
+    for t, k:
+        e = indices[t, k]
         slot = recv_expert_count[e]
         recv_x[e, slot, :] = x_norm[t, :]
-        recv_weights[e, slot] = weights_flat[p]
+        recv_weights[e, slot] = weights[t, k]
         recv_token[e, slot] = t
         recv_expert_count[e] += 1
 
@@ -386,6 +386,7 @@ def build_tensor_specs(layer_id=0):
 
 if __name__ == "__main__":
     import argparse
+    import sys
     import torch
     from golden import ratio_reldiff, run_jit
 
@@ -396,6 +397,22 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument(
+        "--export-kernel-insight",
+        action="store_true",
+        default=False,
+        help=(
+            "After a successful run, export msprof op-simulator Insight traces "
+            "for all generated InCore kernels under the same build_output dir."
+        ),
+    )
+    parser.add_argument(
+        "--kernel-insight-func",
+        action="append",
+        default=[],
+        help="Only export this generated kernel function; can be repeated.",
+    )
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
@@ -407,6 +424,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_pmu=args.enable_pmu,
         ),
         rtol=1e-3,
         atol=1e-3,
@@ -418,3 +436,20 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+    if args.export_kernel_insight:
+        if result.work_dir is None:
+            print("kernel insight export failed: run result has no build_output directory", file=sys.stderr)
+            raise SystemExit(1)
+        from tools.export_all_kernel_insight import StepError, main as export_kernel_insight
+
+        export_args = ["--build-dir", str(result.work_dir)]
+        for func in args.kernel_insight_func:
+            export_args.extend(["--func", func])
+        try:
+            export_rc = export_kernel_insight(export_args)
+        except StepError as exc:
+            print(f"kernel insight export failed: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        if export_rc != 0:
+            raise SystemExit(export_rc)
