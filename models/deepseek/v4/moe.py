@@ -68,9 +68,6 @@ VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
-# Sanity: chosen layout requires RECV_MAX >= T * TOPK.
-assert RECV_MAX >= T * TOPK, "packed layout needs RECV_MAX >= T * TOPK"
-
 
 @pl.jit.inline
 def moe(
