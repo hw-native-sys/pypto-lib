@@ -405,7 +405,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -418,22 +418,19 @@ if __name__ == "__main__":
         fn=compressor_test,
         specs=build_tensor_specs(),
         golden_fn=golden_compressor,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
-            compare_fn={
-                "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-                "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-                "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-                "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
-            },
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
+        },
     )
     if not result.passed:
         if result.error:

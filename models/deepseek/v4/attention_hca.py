@@ -714,7 +714,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -727,21 +727,18 @@ if __name__ == "__main__":
         fn=attention_hca_test,
         specs=build_tensor_specs(),
         golden_fn=golden_attention_hca,
-        config=RunConfig(
-            # Random ori/cmp cache fixtures exercise non-zero history values
-            # instead of the previous all-zero cache.
-            rtol=1e-2,
-            atol=1e-2,
-            compare_fn={
-                "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
-            },
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        atol=1e-2,
+        compare_fn={
+            "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+        },
+        # Random ori/cmp cache fixtures exercise non-zero history values
+# instead of the previous all-zero cache.
+rtol=1e-2,
     )
     if not result.passed:
         if result.error:

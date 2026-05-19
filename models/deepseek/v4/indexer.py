@@ -594,7 +594,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit, topk_pair_compare
+    from golden import ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -607,21 +607,18 @@ if __name__ == "__main__":
         fn=indexer_test,
         specs=build_tensor_specs(),
         golden_fn=golden_indexer,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compile=dict(dump_passes=True),
-            compare_fn={
-                "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "topk_idxs":    topk_pair_compare("score"),
-                "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
-            },
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "topk_idxs":    topk_pair_compare("score"),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
+        },
     )
     if not result.passed:
         if result.error:

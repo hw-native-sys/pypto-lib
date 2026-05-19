@@ -177,7 +177,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run_jit
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -189,15 +189,12 @@ if __name__ == "__main__":
         fn=moe_combine_test,
         specs=build_tensor_specs(),
         golden_fn=golden_moe_combine,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
         ),
+        rtol=1e-3,
+        atol=1e-3,
     )
     if not result.passed:
         if result.error:

@@ -1059,7 +1059,7 @@ if __name__ == "__main__":
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from golden import RunConfig, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1097,18 +1097,16 @@ if __name__ == "__main__":
             num_layers=args.num_layers,
         ),
         golden_fn=golden_qwen3_decode,
-        config=RunConfig(
-            rtol=5e-3,
-            atol=5e-3,
-            compile_only=args.compile_only,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
-            compare_fn={"out": make_pass_rate_compare(args.pass_rate)},
+        compile_cfg=dict(dump_passes=True),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=5e-3,
+        atol=5e-3,
+        compare_fn={"out": make_pass_rate_compare(args.pass_rate)},
+        compile_only=args.compile_only,
     )
     if not result.passed:
         if result.error:

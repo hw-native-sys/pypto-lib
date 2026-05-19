@@ -460,7 +460,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_reldiff, run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -472,19 +472,16 @@ if __name__ == "__main__":
         fn=moe_expert_test,
         specs=build_tensor_specs(),
         golden_fn=golden_moe_expert,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-            ),
-            compare_fn={
-                "recv_y": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-                "sh": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-            },
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "recv_y": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            "sh": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        },
     )
     if not result.passed:
         if result.error:

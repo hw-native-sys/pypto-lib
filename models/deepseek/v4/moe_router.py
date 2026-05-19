@@ -308,7 +308,7 @@ def build_tensor_specs(layer_id=0):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, run_jit
+    from golden import run_jit
 
     def bf16_allclose(rtol, atol):
         """Loosened comparator for BF16 outputs whose kernel reduction order
@@ -328,15 +328,12 @@ if __name__ == "__main__":
         fn=moe_router_test,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_router_core,
-        config=RunConfig(
-            rtol=1e-5,
-            atol=1e-5,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
         ),
+        rtol=1e-5,
+        atol=1e-5,
     )
     if not result.passed:
         if result.error:

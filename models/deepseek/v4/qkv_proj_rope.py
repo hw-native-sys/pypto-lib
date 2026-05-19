@@ -496,7 +496,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -509,23 +509,20 @@ if __name__ == "__main__":
         fn=qkv_proj_rope_test,
         specs=build_tensor_specs(),
         golden_fn=golden_qkv_proj_rope,
-        config=RunConfig(
-            # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
-            rtol=5e-3,
-            atol=5e-3,
-            compare_fn={
-                "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "qr":       ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
-                "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            },
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        atol=5e-3,
+        compare_fn={
+            "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "qr":       ratio_allclose(atol=1, rtol=0, max_error_ratio=0),
+            "qr_scale": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+        },
+        # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
+rtol=5e-3,
     )
     if not result.passed:
         if result.error:

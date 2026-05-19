@@ -9,12 +9,12 @@
 
 """Compile PyPTO programs, run them on device, and validate against goldens.
 
-Public entry point: :func:`run`.
+Public entry points: :func:`run` and :func:`run_jit`.
 """
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -22,35 +22,6 @@ import torch
 
 from .spec import ScalarSpec, TensorSpec
 from .validation import validate_golden
-
-
-@dataclass
-class RunConfig:
-    """Harness-level configuration for :func:`run`.
-
-    Attributes:
-        rtol: Relative tolerance for golden comparison.
-        atol: Absolute tolerance for golden comparison.
-        compile_only: If ``True``, stop after code generation without
-            executing on device or validating against golden.
-        compile: Kwargs forwarded to :func:`pypto.ir.compile` (e.g.
-            ``backend_type``, ``dump_passes``, ``output_dir``, ``strategy``,
-            ``profiling``).
-        runtime: Kwargs forwarded to :func:`pypto.runtime.execute_compiled`
-            (e.g. ``platform``, ``device_id``, ``enable_l2_swimlane``).
-        compare_fn: Per-output-name custom comparators that override
-            ``torch.allclose`` for those tensors. See
-            :func:`golden.validation.validate_golden` for the callable
-            signature, and :func:`golden.validation.topk_pair_compare` for
-            a built-in helper covering top-k index/value outputs.
-    """
-
-    rtol: float = 1e-5
-    atol: float = 1e-5
-    compile_only: bool = False
-    compile: dict[str, Any] = field(default_factory=dict)
-    runtime: dict[str, Any] = field(default_factory=dict)
-    compare_fn: dict[str, Callable] = field(default_factory=dict)
 
 
 @dataclass
@@ -142,24 +113,21 @@ def _backend_for_platform(platform: str) -> Any:
         ) from None
 
 
-_EXECUTE_COMPILED_KEYS = {"platform", "device_id", "pto_isa_commit", "level"}
 _DFX_FLAG_KEYS = ("enable_l2_swimlane", "enable_dump_tensor", "enable_pmu", "enable_dep_gen")
 
 
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
-    """Translate user-facing ``config.runtime`` into ``execute_compiled`` kwargs.
+    """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    pypto's ``execute_compiled`` takes the four DFX flags as a single
-    bundled ``dfx: _DfxOpts`` parameter rather than individual kwargs, so
-    flat per-flag keys (``enable_l2_swimlane=True``, ...) supplied via
-    ``RunConfig.runtime`` are folded into ``_DfxOpts`` here. Other keys
-    are filtered to the documented ``execute_compiled`` surface.
+    The four DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
+    keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
+    on unknown keys rather than us silently dropping them.
     """
-    out: dict[str, Any] = {k: v for k, v in runtime.items() if k in _EXECUTE_COMPILED_KEYS}
+    out: dict[str, Any] = {k: v for k, v in runtime.items() if k not in _DFX_FLAG_KEYS}
     dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
         try:
-            from pypto.runtime.runner import _DfxOpts  # noqa: PLC0415
+            from pypto.runtime.runner import _DfxOpts
         except ImportError as exc:
             raise ValueError(
                 "This pypto runtime does not support execute_compiled DFX flags: "
@@ -170,265 +138,384 @@ def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _consume_runtime_harness_keys(runtime_cfg: dict[str, Any]) -> None:
+    """Pop harness-only keys from *runtime_cfg* and apply their side effects.
+
+    Recognised key (not forwarded to ``execute_compiled``):
+      - ``log_level``: PyPTO runtime log threshold, see
+        :func:`pypto.runtime.log_config.configure_log`. One of ``debug``,
+        ``v0..v9``, ``info``, ``warn``, ``error``, ``null``.
+
+    Mutates *runtime_cfg* in place by popping the recognised key.
+    """
+    level = runtime_cfg.pop("log_level", None)
+    if level is None:
+        return
+    from pypto.runtime.log_config import configure_log
+    configure_log(level)
+
+
+def _stale_cpps(work_dir: Path) -> list[Path]:
+    """Return cpps under ``kernels/`` / ``orchestration/`` whose sibling
+    ``.so``/``.o`` is older than the cpp itself (cpp was edited after its
+    last build). Cpps with no sibling binary are skipped — those haven't
+    been built yet and ``compile_and_assemble`` will handle them.
+    """
+    stale: list[Path] = []
+    for sub in ("kernels", "orchestration"):
+        root = work_dir / sub
+        if not root.is_dir():
+            continue
+        for cpp in root.rglob("*.cpp"):
+            siblings = [cpp.with_suffix(ext) for ext in (".so", ".o")]
+            existing = [p for p in siblings if p.exists()]
+            if not existing:
+                continue
+            cpp_mtime = cpp.stat().st_mtime
+            if any(p.stat().st_mtime < cpp_mtime for p in existing):
+                stale.append(cpp)
+    return stale
+
+
+def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
+    """Validate *runtime_dir*; rebuild kernel cpps from edited ``.pto`` files
+    and drop cached binaries for any cpp newer than its ``.so``/``.o``.
+
+    Raises ``ValueError`` if the directory does not exist.
+    """
+    work_dir = Path(runtime_dir)
+    if not work_dir.is_dir():
+        raise ValueError(f"runtime_dir does not exist: {work_dir}")
+    print(f"[RUN] runtime_only: skipping {compile_label}, using {work_dir}", flush=True)
+    # pto -> cpp: splices updated ptoas body into kernel cpps, bumping their
+    # mtime so the cpp -> .so check below picks them up.
+    from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
+    rebuild_kernel_cpp_from_pto(work_dir)
+    stale = _stale_cpps(work_dir)
+    if stale:
+        from pypto.runtime.debug.replay import invalidate_binary_cache
+        invalidate_binary_cache(work_dir)
+        print(f"[cpp->.so] cpp edits detected ({len(stale)} file(s)); rebuilding", flush=True)
+    else:
+        print("[cpp->.so] no cpp edits since last build; reusing cached binaries", flush=True)
+    return work_dir
+
+
+def _prepare_inputs(
+    specs: list[TensorSpec | ScalarSpec],
+    tensor_specs: list[TensorSpec],
+    scalar_specs: list[ScalarSpec],
+    data_dir: Path | None,
+    work_dir: Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
+    """Build inputs for the runtime stage.
+
+    With *data_dir* set, load tensors and scalars from ``{data_dir}/in/`` and
+    leave ``input_snapshot`` empty (golden will be loaded from cache, no need
+    to clone inputs for ``golden_fn``). Otherwise generate from *specs* and
+    persist into ``{work_dir}/data/in/``.
+
+    Raises ``ValueError`` on missing files or scalar dtype mismatch.
+    """
+    if data_dir is None:
+        tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
+        scalar_specs_eff = {s.name: s for s in scalar_specs}
+        input_snapshot = {
+            spec.name: tensors[spec.name].clone()
+            for spec in tensor_specs
+            if not spec.is_output or spec.init_value is not None
+        }
+        in_dir = work_dir / "data" / "in"
+        _save_tensors(in_dir, input_snapshot)
+        _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+        return tensors, scalar_specs_eff, input_snapshot
+
+    required: list[tuple[str, str]] = []
+    for spec in (*tensor_specs, *scalar_specs):
+        required.extend(_required_files(spec))
+    missing = [
+        str(data_dir / sub / name)
+        for sub, name in required
+        if not (data_dir / sub / name).is_file()
+    ]
+    if missing:
+        raise ValueError(f"golden_data is missing files: {missing}")
+    print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
+
+    # Load inputs + inout initial values from {dir}/in/; pure outputs stay zero-init.
+    input_names = [s.name for s in tensor_specs if not s.is_output or s.init_value is not None]
+    tensors = _load_tensors(data_dir, "in", input_names)
+    for spec in tensor_specs:
+        if spec.is_output and spec.init_value is None:
+            tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+
+    scalar_specs_eff = {}
+    for s in scalar_specs:
+        cached = torch.load(data_dir / "in" / f"{s.name}.pt", weights_only=True)
+        if not isinstance(cached, torch.Tensor) or cached.ndim != 0:
+            shape = tuple(cached.shape) if isinstance(cached, torch.Tensor) else type(cached).__name__
+            raise ValueError(f"{s.name}.pt must contain a 0-dim torch.Tensor, got {shape}")
+        if cached.dtype != s.dtype:
+            raise ValueError(f"{s.name}.pt dtype mismatch: spec={s.dtype} cache={cached.dtype}")
+        scalar_specs_eff[s.name] = ScalarSpec(name=s.name, dtype=s.dtype, value=cached)
+
+    return tensors, scalar_specs_eff, {}
+
+
+def _execute_via_runner(
+    work_dir: Path,
+    specs: list[TensorSpec | ScalarSpec],
+    tensors: dict[str, torch.Tensor],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    runtime_cfg: dict[str, Any],
+) -> None:
+    """Reorder args to orchestration param order and dispatch via ``execute_compiled``."""
+    from pypto.runtime import execute_compiled
+
+    ordered: list[Any] = [
+        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
+        for s in specs
+    ]
+    execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
+
+
+def _try_l3_dispatch(
+    compiled: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    tensors: dict[str, torch.Tensor],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    runtime_cfg: dict[str, Any],
+) -> bool:
+    """If *compiled* is an L3 ``DistributedCompiledProgram``, dispatch it and return True.
+
+    L3 (HOST Orchestrator) programs cannot use ``execute_compiled`` (no
+    top-level ``kernel_config.py``); the compiled object is callable directly
+    with ``pypto.runtime.RunConfig``.
+    """
+    try:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    except ImportError:
+        return False
+    if not isinstance(compiled, DistributedCompiledProgram):
+        return False
+
+    import dataclasses
+
+    from pypto.runtime import RunConfig as PyptoRunConfig
+
+    # Build name->value map; SSA names ``orig__ssa_vN`` get stripped to ``orig``.
+    arg_map: dict[str, Any] = {}
+    for s in specs:
+        if isinstance(s, TensorSpec):
+            arg_map[s.name] = tensors[s.name]
+        else:
+            arg_map[s.name] = scalar_specs_eff[s.name].value
+    param_infos, _, _ = compiled._get_metadata()
+    ordered = [arg_map[p.name.split("__ssa_")[0]] for p in param_infos]
+
+    platform = runtime_cfg.get("platform", "a2a3")
+    allowed = {f.name for f in dataclasses.fields(PyptoRunConfig)}
+    kwargs = {k: v for k, v in runtime_cfg.items() if k in allowed}
+    kwargs.setdefault("platform", platform)
+    kwargs.setdefault("device_id", 0)
+    kwargs["backend_type"] = _backend_for_platform(platform)
+    compiled(*ordered, config=PyptoRunConfig(**kwargs))
+    return True
+
+
+def _compute_golden(
+    specs: list[TensorSpec | ScalarSpec],
+    tensor_specs: list[TensorSpec],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    input_snapshot: dict[str, torch.Tensor],
+    work_dir: Path,
+    data_dir: Path | None,
+    golden_fn: Callable | None,
+) -> dict[str, torch.Tensor]:
+    """Produce golden output tensors for validation.
+
+    With *data_dir* set, load from ``{data_dir}/out/``. Otherwise call
+    *golden_fn* on a scratch dict (inputs cloned from *input_snapshot*,
+    outputs zero-init) and persist results into ``{work_dir}/data/out/``.
+    """
+    with _Stage("compute golden"):
+        if data_dir is not None:
+            print(f"[RUN]   cache hit: {data_dir / 'out'}", flush=True)
+            output_names = [s.name for s in tensor_specs if s.is_output]
+            return _load_tensors(data_dir, "out", output_names)
+
+        scratch: dict[str, Any] = {}
+        for spec in specs:
+            if isinstance(spec, ScalarSpec):
+                scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
+            elif spec.is_output and spec.init_value is None:
+                scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
+            else:
+                scratch[spec.name] = input_snapshot[spec.name].clone()
+        golden_fn(scratch)
+        golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
+        _save_tensors(work_dir / "data" / "out", golden_outputs)
+        return golden_outputs
+
+
+def _validate(
+    tensor_specs: list[TensorSpec],
+    tensors: dict[str, torch.Tensor],
+    golden_outputs: dict[str, torch.Tensor],
+    rtol: float,
+    atol: float,
+    compare_fn: dict[str, Callable],
+) -> None:
+    """Compare device outputs against *golden_outputs*. Raises ``AssertionError``."""
+    with _Stage("validate"):
+        device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+        input_tensors = {spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output}
+        validate_golden(
+            device_outputs, golden_outputs,
+            rtol=rtol, atol=atol, compare_fn=compare_fn, inputs=input_tensors,
+        )
+
+
 def run(
     program: Any,
     specs: list[TensorSpec | ScalarSpec],
-    config: RunConfig | None = None,
     golden_fn: Callable | None = None,
     golden_data: str | None = None,
+    compile_cfg: dict[str, Any] | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+    compare_fn: dict[str, Callable] | None = None,
+    compile_only: bool = False,
     runtime_dir: str | None = None,
 ) -> RunResult:
-    """Compile *program*, run on device, and optionally validate goldens.
+    """Compile *program*, run on device, and validate against golden.
 
     Args:
-        program: A ``@pl.program`` decorated class or an ``ir.Program``.
-        specs: Ordered list of :class:`TensorSpec` and :class:`ScalarSpec`
-            entries matching the orchestration function's parameter order.
-        config: Run configuration.  Uses default :class:`RunConfig` if ``None``.
-        golden_fn: Optional callable ``golden_fn(values)`` that computes
-            expected outputs in-place.  ``values`` is a dict containing both
-            tensor clones and scalar Python values keyed by spec name.  When
-            ``None``, golden is sourced from *golden_data* if set; if neither
-            is provided, validation is skipped.
-        golden_data: Optional directory with persisted ``in/{name}.pt`` and
-            ``out/{name}.pt`` files (scalars are stored as 0-dim tensors in
-            the same format).  When set, :func:`run` loads inputs from it
-            instead of generating them (read-only).  Takes precedence over
-            *golden_fn* when both are provided.
-        runtime_dir: Optional path to a pre-compiled build_output directory.
-            When set, compilation is skipped and execution runs against this
-            directory; ``config.compile`` is ignored and ``compile_only`` is
-            rejected.
+        program: ``@pl.program`` class or ``ir.Program``.
+        specs: :class:`TensorSpec` / :class:`ScalarSpec` list in orchestration
+            parameter order.
+        golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
+            maps spec name to tensor clone or Python scalar. Ignored when
+            *golden_data* is set; if neither is given, validation is skipped.
+        golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
+            loads inputs and expected outputs (read-only). Takes precedence
+            over *golden_fn*.
+        compile_cfg: Kwargs forwarded to :func:`pypto.ir.compile`. Unknown
+            keys raise there.
+        runtime_cfg: Kwargs forwarded to
+            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
+            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            the harness-only key ``log_level``, which is consumed up-front
+            to configure the PyPTO runtime logger via
+            :func:`pypto.runtime.log_config.configure_log`.
+        rtol, atol: Golden comparison tolerances.
+        compare_fn: Per-output-name overrides for ``torch.allclose``; see
+            :func:`golden.validation.validate_golden`.
+        compile_only: Stop after code generation; skip execute and validate.
+        runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
+            compile and invalidates cached ``.so``/``.bin`` so cpp edits
+            rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
 
     Returns:
-        :class:`RunResult` with ``passed=True`` on success, or ``passed=False``
-        with an ``error`` message on failure.
+        :class:`RunResult`.
     """
     from pypto import ir
-    from pypto.runtime import execute_compiled
 
-    if config is None:
-        config = RunConfig()
+    compile_cfg = compile_cfg or {}
+    runtime_cfg = dict(runtime_cfg or {})  # copy: we pop harness-only keys
+    compare_fn = compare_fn or {}
+
+    _consume_runtime_harness_keys(runtime_cfg)
+
+    if compile_only and runtime_dir is not None:
+        return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
 
     data_dir = Path(golden_data) if golden_data is not None else None
-
     tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
     scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
 
     start = time.time()
-    _stage = _Stage  # local alias so the with-statement reads `_stage(...)`
-
     work_dir: Path | None = None
 
     def _fail(error: str) -> RunResult:
         return RunResult(
-            passed=False,
-            error=error,
-            execution_time=time.time() - start,
-            work_dir=work_dir,
+            passed=False, error=error,
+            execution_time=time.time() - start, work_dir=work_dir,
         )
 
-    # Compile
+    # Compile (or pick runtime_dir)
+    compiled: Any = None
     if runtime_dir is not None:
-        if config.compile_only:
-            return _fail("runtime_dir is incompatible with config.compile_only")
-        work_dir = Path(runtime_dir)
-        if not work_dir.is_dir():
-            return _fail(f"runtime_dir does not exist: {work_dir}")
-        print(f"[RUN] runtime_only: skipping compile, using {work_dir}", flush=True)
+        try:
+            work_dir = _setup_runtime_dir(runtime_dir, compile_label="compile")
+        except ValueError as e:
+            return _fail(str(e))
     else:
-        with _stage("compile"):
-            compile_kwargs = dict(config.compile)
-            platform = config.runtime.get("platform")
+        with _Stage("compile"):
+            compile_kwargs = dict(compile_cfg)
+            platform = runtime_cfg.get("platform")
             if platform is not None:
                 compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
             compiled = ir.compile(program, **compile_kwargs)
             work_dir = Path(compiled.output_dir)
-
-        if config.compile_only:
+        if compile_only:
             total = time.time() - start
             print(f"[RUN] PASS ({total:.2f}s)", flush=True)
             return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     # Generate Inputs
-    input_snapshot: dict[str, torch.Tensor] = {}
-    scalar_specs_eff: dict[str, ScalarSpec] = {}
-    with _stage("generate inputs"):
-        if data_dir is not None:
-            required: list[tuple[str, str]] = []
-            for spec in (*tensor_specs, *scalar_specs):
-                required.extend(_required_files(spec))
-            missing = [
-                str(data_dir / sub / name)
-                for sub, name in required
-                if not (data_dir / sub / name).is_file()
-            ]
-            if missing:
-                return _fail(f"golden_data is missing files: {missing}")
-            print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
-            # Load inputs + inout initial values from {dir}/in/; pure outputs stay zero-init.
-            input_names = [
-                s.name for s in tensor_specs
-                if not s.is_output or s.init_value is not None
-            ]
-            tensors = _load_tensors(data_dir, "in", input_names)
-            for spec in tensor_specs:
-                if spec.is_output and spec.init_value is None:
-                    tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
-            # Load each scalar from its own {name}.pt; verify dtype matches the
-            # spec, then reconstruct a ScalarSpec (cached value overrides the
-            # spec value, dtype must be identical).
-            for s in scalar_specs:
-                cached = torch.load(data_dir / "in" / f"{s.name}.pt", weights_only=True)
-                if not isinstance(cached, torch.Tensor) or cached.ndim != 0:
-                    shape = tuple(cached.shape) if isinstance(cached, torch.Tensor) else type(cached).__name__
-                    return _fail(
-                        f"{s.name}.pt must contain a 0-dim torch.Tensor, got {shape}"
-                    )
-                if cached.dtype != s.dtype:
-                    return _fail(
-                        f"{s.name}.pt dtype mismatch: spec={s.dtype} cache={cached.dtype}"
-                    )
-                scalar_specs_eff[s.name] = ScalarSpec(
-                    name=s.name, dtype=s.dtype, value=cached
-                )
-        else:
-            tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
-            scalar_specs_eff = {s.name: s for s in scalar_specs}
-            input_snapshot = {
-                spec.name: tensors[spec.name].clone()
-                for spec in tensor_specs
-                if not spec.is_output or spec.init_value is not None
-            }
-            in_dir = work_dir / "data" / "in"
-            _save_tensors(in_dir, input_snapshot)
-            _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+    try:
+        with _Stage("generate inputs"):
+            tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
+                specs, tensor_specs, scalar_specs, data_dir, work_dir,
+            )
+    except ValueError as e:
+        return _fail(str(e))
+
+    # Compute Golden
+    golden_outputs: dict[str, torch.Tensor] | None = None
+    if golden_fn is not None or golden_data is not None:
+        golden_outputs = _compute_golden(
+            specs, tensor_specs, scalar_specs_eff, input_snapshot,
+            work_dir, data_dir, golden_fn,
+        )
 
     # Runtime
-    with _stage("runtime"):
-        # Detect L3 programs (HOST Orchestrator): ir.compile() returns a
-        # DistributedCompiledProgram.  These cannot use execute_compiled()
-        # (which expects kernel_config.py at the top level); instead call
-        # compiled() directly with all scalars passed as 0-dim tensors and
-        # args reordered to the function declaration order via _get_metadata().
-        _is_l3 = False
-        if runtime_dir is None:
-            try:
-                from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
-                    DistributedCompiledProgram as _DC,
-                )
-                _is_l3 = isinstance(compiled, _DC)
-            except ImportError:
-                pass
+    with _Stage("runtime"):
+        if compiled is None or not _try_l3_dispatch(
+            compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
+        ):
+            _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
-        if _is_l3:
-            from pypto.runtime import RunConfig as _PRC  # noqa: PLC0415
-
-            # Build name->value dict: tensors unchanged, scalars as 0-dim tensors.
-            _arg_map: dict[str, Any] = {s.name: tensors[s.name] for s in tensor_specs}
-            _arg_map.update(
-                {s.name: scalar_specs_eff[s.name].value for s in scalar_specs}
-            )
-            # Reorder to function declaration order from param_infos.
-            # SSA names have the form ``orig_name__ssa_vN``; strip the suffix.
-            _param_infos, _, _ = compiled._get_metadata()
-            _ordered_l3: list[Any] = [
-                _arg_map[p.name.split("__ssa_")[0]] for p in _param_infos
-            ]
-            _platform = config.runtime.get("platform", "a2a3")
-            # Forward every RunConfig field the caller supplied so L3 behaves
-            # consistently with the non-L3 path (which forwards via run_jit's
-            # whitelist).  Unknown keys fail fast inside RunConfig(**...).
-            import dataclasses as _dc  # noqa: PLC0415
-            _allowed = {f.name for f in _dc.fields(_PRC)}
-            _kwargs = {k: v for k, v in config.runtime.items() if k in _allowed}
-            _kwargs.setdefault("platform", _platform)
-            _kwargs.setdefault("device_id", 0)
-            _kwargs["backend_type"] = _backend_for_platform(_platform)
-            _run_cfg = _PRC(**_kwargs)
-            compiled(*_ordered_l3, config=_run_cfg)
-        else:
-            ordered: list[Any] = [
-                tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-                for s in specs
-            ]
-            execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(config.runtime))
-
-    if golden_fn is None and golden_data is None:
+    # Validate
+    if golden_outputs is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir)
-
-    device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
-
-    # Compute Golden (or load from cache)
-    with _stage("compute golden"):
-        if data_dir is not None:
-            print(f"[RUN]   cache hit: {data_dir / 'out'}", flush=True)
-            output_names = [s.name for s in tensor_specs if s.is_output]
-            golden_outputs = _load_tensors(data_dir, "out", output_names)
-        else:
-            scratch: dict[str, Any] = {}
-            for spec in specs:
-                if isinstance(spec, ScalarSpec):
-                    scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
-                elif spec.is_output and spec.init_value is None:
-                    scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
-                else:
-                    scratch[spec.name] = input_snapshot[spec.name].clone()
-            golden_fn(scratch)
-            golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
-            _save_tensors(work_dir / "data" / "out", golden_outputs)
-
-    # Validate
-    with _stage("validate"):
-        try:
-            input_tensors = {spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output}
-            validate_golden(
-                device_outputs,
-                golden_outputs,
-                rtol=config.rtol,
-                atol=config.atol,
-                compare_fn=config.compare_fn,
-                inputs=input_tensors,
-            )
-        except AssertionError as e:
-            return _fail(str(e))
+    try:
+        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+    except AssertionError as e:
+        return _fail(str(e))
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
     return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
 
-def _resolve_jit_work_dir(fn: Any) -> Path:
-    """Return the most recently compiled :class:`CompiledProgram`'s output dir
-    from a :class:`pypto.jit.JITFunction`'s L1 cache.
+def _jit_compile_only(
+    fn: Any, jit_args: list[Any], platform: str | None, **compile_kwargs: Any,
+) -> Path:
+    """Compile a ``@pl.jit`` function without executing on device.
 
-    Used after a JIT call to locate ``data/in`` and ``data/out`` for snapshot
-    persistence.
+    Replays :meth:`JITFunction.__call__`'s prelude (bind args → cache key →
+    ``_compile``) and stops there, populating the L1 cache. Private-API
+    surgery — pypto exposes no platform-aware compile-only entry. Extra
+    *compile_kwargs* forward to ``fn._compile``, so unsupported keys raise
+    ``TypeError`` there rather than being silently dropped.
     """
-    cache = getattr(fn, "_cache", None)
-    if not cache:
-        raise RuntimeError(
-            f"@pl.jit function {getattr(fn, '__name__', fn)!r} has no cached "
-            "CompiledProgram; was it executed?"
-        )
-    compiled = next(reversed(cache.values()))
-    return Path(compiled.output_dir)
-
-
-def _jit_compile_only(fn: Any, jit_args: list[Any], platform: str | None) -> Path:
-    """Drive the JIT decorator's compile step without executing on device.
-
-    ``CompiledProgram.__call__`` always dispatches to ``execute_compiled`` —
-    ``codegen_only`` is only honored by the higher-level
-    :func:`pypto.runtime.run` entry point.  To get a true compile-only path
-    on the JIT side we replicate :meth:`JITFunction.__call__`'s prelude
-    (bind args → cache key → ``_compile``) and stop there, populating the
-    JIT's L1 cache so a subsequent call hits and runs end-to-end.
-    """
-    import pypto.language as pl_mod  # noqa: PLC0415
-    from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+    import pypto.language as pl_mod
+    from pypto.jit.cache import make_cache_key
 
     param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = (
         fn._bind_args(tuple(jit_args), {})
@@ -444,7 +531,8 @@ def _jit_compile_only(fn: Any, jit_args: list[Any], platform: str | None) -> Pat
     )
     if key not in fn._cache:
         fn._cache[key] = fn._compile(
-            tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod, platform=platform
+            tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
+            platform=platform, **compile_kwargs,
         )
     return Path(fn._cache[key].output_dir)
 
@@ -452,222 +540,125 @@ def _jit_compile_only(fn: Any, jit_args: list[Any], platform: str | None) -> Pat
 def run_jit(
     fn: Any,
     specs: list[TensorSpec | ScalarSpec],
-    config: RunConfig | None = None,
     golden_fn: Callable | None = None,
     golden_data: str | None = None,
+    compile_cfg: dict[str, Any] | None = None,
+    runtime_cfg: dict[str, Any] | None = None,
+    rtol: float = 1e-5,
+    atol: float = 1e-5,
+    compare_fn: dict[str, Callable] | None = None,
+    compile_only: bool = False,
     runtime_dir: str | None = None,
 ) -> RunResult:
-    """Run a ``@pl.jit`` entry under the same harness as :func:`run`.
-
-    The JIT decorator owns compilation + caching; this wrapper layers
-    :class:`TensorSpec`-driven input generation, ``golden_fn`` validation,
-    and persistence to ``data/in`` / ``data/out`` on top.
+    """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
 
     Args:
-        fn: A ``@pl.jit`` decorated callable (``JITFunction``).
-        specs: Ordered list of :class:`TensorSpec` and :class:`ScalarSpec`,
-            matching the JIT function's parameter order.
-        config: Run configuration.  Both ``config.compile`` and
-            ``config.runtime`` are merged and forwarded into a single
-            :class:`pypto.runtime.RunConfig`, since the JIT decorator owns
-            both compile and execute under one call.  Putting compile-side
-            knobs (``dump_passes``, ``save_kernels``, ``codegen_only``,
-            ``backend_type``, ``strategy``) in ``config.compile`` keeps the
-            split symmetric with :func:`run`.  Conflicts between the two
-            dicts raise an error.
-        golden_fn: Optional ``golden_fn(values)`` for in-place reference
-            computation (same contract as :func:`run`).
-        golden_data: Optional cached-data directory (same contract as
-            :func:`run`).
-        runtime_dir: Optional pre-compiled ``build_output`` directory.  When
-            set, bypasses the JIT and dispatches via
-            :func:`pypto.runtime.execute_compiled`.
+        fn: ``@pl.jit`` decorated callable.
+        specs: :class:`TensorSpec` / :class:`ScalarSpec` list in the JIT
+            function's parameter order.
+        golden_fn: ``golden_fn(values)`` that fills outputs in-place; *values*
+            maps spec name to tensor clone or Python scalar. Ignored when
+            *golden_data* is set; if neither is given, validation is skipped.
+        golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
+            loads inputs and expected outputs (read-only). Takes precedence
+            over *golden_fn*.
+        compile_cfg: Kwargs forwarded to ``fn._compile``. The JIT path only
+            honors ``platform`` (typically supplied via *runtime_cfg*), so
+            other keys raise there.
+        runtime_cfg: Kwargs forwarded to
+            :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
+            ``enable_l2_swimlane``, ...). Unknown keys raise there, except
+            the harness-only key ``log_level``, which is consumed up-front
+            to configure the PyPTO runtime logger via
+            :func:`pypto.runtime.log_config.configure_log`.
+        rtol, atol: Golden comparison tolerances.
+        compare_fn: Per-output-name overrides for ``torch.allclose``; see
+            :func:`golden.validation.validate_golden`.
+        compile_only: Stop after code generation; skip execute and validate.
+        runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
+            compile and invalidates cached ``.so``/``.bin`` so cpp edits
+            rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
 
     Returns:
-        :class:`RunResult` matching :func:`run`'s convention.
+        :class:`RunResult`.
     """
-    from pypto.runtime import RunConfig as RTRunConfig  # noqa: PLC0415
-    from pypto.runtime import execute_compiled  # noqa: PLC0415
+    compile_cfg = compile_cfg or {}
+    runtime_cfg = dict(runtime_cfg or {})  # copy: we pop harness-only keys
+    compare_fn = compare_fn or {}
 
-    if config is None:
-        config = RunConfig()
-    if config.compile_only and runtime_dir is not None:
-        return RunResult(
-            passed=False,
-            error="runtime_dir is incompatible with config.compile_only",
-        )
+    _consume_runtime_harness_keys(runtime_cfg)
+
+    if compile_only and runtime_dir is not None:
+        return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
 
     data_dir = Path(golden_data) if golden_data is not None else None
     tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
     scalar_specs = [s for s in specs if isinstance(s, ScalarSpec)]
 
     start = time.time()
-    _stage = _Stage
-
     work_dir: Path | None = None
 
     def _fail(error: str) -> RunResult:
         return RunResult(
-            passed=False,
-            error=error,
-            execution_time=time.time() - start,
-            work_dir=work_dir,
+            passed=False, error=error,
+            execution_time=time.time() - start, work_dir=work_dir,
         )
 
-    # Compile (or pick runtime_dir) — done first so stage order matches run().
-    # We feed JIT a set of zero-cost dummy tensors derived from the specs, just
-    # to satisfy _bind_args's tensor-meta extraction.  Real tensors with the
-    # same shape/dtype hit the same cache key on the later execute call.
+    # Compile
     if runtime_dir is not None:
-        work_dir = Path(runtime_dir)
-        if not work_dir.is_dir():
-            return _fail(f"runtime_dir does not exist: {work_dir}")
-        print(f"[RUN] runtime_only: skipping JIT compile, using {work_dir}", flush=True)
-        rt_kwargs: dict[str, Any] = {}
+        try:
+            work_dir = _setup_runtime_dir(runtime_dir, compile_label="JIT compile")
+        except ValueError as e:
+            return _fail(str(e))
     else:
-        with _stage("compile"):
-            rt_kwargs = {**config.compile, **config.runtime}
-            overlap = config.compile.keys() & config.runtime.keys()
-            if overlap:
-                return _fail(
-                    f"config.compile and config.runtime both set: {sorted(overlap)}"
-                )
-            rt_kwargs.setdefault("rtol", config.rtol)
-            rt_kwargs.setdefault("atol", config.atol)
-            dummy_args: list[Any] = []
-            for spec in specs:
-                if isinstance(spec, ScalarSpec):
-                    dummy_args.append(spec.value.item())
-                else:
-                    dummy_args.append(torch.empty(spec.shape, dtype=spec.dtype))
-            work_dir = _jit_compile_only(fn, dummy_args, platform=rt_kwargs.get("platform"))
-
-    if config.compile_only:
-        total = time.time() - start
-        print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+        with _Stage("compile"):
+            # Dummy args just satisfy _bind_args's tensor-meta extraction; real
+            # tensors with the same shape/dtype hit the same cache key later.
+            dummy_args = [
+                spec.value.item() if isinstance(spec, ScalarSpec)
+                else torch.empty(spec.shape, dtype=spec.dtype)
+                for spec in specs
+            ]
+            work_dir = _jit_compile_only(
+                fn, dummy_args,
+                platform=runtime_cfg.get("platform"),
+                **compile_cfg,
+            )
+        if compile_only:
+            total = time.time() - start
+            print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+            return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
     # Generate Inputs
-    input_snapshot: dict[str, torch.Tensor] = {}
-    scalar_specs_eff: dict[str, ScalarSpec] = {}
-    with _stage("generate inputs"):
-        if data_dir is not None:
-            required: list[tuple[str, str]] = []
-            for spec in (*tensor_specs, *scalar_specs):
-                required.extend(_required_files(spec))
-            missing = [
-                str(data_dir / sub / name)
-                for sub, name in required
-                if not (data_dir / sub / name).is_file()
-            ]
-            if missing:
-                return _fail(f"golden_data is missing files: {missing}")
-            print(f"[RUN]   cache hit: {data_dir / 'in'}", flush=True)
-            input_names = [
-                s.name for s in tensor_specs
-                if not s.is_output or s.init_value is not None
-            ]
-            tensors = _load_tensors(data_dir, "in", input_names)
-            for spec in tensor_specs:
-                if spec.is_output and spec.init_value is None:
-                    tensors[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
-            for s in scalar_specs:
-                cached = torch.load(data_dir / "in" / f"{s.name}.pt", weights_only=True)
-                if not isinstance(cached, torch.Tensor) or cached.ndim != 0:
-                    shape = (
-                        tuple(cached.shape) if isinstance(cached, torch.Tensor)
-                        else type(cached).__name__
-                    )
-                    return _fail(
-                        f"{s.name}.pt must contain a 0-dim torch.Tensor, got {shape}"
-                    )
-                if cached.dtype != s.dtype:
-                    return _fail(
-                        f"{s.name}.pt dtype mismatch: spec={s.dtype} cache={cached.dtype}"
-                    )
-                scalar_specs_eff[s.name] = ScalarSpec(name=s.name, dtype=s.dtype, value=cached)
-            input_snapshot = {
-                spec.name: tensors[spec.name].clone()
-                for spec in tensor_specs
-                if not spec.is_output or spec.init_value is not None
-            }
-        else:
-            tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
-            scalar_specs_eff = {s.name: s for s in scalar_specs}
-            input_snapshot = {
-                spec.name: tensors[spec.name].clone()
-                for spec in tensor_specs
-                if not spec.is_output or spec.init_value is not None
-            }
-            in_dir = work_dir / "data" / "in"
-            _save_tensors(in_dir, input_snapshot)
-            _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+    try:
+        with _Stage("generate inputs"):
+            tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
+                specs, tensor_specs, scalar_specs, data_dir, work_dir,
+            )
+    except ValueError as e:
+        return _fail(str(e))
+
+    # Compute Golden
+    golden_outputs: dict[str, torch.Tensor] | None = None
+    if golden_fn is not None or golden_data is not None:
+        golden_outputs = _compute_golden(
+            specs, tensor_specs, scalar_specs_eff, input_snapshot,
+            work_dir, data_dir, golden_fn,
+        )
 
     # Runtime
-    with _stage("runtime"):
-        if runtime_dir is not None:
-            ordered: list[Any] = [
-                tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-                for s in specs
-            ]
-            # execute_compiled only accepts a subset of pypto.runtime.RunConfig
-            # fields — strip the compile-only ones (dump_passes, codegen_only,
-            # rtol, atol, etc.) and bundle DFX flags via _execute_compiled_kwargs.
-            execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(config.runtime))
-        else:
-            jit_args: list[Any] = []
-            for spec in specs:
-                if isinstance(spec, ScalarSpec):
-                    jit_args.append(scalar_specs_eff[spec.name].to_python())
-                else:
-                    jit_args.append(tensors[spec.name])
-            fn(*jit_args, config=RTRunConfig(**rt_kwargs))
+    with _Stage("runtime"):
+        _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
-    if golden_fn is None and golden_data is None:
+    # Validate
+    if golden_outputs is None:
         total = time.time() - start
-        print(
-            f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)",
-            flush=True,
-        )
+        print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
         return RunResult(passed=True, execution_time=total, work_dir=work_dir)
-
-    device_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
-
-    with _stage("compute golden"):
-        if data_dir is not None:
-            print(f"[RUN]   cache hit: {data_dir / 'out'}", flush=True)
-            output_names = [s.name for s in tensor_specs if s.is_output]
-            golden_outputs = _load_tensors(data_dir, "out", output_names)
-        else:
-            scratch: dict[str, Any] = {}
-            for spec in specs:
-                if isinstance(spec, ScalarSpec):
-                    scratch[spec.name] = scalar_specs_eff[spec.name].to_python()
-                elif spec.is_output and spec.init_value is None:
-                    scratch[spec.name] = torch.zeros(spec.shape, dtype=spec.dtype)
-                else:
-                    scratch[spec.name] = input_snapshot[spec.name].clone()
-            golden_fn(scratch)
-            golden_outputs = {
-                spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output
-            }
-            _save_tensors(work_dir / "data" / "out", golden_outputs)
-
-    with _stage("validate"):
-        try:
-            input_tensors = {
-                spec.name: tensors[spec.name] for spec in tensor_specs if not spec.is_output
-            }
-            validate_golden(
-                device_outputs,
-                golden_outputs,
-                rtol=config.rtol,
-                atol=config.atol,
-                compare_fn=config.compare_fn,
-                inputs=input_tensors,
-            )
-        except AssertionError as e:
-            return _fail(str(e))
+    try:
+        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+    except AssertionError as e:
+        return _fail(str(e))
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)

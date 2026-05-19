@@ -743,7 +743,7 @@ def golden_prefill_scope123(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -758,16 +758,14 @@ if __name__ == "__main__":
         program=build_prefill_scope123_program(),
         specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_prefill_scope123,
-        config=RunConfig(
-            rtol=3e-3,
-            atol=3e-3,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        compile_cfg=dict(dump_passes=True),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=3e-3,
+        atol=3e-3,
     )
     if not result.passed:
         if result.error:

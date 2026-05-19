@@ -356,7 +356,7 @@ def build_tensor_specs(layer_id: int = 0):
 if __name__ == "__main__":
     import argparse
     import torch
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -372,20 +372,17 @@ if __name__ == "__main__":
         fn=decode_hca_test,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_decode_hca,
-        config=RunConfig(
-            rtol=1e-2,
-            atol=1e-2,
-            compare_fn={
-                # Two-stage composition (attention_hca + moe) accumulates BF16 error.
-                "x_next": ratio_allclose(atol=5e-2, rtol=2.0 / 128, max_error_ratio=0.02),
-            },
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-2,
+        atol=1e-2,
+        compare_fn={
+            # Two-stage composition (attention_hca + moe) accumulates BF16 error.
+            "x_next": ratio_allclose(atol=5e-2, rtol=2.0 / 128, max_error_ratio=0.02),
+        },
     )
     if not result.passed:
         if result.error:

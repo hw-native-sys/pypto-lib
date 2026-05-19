@@ -83,7 +83,7 @@ def golden_softmax(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, run
+    from golden import run
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -96,16 +96,14 @@ if __name__ == "__main__":
         program=build_softmax_program(),
         specs=build_tensor_specs(),
         golden_fn=golden_softmax,
-        config=RunConfig(
-            rtol=1e-5,
-            atol=1e-5,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        compile_cfg=dict(dump_passes=True),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-5,
+        atol=1e-5,
     )
     if not result.passed:
         if result.error:

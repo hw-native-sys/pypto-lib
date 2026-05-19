@@ -232,7 +232,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -244,20 +244,17 @@ if __name__ == "__main__":
         fn=moe_dispatch_test,
         specs=build_tensor_specs(),
         golden_fn=golden_moe_dispatch,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-            ),
-            compare_fn={
-                # ULP-level FP32 mul drift flips rint at k.5 boundaries → INT8
-                # off-by-one with same dequant magnitude. Allow ≤0.1% bad.
-                "recv_x": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
-            },
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            # ULP-level FP32 mul drift flips rint at k.5 boundaries → INT8
+            # off-by-one with same dequant magnitude. Allow ≤0.1% bad.
+            "recv_x": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
+        },
     )
     if not result.passed:
         if result.error:

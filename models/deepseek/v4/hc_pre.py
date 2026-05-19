@@ -370,7 +370,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -383,21 +383,18 @@ if __name__ == "__main__":
         fn=hc_pre_test,
         specs=build_tensor_specs(),
         golden_fn=golden_hc_pre,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={
-                "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
-                "comb":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            },
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "comb":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+        },
     )
     if not result.passed:
         if result.error:
