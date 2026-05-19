@@ -41,8 +41,9 @@ START_POS = COMPRESS_RATIO - 1       # ScalarSpec default exercises S-token wind
 
 # tiling
 ROPE_CHUCK = 32
-K_CHUNK = 512
-OUT_CHUNK = 32
+K_CHUNK = 128
+OUT_CHUNK = 64
+NEXT_OUT_CHUNK = 32
 HEAD_CHUNK = 32
 HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
@@ -69,41 +70,30 @@ def indexer_compressor(
     start_pos: pl.Scalar[pl.INT32],
     rotate: pl.Scalar[pl.BOOL],
 ):
-    x_flat = pl.reshape(x, [B * S, D])
-    idx_cmp_kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
-    idx_cmp_score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     ape_row = pl.cast(start_pos % COMPRESS_RATIO, target_type=pl.INDEX)
     pre_tokens = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
     kv_state_flat = pl.reshape(kv_state, [B, STATE_LEN * OUT_DIM])
     score_state_flat = pl.reshape(score_state, [B, STATE_LEN * OUT_DIM])
 
-    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
-            x_tile = x_flat[:, 0 : K_CHUNK]
-            wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
-            wgate_tile = wgate[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
-            kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
-            score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+    scatter_stop = S
+    if pre_tokens < S:
+        scatter_stop = pre_tokens
+    for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
+        for s in pl.parallel(scatter_stop):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
+                x_tile = pl.reshape(x[:, s : s + 1, 0 : K_CHUNK], [B, K_CHUNK])
+                wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
+                wgate_tile = wgate[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
+                kv_tile = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
+                score_tile = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
 
-            for k0 in pl.range(K_CHUNK, D, K_CHUNK):
-                x_tile = x_flat[:, k0 : k0 + K_CHUNK]
-                wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
-                wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
+                for k0 in pl.range(K_CHUNK, D, K_CHUNK):
+                    x_tile = pl.reshape(x[:, s : s + 1, k0 : k0 + K_CHUNK], [B, K_CHUNK])
+                    wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
+                    wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
+                    kv_tile = pl.matmul_acc(kv_tile, x_tile, wkv_tile)
+                    score_tile = pl.matmul_acc(score_tile, x_tile, wgate_tile)
 
-            idx_cmp_kv_proj_scratch = pl.assemble(idx_cmp_kv_proj_scratch, kv_acc, [0, o0])
-            idx_cmp_score_proj_scratch = pl.assemble(idx_cmp_score_proj_scratch, score_acc, [0, o0])
-
-        idx_cmp_kv_proj_3d = pl.reshape(idx_cmp_kv_proj_scratch, [B, S, OUT_DIM])
-        idx_cmp_score_proj_3d = pl.reshape(idx_cmp_score_proj_scratch, [B, S, OUT_DIM])
-        scatter_stop = S
-        if pre_tokens < S:
-            scatter_stop = pre_tokens
-        for s in pl.range(scatter_stop):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
-                kv_tile = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
-                score_tile = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
                 token_ape_row = (ape_row + s) % COMPRESS_RATIO
                 ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_CHUNK]
                 ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
@@ -268,39 +258,49 @@ def indexer_compressor(
                     pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
                     [cache_row, 0],
                 )
-        idx_cmp_kv_proj_3d = pl.reshape(idx_cmp_kv_proj_scratch, [B, S, OUT_DIM])
-        idx_cmp_score_proj_3d = pl.reshape(idx_cmp_score_proj_scratch, [B, S, OUT_DIM])
+        if pre_tokens < S:
+            for o0 in pl.parallel(0, OUT_DIM, NEXT_OUT_CHUNK):
+                for s in pl.range(pre_tokens, S):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj_next"):
+                        x_tile_next = pl.reshape(x[:, s : s + 1, 0 : K_CHUNK], [B, K_CHUNK])
+                        wkv_tile_next = wkv[0 : K_CHUNK, o0 : o0 + NEXT_OUT_CHUNK]
+                        wgate_tile_next = wgate[0 : K_CHUNK, o0 : o0 + NEXT_OUT_CHUNK]
+                        kv_tile_next = pl.matmul(x_tile_next, wkv_tile_next, out_dtype=pl.FP32)
+                        score_tile_next = pl.matmul(x_tile_next, wgate_tile_next, out_dtype=pl.FP32)
+
+                        for k0 in pl.range(K_CHUNK, D, K_CHUNK):
+                            x_tile_next = pl.reshape(x[:, s : s + 1, k0 : k0 + K_CHUNK], [B, K_CHUNK])
+                            wkv_tile_next = wkv[k0 : k0 + K_CHUNK, o0 : o0 + NEXT_OUT_CHUNK]
+                            wgate_tile_next = wgate[k0 : k0 + K_CHUNK, o0 : o0 + NEXT_OUT_CHUNK]
+                            kv_tile_next = pl.matmul_acc(kv_tile_next, x_tile_next, wkv_tile_next)
+                            score_tile_next = pl.matmul_acc(score_tile_next, x_tile_next, wgate_tile_next)
+
+                        shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM + o0
+                        dep_zero_next = pl.sub(
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + NEXT_OUT_CHUNK],
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + NEXT_OUT_CHUNK],
+                        )
+                        kv_tile_next = pl.add(kv_tile_next, dep_zero_next)
+                        score_tile_next = pl.add(score_tile_next, dep_zero_next)
+                        token_ape_row_next = (ape_row + s) % COMPRESS_RATIO
+                        ape_tile_next = ape[token_ape_row_next : token_ape_row_next + 1, o0 : o0 + NEXT_OUT_CHUNK]
+                        ape_base_next = pl.full([B, NEXT_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        score_tile_next = pl.add(score_tile_next, pl.col_expand(ape_base_next, ape_tile_next))
+                        slot_col0_s = (COMPRESS_RATIO + token_ape_row_next) * OUT_DIM
+                        kv_state_flat = pl.assemble(kv_state_flat, kv_tile_next, [0, slot_col0_s + o0])
+                        score_state_flat = pl.assemble(score_state_flat, score_tile_next, [0, slot_col0_s + o0])
+
         if pre_tokens < S:
             for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-                for s in pl.range(pre_tokens, S):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
-                        kv_tile = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
-                        score_tile = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
-                        shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM + o0
-                        dep_zero = pl.sub(
-                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
-                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
-                        )
-                        kv_tile = pl.add(kv_tile, dep_zero)
-                        score_tile = pl.add(score_tile, dep_zero)
+                for s in pl.range(pre_tokens):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift_boundary"):
                         token_ape_row = (ape_row + s) % COMPRESS_RATIO
-                        ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_CHUNK]
-                        ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
-                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                        slot_col0_s = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
-                        kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, slot_col0_s + o0])
-                        score_state_flat = pl.assemble(score_state_flat, score_tile, [0, slot_col0_s + o0])
-
-        for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-            for s in pl.range(pre_tokens):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift_boundary"):
-                    token_ape_row = (ape_row + s) % COMPRESS_RATIO
-                    src_col0 = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
-                    dst_col0 = token_ape_row * OUT_DIM
-                    kv_tile = kv_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
-                    score_tile = score_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
-                    kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, dst_col0 + o0])
-                    score_state_flat = pl.assemble(score_state_flat, score_tile, [0, dst_col0 + o0])
+                        src_col0 = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
+                        dst_col0 = token_ape_row * OUT_DIM
+                        kv_tile = kv_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
+                        score_tile = score_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
+                        kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, dst_col0 + o0])
+                        score_state_flat = pl.assemble(score_state_flat, score_tile, [0, dst_col0 + o0])
 
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
