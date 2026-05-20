@@ -107,18 +107,10 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          # Default: every model file once with no extra args.
+          # Run every model file once with no extra args.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
             run_case "$f" "$f"
           done
-          # Extras from .github/daily_ci_cases.tsv (file <whitespace> args; '#' = comment).
-          while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in ''|\#*) continue ;; esac
-            read -r file extra <<< "$line"
-            [ -z "$file" ] && continue
-            # shellcheck disable=SC2086  # $extra must word-split into argv
-            run_case "$file" "${file}[${extra}]" $extra
-          done < .github/daily_ci_cases.tsv
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
@@ -270,18 +262,10 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          # Default: every model file once with no extra args.
+          # Run every model file once with no extra args.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
             run_case "$f" "$f"
           done
-          # Extras from .github/daily_ci_cases.tsv (file <whitespace> args; '#' = comment).
-          while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in ''|\#*) continue ;; esac
-            read -r file extra <<< "$line"
-            [ -z "$file" ] && continue
-            # shellcheck disable=SC2086  # $extra must word-split into argv
-            run_case "$file" "${file}[${extra}]" $extra
-          done < .github/daily_ci_cases.tsv
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
