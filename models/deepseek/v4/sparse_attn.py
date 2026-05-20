@@ -144,8 +144,6 @@ def sparse_attn(
     sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     o_proj_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
     o_proj_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
-    rope_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
-    rope_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.BF16)
     rope_even_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -358,61 +356,56 @@ def sparse_attn(
                         rope_slice_head_row : rope_slice_head_row + H,
                         2 * rope_slice_r0 : 2 * rope_slice_r0 + ROPE_INTERLEAVE_CHUNK,
                     ]
-                    even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
-                    odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
-                    o_proj_even = pl.assemble(o_proj_even, even_chunk, [rope_slice_head_row, rope_slice_r0])
-                    o_proj_odd = pl.assemble(o_proj_odd, odd_chunk, [rope_slice_head_row, rope_slice_r0])
+                    rope_slice_even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
+                    rope_slice_odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
+                    o_proj_even = pl.assemble(o_proj_even, rope_slice_even_chunk, [rope_slice_head_row, rope_slice_r0])
+                    o_proj_odd = pl.assemble(o_proj_odd, rope_slice_odd_chunk, [rope_slice_head_row, rope_slice_r0])
 
-    # Stage 3: inverse RoPE on the rope slice of the attention output by
-    # rotating the even/odd halves, then reinterleaving into packed rows.
+    # Stage 3: rotate even/odd halves and immediately reinterleave them. Keeping
+    # the BF16 rint cast local avoids the new orchestration SSA collision on
+    # written-then-read RoPE GM scratch tensors.
     for rope_apply_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply_tile"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_apply_assemble_tile"):
             for rope_apply_dt in pl.range(ROPE_TOKEN_TILE):
                 rope_apply_t = rope_apply_t0 + rope_apply_dt
                 rope_apply_head_row = rope_apply_t * H
 
-                # Apply inverse rotary mixing with this token's cos/sin tables.
-                cos_tile = pl.cast(freqs_cos[rope_apply_t : rope_apply_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                sin_tile = pl.cast(freqs_sin[rope_apply_t : rope_apply_t + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-                even_tile = o_proj_even[rope_apply_head_row : rope_apply_head_row + H, :]
-                odd_tile = o_proj_odd[rope_apply_head_row : rope_apply_head_row + H, :]
-                rope_even_acc = pl.add(
-                    pl.col_expand_mul(even_tile, cos_tile),
-                    pl.col_expand_mul(odd_tile, sin_tile),
-                )
-                rope_odd_acc = pl.sub(
-                    pl.col_expand_mul(odd_tile, cos_tile),
-                    pl.col_expand_mul(even_tile, sin_tile),
-                )
-                rope_even = pl.assemble(
-                    rope_even,
-                    pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint"),
-                    [rope_apply_head_row, 0],
-                )
-                rope_odd = pl.assemble(
-                    rope_odd,
-                    pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint"),
-                    [rope_apply_head_row, 0],
-                )
-
-    for rope_asm_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_rope_assemble_matmul_tile"):
-            for rope_asm_dt in pl.range(ROPE_TOKEN_TILE):
-                rope_asm_t = rope_asm_t0 + rope_asm_dt
-                rope_asm_head_row = rope_asm_t * H
-
                 # Reinterleave the rotated even/odd halves back to rope lane order.
                 for rope_asm_r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
-                    rope_even_chunk = rope_even[rope_asm_head_row : rope_asm_head_row + H, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK]
-                    rope_odd_chunk = rope_odd[rope_asm_head_row : rope_asm_head_row + H, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK]
+                    cos_chunk = pl.cast(
+                        freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
+                        target_type=pl.FP32,
+                    )
+                    sin_chunk = pl.cast(
+                        freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
+                        target_type=pl.FP32,
+                    )
+                    rope_apply_even_chunk = o_proj_even[
+                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
+                    ]
+                    rope_apply_odd_chunk = o_proj_odd[
+                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
+                    ]
+                    rope_even_acc = pl.add(
+                        pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
+                        pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),
+                    )
+                    rope_odd_acc = pl.sub(
+                        pl.col_expand_mul(rope_apply_odd_chunk, cos_chunk),
+                        pl.col_expand_mul(rope_apply_even_chunk, sin_chunk),
+                    )
+                    rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
+                    rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
                     rope_even_interleave = pl.matmul(
-                        rope_even_chunk,
+                        rope_rot_even_chunk,
                         even_select_local,
                         b_trans=True,
                         out_dtype=pl.FP32,
                     )
                     rope_odd_interleave = pl.matmul(
-                        rope_odd_chunk,
+                        rope_rot_odd_chunk,
                         odd_select_local,
                         b_trans=True,
                         out_dtype=pl.FP32,
@@ -420,12 +413,12 @@ def sparse_attn(
                     rope_even_interleave_buf = pl.assemble(
                         rope_even_interleave_buf,
                         rope_even_interleave,
-                        [rope_asm_head_row, 2 * rope_asm_r0],
+                        [rope_apply_head_row, 2 * rope_asm_r0],
                     )
                     rope_odd_interleave_buf = pl.assemble(
                         rope_odd_interleave_buf,
                         rope_odd_interleave,
-                        [rope_asm_head_row, 2 * rope_asm_r0],
+                        [rope_apply_head_row, 2 * rope_asm_r0],
                     )
 
     for rope_combine_t0 in pl.parallel(0, T, ROPE_PACK_TOKEN_TILE):
