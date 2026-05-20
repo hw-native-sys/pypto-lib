@@ -143,15 +143,16 @@ sub-kernels below; the variant determines whether `compressor` and
 ║  model.py:533-534, 537-542                                                  ║
 ║  NOTE: outer loop is `for t in pl.range(T)` — per-query-token attention. ║
 ║        Token t belongs to batch b = t // S and step s = t % S; each token   ║
-║        reads seqused_kv[b, s]. Intra-query causal is enforced upstream by   ║
-║        the topk index set the indexer produces per token.                  ║
+║        derives its sparse length from final seqused_kv[b] as               ║
+║        `seqused_kv[b] - S + 1 + s`. Intra-query causal is enforced by this ║
+║        per-token derived length plus the topk index set.                   ║
 ║                                                                             ║
 ║  IN : q [T, H, HEAD_DIM]                                                 ║
 ║       ori_kv (PA)              — always                                     ║
 ║       cmp_kv (PA)              — ratio>0 only                               ║
 ║       topk_idxs [T, *]         — per-token; ratio-dependent, see § below    ║
 ║       attn_sink [H]  fp32                                                   ║
-║       seqused_kv [B, S]        — per-token valid sparse KV length           ║
+║       seqused_kv [B]           — final valid sparse KV length per batch     ║
 ║       freqs_cos/sin [T, ROPE_DIM]                                           ║
 ║       wo_a [O_GROUPS=8, O_LORA=1024, 4096]   bf16   (grouped output LoRA)   ║
 ║       wo_b [D=4096, O_GROUPS*O_LORA=8192]    int8                           ║
