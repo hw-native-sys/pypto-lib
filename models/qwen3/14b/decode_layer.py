@@ -28,9 +28,7 @@ Scope 3:
   4. MLP: gate/up projections, SiLU activation, down projection
   5. Final residual addition
 
-Final head:
-  1. Final RMSNorm
-  2. LM head projection to vocabulary logits
+The final RMSNorm and LM head projection live in rms_lm_head.py.
 """
 
 # pyright: reportUndefinedVariable=false
@@ -81,6 +79,7 @@ from config import (
     VOCAB,
     VOCAB_CHUNK,
 )
+from rms_lm_head import rms_lm_head
 
 
 @pl.jit.inline
@@ -104,9 +103,7 @@ def decode_layer(
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
     w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
-    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
-    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
+    next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
     decode_scope1_hidden_blocks = HIDDEN // INPUT_PROJ_K_CHUNK
@@ -122,7 +119,6 @@ def decode_layer(
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
     layer_cache_base = layer_idx * decode_layer_cache_rows
-    next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
 
     # Intermediate FP32 tensors between scope 1 and scope 2.
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -588,77 +584,11 @@ def decode_layer(
                 out_chunk_cast = pl.cast(out_chunk, target_type=pl.BF16)
                 next_hidden = pl.assemble(next_hidden, out_chunk_cast, [b0, d0])
 
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
-            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
-                final_sq_chunk = pl.cast(
-                    pl.slice(next_hidden, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_sq_k0]),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)), [1, BATCH_TILE]),
-                )
-            inv_rms_final = pl.reshape(
-                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-                [BATCH_TILE, 1],
-            )
-
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
-                final_hidden_chunk = pl.cast(
-                    pl.slice(next_hidden, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_norm_k0]),
-                    target_type=pl.FP32,
-                )
-                final_gamma = pl.slice(final_norm_weight, [1, FINAL_RMS_K_CHUNK], [0, final_norm_k0])
-                final_normed_chunk = pl.col_expand_mul(
-                    pl.row_expand_mul(final_hidden_chunk, inv_rms_final),
-                    final_gamma,
-                )
-                final_normed = pl.assemble(
-                    final_normed,
-                    pl.cast(final_normed_chunk, target_type=pl.BF16),
-                    [b0, final_norm_k0],
-                )
-
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
-        for ob in pl.parallel(VOCAB // VOCAB_CHUNK):
-            lm_o0 = ob * VOCAB_CHUNK
-            lm_acc_gm = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
-                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
-                lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
-                lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
-                for kb in pl.range(1, HIDDEN // LM_HEAD_K_CHUNK):
-                    lm_k0 = kb * LM_HEAD_K_CHUNK
-                    lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
-                    lm_weight_chunk = pl.slice(
-                        lm_head_weight,
-                        [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
-                        [lm_o0, lm_k0],
-                    )
-                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
-                lm_acc_gm = pl.assemble(lm_acc_gm, lm_acc, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_store"):
-                lm_acc_chunk = pl.slice(lm_acc_gm, [BATCH_TILE, VOCAB_CHUNK], [0, 0])
-                lm_acc_trimmed = pl.slice(
-                    lm_acc_chunk,
-                    [BATCH_TILE, VOCAB_CHUNK],
-                    [0, 0],
-                    valid_shape=[lm_valid_rows, VOCAB_CHUNK],
-                )
-                out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
-
     return next_hidden
 
 
 @pl.jit
-def qwen3_decode_test(
+def test_decode_layer(
     hidden_states: pl.Tensor[[USER_BATCH_DYN, HIDDEN], pl.BF16],
     input_rms_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     wq: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
@@ -697,6 +627,7 @@ def qwen3_decode_test(
                 )
                 current_hidden = pl.assemble(current_hidden, hidden_chunk, [b0, copy_k0])
 
+    next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     current_hidden = decode_layer(
         current_hidden,
         input_rms_weight,
@@ -717,11 +648,10 @@ def qwen3_decode_test(
         w_gate,
         w_up,
         w_down,
-        final_norm_weight,
-        lm_head_weight,
-        out,
+        next_hidden,
         0,
     )
+    out = rms_lm_head(current_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
 
 
@@ -874,7 +804,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_qwen3_decode(tensors):
+def golden_decode_layer(tensors):
     """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
     import math
 
@@ -1115,9 +1045,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=qwen3_decode_test,
+        fn=test_decode_layer,
         specs=build_tensor_specs(batch=args.batch, use_max_seq=args.max_seq),
-        golden_fn=golden_qwen3_decode,
+        golden_fn=golden_decode_layer,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

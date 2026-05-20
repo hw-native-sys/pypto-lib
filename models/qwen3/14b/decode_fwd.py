@@ -29,9 +29,7 @@ Scope 3:
   4. MLP: gate/up projections, SiLU activation, down projection
   5. Final residual addition
 
-Final head:
-  1. Final RMSNorm
-  2. LM head projection to vocabulary logits
+Final head is applied once after all decode layers.
 """
 
 # pyright: reportUndefinedVariable=false
@@ -67,10 +65,11 @@ from config import (
     VOCAB_CHUNK,
 )
 from decode_layer import decode_layer
+from rms_lm_head import rms_lm_head
 
 
 @pl.jit
-def qwen3_decode_full_test(
+def decode_fwd(
     hidden_states: pl.Tensor[[USER_BATCH_DYN, HIDDEN], pl.BF16],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
@@ -114,6 +113,7 @@ def qwen3_decode_full_test(
                 current_hidden = pl.assemble(current_hidden, hidden_chunk, [b0, copy_k0])
 
     for layer_idx in pl.range(num_layers_actual):
+        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         current_hidden = decode_layer(
             current_hidden,
             input_rms_weight,
@@ -134,12 +134,11 @@ def qwen3_decode_full_test(
             w_gate,
             w_up,
             w_down,
-            final_norm_weight,
-            lm_head_weight,
-            out,
+            next_hidden,
             layer_idx,
         )
 
+    out = rms_lm_head(current_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
 
 
@@ -272,7 +271,7 @@ def build_tensor_specs(
     ]
 
 
-def golden_qwen3_decode(tensors):
+def golden_decode_fwd(tensors):
     """PyTorch reference for the full-layer Qwen3-14B decode program."""
     import math
 
@@ -550,13 +549,13 @@ if __name__ == "__main__":
         )
 
     result = run_jit(
-        fn=qwen3_decode_full_test,
+        fn=decode_fwd,
         specs=build_tensor_specs(
             batch=args.batch,
             max_seq=args.max_seq,
             num_layers=args.num_layers,
         ),
-        golden_fn=golden_qwen3_decode,
+        golden_fn=golden_decode_fwd,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
@@ -573,5 +572,5 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
 
-__all__ = ["qwen3_decode_full_test", "build_tensor_specs", "golden_qwen3_decode",
+__all__ = ["decode_fwd", "build_tensor_specs", "golden_decode_fwd",
            "make_pass_rate_compare"]
