@@ -81,6 +81,11 @@ from config import (
 )
 from rms_lm_head import rms_lm_head
 
+# Module-level compile-time constant (Python int) for sizing pl.array.create.
+# A `decode_mlp_out_blocks = INTERMEDIATE // MLP_OUT_CHUNK` computed inside the
+# pl.jit function body becomes an IR Scalar, which pl.array.create rejects.
+MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
+
 
 @pl.jit.inline
 def decode_layer(
@@ -264,7 +269,14 @@ def decode_layer(
         sin_lo = pl.slice(sin_row, [1, HALF_DIM], [0, 0])
         sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
+        # no_dep_args opts k_cache / v_cache / all_q_padded out of OverlapMap:
+        # the paged-attention slot_mapping guarantees each batch writes a
+        # disjoint slot (the offset is a runtime read, so the compiler can't
+        # prove disjointness and would otherwise chain the per-batch fan-out
+        # into a serial run). qk_matmul / sv_matmul re-establish the producer
+        # fence explicitly via deps=[rope_tid].
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache",
+                   no_dep_args=[k_cache, v_cache, all_q_padded]) as rope_tid:
             for ki in pl.range(NUM_KV_HEADS):
                 kv_col = ki * HEAD_DIM
                 cache_row = layer_cache_base + (slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + slot_offset
@@ -349,7 +361,7 @@ def decode_layer(
 
             all_raw_scores0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
             all_raw_scores1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul", deps=[rope_tid]):
                 for sb in pl.range(ctx_blocks):
                     qk_block_table_idx = block_table_base + sb
                     qk_pbid = pl.cast(pl.tensor.read(block_table, [qk_block_table_idx]), pl.INDEX)
@@ -411,7 +423,7 @@ def decode_layer(
 
             all_oi_tmp0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
             all_oi_tmp1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul", deps=[rope_tid]):
                 for sb in pl.range(ctx_blocks):
                     sv_block_table_idx = block_table_base + sb
                     sv_pbid = pl.cast(pl.tensor.read(block_table, [sv_block_table_idx]), pl.INDEX)
@@ -523,7 +535,13 @@ def decode_layer(
                 normed_bf16 = pl.cast(post_normed, target_type=pl.BF16)
                 post_norm_tile = pl.assemble(post_norm_tile, normed_bf16, [0, post_norm_k0])
 
-        mlp_tile = pl.create_tensor([BATCH_TILE, INTERMEDIATE], dtype=pl.BF16)
+        # mlp_tile is written by `decode_mlp_out_blocks` disjoint-slice silu
+        # tasks. As a plain loop iter-arg the OverlapMap chains those writes
+        # WAW and serialises silu onto one core; manual_dep=True opts it out so
+        # the writes fan out, and the down_proj readers below fence on the silu
+        # producer TaskIds via deps=[silu_tids].
+        mlp_tile = pl.create_tensor([BATCH_TILE, INTERMEDIATE], dtype=pl.BF16, manual_dep=True)
+        silu_tids = pl.array.create(MLP_OUT_BLOCKS, pl.TASK_ID)
         for ob in pl.range(decode_mlp_out_blocks):
             mlp_o0 = ob * MLP_OUT_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
@@ -546,11 +564,12 @@ def decode_layer(
                     wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + up_k0, mlp_o0])
                     up_acc = pl.matmul_acc(up_acc, up_post_chunk, wu)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu", no_dep_args=[mlp_tile]) as silu_tid:
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                 mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                 mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                 mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, mlp_o0])
+            silu_tids[ob] = silu_tid
 
         for dob in pl.range(hidden_blocks):
             d0 = dob * K_CHUNK
@@ -559,7 +578,7 @@ def decode_layer(
             # 8 KiB) and avoids a large pre-allocated scratch.
             fp32_chunk_gm = pl.create_tensor([BATCH_TILE, K_CHUNK], dtype=pl.FP32)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_proj", deps=[silu_tids]):
                 mlp_chunk_0 = pl.slice(mlp_tile, [BATCH_TILE, MLP_OUT_CHUNK], [0, 0])
                 w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base, d0])
                 down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
