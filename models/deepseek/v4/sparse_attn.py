@@ -30,7 +30,7 @@ Standalone contract:
 - `cmp_sparse_indices[t, :]` may contain `-1` pads.
 - entries in `[0, WIN)` address the logical sliding-window ring slots.
 - entries in `[WIN, WIN + cmp_valid)` address compressed cache slots, where
-    `cmp_valid = max(seqused_kv[b] - min(WIN, seqused_kv[b]), 0)`.
+    `cmp_valid = max(seqused_kv[b, s] - min(WIN, seqused_kv[b, s]), 0)`.
 - the grouped projection layout matches:
     `o.view(bsz, seqlen, self.n_local_groups, -1)` with
     `self.n_local_groups == O_GROUPS` and `-1 == O_GROUP_IN`.
@@ -110,7 +110,7 @@ def sparse_attn(
     cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                            pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK],                                      pl.INT32],
     attn_sink:          pl.Tensor[[H],                                            pl.FP32],
-    seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
+    seqused_kv:         pl.Tensor[[B, S],                                         pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
@@ -132,6 +132,7 @@ def sparse_attn(
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
     cmp_sparse_indices_flat = pl.reshape(cmp_sparse_indices, [T * TOPK])
+    seqused_kv_flat = pl.reshape(seqused_kv, [T])
     sparse_kv = pl.create_tensor([T * TOPK, HEAD_DIM], dtype=pl.BF16)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     sparse_exp = pl.create_tensor([T * H * SPARSE_ATTN_BLOCKS, SPARSE_ATTN_TILE], dtype=pl.BF16)
@@ -156,7 +157,7 @@ def sparse_attn(
             for gather_dt in pl.range(GATHER_TOKEN_TILE):
                 gather_t = gather_t0 + gather_dt
                 gather_b = gather_t // S
-                gather_seq_used = pl.read(seqused_kv, [gather_b])
+                gather_seq_used = pl.read(seqused_kv_flat, [gather_t])
                 gather_window_valid = pl.min(WIN, gather_seq_used)
                 gather_cmp_valid = gather_seq_used - gather_window_valid
                 gather_cmp_topk_valid = pl.min(IDX_TOPK, gather_cmp_valid)
@@ -206,8 +207,7 @@ def sparse_attn(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_qk_softmax_tile"):
                 for qk_dt in pl.range(ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
-                    qk_b = qk_t // S
-                    qk_seq_used = pl.read(seqused_kv, [qk_b])
+                    qk_seq_used = pl.read(seqused_kv_flat, [qk_t])
                     qk_window_valid = pl.min(WIN, qk_seq_used)
                     qk_cmp_valid = qk_seq_used - qk_window_valid
                     qk_cmp_topk_valid = pl.min(IDX_TOPK, qk_cmp_valid)
@@ -246,8 +246,7 @@ def sparse_attn(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_pv_tile"):
                 for pv_dt in pl.range(ATTN_TOKEN_TILE):
                     pv_t = attn_t0 + pv_dt
-                    pv_b = pv_t // S
-                    pv_seq_used = pl.read(seqused_kv, [pv_b])
+                    pv_seq_used = pl.read(seqused_kv_flat, [pv_t])
                     pv_window_valid = pl.min(WIN, pv_seq_used)
                     pv_cmp_valid = pv_seq_used - pv_window_valid
                     pv_cmp_topk_valid = pl.min(IDX_TOPK, pv_cmp_valid)
@@ -269,8 +268,7 @@ def sparse_attn(
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="cfa_proj_sparse_attn_merge_tile"):
                 for merge_dt in pl.range(ATTN_TOKEN_TILE):
                     merge_t = attn_t0 + merge_dt
-                    merge_b = merge_t // S
-                    merge_seq_used = pl.read(seqused_kv, [merge_b])
+                    merge_seq_used = pl.read(seqused_kv_flat, [merge_t])
                     merge_window_valid = pl.min(WIN, merge_seq_used)
                     merge_cmp_valid = merge_seq_used - merge_window_valid
                     merge_cmp_topk_valid = pl.min(IDX_TOPK, merge_cmp_valid)
@@ -535,7 +533,7 @@ def sparse_attn_test(
     cmp_block_table:    pl.Tensor[[B, CMP_MAX_BLOCKS],                            pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK],                                      pl.INT32],
     attn_sink:          pl.Tensor[[H],                                            pl.FP32],
-    seqused_kv:         pl.Tensor[[B],                                            pl.INT32],
+    seqused_kv:         pl.Tensor[[B, S],                                         pl.INT32],
     freqs_cos:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     freqs_sin:          pl.Tensor[[T, ROPE_DIM],                                  pl.BF16],
     even_select_local:  pl.Tensor[[ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK],            pl.BF16],
@@ -610,11 +608,12 @@ def golden_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
 
-    # Per-query-token attention. Each token has its own cmp_sparse_indices row;
-    # seqused_kv / block tables are per-batch (token t belongs to batch t // S).
+    # Per-query-token attention. Each token has its own cmp_sparse_indices row
+    # and seqused_kv entry; block tables stay per-batch.
     for t in range(T):
         b = t // S
-        seq_used = int(seqused_kv[b].item())
+        s = t - b * S
+        seq_used = int(seqused_kv[b, s].item())
         window_valid = min(WIN, seq_used)
         cmp_valid = max(seq_used - window_valid, 0)
         gathered = []
@@ -726,7 +725,9 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
 
     def init_seqused_kv():
         """Expose the demo sequence-used length that matches the chosen ratio mode."""
-        return torch.tensor([sparse_k] * B, dtype=torch.int32)
+        token_s = torch.arange(S, dtype=torch.int32)
+        seq = torch.clamp(sparse_k - (S - 1 - token_s), min=1)
+        return seq.expand(B, S).clone()
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -777,7 +778,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
+        TensorSpec("seqused_kv", [B, S], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("even_select_local", [ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
@@ -791,7 +792,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
 
 if __name__ == "__main__":
     import argparse
-    from golden import RunConfig, ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -807,20 +808,17 @@ if __name__ == "__main__":
         fn=sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio),
         golden_fn=golden_sparse_attn,
-        config=RunConfig(
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={
-                "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            },
-            compile=dict(dump_passes=True),
-            runtime=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-                enable_pmu=args.enable_pmu,
-            ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_pmu=args.enable_pmu,
         ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        },
     )
     if not result.passed:
         if result.error:
