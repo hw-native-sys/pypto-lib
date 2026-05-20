@@ -37,12 +37,14 @@ START_POS = COMPRESS_RATIO - 1       # ScalarSpec default exercises S-token wind
 # tiling
 ROPE_CHUNK = 32
 K_CHUNK = 512
-OUT_CHUNK = 128
+OUT_CHUNK = 64
 
 HEAD_CHUNK = 64 if B * S >= 64 else 128
 K_BLOCKS = D // K_CHUNK            # 8
-OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 4
+OUT_BLOCKS = OUT_DIM // OUT_CHUNK  # 8
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK  # 4
+BATCH_CHUNK_0 = 64
+BATCH_CHUNK_1 = 16
 
 
 @pl.jit.inline
@@ -76,28 +78,30 @@ def compressor(
 
     cmp128_kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     cmp128_score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
-    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
-            x_tile = x_flat[:, 0 : K_CHUNK]
-            wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
-            wgate_tile = wgate[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
-            kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
-            score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+    for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
+        for b_idx in pl.parallel(0, B * S, BATCH_CHUNK_0):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
+                kv_acc = pl.create_tensor([BATCH_CHUNK_0, OUT_CHUNK], dtype=pl.FP32)
+                score_acc = pl.create_tensor([BATCH_CHUNK_0, OUT_CHUNK], dtype=pl.FP32)
+                for kb in pl.pipeline(0, K_BLOCKS, stage=2):
+                    k0 = kb * K_CHUNK
+                    x_tile = x_flat[b_idx : b_idx + BATCH_CHUNK_0, k0 : k0 + K_CHUNK]
+                    wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
+                    wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
+                    if k0 == 0:
+                        kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
+                        score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+                    else:
+                        kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
+                        score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
 
-            for k0 in pl.range(K_CHUNK, D, K_CHUNK):
-                x_tile = x_flat[:, k0 : k0 + K_CHUNK]
-                wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
-                wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
-
-            cmp128_kv_proj_scratch = pl.assemble(cmp128_kv_proj_scratch, kv_acc, [0, o0])
-            cmp128_score_proj_scratch = pl.assemble(cmp128_score_proj_scratch, score_acc, [0, o0])
+                cmp128_kv_proj_scratch = pl.assemble(cmp128_kv_proj_scratch, kv_acc, [b_idx, o0])
+                cmp128_score_proj_scratch = pl.assemble(cmp128_score_proj_scratch, score_acc, [b_idx, o0])
 
         cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [B, S * OUT_DIM])
         cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [B, S * OUT_DIM])
         for s in pl.range(scatter_stop):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_ape_state_scatter"):
                 proj_col0 = s * OUT_DIM + o0
                 kv_tile = cmp128_kv_proj_by_batch[:, proj_col0 : proj_col0 + OUT_CHUNK]
                 score_tile = cmp128_score_proj_by_batch[:, proj_col0 : proj_col0 + OUT_CHUNK]
@@ -115,61 +119,63 @@ def compressor(
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
 
     if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-        for hb in pl.parallel(0, HEAD_BLOCKS, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
-                h0 = hb * HEAD_CHUNK
-                # Initialize m/l/o from last slot
-                last_col0 = (STATE_LEN - 1) * OUT_DIM + h0
-                mi = score_state_flat[:, last_col0 : last_col0 + HEAD_CHUNK]
-                oi = kv_state_flat[:, last_col0 : last_col0 + HEAD_CHUNK]
-                if pre_tokens < S:
-                    pre_s = pre_tokens - 1
-                    token_ape_row = (ape_row + pre_s) % COMPRESS_RATIO
-                    mi_seed = pl.create_tensor([B, HEAD_CHUNK], dtype=pl.FP32)
-                    oi_seed = pl.create_tensor([B, HEAD_CHUNK], dtype=pl.FP32)
-                    for b in pl.range(B):
-                        scratch_row = b * S + pre_s
-                        mi_seed = pl.assemble(
-                            mi_seed,
-                            cmp128_score_proj_scratch[scratch_row : scratch_row + 1, h0 : h0 + HEAD_CHUNK],
-                            [b, 0],
-                        )
-                        oi_seed = pl.assemble(
-                            oi_seed,
-                            cmp128_kv_proj_scratch[scratch_row : scratch_row + 1, h0 : h0 + HEAD_CHUNK],
-                            [b, 0],
-                        )
-                    mi = mi_seed
-                    pool_ape_tile = ape[token_ape_row : token_ape_row + 1, h0 : h0 + HEAD_CHUNK]
-                    pool_ape_base = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
-                    mi = pl.add(mi, pl.col_expand(pool_ape_base, pool_ape_tile))
-                    oi = oi_seed
-                li = pl.exp(pl.sub(mi, mi))
+        for b_idx in pl.parallel(0, B, BATCH_CHUNK_1):
+            for hb in pl.parallel(0, HEAD_BLOCKS):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
+                    h0 = hb * HEAD_CHUNK
+                    # Initialize m/l/o from last slot
+                    last_col0 = (STATE_LEN - 1) * OUT_DIM + h0
+                    mi = score_state_flat[b_idx : b_idx + BATCH_CHUNK_1, last_col0 : last_col0 + HEAD_CHUNK]
+                    oi = kv_state_flat[b_idx : b_idx + BATCH_CHUNK_1, last_col0 : last_col0 + HEAD_CHUNK]
+                    if pre_tokens < S:
+                        pre_s = pre_tokens - 1
+                        token_ape_row = (ape_row + pre_s) % COMPRESS_RATIO
+                        mi_seed = pl.create_tensor([BATCH_CHUNK_1, HEAD_CHUNK], dtype=pl.FP32)
+                        oi_seed = pl.create_tensor([BATCH_CHUNK_1, HEAD_CHUNK], dtype=pl.FP32)
+                        for b in pl.range(b_idx, b_idx + BATCH_CHUNK_1):
+                            scratch_row = b * S + pre_s
+                            mi_seed = pl.assemble(
+                                mi_seed,
+                                cmp128_score_proj_scratch[scratch_row : scratch_row + 1, h0 : h0 + HEAD_CHUNK],
+                                [b - b_idx, 0],
+                            )
+                            oi_seed = pl.assemble(
+                                oi_seed,
+                                cmp128_kv_proj_scratch[scratch_row : scratch_row + 1, h0 : h0 + HEAD_CHUNK],
+                                [b - b_idx, 0],
+                            )
+                        mi = mi_seed
+                        pool_ape_tile = ape[token_ape_row : token_ape_row + 1, h0 : h0 + HEAD_CHUNK]
+                        pool_ape_base = pl.full([BATCH_CHUNK_1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+                        mi = pl.add(mi, pl.col_expand(pool_ape_base, pool_ape_tile))
+                        oi = oi_seed
+                    li = pl.exp(pl.sub(mi, mi))
 
-                # Online softmax over all remaining slots
-                for s in pl.range(0, STATE_LEN - 1):
-                    col0 = s * OUT_DIM + h0
-                    slot_score = score_state_flat[:, col0 : col0 + HEAD_CHUNK]
-                    slot_kv = kv_state_flat[:, col0 : col0 + HEAD_CHUNK]
-                    mi_next = pl.maximum(mi, slot_score)
-                    alpha = pl.exp(pl.sub(mi, mi_next))
-                    beta = pl.exp(pl.sub(slot_score, mi_next))
-                    li = pl.add(pl.mul(alpha, li), beta)
-                    oi = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-                    mi = mi_next
+                    # Online softmax over all remaining slots
+                    for s in pl.pipeline(0, STATE_LEN - 1, stage=2):
+                        col0 = s * OUT_DIM + h0
+                        slot_score = score_state_flat[b_idx : b_idx + BATCH_CHUNK_1, col0 : col0 + HEAD_CHUNK]
+                        slot_kv = kv_state_flat[b_idx : b_idx + BATCH_CHUNK_1, col0 : col0 + HEAD_CHUNK]
+                        mi_next = pl.maximum(mi, slot_score)
+                        alpha = pl.exp(pl.sub(mi, mi_next))
+                        beta = pl.exp(pl.sub(slot_score, mi_next))
+                        li = pl.add(pl.mul(alpha, li), beta)
+                        oi = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
+                        mi = mi_next
 
-                pooled_chunk = pl.div(oi, li)
-                pooled_kv = pl.assemble(pooled_kv, pooled_chunk, [0, h0])
+                    pooled_chunk = pl.div(oi, li)
+                    pooled_kv = pl.assemble(pooled_kv, pooled_chunk, [b_idx, h0])
 
         # No state shift for non-overlap
 
         # RMSNorm with BF16 intermediate
         norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
+        kv_rope = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.BF16)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_slice"):
             partial_sq = pl.full([1, B], dtype=pl.FP32, value=0.0)
-            for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
+            for rms_kb in pl.pipeline(HEAD_BLOCKS, stage=4):
                 kv_rms_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
+                    pl.cast(pooled_kv[:, rms_kb * HEAD_CHUNK : (rms_kb + 1) * HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
                     target_type=pl.FP32,
                 )
                 partial_sq = pl.add(
@@ -179,38 +185,25 @@ def compressor(
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [B, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
-            for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
+            for rms_kb in pl.pipeline(HEAD_BLOCKS, stage=4):
                 kv_norm_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
+                    pl.cast(pooled_kv[:, rms_kb * HEAD_CHUNK : (rms_kb + 1) * HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
                     target_type=pl.FP32,
                 )
-                gamma = norm_w_2d[:, k0 : k0 + HEAD_CHUNK]
+                gamma = norm_w_2d[:, rms_kb * HEAD_CHUNK : (rms_kb + 1) * HEAD_CHUNK]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16, mode="rint"), [0, k0])
+                normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16, mode="rint"), [0, rms_kb * HEAD_CHUNK])
+            kv_rope = pl.assemble(kv_rope, normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], [0, 0])
 
         # Selector-based RoPE
-        kv_rope = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.BF16)
         kv_proj_even = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
         kv_proj_odd = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
         rope_even = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
         rope_odd = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_slice"):
-            kv_rope = pl.assemble(kv_rope, normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], [0, 0])
-
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
-            kv_rope_tile = kv_rope[:, 0 : ROPE_CHUNK]
-            even_select_tile = even_select[0 : ROPE_CHUNK, :]
-            odd_select_tile = odd_select[0 : ROPE_CHUNK, :]
-            even_acc = pl.matmul(kv_rope_tile, even_select_tile, out_dtype=pl.FP32)
-            odd_acc = pl.matmul(kv_rope_tile, odd_select_tile, out_dtype=pl.FP32)
-
-            for r0 in pl.range(ROPE_CHUNK, ROPE_HEAD_DIM, ROPE_CHUNK):
-                kv_rope_tile = kv_rope[:, r0 : r0 + ROPE_CHUNK]
-                even_select_tile = even_select[r0 : r0 + ROPE_CHUNK, :]
-                odd_select_tile = odd_select[r0 : r0 + ROPE_CHUNK, :]
-                even_acc = pl.matmul_acc(even_acc, kv_rope_tile, even_select_tile)
-                odd_acc = pl.matmul_acc(odd_acc, kv_rope_tile, odd_select_tile)
+            even_acc = pl.matmul(kv_rope, even_select, out_dtype=pl.FP32)
+            odd_acc = pl.matmul(kv_rope, odd_select, out_dtype=pl.FP32)
             kv_proj_even = pl.assemble(kv_proj_even, even_acc, [0, 0])
             kv_proj_odd = pl.assemble(kv_proj_odd, odd_acc, [0, 0])
 
@@ -223,28 +216,16 @@ def compressor(
             rope_odd = pl.assemble(rope_odd, rope_odd_acc, [0, 0])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
-            rope_even_tile = rope_even[:, 0 : ROPE_CHUNK]
-            rope_odd_tile = rope_odd[:, 0 : ROPE_CHUNK]
-            even_select_tile_t = even_select[:, 0 : ROPE_CHUNK]
-            odd_select_tile_t = odd_select[:, 0 : ROPE_CHUNK]
-            rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
-            rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-            for r0 in pl.range(ROPE_CHUNK, ROPE_HEAD_DIM // 2, ROPE_CHUNK):
-                rope_even_tile = rope_even[:, r0 : r0 + ROPE_CHUNK]
-                rope_odd_tile = rope_odd[:, r0 : r0 + ROPE_CHUNK]
-                even_select_tile_t = even_select[:, r0 : r0 + ROPE_CHUNK]
-                odd_select_tile_t = odd_select[:, r0 : r0 + ROPE_CHUNK]
-                rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
-                rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
+            rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
+            rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
             normed_kv = pl.assemble(normed_kv, pl.cast(rope_acc, target_type=pl.BF16, mode="rint"), [0, NOPE_HEAD_DIM])
 
         if rotate:
-            for o0 in pl.range(0, HEAD_DIM, OUT_CHUNK):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-                    kv_proj_tile = normed_kv[:, 0 : HEAD_DIM]
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
+                kv_proj_tile = normed_kv[:, 0 : HEAD_DIM]
+                for o0 in pl.range(0, HEAD_DIM, OUT_CHUNK):
                     hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_CHUNK]
                     kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
                     kv_final = pl.assemble(kv_final, kv_hadamard_acc, [0, o0])
@@ -257,8 +238,8 @@ def compressor(
         # Per-batch fan-out: write kv_final[b] to kv[b, 0, :] (row b*S of kv_flat).
         kv_cache_flat = pl.reshape(kv_cache, [B * IDX_KV_LEN, HEAD_DIM])
         cache_col = start_pos // COMPRESS_RATIO
-        for b_idx in pl.parallel(B):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="kv_and_cache_write"):
+            for b_idx in pl.parallel(0, B, chunk=16):
                 kv_row_fp32 = kv_final[b_idx : b_idx + 1, 0 : HEAD_DIM]
                 kv_flat = pl.assemble(kv_flat, kv_row_fp32, [b_idx * S, 0])
                 cache_row = b_idx * IDX_KV_LEN + cache_col
@@ -272,7 +253,7 @@ def compressor(
     if pre_tokens < S:
         cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [B, S * OUT_DIM])
         cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [B, S * OUT_DIM])
-        for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
+        for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
             for s in pl.range(pre_tokens, S):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
                     proj_col0 = s * OUT_DIM + o0
@@ -474,6 +455,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_pmu=2,
         ),
         rtol=1e-3,
         atol=1e-3,
