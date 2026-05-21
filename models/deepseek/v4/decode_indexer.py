@@ -54,7 +54,6 @@ Q_OUT_CHUCK = 128
 ROPE_CHUCK = 16
 HEAD_DIM_CHUCK = 32
 D_CHUCK = 32
-HEAD_CHUCK = 16
 QUANT_CHUNK = 128 if T >= 64 else 256
 
 @pl.jit.inline
@@ -93,132 +92,100 @@ def indexer(
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
     for o0 in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, Q_OUT_CHUCK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj"):
-            qr_tile = qr_i8[:, 0 : Q_CHUCK]
-            wq_tile = wq_b[0 : Q_CHUCK, o0 : o0 + Q_OUT_CHUCK]
-            qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-
-            for q0 in pl.range(Q_CHUCK, Q_LORA, Q_CHUCK):
+            qr_acc = pl.create_tensor([T, Q_OUT_CHUCK], dtype=pl.INT32)
+            for kb in pl.pipeline(0, Q_LORA // Q_CHUCK, stage=2):
+                q0 = kb * Q_CHUCK
                 qr_tile = qr_i8[:, q0 : q0 + Q_CHUCK]
                 wq_tile = wq_b[q0 : q0 + Q_CHUCK, o0 : o0 + Q_OUT_CHUCK]
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+                if q0 == 0:
+                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+                else:
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_write"):
             qr_acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
             wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_CHUCK], [1, Q_OUT_CHUCK])
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(qr_acc_fp32, qr_scale_dq), wq_scale)
-            qr_proj = pl.assemble(qr_proj, pl.cast(qr_dequant, target_type=pl.BF16, mode="rint"), [0, o0])
+            qr_proj[:, o0 : o0 + Q_OUT_CHUCK] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_rope = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
-    qr_proj_even = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    qr_proj_odd = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    rope_even = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-    rope_odd = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-    qr_hadamard = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
 
     for o0 in pl.parallel(0, T * IDX_N_HEADS, IDX_N_HEADS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_slice"):
-            qr_rope = pl.assemble(qr_rope, qr_proj_flat[o0 : o0 + IDX_N_HEADS, IDX_NOPE_HEAD_DIM :], [o0, 0])
-
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
-            qr_proj_rope_tile = qr_rope[o0 : o0 + IDX_N_HEADS, 0 : ROPE_CHUCK]
-            even_select_tile = even_select[0 : ROPE_CHUCK, :]
-            odd_select_tile = odd_select[0 : ROPE_CHUCK, :]
-            even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
-            odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
-
-            for r0 in pl.range(ROPE_CHUCK, ROPE_HEAD_DIM, ROPE_CHUCK):
-                qr_proj_rope_tile = qr_rope[o0 : o0 + IDX_N_HEADS, r0 : r0 + ROPE_CHUCK]
+            even_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+            odd_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+            for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
+                r0 = rb * ROPE_CHUCK
+                qr_proj_rope_tile = qr_proj_flat[o0 : o0 + IDX_N_HEADS, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
                 even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
                 odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
-                even_acc = pl.matmul_acc(even_acc, qr_proj_rope_tile, even_select_tile)
-                odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
-            qr_proj_even = pl.assemble(qr_proj_even, even_acc, [o0, 0])
-            qr_proj_odd = pl.assemble(qr_proj_odd, odd_acc, [o0, 0])
+                if r0 == 0:
+                    even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
+                    odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
+                else:
+                    even_acc = pl.matmul_acc(even_acc, qr_proj_rope_tile, even_select_tile)
+                    odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-            even_tile = qr_proj_even[o0 : o0 + IDX_N_HEADS, :]
-            odd_tile = qr_proj_odd[o0 : o0 + IDX_N_HEADS, :]
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos), pl.col_expand_mul(odd_tile, sin)), target_type=pl.BF16, mode="rint")
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin), pl.col_expand_mul(odd_tile, cos)), target_type=pl.BF16, mode="rint")
-            rope_even = pl.assemble(rope_even, rope_even_acc, [o0, 0])
-            rope_odd = pl.assemble(rope_odd, rope_odd_acc, [o0, 0])
+            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos), pl.col_expand_mul(odd_acc, sin)), target_type=pl.BF16, mode="rint")
+            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
-            rope_even_tile = rope_even[o0 : o0 + IDX_N_HEADS, 0 : ROPE_CHUCK]
-            rope_odd_tile = rope_odd[o0 : o0 + IDX_N_HEADS, 0 : ROPE_CHUCK]
-            even_select_tile_t = even_select[:, 0 : ROPE_CHUCK]
-            odd_select_tile_t = odd_select[:, 0 : ROPE_CHUCK]
-            rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
-            rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-            for r0 in pl.range(ROPE_CHUCK, ROPE_HEAD_DIM // 2, ROPE_CHUCK):
-                rope_even_tile = rope_even[o0 : o0 + IDX_N_HEADS, r0 : r0 + ROPE_CHUCK]
-                rope_odd_tile = rope_odd[o0 : o0 + IDX_N_HEADS, r0 : r0 + ROPE_CHUCK]
-                even_select_tile_t = even_select[:, r0 : r0 + ROPE_CHUCK]
-                odd_select_tile_t = odd_select[:, r0 : r0 + ROPE_CHUCK]
-                rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
+            rope_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.FP32)
+            for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
+                ra_0 = ra_b * ROPE_CHUCK
+                rope_even_tile = rope_even_acc[0 : IDX_N_HEADS, ra_0 : ra_0 + ROPE_CHUCK]
+                rope_odd_tile = rope_odd_acc[0 : IDX_N_HEADS, ra_0 : ra_0 + ROPE_CHUCK]
+                even_select_tile_t = even_select[:, ra_0 : ra_0 + ROPE_CHUCK]
+                odd_select_tile_t = odd_select[:, ra_0 : ra_0 + ROPE_CHUCK]
+                if ra_0 == 0:
+                    rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-            qr_rope = pl.assemble(qr_rope, pl.cast(rope_acc, target_type=pl.BF16, mode="rint"), [o0, 0])
-
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_assemble"):
-            qr_proj_flat = pl.assemble(qr_proj_flat, qr_rope[o0 : o0 + IDX_N_HEADS, :], [o0, IDX_NOPE_HEAD_DIM])
-
+            qr_proj_flat[o0 : o0 + IDX_N_HEADS, IDX_NOPE_HEAD_DIM : IDX_NOPE_HEAD_DIM + ROPE_HEAD_DIM] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_hadamard"):
-            qr_proj_tile = qr_proj_flat[o0 : o0 + IDX_N_HEADS, 0 : HEAD_DIM_CHUCK]
-            hadamard_tile = hadamard[0 : HEAD_DIM_CHUCK, :]
-            qr_hadamard_acc = pl.matmul(qr_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-
-            for h0 in pl.range(HEAD_DIM_CHUCK, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                qr_proj_tile = qr_proj_flat[o0 : o0 + IDX_N_HEADS, h0 : h0 + HEAD_DIM_CHUCK]
-                hadamard_tile = hadamard[h0 : h0 + HEAD_DIM_CHUCK, :]
-                qr_hadamard_acc = pl.matmul_acc(qr_hadamard_acc, qr_proj_tile, hadamard_tile)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_hadamard_write"):
-            qr_hadamard = pl.assemble(qr_hadamard, pl.cast(qr_hadamard_acc, target_type=pl.BF16, mode="rint"), [o0, 0])
+            qr_hadamard_acc = pl.matmul(qr_proj_flat[o0 : o0 + IDX_N_HEADS, 0 : IDX_HEAD_DIM], hadamard[0 : IDX_HEAD_DIM, :], out_dtype=pl.FP32)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_hadamard_quant"):
             qh_amax = pl.full([1, IDX_N_HEADS], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                qh_a_f32 = pl.cast(qr_hadamard[o0 : o0 + IDX_N_HEADS, h0 : h0 + HEAD_DIM_CHUCK], target_type=pl.FP32)
+                qh_a_f32 = qr_hadamard_acc[0 : IDX_N_HEADS, h0 : h0 + HEAD_DIM_CHUCK]
                 qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
                 qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, IDX_N_HEADS])
                 qh_amax = pl.maximum(qh_amax, qh_a_max)
             qh_scale_quant_row = pl.div(pl.full([1, IDX_N_HEADS], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
             qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [IDX_N_HEADS, 1])
-            qr_hadamard_scale_dq = pl.assemble(qr_hadamard_scale_dq, qh_scale_dq, [o0, 0])
+            qr_hadamard_scale_dq[o0 : o0 + IDX_N_HEADS, :] = qh_scale_dq
             qh_scale_quant = pl.reshape(qh_scale_quant_row, [IDX_N_HEADS, 1])
             for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                qh_q_f32 = pl.cast(qr_hadamard[o0 : o0 + IDX_N_HEADS, h1 : h1 + HEAD_DIM_CHUCK], target_type=pl.FP32)
+                qh_q_f32 = qr_hadamard_acc[0 : IDX_N_HEADS, h1 : h1 + HEAD_DIM_CHUCK]
                 qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
                 qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
                 qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
                 qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
-                qr_hadamard_i8 = pl.assemble(qr_hadamard_i8, qh_i8, [o0, h1])
+                qr_hadamard_i8[o0 : o0 + IDX_N_HEADS, h1 : h1 + HEAD_DIM_CHUCK] = qh_i8
 
 
-    weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
     x_flat = pl.reshape(x, [T, D])
-    for h0 in pl.parallel(0, IDX_N_HEADS, HEAD_CHUCK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
-            x_tile = x_flat[:, 0 : D_CHUCK]
-            weights_proj_tile = weights_proj[0 : D_CHUCK, h0 : h0 + HEAD_CHUCK]
-            weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
-
-            for d0 in pl.range(D_CHUCK, D, D_CHUCK):
-                x_tile = x_flat[:, d0 : d0 + D_CHUCK]
-                weights_proj_tile = weights_proj[d0 : d0 + D_CHUCK, h0 : h0 + HEAD_CHUCK]
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
+        weights_acc = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
+        for db in pl.pipeline(0, D // D_CHUCK, stage=2):
+            d0 = db * D_CHUCK
+            x_tile = x_flat[:, d0 : d0 + D_CHUCK]
+            weights_proj_tile = weights_proj[d0 : d0 + D_CHUCK, :]
+            if d0 == 0:
+                weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
+            else:
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_write"):
-            weights_scale = pl.mul(weights_acc, WEIGHTS_SCALE)
-            weights = pl.assemble(weights, weights_scale, [0, h0])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_write"):
+        weights = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     inner_kv, inner_kv_state, inner_score_state, idx_kv_cache = indexer_compressor(
         x,
@@ -242,9 +209,7 @@ def indexer(
     kv_cache_flat = pl.reshape(idx_kv_cache, [B * IDX_KV_LEN, IDX_HEAD_DIM])
     # score_logits width is S * IDX_N_HEADS because score_accum matmuls
     # qr_hadamard for all S query tokens of the batch at once.
-    score_logits = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, S * IDX_N_HEADS], dtype=pl.FP32)
     score_kv_scale = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, 1], dtype=pl.FP32)
-    weighted_score_tiles = pl.create_tensor([B * MAX_CACHE_BLOCKS * S, CACHE_TILE], dtype=pl.FP32)
     score_flat = pl.reshape(score, [T, SCORE_LEN])
 
     for b in pl.parallel(B):
@@ -254,9 +219,9 @@ def indexer(
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_init"):
             neg_inf_score = pl.full([S, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-            score_flat = pl.assemble(score_flat, neg_inf_score, [t0, 0])
+            score_flat[t0 : t0 + S, :] = neg_inf_score
 
-        for cb in pl.range(cache_blocks):
+        for cb in pl.parallel(cache_blocks):
             cache0 = cb * CACHE_TILE
             valid_len = pl.min(CACHE_TILE, cache_len - cache0)
             score_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
@@ -280,49 +245,39 @@ def indexer(
                     kv_q_i32 = pl.cast(kv_q_scaled, target_type=pl.INT32, mode="rint")
                     kv_q_half = pl.cast(kv_q_i32, target_type=pl.FP16, mode="round")
                     kv_q_i8 = pl.cast(kv_q_half, target_type=pl.INT8, mode="trunc")
-                    kv_cache_tile_i8 = pl.assemble(kv_cache_tile_i8, kv_q_i8, [0, h1])
-                score_kv_scale = pl.assemble(score_kv_scale, kv_cache_scale_dq, [score_row0, 0])
+                    kv_cache_tile_i8[:, h1 : h1 + HEAD_DIM_CHUCK] = kv_q_i8
+                score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :] = kv_cache_scale_dq
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_accum"):
                 qr_hadamard_tile = qr_hadamard_i8[q0 : q0 + S * IDX_N_HEADS, :]
                 score_acc = pl.matmul(kv_cache_tile_i8, qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
 
+            # Fused: dequant + per-query-token weighted reduce in ONE scope; the
+            # per-token reduce reads the score_tile directly (no score_logits GM
+            # round-trip, no cross-task windowed-write -> full-read dependency).
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_store"):
                 kv_cache_scale_dq = score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :]
                 qh_scale = pl.reshape(qr_hadamard_scale_dq[q0 : q0 + S * IDX_N_HEADS, :], [1, S * IDX_N_HEADS])
                 score_tile = pl.cast(score_acc, target_type=pl.FP32, mode="none")
                 score_tile = pl.col_expand_mul(pl.row_expand_mul(score_tile, kv_cache_scale_dq), qh_scale)
-                score_logits = pl.assemble(score_logits, score_tile, [score_row0, 0])
 
-            # Per-query-token weighted reduce (each token has its own head-weights).
-            # col_expand_mul requires the right-hand "row" dim to be 1, so we
-            # cannot collapse the S tokens into a single multi-row weights_tile.
-            for s in pl.range(S):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_weighted_reduce"):
-                    logits_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
-                    score_tile_s = score_logits[logits_row0 : logits_row0 + CACHE_TILE, s * IDX_N_HEADS : (s + 1) * IDX_N_HEADS]
+                # col_expand_mul requires the right-hand "row" dim to be 1, so we
+                # cannot collapse the S tokens into a single multi-row weights_tile.
+                for s in pl.range(S):
+                    score_tile_s = score_tile[:, s * IDX_N_HEADS : (s + 1) * IDX_N_HEADS]
                     relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
                     weights_row_s = pl.reshape(weights[t0 + s : t0 + s + 1, :], [1, IDX_N_HEADS])
                     weighted_score_s_t = pl.col_expand_mul(relu_score_s, weights_row_s)
                     weighted_score_s = pl.reshape(pl.row_sum(weighted_score_s_t), [1, CACHE_TILE])
-                    score_row0_s = (b * MAX_CACHE_BLOCKS + cb) * S + s
-                    weighted_score_tiles = pl.assemble(weighted_score_tiles, weighted_score_s, [score_row0_s, 0])
-                    weighted_score_valid_s = pl.slice(
-                        weighted_score_tiles,
-                        [1, CACHE_TILE],
-                        [score_row0_s, 0],
-                        valid_shape=[1, valid_len],
-                    )
-                    score_flat = pl.assemble(score_flat, weighted_score_valid_s, [t0 + s, cache0])
+                    weighted_score_valid_s = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len), pad_value=pl.PadValue.min)
+                    score_flat[t0 + s : t0 + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
     for t in pl.parallel(T):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_init"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
             invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
-            topk_idxs_flat = pl.assemble(topk_idxs_flat, invalid_idxs, [t, 0])
-    if cache_len > 0:
-        for t in pl.parallel(T):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
+            topk_idxs_flat[t : t + 1, :] = invalid_idxs
+            if cache_len > 0:
                 offset_i32 = pl.cast(offset, target_type=pl.INT32)
                 score_row = score_flat[t : t + 1, :]
                 idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
@@ -332,16 +287,9 @@ def indexer(
                 sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)
                 topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
                 topk_idxs_tile = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                raw_topk_idxs = pl.create_tensor([1, IDX_TOPK], dtype=pl.INT32)
-                raw_topk_idxs = pl.assemble(raw_topk_idxs, topk_idxs_tile, [0, 0])
                 valid_topk = pl.min(IDX_TOPK, cache_len)
-                topk_idxs_valid = pl.slice(
-                    raw_topk_idxs,
-                    [1, IDX_TOPK],
-                    [0, 0],
-                    valid_shape=[1, valid_topk],
-                )
-                topk_idxs_flat = pl.assemble(topk_idxs_flat, pl.add(topk_idxs_valid, offset_i32), [t, 0])
+                topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+                topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
     return score, idx_kv_cache, topk_idxs
 
@@ -601,12 +549,14 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=indexer_test,
         specs=build_tensor_specs(),
         golden_fn=golden_indexer,
+        runtime_dir=args.runtime_dir,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
