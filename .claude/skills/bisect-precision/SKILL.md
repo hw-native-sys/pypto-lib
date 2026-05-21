@@ -81,11 +81,15 @@ pip install --no-build-isolation -e $SIMPLER_DIR
 python <script> -p <platform> -d <device>
 GOOD_BUILD=$(ls -td build_output/<ProgramName>_* | head -1)
 
-# Restore
+# Restore to the bad commit
 git -C $PYPTO_DIR checkout $PYPTO_BAD
 git -C $PYPTO_DIR submodule update --init runtime
 pip install --no-build-isolation -e $PYPTO_DIR
 pip install --no-build-isolation -e $SIMPLER_DIR
+
+# Run the example again to generate the bad build_output
+python <script> -p <platform> -d <device>
+BAD_BUILD=$(ls -td build_output/<ProgramName>_* | head -1)
 ```
 
 #### Step 1b: Diff generated code
