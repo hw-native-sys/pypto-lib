@@ -131,8 +131,9 @@ sub-kernels below; the variant determines whether `compressor` and
          │             ori_kv (PA)                │
          │                 │                      │
          │  ┌──── cmp_kv (PA, ratio>0 only) ──────┤
-         │  │   cmp scatter fires once per call   │
-         │  │   when (start_pos+S)%ratio == 0     │
+         │  │   cmp scatter fires on compression  │
+         │  │   steps; non-boundary steps only    │
+         │  │   update compressor state           │
          │  │                                     │
          │  │   topk_idxs [T, *] — per-token   │
          │  │   (indexer/HCA produces 2 rows per  │
@@ -160,6 +161,13 @@ sub-kernels below; the variant determines whether `compressor` and
 ║  OUT: attn_out [T, D=4096]  bf16                                         ║
 ║       (line 534 inverse RoPE + line 537-542 o_proj fused)                   ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
+
+Decode start-position contract:
+- `start_pos` is a scalar shared by the batch in these static standalone
+  fixtures; per-batch variable start positions are out of scope.
+- Compressor-backed paths support scalar no-compression, aligned-compression,
+  and boundary-crossing steps. Full attention fixtures cover post-window decode
+  positions; short window-prefix sparse-attention warmup is out of scope here.
               │ attn_out [T, D]
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗

@@ -102,9 +102,9 @@ ROTATE_MAIN = False
 ROTATE_INNER = True
 
 # Keep the default fixture on a full-window compression step so sparse_attn
-# exercises both the window and compressed paths. Warmup positions before the
-# first compressed slot are also supported when START_POS is lowered.
-START_POS = 126      # (START_POS + S) % COMPRESS_RATIO == 0 triggers compression
+# exercises both the window and compressed paths. The --start-pos fixture option
+# covers post-window no-compression/aligned/boundary positions.
+START_POS = 126
 
 @pl.jit.inline
 def attention_csa(
@@ -746,7 +746,7 @@ def golden_attention_csa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs():
+def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
     from hc_pre import golden_hc_pre
@@ -929,7 +929,7 @@ def build_tensor_specs():
         return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
 
     def init_seqused_kv():
-        seq = START_POS + S
+        seq = start_pos + S
         sparse_len = seq if seq <= WIN else WIN + seq // COMPRESS_RATIO
         return torch.full((B,), sparse_len, dtype=torch.int32)
 
@@ -1020,7 +1020,7 @@ def build_tensor_specs():
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("start_pos", torch.int32, start_pos),
     ]
 
 
@@ -1031,12 +1031,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Decode start position for no-compression/aligned/crossing coverage.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_csa_test_refresh,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_csa,
         runtime_cfg=dict(
             platform=args.platform,

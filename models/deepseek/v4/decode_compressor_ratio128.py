@@ -379,7 +379,7 @@ def golden_compressor(tensors):
     tensors["kv_cache"][:] = kv_cache
 
 
-def build_tensor_specs():
+def build_tensor_specs(start_pos: int = START_POS):
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
 
@@ -431,7 +431,7 @@ def build_tensor_specs():
         TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("kv_cache", [B, IDX_KV_LEN, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("start_pos", torch.int32, start_pos),
         ScalarSpec("rotate", torch.bool, True),
     ]
 
@@ -444,12 +444,14 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Decode start position for no-compression/aligned/crossing coverage.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=compressor_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_compressor,
         runtime_cfg=dict(
             platform=args.platform,

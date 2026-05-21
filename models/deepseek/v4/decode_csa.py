@@ -11,9 +11,10 @@ Composes ``attention_csa`` (hc_pre + qkv_proj + main compressor + indexer +
 sparse_attn + hc_post) with the MoE stack, matching ``Block.forward``
 (model.py:688-700) for layers whose ``compress_ratio == 4`` (the ratio=4
 layers in the demo / flash compress_ratios tuple). Inherits the CSA caller
-contract: runtime ``start_pos`` MUST equal compile-time ``START_POS`` AND
-``(START_POS + S) % COMPRESS_RATIO == 0`` AND ``START_POS >= WIN - S`` —
-see attention_csa.py."""
+contract: runtime ``start_pos`` MUST equal compile-time ``START_POS`` for the
+static standalone fixture. The attention/compressor path supports arbitrary
+scalar ``start_pos`` for no-compression, aligned-compression, and
+boundary-crossing decode steps."""
 
 
 import pypto.language as pl
@@ -73,17 +74,10 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-START_POS = 126      # (START_POS + S) % COMPRESS_RATIO == 0 AND START_POS >= WIN - S
+START_POS = 126      # default fixture exercises a compression step
 
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-
-# Caller contract — same as attention_csa.py.
-SHOULD_COMPRESS = ((START_POS + S) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS and START_POS >= WIN - S, (
-    f"CSA fixture requires a full-window compression step; got START_POS={START_POS}, "
-    f"COMPRESS_RATIO={COMPRESS_RATIO}, WIN={WIN}, S={S}."
-)
 
 # ---- moe-local constants ----
 N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
@@ -177,7 +171,7 @@ def decode_csa(
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],   # MUST equal compile-time START_POS — see header
+    start_pos: pl.Scalar[pl.INT32],   # static standalone fixture uses compile-time START_POS
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block (CSA): hc_pre + attention(+main compressor + indexer) + hc_post → x_attn.

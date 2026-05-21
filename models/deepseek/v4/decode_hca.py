@@ -10,8 +10,10 @@
 Composes ``attention_hca`` (hc_pre + qkv_proj + main compressor + sparse_attn + hc_post)
 with the MoE stack, matching ``Block.forward`` (model.py:688-700) for layers whose
 ``compress_ratio == 128`` (e.g. layers 3/5 in the demo). Inherits the HCA
-caller contract: runtime ``start_pos`` MUST equal compile-time ``START_POS``
-AND ``(START_POS + S) % COMPRESS_RATIO`` MUST be 0 — see attention_hca.py."""
+caller contract: runtime ``start_pos`` MUST equal compile-time ``START_POS`` for
+the static standalone fixture. The attention/compressor path supports arbitrary
+scalar ``start_pos`` for no-compression, aligned-compression, and
+boundary-crossing decode steps."""
 
 
 import pypto.language as pl
@@ -60,14 +62,7 @@ CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SPARSE_IDX_TOPK = M.index_topk
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-START_POS = COMPRESS_RATIO - S       # (START_POS + S) % COMPRESS_RATIO == 0 triggers compression
-
-# Caller contract — same as attention_hca.py.
-SHOULD_COMPRESS = COMPRESS_RATIO != 0 and ((START_POS + S) % COMPRESS_RATIO) == 0
-assert SHOULD_COMPRESS, (
-    f"Test fixture: START_POS={START_POS}, COMPRESS_RATIO={COMPRESS_RATIO}, S={S}; "
-    "need (START_POS+S) % COMPRESS_RATIO == 0."
-)
+START_POS = COMPRESS_RATIO - S       # default fixture exercises a compression step
 
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
@@ -152,7 +147,7 @@ def decode_hca(
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],   # MUST equal compile-time START_POS — see header
+    start_pos: pl.Scalar[pl.INT32],   # static standalone fixture uses compile-time START_POS
     cmp_rotate: pl.Scalar[pl.BOOL],   # always False on the ratio=128 path
     layer_id: pl.Scalar[pl.INT32],
 ):

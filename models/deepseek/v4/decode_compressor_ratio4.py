@@ -95,11 +95,12 @@ def compressor(
             cmp4_kv_proj_scratch = pl.assemble(cmp4_kv_proj_scratch, kv_acc, [0, o0])
             cmp4_score_proj_scratch = pl.assemble(cmp4_score_proj_scratch, score_acc, [0, o0])
 
-        cmp4_kv_proj_3d = pl.reshape(cmp4_kv_proj_scratch, [B, S, OUT_DIM])
-        cmp4_score_proj_3d = pl.reshape(cmp4_score_proj_scratch, [B, S, OUT_DIM])
-        scatter_stop = S
-        if pre_tokens < S:
-            scatter_stop = pre_tokens
+    cmp4_kv_proj_3d = pl.reshape(cmp4_kv_proj_scratch, [B, S, OUT_DIM])
+    cmp4_score_proj_3d = pl.reshape(cmp4_score_proj_scratch, [B, S, OUT_DIM])
+    scatter_stop = S
+    if pre_tokens < S:
+        scatter_stop = pre_tokens
+    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
         for s in pl.range(scatter_stop):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter"):
                 kv_tile = pl.reshape(cmp4_kv_proj_3d[:, s : s + 1, o0 : o0 + OUT_CHUNK], [B, OUT_CHUNK])
@@ -300,17 +301,6 @@ def compressor(
                         kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, slot_col0_s + o0])
                         score_state_flat = pl.assemble(score_state_flat, score_tile, [0, slot_col0_s + o0])
 
-        for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-            for s in pl.range(pre_tokens):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift_boundary"):
-                    token_ape_row = (ape_row + s) % COMPRESS_RATIO
-                    src_col0 = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
-                    dst_col0 = token_ape_row * OUT_DIM
-                    kv_tile = kv_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
-                    score_tile = score_state_flat[:, src_col0 + o0 : src_col0 + o0 + OUT_CHUNK]
-                    kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [0, dst_col0 + o0])
-                    score_state_flat = pl.assemble(score_state_flat, score_tile, [0, dst_col0 + o0])
-
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
     kv_state = pl.reshape(kv_state_flat, [B, STATE_LEN, OUT_DIM])
@@ -426,7 +416,7 @@ def golden_compressor(tensors):
     tensors["kv_cache"][:] = kv_cache
 
 
-def build_tensor_specs():
+def build_tensor_specs(start_pos: int = START_POS):
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
 
@@ -478,7 +468,7 @@ def build_tensor_specs():
         TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("kv_cache", [B, IDX_KV_LEN, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("start_pos", torch.int32, start_pos),
         ScalarSpec("rotate", torch.bool, ROTATE),
     ]
 
@@ -491,12 +481,14 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Decode start position for no-compression/aligned/crossing coverage.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=compressor_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_compressor,
         runtime_cfg=dict(
             platform=args.platform,

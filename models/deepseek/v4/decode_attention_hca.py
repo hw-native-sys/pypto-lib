@@ -63,9 +63,8 @@ IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cac
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 HCA_TOPK_CHUNK = 16 if DECODE_BATCH * DECODE_SEQ >= 64 else DECODE_BATCH * DECODE_SEQ
-# Non-compression-step fixture: (START_POS + 1) % COMPRESS_RATIO != 0.
-# Warmup positions before the first compressed slot are supported; seqused_kv
-# bounds the valid compressed topk range.
+# Default fixture is a post-window non-compression step. The --start-pos fixture
+# option covers post-window no-compression/aligned/boundary positions.
 START_POS = 128
 # tiling
 Q_PROJ_OUT_CHUNK = 128
@@ -117,12 +116,10 @@ def attention_hca(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    start_pos: pl.Scalar[pl.INT32],  # decode step; MUST equal compile-time START_POS — see contract above
+    start_pos: pl.Scalar[pl.INT32],  # scalar decode step shared by the batch
     cmp_rotate: pl.Scalar[pl.BOOL],  # always False on the ratio=128 path; threaded through for the compressor inline contract
 ):
-    """HCA decode orchestration for compress_ratio=128. Caller contract:
-    runtime ``start_pos`` MUST equal compile-time ``START_POS``.
-    """
+    """HCA decode orchestration for compress_ratio=128."""
     compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
 
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
@@ -540,7 +537,7 @@ def golden_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs():
+def build_tensor_specs(start_pos: int = START_POS):
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
 
@@ -657,7 +654,7 @@ def build_tensor_specs():
         return torch.zeros(H)
     def init_seqused_kv():
         # sparse_attn derives per-token causal lengths from this final sparse length.
-        seq = START_POS + S
+        seq = start_pos + S
         sparse_len = seq if seq <= WIN else WIN + seq // COMPRESS_RATIO
         return torch.full((B,), sparse_len, dtype=torch.int32)
     def init_wo_a():
@@ -707,7 +704,7 @@ def build_tensor_specs():
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        ScalarSpec("start_pos", torch.int32, START_POS),
+        ScalarSpec("start_pos", torch.int32, start_pos),
         ScalarSpec("cmp_rotate", torch.bool, ROTATE_MAIN),
     ]
 
@@ -720,12 +717,14 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Decode start position for no-compression/aligned/crossing coverage.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_hca_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_hca,
         runtime_cfg=dict(
             platform=args.platform,
