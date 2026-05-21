@@ -76,7 +76,7 @@ def moe_dispatch(
             x_norm_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(xn_q_half, target_type=pl.INT8, mode="trunc")
 
     # recv_x still uses a flat row view because its destination row is
-    # data-dependent. Small route metadata now uses the natural 2-D layout.
+    # data-dependent. Small route metadata uses the natural 2-D layout.
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_dispatch"):
@@ -89,7 +89,13 @@ def moe_dispatch(
                 pl.write(recv_scale_dq, [e, s], 0.0)
                 pl.write(recv_weights, [e, s], 0.0)
                 pl.write(recv_token, [e, s], pl.cast(0, pl.INT32))
-            pl.write(recv_expert_count, [e, 0], pl.cast(0, pl.INT32))
+            # This read-reset is an ordering edge, not dead arithmetic. It
+            # makes packed_dispatch consume the route_count materialization
+            # before reusing recv_expert_count as the dynamic cursor.
+            dep_count_i32 = pl.read(recv_expert_count, [e, 0])
+            dep_zero_i32 = pl.cast(dep_count_i32 - dep_count_i32, pl.INT32)
+            pl.write(recv_expert_count, [e, 0], dep_zero_i32)
+
         for t in pl.range(T):
             for k in pl.unroll(TOPK):
                 e_global = pl.read(indices, [t, k])

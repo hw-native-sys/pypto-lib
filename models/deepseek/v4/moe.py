@@ -38,6 +38,7 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     EP_WORLD_SIZE,
+    EP_RANK,
     RECV_MAX,
 )
 from hc_pre import hc_pre
@@ -67,6 +68,7 @@ VOCAB = M.vocab_size
 # Expert (must match moe_expert.py)
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 
 @pl.jit.inline
@@ -121,13 +123,26 @@ def moe(
         x_norm, indices, weights,
     )
 
+    # Build the real route histogram before dispatch. The packed dispatch body
+    # reads this tensor again as a data-dependency barrier before consuming the
+    # route table through dynamic scalar indices.
+    recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_count"):
+        for e in pl.range(N_LOCAL_EXPERTS):
+            target_e_i32 = pl.cast(e + EXPERTS_START_IDX, pl.INT32)
+            count_i32: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
+            for t in pl.range(T):
+                for k in pl.unroll(TOPK):
+                    if pl.read(indices, [t, k]) == target_e_i32:
+                        count_i32 = pl.cast(count_i32 + 1, pl.INT32)
+            pl.write(recv_expert_count, [e, 0], count_i32)
+
     # Stage 3: packed dispatch. `recv_x` is INT8 (per-token quantized once
     # inside dispatch), `recv_scale_dq` carries the per-token dequant scale.
     recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
     recv_scale_dq = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_token = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
-    recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
     moe_dispatch(
         x_norm, indices, weights,
         recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
