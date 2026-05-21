@@ -14,7 +14,7 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
-from indexer_compressor import indexer_compressor
+from decode_indexer_compressor import indexer_compressor
 
 # model config
 B = DECODE_BATCH
@@ -429,7 +429,7 @@ def _quant_w_per_output_channel(w):
 def golden_indexer(tensors):
     """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
     import torch
-    from indexer_compressor import golden_compressor
+    from decode_indexer_compressor import golden_compressor
 
     x = tensors["x"].float()
     qr = tensors["qr"]

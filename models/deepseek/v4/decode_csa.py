@@ -26,7 +26,7 @@ from config import (
     EP_WORLD_SIZE,
     RECV_MAX,
 )
-from attention_csa import attention_csa
+from decode_attention_csa import attention_csa
 from moe import moe
 
 
@@ -327,7 +327,7 @@ def golden_decode_csa(tensors):
     """Chains golden_attention_csa and golden_moe (decode branch)."""
     import torch
 
-    from attention_csa import golden_attention_csa
+    from decode_attention_csa import golden_attention_csa
     from moe import golden_moe
 
     x_attn = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
@@ -355,7 +355,7 @@ def build_tensor_specs(layer_id: int = 0):
       - attn ``cmp_sparse_indices``  (internal indexer<->sparse_attn handoff)
       - moe  ``x_hc``                (provided by attn output)
     """
-    from attention_csa import build_tensor_specs as build_attn_specs
+    from decode_attention_csa import build_tensor_specs as build_attn_specs
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}

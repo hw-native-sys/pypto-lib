@@ -23,7 +23,7 @@ from config import (
     EP_WORLD_SIZE,
     RECV_MAX,
 )
-from attention_swa import attention_swa
+from decode_attention_swa import attention_swa
 from moe import moe
 
 
@@ -238,7 +238,7 @@ def golden_decode_swa(tensors):
     """Chains golden_attention_swa and golden_moe (decode branch)."""
     import torch
 
-    from attention_swa import golden_attention_swa
+    from decode_attention_swa import golden_attention_swa
     from moe import golden_moe
 
     # Stage A: attention_swa writes its HC output to a local intermediate.
@@ -262,7 +262,7 @@ def build_tensor_specs(layer_id: int = 0):
       - attn ``x_out``  (intermediate, not exposed)
       - moe ``x_hc``    (provided by attn output)
     """
-    from attention_swa import build_tensor_specs as build_attn_specs
+    from decode_attention_swa import build_tensor_specs as build_attn_specs
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}

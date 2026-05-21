@@ -30,12 +30,12 @@ surface.
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
-from compressor_ratio4 import compressor
+from decode_compressor_ratio4 import compressor
 from hc_post import hc_post
 from hc_pre import hc_pre
-from indexer import indexer
+from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
-from sparse_attn import sparse_attn
+from decode_sparse_attn import sparse_attn
 
 B = DECODE_BATCH
 S = DECODE_SEQ
@@ -462,9 +462,9 @@ def golden_attention_csa(tensors):
     """Torch reference for the ratio-4 compression-step CSA orchestration."""
     import torch
 
-    from compressor_ratio4 import golden_compressor
+    from decode_compressor_ratio4 import golden_compressor
     from hc_pre import golden_hc_pre
-    from indexer import golden_indexer
+    from decode_indexer import golden_indexer
     from qkv_proj_rope import golden_qkv_proj_rope
 
     def rms_norm(x, weight):

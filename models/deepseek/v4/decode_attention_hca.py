@@ -20,8 +20,8 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
-from compressor_ratio128 import compressor
-from sparse_attn import sparse_attn
+from decode_compressor_ratio128 import compressor
+from decode_sparse_attn import sparse_attn
 
 
 # model config
@@ -387,8 +387,8 @@ def golden_attention_hca(tensors):
 
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
-    from compressor_ratio128 import golden_compressor
-    from sparse_attn import golden_sparse_attn
+    from decode_compressor_ratio128 import golden_compressor
+    from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
 
     # ---- Block.hc_pre ----
