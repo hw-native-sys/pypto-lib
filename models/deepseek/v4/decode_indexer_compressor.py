@@ -250,22 +250,23 @@ def indexer_compressor(
         if pre_tokens < S:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
                 for s in pl.range(pre_tokens, S):
-                    kv_row = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, 0 : OUT_DIM], [B, OUT_DIM])
-                    score_row = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, 0 : OUT_DIM], [B, OUT_DIM])
-                    shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM
-                    dep_zero_full = pl.sub(
-                        kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_DIM],
-                        kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_DIM],
-                    )
-                    kv_row = pl.add(kv_row, dep_zero_full)
-                    score_row = pl.add(score_row, dep_zero_full)
                     token_ape_row = (ape_row + s) % COMPRESS_RATIO
-                    ape_tile_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
-                    ape_base_full = pl.full([B, OUT_DIM], dtype=pl.FP32, value=0.0)
-                    score_row = pl.add(score_row, pl.col_expand(ape_base_full, ape_tile_full))
                     slot_col0_s = (COMPRESS_RATIO + token_ape_row) * OUT_DIM
-                    kv_state_flat[:, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row
-                    score_state_flat[:, slot_col0_s : slot_col0_s + OUT_DIM] = score_row
+                    for o0c in pl.range(0, OUT_DIM, OUT_CHUNK):
+                        kv_tile = pl.reshape(idx_cmp_kv_proj_3d[:, s : s + 1, o0c : o0c + OUT_CHUNK], [B, OUT_CHUNK])
+                        score_tile = pl.reshape(idx_cmp_score_proj_3d[:, s : s + 1, o0c : o0c + OUT_CHUNK], [B, OUT_CHUNK])
+                        shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM + o0c
+                        dep_zero = pl.sub(
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
+                            kv_state_flat[:, shift_dep_col0 : shift_dep_col0 + OUT_CHUNK],
+                        )
+                        kv_tile = pl.add(kv_tile, dep_zero)
+                        score_tile = pl.add(score_tile, dep_zero)
+                        ape_tile = ape[token_ape_row : token_ape_row + 1, o0c : o0c + OUT_CHUNK]
+                        ape_base = pl.full([B, OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
+                        kv_state_flat[:, slot_col0_s + o0c : slot_col0_s + o0c + OUT_CHUNK] = kv_tile
+                        score_state_flat[:, slot_col0_s + o0c : slot_col0_s + o0c + OUT_CHUNK] = score_tile
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift_boundary"):
             for sb in pl.range(pre_tokens):
