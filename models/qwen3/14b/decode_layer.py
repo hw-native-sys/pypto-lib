@@ -14,28 +14,29 @@ Scope 1:
 
 Per-head q_norm / k_norm
 
-Scope 2:
-  1. K RoPE + paged cache write, V paged cache write, Q RoPE + pad
-  2. fa_qks (one mixed root): QK matmul (cube) + tail-masked softmax
-     (vec) for both paired streams (gi0 + gi1).
-  3. fa_svo (one mixed root per gi stream): SV matmul (cube) + online-
-     softmax recurrence (vec). Issued twice per outer iter (gi0 then
-     gi1). Stashes the final FP32 ctx [Q_HEAD_PAD, HEAD_DIM] to GM.
-  4. fa_attn_row (vec-only): trim Q_HEAD_PAD->Q_HEAD_BATCH=5, cast to
-     BF16, and assemble into attn_row.
+Scope 2 (fused flash-attention, explicit pl.spmd, bidirectional cube<->vec):
+  1. K RoPE + paged cache write, V paged cache write, Q RoPE + pad.
+  2. fa_fused (ONE mixed root, dispatched via pl.spmd): QK matmul (cube) +
+     tail-masked softmax (vec) + SV matmul (cube), per sequence block.
+     Both cross-lane handoffs are CV BOUNDARY MOVES (cube QK -> vec
+     softmax = C2V; vec exp -> cube SV = V2C), not GM round-trips.
+     Dispatch: pl.spmd(TOTAL_Q_GROUPS // 2) with the UP_DOWN split applied
+     to the outlined InCore scope; each spmd block owns a Q-group PAIR and
+     pipelines the two groups with pl.pipeline(stage=2) to give the
+     bidirectional pipe its ping-pong buffering. NO chunk / auto_chunk
+     (deprecated). Per-block oi_tmp / mi / li are stashed to GM.
+  3. online_softmax (separate vec-only pl.spmd region): online recurrence
+     over blocks (reading the per-block GM tiles), then trim
+     Q_HEAD_PAD->Q_HEAD_BATCH, cast to BF16, assemble into attn_row. Kept
+     separate because the recurrence is sequential while fa_fused is
+     pipelined, and the flatten reshape conflicts with the UP_DOWN split.
 
-  Notes on why not a single fa_fused (the qwen3_14b_decode_mix style):
-  - The Q_HEAD_BATCH=5 trim cannot live inside a mixed root: with
-    SplitMode.UP_DOWN the split-dim 5 is odd and rejected; without
-    UP_DOWN, pto.subview rejects the [5, HEAD_DIM] slice of the
-    row_expand_div output (valid_row inference fails).
-  - Co-packing both paired streams' SV + online recurrences in one
-    fa_svo produces small numerical drift (compiles and runs but
-    fails atol=3e-3 tolerance). Splitting fa_svo per stream restores
-    correctness.
-  - BLOCK_SIZE=128 (SEQ_TILE=128 in config.py) is required so each K/V
-    tile is 32 KB and double-buffered L0B fits the 64 KB platform
-    limit. With SEQ_TILE=256, any cube+vec fusion overflows L0B.
+  NOTE: the model is reconfigured to an even q_per_kv (NUM_KV_HEADS=10 ->
+  Q_HEAD_BATCH=4) so the trim splits cleanly under UP_DOWN. Feeding a vec
+  tile to a cube matmul (V2C) inside one root relies on the cross-core
+  V2C fence enabled in pypto's expand_mixed_kernel pass for 910B/a2a3.
+  BLOCK_SIZE=128 (SEQ_TILE=128 in config.py) keeps each K/V tile at 32 KB
+  so the cube L0B holds two double-buffered tiles in the 64 KB limit.
 
 Scope 3:
   1. Output projection: attn_out × wo
@@ -79,7 +80,9 @@ from config import (
     LM_HEAD_K_CHUNK,
     MAX_BLOCKS_PER_SEQ,
     MAX_SEQ,
+    MLP_GROUP_CHUNK,
     MLP_OUT_CHUNK,
+    MLP_SPMD_INNER,
     NUM_HEADS,
     NUM_KV_HEADS,
     OUT_PROJ_K_CHUNK,
@@ -96,6 +99,10 @@ from config import (
     VOCAB_CHUNK,
 )
 from rms_lm_head import rms_lm_head
+
+# The MLP SPMD grouping bundles MLP_SPMD_INNER output blocks per dispatch,
+# so the output-block count must be an exact multiple.
+assert (INTERMEDIATE // MLP_OUT_CHUNK) % MLP_SPMD_INNER == 0
 
 
 @pl.jit.inline
@@ -346,168 +353,87 @@ def decode_layer(
                     [b * TOTAL_Q_GROUPS * Q_HEAD_PAD + ki * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
                 )
 
+        # Scope-2 attention: QK matmul + tail-masked softmax + SV matmul fused
+        # into ONE mixed root (fa_fused) using CV boundary moves for both
+        # cross-lane directions (cube QK -> vec softmax = C2V; vec exp -> cube
+        # SV = V2C). Dispatched via explicit pl.spmd over Q-group pairs; the
+        # per-pair pl.pipeline(stage=2) supplies the bidirectional pipe's ping-
+        # pong buffering (replacing the deprecated chunk/auto_chunk path). The
+        # online-softmax recurrence + trim run as a separate vec-only pl.spmd
+        # region (cross-ROOT).
         attn_row = pl.create_tensor([1, HIDDEN], dtype=pl.BF16)
-        for gi in pl.parallel(0, TOTAL_Q_GROUPS, 2):
-            gi0 = gi
-            gi1 = gi + 1
+        all_oi_tmp = pl.create_tensor([TOTAL_Q_GROUPS * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
+        all_cur_mi = pl.create_tensor([TOTAL_Q_GROUPS * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
+        all_cur_li = pl.create_tensor([TOTAL_Q_GROUPS * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
-            kvh0 = gi0 // Q_GROUPS
-            qg0 = gi0 - kvh0 * Q_GROUPS
-            q_base0 = kvh0 * Q_PER_KV + qg0 * Q_HEAD_BATCH
-            q_padded_row0 = b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi0 * Q_HEAD_PAD
-            q_padded0 = pl.slice(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [q_padded_row0, 0])
+        # Explicit pl.spmd dispatch (no chunk / auto_chunk — deprecated). Each
+        # spmd block owns a Q-group PAIR and pipelines the two groups with
+        # pl.pipeline(stage=2): that supplies the bidirectional cube<->vec
+        # pipe's ping-pong buffering (what chunk=2 used to provide). Without the
+        # 2-group ping-pong (e.g. one group per spmd block) the bidirectional
+        # pipe deadlocks.
+        for g2 in pl.spmd(TOTAL_Q_GROUPS // 2, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="fa_fused"):
+            for gp in pl.pipeline(2, stage=2):
+                gi = g2 * 2 + gp
+                kvh = gi // Q_GROUPS
+                q_padded_row = b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
+                q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [q_padded_row, 0])
+                g_base = gi * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD
 
-            kvh1 = gi1 // Q_GROUPS
-            qg1 = gi1 - kvh1 * Q_GROUPS
-            q_base1 = kvh1 * Q_PER_KV + qg1 * Q_HEAD_BATCH
-            q_padded_row1 = b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi1 * Q_HEAD_PAD
-            q_padded1 = pl.slice(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [q_padded_row1, 0])
-
-            all_raw_scores0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
-            all_raw_scores1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.FP32)
-            all_exp_padded0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.BF16)
-            all_exp_padded1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, BLOCK_SIZE], dtype=pl.BF16)
-            all_cur_mi0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
-            all_cur_mi1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
-            all_cur_li0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
-            all_cur_li1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, 1], dtype=pl.FP32)
-
-            # fa_qks: cube (QK matmul) + vec (tail-masked softmax) for both
-            # paired streams in one mixed root. Per-sb loop body: each stream
-            # matmuls Q against its kvh K tile, stashes raw scores to GM,
-            # then reads back via bracket slicing, attaches dynamic tail mask
-            # via pl.set_validshape (the pl.slice(..., valid_shape=...)
-            # pattern is disallowed inside a mixed root), and runs softmax.
-            # Requires SEQ_TILE == 128 in config.py: each K tile is 32 KB and
-            # the cube L0B holds at most two double-buffered tiles in 64 KB.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_qks"):
                 for sb in pl.range(ctx_blocks):
                     s0 = sb * BLOCK_SIZE
                     valid_len = pl.min(BLOCK_SIZE, ctx_len - s0)
-                    qk_block_table_idx = block_table_base + sb
-                    qk_pbid = pl.cast(pl.tensor.read(block_table, [qk_block_table_idx]), pl.INDEX)
+                    fa_block_table_idx = block_table_base + sb
+                    fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_block_table_idx]), pl.INDEX)
+                    fa_cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
 
-                    qk_cache_row0 = layer_cache_base + (qk_pbid * NUM_KV_HEADS + kvh0) * BLOCK_SIZE
-                    k_tile0 = k_cache[qk_cache_row0 : qk_cache_row0 + BLOCK_SIZE, :]
-                    raw_scores0 = pl.matmul(q_padded0, k_tile0, b_trans=True, out_dtype=pl.FP32)
-                    all_raw_scores0 = pl.assemble(all_raw_scores0, raw_scores0, [sb * Q_HEAD_PAD, 0])
-                    scores_chunk0 = all_raw_scores0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    scores_valid0 = pl.set_validshape(scores_chunk0, Q_HEAD_PAD, valid_len)
-                    scores_padded0 = pl.fillpad(scores_valid0, pad_value=pl.PadValue.min)
-                    scores0 = pl.mul(scores_padded0, decode_attn_scale)
-                    softmax_cur_mi0 = pl.row_max(scores0)
-                    exp_scores0 = pl.exp(pl.row_expand_sub(scores0, softmax_cur_mi0))
-                    exp_scores_bf16_0 = pl.cast(exp_scores0, target_type=pl.BF16)
-                    exp_scores_fp32_0 = pl.cast(exp_scores_bf16_0, target_type=pl.FP32)
-                    softmax_cur_li0 = pl.row_sum(exp_scores_fp32_0)
-                    all_exp_padded0 = pl.assemble(all_exp_padded0, exp_scores_bf16_0, [sb * Q_HEAD_PAD, 0])
-                    all_cur_mi0 = pl.assemble(all_cur_mi0, softmax_cur_mi0, [sb * Q_HEAD_PAD, 0])
-                    all_cur_li0 = pl.assemble(all_cur_li0, softmax_cur_li0, [sb * Q_HEAD_PAD, 0])
+                    # QK matmul (cube). First vec consumer (pl.mul) triggers the
+                    # C2V boundary move; set_validshape runs on the vec tile.
+                    k_tile = k_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
+                    raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                    scores_scaled = pl.mul(raw_scores, decode_attn_scale)
+                    scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_PAD // 2, valid_len)
+                    scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                    cur_mi = pl.row_max(scores)
+                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                    exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                    exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
+                    cur_li = pl.row_sum(exp_scores_fp32)
 
-                    qk_cache_row1 = layer_cache_base + (qk_pbid * NUM_KV_HEADS + kvh1) * BLOCK_SIZE
-                    k_tile1 = k_cache[qk_cache_row1 : qk_cache_row1 + BLOCK_SIZE, :]
-                    raw_scores1 = pl.matmul(q_padded1, k_tile1, b_trans=True, out_dtype=pl.FP32)
-                    all_raw_scores1 = pl.assemble(all_raw_scores1, raw_scores1, [sb * Q_HEAD_PAD, 0])
-                    scores_chunk1 = all_raw_scores1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    scores_valid1 = pl.set_validshape(scores_chunk1, Q_HEAD_PAD, valid_len)
-                    scores_padded1 = pl.fillpad(scores_valid1, pad_value=pl.PadValue.min)
-                    scores1 = pl.mul(scores_padded1, decode_attn_scale)
-                    softmax_cur_mi1 = pl.row_max(scores1)
-                    exp_scores1 = pl.exp(pl.row_expand_sub(scores1, softmax_cur_mi1))
-                    exp_scores_bf16_1 = pl.cast(exp_scores1, target_type=pl.BF16)
-                    exp_scores_fp32_1 = pl.cast(exp_scores_bf16_1, target_type=pl.FP32)
-                    softmax_cur_li1 = pl.row_sum(exp_scores_fp32_1)
-                    all_exp_padded1 = pl.assemble(all_exp_padded1, exp_scores_bf16_1, [sb * Q_HEAD_PAD, 0])
-                    all_cur_mi1 = pl.assemble(all_cur_mi1, softmax_cur_mi1, [sb * Q_HEAD_PAD, 0])
-                    all_cur_li1 = pl.assemble(all_cur_li1, softmax_cur_li1, [sb * Q_HEAD_PAD, 0])
+                    # SV matmul (cube) reads exp directly -> V2C boundary move.
+                    v_tile = v_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
+                    oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
 
-            all_oi_tmp0 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
-            all_oi_tmp1 = pl.create_tensor([MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
-            # FP32 ctx stash: fa_svo writes [Q_HEAD_PAD, HEAD_DIM] FP32 here,
-            # fa_attn_row trims/casts/assembles. The trim cannot live inside
-            # fa_svo (mixed root): the row_expand_div output's valid_shape
-            # stays uninitialised and pto.subview rejects the
-            # [Q_HEAD_BATCH=5, HEAD_DIM] subview.
-            ctx_gm0 = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
-            ctx_gm1 = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
+                    all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
+                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
+                    all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
 
-            # fa_svo: per-stream cube (SV matmul) + vec (online-softmax
-            # recurrence). Per-stream split: co-packing both streams in one
-            # fa_svo gave a small numeric drift (~10% relative error,
-            # confirmed wrong but close to golden), likely from the IR
-            # serialising two parallel oi/mi/li recurrences inside a single
-            # mixed root. Single-stream matches the unfused recurrence
-            # semantics exactly.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_svo"):
-                for sb in pl.range(ctx_blocks):
-                    sv_block_table_idx = block_table_base + sb
-                    sv_pbid = pl.cast(pl.tensor.read(block_table, [sv_block_table_idx]), pl.INDEX)
-                    sv_cache_row0 = layer_cache_base + (sv_pbid * NUM_KV_HEADS + kvh0) * BLOCK_SIZE
-                    exp_tile0 = all_exp_padded0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    v_tile0 = v_cache[sv_cache_row0 : sv_cache_row0 + BLOCK_SIZE, :]
-                    oi_tmp0 = pl.matmul(exp_tile0, v_tile0, out_dtype=pl.FP32)
-                    all_oi_tmp0 = pl.assemble(all_oi_tmp0, oi_tmp0, [sb * Q_HEAD_PAD, 0])
+        # online-softmax recurrence + trim, as a separate vec-only pl.spmd
+        # region (cross-ROOT; reads the per-block GM tiles fa_fused stashed).
+        for gi in pl.spmd(TOTAL_Q_GROUPS, name_hint="online_softmax"):
+            kvh = gi // Q_GROUPS
+            qg = gi - kvh * Q_GROUPS
+            q_base = kvh * Q_PER_KV + qg * Q_HEAD_BATCH
+            g_base = gi * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD
+            oi = all_oi_tmp[g_base : g_base + Q_HEAD_PAD, :]
+            mi = all_cur_mi[g_base : g_base + Q_HEAD_PAD, :]
+            li = all_cur_li[g_base : g_base + Q_HEAD_PAD, :]
+            for sb in pl.range(1, ctx_blocks):
+                rec = g_base + sb * Q_HEAD_PAD
+                oi_tmp_valid = all_oi_tmp[rec : rec + Q_HEAD_PAD, :]
+                online_cur_mi = all_cur_mi[rec : rec + Q_HEAD_PAD, :]
+                online_cur_li = all_cur_li[rec : rec + Q_HEAD_PAD, :]
+                mi_new = pl.maximum(mi, online_cur_mi)
+                alpha = pl.exp(pl.sub(mi, mi_new))
+                beta = pl.exp(pl.sub(online_cur_mi, mi_new))
+                li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
+                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
+                mi = mi_new
 
-                oi0 = all_oi_tmp0[0:Q_HEAD_PAD, :]
-                mi0 = all_cur_mi0[0:Q_HEAD_PAD, :]
-                li0 = all_cur_li0[0:Q_HEAD_PAD, :]
-                for sb in pl.range(1, ctx_blocks):
-                    oi_tmp_valid0 = all_oi_tmp0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    online_cur_mi0 = all_cur_mi0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    online_cur_li0 = all_cur_li0[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    mi_new0 = pl.maximum(mi0, online_cur_mi0)
-                    alpha0 = pl.exp(pl.sub(mi0, mi_new0))
-                    beta0 = pl.exp(pl.sub(online_cur_mi0, mi_new0))
-                    li0 = pl.add(pl.mul(alpha0, li0), pl.mul(beta0, online_cur_li0))
-                    oi0 = pl.add(pl.row_expand_mul(oi0, alpha0), pl.row_expand_mul(oi_tmp_valid0, beta0))
-                    mi0 = mi_new0
-
-                ctx0 = pl.row_expand_div(oi0, li0)
-                ctx_gm0 = pl.assemble(ctx_gm0, ctx0, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_svo"):
-                for sb in pl.range(ctx_blocks):
-                    sv_block_table_idx = block_table_base + sb
-                    sv_pbid = pl.cast(pl.tensor.read(block_table, [sv_block_table_idx]), pl.INDEX)
-                    sv_cache_row1 = layer_cache_base + (sv_pbid * NUM_KV_HEADS + kvh1) * BLOCK_SIZE
-                    exp_tile1 = all_exp_padded1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    v_tile1 = v_cache[sv_cache_row1 : sv_cache_row1 + BLOCK_SIZE, :]
-                    oi_tmp1 = pl.matmul(exp_tile1, v_tile1, out_dtype=pl.FP32)
-                    all_oi_tmp1 = pl.assemble(all_oi_tmp1, oi_tmp1, [sb * Q_HEAD_PAD, 0])
-
-                oi1 = all_oi_tmp1[0:Q_HEAD_PAD, :]
-                mi1 = all_cur_mi1[0:Q_HEAD_PAD, :]
-                li1 = all_cur_li1[0:Q_HEAD_PAD, :]
-                for sb in pl.range(1, ctx_blocks):
-                    oi_tmp_valid1 = all_oi_tmp1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    online_cur_mi1 = all_cur_mi1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    online_cur_li1 = all_cur_li1[sb * Q_HEAD_PAD : (sb + 1) * Q_HEAD_PAD, :]
-                    mi_new1 = pl.maximum(mi1, online_cur_mi1)
-                    alpha1 = pl.exp(pl.sub(mi1, mi_new1))
-                    beta1 = pl.exp(pl.sub(online_cur_mi1, mi_new1))
-                    li1 = pl.add(pl.mul(alpha1, li1), pl.mul(beta1, online_cur_li1))
-                    oi1 = pl.add(pl.row_expand_mul(oi1, alpha1), pl.row_expand_mul(oi_tmp_valid1, beta1))
-                    mi1 = mi_new1
-
-                ctx1 = pl.row_expand_div(oi1, li1)
-                ctx_gm1 = pl.assemble(ctx_gm1, ctx1, [0, 0])
-
-            # fa_attn_row: vec-only trim + cast + assemble.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_attn_row"):
-                ctx_valid0 = pl.slice(ctx_gm0, [Q_HEAD_BATCH, HEAD_DIM], [0, 0])
-                ctx_flat_bf16_0 = pl.cast(
-                    pl.reshape(ctx_valid0, [1, Q_HEAD_BATCH * HEAD_DIM]),
-                    target_type=pl.BF16,
-                )
-                attn_row = pl.assemble(attn_row, ctx_flat_bf16_0, [0, q_base0 * HEAD_DIM])
-
-                ctx_valid1 = pl.slice(ctx_gm1, [Q_HEAD_BATCH, HEAD_DIM], [0, 0])
-                ctx_flat_bf16_1 = pl.cast(
-                    pl.reshape(ctx_valid1, [1, Q_HEAD_BATCH * HEAD_DIM]),
-                    target_type=pl.BF16,
-                )
-                attn_row = pl.assemble(attn_row, ctx_flat_bf16_1, [0, q_base1 * HEAD_DIM])
-
+            ctx = pl.row_expand_div(oi, li)
+            ctx_valid = ctx[0:Q_HEAD_BATCH, :]
+            ctx_flat_bf16 = pl.cast(pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16)
+            attn_row = pl.assemble(attn_row, ctx_flat_bf16, [0, q_base * HEAD_DIM])
         attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
     # Scope 3: output projection + residual + post RMSNorm + MLP + residual.
@@ -566,9 +492,16 @@ def decode_layer(
                 post_norm_tile = pl.assemble(post_norm_tile, normed_bf16, [0, post_norm_k0])
 
         mlp_tile = pl.create_tensor([BATCH_TILE, INTERMEDIATE], dtype=pl.BF16)
-        for ob in pl.range(decode_mlp_out_blocks):
-            mlp_o0 = ob * MLP_OUT_CHUNK
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
+        # SPMD: bundle MLP_SPMD_INNER output blocks per parallel chunk and
+        # dispatch gate/up/silu across SPMD lanes. gate_group / up_group
+        # stage the FP32 cube outputs in GM so the silu lane can read both.
+        for ob_base in pl.parallel(0, decode_mlp_out_blocks, MLP_SPMD_INNER):
+            gate_group = pl.create_tensor([BATCH_TILE, MLP_GROUP_CHUNK], dtype=pl.FP32)
+            up_group = pl.create_tensor([BATCH_TILE, MLP_GROUP_CHUNK], dtype=pl.FP32)
+
+            for ob in pl.spmd(MLP_SPMD_INNER, name_hint="gate_proj"):
+                mlp_o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                g0 = ob * MLP_OUT_CHUNK
                 post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                 wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, mlp_o0])
                 gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
@@ -577,8 +510,11 @@ def decode_layer(
                     gate_post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, gate_k0])
                     wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + gate_k0, mlp_o0])
                     gate_acc = pl.matmul_acc(gate_acc, gate_post_chunk, wg)
+                gate_group = pl.assemble(gate_group, gate_acc, [0, g0])
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
+            for ob in pl.spmd(MLP_SPMD_INNER, name_hint="up_proj"):
+                mlp_o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                g0 = ob * MLP_OUT_CHUNK
                 post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                 wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, mlp_o0])
                 up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
@@ -587,8 +523,13 @@ def decode_layer(
                     up_post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, up_k0])
                     wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + up_k0, mlp_o0])
                     up_acc = pl.matmul_acc(up_acc, up_post_chunk, wu)
+                up_group = pl.assemble(up_group, up_acc, [0, g0])
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
+            for ob in pl.spmd(MLP_SPMD_INNER, name_hint="silu"):
+                mlp_o0 = (ob_base + ob) * MLP_OUT_CHUNK
+                g0 = ob * MLP_OUT_CHUNK
+                gate_acc = pl.slice(gate_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
+                up_acc = pl.slice(up_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                 mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                 mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
@@ -1096,16 +1037,11 @@ if __name__ == "__main__":
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_pmu=args.enable_pmu,
         ),
-        # Tolerance temporarily loosened from 3e-3 to 1.5e-2 to accommodate
-        # the GM cross-lane race in the fa_qks / fa_svo mixed roots (the
-        # ExpandMixedKernel pass does not insert tpush/tpop between cube
-        # tile.store and vec tile.load on the shared GM scratch tensors,
-        # so device output is non-deterministic). Observed drift: ~3-5e-3
-        # on a2a3 hardware, ~6e-3 to ~1.0e-2 on a2a3sim where the
-        # simulator's scheduling widens the race window. Restore to 3e-3
-        # once hw-native-sys/pypto#1433 lands a fix.
-        rtol=1.5e-2,
-        atol=1.5e-2,
+        # Scope-2 attention now uses the unfused SPMD structure (separate
+        # cube / vec spmd roots), so the fa_qks / fa_svo mixed-root GM race
+        # that previously forced a 1.5e-2 tolerance no longer applies.
+        rtol=3e-3,
+        atol=3e-3,
     )
     if not result.passed:
         if result.error:
