@@ -24,7 +24,6 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     EP_WORLD_SIZE,
-    RECV_MAX,
 )
 from decode_attention_hca import attention_hca
 from moe import moe
@@ -33,7 +32,6 @@ from moe import moe
 # ---- shared model/decode constants (mirror attention_hca.py + moe.py) ----
 B = DECODE_BATCH
 S = DECODE_SEQ
-T = B * S
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -75,7 +73,6 @@ TOPK_E = M.num_experts_per_tok
 VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
-assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 
 
 @pl.jit.inline
