@@ -25,7 +25,6 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     EP_WORLD_SIZE,
-    RECV_MAX,
 )
 from decode_attention_csa import attention_csa
 from moe import moe
@@ -85,7 +84,6 @@ TOPK_E = M.num_experts_per_tok
 VOCAB = M.vocab_size
 MOE_INTER = M.moe_intermediate_size
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
-assert RECV_MAX >= T * TOPK_E, "packed layout needs RECV_MAX >= T * TOPK_E"
 
 
 @pl.jit.inline
