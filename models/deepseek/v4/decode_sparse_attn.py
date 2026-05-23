@@ -659,11 +659,32 @@ def golden_sparse_attn(tensors):
 
         kv_b = torch.stack(gathered, dim=0)
         q_t = q[t]
-        scores = (q_t @ kv_b.T) * SOFTMAX_SCALE
-        score_max = scores.max(dim=-1, keepdim=True).values
-        exp_scores = torch.exp(scores - score_max)
-        oi_num = exp_scores @ kv_b
-        li = exp_scores.sum(dim=-1, keepdim=True)
+
+        block_mi = []
+        block_li = []
+        block_oi = []
+        for tile_start in range(0, kv_b.shape[0], SPARSE_ATTN_TILE):
+            kv_tile = kv_b[tile_start:tile_start + SPARSE_ATTN_TILE]
+            scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
+            mi = scores.max(dim=-1, keepdim=True).values
+            exp_scores = torch.exp(scores - mi).to(torch.bfloat16).float()
+            li = exp_scores.sum(dim=-1, keepdim=True)
+            oi = exp_scores @ kv_tile.to(torch.bfloat16).float()
+            block_mi.append(mi)
+            block_li.append(li)
+            block_oi.append(oi)
+
+        score_max = block_mi[0]
+        li = block_li[0]
+        oi_num = block_oi[0]
+        for mi_cur, li_cur, oi_cur in zip(block_mi[1:], block_li[1:], block_oi[1:]):
+            score_max_new = torch.maximum(score_max, mi_cur)
+            alpha = torch.exp(score_max - score_max_new)
+            beta = torch.exp(mi_cur - score_max_new)
+            li = alpha * li + beta * li_cur
+            oi_num = alpha * oi_num + beta * oi_cur
+            score_max = score_max_new
+
         denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
         o[t] = oi_num / denom
 

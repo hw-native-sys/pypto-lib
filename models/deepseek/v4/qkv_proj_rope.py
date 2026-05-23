@@ -285,7 +285,7 @@ def qkv_proj_rope(
                 d0 = h0 + db * HEAD_CHUNK
                 q_head_chunk = q_proj_fp32[:, d0 : d0 + HEAD_CHUNK]
                 q_head_sq_sum = pl.add(q_head_sq_sum, pl.reshape(pl.row_sum(pl.mul(q_head_chunk, q_head_chunk)), [1, T]))
-            q_head_inv_rms = pl.rsqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS))
+            q_head_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS)))
             q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [T, 1])
             q_head_inv_rms_all[h : h + 1, :] = q_head_inv_rms
 
