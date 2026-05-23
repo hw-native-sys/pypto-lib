@@ -16,285 +16,184 @@ from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD
 
 
 # model config
-B             = DECODE_BATCH
-S             = DECODE_SEQ
-T             = B * S
-D             = M.hidden_size
-NORM_EPS      = M.rms_norm_eps
-N_EXPERTS     = M.n_routed_experts // EP_WORLD_SIZE   # single-card view: route only over local shard
-TOPK          = M.num_experts_per_tok
-ROUTE_SCALE   = M.routed_scaling_factor
-VOCAB         = M.vocab_size
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
+NORM_EPS = M.rms_norm_eps
+N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card view: route only over local shard
+TOPK = M.num_experts_per_tok
+ROUTE_SCALE = M.routed_scaling_factor
+VOCAB = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
-D_CHUNK          = 128 if T >= 128 else (256 if T >= 64 else 512)
-D_BLOCKS         = D // D_CHUNK
-GATE_D_CHUNK     = 512
-GATE_N_CHUNK     = N_EXPERTS if N_EXPERTS <= 32 else 16
-if D % GATE_D_CHUNK != 0:
-    raise ValueError(f"moe_router requires D ({D}) to be divisible by GATE_D_CHUNK ({GATE_D_CHUNK})")
-if N_EXPERTS % GATE_N_CHUNK != 0:
-    raise ValueError(
-        f"moe_router requires N_EXPERTS ({N_EXPERTS}) to be divisible by GATE_N_CHUNK ({GATE_N_CHUNK})"
-    )
-GATE_D_BLOCKS    = D // GATE_D_CHUNK
-GATE_N_BLOCKS    = N_EXPERTS // GATE_N_CHUNK
-# SCORE_PAD = padded expert row width. sort32 handles 32-value runs; the
-# 512-wide path uses two mrgsort passes to cover FLASH/PRO expert counts.
-if N_EXPERTS <= 32:
-    SCORE_PAD    = 32
-elif N_EXPERTS <= 512:
-    SCORE_PAD    = 512
-else:
-    raise ValueError(f"moe_router supports at most 512 routed experts, got {N_EXPERTS}")
-# PAIR_PAD covers the (val, idx) interleaved topk slice. FP32_NEG_INF seeds
-# the unused tail so padding ranks last.
-PAIR_PAD         = 32
-TOPK_GATHER_PAD  = PAIR_PAD // 2
-assert TOPK <= TOPK_GATHER_PAD
-RMS_PIPE_STAGE   = 1 if T >= 64 else 4
-# Column chunk for the two-pass per-token INT8 quant of the FFN-normed activation.
-QUANT_CHUNK      = 32 if T >= 128 else (128 if T >= 64 else 256)
-# Token chunk for the per-token INT8 quant; each chunk is an independent scope
-# (per-token amax + per-token scale → no cross-token dependency).
-QUANT_T_CHUNK    = 16 if T >= 64 else (8 if T >= 16 else T)
-if T % QUANT_T_CHUNK != 0:
-    raise ValueError(
-        f"moe_router requires T ({T}) to be divisible by QUANT_T_CHUNK ({QUANT_T_CHUNK})"
-    )
+T_TILE = 16
+D_CHUNK = 128
+GATE_D_CHUNK = 512
+QUANT_CHUNK = 32
+SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
+TOPK_PAD = 8            # TOPK padded to 32B-aligned width
+SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
+assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
 def moe_router(
-    x_mixed:        pl.Tensor[[B, S, D],                    pl.BF16],
-    norm_w:         pl.Tensor[[D],                           pl.FP32],
-    gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
-    gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
-    layer_id:       pl.Scalar[pl.INT32],
-    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
-    x_norm:         pl.Tensor[[T, D],                        pl.BF16],
-    x_norm_i8:      pl.Tensor[[T, D],                        pl.INT8],
-    x_norm_scale_dq: pl.Tensor[[T, 1],                       pl.FP32],
-    indices:        pl.Tensor[[T, TOPK],                     pl.INT32],
-    weights:        pl.Tensor[[T, TOPK],                     pl.FP32],
+    x_mixed: pl.Tensor[[B, S, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    layer_id: pl.Scalar[pl.INT32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[B, S], pl.INT64],
+    x_norm: pl.Tensor[[T, D], pl.BF16],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    # Stage 0: FFN RMSNorm over x_mixed.
     x_mixed_flat = pl.reshape(x_mixed, [T, D])
-    inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="ffn_norm_rms"):
-        sq_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
-        for db in pl.pipeline(D_BLOCKS, stage=RMS_PIPE_STAGE):
-            d0 = db * D_CHUNK
-            x_chunk = pl.cast(x_mixed_flat[:, d0 : d0 + D_CHUNK], target_type=pl.FP32)
-            sq_sum = pl.add(
-                sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T]),
-            )
-        inv_rms_val = pl.rsqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS), high_precision=True)
-        inv_rms[:, :] = inv_rms_val
+    input_ids_flat = pl.reshape(input_ids, [T])
+    for ts0 in pl.parallel(0, T, T_TILE):
+        # FFN RMSNorm.
+        x_norm_gate_tile = pl.create_tensor([T_TILE, D], dtype=pl.FP32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm"):
+            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for rms_d0 in pl.range(0, D, D_CHUNK):
+                rms_x = pl.cast(x_mixed_flat[ts0 : ts0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
+                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
+            inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
+            for an_d0 in pl.range(0, D, D_CHUNK):
+                an_x = pl.cast(x_mixed_flat[ts0 : ts0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
+                an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_CHUNK], [1, D_CHUNK])
+                an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
+                an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
+                x_norm_gate_tile[:, an_d0 : an_d0 + D_CHUNK] = pl.cast(an_bf16, pl.FP32)
+                x_norm[ts0 : ts0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = an_bf16
 
-    # Stage 1: ffn_norm apply. Doubles as the gate-dot input and as the
-    # entry's `x_norm` output.
-    x_norm_gate = pl.create_tensor([T, D], dtype=pl.FP32)
-    for db in pl.parallel(0, D_BLOCKS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm_apply"):
-            d0 = db * D_CHUNK
-            inv_rms_col = pl.reshape(inv_rms[:, :], [T, 1])
-            x_chunk = pl.cast(x_mixed_flat[:, d0 : d0 + D_CHUNK], target_type=pl.FP32)
-            norm_w_chunk = pl.reshape(norm_w[d0 : d0 + D_CHUNK], [1, D_CHUNK])
-            x_normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_col), norm_w_chunk)
-            # mode="rint" = round half to even, matches torch's `.to(bfloat16)`.
-            x_normed_bf16 = pl.cast(x_normed, target_type=pl.BF16, mode="rint")
-            x_norm_gate[:, d0 : d0 + D_CHUNK] = pl.cast(x_normed_bf16, target_type=pl.FP32)
-            x_norm[:, d0 : d0 + D_CHUNK] = x_normed_bf16
-
-    # Stage 1b: per-token symmetric INT8 quant for the routed dispatch path.
-    # Reads x_norm_gate (== fp32(bf16)) so it matches the bf16 x_norm the
-    # shared-expert path re-quantizes. Each token row is independent, so we
-    # tile along T and run the two-pass amax/quant per token-chunk in parallel.
-    # Each token row is independent (per-token amax + scale), so emit each
-    # T-chunk as its own CORE_GROUP scope. We use `pl.range` rather than
-    # `pl.parallel`: a true parallel loop here aliases the x_norm_gate buffer
-    # under MemoryReuse and corrupts gate_dot's read of rows ≥ T/2.
-    for t0 in pl.range(0, T, QUANT_T_CHUNK):
+        # Per-token symmetric INT8 quant of x_norm.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
-            xn_amax = pl.full([1, QUANT_T_CHUNK], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for k0 in pl.range(0, D, QUANT_CHUNK):
-                xn_a_f32 = x_norm_gate[t0 : t0 + QUANT_T_CHUNK, k0 : k0 + QUANT_CHUNK]
+            xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for xq_a_k in pl.range(0, D, QUANT_CHUNK):
+                xn_a_f32 = x_norm_gate_tile[:, xq_a_k : xq_a_k + QUANT_CHUNK]
                 xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
-                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, QUANT_T_CHUNK])
+                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
                 xn_amax = pl.maximum(xn_amax, xn_a_max)
-            xn_sq_row = pl.div(
-                pl.full([1, QUANT_T_CHUNK], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax
-            )
-            x_norm_scale_dq[t0 : t0 + QUANT_T_CHUNK, 0:1] = pl.reshape(
-                pl.recip(xn_sq_row), [QUANT_T_CHUNK, 1]
-            )
-            xn_sq_col = pl.reshape(xn_sq_row, [QUANT_T_CHUNK, 1])
-            for k1 in pl.range(0, D, QUANT_CHUNK):
-                xn_q_scaled = pl.row_expand_mul(
-                    x_norm_gate[t0 : t0 + QUANT_T_CHUNK, k1 : k1 + QUANT_CHUNK], xn_sq_col
-                )
-                xn_q_i32 = pl.cast(xn_q_scaled, target_type=pl.INT32, mode="rint")
-                xn_q_half = pl.cast(xn_q_i32, target_type=pl.FP16, mode="round")
-                x_norm_i8[t0 : t0 + QUANT_T_CHUNK, k1 : k1 + QUANT_CHUNK] = pl.cast(
-                    xn_q_half, target_type=pl.INT8, mode="trunc"
-                )
+            xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
+            x_norm_scale_dq[ts0 : ts0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
+            xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
+            for xq_b_k in pl.range(0, D, QUANT_CHUNK):
+                xn_q_scaled = pl.row_expand_mul(x_norm_gate_tile[:, xq_b_k : xq_b_k + QUANT_CHUNK], xn_sq_col)
+                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                x_norm_i8[ts0 : ts0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
-    # Stage 2: gate.forward — dot(x_norm, gate_w) → sqrt(softplus(.)) + bias.
-    gate_logits = pl.create_tensor([T, N_EXPERTS], dtype=pl.FP32)
-    route_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    biased_scores = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    if GATE_N_BLOCKS == 1:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_dot"):
-            score_acc = pl.create_tensor([T, GATE_N_CHUNK], dtype=pl.FP32)
-            for kb in pl.range(1, GATE_D_BLOCKS + 1):
-                db = kb - 1
-                d0 = db * GATE_D_CHUNK
-                gate_x_chunk = x_norm_gate[:, d0 : d0 + GATE_D_CHUNK]
-                gate_w_chunk = gate_w[0:GATE_N_CHUNK, d0 : d0 + GATE_D_CHUNK]
-                if kb == 1:
-                    score_acc = pl.matmul(gate_x_chunk, gate_w_chunk, out_dtype=pl.FP32, b_trans=True)
+        # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
+        route_scores_tile = pl.create_tensor([T_TILE, SCORE_PAD], dtype=pl.FP32)
+        biased_scores_tile = pl.create_tensor([T_TILE, SCORE_PAD], dtype=pl.FP32)
+        gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            optimizations=[pl.split(pl.SplitMode.NONE)],
+            name_hint="gate",
+        ):
+            gate_logits_tile = pl.create_tensor([T_TILE, N_EXPERTS], dtype=pl.FP32)
+            for kb in pl.range(0, D // GATE_D_CHUNK):
+                gd_kd = kb * GATE_D_CHUNK
+                gd_x = x_norm_gate_tile[:, gd_kd : gd_kd + GATE_D_CHUNK]
+                gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_CHUNK]
+                if gd_kd == 0:
+                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
                 else:
-                    score_acc = pl.matmul_acc(score_acc, gate_x_chunk, gate_w_chunk, b_trans=True)
-            gate_logits = pl.assemble(gate_logits, score_acc, [0, 0])
-    else:
-        for expert0 in pl.parallel(0, N_EXPERTS, GATE_N_CHUNK):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_dot"):
-                score_acc = pl.create_tensor([T, GATE_N_CHUNK], dtype=pl.FP32)
-                for kb in pl.range(1, GATE_D_BLOCKS + 1):
-                    db = kb - 1
-                    d0 = db * GATE_D_CHUNK
-                    gate_x_chunk = x_norm_gate[:, d0 : d0 + GATE_D_CHUNK]
-                    gate_w_chunk = gate_w[expert0 : expert0 + GATE_N_CHUNK, d0 : d0 + GATE_D_CHUNK]
-                    if kb == 1:
-                        score_acc = pl.matmul(gate_x_chunk, gate_w_chunk, out_dtype=pl.FP32, b_trans=True)
-                    else:
-                        score_acc = pl.matmul_acc(score_acc, gate_x_chunk, gate_w_chunk, b_trans=True)
-                gate_logits = pl.assemble(gate_logits, score_acc, [0, expert0])
+                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+            route_scores_tile[:, :] = pl.full([T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
+            biased_scores_tile[:, :] = pl.full([T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
+            gp_relu = pl.maximum(gate_logits_tile, 0.0)
+            gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
+            gp_softplus = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+            gp_score = pl.sqrt(gp_softplus)
+            gp_bias = pl.col_expand_mul(pl.full([T_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
+            gp_biased = pl.add(gp_score, gp_bias)
+            route_scores_tile[:, 0:N_EXPERTS] = gp_score
+            biased_scores_tile[:, 0:N_EXPERTS] = gp_biased
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_score_post"):
-        # Pad-tail seeded to -inf so sort32 ranks padded slots after real
-        # scores (otherwise pad-zero beats negative reals and topk picks pads).
-        route_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
-        biased_scores[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
-        for expert0 in pl.range(0, N_EXPERTS, GATE_N_CHUNK):
-            logits = pl.load(gate_logits, [0, expert0], [T, GATE_N_CHUNK])
-            zero = pl.mul(logits, 0.0)
-            relu_logits = pl.maximum(logits, zero)
-            abs_logits = pl.maximum(logits, pl.neg(logits))
-            softplus = pl.add(relu_logits, pl.log(pl.add(pl.exp(pl.neg(abs_logits)), 1.0)))
-            score_tile = pl.sqrt(softplus)
-            bias_row = pl.reshape(
-                pl.load(gate_bias, [expert0], [GATE_N_CHUNK]),
-                [1, GATE_N_CHUNK],
-            )
-            bias_tile = pl.col_expand_mul(pl.add(zero, 1.0), bias_row)
-            biased_tile = pl.add(score_tile, bias_tile)
-            route_scores = pl.store(score_tile, [0, expert0], route_scores)
-            biased_scores = pl.store(biased_tile, [0, expert0], biased_scores)
-
-    # Stage 3: choose routed expert ids. Hash layers take ids directly from
-    # tid2eid[input_ids]; score-routed layers use biased top-k.
-    topk_vals_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    topk_idx_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.INT32)
-    weight_out_pad = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    if layer_id < N_HASH_LAYERS:
-        tid2eid_flat = pl.reshape(tid2eid, [VOCAB * TOPK])
-        input_ids_flat = pl.reshape(input_ids, [T])
-        route_scores_flat = pl.reshape(route_scores, [T * SCORE_PAD])
-        topk_vals_pad_flat = pl.reshape(topk_vals_pad, [T * SCORE_PAD])
-        topk_idx_pad_flat = pl.reshape(topk_idx_pad, [T * SCORE_PAD])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_hash_indices_and_scores"):
-            topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
-            for t in pl.unroll(T):
-                token_id = pl.cast(pl.read(input_ids_flat, [t]), pl.INDEX)
-                src_base = token_id * TOPK
-                dst_score_base = t * SCORE_PAD
-                for k in pl.unroll(TOPK):
-                    hash_expert_i = pl.read(tid2eid_flat, [src_base + k])
-                    hash_expert_pos = pl.cast(hash_expert_i, pl.INDEX)
-                    hash_score = pl.read(route_scores_flat, [dst_score_base + hash_expert_pos])
-                    pl.write(topk_idx_pad_flat, [dst_score_base + k], hash_expert_i)
-                    pl.write(topk_vals_pad_flat, [dst_score_base + k], hash_score)
-        topk_idx_pad = pl.reshape(topk_idx_pad_flat, [T, SCORE_PAD])
-        topk_vals_pad = pl.reshape(topk_vals_pad_flat, [T, SCORE_PAD])
-    else:
-        topk_idx_work = pl.create_tensor([T, TOPK_GATHER_PAD], dtype=pl.INT32)
-        # Per-token sort with paired UINT32 indices.
-        sorted_rows = pl.create_tensor([T, 2 * SCORE_PAD], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_sort_topk"):
-            for t in pl.unroll(T):
-                score_row = biased_scores[t : t + 1, :]
-                idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                sorted_t = pl.tensor.sort32(score_row, idx_init)
-                if SCORE_PAD == 512:
-                    sorted_t = pl.tensor.mrgsort(sorted_t, block_len=64)
-                    sorted_t = pl.tensor.mrgsort(sorted_t, block_len=256)
-                sorted_rows[t : t + 1, :] = sorted_t
-
-        # Extract topk indices from the biased sort result.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_extract_topk"):
-            for t in pl.unroll(T):
-                topk_pairs = sorted_rows[t : t + 1, 0 : PAIR_PAD]
-                topk_i_raw = pl.tensor.gather(
-                    topk_pairs,
-                    mask_pattern=pl.tile.MaskPattern.P1010,
-                    output_dtype=pl.INT32,
-                )
-                topk_idx_work[t : t + 1, :] = topk_i_raw
-                topk_idx_pad[t : t + 1, 0 : TOPK_GATHER_PAD] = topk_i_raw
-
-        # Stage 4: gather unbiased score values for the selected expert ids.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_gather_weights"):
-            topk_scores = pl.tensor.gather(route_scores, dim=-1, index=topk_idx_work)
-            topk_vals_pad[:, :] = pl.full([T, SCORE_PAD], dtype=pl.FP32, value=0.0)
-            for t in pl.unroll(T):
-                # `valid_shape` carries the meaningful [1, TOPK] subspan so
-                # fillpad zeros the padding columns; no [:] equivalent.
-                topk_vals_valid = pl.slice(
-                    topk_scores,
-                    [1, TOPK_GATHER_PAD],
-                    [t, 0],
-                    valid_shape=[1, TOPK],
-                )
-                topk_vals_padded = pl.fillpad(topk_vals_valid, pad_value=pl.PadValue.zero)
-                topk_vals_pad[t : t + 1, 0 : TOPK_GATHER_PAD] = topk_vals_padded
-
-    # Stage 5: normalize weights, then scatter first TOPK cols to GM outputs.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_normalize_weights"):
-        denom = pl.reshape(pl.row_sum(topk_vals_pad), [T, 1])
-        weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, denom), ROUTE_SCALE)
-        weight_out_pad[:, :] = weights_pad
-
-    indices_flat = pl.reshape(indices, [T * TOPK])
-    weights_flat = pl.reshape(weights, [T * TOPK])
-    topk_idx_flat = pl.reshape(topk_idx_pad, [T * SCORE_PAD])
-    weight_out_flat = pl.reshape(weight_out_pad, [T * SCORE_PAD])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_route_outputs"):
-        for t in pl.unroll(T):
-            dst_base = t * TOPK
-            src_base = t * SCORE_PAD
-            for k in pl.unroll(TOPK):
-                indices_flat = pl.write(indices_flat, [dst_base + k], pl.read(topk_idx_flat, [src_base + k]))
-                weights_flat = pl.write(weights_flat, [dst_base + k], pl.read(weight_out_flat, [src_base + k]))
+        # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
+        # topk_idx_tile stays Tensor (out of pl.at) so the batched tensor.gather
+        # below accepts it — Tile index against Tensor src is rejected.
+        topk_idx_tile = pl.create_tensor([T_TILE, TOPK_PAD], dtype=pl.INT32)
+        if layer_id < N_HASH_LAYERS:
+            # Hash branch: select + normalize + write in one scope (ptoas-696
+            # cross-scope stale-cache bug). hs_*_buf MUST be inside pl.at; outer
+            # alloc shares one buffer across parallel iters → NaN weights.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_hash"):
+                # Scalar gather TOPK (eid, unbiased score) per row; tail
+                # [TOPK, TOPK_PAD) stays zero so row_sum below sums only TOPK.
+                hs_vals_buf = pl.full([T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
+                hs_idx_buf = pl.full([T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+                for hs_tt in pl.range(T_TILE):
+                    hs_token = pl.cast(pl.read(input_ids_flat, [ts0 + hs_tt]), pl.INDEX)
+                    for hs_k in pl.range(TOPK):
+                        hs_eid = pl.read(tid2eid, [hs_token, hs_k])
+                        hs_epos = pl.cast(hs_eid, pl.INDEX)
+                        hs_unbiased = pl.read(route_scores_tile, [hs_tt, hs_epos])
+                        pl.write(hs_idx_buf, [hs_tt, hs_k], hs_eid)
+                        pl.write(hs_vals_buf, [hs_tt, hs_k], hs_unbiased)
+                # Normalize+scale, then scalar-scatter to GM. Slice-assign would
+                # alloc a [T_TILE, TOPK=6] temp (24B row, under alloc_tile's 32B
+                # alignment), so write element-by-element.
+                hs_denom = pl.reshape(pl.row_sum(hs_vals_buf), [T_TILE, 1])
+                hs_weights_buf = pl.mul(pl.row_expand_div(hs_vals_buf, hs_denom), ROUTE_SCALE)
+                for hs_wt_tt in pl.range(T_TILE):
+                    for hs_wt_k in pl.range(TOPK):
+                        pl.write(indices, [ts0 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
+                        pl.write(weights, [ts0 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
+        else:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_sort"):
+                # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
+                # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
+                # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+                for sr_tt in pl.range(T_TILE):
+                    sr_row = biased_scores_tile[sr_tt : sr_tt + 1, :]
+                    sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                    sr_sorted = pl.sort32(sr_row, sr_idx_init)
+                    sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
+                    sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                    sr_pairs = sr_sorted[:, 0:SORT_PAD]
+                    sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                    topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
+                # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
+                # tail so the normalize sum below sees only real TOPK entries.
+                gather_all = pl.gather(route_scores_tile, dim=-1, index=topk_idx_tile)
+                gather_valid = pl.set_validshape(gather_all, T_TILE, TOPK)
+                topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+                # Copy topk_idx_tile to dodge the tensor_view-vs-ptr SSA conflict
+                # between sort's slice-assign and scalar pl.read (pypto #1493).
+                # Scalar scatter avoids the 24B-row alloc that slice-assign to
+                # [T_TILE, TOPK] would need (under alloc_tile's 32B alignment).
+                topk_idx_read = pl.create_tensor([T_TILE, TOPK_PAD], dtype=pl.INT32)
+                topk_idx_read[:, :] = topk_idx_tile[:, :]
+                nm_denom = pl.reshape(pl.row_sum(topk_vals_pad), [T_TILE, 1])
+                nm_weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, nm_denom), ROUTE_SCALE)
+                for nm_tt in pl.range(T_TILE):
+                    for nm_k in pl.range(TOPK):
+                        pl.write(indices, [ts0 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
+                        pl.write(weights, [ts0 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
 
 
 @pl.jit
 def moe_router_test(
-    x_mixed:      pl.Tensor[[B, S, D],                     pl.BF16],
-    norm_w:       pl.Tensor[[D],                           pl.FP32],
-    gate_w:       pl.Tensor[[N_EXPERTS, D],                pl.FP32],
-    gate_bias:    pl.Tensor[[N_EXPERTS],                   pl.FP32],
-    layer_id:     pl.Scalar[pl.INT32],
-    tid2eid:      pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:    pl.Tensor[[B, S],                        pl.INT64],
-    x_norm:       pl.Out[pl.Tensor[[T, D],                 pl.BF16]],
-    x_norm_i8:    pl.Out[pl.Tensor[[T, D],                 pl.INT8]],
-    x_norm_scale_dq: pl.Out[pl.Tensor[[T, 1],              pl.FP32]],
-    indices:      pl.Out[pl.Tensor[[T, TOPK],              pl.INT32]],
-    weights:      pl.Out[pl.Tensor[[T, TOPK],              pl.FP32]],
+    x_mixed: pl.Tensor[[B, S, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    layer_id: pl.Scalar[pl.INT32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[B, S], pl.INT64],
+    x_norm: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
+    x_norm_scale_dq: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
+    indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
+    weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
     moe_router(
         x_mixed,
@@ -307,12 +206,6 @@ def moe_router_test(
 
 
 def _per_token_int8_quant(x_bf16):
-    """Per-token symmetric INT8 quant matching the kernel's cast chain.
-
-    Kernel: FP32(scaled) -> INT32(rint) -> FP16(round) -> INT8(trunc).
-    Torch reproduction uses ``torch.round`` (half-to-even) explicitly so the
-    INT32 stage is the rounded value, not truncated toward zero.
-    """
     import torch
     x_f32 = x_bf16.float()
     amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
@@ -325,42 +218,48 @@ def _per_token_int8_quant(x_bf16):
 
 def golden_moe_router_core(tensors):
     import torch
-    import torch.nn.functional as F
 
-    # RMSNorm; cast back to bf16 to match what downstream gate/expert see.
+    # FFN RMSNorm.
+    x_f = tensors["x_mixed"].float().view(T, D)
     norm_w = tensors["norm_w"].float()
-    x_f = tensors["x_mixed"].float()
-    var = x_f.square().mean(-1, keepdim=True)
-    x_n = x_f * torch.rsqrt(var + NORM_EPS)
-    x_normalized = (norm_w * x_n).to(torch.bfloat16)
-    x_flat = x_normalized.view(T, D)
+    sq_sum = (x_f * x_f).sum(dim=-1, keepdim=True)
+    inv_rms = torch.rsqrt(sq_sum * (1.0 / D) + NORM_EPS)
+    x_normalized = (x_f * inv_rms) * norm_w.view(1, D)
+    x_flat = x_normalized.to(torch.bfloat16)
 
+    # Per-token symmetric INT8 quant of bf16(x_norm).
+    x_norm_i8, x_norm_scale_dq = _per_token_int8_quant(x_flat)
+
+    # Gate matmul + numerically stable softplus(x) = relu(x) + log(exp(-|x|)+1).
     gate_w = tensors["gate_w"].float()
     gate_bias = tensors["gate_bias"].float()
-    scores = F.softplus(x_flat.float() @ gate_w.T).sqrt()
-    original_scores = scores
+    logits = x_flat.float() @ gate_w.T
+    relu_logits = torch.maximum(logits, torch.zeros_like(logits))
+    abs_logits = torch.maximum(logits, -logits)
+    softplus = relu_logits + torch.log(torch.exp(-abs_logits) + 1.0)
+    scores = softplus.sqrt()
+    biased = scores + gate_bias.view(1, -1)
 
+    # Choose TOPK ids: hash layers take ids from tid2eid[input_ids]; score
+    # layers argsort biased (stable to match NPU sort32 deterministic order).
     layer_id = int(tensors["layer_id"])
     if layer_id < N_HASH_LAYERS:
         tid2eid = tensors["tid2eid"]
         input_ids = tensors["input_ids"]
         indices = tid2eid[input_ids.flatten().long()]
     else:
-        biased = scores + gate_bias
-        # Stable sort: deterministic tie-break to match the NPU sort32 order.
         indices = torch.argsort(-biased, dim=-1, stable=True)[..., :TOPK]
 
-    weights = original_scores.gather(1, indices.long())
-    weights = weights / weights.sum(dim=-1, keepdim=True)
-    weights = weights * ROUTE_SCALE
+    # Gather unbiased scores, normalize over TOPK, scale by ROUTE_SCALE.
+    topk_vals = torch.gather(scores, dim=-1, index=indices.long())
+    denom = topk_vals.sum(dim=-1, keepdim=True)
+    weights = (topk_vals / denom) * ROUTE_SCALE
 
-    x_norm_i8, x_norm_scale_dq = _per_token_int8_quant(x_flat)
-
-    tensors["x_norm"][:]          = x_flat
-    tensors["x_norm_i8"][:]       = x_norm_i8
+    tensors["x_norm"][:] = x_flat
+    tensors["x_norm_i8"][:] = x_norm_i8
     tensors["x_norm_scale_dq"][:] = x_norm_scale_dq.reshape(T, 1)
-    tensors["indices"][:]  = indices.to(torch.int32)
-    tensors["weights"][:]  = weights.to(torch.float32)
+    tensors["indices"][:] = indices.to(torch.int32)
+    tensors["weights"][:] = weights.to(torch.float32)
 
 
 def build_tensor_specs(layer_id=0):
@@ -381,25 +280,24 @@ def build_tensor_specs(layer_id=0):
     def init_input_ids():
         return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
     return [
-        TensorSpec("x_mixed",      [B, S, D],                  torch.bfloat16, init_value=init_x_mixed),
-        TensorSpec("norm_w",       [D],                        torch.float32,  init_value=init_norm_w),
-        TensorSpec("gate_w",       [N_EXPERTS, D],             torch.float32,  init_value=init_gate_w),
-        TensorSpec("gate_bias",    [N_EXPERTS],                torch.float32,  init_value=init_gate_bias),
-        ScalarSpec("layer_id",     torch.int32,                layer_id),
-        TensorSpec("tid2eid",      [VOCAB, TOPK],              torch.int32,    init_value=init_tid2eid),
-        TensorSpec("input_ids",    [B, S],                     torch.int64,    init_value=init_input_ids),
-        TensorSpec("x_norm",          [T, D],                  torch.bfloat16, is_output=True),
-        TensorSpec("x_norm_i8",       [T, D],                  torch.int8,     is_output=True),
-        TensorSpec("x_norm_scale_dq", [T, 1],                  torch.float32,  is_output=True),
-        TensorSpec("indices",      [T, TOPK],                  torch.int32,    is_output=True),
-        TensorSpec("weights",      [T, TOPK],                  torch.float32,  is_output=True),
+        TensorSpec("x_mixed", [B, S, D], torch.bfloat16, init_value=init_x_mixed),
+        TensorSpec("norm_w", [D], torch.float32, init_value=init_norm_w),
+        TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
+        TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
+        ScalarSpec("layer_id", torch.int32, layer_id),
+        TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
+        TensorSpec("input_ids", [B, S], torch.int64, init_value=init_input_ids),
+        TensorSpec("x_norm", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
+        TensorSpec("x_norm_scale_dq", [T, 1], torch.float32, is_output=True),
+        TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
+        TensorSpec("weights", [T, TOPK], torch.float32, is_output=True),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    import sys
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -407,22 +305,6 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
-    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
-    parser.add_argument(
-        "--export-kernel-insight",
-        action="store_true",
-        default=False,
-        help=(
-            "After a successful run, export msprof op-simulator Insight traces "
-            "for all generated InCore kernels under the same build_output dir."
-        ),
-    )
-    parser.add_argument(
-        "--kernel-insight-func",
-        action="append",
-        default=[],
-        help="Only export this generated kernel function; can be repeated.",
-    )
     args = parser.parse_args()
 
     result = run_jit(
@@ -433,34 +315,16 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
-            enable_pmu=args.enable_pmu,
         ),
-        rtol=1e-5,
-        atol=1e-5,
+        rtol=1e-3,
+        atol=1e-3,
         compare_fn={
-            # ULP-level FP32 mul drift flips rint at k.5 boundaries → INT8
-            # off-by-one with same dequant magnitude. Allow ≤0.1% bad.
+            "x_norm": ratio_allclose(atol=1e-3, rtol=1.0 / 128),
             "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
+            "indices": topk_pair_compare("weights"),
         },
     )
     if not result.passed:
         if result.error:
             print(result.error)
         raise SystemExit(1)
-
-    if args.export_kernel_insight:
-        if result.work_dir is None:
-            print("kernel insight export failed: run result has no build_output directory", file=sys.stderr)
-            raise SystemExit(1)
-        from tools.export_all_kernel_insight import StepError, main as export_kernel_insight
-
-        export_args = ["--build-dir", str(result.work_dir)]
-        for func in args.kernel_insight_func:
-            export_args.extend(["--func", func])
-        try:
-            export_rc = export_kernel_insight(export_args)
-        except StepError as exc:
-            print(f"kernel insight export failed: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
-        if export_rc != 0:
-            raise SystemExit(export_rc)

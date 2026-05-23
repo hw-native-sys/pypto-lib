@@ -8,10 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE packed combine -- decode, single-card EP.
 
-Combines local expert rows from ``moe_expert`` back to token-major FFN output;
-the routed contribution is FP32-weighted by ``recv_weights``.
-
-    recv_y / recv_token / recv_weights / recv_expert_count + sh -> ffn_out
+Two-phase structure mirrors runtime/examples/workers/l3/ep_dispatch_combine
+combine.cpp so multi-rank port only needs to replace Phase-1 local writes
+with cross-rank TPUT:
+  * Phase 1 (sequential pl.at): scatter recv_y rows into [T*TOPK, D] scratch.
+  * Phase 2 (pl.parallel(T)): sum TOPK weighted rows on top of sh, cast to BF16.
 """
 
 
@@ -20,15 +21,13 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
 
 
-# model config
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
-# EP layout / recv buffers (single-card view: kernel only sees the local shard)
+TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
-# tiling
 COL_CHUNK = 512
 
 
@@ -39,60 +38,61 @@ def moe_combine(
     recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
     sh:                pl.Tensor[[T, D],                         pl.BF16],
-    # ``ffn_out`` is [B, S, D] so the immediate consumer (``hc_post``'s ``x``
-    # input) can use the buffer as-is. The body reshapes to a [T, D] view
-    # before any kernel scope so the inner loop indexes flat.
     ffn_out:           pl.Tensor[[B, S, D],                      pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
     recv_token_flat = pl.reshape(recv_token, [N_LOCAL_EXPERTS * RECV_MAX])
     recv_weights_flat = pl.reshape(recv_weights, [N_LOCAL_EXPERTS * RECV_MAX])
-    count_flat = pl.reshape(recv_expert_count, [N_LOCAL_EXPERTS])
-    routed_y_buf = pl.create_tensor([T * N_LOCAL_EXPERTS, D], dtype=pl.BF16)
-    # Zero entries contribute nothing so accumulation can run dense.
-    routed_w_buf = pl.create_tensor([T * N_LOCAL_EXPERTS], dtype=pl.FP32)
-    # Tensor flag used as the packed_combine_init -> packed_combine ordering
-    # edge. packed_combine folds the read into n_rows through a zero value so
-    # the scratch clear remains visible without inline TaskId deps.
-    combine_init_done = pl.create_tensor([1], dtype=pl.INT32)
     ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine_init"):
-        for r0 in pl.range(0, T * N_LOCAL_EXPERTS, N_LOCAL_EXPERTS):
-            for d0 in pl.range(0, D, COL_CHUNK):
-                routed_y_buf[r0 : r0 + N_LOCAL_EXPERTS, d0 : d0 + COL_CHUNK] = pl.full(
-                    [N_LOCAL_EXPERTS, COL_CHUNK], dtype=pl.BF16, value=0.0
-                )
-        for r in pl.range(T * N_LOCAL_EXPERTS):
-            pl.write(routed_w_buf, [r], 0.0)
-        pl.write(combine_init_done, [0], pl.cast(1, pl.INT32))
+    # Matches combine.cpp routed_y_buf [T, TOPK, D]. Multi-rank derives the
+    # k-within-t slot via dispatch's recv_idx_out; single-card reconstructs
+    # it by counting on the fly with slot_count.
+    routed_y_buf = pl.create_tensor([T * TOPK, D], dtype=pl.BF16)
+    routed_w_buf = pl.create_tensor([T * TOPK], dtype=pl.FP32)
+    slot_count = pl.create_tensor([T], dtype=pl.INT32)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="packed_combine"):
-        init_done = pl.read(combine_init_done, [0])
-        # Preserve the init_done read as a data-flow dependency while keeping
-        # n_rows numerically unchanged.
-        init_zero_i32 = pl.cast(init_done - init_done, pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_scatter"):
+        # routed_w_buf / slot_count use pl.write loops for init because their
+        # scatter loop also uses pl.write — mixing pl.full slice-assign with
+        # pl.read/pl.write on one tensor breaks SSA typing in ptoas.
+        for r0 in pl.range(0, T * TOPK, TOPK):
+            routed_y_buf[r0:r0+TOPK, :] = pl.full([TOPK, D], dtype=pl.BF16, value=0.0)
+        for r in pl.range(T * TOPK):
+            pl.write(routed_w_buf, [r], 0.0)
+        for t0 in pl.range(T):
+            pl.write(slot_count, [t0], pl.cast(0, pl.INT32))
+
         for e in pl.range(N_LOCAL_EXPERTS):
-            n_rows = pl.cast(pl.read(count_flat, [e]) + init_zero_i32, pl.INDEX)
+            n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
             for s in pl.range(n_rows):
                 i = e * RECV_MAX + s
                 t = pl.cast(pl.read(recv_token_flat, [i]), pl.INDEX)
-                dst = t * N_LOCAL_EXPERTS + e
+                k_i32 = pl.read(slot_count, [t])
+                pl.write(slot_count, [t], pl.cast(k_i32 + 1, pl.INT32))
+                dst = t * TOPK + pl.cast(k_i32, pl.INDEX)
                 routed_y_buf = pl.assemble(
                     routed_y_buf,
                     pl.slice(recv_y_flat, [1, D], [i, 0]),
                     [dst, 0],
                 )
                 pl.write(routed_w_buf, [dst], pl.read(recv_weights_flat, [i]))
-        for t in pl.range(T):
-            base = t * N_LOCAL_EXPERTS
+
+    for t in pl.parallel(T):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_reduce"):
+            base = t * TOPK
             for d0 in pl.range(0, D, COL_CHUNK):
-                acc = pl.cast(sh[t : t + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
-                for e in pl.range(N_LOCAL_EXPERTS):
-                    row = pl.cast(routed_y_buf[base + e : base + e + 1, d0 : d0 + COL_CHUNK], target_type=pl.FP32)
-                    w = pl.read(routed_w_buf, [base + e])
-                    acc = pl.add(acc, pl.mul(row, w))
-                ffn_out_flat[t : t + 1, d0 : d0 + COL_CHUNK] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+                acc = pl.cast(sh[t:t+1, d0:d0+COL_CHUNK], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    src = base + k
+                    row_fp32 = pl.cast(
+                        routed_y_buf[src:src+1, d0:d0+COL_CHUNK], target_type=pl.FP32
+                    )
+                    w = pl.read(routed_w_buf, [src])
+                    acc = pl.add(acc, pl.mul(row_fp32, w))
+                ffn_out_flat[t:t+1, d0:d0+COL_CHUNK] = pl.cast(
+                    acc, target_type=pl.BF16, mode="rint"
+                )
 
 
 @pl.jit
@@ -135,22 +135,36 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
+    # Simulate dispatch routing: each of T tokens routes to topk distinct
+    # local experts. counts[e] = #tokens routed to e (sum = T*topk before
+    # RECV_MAX clamp); recv_token[e, :counts[e]] is the matching token list
+    # with no per-expert duplicates. Mirrors moe_expert.build_tensor_specs.
+    topk = min(M.num_experts_per_tok, N_LOCAL_EXPERTS)
+    gen = torch.Generator().manual_seed(0)
+    routing = torch.stack(
+        [torch.randperm(N_LOCAL_EXPERTS, generator=gen)[:topk] for _ in range(T)]
+    )
+
+    per_expert_tokens = [[] for _ in range(N_LOCAL_EXPERTS)]
+    for t in range(T):
+        for k in range(topk):
+            per_expert_tokens[int(routing[t, k].item())].append(t)
     counts = torch.tensor(
-        [(e * 3 + 1) % (T + 1) for e in range(N_LOCAL_EXPERTS)],
+        [min(len(toks), RECV_MAX) for toks in per_expert_tokens],
         dtype=torch.int32,
     )
-    counts[0] = 0
-    counts[-1] = min(T, RECV_MAX)
 
     def init_recv_y():
         return torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D)
 
     def init_recv_token():
         recv_token = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
-        base = torch.arange(RECV_MAX, dtype=torch.int32)
         for e in range(N_LOCAL_EXPERTS):
-            count = int(counts[e].item())
-            recv_token[e, :count] = (base[:count] * 5 + e) % T
+            n = int(counts[e].item())
+            if n > 0:
+                recv_token[e, :n] = torch.tensor(
+                    per_expert_tokens[e][:n], dtype=torch.int32
+                )
         return recv_token
 
     def init_recv_weights():
@@ -190,15 +204,19 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=moe_combine_test,
         specs=build_tensor_specs(),
         golden_fn=golden_moe_combine,
+        runtime_dir=args.runtime_dir,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
+            enable_l2_swimlane=args.enable_l2_swimlane,
         ),
         rtol=1e-3,
         atol=1e-3,
