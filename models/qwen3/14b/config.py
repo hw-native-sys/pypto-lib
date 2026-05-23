@@ -22,12 +22,8 @@ LAYER_INTER_ROWS_DYN = pl.dynamic("LAYER_INTER_ROWS_DYN")
 # Model shape.
 BATCH = 16
 MAX_SEQ = 4096
-# NOTE: NUM_KV_HEADS reconfigured 8 -> 10 so q_per_kv = 40/10 = 4 is even.
-# This makes Q_HEAD_BATCH=4 (even), so the fused fa_fused attention operator
-# can run the Q_HEAD_BATCH-row trim inside the UP_DOWN-split mixed root (which
-# requires even split dims), enabling a single fully-fused FA op under pl.spmd.
 NUM_HEADS = 40
-NUM_KV_HEADS = 10
+NUM_KV_HEADS = 8
 HEAD_DIM = 128
 HIDDEN = NUM_HEADS * HEAD_DIM
 INTERMEDIATE = 17408
@@ -50,8 +46,10 @@ KV_OUT_CHUNK = 256
 BATCH_TILE = 16
 
 # Scope 2 tiling constants.
-# Q_HEAD_BATCH = q_per_kv = 4 (even) after the NUM_KV_HEADS=10 reconfig above.
-Q_HEAD_BATCH = 4
+# Q_HEAD_BATCH = q_per_kv = 40/8 = 5 for the official Qwen3-14B config.
+# The Q_HEAD_BATCH-row trim runs in the non-UP_DOWN online_softmax region, so
+# the odd 5 is fine; fa_fused itself splits on Q_HEAD_PAD=16 (always even).
+Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16
 # SEQ_TILE = 128 keeps each K/V tile at 32 KB (BLOCK_SIZE * HEAD_DIM * BF16),
 # letting the cube L0B fit two tiles simultaneously (64 KB platform limit).
