@@ -11,7 +11,8 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD_SIZE
+from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD_SIZE,
+                    INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
 # model config
@@ -53,19 +54,30 @@ PAIR_PAD         = 32
 TOPK_GATHER_PAD  = PAIR_PAD // 2
 assert TOPK <= TOPK_GATHER_PAD
 RMS_PIPE_STAGE   = 1 if T >= 64 else 4
+# Column chunk for the two-pass per-token INT8 quant of the FFN-normed activation.
+QUANT_CHUNK      = 32 if T >= 128 else (128 if T >= 64 else 256)
+# Token chunk for the per-token INT8 quant; each chunk is an independent scope
+# (per-token amax + per-token scale → no cross-token dependency).
+QUANT_T_CHUNK    = 16 if T >= 64 else (8 if T >= 16 else T)
+if T % QUANT_T_CHUNK != 0:
+    raise ValueError(
+        f"moe_router requires T ({T}) to be divisible by QUANT_T_CHUNK ({QUANT_T_CHUNK})"
+    )
 
 @pl.jit.inline
 def moe_router(
-    x_mixed:      pl.Tensor[[B, S, D],                    pl.BF16],
-    norm_w:       pl.Tensor[[D],                           pl.FP32],
-    gate_w:       pl.Tensor[[N_EXPERTS, D],                pl.FP32],
-    gate_bias:    pl.Tensor[[N_EXPERTS],                   pl.FP32],
-    layer_id:     pl.Scalar[pl.INT32],
-    tid2eid:      pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:    pl.Tensor[[B, S],                        pl.INT64],
-    x_norm:       pl.Tensor[[T, D],                        pl.BF16],
-    indices:      pl.Tensor[[T, TOPK],                     pl.INT32],
-    weights:      pl.Tensor[[T, TOPK],                     pl.FP32],
+    x_mixed:        pl.Tensor[[B, S, D],                    pl.BF16],
+    norm_w:         pl.Tensor[[D],                           pl.FP32],
+    gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
+    gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
+    layer_id:       pl.Scalar[pl.INT32],
+    tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
+    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    x_norm:         pl.Tensor[[T, D],                        pl.BF16],
+    x_norm_i8:      pl.Tensor[[T, D],                        pl.INT8],
+    x_norm_scale_dq: pl.Tensor[[T, 1],                       pl.FP32],
+    indices:        pl.Tensor[[T, TOPK],                     pl.INT32],
+    weights:        pl.Tensor[[T, TOPK],                     pl.FP32],
 ):
     # Stage 0: FFN RMSNorm over x_mixed.
     x_mixed_flat = pl.reshape(x_mixed, [T, D])
@@ -96,6 +108,39 @@ def moe_router(
             x_normed_bf16 = pl.cast(x_normed, target_type=pl.BF16, mode="rint")
             x_norm_gate[:, d0 : d0 + D_CHUNK] = pl.cast(x_normed_bf16, target_type=pl.FP32)
             x_norm[:, d0 : d0 + D_CHUNK] = x_normed_bf16
+
+    # Stage 1b: per-token symmetric INT8 quant for the routed dispatch path.
+    # Reads x_norm_gate (== fp32(bf16)) so it matches the bf16 x_norm the
+    # shared-expert path re-quantizes. Each token row is independent, so we
+    # tile along T and run the two-pass amax/quant per token-chunk in parallel.
+    # Each token row is independent (per-token amax + scale), so emit each
+    # T-chunk as its own CORE_GROUP scope. We use `pl.range` rather than
+    # `pl.parallel`: a true parallel loop here aliases the x_norm_gate buffer
+    # under MemoryReuse and corrupts gate_dot's read of rows ≥ T/2.
+    for t0 in pl.range(0, T, QUANT_T_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
+            xn_amax = pl.full([1, QUANT_T_CHUNK], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for k0 in pl.range(0, D, QUANT_CHUNK):
+                xn_a_f32 = x_norm_gate[t0 : t0 + QUANT_T_CHUNK, k0 : k0 + QUANT_CHUNK]
+                xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
+                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, QUANT_T_CHUNK])
+                xn_amax = pl.maximum(xn_amax, xn_a_max)
+            xn_sq_row = pl.div(
+                pl.full([1, QUANT_T_CHUNK], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax
+            )
+            x_norm_scale_dq[t0 : t0 + QUANT_T_CHUNK, 0:1] = pl.reshape(
+                pl.recip(xn_sq_row), [QUANT_T_CHUNK, 1]
+            )
+            xn_sq_col = pl.reshape(xn_sq_row, [QUANT_T_CHUNK, 1])
+            for k1 in pl.range(0, D, QUANT_CHUNK):
+                xn_q_scaled = pl.row_expand_mul(
+                    x_norm_gate[t0 : t0 + QUANT_T_CHUNK, k1 : k1 + QUANT_CHUNK], xn_sq_col
+                )
+                xn_q_i32 = pl.cast(xn_q_scaled, target_type=pl.INT32, mode="rint")
+                xn_q_half = pl.cast(xn_q_i32, target_type=pl.FP16, mode="round")
+                x_norm_i8[t0 : t0 + QUANT_T_CHUNK, k1 : k1 + QUANT_CHUNK] = pl.cast(
+                    xn_q_half, target_type=pl.INT8, mode="trunc"
+                )
 
     # Stage 2: gate.forward — dot(x_norm, gate_w) → sqrt(softplus(.)) + bias.
     gate_logits = pl.create_tensor([T, N_EXPERTS], dtype=pl.FP32)
@@ -246,6 +291,8 @@ def moe_router_test(
     tid2eid:      pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
     input_ids:    pl.Tensor[[B, S],                        pl.INT64],
     x_norm:       pl.Out[pl.Tensor[[T, D],                 pl.BF16]],
+    x_norm_i8:    pl.Out[pl.Tensor[[T, D],                 pl.INT8]],
+    x_norm_scale_dq: pl.Out[pl.Tensor[[T, 1],              pl.FP32]],
     indices:      pl.Out[pl.Tensor[[T, TOPK],              pl.INT32]],
     weights:      pl.Out[pl.Tensor[[T, TOPK],              pl.FP32]],
 ):
@@ -254,9 +301,26 @@ def moe_router_test(
         norm_w, gate_w, gate_bias,
         layer_id,
         tid2eid, input_ids,
-        x_norm, indices, weights,
+        x_norm, x_norm_i8, x_norm_scale_dq, indices, weights,
     )
-    return x_norm, indices, weights
+    return x_norm, x_norm_i8, x_norm_scale_dq, indices, weights
+
+
+def _per_token_int8_quant(x_bf16):
+    """Per-token symmetric INT8 quant matching the kernel's cast chain.
+
+    Kernel: FP32(scaled) -> INT32(rint) -> FP16(round) -> INT8(trunc).
+    Torch reproduction uses ``torch.round`` (half-to-even) explicitly so the
+    INT32 stage is the rounded value, not truncated toward zero.
+    """
+    import torch
+    x_f32 = x_bf16.float()
+    amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale_q = INT8_SCALE_MAX / amax
+    scaled = x_f32 * scale_q
+    x_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dq = (1.0 / scale_q).reshape(-1)  # [T]
+    return x_i8, scale_dq
 
 
 def golden_moe_router_core(tensors):
@@ -290,7 +354,11 @@ def golden_moe_router_core(tensors):
     weights = weights / weights.sum(dim=-1, keepdim=True)
     weights = weights * ROUTE_SCALE
 
-    tensors["x_norm"][:]   = x_flat
+    x_norm_i8, x_norm_scale_dq = _per_token_int8_quant(x_flat)
+
+    tensors["x_norm"][:]          = x_flat
+    tensors["x_norm_i8"][:]       = x_norm_i8
+    tensors["x_norm_scale_dq"][:] = x_norm_scale_dq.reshape(T, 1)
     tensors["indices"][:]  = indices.to(torch.int32)
     tensors["weights"][:]  = weights.to(torch.float32)
 
@@ -320,7 +388,9 @@ def build_tensor_specs(layer_id=0):
         ScalarSpec("layer_id",     torch.int32,                layer_id),
         TensorSpec("tid2eid",      [VOCAB, TOPK],              torch.int32,    init_value=init_tid2eid),
         TensorSpec("input_ids",    [B, S],                     torch.int64,    init_value=init_input_ids),
-        TensorSpec("x_norm",       [T, D],                     torch.bfloat16, is_output=True),
+        TensorSpec("x_norm",          [T, D],                  torch.bfloat16, is_output=True),
+        TensorSpec("x_norm_i8",       [T, D],                  torch.int8,     is_output=True),
+        TensorSpec("x_norm_scale_dq", [T, 1],                  torch.float32,  is_output=True),
         TensorSpec("indices",      [T, TOPK],                  torch.int32,    is_output=True),
         TensorSpec("weights",      [T, TOPK],                  torch.float32,  is_output=True),
     ]
@@ -329,7 +399,7 @@ def build_tensor_specs(layer_id=0):
 if __name__ == "__main__":
     import argparse
     import sys
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -367,6 +437,11 @@ if __name__ == "__main__":
         ),
         rtol=1e-5,
         atol=1e-5,
+        compare_fn={
+            # ULP-level FP32 mul drift flips rint at k.5 boundaries → INT8
+            # off-by-one with same dequant magnitude. Allow ≤0.1% bad.
+            "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
+        },
     )
     if not result.passed:
         if result.error:
