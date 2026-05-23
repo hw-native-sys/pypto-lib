@@ -76,6 +76,23 @@ VOCAB_CHUNK = 64
 
 # Decode grouping.
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
+# fa_fused groups attention work by (KV head, Q-head batch). Each KV head must
+# map to an integer number of Q_HEAD_BATCH chunks.
+assert Q_PER_KV % Q_HEAD_BATCH == 0, (
+    f"Q_PER_KV ({Q_PER_KV}) must be divisible by Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+)
+# Q_HEAD_PAD is the padded Q row count fa_fused operates on. It must be even
+# (ExpandMixedKernel applies an UP_DOWN row split inside the spmd body, and
+# set_validshape uses Q_HEAD_PAD // 2 as the post-split height) and large
+# enough to hold a Q_HEAD_BATCH chunk before the trim.
+assert Q_HEAD_PAD % 2 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH, (
+    f"Q_HEAD_PAD ({Q_HEAD_PAD}) must be even and >= Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+)
 Q_GROUPS = Q_PER_KV // Q_HEAD_BATCH
 TOTAL_Q_GROUPS = NUM_KV_HEADS * Q_GROUPS
+# fa_fused dispatches via pl.spmd(TOTAL_Q_GROUPS // 2) with an inner
+# pl.pipeline(2, stage=2) over the Q-group pair; that requires an even count.
+assert TOTAL_Q_GROUPS % 2 == 0, (
+    f"TOTAL_Q_GROUPS ({TOTAL_Q_GROUPS}) must be even (fa_fused pairs Q groups)"
+)
 MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
