@@ -193,17 +193,19 @@ def moe_expert(
             ):
                 for ng in pl.range(8):
                     n0 = n_base + ng * SH_INTER_CHUNK
-                    xs_init = x_local_i8_tile[:, 0 : K_CHUNK]
-                    sw1_init = shared_w1[n0 : n0 + SH_INTER_CHUNK, 0 : K_CHUNK]
-                    sw3_init = shared_w3[n0 : n0 + SH_INTER_CHUNK, 0 : K_CHUNK]
-                    sh_gate_acc = pl.matmul(xs_init, sw1_init, b_trans=True, out_dtype=pl.INT32)
-                    sh_up_acc = pl.matmul(xs_init, sw3_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.range(K_CHUNK, D, K_CHUNK):
+                    sh_gate_acc = pl.create_tensor([T_TILE, SH_INTER_CHUNK], dtype=pl.INT32)
+                    sh_up_acc = pl.create_tensor([T_TILE, SH_INTER_CHUNK], dtype=pl.INT32)
+                    for kb in pl.pipeline(0, D // K_CHUNK, stage=2):
+                        k0 = kb * K_CHUNK
                         xs_k = x_local_i8_tile[:, k0 : k0 + K_CHUNK]
                         sw1_k = shared_w1[n0 : n0 + SH_INTER_CHUNK, k0 : k0 + K_CHUNK]
                         sw3_k = shared_w3[n0 : n0 + SH_INTER_CHUNK, k0 : k0 + K_CHUNK]
-                        sh_gate_acc = pl.matmul_acc(sh_gate_acc, xs_k, sw1_k, b_trans=True)
-                        sh_up_acc = pl.matmul_acc(sh_up_acc, xs_k, sw3_k, b_trans=True)
+                        if k0 == 0:
+                            sh_gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
+                            sh_up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
+                        else:
+                            sh_gate_acc = pl.matmul_acc(sh_gate_acc, xs_k, sw1_k, b_trans=True)
+                            sh_up_acc = pl.matmul_acc(sh_up_acc, xs_k, sw3_k, b_trans=True)
 
                     sw1_scale_chunk = pl.reshape(shared_w1_scale[n0 : n0 + SH_INTER_CHUNK], [1, SH_INTER_CHUNK])
                     sw3_scale_chunk = pl.reshape(shared_w3_scale[n0 : n0 + SH_INTER_CHUNK], [1, SH_INTER_CHUNK])
