@@ -27,6 +27,7 @@ from hc_post import hc_post
 from moe_router import moe_router
 from moe_dispatch import moe_dispatch
 from moe_expert import moe_expert
+from moe_expert_shared import moe_expert_shared
 from moe_combine import moe_combine
 
 
@@ -107,14 +108,19 @@ def moe(
     )
 
     recv_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
     moe_expert(
-        recv_x, recv_scale_dq, recv_expert_count, x_norm,
+        recv_x, recv_scale_dq, recv_expert_count,
         expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
         expert_w2, expert_w2_scale,
+        recv_y,
+    )
+
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    moe_expert_shared(
+        x_norm_i8, x_norm_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_y, sh,
+        sh,
     )
 
     # ffn_out kept as [B, S, D] so hc_post consumes it without a post-write
@@ -178,6 +184,7 @@ def golden_moe(tensors):
     from moe_router import golden_moe_router_core
     from moe_dispatch import golden_moe_dispatch
     from moe_expert import golden_moe_expert
+    from moe_expert_shared import golden_moe_expert_shared
     from moe_combine import golden_moe_combine
 
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
@@ -231,25 +238,29 @@ def golden_moe(tensors):
     })
 
     recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
-    sh = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_moe_expert({
         "recv_x":           recv_x,
         "recv_scale_dq":    recv_scale_dq,
         "recv_expert_count": recv_expert_count_actual,
-        "x_local":          x_norm,
         "expert_w1":        tensors["expert_w1"],
         "expert_w1_scale":  tensors["expert_w1_scale"],
         "expert_w3":        tensors["expert_w3"],
         "expert_w3_scale":  tensors["expert_w3_scale"],
         "expert_w2":        tensors["expert_w2"],
         "expert_w2_scale":  tensors["expert_w2_scale"],
+        "recv_y":           recv_y,
+    })
+
+    sh = torch.zeros(T, D, dtype=torch.bfloat16)
+    golden_moe_expert_shared({
+        "x_local_i8":       x_norm_i8,
+        "x_local_scale_dq": x_norm_scale_dq,
         "shared_w1":        tensors["shared_w1"],
         "shared_w1_scale":  tensors["shared_w1_scale"],
         "shared_w3":        tensors["shared_w3"],
         "shared_w3_scale":  tensors["shared_w3_scale"],
         "shared_w2":        tensors["shared_w2"],
         "shared_w2_scale":  tensors["shared_w2_scale"],
-        "recv_y":           recv_y,
         "sh":               sh,
     })
 

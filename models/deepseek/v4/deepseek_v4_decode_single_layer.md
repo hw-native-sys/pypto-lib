@@ -52,6 +52,7 @@ Per-ratio dispatch happens at the orchestration level: one of
               ║  model.py:696-700                         ║
               ║  (hc_pre[ffn] + moe_router                ║
               ║   + moe_dispatch + moe_expert             ║
+              ║   + moe_expert_shared                     ║
               ║   + moe_combine + hc_post[ffn])           ║
               ║                                           ║
               ║  IN : x [B,S,HC=4,D]  bf16              ║
@@ -250,21 +251,35 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
               │
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_expert.py  (routed expert GEMMs + shared expert; W8A8)                 ║
+║  moe_expert.py  (routed expert GEMMs; W8A8)                                 ║
 ║  model.py:636-644                                                           ║
 ║                                                                             ║
 ║  IN :  recv_x            [N_LOCAL_EXPERTS, RECV_MAX, D]  int8           ║
 ║        recv_scale_dq     [N_LOCAL_EXPERTS, RECV_MAX]     fp32               ║
 ║        recv_expert_count [N_LOCAL_EXPERTS, 1]            int32              ║
-║        x_local           [T, D]   bf16  (= x_norm; for shared expert)    ║
 ║        expert_w1/w2/w3   [N_LOCAL_EXPERTS, …]  int8 + fp32 scale            ║
-║        shared_w1/w2/w3   [...]                 int8 + fp32 scale            ║
 ║  OUT:  recv_y            [N_LOCAL_EXPERTS, RECV_MAX, D]  bf16           ║
-║        sh                [T, D]                       bf16  (shared)     ║
 ║                                                                             ║
 ║  NOTE: expert loop reads recv_expert_count[e] per expert and tiles only     ║
 ║        the actually-occupied rows (n_tiles = ceil(n_rows/RECV_TILE));       ║
 ║        tail rows beyond recv_expert_count[e] are not visited.               ║
+╚═════════════════════════════════════════════════════════════════════════════╝
+              │ recv_y
+              │
+              ▼
+╔═════════════════════════════════════════════════════════════════════════════╗
+║  moe_expert_shared.py  (shared expert FFN; W8A8)                            ║
+║  model.py:636-644                                                           ║
+║                                                                             ║
+║  IN :  x_local_i8        [T, D]   int8  (= x_norm_i8, reused from router)║
+║        x_local_scale_dq  [T, 1]   fp32  (= x_norm_scale_dq)              ║
+║        shared_w1/w2/w3   [...]    int8 + fp32 scale                         ║
+║  OUT:  sh                [T, D]   bf16                                   ║
+║                                                                             ║
+║  NOTE: shared expert is computed locally with no EP communication; the      ║
+║        result is added inside moe_combine. The INT8 input is the same       ║
+║        per-token quant moe_router produced for dispatch, so the shared      ║
+║        path does not re-amax/re-quantize x_norm.                            ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
               │ recv_y, sh
               ▼
@@ -321,8 +336,10 @@ EP semantics around the MoE sub-kernels (when EP > 1):
   for both `recv_x` (dispatch) and `x_local` (shared expert input).
 - **moe_expert**: each card holds `N_LOCAL_EXPERTS = N_EXPERTS_GLOBAL / EP_WORLD_SIZE`
   routed expert weights. `recv_x` is the post-dispatch token set (source:
-  all cards' `x_norm`, repacked by destination expert); `x_local` is this
-  card's slice of `x_norm` (shared expert only). The two inputs are
-  distinct token populations from the same global `x_norm`.
-- **shared expert**: computed locally on `x_local` with no communication;
-  result `sh` stays on the card and is added inside `moe_combine`.
+  all cards' `x_norm`, repacked by destination expert). Produces `recv_y`.
+- **moe_expert_shared**: computed locally on this card's slice of
+  `x_norm_i8` / `x_norm_scale_dq` (the per-token INT8 quant `moe_router`
+  already produced for dispatch — no re-quantization). No communication;
+  result `sh` stays on the card and is added inside `moe_combine`. The
+  routed and shared paths consume distinct token populations of the same
+  global `x_norm`.
