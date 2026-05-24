@@ -165,7 +165,6 @@ def decode_csa(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     # ---- scalars ----
@@ -205,7 +204,6 @@ def decode_csa(
         expert_w2, expert_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
         layer_id,
     )
@@ -279,7 +277,6 @@ def decode_csa_test(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
@@ -308,7 +305,6 @@ def decode_csa_test(
         expert_w2, expert_w2_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        recv_expert_count_full,
         x_next,
         start_pos, layer_id,
     )
@@ -384,7 +380,6 @@ def build_tensor_specs(layer_id: int = 0):
         "shared_w1", "shared_w1_scale",
         "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
-        "recv_expert_count_full",
         # ---- output ----
         "x_next",
         # ---- scalars ----
