@@ -349,6 +349,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3sim",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--layer-id", type=int, default=0,
+                        help="layer_id < num_hash_layers picks the hash route; "
+                             "≥ num_hash_layers picks the sort route")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -356,7 +359,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=moe_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
