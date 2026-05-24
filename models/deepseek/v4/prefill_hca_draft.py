@@ -76,7 +76,6 @@ def prefill_hca(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    recv_expert_count_full: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
     cmp_rotate: pl.Scalar[pl.BOOL],

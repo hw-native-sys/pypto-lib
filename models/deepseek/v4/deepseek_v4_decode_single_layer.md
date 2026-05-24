@@ -255,17 +255,16 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
 ║                                                                             ║
 ║  IN :  recv_x            [N_LOCAL_EXPERTS, RECV_MAX, D]  int8           ║
 ║        recv_scale_dq     [N_LOCAL_EXPERTS, RECV_MAX]     fp32               ║
-║        recv_expert_count_full [N_LOCAL_EXPERTS, 1]       int32  (= RECV_MAX,║
-║                                                                  static)    ║
+║        recv_expert_count [N_LOCAL_EXPERTS, 1]            int32              ║
 ║        x_local           [T, D]   bf16  (= x_norm; for shared expert)    ║
 ║        expert_w1/w2/w3   [N_LOCAL_EXPERTS, …]  int8 + fp32 scale            ║
 ║        shared_w1/w2/w3   [...]                 int8 + fp32 scale            ║
 ║  OUT:  recv_y            [N_LOCAL_EXPERTS, RECV_MAX, D]  bf16           ║
 ║        sh                [T, D]                       bf16  (shared)     ║
 ║                                                                             ║
-║  NOTE: expert loop walks the static count; tail rows beyond the actual      ║
-║        recv_expert_count are still produced but contribute weight 0 in     ║
-║        combine, so they are dropped.                                        ║
+║  NOTE: expert loop reads recv_expert_count[e] per expert and tiles only     ║
+║        the actually-occupied rows (n_tiles = ceil(n_rows/RECV_TILE));       ║
+║        tail rows beyond recv_expert_count[e] are not visited.               ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
               │ recv_y, sh
               ▼
