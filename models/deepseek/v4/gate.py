@@ -38,7 +38,7 @@ SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
-def moe_router(
+def gate(
     x_mixed: pl.Tensor[[B, S, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -48,7 +48,7 @@ def moe_router(
     input_ids: pl.Tensor[[B, S], pl.INT64],
     x_norm: pl.Tensor[[T, D], pl.BF16],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
-    x_norm_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
@@ -80,7 +80,7 @@ def moe_router(
                 xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
                 xn_amax = pl.maximum(xn_amax, xn_a_max)
             xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
-            x_norm_scale_dq[ts0 : ts0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
+            x_norm_scale[ts0 : ts0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
             xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
             for xq_b_k in pl.range(0, D, QUANT_CHUNK):
                 xn_q_scaled = pl.row_expand_mul(x_norm_gate_tile[:, xq_b_k : xq_b_k + QUANT_CHUNK], xn_sq_col)
@@ -181,7 +181,7 @@ def moe_router(
 
 
 @pl.jit
-def moe_router_test(
+def gate_test(
     x_mixed: pl.Tensor[[B, S, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
@@ -191,18 +191,18 @@ def moe_router_test(
     input_ids: pl.Tensor[[B, S], pl.INT64],
     x_norm: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
-    x_norm_scale_dq: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
+    x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
 ):
-    moe_router(
+    gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
         layer_id,
         tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale_dq, indices, weights,
+        x_norm, x_norm_i8, x_norm_scale, indices, weights,
     )
-    return x_norm, x_norm_i8, x_norm_scale_dq, indices, weights
+    return x_norm, x_norm_i8, x_norm_scale, indices, weights
 
 
 def _per_token_int8_quant(x_bf16):
@@ -216,7 +216,7 @@ def _per_token_int8_quant(x_bf16):
     return x_i8, scale_dq
 
 
-def golden_moe_router_core(tensors):
+def golden_gate_core(tensors):
     import torch
 
     # FFN RMSNorm.
@@ -228,7 +228,7 @@ def golden_moe_router_core(tensors):
     x_flat = x_normalized.to(torch.bfloat16)
 
     # Per-token symmetric INT8 quant of bf16(x_norm).
-    x_norm_i8, x_norm_scale_dq = _per_token_int8_quant(x_flat)
+    x_norm_i8, x_norm_scale = _per_token_int8_quant(x_flat)
 
     # Gate matmul + numerically stable softplus(x) = relu(x) + log(exp(-|x|)+1).
     gate_w = tensors["gate_w"].float()
@@ -257,7 +257,7 @@ def golden_moe_router_core(tensors):
 
     tensors["x_norm"][:] = x_flat
     tensors["x_norm_i8"][:] = x_norm_i8
-    tensors["x_norm_scale_dq"][:] = x_norm_scale_dq.reshape(T, 1)
+    tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
 
@@ -289,7 +289,7 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("input_ids", [B, S], torch.int64, init_value=init_input_ids),
         TensorSpec("x_norm", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
-        TensorSpec("x_norm_scale_dq", [T, 1], torch.float32, is_output=True),
+        TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
         TensorSpec("weights", [T, TOPK], torch.float32, is_output=True),
     ]
@@ -308,9 +308,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_router_test,
+        fn=gate_test,
         specs=build_tensor_specs(layer_id=args.layer_id),
-        golden_fn=golden_moe_router_core,
+        golden_fn=golden_gate_core,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

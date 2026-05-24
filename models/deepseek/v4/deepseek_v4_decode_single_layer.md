@@ -50,10 +50,10 @@ Per-ratio dispatch happens at the orchestration level: one of
               ╔═══════════════════════════════════════════╗
               ║  moe.py                                   ║
               ║  model.py:696-700                         ║
-              ║  (hc_pre[ffn] + moe_router                ║
-              ║   + moe_dispatch + moe_expert             ║
-              ║   + moe_expert_shared                     ║
-              ║   + moe_combine + hc_post[ffn])           ║
+              ║  (hc_pre[ffn] + gate                      ║
+              ║   + dispatch + expert_routed              ║
+              ║   + expert_shared                         ║
+              ║   + combine + hc_post[ffn])               ║
               ║                                           ║
               ║  IN : x [B,S,HC=4,D]  bf16              ║
               ║       input_ids [B,S] int64             ║
@@ -213,7 +213,7 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
               │ x_mixed [B,S,D]
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_router.py  (ffn_norm fused + gate + topk + hash route)                 ║
+║  gate.py  (ffn_norm fused + gate + topk + hash route)                       ║
 ║  model.py:564-584                                                           ║
 ║                                                                             ║
 ║  IN :  x_mixed     [B, S, D]        bf16                                  ║
@@ -230,7 +230,7 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
               │ x_norm, indices, weights
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_dispatch.py  (per-token INT8 quant + pack by destination expert)       ║
+║  dispatch.py  (per-token INT8 quant + pack by destination expert)           ║
 ║  [EP-orch placeholder — currently single-card, EP_WORLD_SIZE=1]             ║
 ║  NOTE: RECV_MAX = B*S*TOPK under MTP (was 384 at S=1).            ║
 ║                                                                             ║
@@ -251,13 +251,13 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
               │
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_expert.py  (routed expert GEMMs; W8A8)                                 ║
+║  expert_routed.py  (routed expert GEMMs; W8A8)                              ║
 ║  model.py:636-644                                                           ║
 ║                                                                             ║
 ║  IN :  recv_x            [N_LOCAL_EXPERTS, RECV_MAX, D]  int8           ║
 ║        recv_scale_dq     [N_LOCAL_EXPERTS, RECV_MAX]     fp32               ║
 ║        recv_expert_count [N_LOCAL_EXPERTS, 1]            int32              ║
-║        expert_w1/w2/w3   [N_LOCAL_EXPERTS, …]  int8 + fp32 scale            ║
+║        routed_w1/w2/w3   [N_LOCAL_EXPERTS, …]  int8 + fp32 scale            ║
 ║  OUT:  recv_y            [N_LOCAL_EXPERTS, RECV_MAX, D]  bf16           ║
 ║                                                                             ║
 ║  NOTE: expert loop reads recv_expert_count[e] per expert and tiles only     ║
@@ -268,23 +268,23 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
               │
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_expert_shared.py  (shared expert FFN; W8A8)                            ║
+║  expert_shared.py  (shared expert FFN; W8A8)                                ║
 ║  model.py:636-644                                                           ║
 ║                                                                             ║
 ║  IN :  x_local_i8        [T, D]   int8  (= x_norm_i8, reused from router)║
-║        x_local_scale_dq  [T, 1]   fp32  (= x_norm_scale_dq)              ║
+║        x_local_scale_dq  [T, 1]   fp32  (= x_norm_scale)              ║
 ║        shared_w1/w2/w3   [...]    int8 + fp32 scale                         ║
 ║  OUT:  sh                [T, D]   bf16                                   ║
 ║                                                                             ║
 ║  NOTE: shared expert is computed locally with no EP communication; the      ║
-║        result is added inside moe_combine. The INT8 input is the same       ║
-║        per-token quant moe_router produced for dispatch, so the shared      ║
+║        result is added inside combine. The INT8 input is the same          ║
+║        per-token quant gate produced for dispatch, so the shared            ║
 ║        path does not re-amax/re-quantize x_norm.                            ║
 ╚═════════════════════════════════════════════════════════════════════════════╝
               │ recv_y, sh
               ▼
 ╔═════════════════════════════════════════════════════════════════════════════╗
-║  moe_combine.py  (weighted scatter-add back to token space + shared add)    ║
+║  combine.py  (weighted scatter-add back to token space + shared add)        ║
 ║  [EP-orch placeholder — currently single-card]                              ║
 ║                                                                             ║
 ║  IN :  recv_y, recv_token, recv_weights, recv_expert_count, sh              ║
@@ -314,7 +314,7 @@ Corresponds to `Block.hc_pre(ffn)` + `self.ffn_norm` + `MoE.forward` +
 ### EP topology notes
 
 Today `moe.py` runs **single-card** (`EP_WORLD_SIZE=1`, `N_LOCAL_EXPERTS == N_EXPERTS`).
-`moe_dispatch` and `moe_combine` are written as in-kernel pack/scatter so
+`dispatch` and `combine` are written as in-kernel pack/scatter so
 the end-to-end MoE composes inline without HCCL. They are marked
 `[EP-orch placeholder]` because the multi-card variant still needs
 `AllToAllv` between dispatch and expert and again before combine.
@@ -326,20 +326,20 @@ orchestration kernel + three AIV children over a shared HCCL window
 scratch (`dispatch.cpp`, `local_expert.cpp`, `combine.cpp`,
 `ep_dispatch_combine_orch.cpp`). pypto has not yet adapted that path;
 once the equivalent DSL primitives (TPUT/TNOTIFY barriers + HCCL window)
-are exposed, `moe_dispatch` / `moe_combine` can be split into the real
+are exposed, `dispatch` / `combine` can be split into the real
 pre/post-AllToAllv halves following the simpler reference.
 
 EP semantics around the MoE sub-kernels (when EP > 1):
 
-- **moe_router**: runs on every card with replicated `gate_w`; `indices`
+- **gate**: runs on every card with replicated `gate_w`; `indices`
   cover global expert space `[0, N_EXPERTS_GLOBAL)`. `x_norm` is the source
   for both `recv_x` (dispatch) and `x_local` (shared expert input).
-- **moe_expert**: each card holds `N_LOCAL_EXPERTS = N_EXPERTS_GLOBAL / EP_WORLD_SIZE`
+- **expert_routed**: each card holds `N_LOCAL_EXPERTS = N_EXPERTS_GLOBAL / EP_WORLD_SIZE`
   routed expert weights. `recv_x` is the post-dispatch token set (source:
   all cards' `x_norm`, repacked by destination expert). Produces `recv_y`.
-- **moe_expert_shared**: computed locally on this card's slice of
-  `x_norm_i8` / `x_norm_scale_dq` (the per-token INT8 quant `moe_router`
+- **expert_shared**: computed locally on this card's slice of
+  `x_norm_i8` / `x_norm_scale` (the per-token INT8 quant `gate`
   already produced for dispatch — no re-quantization). No communication;
-  result `sh` stays on the card and is added inside `moe_combine`. The
+  result `sh` stays on the card and is added inside `combine`. The
   routed and shared paths consume distinct token populations of the same
   global `x_norm`.

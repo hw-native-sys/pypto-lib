@@ -9,7 +9,7 @@
 """DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
 
 Only the routed-expert path lives here. The shared expert was split out
-into ``moe_expert_shared.py``; both kernels are composed in ``moe.py``.
+into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 """
 
 
@@ -41,16 +41,16 @@ QUANT_CHUNK = 256
 
 
 @pl.jit.inline
-def moe_expert(
+def expert_routed(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
@@ -79,22 +79,22 @@ def moe_expert(
                     for ng in pl.range(8):
                         n0 = n_base + ng * INTER_CHUNK
                         x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_CHUNK]
-                        w1_init = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
-                        w3_init = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
+                        w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
+                        w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
                         gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
                         up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
                         for k0 in pl.range(K_CHUNK, D, K_CHUNK):
                             x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_CHUNK]
-                            w1_k = expert_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
-                            w3_k = expert_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
+                            w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
+                            w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
                             gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
                             up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
 
                         gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_CHUNK])
                         up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_CHUNK])
                         recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
-                        w1_scale_chunk = expert_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
-                        w3_scale_chunk = expert_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
+                        w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
+                        w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
                         gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                         up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                         gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
@@ -141,15 +141,15 @@ def moe_expert(
                     for dg in pl.range(16):
                         d0 = d_base + dg * D_OUT_CHUNK
                         h_init = h_tile_i8[:, 0 : INTER_K]
-                        w2_init = expert_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, 0 : INTER_K]
+                        w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, 0 : INTER_K]
                         y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
                         for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
                             h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                            w2_k = expert_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
+                            w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
                             y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
 
                         y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_CHUNK])
-                        w2_scale_chunk = expert_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK]
+                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK]
                         y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                         y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
                         recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_CHUNK] = pl.cast(
@@ -158,22 +158,22 @@ def moe_expert(
 
 
 @pl.jit
-def moe_expert_test(
+def expert_routed_test(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    expert_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    expert_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    expert_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    expert_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
-    moe_expert(
+    expert_routed(
         recv_x, recv_scale_dq, recv_expert_count,
-        expert_w1, expert_w1_scale, expert_w3, expert_w3_scale,
-        expert_w2, expert_w2_scale,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
         recv_y,
     )
     return recv_y
@@ -204,10 +204,10 @@ def _quant_w_per_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def golden_moe_expert(tensors):
+def golden_expert_routed(tensors):
     """Torch reference for the routed expert. recv_y is the partial routed
     contribution only (without routing-weight scaling — that is applied in
-    moe_combine); AllToAllv combine and the shared-expert add happen in the
+    combine); AllToAllv combine and the shared-expert add happen in the
     host orchestrator.
 
     Per-expert layout: recv_x[e, 0:cnt[e], :] is the valid INT8 receive
@@ -221,9 +221,9 @@ def golden_moe_expert(tensors):
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
     recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
-    w1 = dequant_w(tensors["expert_w1"], tensors["expert_w1_scale"].float())
-    w3 = dequant_w(tensors["expert_w3"], tensors["expert_w3_scale"].float())
-    w2 = dequant_w(tensors["expert_w2"], tensors["expert_w2_scale"].float())
+    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
+    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
+    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
 
     recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
     for e in range(N_LOCAL_EXPERTS):
@@ -298,12 +298,12 @@ def build_tensor_specs():
         TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
         TensorSpec("recv_scale_dq", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
-        TensorSpec("expert_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
-        TensorSpec("expert_w1_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),
-        TensorSpec("expert_w3", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
-        TensorSpec("expert_w3_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w3_s),
-        TensorSpec("expert_w2", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("expert_w2_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("routed_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
+        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),
+        TensorSpec("routed_w3", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
+        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w3_s),
+        TensorSpec("routed_w2", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
+        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
         TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, is_output=True),
     ]
 
@@ -320,9 +320,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_expert_test,
+        fn=expert_routed_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_expert,
+        golden_fn=golden_expert_routed,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

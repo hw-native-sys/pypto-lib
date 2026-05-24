@@ -31,7 +31,7 @@ T_TILE = 4
 
 
 @pl.jit.inline
-def moe_combine(
+def combine(
     recv_y:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
     recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
@@ -85,7 +85,7 @@ def moe_combine(
 
 
 @pl.jit
-def moe_combine_test(
+def combine_test(
     recv_y:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
     recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
@@ -93,11 +93,11 @@ def moe_combine_test(
     sh:                pl.Tensor[[T, D],                         pl.BF16],
     ffn_out:           pl.Out[pl.Tensor[[B, S, D],               pl.BF16]],
 ):
-    moe_combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
+    combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
     return ffn_out
 
 
-def golden_moe_combine(tensors):
+def golden_combine(tensors):
     import torch
 
     recv_y = tensors["recv_y"]
@@ -127,7 +127,7 @@ def build_tensor_specs():
     # Simulate dispatch routing: each of T tokens routes to topk distinct
     # local experts. counts[e] = #tokens routed to e (sum = T*topk before
     # RECV_MAX clamp); recv_token[e, :counts[e]] is the matching token list
-    # with no per-expert duplicates. Mirrors moe_expert.build_tensor_specs.
+    # with no per-expert duplicates. Mirrors expert_routed.build_tensor_specs.
     topk = min(M.num_experts_per_tok, N_LOCAL_EXPERTS)
     gen = torch.Generator().manual_seed(0)
     routing = torch.stack(
@@ -199,9 +199,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_combine_test,
+        fn=combine_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_combine,
+        golden_fn=golden_combine,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         runtime_cfg=dict(

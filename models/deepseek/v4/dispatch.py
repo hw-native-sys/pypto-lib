@@ -9,8 +9,8 @@
 """DeepSeek-V4 MoE packed dispatch (decode, single-card EP).
 
 Pure scatter from token-major router outputs to the per-local-expert layout
-consumed by ``moe_expert``. The INT8 quant of ``x_norm`` already happened in
-``moe_router``; this kernel only moves the pre-quantized rows and dequant
+consumed by ``expert_routed``. The INT8 quant of ``x_norm`` already happened in
+``gate``; this kernel only moves the pre-quantized rows and dequant
 scales into the recv buffers.
 """
 
@@ -33,9 +33,9 @@ EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 
 @pl.jit.inline
-def moe_dispatch(
+def dispatch(
     x_norm_i8:       pl.Tensor[[T, D],    pl.INT8],
-    x_norm_scale_dq: pl.Tensor[[T, 1],    pl.FP32],
+    x_norm_scale: pl.Tensor[[T, 1],    pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
     recv_x:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
@@ -49,7 +49,7 @@ def moe_dispatch(
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch"):
-        # Zero-init tail slots so downstream consumers (moe_expert / moe_combine)
+        # Zero-init tail slots so downstream consumers (expert_routed / combine)
         # can rely on slot >= recv_expert_count[e] being neutral:
         #   - recv_scale_dq = 0 -> dequant of any recv_x tail row yields 0
         #   - recv_weights  = 0 -> combine's weighted reduction skips tail rows
@@ -72,16 +72,16 @@ def moe_dispatch(
                 dst = e * RECV_MAX + slot
 
                 recv_x_flat = pl.assemble(recv_x_flat, pl.slice(x_norm_i8, [1, D], [t, 0]), [dst, 0])
-                pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale_dq, [t, 0]))
+                pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale, [t, 0]))
                 pl.write(recv_weights, [e, slot], pl.read(weights, [t, k]))
                 pl.write(recv_token, [e, slot], pl.cast(t, pl.INT32))
                 pl.write(recv_expert_count, [e, 0], pl.cast(slot_i32 + 1, pl.INT32))
 
 
 @pl.jit
-def moe_dispatch_test(
+def dispatch_test(
     x_norm_i8:       pl.Tensor[[T, D],    pl.INT8],
-    x_norm_scale_dq: pl.Tensor[[T, 1],    pl.FP32],
+    x_norm_scale: pl.Tensor[[T, 1],    pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
     recv_x:            pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8]],
@@ -90,19 +90,19 @@ def moe_dispatch_test(
     recv_token:        pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32]],
     recv_expert_count: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32]],
 ):
-    moe_dispatch(
-        x_norm_i8, x_norm_scale_dq, indices, weights,
+    dispatch(
+        x_norm_i8, x_norm_scale, indices, weights,
         recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
     )
     return recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count
 
 
-def golden_moe_dispatch(tensors):
+def golden_dispatch(tensors):
     """Torch reference for the packed dispatch contract (pure scatter)."""
     import torch
 
     x_norm_i8       = tensors["x_norm_i8"]        # [T, D]    int8 (pre-quantized in router)
-    x_norm_scale_dq = tensors["x_norm_scale_dq"]  # [T, 1]    fp32 per-token dequant scale
+    x_norm_scale = tensors["x_norm_scale"]  # [T, 1]    fp32 per-token dequant scale
     indices = tensors["indices"]   # [T, TOPK] int32
     weights = tensors["weights"]   # [T, TOPK] fp32
 
@@ -118,7 +118,7 @@ def golden_moe_dispatch(tensors):
             assert 0 <= e < N_LOCAL_EXPERTS
             assert s < RECV_MAX, f"expert {e} received > RECV_MAX={RECV_MAX} rows"
             recv_x[e, s, :]      = x_norm_i8[t, :]
-            recv_scale_dq[e, s]  = float(x_norm_scale_dq[t, 0].item())
+            recv_scale_dq[e, s]  = float(x_norm_scale[t, 0].item())
             recv_weights[e, s]   = float(weights[t, k].item())
             recv_token[e, s]     = t
             cursor[e] = s + 1
@@ -174,7 +174,7 @@ def build_tensor_specs():
     def init_x_norm_i8():
         return torch.randint(-128, 128, (T, D), dtype=torch.int8)
 
-    def init_x_norm_scale_dq():
+    def init_x_norm_scale():
         # Per-token dequant scale (strictly positive, as produced by the router).
         return (torch.rand(T, 1) + 0.01).float()
 
@@ -191,7 +191,7 @@ def build_tensor_specs():
 
     return [
         TensorSpec("x_norm_i8",       [T, D], torch.int8,    init_value=init_x_norm_i8),
-        TensorSpec("x_norm_scale_dq", [T, 1], torch.float32, init_value=init_x_norm_scale_dq),
+        TensorSpec("x_norm_scale", [T, 1], torch.float32, init_value=init_x_norm_scale),
         TensorSpec("indices", [T, TOPK], torch.int32,    init_value=init_indices),
         TensorSpec("weights", [T, TOPK], torch.float32,  init_value=init_weights),
         TensorSpec("recv_x",            [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8,     is_output=True),
@@ -214,9 +214,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_dispatch_test,
+        fn=dispatch_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_dispatch,
+        golden_fn=golden_dispatch,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

@@ -8,13 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE shared expert compute (decode, EP single-card).
 
-Split out of ``moe_expert.py``: only the shared-expert FFN path lives here.
-The routed local experts are computed by ``moe_expert.py``; both kernels
+Split out of ``expert_routed.py``: only the shared-expert FFN path lives here.
+The routed local experts are computed by ``expert_routed.py``; both kernels
 are composed inside ``moe.py``.
 
 The shared expert reuses the per-token INT8 quant already produced by
-``moe_router`` (``x_norm_i8`` + ``x_norm_scale_dq``) — the same INT8 view
-that ``moe_dispatch`` packs for the routed path. This avoids a second
+``gate`` (``x_norm_i8`` + ``x_norm_scale``) — the same INT8 view
+that ``dispatch`` packs for the routed path. This avoids a second
 amax+rescale of the same tokens.
 """
 
@@ -41,7 +41,7 @@ T_TILE = 32
 
 
 @pl.jit.inline
-def moe_expert_shared(
+def expert_shared(
     x_local_i8:       pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -130,7 +130,7 @@ def moe_expert_shared(
 
 
 @pl.jit
-def moe_expert_shared_test(
+def expert_shared_test(
     x_local_i8:       pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
@@ -141,7 +141,7 @@ def moe_expert_shared_test(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    moe_expert_shared(
+    expert_shared(
         x_local_i8, x_local_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
@@ -175,11 +175,11 @@ def _quant_w_per_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def golden_moe_expert_shared(tensors):
+def golden_expert_shared(tensors):
     """Torch reference for the shared expert.
 
-    Input is the per-token INT8 quant produced by moe_router (shared with
-    moe_dispatch / routed expert); we dequant inside to match the kernel's
+    Input is the per-token INT8 quant produced by gate (shared with
+    dispatch / routed expert); we dequant inside to match the kernel's
     dequant-then-matmul pattern."""
     import torch
     import torch.nn.functional as F
@@ -209,7 +209,7 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     # Pre-quantize x_local once so the i8 / scale specs see consistent values
-    # (mirrors what moe_router produces in the full pipeline).
+    # (mirrors what gate produces in the full pipeline).
     x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
     x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
 
@@ -246,9 +246,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     result = run_jit(
-        fn=moe_expert_shared_test,
+        fn=expert_shared_test,
         specs=build_tensor_specs(),
-        golden_fn=golden_moe_expert_shared,
+        golden_fn=golden_expert_shared,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
