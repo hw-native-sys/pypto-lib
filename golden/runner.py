@@ -156,10 +156,19 @@ def _consume_runtime_harness_keys(runtime_cfg: dict[str, Any]) -> None:
 
 
 def _stale_cpps(work_dir: Path) -> list[Path]:
-    """Return cpps under ``kernels/`` / ``orchestration/`` whose sibling
-    ``.so``/``.o`` is older than the cpp itself (cpp was edited after its
-    last build). Cpps with no sibling binary are skipped — those haven't
-    been built yet and ``compile_and_assemble`` will handle them.
+    """Return cpps under ``kernels/`` / ``orchestration/`` that need rebuilding.
+
+    A cpp is considered stale if **either**:
+
+    - its sibling ``.so``/``.o`` is missing entirely (binary never built or
+      removed by hand), **or**
+    - any existing sibling ``.so``/``.o`` is older than the cpp itself
+      (cpp was edited after its last build).
+
+    Both cases require a rebuild; reporting them uniformly through this
+    helper keeps the runner's log message honest (previously a missing
+    binary would log ``no cpp edits ... reusing cached binaries`` even
+    though ``compile_and_assemble`` would silently rebuild it).
     """
     stale: list[Path] = []
     for sub in ("kernels", "orchestration"):
@@ -170,11 +179,23 @@ def _stale_cpps(work_dir: Path) -> list[Path]:
             siblings = [cpp.with_suffix(ext) for ext in (".so", ".o")]
             existing = [p for p in siblings if p.exists()]
             if not existing:
+                stale.append(cpp)
                 continue
             cpp_mtime = cpp.stat().st_mtime
             if any(p.stat().st_mtime < cpp_mtime for p in existing):
                 stale.append(cpp)
     return stale
+
+
+def _format_stale_paths(stale: list[Path], work_dir: Path, max_show: int = 5) -> str:
+    """Render a comma-separated list of stale cpp paths relative to
+    *work_dir*, truncated to *max_show* entries with a ``(+N more)`` tail
+    when the list is longer."""
+    rels = [str(p.relative_to(work_dir)) for p in stale]
+    if len(rels) <= max_show:
+        return ", ".join(rels)
+    head = ", ".join(rels[:max_show])
+    return f"{head} (+{len(rels) - max_show} more)"
 
 
 def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
@@ -195,7 +216,11 @@ def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
     if stale:
         from pypto.runtime.debug.replay import invalidate_binary_cache
         invalidate_binary_cache(work_dir)
-        print(f"[cpp->.so] cpp edits detected ({len(stale)} file(s)); rebuilding", flush=True)
+        print(
+            f"[cpp->.so] cpp edits or missing binaries detected "
+            f"({len(stale)} file(s)): {_format_stale_paths(stale, work_dir)}; rebuilding",
+            flush=True,
+        )
     else:
         print("[cpp->.so] no cpp edits since last build; reusing cached binaries", flush=True)
     return work_dir

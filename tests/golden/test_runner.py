@@ -23,6 +23,7 @@ from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
     _backend_for_platform,
+    _format_stale_paths,
     _save_tensors,
     _setup_runtime_dir,
     _stale_cpps,
@@ -896,12 +897,18 @@ def _set_mtime(path: Path, mtime: float) -> None:
 class TestStaleCpps:
     """`_stale_cpps` flags cpps whose sibling .so/.o is older."""
 
-    def test_no_binary_means_not_stale(self, tmp_path):
-        """cpp with no sibling .so/.o is skipped (first build hasn't happened)."""
+    def test_no_binary_is_stale(self, tmp_path):
+        """cpp with no sibling .so/.o is flagged as stale.
+
+        ``compile_and_assemble`` will rebuild it either way; flagging it
+        here keeps the runner log honest ("missing binary → rebuild"
+        instead of the misleading "no cpp edits; reusing cached binaries").
+        """
         kernels = tmp_path / "kernels" / "aiv"
         kernels.mkdir(parents=True)
-        (kernels / "foo.cpp").write_text("// cpp")
-        assert _stale_cpps(tmp_path) == []
+        cpp = kernels / "foo.cpp"
+        cpp.write_text("// cpp")
+        assert _stale_cpps(tmp_path) == [cpp]
 
     def test_so_older_than_cpp_is_stale(self, tmp_path):
         """cpp edited after .so was built → reported as stale."""
@@ -950,6 +957,20 @@ class TestStaleCpps:
         _set_mtime(so, 1000.0)
         _set_mtime(cpp, 2000.0)
         assert _stale_cpps(tmp_path) == [cpp]
+
+
+class TestFormatStalePaths:
+    """`_format_stale_paths` renders work-dir-relative paths with truncation."""
+
+    def test_short_list_not_truncated(self, tmp_path):
+        paths = [tmp_path / "kernels" / "a.cpp", tmp_path / "orchestration" / "b.cpp"]
+        assert _format_stale_paths(paths, tmp_path) == "kernels/a.cpp, orchestration/b.cpp"
+
+    def test_long_list_is_truncated(self, tmp_path):
+        paths = [tmp_path / "kernels" / f"k{i}.cpp" for i in range(8)]
+        out = _format_stale_paths(paths, tmp_path, max_show=5)
+        assert out.endswith("(+3 more)")
+        assert "k0.cpp" in out and "k4.cpp" in out and "k5.cpp" not in out
 
 
 class TestSetupRuntimeDir:
