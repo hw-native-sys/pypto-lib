@@ -234,13 +234,13 @@ def moe_expert(
                 shq_q_half = pl.cast(shq_q_i32, target_type=pl.FP16, mode="round")
                 sh_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(shq_q_half, target_type=pl.INT8, mode="trunc")
 
-        for d_base in pl.parallel(0, D, 8 * SH_D_OUT_CHUNK):
+        for d_base in pl.parallel(0, D, 16 * SH_D_OUT_CHUNK):
             with pl.at(
                 level=pl.Level.CORE_GROUP,
                 optimizations=[pl.split(pl.SplitMode.NONE)],
                 name_hint="sh_w2",
             ):
-                for dg in pl.range(8):
+                for dg in pl.range(16):
                     d0 = d_base + dg * SH_D_OUT_CHUNK
                     hs_init = sh_tile_i8[:, 0 : INTER_K]
                     sw2_init = shared_w2[d0 : d0 + SH_D_OUT_CHUNK, 0 : INTER_K]
