@@ -239,8 +239,12 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 64          # B: tokens per decode step
-DECODE_SEQ = 2             # S: 2 tokens per step (MTP)
+DECODE_BATCH = 64                 # B: tokens per decode step
+DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
+PREFILL_BATCH = 64                # target prefill batch handled by the outer scheduler
+PREFILL_SEQ = 8192                # target full prompt length handled by the outer scheduler
+PREFILL_BATCH_TILE = 1            # per-kernel NPU batch tile
+PREFILL_SEQ_TILE = 128            # per-kernel NPU sequence tile
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
