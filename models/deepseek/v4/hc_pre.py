@@ -40,7 +40,6 @@ COMB_T_TILE      = 16
 RMS_K_CHUNK      = 128
 LINEAR_K_CHUNK   = 128
 D_CHUNK          = 512
-D_BLOCKS         = D // D_CHUNK
 
 
 @pl.jit.inline
@@ -98,14 +97,13 @@ def hc_pre(
         comb_scaled = pl.mul(mixes[0:T, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], scale2)
         comb_logits = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
 
-    post_pad_flat = pl.reshape(post_pad, [T * HC_PAD])
-
-    pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
-    for t0 in pl.parallel(0, T, LINEAR_T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
-            pre_tile = pre_val_store[t0:t0 + LINEAR_T_TILE, 0:HC_PAD]
-            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
-            pre_val_t[0:HC_PAD, t0:t0 + LINEAR_T_TILE] = pre_tile_t
+    post_2d = pl.reshape(post, [T, HC_MULT])
+    for t0 in pl.parallel(0, T, COMB_T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_post"):
+            post_tile = pl.load(post_pad, [t0, 0], [COMB_T_TILE, HC_PAD],
+                                valid_shapes=[COMB_T_TILE, HC_MULT],
+                                target_memory=pl.MemorySpace.Vec)
+            post_2d = pl.store(post_tile, [t0, 0], post_2d)
 
     comb_flat = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     for t0 in pl.parallel(0, T, COMB_T_TILE):
@@ -180,102 +178,32 @@ def hc_pre(
             comb_flat = pl.store(row2_out, [t0, 2 * HC_MULT], comb_flat)
             comb_flat = pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
 
-    post_flat = pl.reshape(post, [T * HC_MULT])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_post"):
-        for token_idx in pl.range(0, T, 1):
-            for h in pl.unroll(HC_MULT):
-                pl.write(
-                    post_flat,
-                    [token_idx * HC_MULT + h],
-                    pl.read(post_pad_flat, [token_idx * HC_PAD + h]),
-                )
+    pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
+    for t0 in pl.parallel(0, T, LINEAR_T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
+            pre_tile = pre_val_store[t0:t0 + LINEAR_T_TILE, 0:HC_PAD]
+            pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
+            pre_val_t[0:HC_PAD, t0:t0 + LINEAR_T_TILE] = pre_tile_t
 
     x_mixed_view = pl.reshape(x_mixed, [T, D])
     for t0 in pl.parallel(0, T, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mix_x"):
-            pre0 = pl.reshape(
-                pl.load(
-                    pre_val_t,
-                    [0, t0],
-                    [1, T_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                ),
-                [T_TILE, 1],
-            )
-            pre1 = pl.reshape(
-                pl.load(
-                    pre_val_t,
-                    [1, t0],
-                    [1, T_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                ),
-                [T_TILE, 1],
-            )
-            pre2 = pl.reshape(
-                pl.load(
-                    pre_val_t,
-                    [2, t0],
-                    [1, T_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                ),
-                [T_TILE, 1],
-            )
-            pre3 = pl.reshape(
-                pl.load(
-                    pre_val_t,
-                    [3, t0],
-                    [1, T_TILE],
-                    target_memory=pl.MemorySpace.Vec,
-                ),
-                [T_TILE, 1],
-            )
-            for db in pl.range(D_BLOCKS):
+            pre0 = pl.reshape(pre_val_t[0:1, t0:t0 + T_TILE], [T_TILE, 1])
+            pre1 = pl.reshape(pre_val_t[1:2, t0:t0 + T_TILE], [T_TILE, 1])
+            pre2 = pl.reshape(pre_val_t[2:3, t0:t0 + T_TILE], [T_TILE, 1])
+            pre3 = pl.reshape(pre_val_t[3:4, t0:t0 + T_TILE], [T_TILE, 1])
+            for db in pl.range(D // D_CHUNK):
                 d0 = db * D_CHUNK
-                x0 = pl.cast(
-                    pl.load(
-                        x_flat,
-                        [t0, 0 * D + d0],
-                        [T_TILE, D_CHUNK],
-                        target_memory=pl.MemorySpace.Vec,
-                    ),
-                    target_type=pl.FP32,
-                )
-                x1 = pl.cast(
-                    pl.load(
-                        x_flat,
-                        [t0, 1 * D + d0],
-                        [T_TILE, D_CHUNK],
-                        target_memory=pl.MemorySpace.Vec,
-                    ),
-                    target_type=pl.FP32,
-                )
-                x2 = pl.cast(
-                    pl.load(
-                        x_flat,
-                        [t0, 2 * D + d0],
-                        [T_TILE, D_CHUNK],
-                        target_memory=pl.MemorySpace.Vec,
-                    ),
-                    target_type=pl.FP32,
-                )
-                x3 = pl.cast(
-                    pl.load(
-                        x_flat,
-                        [t0, 3 * D + d0],
-                        [T_TILE, D_CHUNK],
-                        target_memory=pl.MemorySpace.Vec,
-                    ),
-                    target_type=pl.FP32,
-                )
-                y_tile = pl.add(
-                    pl.add(pl.row_expand_mul(x0, pre0), pl.row_expand_mul(x1, pre1)),
-                    pl.add(pl.row_expand_mul(x2, pre2), pl.row_expand_mul(x3, pre3)),
-                )
-                x_mixed_view = pl.store(
-                    pl.cast(y_tile, target_type=pl.BF16, mode="rint"),
-                    [t0, d0],
-                    x_mixed_view,
-                )
+                x0 = pl.cast(x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                x1 = pl.cast(x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                x2 = pl.cast(x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                x3 = pl.cast(x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                y0 = pl.row_expand_mul(x0, pre0)
+                y1 = pl.row_expand_mul(x1, pre1)
+                y2 = pl.row_expand_mul(x2, pre2)
+                y3 = pl.row_expand_mul(x3, pre3)
+                y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+                x_mixed_view[t0:t0 + T_TILE, d0:d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
     x_mixed = pl.reshape(x_mixed_view, [B, S, D])
     return x_mixed
 
