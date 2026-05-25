@@ -67,6 +67,10 @@ HEAD_ROWS = IDX_N_HEADS * HEAD_GROUP
 # qr_hadamard_quant), so they fold at a larger group in their own loop.
 HEAD_GROUP_ROPE = 4 if T >= 4 else HEAD_GROUP
 HEAD_ROWS_ROPE = IDX_N_HEADS * HEAD_GROUP_ROPE
+# Inner row-chunk for the mix-fused rope_slice: matmul+cast per ROPE_ROW_CHUNK rows so
+# the fused acc+epilogue fits 192KB Vec at GRP=4 (vs whole HEAD_ROWS_ROPE at once = 344KB).
+ROPE_ROW_CHUNK = IDX_N_HEADS
+assert HEAD_ROWS_ROPE % ROPE_ROW_CHUNK == 0, "HEAD_ROWS_ROPE must be divisible by ROPE_ROW_CHUNK"
 assert (T * IDX_N_HEADS) % HEAD_ROWS_ROPE == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS_ROPE"
 # Fold SCORE_B_GROUP batches into one task in the per-(batch, cache-block) score loop.
 SCORE_B_GROUP = 8 if B >= 8 else B
@@ -145,41 +149,47 @@ def indexer(
     # rows. All ops are per-row independent and cos/sin are shared across tokens,
     # so the taller tiles are numerically identical to the per-token form.
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_ROPE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
-            even_acc = pl.create_tensor([HEAD_ROWS_ROPE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            odd_acc = pl.create_tensor([HEAD_ROWS_ROPE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
-                r0 = rb * ROPE_CHUCK
-                qr_proj_rope_tile = qr_proj_flat[o0 : o0 + HEAD_ROWS_ROPE, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
-                even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
-                odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
-                if r0 == 0:
-                    even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
-                    odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
-                else:
-                    even_acc = pl.matmul_acc(even_acc, qr_proj_rope_tile, even_select_tile)
-                    odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
+        # Mix: select matmul (cube, FP32-out) + cos/sin rotate cast (vector) in one scope.
+        # GRP=4 stays, but the fused acc+epilogue is inner-chunked over ROPE_ROW_CHUNK
+        # rows so each tile is small (~16KB Vec); rows are independent so this is
+        # numerically identical to the whole-group form.
+        rope_even_acc = pl.create_tensor([HEAD_ROWS_ROPE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        rope_odd_acc = pl.create_tensor([HEAD_ROWS_ROPE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_slice"):
+            for ro in pl.range(0, HEAD_ROWS_ROPE, ROPE_ROW_CHUNK):
+                even_acc = pl.create_tensor([ROPE_ROW_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+                odd_acc = pl.create_tensor([ROPE_ROW_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+                for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
+                    r0 = rb * ROPE_CHUCK
+                    qr_proj_rope_tile = qr_proj_flat[o0 + ro : o0 + ro + ROPE_ROW_CHUNK, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
+                    even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
+                    odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
+                    if r0 == 0:
+                        even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
+                        odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
+                    else:
+                        even_acc = pl.matmul_acc(even_acc, qr_proj_rope_tile, even_select_tile)
+                        odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
+                rope_even_acc[ro : ro + ROPE_ROW_CHUNK, :] = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos), pl.col_expand_mul(odd_acc, sin)), target_type=pl.BF16, mode="rint")
+                rope_odd_acc[ro : ro + ROPE_ROW_CHUNK, :] = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos), pl.col_expand_mul(odd_acc, sin)), target_type=pl.BF16, mode="rint")
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
-            rope_acc = pl.create_tensor([HEAD_ROWS_ROPE, ROPE_HEAD_DIM], dtype=pl.FP32)
-            for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
-                ra_0 = ra_b * ROPE_CHUCK
-                rope_even_tile = rope_even_acc[0 : HEAD_ROWS_ROPE, ra_0 : ra_0 + ROPE_CHUCK]
-                rope_odd_tile = rope_odd_acc[0 : HEAD_ROWS_ROPE, ra_0 : ra_0 + ROPE_CHUCK]
-                even_select_tile_t = even_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-                odd_select_tile_t = odd_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-                if ra_0 == 0:
-                    rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
-                else:
-                    rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
-                rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-            qr_rope_out[o0 : o0 + HEAD_ROWS_ROPE, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
+        # Mix: assemble matmul (cube, FP32-out) + final BF16 cast (vector) in one scope.
+        # rope_acc never round-trips GM; merging drops the assemble->write handshake.
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_assemble"):
+            for ro in pl.range(0, HEAD_ROWS_ROPE, ROPE_ROW_CHUNK):
+                rope_acc = pl.create_tensor([ROPE_ROW_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32)
+                for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
+                    ra_0 = ra_b * ROPE_CHUCK
+                    rope_even_tile = rope_even_acc[ro : ro + ROPE_ROW_CHUNK, ra_0 : ra_0 + ROPE_CHUCK]
+                    rope_odd_tile = rope_odd_acc[ro : ro + ROPE_ROW_CHUNK, ra_0 : ra_0 + ROPE_CHUCK]
+                    even_select_tile_t = even_select[:, ra_0 : ra_0 + ROPE_CHUCK]
+                    odd_select_tile_t = odd_select[:, ra_0 : ra_0 + ROPE_CHUCK]
+                    if ra_0 == 0:
+                        rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
+                    else:
+                        rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
+                    rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
+                qr_rope_out[o0 + ro : o0 + ro + ROPE_ROW_CHUNK, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
     # qr_hadamard is a cube-only matmul (output [HEAD_ROWS_ROPE, IDX_HEAD_DIM] FP32 =
     # 128KB L0C at GRP=4), so it folds at the larger rope group in its own loop.
