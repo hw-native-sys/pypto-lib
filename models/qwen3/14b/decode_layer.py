@@ -1040,12 +1040,8 @@ if __name__ == "__main__":
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_pmu=args.enable_pmu,
         ),
-        # fa_fused is a bidirectional cube<->vec mixed root. On a2a3 (hardware
-        # and sim) per-element drift stays well under 3e-3; on a5sim the
-        # Ascend950 FP path accumulates a few-thousandths of extra cross-lane
-        # drift (peak observed ~1.1-1.2e-2), so 1.5e-2 covers all platforms.
-        rtol=1.5e-2,
-        atol=1.5e-2,
+        rtol=3e-3,
+        atol=3e-3,
     )
     if not result.passed:
         if result.error:
