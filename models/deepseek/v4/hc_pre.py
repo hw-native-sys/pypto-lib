@@ -35,16 +35,12 @@ NEG_INF          = -1e20
 
 # tiling
 T_TILE           = 16
-RMS_T_TILE       = 16
 LINEAR_T_TILE    = 16
 COMB_T_TILE      = 16
 RMS_K_CHUNK      = 128
-LINEAR_K_CHUNK   = 512
+LINEAR_K_CHUNK   = 128
 D_CHUNK          = 512
-RMS_K_BLOCKS     = HC_DIM // RMS_K_CHUNK
-LINEAR_K_BLOCKS  = HC_DIM // LINEAR_K_CHUNK
 D_BLOCKS         = D // D_CHUNK
-RMS_PIPE_STAGE   = 1 if T >= 64 else 4
 
 
 @pl.jit.inline
@@ -58,105 +54,54 @@ def hc_pre(
     comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, HC_DIM])
-    post_flat = pl.reshape(post, [T * HC_MULT])
-    comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
-    inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
-    mix_raw = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
-    pre_val_store = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
-
-    for t0 in pl.parallel(0, T, RMS_T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms"):
-            sq_sum = pl.full([1, RMS_T_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.pipeline(RMS_K_BLOCKS, stage=RMS_PIPE_STAGE):
-                k0 = kb * RMS_K_CHUNK
-                x_chunk = pl.cast(
-                    pl.slice(x_flat, [RMS_T_TILE, RMS_K_CHUNK], [t0, k0]),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, RMS_T_TILE]),
-                )
-            inv_rms_val = pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True)
-            inv_rms = pl.assemble(inv_rms, inv_rms_val, [0, t0])
-
     for t0 in pl.parallel(0, T, LINEAR_T_TILE):
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
-            name_hint="linear",
-        ):
-            x_lin_0 = pl.cast(
-                pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, 0]),
-                target_type=pl.FP32,
-            )
-            w_lin_0 = pl.slice(
-                hc_fn,
-                [MIX_PAD, LINEAR_K_CHUNK],
-                [0, 0],
-                valid_shape=[MIX_HC, LINEAR_K_CHUNK],
-            )
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear"):
+            sq_sum = pl.full([1, LINEAR_T_TILE], dtype=pl.FP32, value=0.0)
+
+            x_lin_0 = pl.cast(x_flat[t0:t0 + LINEAR_T_TILE, 0:LINEAR_K_CHUNK], target_type=pl.FP32)
+            x_sq_0 = pl.mul(x_lin_0, x_lin_0)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(x_sq_0), [1, LINEAR_T_TILE]))
+            w_lin_0 = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, 0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
             mix_acc = pl.matmul(x_lin_0, w_lin_0, b_trans=True, out_dtype=pl.FP32)
-            for kb in pl.pipeline(1, LINEAR_K_BLOCKS, stage=2):
+
+            for kb in pl.pipeline(1, HC_DIM // LINEAR_K_CHUNK, stage=2):
                 kl0 = kb * LINEAR_K_CHUNK
-                x_lin = pl.cast(
-                    pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, kl0]),
-                    target_type=pl.FP32,
-                )
-                w_lin = pl.slice(
-                    hc_fn,
-                    [MIX_PAD, LINEAR_K_CHUNK],
-                    [0, kl0],
-                    valid_shape=[MIX_HC, LINEAR_K_CHUNK],
-                )
+                x_lin = pl.cast(x_flat[t0:t0 + LINEAR_T_TILE, kl0:kl0 + LINEAR_K_CHUNK], target_type=pl.FP32)
+                x_sq = pl.mul(x_lin, x_lin)
+                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(x_sq), [1, LINEAR_T_TILE]))
+                w_lin = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, kl0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
                 mix_acc = pl.matmul_acc(mix_acc, x_lin, w_lin, b_trans=True)
-            mix_raw = pl.assemble(mix_raw, mix_acc, [t0, 0])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear_scale"):
-        mixes = pl.assemble(
-            mixes,
-            pl.row_expand_mul(pl.slice(mix_raw, [T, MIX_PAD], [0, 0]), pl.reshape(inv_rms, [T, 1])),
-            [0, 0],
-        )
+            mean_sq = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
+            inv_rms_val = pl.rsqrt(mean_sq, high_precision=True)
+            inv_rms_col = pl.reshape(inv_rms_val, [LINEAR_T_TILE, 1])
+            mixes[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc, inv_rms_col)
 
-    comb_logits = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_pre_post"):
         scale0 = pl.tensor.read(hc_scale, [0])
         scale1 = pl.tensor.read(hc_scale, [1])
         scale2 = pl.tensor.read(hc_scale, [2])
 
-        ones_hc = pl.full([T, HC_PAD], dtype=pl.FP32, value=1.0)
-        pre_base = pl.reshape(pl.slice(hc_base, [HC_PAD], [0]), [1, HC_PAD])
-        pre_logits = pl.add(
-            pl.mul(pl.slice(mixes, [T, HC_PAD], [0, 0]), scale0),
-            pl.col_expand_mul(ones_hc, pre_base),
-        )
-        pre_val = pl.add(pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0)), HC_EPS)
-        pre_val_store = pl.assemble(pre_val_store, pre_val, [0, 0])
+        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        pre_scaled = pl.mul(mixes[0:T, 0:HC_PAD], scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+        pre_val_store = pl.add(pre_sig, HC_EPS)
 
-        post_base = pl.reshape(pl.slice(hc_base, [HC_PAD], [HC_MULT]), [1, HC_PAD])
-        post_logits = pl.add(
-            pl.mul(pl.slice(mixes, [T, HC_PAD], [0, HC_MULT]), scale1),
-            pl.col_expand_mul(ones_hc, post_base),
-        )
-        post_pad = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
+        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
+        post_scaled = pl.mul(mixes[0:T, HC_MULT:HC_MULT + HC_PAD], scale1)
+        post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+        post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
+        post_pad = pl.mul(post_sig, 2.0)
 
-        ones_comb = pl.full([T, HC_MULT * HC_MULT], dtype=pl.FP32, value=1.0)
-        comb_base = pl.reshape(
-            pl.slice(hc_base, [HC_MULT * HC_MULT], [HC_MULT * 2]),
-            [1, HC_MULT * HC_MULT],
-        )
-        comb_mix = pl.slice(mixes, [T, HC_MULT * HC_MULT], [0, HC_MULT * 2])
-        comb_logits_val = pl.add(
-            pl.mul(comb_mix, scale2),
-            pl.col_expand_mul(ones_comb, comb_base),
-        )
-        comb_logits = pl.assemble(comb_logits, comb_logits_val, [0, 0])
+        comb_base = pl.reshape(hc_base[HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], [1, HC_MULT * HC_MULT])
+        comb_scaled = pl.mul(mixes[0:T, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], scale2)
+        comb_logits = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
 
     post_pad_flat = pl.reshape(post_pad, [T * HC_PAD])
 
+    pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
         for t0 in pl.range(0, T, T_TILE):
             pre_tile = pl.load(
@@ -168,6 +113,7 @@ def hc_pre(
             pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
             pre_val_t = pl.store(pre_tile_t, [0, t0], pre_val_t)
 
+    comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
     for t0 in pl.parallel(0, T, COMB_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="comb_sinkhorn"):
             row0 = pl.fillpad(pl.load(
@@ -223,7 +169,7 @@ def hc_pre(
             row2_cur = pl.div(row2_eff, col_sum)
             row3_cur = pl.div(row3_eff, col_sum)
 
-            for _ in pl.unroll(HC_SINKHORN_ITER - 1):
+            for sk_it in pl.range(HC_SINKHORN_ITER - 1):
                 row0_norm = pl.row_expand_div(row0_cur, pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS))
                 row1_norm = pl.row_expand_div(row1_cur, pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS))
                 row2_norm = pl.row_expand_div(row2_cur, pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS))
@@ -259,6 +205,7 @@ def hc_pre(
                         pl.read(row3_cur, [ti, c]),
                     )
 
+    post_flat = pl.reshape(post, [T * HC_MULT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_post"):
         for token_idx in pl.range(0, T, 1):
             for h in pl.unroll(HC_MULT):
