@@ -108,23 +108,43 @@ def validate_golden(
         )
 
 
-def topk_pair_compare(vals_name: str) -> Callable:
-    """Return a comparator for top-k outputs that is robust to score ties.
+def topk_pair_compare(
+    vals_name: str,
+    *,
+    dim: int = -1,
+    descending: bool = True,
+    max_show: int = 10,
+) -> Callable:
+    """Return a comparator for top-k idx outputs that tolerates score-tie swaps.
 
     For a top-k operation that emits both an index tensor and a paired value
     tensor, kernel-vs-golden index mismatches are legal whenever the picked
-    score sets are equivalent — e.g. when INT8 quantization collapses several
-    candidates onto the same score.
+    candidate's score is tied with its neighbors — e.g. when INT8 quantization
+    collapses several candidates onto the same score.
 
-    The returned comparator looks up the paired value tensors (kernel and
-    golden) by ``vals_name`` and checks that, per row, the values are equal
-    after sorting. This passes legal tie-break swaps and fails real misses
-    (where one side picked a strictly lower-scoring candidate).
+    The returned comparator first does a position-wise idx compare. For each
+    position ``i`` where ``actual_idx[i] != expected_idx[i]``, it verifies
+    that ``actual_vals`` is still monotonically ordered across ``i`` along
+    ``dim`` (descending if ``descending=True``, otherwise ascending) within
+    tolerance. A legal tie-swap preserves that order; a real miss — kernel
+    picked a strictly worse-scoring candidate at position ``i`` — breaks it.
 
-    Use it for the index tensor; the value tensor itself can stay on the
-    default ``allclose`` path because top-k outputs are conventionally
-    emitted in descending score order, so equivalent score sets line up
-    positionally.
+    The paired ``vals`` output stays on the default ``allclose`` path and is
+    what catches "kernel reported a worse score than golden"; this comparator
+    only adjudicates idx differences and intentionally does not consult
+    ``expected_vals``.
+
+    Parameters
+    ----------
+    vals_name : name of the paired score tensor in the outputs dict.
+    dim : axis along which the top-k is sorted (default ``-1``).
+    descending : whether ``actual_vals`` is expected to be in descending order
+        along ``dim`` (default ``True``).
+    max_show : maximum number of per-position diagnostics to print on failure.
+
+    On failure, up to ``max_show`` per-position diagnostics are printed:
+    tensor coordinate, actual_idx, expected_idx, the actual score, and the
+    surrounding a_vals window along ``dim``.
 
         compare_fn = {
             "topk_idx_out": topk_pair_compare("topk_vals_out"),
@@ -140,32 +160,93 @@ def topk_pair_compare(vals_name: str) -> Callable:
         rtol: float,
         atol: float,
     ) -> tuple[bool, str]:
-        if vals_name not in actual_outputs or vals_name not in expected_outputs:
+        if vals_name not in actual_outputs:
             return False, (
                 f"    compare_fn misconfigured: vals_name='{vals_name}' not found "
-                f"(outputs={list(actual_outputs)}, golden={list(expected_outputs)})"
+                f"in actual outputs={list(actual_outputs)}"
             )
+        a_idx = actual.cpu()
+        e_idx = expected.cpu()
         a_vals = actual_outputs[vals_name].cpu().to(torch.float32)
-        e_vals = expected_outputs[vals_name].cpu().to(torch.float32)
-        if a_vals.shape != e_vals.shape:
-            return False, f"    vals shape mismatch: {tuple(a_vals.shape)} vs {tuple(e_vals.shape)}"
-        a_sorted = torch.sort(a_vals, dim=-1, descending=True).values
-        e_sorted = torch.sort(e_vals, dim=-1, descending=True).values
-        ok = torch.allclose(a_sorted, e_sorted, rtol=rtol, atol=atol)
-        if ok:
+        if a_idx.shape != e_idx.shape:
+            return False, f"    idx shape mismatch: {tuple(a_idx.shape)} vs {tuple(e_idx.shape)}"
+        if a_idx.shape != a_vals.shape:
+            return False, (
+                f"    idx/vals shape mismatch: idx={tuple(a_idx.shape)} "
+                f"vs vals={tuple(a_vals.shape)}"
+            )
+        ndim = a_idx.dim()
+        dim_pos = dim if dim >= 0 else dim + ndim
+        if not 0 <= dim_pos < ndim:
+            return False, f"    dim={dim} out of range for shape {tuple(a_idx.shape)}"
+        a_idx_m = a_idx.movedim(dim_pos, -1)
+        e_idx_m = e_idx.movedim(dim_pos, -1)
+        a_vals_m = a_vals.movedim(dim_pos, -1)
+        orig_shape = tuple(a_idx.shape)
+        leading_axes = [d for d in range(ndim) if d != dim_pos]
+        leading_shape = tuple(orig_shape[d] for d in leading_axes)
+        a_idx_2d = a_idx_m.reshape(-1, a_idx_m.shape[-1])
+        e_idx_2d = e_idx_m.reshape(-1, e_idx_m.shape[-1])
+        a_vals_2d = a_vals_m.reshape(-1, a_vals_m.shape[-1])
+        n_rows, k = a_idx_2d.shape
+
+        def _coord(r: int, pos: int) -> str:
+            coords_leading: list[int] = []
+            rem = r
+            for sz in reversed(leading_shape):
+                coords_leading.append(rem % sz)
+                rem //= sz
+            coords_leading.reverse()
+            full = [0] * ndim
+            for idx_pos, axis in enumerate(leading_axes):
+                full[axis] = coords_leading[idx_pos]
+            full[dim_pos] = pos
+            return "[" + ",".join(str(c) for c in full) + "]"
+
+        mismatch_mask = a_idx_2d != e_idx_2d
+        if not mismatch_mask.any().item():
             return True, ""
-        diff = (a_sorted - e_sorted).abs()
-        flat_diff = diff.reshape(-1, diff.shape[-1])
-        b_worst = int(flat_diff.amax(dim=-1).argmax().item())
-        a_row = a_sorted.reshape(-1, a_sorted.shape[-1])[b_worst]
-        e_row = e_sorted.reshape(-1, e_sorted.shape[-1])[b_worst]
-        worst_diff = float((a_row - e_row).abs().max().item())
-        return False, (
-            f"    top-k pair mismatch via '{vals_name}' "
-            f"(rtol={rtol} atol={atol}): worst row={b_worst} max_diff={worst_diff:.6g}\n"
-            f"      actual_sorted  = {a_row.tolist()}\n"
-            f"      expected_sorted= {e_row.tolist()}"
-        )
+
+        if k >= 2:
+            left_slc = a_vals_2d[:, :-1]
+            right_slc = a_vals_2d[:, 1:]
+            pair_ok = (left_slc >= right_slc) if descending else (left_slc <= right_slc)
+            left_ok = torch.ones_like(mismatch_mask)
+            left_ok[:, 1:] = pair_ok  # position i: pair (i-1, i)
+            right_ok = torch.ones_like(mismatch_mask)
+            right_ok[:, :-1] = pair_ok  # position i: pair (i, i+1)
+            pos_ok = left_ok & right_ok
+        else:
+            pos_ok = torch.ones_like(mismatch_mask)
+        fail_mask = mismatch_mask & ~pos_ok
+        if not fail_mask.any().item():
+            return True, ""
+
+        fail_rc = fail_mask.nonzero(as_tuple=False)
+        n_fail = fail_rc.shape[0]
+        order_word = "descending" if descending else "ascending"
+        lines = [
+            f"    top-k idx mismatch via '{vals_name}' "
+            f"(dim={dim} order={order_word}): "
+            f"{n_fail} position(s) where a_vals breaks {order_word} order at the mismatch"
+        ]
+        for i in range(min(n_fail, max_show)):
+            r = int(fail_rc[i, 0].item())
+            pos = int(fail_rc[i, 1].item())
+            lo = max(0, pos - 1)
+            hi = min(k, pos + 2)
+            local = a_vals_2d[r, lo:hi].tolist()
+            local_str = ", ".join(f"{v:.6g}" for v in local)
+            lines.append(
+                f"      {_coord(r, pos)} "
+                f"actual_idx={int(a_idx_2d[r, pos].item())} "
+                f"expected_idx={int(e_idx_2d[r, pos].item())} "
+                f"actual_score={float(a_vals_2d[r, pos].item()):.6g} "
+                f"actual_vals[{lo}:{hi}]=[{local_str}]"
+            )
+        if n_fail > max_show:
+            lines.append(f"      ... and {n_fail - max_show} more")
+        return False, "\n".join(lines)
     cmp.__name__ = "topk_pair_compare"
     return cmp
 

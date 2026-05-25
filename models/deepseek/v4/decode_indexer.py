@@ -595,6 +595,7 @@ def build_tensor_specs():
 
 if __name__ == "__main__":
     import argparse
+    import torch
     from golden import ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser()
@@ -604,6 +605,27 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+
+    # topk_pair_compare expects a tensor whose [..., i] entry is the score paired
+    # with idx[..., i] (sorted along the top-k axis). Here `score` is per-key
+    # (input-space) so it isn't pre-sorted; recover the paired scores on the fly
+    # by gathering `score[topk_idxs - OFFSET]` over the valid first IDX_TOPK
+    # slots, then delegate.
+    def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        score = actual_outputs["score"]
+        a_top = actual[..., :IDX_TOPK]
+        e_top = expected[..., :IDX_TOPK]
+        a_orig = (a_top.long() - OFFSET).clamp(min=0, max=score.shape[-1] - 1)
+        paired = torch.gather(score, dim=-1, index=a_orig)
+        synth_actual = {**actual_outputs, "_topk_paired_scores": paired}
+        return topk_pair_compare("_topk_paired_scores")(
+            a_top, e_top,
+            actual_outputs=synth_actual,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol, atol=atol,
+        )
+    topk_idxs_compare.__name__ = "topk_pair_compare"
 
     result = run_jit(
         fn=indexer_test,
@@ -619,7 +641,7 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "topk_idxs":    topk_pair_compare("score"),
+            "topk_idxs":    topk_idxs_compare,
             "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
         },
     )

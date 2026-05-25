@@ -212,29 +212,33 @@ class TestTopkPairCompare:
         assert ok
 
     def test_real_miss_fails(self):
-        """If one side picked a strictly lower-scoring candidate, fail."""
-        idx_actual = torch.tensor([[0, 1, 2]], dtype=torch.int32)
-        idx_expected = torch.tensor([[0, 1, 2]], dtype=torch.int32)
-        vals_actual = torch.tensor([[3.0, 2.0, 0.5]])    # picked a 0.5
-        vals_expected = torch.tensor([[3.0, 2.0, 1.0]])  # had a 1.0 there
+        """Mismatch at a position where a_vals breaks descending order → fail."""
+        idx_actual   = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[0, 1, 3]], dtype=torch.int32)
+        # Pair (1, 2): 0.5 < 1.0 — kernel's own output is not descending at the
+        # mismatched position, so the pick at pos 2 cannot be a legal tie-swap.
+        a_vals = torch.tensor([[3.0, 0.5, 1.0]])
 
         cmp = topk_pair_compare("vals")
         ok, detail = cmp(
             idx_actual, idx_expected,
-            actual_outputs={"vals": vals_actual},
-            expected_outputs={"vals": vals_expected},
+            actual_outputs={"vals": a_vals},
+            expected_outputs={"vals": a_vals.clone()},
             inputs={},
             rtol=1e-3, atol=1e-3,
         )
         assert not ok
-        assert "top-k pair mismatch" in detail
-        assert "0.5" in detail and "1.0" in detail
+        assert "top-k idx mismatch" in detail
+        assert "actual_idx=2" in detail
+        assert "expected_idx=3" in detail
+        assert "[0,2]" in detail  # multi-dim coord
 
-    def test_within_tolerance_passes(self):
-        """Score sets within rtol/atol pass even if not bit-exact."""
+    def test_idx_match_short_circuits_without_vals_check(self):
+        """When idx matches position-wise, vals are not consulted at all."""
         idx = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        # vals differ wildly, but the comparator never looks at vals when idx matches.
         vals_a = torch.tensor([[3.0, 2.0, 1.0]])
-        vals_b = torch.tensor([[3.0005, 2.0005, 1.0005]])
+        vals_b = torch.tensor([[100.0, -1.0, 50.0]])
 
         cmp = topk_pair_compare("vals")
         ok, _ = cmp(
@@ -295,21 +299,86 @@ class TestTopkPairCompare:
         assert "misconfigured" in detail
         assert "typo_vals" in detail
 
-    def test_ndim_greater_than_two(self):
-        """Helper handles vals with leading rank > 1 (e.g. [B, H, K])."""
-        idx = torch.zeros((2, 3, 4), dtype=torch.int32)
-        vals_a = torch.arange(24.0).reshape(2, 3, 4)
-        # Permute the last dim per row — same set, different order, must pass.
-        vals_b = vals_a.flip(dims=[-1]).contiguous()
+    def test_ndim_greater_than_two_uses_multi_dim_coord(self):
+        """Failure diagnostics use original tensor axes for the coordinate."""
+        # Shape [2, 1, 3]: batch 1 has a mismatch at last-dim position 2
+        # with a_vals broken across that position.
+        idx_actual   = torch.tensor([[[0, 1, 2]], [[0, 1, 2]]], dtype=torch.int32)
+        idx_expected = torch.tensor([[[0, 1, 2]], [[0, 1, 3]]], dtype=torch.int32)
+        a_vals = torch.tensor([[[3.0, 2.0, 1.0]], [[3.0, 0.5, 1.0]]])
+
         cmp = topk_pair_compare("vals")
-        ok, _ = cmp(
-            idx, idx,
-            actual_outputs={"vals": vals_a},
-            expected_outputs={"vals": vals_b},
+        ok, detail = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": a_vals},
+            expected_outputs={"vals": a_vals.clone()},
             inputs={},
-            rtol=1e-5, atol=1e-5,
+            rtol=1e-3, atol=1e-3,
+        )
+        assert not ok
+        assert "[1,0,2]" in detail  # original-axis coord
+
+    def test_dim_parameter(self):
+        """Top-k sorted along a non-last axis is handled via ``dim``."""
+        # Shape [3, 4]: top-k along dim=0 with descending order per column.
+        # Column 0 has a tie 8.0 == 8.0 between rows 1 and 2 — kernel may
+        # swap their idx legally.
+        idx_actual = torch.tensor(
+            [[0, 0, 0, 0],
+             [1, 1, 1, 1],
+             [2, 2, 2, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor(
+            [[0, 0, 0, 0],
+             [2, 1, 1, 1],
+             [1, 2, 2, 2]], dtype=torch.int32)
+        a_vals = torch.tensor(
+            [[9.0, 9.0, 9.0, 9.0],
+             [8.0, 8.0, 8.0, 8.0],
+             [8.0, 7.0, 7.0, 7.0]])
+
+        cmp = topk_pair_compare("vals", dim=0)
+        ok, _ = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": a_vals},
+            expected_outputs={"vals": a_vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
         )
         assert ok
+
+    def test_descending_false_passes_on_ascending_tie(self):
+        """Ascending top-k passes when a_vals is ascending across mismatches."""
+        idx_actual   = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[2, 1, 0]], dtype=torch.int32)
+        a_vals = torch.tensor([[1.0, 2.0, 3.0]])  # ascending
+
+        cmp = topk_pair_compare("vals", descending=False)
+        ok, _ = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": a_vals},
+            expected_outputs={"vals": a_vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert ok
+
+    def test_descending_false_broken_fails(self):
+        """Ascending top-k with order broken at a mismatch fails."""
+        idx_actual   = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+        idx_expected = torch.tensor([[0, 1, 3]], dtype=torch.int32)
+        # Pair (1, 2): 3.0 > 2.0 — ascending broken at the mismatch.
+        a_vals = torch.tensor([[1.0, 3.0, 2.0]])
+
+        cmp = topk_pair_compare("vals", descending=False)
+        ok, detail = cmp(
+            idx_actual, idx_expected,
+            actual_outputs={"vals": a_vals},
+            expected_outputs={"vals": a_vals.clone()},
+            inputs={},
+            rtol=1e-3, atol=1e-3,
+        )
+        assert not ok
+        assert "ascending" in detail
 
     def test_bfloat16_vals(self):
         """BF16 vals work — helper promotes to float32 internally."""
