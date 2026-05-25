@@ -36,7 +36,7 @@ def build_softmax_program(
             x: pl.Tensor[[rows, cols], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for r in pl.parallel(0, rows, row_chunk, chunk=1):
                     tile_x = pl.slice(x, [row_chunk, cols], [r, 0])
 

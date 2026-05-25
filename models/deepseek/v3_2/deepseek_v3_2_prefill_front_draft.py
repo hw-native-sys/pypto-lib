@@ -139,7 +139,7 @@ def build_deepseek_v3_2_prefill_front_program(
             w_latent_to_v: pl.Tensor[[NUM_HEADS_CFG, KV_LORA_RANK_CFG, V_HEAD_DIM_CFG], pl.BF16],
             dispatch_buf: pl.Tensor[[EP_NODES_CFG, BATCH_CFG, MAX_SEQ_CFG, ATTN_OUT_CFG], pl.BF16],
         ) -> pl.Tensor[[EP_NODES_CFG, BATCH_CFG, MAX_SEQ_CFG, ATTN_OUT_CFG], pl.BF16]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 layer_id = pl.tensor.read(layer_id_t, [0])
 
                 for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):

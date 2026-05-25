@@ -99,7 +99,7 @@ def qkv_proj_rope(
 
     # Stage 0.1: attn_norm RMS — parallel partial sum (Opt S).
     # Single-task serial reduce was ~93us at S=2; split into ATTN_RMS_PARTIALS
-    # workers + a small final reduce. chunked_loop_optimizer is REQUIRED here:
+    # workers + a small final reduce. auto_chunk is REQUIRED here:
     # without it the inner pl.range tile allocations accumulate and exceed the
     # 192KB Vec UB at S=2/T=128 (verified by compile failure during tuning).
     # PARTIALS=2 (not 4+) keeps the FP32 add associativity-free, preserving `q`
@@ -107,7 +107,7 @@ def qkv_proj_rope(
     D_BLOCKS_PER_PARTIAL = D_BLOCKS // ATTN_RMS_PARTIALS
     x_sq_partial = pl.create_tensor([ATTN_RMS_PARTIALS, T], dtype=pl.FP32)
     for wg in pl.parallel(0, ATTN_RMS_PARTIALS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="attn_norm_rms_partial"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="attn_norm_rms_partial"):
             rms_d_base = wg * D_BLOCKS_PER_PARTIAL * D_CHUNK
             local_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
             for rms_db in pl.range(D_BLOCKS_PER_PARTIAL):
@@ -156,11 +156,11 @@ def qkv_proj_rope(
 
     # Stage 2.1: qr_rms — same partial-sum pattern as attn_norm_rms (Opt U).
     # Inner loop is cast-free (qr_fp32 is already FP32) so Vec pressure is lower
-    # than attn_norm_rms_partial, but chunked_loop_optimizer is kept for parity.
+    # than attn_norm_rms_partial, but auto_chunk is kept for parity.
     Q_BLOCKS_PER_QR_PARTIAL = Q_BLOCKS // QR_RMS_PARTIALS
     qr_sq_partial = pl.create_tensor([QR_RMS_PARTIALS, T], dtype=pl.FP32)
     for wgr in pl.parallel(0, QR_RMS_PARTIALS, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="qr_rms_partial"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="qr_rms_partial"):
             qr_rms_q_base = wgr * Q_BLOCKS_PER_QR_PARTIAL * Q_LORA_CHUNK
             qr_local_sum = pl.full([1, T], dtype=pl.FP32, value=0.0)
             for qr_rms_qb in pl.range(Q_BLOCKS_PER_QR_PARTIAL):

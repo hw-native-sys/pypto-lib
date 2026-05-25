@@ -43,7 +43,7 @@ def hc_post(
     y_flat = pl.reshape(y, [T, HC_DIM])
 
     for out_h in pl.parallel(HC_MULT):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hc_post"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="hc_post"):
             for t in pl.parallel(0, T, 1, chunk=16):
                 post_w = pl.read(post_flat, [t * HC_MULT + out_h])
                 for db in pl.range(D_BLOCKS):

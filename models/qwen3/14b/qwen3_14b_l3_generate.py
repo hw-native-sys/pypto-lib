@@ -247,7 +247,7 @@ def build_qwen3_14b_l3_generate_program(
                                 )
 
                         q_proj_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_q_proj"):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_q_proj"):
                             for ob in pl.parallel(q_out_blocks, chunk=4):
                                 q0 = ob * Q_OUT_CHUNK
                                 tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
@@ -264,7 +264,7 @@ def build_qwen3_14b_l3_generate_program(
 
                         k_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
                         v_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_kv_proj"):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_kv_proj"):
                             for ob in pl.parallel(kv_out_blocks, chunk=4):
                                 kv0 = ob * KV_OUT_CHUNK
                                 tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
@@ -291,7 +291,7 @@ def build_qwen3_14b_l3_generate_program(
                                     v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
                                 v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
 
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_q_norm"):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_q_norm"):
                             for qh in pl.parallel(0, num_heads, chunk=num_heads):
                                 q_col = qh * head_dim
                                 q_head = pl.slice(q_proj_tile, [TOK_TILE, head_dim], [0, q_col])
@@ -299,7 +299,7 @@ def build_qwen3_14b_l3_generate_program(
                                 q_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_sq, head_dim_inv), EPS)))
                                 q_normed = pl.col_expand_mul(pl.row_expand_mul(q_head, q_inv_rms), q_norm_w)
                                 q_proj_tile = pl.assemble(q_proj_tile, q_normed, [0, q_col])
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_k_norm"):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_k_norm"):
                             for kh in pl.parallel(0, num_kv_heads, chunk=num_kv_heads):
                                 k_col = kh * head_dim
                                 k_head = pl.slice(k_proj_tile, [TOK_TILE, head_dim], [0, k_col])
@@ -324,7 +324,7 @@ def build_qwen3_14b_l3_generate_program(
                             all_q_padded = pl.create_tensor(
                                 [total_q_groups * Q_HEAD_PAD, head_dim], dtype=pl.BF16
                             )
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_q_pad"):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_q_pad"):
                                 for gi in pl.parallel(0, total_q_groups, chunk=total_q_groups):
                                     all_q_padded = pl.assemble(
                                         all_q_padded,
@@ -343,7 +343,7 @@ def build_qwen3_14b_l3_generate_program(
                             )
                             cache_slot_block = cache_slot // BLOCK_SIZE
                             cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_rope_kv_cache"):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_rope_kv_cache"):
                                 for ki in pl.parallel(0, num_kv_heads, chunk=8):
                                     kv_col = ki * head_dim
                                     k_lo = pl.reshape(
@@ -444,7 +444,7 @@ def build_qwen3_14b_l3_generate_program(
                                     [max_ctx_blocks * Q_HEAD_BATCH_PAD, 1], dtype=pl.FP32
                                 )
 
-                                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_qk_matmul"):
+                                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_qk_matmul"):
                                     for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                         block_table_idx = b * max_blocks_per_seq + sb
                                         pbid = pl.cast(
@@ -463,7 +463,7 @@ def build_qwen3_14b_l3_generate_program(
                                             all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0]
                                         )
 
-                                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_softmax"):
+                                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_softmax"):
                                     for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                         s0 = sb * SEQ_TILE
                                         valid_len = pl.min(SEQ_TILE, ctx_len - s0)
@@ -493,7 +493,7 @@ def build_qwen3_14b_l3_generate_program(
                                             all_cur_li, cur_li, [sb * Q_HEAD_BATCH_PAD, 0]
                                         )
 
-                                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_sv_matmul"):
+                                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_sv_matmul"):
                                     for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                         block_table_idx = b * max_blocks_per_seq + sb
                                         pbid = pl.cast(
@@ -669,7 +669,7 @@ def build_qwen3_14b_l3_generate_program(
                                     )
                                     up_acc = pl.matmul_acc(up_acc, pci, wui)
 
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="prefill_silu"):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="prefill_silu"):
                                 sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                                 mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                                 mlp_silu_tile = pl.assemble(
@@ -832,7 +832,7 @@ def build_qwen3_14b_l3_generate_program(
                                 [0, k0],
                             )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_q_proj"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_q_proj"):
                         for ob in pl.parallel(q_out_blocks, chunk=4):
                             q0 = ob * Q_OUT_CHUNK
                             tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
@@ -851,7 +851,7 @@ def build_qwen3_14b_l3_generate_program(
                                 q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
                             q_proj = pl.assemble(q_proj, q_acc, [b0, q0])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_kv_proj"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_kv_proj"):
                         for ob in pl.parallel(kv_out_blocks, chunk=4):
                             kv0 = ob * KV_OUT_CHUNK
                             tile_a = pl.slice(normed_tile, [BATCH_TILE, SCOPE1_K_CHUNK], [0, 0])
@@ -942,7 +942,7 @@ def build_qwen3_14b_l3_generate_program(
                     sin_lo = pl.slice(sin_row, [1, half_dim], [0, 0])
                     sin_hi = pl.slice(sin_row, [1, half_dim], [0, half_dim])
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_rope_kv_cache"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_rope_kv_cache"):
                         for ki in pl.parallel(0, num_kv_heads, chunk=8):
                             kv_col = ki * head_dim
                             cache_row = (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
@@ -1025,7 +1025,7 @@ def build_qwen3_14b_l3_generate_program(
                         [total_q_groups * max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32,
                     )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_qk_matmul"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_qk_matmul"):
                         for gi in pl.range(total_q_groups):
                             kvh = gi // q_groups
                             q_padded = pl.slice(
@@ -1048,7 +1048,7 @@ def build_qwen3_14b_l3_generate_program(
                                     [(gi * max_ctx_blocks + sb) * Q_HEAD_PAD, 0],
                                 )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_softmax"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_softmax"):
                         for gi in pl.range(total_q_groups):
                             for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                 s0 = sb * BLOCK_SIZE
@@ -1079,7 +1079,7 @@ def build_qwen3_14b_l3_generate_program(
                                     [(gi * max_ctx_blocks + sb) * Q_HEAD_PAD, 0],
                                 )
 
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_sv_matmul"):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_sv_matmul"):
                         for gi in pl.range(total_q_groups):
                             kvh = gi // q_groups
                             for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
@@ -1239,7 +1239,7 @@ def build_qwen3_14b_l3_generate_program(
                                 )
                                 up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
 
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="decode_silu"):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="decode_silu"):
                             sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)

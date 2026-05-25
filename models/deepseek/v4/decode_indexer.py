@@ -59,7 +59,7 @@ QUANT_CHUNK = 128 if T >= 64 else 256
 # Ops are per-row independent, so this just makes the tiles HEAD_GROUP-taller (no
 # GM intermediates, bit-identical numerics). Vec buffer scales with HEAD_ROWS;
 # qr_hadamard_quant Vec buffer caps single-loop GRP at 2: GRP=4 overflows even with
-# chunked_loop_optimizer (199KB, INT8 store needs >=32-col chunk so can't shrink),
+# auto_chunk (199KB, INT8 store needs >=32-col chunk so can't shrink),
 # and GRP=8 overflows L0C (qr_hadamard_acc [GRP*64,128] FP32 = 256KB).
 HEAD_GROUP = 2 if T >= 2 else 1
 HEAD_ROWS = IDX_N_HEADS * HEAD_GROUP
@@ -267,7 +267,7 @@ def indexer(
             cache0 = cb * CACHE_TILE
             valid_len = pl.min(CACHE_TILE, cache_len - cache0)
 
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="score_quant"):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="score_quant"):
                 for bi in pl.range(SCORE_B_GROUP):
                     b = bg + bi
                     kv0 = b * IDX_KV_LEN
