@@ -54,6 +54,9 @@ def hc_pre(
     comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, HC_DIM])
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
     for t0 in pl.parallel(0, T, LINEAR_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear"):
@@ -79,10 +82,6 @@ def hc_pre(
             mixes[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc, inv_rms_col)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_pre_post"):
-        scale0 = pl.tensor.read(hc_scale, [0])
-        scale1 = pl.tensor.read(hc_scale, [1])
-        scale2 = pl.tensor.read(hc_scale, [2])
-
         pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
         pre_scaled = pl.mul(mixes[0:T, 0:HC_PAD], scale0)
         pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
@@ -102,64 +101,51 @@ def hc_pre(
     post_pad_flat = pl.reshape(post_pad, [T * HC_PAD])
 
     pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
-        for t0 in pl.range(0, T, T_TILE):
-            pre_tile = pl.load(
-                pre_val_store,
-                [t0, 0],
-                [T_TILE, HC_PAD],
-                target_memory=pl.MemorySpace.Vec,
-            )
+    for t0 in pl.parallel(0, T, LINEAR_T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
+            pre_tile = pre_val_store[t0:t0 + LINEAR_T_TILE, 0:HC_PAD]
             pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
-            pre_val_t = pl.store(pre_tile_t, [0, t0], pre_val_t)
+            pre_val_t[0:HC_PAD, t0:t0 + LINEAR_T_TILE] = pre_tile_t
 
-    comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
+    comb_flat = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     for t0 in pl.parallel(0, T, COMB_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="comb_sinkhorn"):
-            row0 = pl.fillpad(pl.load(
-                comb_logits,
-                [t0, 0 * HC_MULT],
-                [COMB_T_TILE, HC_PAD],
-                valid_shapes=[COMB_T_TILE, HC_MULT],
-                target_memory=pl.MemorySpace.Vec,
-            ), pad_value=pl.PadValue.min)
-            row1 = pl.fillpad(pl.load(
-                comb_logits,
-                [t0, 1 * HC_MULT],
-                [COMB_T_TILE, HC_PAD],
-                valid_shapes=[COMB_T_TILE, HC_MULT],
-                target_memory=pl.MemorySpace.Vec,
-            ), pad_value=pl.PadValue.min)
-            row2 = pl.fillpad(pl.load(
-                comb_logits,
-                [t0, 2 * HC_MULT],
-                [COMB_T_TILE, HC_PAD],
-                valid_shapes=[COMB_T_TILE, HC_MULT],
-                target_memory=pl.MemorySpace.Vec,
-            ), pad_value=pl.PadValue.min)
-            row3 = pl.fillpad(pl.load(
-                comb_logits,
-                [t0, 3 * HC_MULT],
-                [COMB_T_TILE, HC_PAD],
-                valid_shapes=[COMB_T_TILE, HC_MULT],
-                target_memory=pl.MemorySpace.Vec,
-            ), pad_value=pl.PadValue.min)
+            row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+            row0 = pl.fillpad(row0, pad_value=pl.PadValue.min)
+            row1 = pl.fillpad(row1, pad_value=pl.PadValue.min)
+            row2 = pl.fillpad(row2, pad_value=pl.PadValue.min)
+            row3 = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
             row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            row0_exp = pl.exp(pl.row_expand_sub(row0, pl.row_max(row0, row_max_tmp)))
-            row1_exp = pl.exp(pl.row_expand_sub(row1, pl.row_max(row1, row_max_tmp)))
-            row2_exp = pl.exp(pl.row_expand_sub(row2, pl.row_max(row2, row_max_tmp)))
-            row3_exp = pl.exp(pl.row_expand_sub(row3, pl.row_max(row3, row_max_tmp)))
-            row0_soft = pl.add(pl.row_expand_div(row0_exp, pl.row_sum(row0_exp, row_sum_tmp)), HC_EPS)
-            row1_soft = pl.add(pl.row_expand_div(row1_exp, pl.row_sum(row1_exp, row_sum_tmp)), HC_EPS)
-            row2_soft = pl.add(pl.row_expand_div(row2_exp, pl.row_sum(row2_exp, row_sum_tmp)), HC_EPS)
-            row3_soft = pl.add(pl.row_expand_div(row3_exp, pl.row_sum(row3_exp, row_sum_tmp)), HC_EPS)
+            row0_max = pl.row_max(row0, row_max_tmp)
+            row1_max = pl.row_max(row1, row_max_tmp)
+            row2_max = pl.row_max(row2, row_max_tmp)
+            row3_max = pl.row_max(row3, row_max_tmp)
+            row0_exp = pl.exp(pl.row_expand_sub(row0, row0_max))
+            row1_exp = pl.exp(pl.row_expand_sub(row1, row1_max))
+            row2_exp = pl.exp(pl.row_expand_sub(row2, row2_max))
+            row3_exp = pl.exp(pl.row_expand_sub(row3, row3_max))
+            row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
+            row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
+            row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
+            row3_sum = pl.row_sum(row3_exp, row_sum_tmp)
+            row0_soft = pl.add(pl.row_expand_div(row0_exp, row0_sum), HC_EPS)
+            row1_soft = pl.add(pl.row_expand_div(row1_exp, row1_sum), HC_EPS)
+            row2_soft = pl.add(pl.row_expand_div(row2_exp, row2_sum), HC_EPS)
+            row3_soft = pl.add(pl.row_expand_div(row3_exp, row3_sum), HC_EPS)
 
-            row0_eff = pl.tile.fillpad(pl.tile.set_validshape(row0_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row1_eff = pl.tile.fillpad(pl.tile.set_validshape(row1_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row2_eff = pl.tile.fillpad(pl.tile.set_validshape(row2_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row3_eff = pl.tile.fillpad(pl.tile.set_validshape(row3_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
+            row0_valid = pl.set_validshape(row0_soft, COMB_T_TILE, HC_MULT)
+            row1_valid = pl.set_validshape(row1_soft, COMB_T_TILE, HC_MULT)
+            row2_valid = pl.set_validshape(row2_soft, COMB_T_TILE, HC_MULT)
+            row3_valid = pl.set_validshape(row3_soft, COMB_T_TILE, HC_MULT)
+            row0_eff = pl.fillpad(row0_valid, pad_value=pl.PadValue.zero)
+            row1_eff = pl.fillpad(row1_valid, pad_value=pl.PadValue.zero)
+            row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
+            row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
             row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
@@ -170,10 +156,14 @@ def hc_pre(
             row3_cur = pl.div(row3_eff, col_sum)
 
             for sk_it in pl.range(HC_SINKHORN_ITER - 1):
-                row0_norm = pl.row_expand_div(row0_cur, pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS))
-                row1_norm = pl.row_expand_div(row1_cur, pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS))
-                row2_norm = pl.row_expand_div(row2_cur, pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS))
-                row3_norm = pl.row_expand_div(row3_cur, pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS))
+                row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
+                row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
+                row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
+                row3_rowsum = pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS)
+                row0_norm = pl.row_expand_div(row0_cur, row0_rowsum)
+                row1_norm = pl.row_expand_div(row1_cur, row1_rowsum)
+                row2_norm = pl.row_expand_div(row2_cur, row2_rowsum)
+                row3_norm = pl.row_expand_div(row3_cur, row3_rowsum)
                 col_sum = pl.add(pl.add(row0_norm, row1_norm), pl.add(row2_norm, row3_norm))
                 col_sum = pl.add(col_sum, HC_EPS)
                 row0_cur = pl.div(row0_norm, col_sum)
@@ -181,29 +171,14 @@ def hc_pre(
                 row2_cur = pl.div(row2_norm, col_sum)
                 row3_cur = pl.div(row3_norm, col_sum)
 
-            for ti in pl.unroll(COMB_T_TILE):
-                for c in pl.unroll(HC_MULT):
-                    comb_t_idx = t0 + ti
-                    pl.write(
-                        comb_flat,
-                        [comb_t_idx * HC_MULT * HC_MULT + 0 * HC_MULT + c],
-                        pl.read(row0_cur, [ti, c]),
-                    )
-                    pl.write(
-                        comb_flat,
-                        [comb_t_idx * HC_MULT * HC_MULT + 1 * HC_MULT + c],
-                        pl.read(row1_cur, [ti, c]),
-                    )
-                    pl.write(
-                        comb_flat,
-                        [comb_t_idx * HC_MULT * HC_MULT + 2 * HC_MULT + c],
-                        pl.read(row2_cur, [ti, c]),
-                    )
-                    pl.write(
-                        comb_flat,
-                        [comb_t_idx * HC_MULT * HC_MULT + 3 * HC_MULT + c],
-                        pl.read(row3_cur, [ti, c]),
-                    )
+            row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+            row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+            row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+            row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+            comb_flat = pl.store(row0_out, [t0, 0 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row1_out, [t0, 1 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row2_out, [t0, 2 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
 
     post_flat = pl.reshape(post, [T * HC_MULT])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="write_post"):
