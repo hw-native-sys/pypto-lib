@@ -36,26 +36,27 @@ def build_softmax_program(
             x: pl.Tensor[[rows, cols], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    tile_x = pl.slice(x, [row_chunk, cols], [r, 0])
+            for r_chunk in pl.parallel(0, rows, row_chunk * 1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for r in pl.range(r_chunk, r_chunk + row_chunk * 1, row_chunk):
+                        tile_x = pl.slice(x, [row_chunk, cols], [r, 0])
 
-                    # Step 1: row-wise max for numerical stability
-                    row_max = pl.row_max(tile_x)
+                        # Step 1: row-wise max for numerical stability
+                        row_max = pl.row_max(tile_x)
 
-                    # Step 2: subtract row max: x - max(x)
-                    shifted = pl.row_expand_sub(tile_x, row_max)
+                        # Step 2: subtract row max: x - max(x)
+                        shifted = pl.row_expand_sub(tile_x, row_max)
 
-                    # Step 3: exp(x - max(x))
-                    exp_shifted = pl.exp(shifted)
+                        # Step 3: exp(x - max(x))
+                        exp_shifted = pl.exp(shifted)
 
-                    # Step 4: row-wise sum of exp values
-                    row_sum = pl.row_sum(exp_shifted)
+                        # Step 4: row-wise sum of exp values
+                        row_sum = pl.row_sum(exp_shifted)
 
-                    # Step 5: divide each row by its sum
-                    result = pl.row_expand_div(exp_shifted, row_sum)
+                        # Step 5: divide each row by its sum
+                        result = pl.row_expand_div(exp_shifted, row_sum)
 
-                    y = pl.assemble(y, result, [r, 0])
+                        y = pl.assemble(y, result, [r, 0])
 
             return y
 

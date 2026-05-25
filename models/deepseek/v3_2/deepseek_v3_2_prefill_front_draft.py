@@ -139,306 +139,306 @@ def build_deepseek_v3_2_prefill_front_program(
             w_latent_to_v: pl.Tensor[[NUM_HEADS_CFG, KV_LORA_RANK_CFG, V_HEAD_DIM_CFG], pl.BF16],
             dispatch_buf: pl.Tensor[[EP_NODES_CFG, BATCH_CFG, MAX_SEQ_CFG, ATTN_OUT_CFG], pl.BF16],
         ) -> pl.Tensor[[EP_NODES_CFG, BATCH_CFG, MAX_SEQ_CFG, ATTN_OUT_CFG], pl.BF16]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                layer_id = pl.tensor.read(layer_id_t, [0])
+            for b_chunk in pl.parallel(0, BATCH_CFG, 4):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    layer_id = pl.tensor.read(layer_id_t, [0])
+                    for b in pl.range(b_chunk, b_chunk + 4):
+                        seq_len_b = pl.tensor.read(seq_lens, [b])
+                        tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
+                        for p0_idx in pl.range(tok_blocks):
+                            p0 = p0_idx * TOK_TILE
+                            valid_tok = pl.min(TOK_TILE, seq_len_b - p0)
 
-                for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                    seq_len_b = pl.tensor.read(seq_lens, [b])
-                    tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
-                    for p0_idx in pl.range(tok_blocks):
-                        p0 = p0_idx * TOK_TILE
-                        valid_tok = pl.min(TOK_TILE, seq_len_b - p0)
-
-                        # Scope 1: RMSNorm + Q/K/V projections.
-                        sq_sum = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
-                        sq_sum = pl.mul(sq_sum, 0.0)
-                        # Keep an explicit local Vec pad tensor alive in this
-                        # scope so AllocateMemoryAddr can reflect high occupancy.
-                        usage_pad = pl.create_tensor([TOK_TILE, LOCAL_PAD_WIDTH], dtype=pl.BF16, valid_shape=[valid_tok, LOCAL_PAD_WIDTH])
-                        usage_pad = pl.mul(usage_pad, 0.0)
-                        usage_pad_fp = pl.cast(usage_pad, target_type=pl.FP32)
-                        usage_pad_sum = pl.row_sum(usage_pad_fp)
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            x_chunk = pl.cast(
-                                pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0], valid_shape=[valid_tok, K_CHUNK]),
-                                target_type=pl.FP32,
-                            )
-                            sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
-                        inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
-                        inv_rms = pl.add(inv_rms, pl.mul(usage_pad_sum, 0.0))
-
-                        q_proj_tile = pl.create_tensor([TOK_TILE, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16, valid_shape=[valid_tok, NUM_HEADS_CFG * QK_HEAD_DIM_CFG])
-                        kv_a_tile = pl.create_tensor([TOK_TILE, KV_A_OUT], dtype=pl.BF16, valid_shape=[valid_tok, KV_A_OUT])
-
-                        # Fused Q path (local fusion trial for former incore_0/1):
-                        # directly accumulates q_proj_tile from x -> wq_a -> q_norm -> wq_b
-                        # without materializing full qr_tile.
-                        for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                            q0 = ob * Q_OUT_CHUNK
-                            q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                            q_acc = pl.mul(q_acc, 0.0)
+                            # Scope 1: RMSNorm + Q/K/V projections.
+                            sq_sum = pl.create_tensor([TOK_TILE, 1], dtype=pl.FP32)
+                            sq_sum = pl.mul(sq_sum, 0.0)
+                            # Keep an explicit local Vec pad tensor alive in this
+                            # scope so AllocateMemoryAddr can reflect high occupancy.
+                            usage_pad = pl.create_tensor([TOK_TILE, LOCAL_PAD_WIDTH], dtype=pl.BF16, valid_shape=[valid_tok, LOCAL_PAD_WIDTH])
+                            usage_pad = pl.mul(usage_pad, 0.0)
+                            usage_pad_fp = pl.cast(usage_pad, target_type=pl.FP32)
+                            usage_pad_sum = pl.row_sum(usage_pad_fp)
                             for kb in pl.range(HIDDEN_BLOCKS):
                                 k0 = kb * K_CHUNK
                                 x_chunk = pl.cast(
                                     pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0], valid_shape=[valid_tok, K_CHUNK]),
                                     target_type=pl.FP32,
                                 )
-                                gamma_in = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                                normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma_in)
-                                for rb in pl.range(QR_BLOCKS):
-                                    r0 = rb * LORA_CHUNK
-                                    wq_a_chunk = pl.slice(wq_a, [K_CHUNK, LORA_CHUNK], [k0, r0])
-                                    qr_part = pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_a_chunk)
-                                    gamma_q = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, r0])
-                                    qn_part = pl.col_expand_mul(qr_part, gamma_q)
-                                    wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [r0, q0])
-                                    q_acc = pl.add(q_acc, pl.matmul(pl.cast(qn_part, target_type=pl.BF16), wq_b_chunk))
-                            q_proj_tile = pl.assemble(q_proj_tile, pl.cast(q_acc, target_type=pl.BF16), [0, q0])
+                                sq_sum = pl.add(sq_sum, pl.row_sum(pl.mul(x_chunk, x_chunk)))
+                            inv_rms = pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS))
+                            inv_rms = pl.add(inv_rms, pl.mul(usage_pad_sum, 0.0))
 
-                        for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
-                            kv0 = ob * KV_OUT_CHUNK
-                            kv_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                            kv_acc = pl.mul(kv_acc, 0.0)
-                            for kb in pl.range(HIDDEN_BLOCKS):
-                                k0 = kb * K_CHUNK
-                                x_chunk = pl.cast(
-                                    pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0], valid_shape=[valid_tok, K_CHUNK]),
-                                    target_type=pl.FP32,
-                                )
-                                gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                                normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                                wkv_chunk = pl.slice(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                                kv_acc = pl.add(kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk))
-                            kv_a_tile = pl.assemble(kv_a_tile, pl.cast(kv_acc, target_type=pl.BF16), [0, kv0])
+                            q_proj_tile = pl.create_tensor([TOK_TILE, NUM_HEADS_CFG * QK_HEAD_DIM_CFG], dtype=pl.BF16, valid_shape=[valid_tok, NUM_HEADS_CFG * QK_HEAD_DIM_CFG])
+                            kv_a_tile = pl.create_tensor([TOK_TILE, KV_A_OUT], dtype=pl.BF16, valid_shape=[valid_tok, KV_A_OUT])
 
-                        # Scope 2: RoPE + cache update + indexer topk + sparse attention.
-                        # Fusion policy (aligned with decode_front):
-                        # - Stage A/B/C all stay in ONE auto_incore scope.
-                        # - A: per-token cache write
-                        # - B1/B2: two-stage topk (block-local then global merge)
-                        # - C: sparse attention consumes merged topk immediately
-                        # This avoids materializing topk intermediates across kernel boundaries.
-                        attn_tile = pl.create_tensor([TOK_TILE, ATTN_OUT_CFG], dtype=pl.FP32, valid_shape=[valid_tok, ATTN_OUT_CFG])
-                        attn_tile = pl.mul(attn_tile, 0.0)
-                        for ti in pl.range(valid_tok):
-                            pos = p0 + ti
-                            ctx_len = pos + 1
-                            cos_row = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
-                            sin_row = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
-                            cos_lo = pl.slice(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                            cos_hi = pl.slice(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                            sin_lo = pl.slice(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                            sin_hi = pl.slice(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                            # Fused Q path (local fusion trial for former incore_0/1):
+                            # directly accumulates q_proj_tile from x -> wq_a -> q_norm -> wq_b
+                            # without materializing full qr_tile.
+                            for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
+                                q0 = ob * Q_OUT_CHUNK
+                                q_acc = pl.create_tensor([TOK_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                                q_acc = pl.mul(q_acc, 0.0)
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    x_chunk = pl.cast(
+                                        pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0], valid_shape=[valid_tok, K_CHUNK]),
+                                        target_type=pl.FP32,
+                                    )
+                                    gamma_in = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma_in)
+                                    for rb in pl.range(QR_BLOCKS):
+                                        r0 = rb * LORA_CHUNK
+                                        wq_a_chunk = pl.slice(wq_a, [K_CHUNK, LORA_CHUNK], [k0, r0])
+                                        qr_part = pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_a_chunk)
+                                        gamma_q = pl.slice(q_norm_weight, [1, LORA_CHUNK], [0, r0])
+                                        qn_part = pl.col_expand_mul(qr_part, gamma_q)
+                                        wq_b_chunk = pl.slice(wq_b, [LORA_CHUNK, Q_OUT_CHUNK], [r0, q0])
+                                        q_acc = pl.add(q_acc, pl.matmul(pl.cast(qn_part, target_type=pl.BF16), wq_b_chunk))
+                                q_proj_tile = pl.assemble(q_proj_tile, pl.cast(q_acc, target_type=pl.BF16), [0, q0])
 
-                            cache_row = b * MAX_SEQ_CFG + pos
-                            kv_row = pl.cast(pl.slice(kv_a_tile, [1, KV_LORA_RANK_CFG], [ti, 0]), target_type=pl.FP32)
-                            kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
-                            kv_normed = pl.col_expand_mul(kv_row, kv_gamma)
-                            pe_row = pl.cast(
-                                pl.slice(kv_a_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, KV_LORA_RANK_CFG]),
-                                target_type=pl.FP32,
-                            )
-                            pe_lo = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                            pe_hi = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                            pe_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                            pe_rot = pl.assemble(pe_rot, pl.sub(pl.col_expand_mul(pe_lo, cos_lo), pl.col_expand_mul(pe_hi, sin_lo)), [0, 0])
-                            pe_rot = pl.assemble(pe_rot, pl.add(pl.col_expand_mul(pe_hi, cos_hi), pl.col_expand_mul(pe_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                            kv_cache = pl.assemble(kv_cache, pl.cast(kv_normed, target_type=pl.BF16), [cache_row, 0])
-                            pe_cache = pl.assemble(pe_cache, pl.cast(pe_rot, target_type=pl.BF16), [cache_row, 0])
+                            for ob in pl.parallel(0, KV_A_BLOCKS, 1, chunk=8):
+                                kv0 = ob * KV_OUT_CHUNK
+                                kv_acc = pl.create_tensor([TOK_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                                kv_acc = pl.mul(kv_acc, 0.0)
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    x_chunk = pl.cast(
+                                        pl.slice(hidden_states, [TOK_TILE, K_CHUNK], [b, p0, k0], valid_shape=[valid_tok, K_CHUNK]),
+                                        target_type=pl.FP32,
+                                    )
+                                    gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
+                                    wkv_chunk = pl.slice(wkv_a, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                                    kv_acc = pl.add(kv_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wkv_chunk))
+                                kv_a_tile = pl.assemble(kv_a_tile, pl.cast(kv_acc, target_type=pl.BF16), [0, kv0])
 
-                            # Stage B1: block-local topk (2 blocks, each 2K candidates).
-                            topk_vals = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.FP32)
-                            topk_idx = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.INT32)
-                            blk_topk_vals = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.FP32)
-                            blk_topk_idx = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.INT32)
-                            topk_vals = pl.mul(topk_vals, -3.402823e38)
-                            topk_idx = pl.mul(topk_idx, 0)
-                            blk_topk_vals = pl.mul(blk_topk_vals, -3.402823e38)
-                            blk_topk_idx = pl.mul(blk_topk_idx, 0)
-                            for kk in pl.range(INDEX_TOPK_CFG):
-                                neg_one = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                neg_one = pl.mul(neg_one, 0)
-                                neg_one = pl.add(neg_one, -1)
-                                topk_idx = pl.assemble(topk_idx, neg_one, [0, kk])
-                                blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [0, kk])
-                                blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [1, kk])
-
-                            q_col0 = 0
-                            q_nope0 = pl.cast(
-                                pl.slice(q_proj_tile, [1, QK_NOPE_HEAD_DIM_CFG], [ti, q_col0]),
-                                target_type=pl.FP32,
-                            )
-                            q_pe0 = pl.cast(
-                                pl.slice(q_proj_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, q_col0 + QK_NOPE_HEAD_DIM_CFG]),
-                                target_type=pl.FP32,
-                            )
-                            q0_lo = pl.slice(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                            q0_hi = pl.slice(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                            q0_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                            q0_rot = pl.assemble(q0_rot, pl.sub(pl.col_expand_mul(q0_lo, cos_lo), pl.col_expand_mul(q0_hi, sin_lo)), [0, 0])
-                            q0_rot = pl.assemble(q0_rot, pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                            q0_nope_latent = pl.matmul(
-                                pl.cast(q_nope0, target_type=pl.BF16),
-                                pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]),
-                            )
-
-                            sparse_k_gen = pl.min(INDEX_TOPK_CFG, ctx_len)
-                            for blk in pl.range(2):
-                                blk_start = blk * INDEX_TOPK_CFG
-                                blk_end = pl.min(ctx_len, blk_start + INDEX_TOPK_CFG)
-                                for ss in pl.range(INDEX_TOPK_CFG):
-                                    s = blk_start + ss
-                                    if s < blk_end:
-                                        cache_s = b * MAX_SEQ_CFG + s
-                                        kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                        pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                        score_nope = pl.row_sum(pl.mul(q0_nope_latent, kv_s))
-                                        score_pe = pl.row_sum(pl.mul(q0_rot, pe_s))
-                                        score_fp32 = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
-                                        score_fp8 = pl.cast(score_fp32, target_type=pl.FP8E4M3FN)
-                                        score_a5 = pl.cast(score_fp8, target_type=pl.FP32)
-                                        cur_score = pl.tensor.read(score_a5, [0, 0])
-
-                                        inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                        inserted = pl.mul(inserted, 0)
-                                        for kk in pl.range(sparse_k_gen):
-                                            ins = pl.tensor.read(inserted, [0, 0])
-                                            kth_val = pl.tensor.read(blk_topk_vals, [blk, kk])
-                                            if ins == 0:
-                                                if cur_score > kth_val:
-                                                    for sh in pl.range(sparse_k_gen - 1, kk, -1):
-                                                        prev_val = pl.tensor.read(blk_topk_vals, [blk, sh - 1])
-                                                        prev_idx = pl.tensor.read(blk_topk_idx, [blk, sh - 1])
-                                                        prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                                        prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                        prev_val_t = pl.mul(prev_val_t, 0.0)
-                                                        prev_idx_t = pl.mul(prev_idx_t, 0)
-                                                        prev_val_t = pl.add(prev_val_t, prev_val)
-                                                        prev_idx_t = pl.add(prev_idx_t, prev_idx)
-                                                        blk_topk_vals = pl.assemble(blk_topk_vals, prev_val_t, [blk, sh])
-                                                        blk_topk_idx = pl.assemble(blk_topk_idx, prev_idx_t, [blk, sh])
-                                                    cur_score_t = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                                    cur_index_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                    one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                    cur_score_t = pl.mul(cur_score_t, 0.0)
-                                                    cur_index_t = pl.mul(cur_index_t, 0)
-                                                    one_t = pl.mul(one_t, 0)
-                                                    cur_score_t = pl.add(cur_score_t, cur_score)
-                                                    cur_index_t = pl.add(cur_index_t, s)
-                                                    one_t = pl.add(one_t, 1)
-                                                    blk_topk_vals = pl.assemble(blk_topk_vals, cur_score_t, [blk, kk])
-                                                    blk_topk_idx = pl.assemble(blk_topk_idx, cur_index_t, [blk, kk])
-                                                    inserted = pl.assemble(inserted, one_t, [0, 0])
-
-                            # Stage B2: global merge from 2x(local topk) -> final topk.
-                            for blk in pl.range(2):
-                                for kk in pl.range(sparse_k_gen):
-                                    cand_idx = pl.tensor.read(blk_topk_idx, [blk, kk])
-                                    if cand_idx >= 0:
-                                        cand_val = pl.tensor.read(blk_topk_vals, [blk, kk])
-                                        inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                        inserted = pl.mul(inserted, 0)
-                                        for tkk in pl.range(sparse_k_gen):
-                                            ins = pl.tensor.read(inserted, [0, 0])
-                                            kth_val = pl.tensor.read(topk_vals, [0, tkk])
-                                            if ins == 0:
-                                                if cand_val > kth_val:
-                                                    for sh in pl.range(sparse_k_gen - 1, tkk, -1):
-                                                        prev_val = pl.tensor.read(topk_vals, [0, sh - 1])
-                                                        prev_idx = pl.tensor.read(topk_idx, [0, sh - 1])
-                                                        prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                                        prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                        prev_val_t = pl.mul(prev_val_t, 0.0)
-                                                        prev_idx_t = pl.mul(prev_idx_t, 0)
-                                                        prev_val_t = pl.add(prev_val_t, prev_val)
-                                                        prev_idx_t = pl.add(prev_idx_t, prev_idx)
-                                                        topk_vals = pl.assemble(topk_vals, prev_val_t, [0, sh])
-                                                        topk_idx = pl.assemble(topk_idx, prev_idx_t, [0, sh])
-                                                    cand_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                                    cand_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                    one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
-                                                    cand_val_t = pl.mul(cand_val_t, 0.0)
-                                                    cand_idx_t = pl.mul(cand_idx_t, 0)
-                                                    one_t = pl.mul(one_t, 0)
-                                                    cand_val_t = pl.add(cand_val_t, cand_val)
-                                                    cand_idx_t = pl.add(cand_idx_t, cand_idx)
-                                                    one_t = pl.add(one_t, 1)
-                                                    topk_vals = pl.assemble(topk_vals, cand_val_t, [0, tkk])
-                                                    topk_idx = pl.assemble(topk_idx, cand_idx_t, [0, tkk])
-                                                    inserted = pl.assemble(inserted, one_t, [0, 0])
-
-                            # Stage C: sparse attention directly consumes merged topk_idx.
-                            attn_row = pl.create_tensor([1, ATTN_OUT_CFG], dtype=pl.FP32)
-                            attn_row = pl.mul(attn_row, 0.0)
-                            for h in pl.parallel(0, NUM_HEADS_CFG, 1, chunk=8):
-                                q_col = h * QK_HEAD_DIM_CFG
-                                q_nope = pl.cast(
-                                    pl.slice(q_proj_tile, [1, QK_NOPE_HEAD_DIM_CFG], [ti, q_col]),
-                                    target_type=pl.FP32,
-                                )
-                                q_pe = pl.cast(
-                                    pl.slice(q_proj_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, q_col + QK_NOPE_HEAD_DIM_CFG]),
-                                    target_type=pl.FP32,
-                                )
-                                q_lo = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
-                                q_hi = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                                q_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
-                                q_rot = pl.assemble(q_rot, pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)), [0, 0])
-                                q_rot = pl.assemble(q_rot, pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
-                                q_nope_latent = pl.matmul(
-                                    pl.cast(q_nope, target_type=pl.BF16),
-                                    pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]),
-                                )
-
-                                oi = pl.create_tensor([1, KV_LORA_RANK_CFG], dtype=pl.FP32)
-                                li = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                mi = pl.create_tensor([1, 1], dtype=pl.FP32)
-                                oi = pl.mul(oi, 0.0)
-                                li = pl.mul(li, 0.0)
-                                mi = pl.mul(mi, 0.0)
-                                sparse_k = pl.min(INDEX_TOPK_CFG, ctx_len)
-                                for kk in pl.range(sparse_k):
-                                    s = pl.tensor.read(topk_idx, [0, kk])
-                                    if s >= 0:
-                                        cache_s = b * MAX_SEQ_CFG + s
-                                        kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                        pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
-                                        score_nope = pl.row_sum(pl.mul(q_nope_latent, kv_s))
-                                        score_pe = pl.row_sum(pl.mul(q_rot, pe_s))
-                                        score = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
-                                        cur_mi = score
-                                        cur_li = pl.exp(pl.sub(score, cur_mi))
-                                        oi_tmp = pl.row_expand_mul(kv_s, cur_li)
-                                        if kk == 0:
-                                            oi = oi_tmp
-                                            li = cur_li
-                                            mi = cur_mi
-                                        else:
-                                            mi_new = pl.maximum(mi, cur_mi)
-                                            alpha = pl.exp(pl.sub(mi, mi_new))
-                                            beta = pl.exp(pl.sub(cur_mi, mi_new))
-                                            li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                                            oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
-                                            mi = mi_new
-                                ctx_latent = pl.row_expand_div(oi, li)
-                                v_col = h * V_HEAD_DIM_CFG
-                                ctx_v = pl.create_tensor([1, V_HEAD_DIM_CFG], dtype=pl.FP32)
-                                ctx_v = pl.mul(ctx_v, 0.0)
-                                for vb in pl.range(V_OUT_BLOCKS):
-                                    v0 = vb * V_OUT_CHUNK
-                                    wv_tile = pl.slice(w_latent_to_v, [KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
-                                    v_part = pl.matmul(pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
-                                    ctx_v = pl.assemble(ctx_v, v_part, [0, v0])
-                                attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
-                            attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
-
-                            # Scope 3: dispatch writes and return after dispatch.
+                            # Scope 2: RoPE + cache update + indexer topk + sparse attention.
+                            # Fusion policy (aligned with decode_front):
+                            # - Stage A/B/C all stay in ONE auto_incore scope.
+                            # - A: per-token cache write
+                            # - B1/B2: two-stage topk (block-local then global merge)
+                            # - C: sparse attention consumes merged topk immediately
+                            # This avoids materializing topk intermediates across kernel boundaries.
+                            attn_tile = pl.create_tensor([TOK_TILE, ATTN_OUT_CFG], dtype=pl.FP32, valid_shape=[valid_tok, ATTN_OUT_CFG])
+                            attn_tile = pl.mul(attn_tile, 0.0)
                             for ti in pl.range(valid_tok):
                                 pos = p0 + ti
-                                target_node = (b + pos + layer_id) % EP_NODES_CFG
-                                token_row = pl.cast(pl.slice(attn_tile, [1, ATTN_OUT_CFG], [ti, 0]), target_type=pl.BF16)
-                                dispatch_buf = pl.assemble(dispatch_buf, token_row, [target_node, b, pos, 0])
+                                ctx_len = pos + 1
+                                cos_row = pl.slice(rope_cos, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
+                                sin_row = pl.slice(rope_sin, [1, QK_ROPE_HEAD_DIM_CFG], [pos, 0])
+                                cos_lo = pl.slice(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                                cos_hi = pl.slice(cos_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                sin_lo = pl.slice(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                                sin_hi = pl.slice(sin_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+
+                                cache_row = b * MAX_SEQ_CFG + pos
+                                kv_row = pl.cast(pl.slice(kv_a_tile, [1, KV_LORA_RANK_CFG], [ti, 0]), target_type=pl.FP32)
+                                kv_gamma = pl.slice(kv_norm_weight, [1, KV_LORA_RANK_CFG], [0, 0])
+                                kv_normed = pl.col_expand_mul(kv_row, kv_gamma)
+                                pe_row = pl.cast(
+                                    pl.slice(kv_a_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, KV_LORA_RANK_CFG]),
+                                    target_type=pl.FP32,
+                                )
+                                pe_lo = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                                pe_hi = pl.slice(pe_row, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                pe_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
+                                pe_rot = pl.assemble(pe_rot, pl.sub(pl.col_expand_mul(pe_lo, cos_lo), pl.col_expand_mul(pe_hi, sin_lo)), [0, 0])
+                                pe_rot = pl.assemble(pe_rot, pl.add(pl.col_expand_mul(pe_hi, cos_hi), pl.col_expand_mul(pe_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                kv_cache = pl.assemble(kv_cache, pl.cast(kv_normed, target_type=pl.BF16), [cache_row, 0])
+                                pe_cache = pl.assemble(pe_cache, pl.cast(pe_rot, target_type=pl.BF16), [cache_row, 0])
+
+                                # Stage B1: block-local topk (2 blocks, each 2K candidates).
+                                topk_vals = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.FP32)
+                                topk_idx = pl.create_tensor([1, INDEX_TOPK_CFG], dtype=pl.INT32)
+                                blk_topk_vals = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.FP32)
+                                blk_topk_idx = pl.create_tensor([2, INDEX_TOPK_CFG], dtype=pl.INT32)
+                                topk_vals = pl.mul(topk_vals, -3.402823e38)
+                                topk_idx = pl.mul(topk_idx, 0)
+                                blk_topk_vals = pl.mul(blk_topk_vals, -3.402823e38)
+                                blk_topk_idx = pl.mul(blk_topk_idx, 0)
+                                for kk in pl.range(INDEX_TOPK_CFG):
+                                    neg_one = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                    neg_one = pl.mul(neg_one, 0)
+                                    neg_one = pl.add(neg_one, -1)
+                                    topk_idx = pl.assemble(topk_idx, neg_one, [0, kk])
+                                    blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [0, kk])
+                                    blk_topk_idx = pl.assemble(blk_topk_idx, neg_one, [1, kk])
+
+                                q_col0 = 0
+                                q_nope0 = pl.cast(
+                                    pl.slice(q_proj_tile, [1, QK_NOPE_HEAD_DIM_CFG], [ti, q_col0]),
+                                    target_type=pl.FP32,
+                                )
+                                q_pe0 = pl.cast(
+                                    pl.slice(q_proj_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, q_col0 + QK_NOPE_HEAD_DIM_CFG]),
+                                    target_type=pl.FP32,
+                                )
+                                q0_lo = pl.slice(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                                q0_hi = pl.slice(q_pe0, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                q0_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
+                                q0_rot = pl.assemble(q0_rot, pl.sub(pl.col_expand_mul(q0_lo, cos_lo), pl.col_expand_mul(q0_hi, sin_lo)), [0, 0])
+                                q0_rot = pl.assemble(q0_rot, pl.add(pl.col_expand_mul(q0_hi, cos_hi), pl.col_expand_mul(q0_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                q0_nope_latent = pl.matmul(
+                                    pl.cast(q_nope0, target_type=pl.BF16),
+                                    pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [0, 0, 0]),
+                                )
+
+                                sparse_k_gen = pl.min(INDEX_TOPK_CFG, ctx_len)
+                                for blk in pl.range(2):
+                                    blk_start = blk * INDEX_TOPK_CFG
+                                    blk_end = pl.min(ctx_len, blk_start + INDEX_TOPK_CFG)
+                                    for ss in pl.range(INDEX_TOPK_CFG):
+                                        s = blk_start + ss
+                                        if s < blk_end:
+                                            cache_s = b * MAX_SEQ_CFG + s
+                                            kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                            pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                            score_nope = pl.row_sum(pl.mul(q0_nope_latent, kv_s))
+                                            score_pe = pl.row_sum(pl.mul(q0_rot, pe_s))
+                                            score_fp32 = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
+                                            score_fp8 = pl.cast(score_fp32, target_type=pl.FP8E4M3FN)
+                                            score_a5 = pl.cast(score_fp8, target_type=pl.FP32)
+                                            cur_score = pl.tensor.read(score_a5, [0, 0])
+
+                                            inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                            inserted = pl.mul(inserted, 0)
+                                            for kk in pl.range(sparse_k_gen):
+                                                ins = pl.tensor.read(inserted, [0, 0])
+                                                kth_val = pl.tensor.read(blk_topk_vals, [blk, kk])
+                                                if ins == 0:
+                                                    if cur_score > kth_val:
+                                                        for sh in pl.range(sparse_k_gen - 1, kk, -1):
+                                                            prev_val = pl.tensor.read(blk_topk_vals, [blk, sh - 1])
+                                                            prev_idx = pl.tensor.read(blk_topk_idx, [blk, sh - 1])
+                                                            prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                                            prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                            prev_val_t = pl.mul(prev_val_t, 0.0)
+                                                            prev_idx_t = pl.mul(prev_idx_t, 0)
+                                                            prev_val_t = pl.add(prev_val_t, prev_val)
+                                                            prev_idx_t = pl.add(prev_idx_t, prev_idx)
+                                                            blk_topk_vals = pl.assemble(blk_topk_vals, prev_val_t, [blk, sh])
+                                                            blk_topk_idx = pl.assemble(blk_topk_idx, prev_idx_t, [blk, sh])
+                                                        cur_score_t = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                                        cur_index_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                        one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                        cur_score_t = pl.mul(cur_score_t, 0.0)
+                                                        cur_index_t = pl.mul(cur_index_t, 0)
+                                                        one_t = pl.mul(one_t, 0)
+                                                        cur_score_t = pl.add(cur_score_t, cur_score)
+                                                        cur_index_t = pl.add(cur_index_t, s)
+                                                        one_t = pl.add(one_t, 1)
+                                                        blk_topk_vals = pl.assemble(blk_topk_vals, cur_score_t, [blk, kk])
+                                                        blk_topk_idx = pl.assemble(blk_topk_idx, cur_index_t, [blk, kk])
+                                                        inserted = pl.assemble(inserted, one_t, [0, 0])
+
+                                # Stage B2: global merge from 2x(local topk) -> final topk.
+                                for blk in pl.range(2):
+                                    for kk in pl.range(sparse_k_gen):
+                                        cand_idx = pl.tensor.read(blk_topk_idx, [blk, kk])
+                                        if cand_idx >= 0:
+                                            cand_val = pl.tensor.read(blk_topk_vals, [blk, kk])
+                                            inserted = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                            inserted = pl.mul(inserted, 0)
+                                            for tkk in pl.range(sparse_k_gen):
+                                                ins = pl.tensor.read(inserted, [0, 0])
+                                                kth_val = pl.tensor.read(topk_vals, [0, tkk])
+                                                if ins == 0:
+                                                    if cand_val > kth_val:
+                                                        for sh in pl.range(sparse_k_gen - 1, tkk, -1):
+                                                            prev_val = pl.tensor.read(topk_vals, [0, sh - 1])
+                                                            prev_idx = pl.tensor.read(topk_idx, [0, sh - 1])
+                                                            prev_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                                            prev_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                            prev_val_t = pl.mul(prev_val_t, 0.0)
+                                                            prev_idx_t = pl.mul(prev_idx_t, 0)
+                                                            prev_val_t = pl.add(prev_val_t, prev_val)
+                                                            prev_idx_t = pl.add(prev_idx_t, prev_idx)
+                                                            topk_vals = pl.assemble(topk_vals, prev_val_t, [0, sh])
+                                                            topk_idx = pl.assemble(topk_idx, prev_idx_t, [0, sh])
+                                                        cand_val_t = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                                        cand_idx_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                        one_t = pl.create_tensor([1, 1], dtype=pl.INT32)
+                                                        cand_val_t = pl.mul(cand_val_t, 0.0)
+                                                        cand_idx_t = pl.mul(cand_idx_t, 0)
+                                                        one_t = pl.mul(one_t, 0)
+                                                        cand_val_t = pl.add(cand_val_t, cand_val)
+                                                        cand_idx_t = pl.add(cand_idx_t, cand_idx)
+                                                        one_t = pl.add(one_t, 1)
+                                                        topk_vals = pl.assemble(topk_vals, cand_val_t, [0, tkk])
+                                                        topk_idx = pl.assemble(topk_idx, cand_idx_t, [0, tkk])
+                                                        inserted = pl.assemble(inserted, one_t, [0, 0])
+
+                                # Stage C: sparse attention directly consumes merged topk_idx.
+                                attn_row = pl.create_tensor([1, ATTN_OUT_CFG], dtype=pl.FP32)
+                                attn_row = pl.mul(attn_row, 0.0)
+                                for h in pl.parallel(0, NUM_HEADS_CFG, 1, chunk=8):
+                                    q_col = h * QK_HEAD_DIM_CFG
+                                    q_nope = pl.cast(
+                                        pl.slice(q_proj_tile, [1, QK_NOPE_HEAD_DIM_CFG], [ti, q_col]),
+                                        target_type=pl.FP32,
+                                    )
+                                    q_pe = pl.cast(
+                                        pl.slice(q_proj_tile, [1, QK_ROPE_HEAD_DIM_CFG], [ti, q_col + QK_NOPE_HEAD_DIM_CFG]),
+                                        target_type=pl.FP32,
+                                    )
+                                    q_lo = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, 0])
+                                    q_hi = pl.slice(q_pe, [1, QK_ROPE_HEAD_DIM_CFG // 2], [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                    q_rot = pl.create_tensor([1, QK_ROPE_HEAD_DIM_CFG], dtype=pl.FP32)
+                                    q_rot = pl.assemble(q_rot, pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)), [0, 0])
+                                    q_rot = pl.assemble(q_rot, pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)), [0, QK_ROPE_HEAD_DIM_CFG // 2])
+                                    q_nope_latent = pl.matmul(
+                                        pl.cast(q_nope, target_type=pl.BF16),
+                                        pl.slice(w_q_nope_to_latent, [QK_NOPE_HEAD_DIM_CFG, KV_LORA_RANK_CFG], [h, 0, 0]),
+                                    )
+
+                                    oi = pl.create_tensor([1, KV_LORA_RANK_CFG], dtype=pl.FP32)
+                                    li = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                    mi = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                    oi = pl.mul(oi, 0.0)
+                                    li = pl.mul(li, 0.0)
+                                    mi = pl.mul(mi, 0.0)
+                                    sparse_k = pl.min(INDEX_TOPK_CFG, ctx_len)
+                                    for kk in pl.range(sparse_k):
+                                        s = pl.tensor.read(topk_idx, [0, kk])
+                                        if s >= 0:
+                                            cache_s = b * MAX_SEQ_CFG + s
+                                            kv_s = pl.cast(pl.slice(kv_cache, [1, KV_LORA_RANK_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                            pe_s = pl.cast(pl.slice(pe_cache, [1, QK_ROPE_HEAD_DIM_CFG], [cache_s, 0]), target_type=pl.FP32)
+                                            score_nope = pl.row_sum(pl.mul(q_nope_latent, kv_s))
+                                            score_pe = pl.row_sum(pl.mul(q_rot, pe_s))
+                                            score = pl.mul(pl.add(score_nope, score_pe), ATTN_SCALE)
+                                            cur_mi = score
+                                            cur_li = pl.exp(pl.sub(score, cur_mi))
+                                            oi_tmp = pl.row_expand_mul(kv_s, cur_li)
+                                            if kk == 0:
+                                                oi = oi_tmp
+                                                li = cur_li
+                                                mi = cur_mi
+                                            else:
+                                                mi_new = pl.maximum(mi, cur_mi)
+                                                alpha = pl.exp(pl.sub(mi, mi_new))
+                                                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                                                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                                                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
+                                                mi = mi_new
+                                    ctx_latent = pl.row_expand_div(oi, li)
+                                    v_col = h * V_HEAD_DIM_CFG
+                                    ctx_v = pl.create_tensor([1, V_HEAD_DIM_CFG], dtype=pl.FP32)
+                                    ctx_v = pl.mul(ctx_v, 0.0)
+                                    for vb in pl.range(V_OUT_BLOCKS):
+                                        v0 = vb * V_OUT_CHUNK
+                                        wv_tile = pl.slice(w_latent_to_v, [KV_LORA_RANK_CFG, V_OUT_CHUNK], [h, 0, v0])
+                                        v_part = pl.matmul(pl.cast(ctx_latent, target_type=pl.BF16), wv_tile, out_dtype=pl.FP32)
+                                        ctx_v = pl.assemble(ctx_v, v_part, [0, v0])
+                                    attn_row = pl.assemble(attn_row, ctx_v, [0, v_col])
+                                attn_tile = pl.assemble(attn_tile, attn_row, [ti, 0])
+
+                                # Scope 3: dispatch writes and return after dispatch.
+                                for ti in pl.range(valid_tok):
+                                    pos = p0 + ti
+                                    target_node = (b + pos + layer_id) % EP_NODES_CFG
+                                    token_row = pl.cast(pl.slice(attn_tile, [1, ATTN_OUT_CFG], [ti, 0]), target_type=pl.BF16)
+                                    dispatch_buf = pl.assemble(dispatch_buf, token_row, [target_node, b, pos, 0])
 
             return dispatch_buf
 

@@ -57,29 +57,30 @@ def build_rope_program(
             sin: pl.Tensor[[1, head_dim], pl.FP32],
             y: pl.Out[pl.Tensor[[total_rows, head_dim], pl.FP32]],
         ) -> pl.Tensor[[total_rows, head_dim], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for b in pl.parallel(0, batch, 1, chunk=batch_chunk):
-                    # Slice cos/sin lo/hi halves directly from tensor
-                    # so each becomes a separate tile.load (no textract).
-                    cos_lo = pl.slice(cos, [1, half_dim], [0, 0])
-                    cos_hi = pl.slice(cos, [1, half_dim], [0, half_dim])
-                    sin_lo = pl.slice(sin, [1, half_dim], [0, 0])
-                    sin_hi = pl.slice(sin, [1, half_dim], [0, half_dim])
+            for b_chunk in pl.parallel(0, batch, 1 * batch_chunk):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for b in pl.range(b_chunk, b_chunk + 1 * batch_chunk, 1):
+                        # Slice cos/sin lo/hi halves directly from tensor
+                        # so each becomes a separate tile.load (no textract).
+                        cos_lo = pl.slice(cos, [1, half_dim], [0, 0])
+                        cos_hi = pl.slice(cos, [1, half_dim], [0, half_dim])
+                        sin_lo = pl.slice(sin, [1, half_dim], [0, 0])
+                        sin_hi = pl.slice(sin, [1, half_dim], [0, half_dim])
 
-                    base = b * num_heads
-                    x_lo = pl.slice(x, [num_heads, half_dim], [base, 0])
-                    x_hi = pl.slice(x, [num_heads, half_dim], [base, half_dim])
+                        base = b * num_heads
+                        x_lo = pl.slice(x, [num_heads, half_dim], [base, 0])
+                        x_hi = pl.slice(x, [num_heads, half_dim], [base, half_dim])
 
-                    rot_lo = pl.sub(
-                        pl.col_expand_mul(x_lo, cos_lo),
-                        pl.col_expand_mul(x_hi, sin_lo),
-                    )
-                    rot_hi = pl.add(
-                        pl.col_expand_mul(x_hi, cos_hi),
-                        pl.col_expand_mul(x_lo, sin_hi),
-                    )
-                    y = pl.assemble(y, rot_lo, [base, 0])
-                    y = pl.assemble(y, rot_hi, [base, half_dim])
+                        rot_lo = pl.sub(
+                            pl.col_expand_mul(x_lo, cos_lo),
+                            pl.col_expand_mul(x_hi, sin_lo),
+                        )
+                        rot_hi = pl.add(
+                            pl.col_expand_mul(x_hi, cos_hi),
+                            pl.col_expand_mul(x_lo, sin_hi),
+                        )
+                        y = pl.assemble(y, rot_lo, [base, 0])
+                        y = pl.assemble(y, rot_hi, [base, half_dim])
 
             return y
 

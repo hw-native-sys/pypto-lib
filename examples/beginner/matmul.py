@@ -46,13 +46,15 @@ def build_matmul_program(
             b: pl.Tensor[[k, n], pl.FP32],
             c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
         ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
-                    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        tile_a = pl.slice(a, [m_tile, k], [mb, 0])
-                        tile_b = pl.slice(b, [k, n_tile], [0, nb])
-                        tile_c = pl.matmul(tile_a, tile_b)
-                        c = pl.assemble(c, tile_c, [mb, nb])
+            for mb_chunk in pl.parallel(0, m, m_tile * m_chunk):
+                for nb_chunk in pl.parallel(0, n, n_tile * n_chunk):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        for mb in pl.range(mb_chunk, mb_chunk + m_tile * m_chunk, m_tile):
+                            for nb in pl.range(nb_chunk, nb_chunk + n_tile * n_chunk, n_tile):
+                                tile_a = pl.slice(a, [m_tile, k], [mb, 0])
+                                tile_b = pl.slice(b, [k, n_tile], [0, nb])
+                                tile_c = pl.matmul(tile_a, tile_b)
+                                c = pl.assemble(c, tile_c, [mb, nb])
 
             return c
 

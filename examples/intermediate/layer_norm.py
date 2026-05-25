@@ -42,33 +42,34 @@ def build_layer_norm_program(
             beta: pl.Tensor[[1, hidden], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
         ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    tile_x = pl.slice(x, [row_chunk, hidden], [r, 0])
-                    gamma_tile = pl.slice(gamma, [1, hidden], [0, 0])
-                    beta_tile = pl.slice(beta, [1, hidden], [0, 0])
+            for r_chunk in pl.parallel(0, rows, row_chunk * 1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for r in pl.range(r_chunk, r_chunk + row_chunk * 1, row_chunk):
+                        tile_x = pl.slice(x, [row_chunk, hidden], [r, 0])
+                        gamma_tile = pl.slice(gamma, [1, hidden], [0, 0])
+                        beta_tile = pl.slice(beta, [1, hidden], [0, 0])
 
-                    # Step 1: row mean — pre-scale before row_sum, no reshape
-                    mean = pl.row_sum(pl.mul(tile_x, hidden_inv))
+                        # Step 1: row mean — pre-scale before row_sum, no reshape
+                        mean = pl.row_sum(pl.mul(tile_x, hidden_inv))
 
-                    # Step 2: row variance + eps — pre-scale and pre-add
-                    centred = pl.row_expand_sub(tile_x, mean)
-                    var_eps = pl.row_sum(
-                        pl.mul(pl.add(pl.mul(centred, centred), eps), hidden_inv)
-                    )
+                        # Step 2: row variance + eps — pre-scale and pre-add
+                        centred = pl.row_expand_sub(tile_x, mean)
+                        var_eps = pl.row_sum(
+                            pl.mul(pl.add(pl.mul(centred, centred), eps), hidden_inv)
+                        )
 
-                    # Step 3: normalise — single reshape pair for sqrt
-                    std = pl.reshape(
-                        pl.sqrt(pl.reshape(var_eps, [1, row_chunk])),
-                        [row_chunk, 1],
-                    )
-                    normed = pl.row_expand_div(centred, std)
+                        # Step 3: normalise — single reshape pair for sqrt
+                        std = pl.reshape(
+                            pl.sqrt(pl.reshape(var_eps, [1, row_chunk])),
+                            [row_chunk, 1],
+                        )
+                        normed = pl.row_expand_div(centred, std)
 
-                    # Step 4: apply gamma scale and beta offset
-                    scaled = pl.col_expand_mul(normed, gamma_tile)
-                    ones = pl.add(pl.sub(tile_x, tile_x), 1.0)
-                    result = pl.add(scaled, pl.col_expand_mul(ones, beta_tile))
-                    y = pl.assemble(y, result, [r, 0])
+                        # Step 4: apply gamma scale and beta offset
+                        scaled = pl.col_expand_mul(normed, gamma_tile)
+                        ones = pl.add(pl.sub(tile_x, tile_x), 1.0)
+                        result = pl.add(scaled, pl.col_expand_mul(ones, beta_tile))
+                        y = pl.assemble(y, result, [r, 0])
 
             return y
 

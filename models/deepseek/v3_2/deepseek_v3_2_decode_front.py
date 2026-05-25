@@ -372,8 +372,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Stage 2.8: Reduce q_idx_full across heads with weights to get q_idx_out.
             q_idx_out = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
             weights_flat = pl.reshape(weights, [BATCH * INDEX_HEADS])
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_reduce"):
-                for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_CHUNK):
+            for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_CHUNK):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_reduce"):
                     for b in pl.range(BATCH):
                         s2_acc_b = pl.full([1, QREDUCE_OUT_CHUNK], dtype=pl.FP32, value=0.0)
                         for h in pl.range(INDEX_HEADS):

@@ -160,21 +160,22 @@ def attention_swa(
     block_table_flat = pl.reshape(block_table, [B * MAX_BLOCKS])
     # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
     for s_idx in pl.range(S):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_scatter_kv"):
-            ori_slot = (start_pos + s_idx) % WIN
-            for b in pl.parallel(0, B, 1, chunk=16):
-                blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
-                dst_row = blk_id * BLOCK_SIZE + ori_slot
-                kv_cache_flat = pl.assemble(
-                    kv_cache_flat,
-                    kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
-                    [dst_row, 0],
-                )
+        ori_slot = (start_pos + s_idx) % WIN
+        for b_chunk in pl.parallel(0, B, 1 * 16):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_scatter_kv"):
+                for b in pl.range(b_chunk, b_chunk + 1 * 16, 1):
+                    blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
+                    dst_row = blk_id * BLOCK_SIZE + ori_slot
+                    kv_cache_flat = pl.assemble(
+                        kv_cache_flat,
+                        kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
+                        [dst_row, 0],
+                    )
     kv_cache = pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     for b0 in pl.range(0, T, SWA_BATCH_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_topk"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_topk"):
             idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
             pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
             sparse_topk_row = pl.concat(idx_row, pad_row)
@@ -187,7 +188,7 @@ def attention_swa(
     cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     for b0 in pl.range(0, B, SWA_BATCH_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cmp_dummy"):
             cmp_block_table_dummy_tile = pl.full([SWA_BATCH_CHUNK, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
             cmp_block_table_dummy = pl.assemble(cmp_block_table_dummy, cmp_block_table_dummy_tile, [b0, 0])
 

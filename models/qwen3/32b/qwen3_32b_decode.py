@@ -331,7 +331,7 @@ def build_qwen3_decode_program():
 
             # Stage 1 & 2: Output projection + residual addition with hidden_states.
             for ob in pl.parallel(0, HIDDEN // Q_OUT_CHUNK, 2):
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="out_proj_residual"):
                     for oi in pl.range(ob, ob + 2):
                         o0 = oi * Q_OUT_CHUNK
                         hidden_chunk = hidden_states[:, o0 : o0 + Q_OUT_CHUNK]
@@ -422,7 +422,7 @@ def build_qwen3_decode_program():
 
             # Stage 7 & 8: Down projection + final residual writeback.
             for db in pl.parallel(0, HIDDEN // DOWN_N_CHUNK, 2):
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="down_proj_residual"):
                     for di in pl.range(db, db + 2):
                         d0 = di * DOWN_N_CHUNK
                         resid1_tile_chunk = resid1_tile[:, d0 : d0 + DOWN_N_CHUNK]

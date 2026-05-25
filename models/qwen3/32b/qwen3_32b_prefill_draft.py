@@ -136,45 +136,47 @@ def build_prefill_scope123_program(
 
                     # Stage 1.2: Q projection (matmul + matmul_acc, FP32 output).
                     q_proj_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                        for ob in pl.parallel(q_out_blocks, chunk=4):
-                            q0 = ob * Q_OUT_CHUNK
-                            tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                            tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
-                            q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                            for kb in pl.range(1, hidden_blocks):
-                                k0 = kb * K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                                tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                                q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
-                            q_proj_tile = pl.assemble(q_proj_tile, q_acc, [0, q0])
+                    for ob_chunk in pl.parallel(0, q_out_blocks, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for ob in pl.range(ob_chunk, ob_chunk + 4):
+                                q0 = ob * Q_OUT_CHUNK
+                                tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                                tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [0, q0])
+                                q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
+                                for kb in pl.range(1, hidden_blocks):
+                                    k0 = kb * K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                    tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                                    q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
+                                q_proj_tile = pl.assemble(q_proj_tile, q_acc, [0, q0])
 
                     # Stage 1.3: K/V projection (matmul + matmul_acc in single incore).
                     k_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
                     v_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                        for ob in pl.parallel(kv_out_blocks, chunk=4):
-                            kv0 = ob * KV_OUT_CHUNK
+                    for ob_chunk in pl.parallel(0, kv_out_blocks, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for ob in pl.range(ob_chunk, ob_chunk + 4):
+                                kv0 = ob * KV_OUT_CHUNK
 
-                            tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                            tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
-                            k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                            for kb in pl.range(1, hidden_blocks):
-                                k0 = kb * K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                                tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                                k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                            k_proj_tile = pl.assemble(k_proj_tile, k_acc, [0, kv0])
+                                tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                                tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                                k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
+                                for kb in pl.range(1, hidden_blocks):
+                                    k0 = kb * K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                    tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                                    k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                                k_proj_tile = pl.assemble(k_proj_tile, k_acc, [0, kv0])
 
-                            tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                            tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
-                            v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                            for kb in pl.range(1, hidden_blocks):
-                                k0 = kb * K_CHUNK
-                                tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                                tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                                v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
-                            v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
+                                tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                                tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [0, kv0])
+                                v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
+                                for kb in pl.range(1, hidden_blocks):
+                                    k0 = kb * K_CHUNK
+                                    tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                    tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                                    v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                                v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
 
                     # ── Scope 2: RoPE + KV cache update + causal attention ──
                     attn_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.BF16)
@@ -198,62 +200,63 @@ def build_prefill_scope123_program(
                                     pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                                     [gi * Q_HEAD_PAD, 0],
                                 )
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                            for ki in pl.parallel(0, num_kv_heads, chunk=8):
-                                # K RoPE + cache update.
-                                kv_col = ki * head_dim
-                                k_lo = pl.reshape(pl.slice(k_proj_tile, [1, half_dim], [ti, kv_col]), [1, half_dim])
-                                k_hi = pl.reshape(pl.slice(k_proj_tile, [1, half_dim], [ti, kv_col + half_dim]), [1, half_dim])
-                                rot_lo = pl.sub(
-                                    pl.col_expand_mul(k_lo, cos_lo),
-                                    pl.col_expand_mul(k_hi, sin_lo),
-                                )
-                                rot_hi = pl.add(
-                                    pl.col_expand_mul(k_hi, cos_hi),
-                                    pl.col_expand_mul(k_lo, sin_hi),
-                                )
-                                cache_row = b * num_kv_heads * max_seq + ki * max_seq + pos
-                                k_cache = pl.assemble(
-                                    k_cache,
-                                    pl.cast(rot_lo, target_type=pl.BF16),
-                                    [cache_row, 0],
-                                )
-                                k_cache = pl.assemble(
-                                    k_cache,
-                                    pl.cast(rot_hi, target_type=pl.BF16),
-                                    [cache_row, half_dim],
-                                )
-                                # V cache update.
-                                v_cache = pl.assemble(
-                                    v_cache,
-                                    pl.cast(
-                                        pl.reshape(pl.slice(v_proj_tile, [1, head_dim], [ti, ki * head_dim]), [1, head_dim]),
-                                        target_type=pl.BF16,
-                                    ),
-                                    [cache_row, 0],
-                                )
-                                # Q RoPE + pad.
-                                q_base = ki * q_per_kv
-                                for qi in pl.range(Q_HEAD_BATCH):
-                                    q_col = (q_base + qi) * head_dim
-                                    q_lo = pl.reshape(pl.slice(q_proj_tile, [1, half_dim], [ti, q_col]), [1, half_dim])
-                                    q_hi = pl.reshape(pl.slice(q_proj_tile, [1, half_dim], [ti, q_col + half_dim]), [1, half_dim])
-                                    rot_lo_bf16 = pl.cast(
-                                        pl.sub(
-                                            pl.col_expand_mul(q_lo, cos_lo),
-                                            pl.col_expand_mul(q_hi, sin_lo),
-                                        ),
-                                        target_type=pl.BF16,
+                        for ki_chunk in pl.parallel(0, num_kv_heads, 8):
+                            with pl.at(level=pl.Level.CORE_GROUP):
+                                for ki in pl.range(ki_chunk, ki_chunk + 8):
+                                    # K RoPE + cache update.
+                                    kv_col = ki * head_dim
+                                    k_lo = pl.reshape(pl.slice(k_proj_tile, [1, half_dim], [ti, kv_col]), [1, half_dim])
+                                    k_hi = pl.reshape(pl.slice(k_proj_tile, [1, half_dim], [ti, kv_col + half_dim]), [1, half_dim])
+                                    rot_lo = pl.sub(
+                                        pl.col_expand_mul(k_lo, cos_lo),
+                                        pl.col_expand_mul(k_hi, sin_lo),
                                     )
-                                    rot_hi_bf16 = pl.cast(
-                                        pl.add(
-                                            pl.col_expand_mul(q_hi, cos_hi),
-                                            pl.col_expand_mul(q_lo, sin_hi),
-                                        ),
-                                        target_type=pl.BF16,
+                                    rot_hi = pl.add(
+                                        pl.col_expand_mul(k_hi, cos_hi),
+                                        pl.col_expand_mul(k_lo, sin_hi),
                                     )
-                                    all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [ki * Q_HEAD_PAD + qi, 0])
-                                    all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [ki * Q_HEAD_PAD + qi, half_dim])
+                                    cache_row = b * num_kv_heads * max_seq + ki * max_seq + pos
+                                    k_cache = pl.assemble(
+                                        k_cache,
+                                        pl.cast(rot_lo, target_type=pl.BF16),
+                                        [cache_row, 0],
+                                    )
+                                    k_cache = pl.assemble(
+                                        k_cache,
+                                        pl.cast(rot_hi, target_type=pl.BF16),
+                                        [cache_row, half_dim],
+                                    )
+                                    # V cache update.
+                                    v_cache = pl.assemble(
+                                        v_cache,
+                                        pl.cast(
+                                            pl.reshape(pl.slice(v_proj_tile, [1, head_dim], [ti, ki * head_dim]), [1, head_dim]),
+                                            target_type=pl.BF16,
+                                        ),
+                                        [cache_row, 0],
+                                    )
+                                    # Q RoPE + pad.
+                                    q_base = ki * q_per_kv
+                                    for qi in pl.range(Q_HEAD_BATCH):
+                                        q_col = (q_base + qi) * head_dim
+                                        q_lo = pl.reshape(pl.slice(q_proj_tile, [1, half_dim], [ti, q_col]), [1, half_dim])
+                                        q_hi = pl.reshape(pl.slice(q_proj_tile, [1, half_dim], [ti, q_col + half_dim]), [1, half_dim])
+                                        rot_lo_bf16 = pl.cast(
+                                            pl.sub(
+                                                pl.col_expand_mul(q_lo, cos_lo),
+                                                pl.col_expand_mul(q_hi, sin_lo),
+                                            ),
+                                            target_type=pl.BF16,
+                                        )
+                                        rot_hi_bf16 = pl.cast(
+                                            pl.add(
+                                                pl.col_expand_mul(q_hi, cos_hi),
+                                                pl.col_expand_mul(q_lo, sin_hi),
+                                            ),
+                                            target_type=pl.BF16,
+                                        )
+                                        all_q_padded = pl.assemble(all_q_padded, rot_lo_bf16, [ki * Q_HEAD_PAD + qi, 0])
+                                        all_q_padded = pl.assemble(all_q_padded, rot_hi_bf16, [ki * Q_HEAD_PAD + qi, half_dim])
 
                         attn_row = pl.create_tensor([1, hidden], dtype=pl.BF16)
 
@@ -271,43 +274,46 @@ def build_prefill_scope123_program(
                             all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
                             # Stage 2.2: QK matmul for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                                for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                                    s0 = sb * SEQ_TILE
-                                    cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
-                                    k_tile = pl.slice(k_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
-                                    raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
-                                    all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
+                            for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for sb in pl.range(sb_chunk, sb_chunk + SB_BATCH):
+                                        s0 = sb * SEQ_TILE
+                                        cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
+                                        k_tile = pl.slice(k_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
+                                        raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                                        all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.3: softmax for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                                for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                                    s0 = sb * SEQ_TILE
-                                    valid_len = pl.min(SEQ_TILE, ctx_len - s0)
-                                    scores_valid = pl.slice(
-                                        all_raw_scores, [Q_HEAD_PAD, SEQ_TILE],
-                                        [sb * Q_HEAD_PAD, 0],
-                                        valid_shape=[Q_HEAD_BATCH, valid_len],
-                                    )
-                                    scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                                    scores = pl.mul(scores_padded, attn_scale)
-                                    cur_mi = pl.row_max(scores)
-                                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                                    exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                                    cur_li = pl.row_sum(pl.cast(exp_scores_bf16, target_type=pl.FP32))
-                                    all_exp_padded = pl.assemble(all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_PAD, 0])
-                                    all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
+                            for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for sb in pl.range(sb_chunk, sb_chunk + SB_BATCH):
+                                        s0 = sb * SEQ_TILE
+                                        valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                                        scores_valid = pl.slice(
+                                            all_raw_scores, [Q_HEAD_PAD, SEQ_TILE],
+                                            [sb * Q_HEAD_PAD, 0],
+                                            valid_shape=[Q_HEAD_BATCH, valid_len],
+                                        )
+                                        scores_padded = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                                        scores = pl.mul(scores_padded, attn_scale)
+                                        cur_mi = pl.row_max(scores)
+                                        exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                                        exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                                        cur_li = pl.row_sum(pl.cast(exp_scores_bf16, target_type=pl.FP32))
+                                        all_exp_padded = pl.assemble(all_exp_padded, exp_scores_bf16, [sb * Q_HEAD_PAD, 0])
+                                        all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [sb * Q_HEAD_PAD, 0])
+                                        all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.4: SV matmul for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                                for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
-                                    s0 = sb * SEQ_TILE
-                                    cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
-                                    exp_tile = pl.slice(all_exp_padded, [Q_HEAD_PAD, SEQ_TILE], [sb * Q_HEAD_PAD, 0])
-                                    v_tile = pl.slice(v_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
-                                    oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
-                                    all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
+                            for sb_chunk in pl.parallel(0, ctx_blocks, SB_BATCH):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for sb in pl.range(sb_chunk, sb_chunk + SB_BATCH):
+                                        s0 = sb * SEQ_TILE
+                                        cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
+                                        exp_tile = pl.slice(all_exp_padded, [Q_HEAD_PAD, SEQ_TILE], [sb * Q_HEAD_PAD, 0])
+                                        v_tile = pl.slice(v_cache, [SEQ_TILE, head_dim], [cache_row0, 0])
+                                        oi_tmp = pl.matmul(exp_tile, v_tile, out_dtype=pl.FP32)
+                                        all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.5: online softmax accumulation.
                             with pl.at(level=pl.Level.CORE_GROUP):
@@ -429,18 +435,19 @@ def build_prefill_scope123_program(
 
                     # Stage 3.3b: Down projection (matmul_acc chain over intermediate dim).
                     down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                        for dob in pl.parallel(hidden_blocks, chunk=4):
-                            d0 = dob * K_CHUNK
-                            dn_a = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])
-                            dn_w = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
-                            down_acc = pl.matmul(dn_a, dn_w, out_dtype=pl.FP32)
-                            for ob in pl.range(1, mlp_out_blocks):
-                                o0 = ob * MLP_OUT_CHUNK
-                                dn_a_i = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0])
-                                dn_w_i = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
-                                down_acc = pl.matmul_acc(down_acc, dn_a_i, dn_w_i)
-                            down_fp32_tile = pl.assemble(down_fp32_tile, down_acc, [0, d0])
+                    for dob_chunk in pl.parallel(0, hidden_blocks, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for dob in pl.range(dob_chunk, dob_chunk + 4):
+                                d0 = dob * K_CHUNK
+                                dn_a = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])
+                                dn_w = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [0, d0])
+                                down_acc = pl.matmul(dn_a, dn_w, out_dtype=pl.FP32)
+                                for ob in pl.range(1, mlp_out_blocks):
+                                    o0 = ob * MLP_OUT_CHUNK
+                                    dn_a_i = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0])
+                                    dn_w_i = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [o0, d0])
+                                    down_acc = pl.matmul_acc(down_acc, dn_a_i, dn_w_i)
+                                down_fp32_tile = pl.assemble(down_fp32_tile, down_acc, [0, d0])
 
                     # Stage 3.4: Final residual add -> BF16 output.
                     for ob in pl.range(hidden_blocks):

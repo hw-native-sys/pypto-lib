@@ -51,22 +51,24 @@ def build_gemm_program(
             b: pl.Tensor[[k, n], pl.FP32],
             c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
         ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
-                    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        # First K-tile: initialize accumulator via matmul
-                        tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
-                        tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
-                        acc = pl.matmul(tile_a, tile_b)
+            for mb_chunk in pl.parallel(0, m, m_tile * m_chunk):
+                for nb_chunk in pl.parallel(0, n, n_tile * n_chunk):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        for mb in pl.range(mb_chunk, mb_chunk + m_tile * m_chunk, m_tile):
+                            for nb in pl.range(nb_chunk, nb_chunk + n_tile * n_chunk, n_tile):
+                                # First K-tile: initialize accumulator via matmul
+                                tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
+                                tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
+                                acc = pl.matmul(tile_a, tile_b)
 
-                        # Remaining K-tiles: accumulate via matmul_acc
-                        for kb in pl.range(1, k_blocks):
-                            k0 = kb * k_tile
-                            tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
-                            tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
-                            acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
+                                # Remaining K-tiles: accumulate via matmul_acc
+                                for kb in pl.range(1, k_blocks):
+                                    k0 = kb * k_tile
+                                    tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
+                                    tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
+                                    acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
 
-                        c = pl.assemble(c, acc, [mb, nb])
+                                c = pl.assemble(c, acc, [mb, nb])
 
             return c
 

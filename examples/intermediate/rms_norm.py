@@ -48,32 +48,33 @@ def build_rms_norm_program(
             gamma: pl.Tensor[[1, hidden], pl.FP32],
             y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
         ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    # Pass 1: accumulate sum(x^2) across hidden chunks
-                    # row_sum produces [row_chunk, 1] col_major; scalar ops
-                    # need row_major, so accumulate in [1, row_chunk] shape.
-                    sq_sum = pl.create_tensor([1, row_chunk], dtype=pl.FP32)
-                    sq_sum = pl.mul(sq_sum, 0.0)
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        rs = pl.row_sum(pl.mul(x_chunk, x_chunk))
-                        sq_sum = pl.add(sq_sum, pl.reshape(rs, [1, row_chunk]))
+            for r_chunk in pl.parallel(0, rows, row_chunk * 1):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for r in pl.range(r_chunk, r_chunk + row_chunk * 1, row_chunk):
+                        # Pass 1: accumulate sum(x^2) across hidden chunks
+                        # row_sum produces [row_chunk, 1] col_major; scalar ops
+                        # need row_major, so accumulate in [1, row_chunk] shape.
+                        sq_sum = pl.create_tensor([1, row_chunk], dtype=pl.FP32)
+                        sq_sum = pl.mul(sq_sum, 0.0)
+                        for hb in pl.range(hidden_blocks):
+                            h0 = hb * hidden_chunk
+                            x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
+                            rs = pl.row_sum(pl.mul(x_chunk, x_chunk))
+                            sq_sum = pl.add(sq_sum, pl.reshape(rs, [1, row_chunk]))
 
-                    # inv_rms = 1 / sqrt(mean(x^2) + eps)
-                    inv_rms_T = pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), eps))
-                    inv_rms = pl.reshape(inv_rms_T, [row_chunk, 1])
+                        # inv_rms = 1 / sqrt(mean(x^2) + eps)
+                        inv_rms_T = pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), eps))
+                        inv_rms = pl.reshape(inv_rms_T, [row_chunk, 1])
 
-                    # Pass 2: normalise and apply gamma weight
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        gamma_chunk = pl.slice(gamma, [1, hidden_chunk], [0, h0])
-                        normed = pl.col_expand_mul(
-                            pl.row_expand_mul(x_chunk, inv_rms), gamma_chunk
-                        )
-                        y = pl.assemble(y, normed, [r, h0])
+                        # Pass 2: normalise and apply gamma weight
+                        for hb in pl.range(hidden_blocks):
+                            h0 = hb * hidden_chunk
+                            x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
+                            gamma_chunk = pl.slice(gamma, [1, hidden_chunk], [0, h0])
+                            normed = pl.col_expand_mul(
+                                pl.row_expand_mul(x_chunk, inv_rms), gamma_chunk
+                            )
+                            y = pl.assemble(y, normed, [r, h0])
 
             return y
 

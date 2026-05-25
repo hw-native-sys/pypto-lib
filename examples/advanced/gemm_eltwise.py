@@ -11,7 +11,7 @@
     output = matmul(attn_out, wo) + hidden_states
 
 Stage 0 (matmul: attn_out x wo) and Stage 1 (residual add) can be:
-  - Fused: single pl.at block with chunked_loop_optimizer (mix mode)
+  - Fused: single pl.at block with auto_chunk (mix mode)
   - Split: separate pl.at blocks for each stage (split mode)
 
 Input and hidden_states are BF16; wo is BF16; output is FP32.
@@ -36,7 +36,7 @@ def build_gemm_eltwise_mix_program(
     batch_tile: int = BATCH_TILE,
     chunk: int = 4,
 ):
-    """Build fused matmul + elementwise program with chunked_loop_optimizer."""
+    """Build fused matmul + elementwise program with auto_chunk."""
     k_blocks = hidden // k_chunk
     n_blocks = hidden // n_chunk
 
@@ -50,26 +50,27 @@ def build_gemm_eltwise_mix_program(
             wo: pl.Tensor[[hidden, hidden], pl.BF16],
             resid: pl.Out[pl.Tensor[[batch, hidden], pl.FP32]],
         ) -> pl.Tensor[[batch, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
-                for nb in pl.parallel(0, n_blocks, chunk=chunk):
-                    n0 = nb * n_chunk
-                    # First K-tile: initialize accumulator via matmul
-                    a_chunk_0 = pl.slice(attn_out, [batch_tile, k_chunk], [0, 0])
-                    w_chunk_0 = pl.slice(wo, [k_chunk, n_chunk], [0, n0])
-                    acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
+            for nb_chunk in pl.parallel(0, n_blocks, 1 * chunk):
+                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+                    for nb in pl.range(nb_chunk, nb_chunk + 1 * chunk, 1):
+                        n0 = nb * n_chunk
+                        # First K-tile: initialize accumulator via matmul
+                        a_chunk_0 = pl.slice(attn_out, [batch_tile, k_chunk], [0, 0])
+                        w_chunk_0 = pl.slice(wo, [k_chunk, n_chunk], [0, n0])
+                        acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
 
-                    # Remaining K-tiles: accumulate via matmul_acc
-                    for kb in pl.range(1, k_blocks):
-                        k0 = kb * k_chunk
-                        a_chunk = pl.slice(attn_out, [batch_tile, k_chunk], [0, k0])
-                        w_chunk = pl.slice(wo, [k_chunk, n_chunk], [k0, n0])
-                        acc = pl.matmul_acc(acc, a_chunk, w_chunk)
+                        # Remaining K-tiles: accumulate via matmul_acc
+                        for kb in pl.range(1, k_blocks):
+                            k0 = kb * k_chunk
+                            a_chunk = pl.slice(attn_out, [batch_tile, k_chunk], [0, k0])
+                            w_chunk = pl.slice(wo, [k_chunk, n_chunk], [k0, n0])
+                            acc = pl.matmul_acc(acc, a_chunk, w_chunk)
 
-                    # Elementwise residual addition
-                    hidden_chunk = pl.slice(hidden_states, [batch_tile, n_chunk], [0, n0])
-                    hidden_chunk_f32 = pl.cast(hidden_chunk, target_type=pl.FP32)
-                    resid_sum = pl.add(acc, hidden_chunk_f32)
-                    resid = pl.assemble(resid, resid_sum, [0, n0])
+                        # Elementwise residual addition
+                        hidden_chunk = pl.slice(hidden_states, [batch_tile, n_chunk], [0, n0])
+                        hidden_chunk_f32 = pl.cast(hidden_chunk, target_type=pl.FP32)
+                        resid_sum = pl.add(acc, hidden_chunk_f32)
+                        resid = pl.assemble(resid, resid_sum, [0, n0])
 
             return resid
 

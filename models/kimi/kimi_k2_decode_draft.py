@@ -137,7 +137,7 @@ def build_kimi_k2_decode_program(
             # =========================================================================
             # Scope 1: Input RMSNorm + QKV Projection
             # =========================================================================
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP):
                 sq_sum = pl.create_tensor([BATCH_CFG, 1], dtype=pl.FP32)
                 sq_sum = pl.mul(sq_sum, 0.0)
 
@@ -157,196 +157,208 @@ def build_kimi_k2_decode_program(
                     inv_rms_tile = pl.slice(inv_rms, [BATCH_TILE, 1], [b0, 0])
 
                     # Q projection
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
-                        q0 = ob * Q_OUT_CHUNK
-                        q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                        q_acc = pl.mul(q_acc, 0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
-                            q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
-                        q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
+                    for ob_chunk in pl.parallel(0, Q_OUT_BLOCKS, 4):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for ob in pl.range(ob_chunk, ob_chunk + 4):
+                                q0 = ob * Q_OUT_CHUNK
+                                q_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                                q_acc = pl.mul(q_acc, 0.0)
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                                    x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                                    gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                                    wq_chunk = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [k0, q0])
+                                    q_acc = pl.add(q_acc, pl.matmul(pl.cast(normed, target_type=pl.BF16), wq_chunk))
+                                q_proj = pl.assemble(q_proj, pl.cast(q_acc, target_type=pl.BF16), [b0, q0])
 
                     # K/V projection
-                    for ob in pl.parallel(0, KV_OUT_BLOCKS, 1, chunk=8):
-                        kv0 = ob * KV_OUT_CHUNK
-                        k_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
-                        k_acc = pl.mul(k_acc, 0.0)
-                        v_acc = pl.mul(v_acc, 0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
-                            x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
-                            gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
-                            normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
-                            normed_bf16 = pl.cast(normed, target_type=pl.BF16)
-                            wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
-                            k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
-                            v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
-                        k_proj = pl.assemble(k_proj, pl.cast(k_acc, target_type=pl.BF16), [b0, kv0])
-                        v_proj = pl.assemble(v_proj, pl.cast(v_acc, target_type=pl.BF16), [b0, kv0])
+                    for ob_chunk in pl.parallel(0, KV_OUT_BLOCKS, 8):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for ob in pl.range(ob_chunk, ob_chunk + 8):
+                                kv0 = ob * KV_OUT_CHUNK
+                                k_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                                v_acc = pl.create_tensor([BATCH_TILE, KV_OUT_CHUNK], dtype=pl.FP32)
+                                k_acc = pl.mul(k_acc, 0.0)
+                                v_acc = pl.mul(v_acc, 0.0)
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    x_chunk_bf16 = pl.slice(hidden_states, [BATCH_TILE, K_CHUNK], [b0, k0])
+                                    x_chunk = pl.cast(x_chunk_bf16, target_type=pl.FP32)
+                                    gamma = pl.slice(input_rms_weight, [1, K_CHUNK], [0, k0])
+                                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms_tile), gamma)
+                                    normed_bf16 = pl.cast(normed, target_type=pl.BF16)
+                                    wk_chunk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                                    wv_chunk = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [k0, kv0])
+                                    k_acc = pl.add(k_acc, pl.matmul(normed_bf16, wk_chunk))
+                                    v_acc = pl.add(v_acc, pl.matmul(normed_bf16, wv_chunk))
+                                k_proj = pl.assemble(k_proj, pl.cast(k_acc, target_type=pl.BF16), [b0, kv0])
+                                v_proj = pl.assemble(v_proj, pl.cast(v_acc, target_type=pl.BF16), [b0, kv0])
 
             # =========================================================================
             # Scope 2: RoPE + KV Cache Update + Flash Decoding Attention
             # =========================================================================
-            for b in pl.parallel(0, BATCH_CFG, 1, chunk=4):
-                pos = pl.tensor.read(cache_pos, [b])
-                ctx_len = pos + 1
-                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+            for b_chunk in pl.parallel(0, BATCH_CFG, 4):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for b in pl.range(b_chunk, b_chunk + 4):
+                        pos = pl.tensor.read(cache_pos, [b])
+                        ctx_len = pos + 1
+                        ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
                 
-                # Load RoPE coefficients
-                cos_row = pl.slice(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
-                sin_row = pl.slice(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
-                cos_lo = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                cos_hi = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
-                sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                        # Load RoPE coefficients
+                        cos_row = pl.slice(rope_cos, [1, HEAD_DIM_CFG], [pos, 0])
+                        sin_row = pl.slice(rope_sin, [1, HEAD_DIM_CFG], [pos, 0])
+                        cos_lo = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                        cos_hi = pl.slice(cos_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                        sin_lo = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                        sin_hi = pl.slice(sin_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
 
-                # RoPE for K/V and update cache
-                for kvh in pl.parallel(0, NUM_KV_HEADS_CFG, 1, chunk=4):
-                    kv_col = kvh * HEAD_DIM_CFG
-                    k_row = pl.cast(
-                        pl.slice(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
-                        target_type=pl.FP32,
-                    )
-                    k_lo = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                    k_hi = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                        # RoPE for K/V and update cache
+                        for kvh_chunk in pl.parallel(0, NUM_KV_HEADS_CFG, 4):
+                            with pl.at(level=pl.Level.CORE_GROUP):
+                                for kvh in pl.range(kvh_chunk, kvh_chunk + 4):
+                                    kv_col = kvh * HEAD_DIM_CFG
+                                    k_row = pl.cast(
+                                        pl.slice(k_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                                        target_type=pl.FP32,
+                                    )
+                                    k_lo = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                                    k_hi = pl.slice(k_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
                     
-                    # Apply RoPE
-                    k_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
-                    k_rot = pl.assemble(
-                        k_rot,
-                        pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo)),
-                        [0, 0],
-                    )
-                    k_rot = pl.assemble(
-                        k_rot,
-                        pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi)),
-                        [0, HEAD_DIM_CFG // 2],
-                    )
+                                    # Apply RoPE
+                                    k_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
+                                    k_rot = pl.assemble(
+                                        k_rot,
+                                        pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo)),
+                                        [0, 0],
+                                    )
+                                    k_rot = pl.assemble(
+                                        k_rot,
+                                        pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi)),
+                                        [0, HEAD_DIM_CFG // 2],
+                                    )
                     
-                    # Update KV cache
-                    cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + pos
-                    k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
-                    v_cache = pl.assemble(
-                        v_cache,
-                        pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
-                        [cache_row, 0],
-                    )
+                                    # Update KV cache
+                                    cache_row = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + pos
+                                    k_cache = pl.assemble(k_cache, pl.cast(k_rot, target_type=pl.BF16), [cache_row, 0])
+                                    v_cache = pl.assemble(
+                                        v_cache,
+                                        pl.slice(v_proj, [1, HEAD_DIM_CFG], [b, kv_col]),
+                                        [cache_row, 0],
+                                    )
 
-                # Flash Decoding Attention per head
-                with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                    attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
-                    attn_row = pl.mul(attn_row, 0.0)
+                        # Flash Decoding Attention per head
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            attn_row = pl.create_tensor([1, HIDDEN_CFG], dtype=pl.FP32)
+                            attn_row = pl.mul(attn_row, 0.0)
 
-                    for h in pl.parallel(0, NUM_HEADS_CFG, 1, chunk=8):
-                        kvh = h // Q_PER_KV_CFG
-                        q_col = h * HEAD_DIM_CFG
+                            for h_chunk in pl.parallel(0, NUM_HEADS_CFG, 8):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for h in pl.range(h_chunk, h_chunk + 8):
+                                        kvh = h // Q_PER_KV_CFG
+                                        q_col = h * HEAD_DIM_CFG
 
-                        # RoPE for Q
-                        q_row = pl.cast(
-                            pl.slice(q_proj, [1, HEAD_DIM_CFG], [b, q_col]),
-                            target_type=pl.FP32,
-                        )
-                        q_lo = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, 0])
-                        q_hi = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
-                        q_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
-                        q_rot = pl.assemble(
-                            q_rot,
-                            pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)),
-                            [0, 0],
-                        )
-                        q_rot = pl.assemble(
-                            q_rot,
-                            pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
-                            [0, HEAD_DIM_CFG // 2],
-                        )
-                        q_rot_bf16 = pl.cast(q_rot, target_type=pl.BF16)
+                                        # RoPE for Q
+                                        q_row = pl.cast(
+                                            pl.slice(q_proj, [1, HEAD_DIM_CFG], [b, q_col]),
+                                            target_type=pl.FP32,
+                                        )
+                                        q_lo = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, 0])
+                                        q_hi = pl.slice(q_row, [1, HEAD_DIM_CFG // 2], [0, HEAD_DIM_CFG // 2])
+                                        q_rot = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
+                                        q_rot = pl.assemble(
+                                            q_rot,
+                                            pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo)),
+                                            [0, 0],
+                                        )
+                                        q_rot = pl.assemble(
+                                            q_rot,
+                                            pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi)),
+                                            [0, HEAD_DIM_CFG // 2],
+                                        )
+                                        q_rot_bf16 = pl.cast(q_rot, target_type=pl.BF16)
 
-                        # Online softmax state
-                        oi = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
-                        li = pl.create_tensor([1, 1], dtype=pl.FP32)
-                        mi = pl.create_tensor([1, 1], dtype=pl.FP32)
-                        oi = pl.mul(oi, 0.0)
-                        li = pl.mul(li, 0.0)
-                        mi = pl.mul(mi, 0.0)
+                                        # Online softmax state
+                                        oi = pl.create_tensor([1, HEAD_DIM_CFG], dtype=pl.FP32)
+                                        li = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                        mi = pl.create_tensor([1, 1], dtype=pl.FP32)
+                                        oi = pl.mul(oi, 0.0)
+                                        li = pl.mul(li, 0.0)
+                                        mi = pl.mul(mi, 0.0)
 
-                        # Process KV cache in chunks (sliding window)
-                        for sb in pl.range(ctx_blocks):
-                            s0 = sb * SEQ_TILE
-                            valid_len = pl.min(SEQ_TILE, ctx_len - s0)
-                            cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
+                                        # Process KV cache in chunks (sliding window)
+                                        for sb in pl.range(ctx_blocks):
+                                            s0 = sb * SEQ_TILE
+                                            valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                                            cache_row0 = b * NUM_KV_HEADS_CFG * MAX_SEQ_CFG + kvh * MAX_SEQ_CFG + s0
                             
-                            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
-                            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
+                                            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
+                                            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM_CFG], [cache_row0, 0])
                             
-                            # Q @ K^T * scale
-                            scores = pl.mul(pl.matmul(q_rot_bf16, k_tile, b_trans=True), ATTN_SCALE)
-                            scores_valid = pl.slice(scores, [1, valid_len], [0, 0])
+                                            # Q @ K^T * scale
+                                            scores = pl.mul(pl.matmul(q_rot_bf16, k_tile, b_trans=True), ATTN_SCALE)
+                                            scores_valid = pl.slice(scores, [1, valid_len], [0, 0])
                             
-                            # Online softmax
-                            cur_mi = pl.cast(pl.row_max(scores_valid), target_type=pl.FP32)
-                            exp_scores = pl.exp(pl.row_expand_sub(scores_valid, cur_mi))
-                            cur_li = pl.cast(pl.row_sum(exp_scores), target_type=pl.FP32)
+                                            # Online softmax
+                                            cur_mi = pl.cast(pl.row_max(scores_valid), target_type=pl.FP32)
+                                            exp_scores = pl.exp(pl.row_expand_sub(scores_valid, cur_mi))
+                                            cur_li = pl.cast(pl.row_sum(exp_scores), target_type=pl.FP32)
                             
-                            exp_pad = pl.create_tensor([1, SEQ_TILE], dtype=pl.FP32)
-                            exp_pad = pl.mul(exp_pad, 0.0)
-                            exp_pad = pl.assemble(exp_pad, exp_scores, [0, 0])
+                                            exp_pad = pl.create_tensor([1, SEQ_TILE], dtype=pl.FP32)
+                                            exp_pad = pl.mul(exp_pad, 0.0)
+                                            exp_pad = pl.assemble(exp_pad, exp_scores, [0, 0])
                             
-                            oi_tmp = pl.matmul(
-                                pl.cast(exp_pad, target_type=pl.BF16),
-                                v_tile,
-                                out_dtype=pl.FP32,
-                            )
+                                            oi_tmp = pl.matmul(
+                                                pl.cast(exp_pad, target_type=pl.BF16),
+                                                v_tile,
+                                                out_dtype=pl.FP32,
+                                            )
 
-                            if sb == 0:
-                                oi = oi_tmp
-                                li = cur_li
-                                mi = cur_mi
-                            else:
-                                mi_new = pl.maximum(mi, cur_mi)
-                                alpha = pl.exp(pl.sub(mi, mi_new))
-                                beta = pl.exp(pl.sub(cur_mi, mi_new))
-                                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
-                                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
-                                mi = mi_new
+                                            if sb == 0:
+                                                oi = oi_tmp
+                                                li = cur_li
+                                                mi = cur_mi
+                                            else:
+                                                mi_new = pl.maximum(mi, cur_mi)
+                                                alpha = pl.exp(pl.sub(mi, mi_new))
+                                                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                                                li = pl.add(pl.mul(alpha, li), pl.mul(beta, cur_li))
+                                                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp, beta))
+                                                mi = mi_new
 
-                        ctx = pl.row_expand_div(oi, li)
-                        attn_row = pl.assemble(attn_row, ctx, [0, q_col])
+                                        ctx = pl.row_expand_div(oi, li)
+                                        attn_row = pl.assemble(attn_row, ctx, [0, q_col])
 
-                    attn_out = pl.assemble(attn_out, attn_row, [b, 0])
+                            attn_out = pl.assemble(attn_out, attn_row, [b, 0])
 
             # =========================================================================
             # Scope 3: Output Projection + Residual + Post RMSNorm + MoE
             # =========================================================================
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP):
                 for b0 in pl.range(0, BATCH_CFG, BATCH_TILE):
                     # Output projection + residual
                     resid1_tile = pl.create_tensor([BATCH_TILE, HIDDEN_CFG], dtype=pl.FP32)
 
-                    for ob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=8):
-                        o0 = ob * Q_OUT_CHUNK
-                        o_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
-                        o_acc = pl.mul(o_acc, 0.0)
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            a_chunk = pl.cast(
-                                pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0]),
-                                target_type=pl.BF16,
-                            )
-                            w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
-                            o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
-                        resid = pl.cast(
-                            pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
-                            target_type=pl.FP32,
-                        )
-                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
+                    for ob_chunk in pl.parallel(0, Q_OUT_BLOCKS, 8):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            for ob in pl.range(ob_chunk, ob_chunk + 8):
+                                o0 = ob * Q_OUT_CHUNK
+                                o_acc = pl.create_tensor([BATCH_TILE, Q_OUT_CHUNK], dtype=pl.FP32)
+                                o_acc = pl.mul(o_acc, 0.0)
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    a_chunk = pl.cast(
+                                        pl.slice(attn_out, [BATCH_TILE, K_CHUNK], [b0, k0]),
+                                        target_type=pl.BF16,
+                                    )
+                                    w_chunk = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [k0, o0])
+                                    o_acc = pl.add(o_acc, pl.matmul(a_chunk, w_chunk))
+                                resid = pl.cast(
+                                    pl.slice(hidden_states, [BATCH_TILE, Q_OUT_CHUNK], [b0, o0]),
+                                    target_type=pl.FP32,
+                                )
+                                resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid), [0, o0])
 
                     # Post RMSNorm
                     sq_sum = pl.create_tensor([BATCH_TILE, 1], dtype=pl.FP32)
@@ -414,12 +426,14 @@ def build_kimi_k2_decode_program(
                         mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                         mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                        for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
-                            d0 = dob * Q_OUT_CHUNK
-                            down_prev = pl.slice(shared_out, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
-                            w_down_chunk = pl.slice(w_down_shared, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
-                            down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                            shared_out = pl.assemble(shared_out, down_next, [0, d0])
+                        for dob_chunk in pl.parallel(0, Q_OUT_BLOCKS, 4):
+                            with pl.at(level=pl.Level.CORE_GROUP):
+                                for dob in pl.range(dob_chunk, dob_chunk + 4):
+                                    d0 = dob * Q_OUT_CHUNK
+                                    down_prev = pl.slice(shared_out, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                                    w_down_chunk = pl.slice(w_down_shared, [MLP_OUT_CHUNK, Q_OUT_CHUNK], [o0, d0])
+                                    down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
+                                    shared_out = pl.assemble(shared_out, down_next, [0, d0])
 
                     # Routed Experts (top-K selection)
                     # Simplified: process all experts with gating weight
@@ -450,14 +464,16 @@ def build_kimi_k2_decode_program(
                             mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
                             mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
 
-                            for dob in pl.parallel(0, Q_OUT_BLOCKS, 1, chunk=4):
-                                d0 = dob * Q_OUT_CHUNK
-                                down_prev = pl.slice(expert_out, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
-                                # Slice and reshape 3D down weights to 2D
-                                w_down_chunk = pl.slice(w_down_experts, [NUM_EXPERTS_CFG, MLP_OUT_CHUNK, Q_OUT_CHUNK], [exp_idx, o0, d0])
-                                w_down_chunk = pl.reshape(w_down_chunk, [MLP_OUT_CHUNK, Q_OUT_CHUNK])
-                                down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
-                                expert_out = pl.assemble(expert_out, down_next, [0, d0])
+                            for dob_chunk in pl.parallel(0, Q_OUT_BLOCKS, 4):
+                                with pl.at(level=pl.Level.CORE_GROUP):
+                                    for dob in pl.range(dob_chunk, dob_chunk + 4):
+                                        d0 = dob * Q_OUT_CHUNK
+                                        down_prev = pl.slice(expert_out, [BATCH_TILE, Q_OUT_CHUNK], [0, d0])
+                                        # Slice and reshape 3D down weights to 2D
+                                        w_down_chunk = pl.slice(w_down_experts, [NUM_EXPERTS_CFG, MLP_OUT_CHUNK, Q_OUT_CHUNK], [exp_idx, o0, d0])
+                                        w_down_chunk = pl.reshape(w_down_chunk, [MLP_OUT_CHUNK, Q_OUT_CHUNK])
+                                        down_next = pl.add(down_prev, pl.matmul(mlp_chunk_bf16, w_down_chunk))
+                                        expert_out = pl.assemble(expert_out, down_next, [0, d0])
 
                         # Weight by gating probability
                         gate_weight = pl.slice(gate_prob, [BATCH_TILE, 1], [0, exp_idx])

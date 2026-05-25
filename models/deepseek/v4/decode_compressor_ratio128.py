@@ -238,16 +238,17 @@ def compressor(
         # Per-batch fan-out: write kv_final[b] to kv[b, 0, :] (row b*S of kv_flat).
         kv_cache_flat = pl.reshape(kv_cache, [B * IDX_KV_LEN, HEAD_DIM])
         cache_col = start_pos // COMPRESS_RATIO
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="kv_and_cache_write"):
-            for b_idx in pl.parallel(0, B, chunk=16):
-                kv_row_fp32 = kv_final[b_idx : b_idx + 1, 0 : HEAD_DIM]
-                kv_flat = pl.assemble(kv_flat, kv_row_fp32, [b_idx * S, 0])
-                cache_row = b_idx * IDX_KV_LEN + cache_col
-                kv_cache_flat = pl.assemble(
-                    kv_cache_flat,
-                    pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
-                    [cache_row, 0],
-                )
+        for b_chunk in pl.parallel(0, B, 1 * 16):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
+                for b_idx in pl.range(b_chunk, b_chunk + 1 * 16, 1):
+                    kv_row_fp32 = kv_final[b_idx : b_idx + 1, 0 : HEAD_DIM]
+                    kv_flat = pl.assemble(kv_flat, kv_row_fp32, [b_idx * S, 0])
+                    cache_row = b_idx * IDX_KV_LEN + cache_col
+                    kv_cache_flat = pl.assemble(
+                        kv_cache_flat,
+                        pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
+                        [cache_row, 0],
+                    )
         kv_cache = pl.reshape(kv_cache_flat, [B, IDX_KV_LEN, HEAD_DIM])
 
     if pre_tokens < S:

@@ -38,11 +38,12 @@ def build_hello_world_program(
             a: pl.Scalar[pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-                for r in pl.parallel(0, rows, 1, chunk=row_chunk):
-                    tile_x = pl.slice(x, [1, cols], [r, 0])
-                    tile_y = pl.add(tile_x, a)
-                    y = pl.assemble(y, tile_y, [r, 0])
+            for r_chunk in pl.parallel(0, rows, 1 * row_chunk):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for r in pl.range(r_chunk, r_chunk + 1 * row_chunk, 1):
+                        tile_x = pl.slice(x, [1, cols], [r, 0])
+                        tile_y = pl.add(tile_x, a)
+                        y = pl.assemble(y, tile_y, [r, 0])
 
             return y
 

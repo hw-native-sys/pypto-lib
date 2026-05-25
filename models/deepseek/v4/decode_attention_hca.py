@@ -270,7 +270,7 @@ def attention_hca(
     # Chunk over T so [T, SPARSE_TOPK] INT32 (T=128 * 640 * 4 = 320KB) doesn't blow Vec budget.
     topk_idxs = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     for t0 in pl.range(0, T, HCA_TOPK_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="hca_topk"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_topk"):
             win_idx = pl.arange(0, [1, WIN], dtype=pl.INT32)
             cmp_idx = pl.add(
                 pl.arange(0, [1, CMP_TOPK], dtype=pl.INT32),
