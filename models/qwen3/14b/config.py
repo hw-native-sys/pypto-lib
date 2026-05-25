@@ -46,6 +46,9 @@ KV_OUT_CHUNK = 256
 BATCH_TILE = 16
 
 # Scope 2 tiling constants.
+# Q_HEAD_BATCH = q_per_kv = 40/8 = 5 for the official Qwen3-14B config.
+# The Q_HEAD_BATCH-row trim runs in the non-UP_DOWN online_softmax region, so
+# the odd 5 is fine; fa_fused itself splits on Q_HEAD_PAD=16 (always even).
 Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16
 # SEQ_TILE = 128 keeps each K/V tile at 32 KB (BLOCK_SIZE * HEAD_DIM * BF16),
@@ -61,6 +64,10 @@ K_CHUNK = 256
 OUT_PROJ_K_CHUNK = 256
 OUT_PROJ_N_CHUNK = 256
 MLP_OUT_CHUNK = 256
+# SPMD grouping for the MLP gate/up/silu stages: MLP_SPMD_INNER output
+# blocks are bundled per parallel chunk and dispatched across SPMD lanes.
+MLP_SPMD_INNER = 2
+MLP_GROUP_CHUNK = MLP_SPMD_INNER * MLP_OUT_CHUNK
 DOWN_MLP_CHUNK = 256
 DOWN_OUT_CHUNK = 256
 FINAL_RMS_K_CHUNK = 128
@@ -69,6 +76,23 @@ VOCAB_CHUNK = 64
 
 # Decode grouping.
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
+# fa_fused groups attention work by (KV head, Q-head batch). Each KV head must
+# map to an integer number of Q_HEAD_BATCH chunks.
+assert Q_PER_KV % Q_HEAD_BATCH == 0, (
+    f"Q_PER_KV ({Q_PER_KV}) must be divisible by Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+)
+# Q_HEAD_PAD is the padded Q row count fa_fused operates on. It must be even
+# (ExpandMixedKernel applies an UP_DOWN row split inside the spmd body, and
+# set_validshape uses Q_HEAD_PAD // 2 as the post-split height) and large
+# enough to hold a Q_HEAD_BATCH chunk before the trim.
+assert Q_HEAD_PAD % 2 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH, (
+    f"Q_HEAD_PAD ({Q_HEAD_PAD}) must be even and >= Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+)
 Q_GROUPS = Q_PER_KV // Q_HEAD_BATCH
 TOTAL_Q_GROUPS = NUM_KV_HEADS * Q_GROUPS
+# fa_fused dispatches via pl.spmd(TOTAL_Q_GROUPS // 2) with an inner
+# pl.pipeline(2, stage=2) over the Q-group pair; that requires an even count.
+assert TOTAL_Q_GROUPS % 2 == 0, (
+    f"TOTAL_Q_GROUPS ({TOTAL_Q_GROUPS}) must be even (fa_fused pairs Q groups)"
+)
 MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
