@@ -97,6 +97,14 @@ def moe(
         x_norm, x_norm_i8, x_norm_scale, indices, weights,
     )
 
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    expert_shared(
+        x_norm_i8, x_norm_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        sh,
+    )
+
     recv_x = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.INT8)
     recv_scale_dq = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
@@ -113,14 +121,6 @@ def moe(
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
-    )
-
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared(
-        x_norm_i8, x_norm_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        sh,
     )
 
     # ffn_out kept as [B, S, D] so hc_post consumes it without a post-write
@@ -220,6 +220,19 @@ def golden_moe(tensors):
         "weights":         weights,
     })
 
+    sh = torch.zeros(T, D, dtype=torch.bfloat16)
+    golden_expert_shared({
+        "x_local_i8":       x_norm_i8,
+        "x_local_scale_dq": x_norm_scale,
+        "shared_w1":        tensors["shared_w1"],
+        "shared_w1_scale":  tensors["shared_w1_scale"],
+        "shared_w3":        tensors["shared_w3"],
+        "shared_w3_scale":  tensors["shared_w3_scale"],
+        "shared_w2":        tensors["shared_w2"],
+        "shared_w2_scale":  tensors["shared_w2_scale"],
+        "sh":               sh,
+    })
+
     recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.int8)
     recv_scale_dq = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
@@ -249,19 +262,6 @@ def golden_moe(tensors):
         "routed_w2":        tensors["routed_w2"],
         "routed_w2_scale":  tensors["routed_w2_scale"],
         "recv_y":           recv_y,
-    })
-
-    sh = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_expert_shared({
-        "x_local_i8":       x_norm_i8,
-        "x_local_scale_dq": x_norm_scale,
-        "shared_w1":        tensors["shared_w1"],
-        "shared_w1_scale":  tensors["shared_w1_scale"],
-        "shared_w3":        tensors["shared_w3"],
-        "shared_w3_scale":  tensors["shared_w3_scale"],
-        "shared_w2":        tensors["shared_w2"],
-        "shared_w2_scale":  tensors["shared_w2_scale"],
-        "sh":               sh,
     })
 
     ffn_out = torch.zeros(B, S, D, dtype=torch.bfloat16)
