@@ -330,9 +330,9 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 524288
-          PTO2_RING_TASK_WINDOW: 524288
-          PTO2_RING_HEAP: 1073741824
+          PTO2_RING_DEP_POOL: 1048576
+          PTO2_RING_TASK_WINDOW: 1048576
+          PTO2_RING_HEAP: 4294967296
         run: |
           set +e
           if [ "${{ github.event_name }}" = "pull_request" ]; then
