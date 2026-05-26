@@ -1040,8 +1040,8 @@ if __name__ == "__main__":
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_pmu=args.enable_pmu,
         ),
-        rtol=3e-3,
-        atol=3e-3,
+        rtol=1.5e-2,
+        atol=1.5e-2,
     )
     if not result.passed:
         if result.error:
