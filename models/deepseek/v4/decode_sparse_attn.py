@@ -183,12 +183,7 @@ def sparse_attn(
                             0 : HEAD_DIM,
                         ]
                         qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
-                        qk_scores_valid = pl.slice(
-                            pl.mul(qk_raw_scores, SOFTMAX_SCALE),
-                            [H_TILE, SPARSE_ATTN_TILE],
-                            [0, 0],
-                            valid_shape=[H_TILE, qk_tile_valid],
-                        )
+                        qk_scores_valid = pl.set_validshape(pl.mul(qk_raw_scores, SOFTMAX_SCALE), H_TILE, qk_tile_valid)
                         qk_scores = pl.fillpad(qk_scores_valid, pad_value=pl.PadValue.min)
                         qk_mi = pl.row_max(qk_scores)
                         qk_exp_scores = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
@@ -226,12 +221,9 @@ def sparse_attn(
                         pv_oi_tmp = pl.matmul(pv_exp, pv_kv_tile, out_dtype=pl.FP32)
                         sparse_blk_oi = pl.assemble(sparse_blk_oi, pv_oi_tmp, [pv_block_row, 0])
 
-            sparse_mi = pl.create_tensor([H_TILE, 1], dtype=pl.FP32)
-            sparse_li = pl.create_tensor([H_TILE, 1], dtype=pl.FP32)
-            sparse_oi = pl.create_tensor([H_TILE, HEAD_DIM], dtype=pl.FP32)
-
-            # Stage 2c: online-softmax merge across sparse-K tiles.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="merge"):
+            # Stage 2c: online-softmax merge across sparse-K tiles, then sink-norm
+            # in the same scope so the per-token mi/li/oi never round-trip GM.
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="merge_norm"):
                 merge_t = attn_t0
                 merge_b = merge_t // S
                 merge_s = merge_t - merge_b * S
@@ -262,19 +254,11 @@ def sparse_attn(
                         )
                         merge_mi = merge_mi_new
 
-                sparse_mi = pl.assemble(sparse_mi, merge_mi, [0, 0])
-                sparse_li = pl.assemble(sparse_li, merge_li, [0, 0])
-                sparse_oi = pl.assemble(sparse_oi, merge_oi, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="norm"):
                 norm_t = attn_t0
-                norm_oi = sparse_oi[0 : H_TILE, 0 : HEAD_DIM]
-                norm_mi = sparse_mi[0 : H_TILE, 0 : 1]
-                norm_li = sparse_li[0 : H_TILE, 0 : 1]
                 norm_sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
-                norm_sink_tile = pl.add(pl.sub(norm_mi, norm_mi), norm_sink_bias)
-                norm_denom = pl.add(norm_li, pl.exp(pl.sub(norm_sink_tile, norm_mi)))
-                oi_out = pl.row_expand_div(norm_oi, norm_denom)
+                norm_sink_tile = pl.add(pl.sub(merge_mi, merge_mi), norm_sink_bias)
+                norm_denom = pl.add(merge_li, pl.exp(pl.sub(norm_sink_tile, merge_mi)))
+                oi_out = pl.row_expand_div(merge_oi, norm_denom)
                 attn_stage_row = pl.cast(
                     oi_out[0 : H_TILE, 0 : HEAD_DIM],
                     target_type=pl.BF16,
