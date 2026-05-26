@@ -213,7 +213,7 @@ def indexer_compressor(
             rope_odd_acc[:, :] = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
 
         # Mix: assemble matmul (cube, FP32-out) + final BF16 write (vector) in one scope.
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_assemble"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.NONE)], name_hint="rope_assemble"):
             rope_acc = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
             for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
                 ra_0 = ra_b * ROPE_CHUCK
