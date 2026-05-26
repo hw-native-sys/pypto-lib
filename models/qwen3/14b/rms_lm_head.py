@@ -116,7 +116,16 @@ def rms_only(
     """Variant of rms_lm_head that performs the final RMSNorm but skips the
     LM-head matmul entirely. ``out`` is returned untouched (the harness
     zero-inits it), and ``lm_head_weight`` is accepted but unused so the
-    function signature stays interchangeable with ``rms_lm_head``."""
+    function signature stays interchangeable with ``rms_lm_head``.
+
+    TODO: ``final_normed`` is written but never read or returned (the LM-head
+    matmul that consumes it is gone in this skip variant). Each pl.assemble
+    is a GM store with side effects, so the pypto JIT should preserve the
+    RMSNorm loop, but the value is dead-data from the IR's perspective and
+    a future DCE pass could elide it (Gemini review on PR #387). If the
+    measured RMSNorm cost collapses to ~0 in perf traces, force ``final_normed``
+    live by writing a small slice (e.g. ``out[:, :HIDDEN]`` cast to FP32) and
+    mirroring the same dummy slice in ``golden_decode_layer_no_lm_head``."""
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):

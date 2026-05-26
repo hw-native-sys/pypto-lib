@@ -79,7 +79,6 @@ from config import (
     LM_HEAD_K_CHUNK,
     MAX_BLOCKS_PER_SEQ,
     MAX_SEQ,
-    MLP_GROUP_CHUNK,
     MLP_OUT_CHUNK,
     MLP_SPMD_INNER,
     NUM_HEADS,
@@ -419,58 +418,68 @@ def decode_layer(
     # Scope-2 attention: QK matmul + tail-masked softmax + SV matmul fused
     # into ONE mixed root (fa_fused) using CV boundary moves for both
     # cross-lane directions (cube QK -> vec softmax = C2V; vec exp -> cube
-    # SV = V2C). Pipeline disabled (gi = g2 * 2 only), masked by --lm-head
-    # skip; restore pl.pipeline(2, stage=2) when running real validation.
+    # SV = V2C). Each spmd block owns a Q-group PAIR and pipelines the two
+    # groups with pl.pipeline(2, stage=2) — that supplies the bidirectional
+    # pipe's ping-pong buffering (without it the bidirectional pipe
+    # deadlocks; with one Q group per block it silently writes only half
+    # the attention output).
     for fa_spmd_idx in pl.spmd(
         BATCH * (TOTAL_Q_GROUPS // 2),
         name_hint="fa_fused",
     ):
         fa_b = fa_spmd_idx // (TOTAL_Q_GROUPS // 2)
         fa_g2 = fa_spmd_idx % (TOTAL_Q_GROUPS // 2)
-        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b])
+        # Clamp the per-b reads of USER_BATCH_DYN-backed tensors so padded
+        # spmd lanes (fa_b >= user_batch when runtime_user_batch < BATCH)
+        # never index past the dynamic dim. Padded lanes re-process batch
+        # (user_batch - 1)'s ctx_len / block_table entries; their writes
+        # to all_oi_tmp / all_cur_mi / all_cur_li still land in their own
+        # (padded) (b, gi) slot of the BATCH-sized global scratch and are
+        # never read back by online_softmax for valid os_b.
+        fa_b_safe = pl.min(fa_b, user_batch - 1)
+        fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
         fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        fa_block_table_base = fa_b * MAX_BLOCKS_PER_SEQ
+        fa_block_table_base = fa_b_safe * MAX_BLOCKS_PER_SEQ
 
-        # for gp in pl.pipeline(2, stage=2):
-        #     gi = fa_g2 * 2 + gp
-        gi = fa_g2 * 2
-        kvh = gi // Q_GROUPS
-        q_padded_row = fa_b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-        q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [q_padded_row, 0])
-        # g_base now indexes per (b, gi) into the global per-call scratch.
-        g_base = (fa_b * TOTAL_Q_GROUPS + gi) * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD
+        for gp in pl.pipeline(2, stage=2):
+            gi = fa_g2 * 2 + gp
+            kvh = gi // Q_GROUPS
+            q_padded_row = fa_b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
+            q_padded = pl.slice(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [q_padded_row, 0])
+            # g_base indexes per (b, gi) into the global per-call scratch.
+            g_base = (fa_b * TOTAL_Q_GROUPS + gi) * MAX_BLOCKS_PER_SEQ * Q_HEAD_PAD
 
-        for sb in pl.range(fa_ctx_blocks):
-            s0 = sb * BLOCK_SIZE
-            valid_len = pl.min(BLOCK_SIZE, fa_ctx_len - s0)
-            fa_block_table_idx = fa_block_table_base + sb
-            fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_block_table_idx]), pl.INDEX)
-            fa_cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+            for sb in pl.range(fa_ctx_blocks):
+                s0 = sb * BLOCK_SIZE
+                valid_len = pl.min(BLOCK_SIZE, fa_ctx_len - s0)
+                fa_block_table_idx = fa_block_table_base + sb
+                fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_block_table_idx]), pl.INDEX)
+                fa_cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
 
-            # QK matmul (cube). First vec consumer (pl.mul) triggers the
-            # C2V boundary move; set_validshape runs on the vec tile.
-            k_tile = k_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
-            raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
-            scores_scaled = pl.mul(raw_scores, decode_attn_scale)
-            # set_validshape's row operand is the POST-split tile
-            # height: the surrounding spmd body is a cube+vec mixed
-            # root and ExpandMixedKernel applies an UP_DOWN row split,
-            # so the vec lane sees Q_HEAD_PAD // 2 rows per chunk.
-            scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_PAD // 2, valid_len)
-            scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-            cur_mi = pl.row_max(scores)
-            exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-            exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-            exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
-            cur_li = pl.row_sum(exp_scores_fp32)
+                # QK matmul (cube). First vec consumer (pl.mul) triggers the
+                # C2V boundary move; set_validshape runs on the vec tile.
+                k_tile = k_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
+                raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                scores_scaled = pl.mul(raw_scores, decode_attn_scale)
+                # set_validshape's row operand is the POST-split tile
+                # height: the surrounding spmd body is a cube+vec mixed
+                # root and ExpandMixedKernel applies an UP_DOWN row split,
+                # so the vec lane sees Q_HEAD_PAD // 2 rows per chunk.
+                scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_PAD // 2, valid_len)
+                scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                cur_mi = pl.row_max(scores)
+                exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
+                cur_li = pl.row_sum(exp_scores_fp32)
 
-            # SV matmul (cube) reads exp directly -> V2C boundary move.
-            v_tile = v_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
-            oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
+                # SV matmul (cube) reads exp directly -> V2C boundary move.
+                v_tile = v_cache[fa_cache_row : fa_cache_row + BLOCK_SIZE, :]
+                oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
 
-            all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
-            all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
-            all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
+                all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
+                all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
+                all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
 
     # online_softmax promoted to TOP-LEVEL flat spmd: BATCH * TOTAL_Q_GROUPS
     # = 128 lanes in one dispatch (was 16 per-batch dispatches of 8).
@@ -479,7 +488,11 @@ def decode_layer(
     for os_spmd_idx in pl.spmd(BATCH * TOTAL_Q_GROUPS, name_hint="online_softmax"):
         os_b = os_spmd_idx // TOTAL_Q_GROUPS
         os_gi = os_spmd_idx % TOTAL_Q_GROUPS
-        os_ctx_len = pl.tensor.read(seq_lens, [os_b])
+        # See the matching clamp on fa_b above: padded spmd lanes
+        # (os_b >= user_batch) must not index past seq_lens. Their
+        # attn_out write lands in a padded row that the host trims away.
+        os_b_safe = pl.min(os_b, user_batch - 1)
+        os_ctx_len = pl.tensor.read(seq_lens, [os_b_safe])
         os_ctx_blocks = (os_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
         kvh = os_gi // Q_GROUPS
