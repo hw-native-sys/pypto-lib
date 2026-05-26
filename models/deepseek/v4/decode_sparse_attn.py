@@ -47,7 +47,7 @@ ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
-SPARSE_ATTN_TILE = 32
+ATTN_K_TILE = 32
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_T_TILE = 16
@@ -128,93 +128,97 @@ def sparse_attn(
             g_pad_row = g_kv_base + g_pad_kk
             sparse_kv[g_pad_row : g_pad_row + 1, 0 : HEAD_DIM] = zero_kv_row
 
-    # Per-tile QK / PV / merge / norm produce the dense attention output.
+    # Sparse-K attention: qk_pv writes per-tile (mi, li, oi) into GM scratch,
+    # merge_norm reads them back. ATTN_K_TILE keeps K and V right-buffer
+    # copies together under the 64KB L1B limit.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    for attn_t0 in pl.parallel(T):
-        for h0 in pl.parallel(0, H, H_TILE):
-            sparse_blk_mi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
-            sparse_blk_li = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
-            sparse_blk_oi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
+    sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE, 1], dtype=pl.FP32)
+    sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE, 1], dtype=pl.FP32)
+    sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-            # QK + softmax + PV fused per sparse-K tile so the BF16 exp scores
-            # stay on chip. SPARSE_ATTN_TILE is halved (vs the unfused form) so
-            # the K and V cube right-buffer copies both fit in L1B (64KB).
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_pv"):
-                qk_t = attn_t0
-                qk_b = qk_t // S
-                qk_s = qk_t - qk_b * S
-                qk_seq_end = pl.read(seqused_kv, [qk_b])
-                qk_seq_len = qk_seq_end - S + 1 + qk_s
-                qk_win_v = pl.min(WIN, qk_seq_len)
-                qk_tk_v = pl.min(IDX_TOPK, qk_seq_len - qk_win_v)
-                qk_sparse_k = qk_win_v + qk_tk_v
-                qk_kv_base = qk_t * TOPK
-                qk_head_row = qk_t * H + h0
-                qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
+    for qk_t in pl.spmd(T, name_hint="qk_pv"):
+        qk_b = qk_t // S
+        qk_s = qk_t - qk_b * S
+        qk_seq_end = pl.read(seqused_kv, [qk_b])
+        qk_seq_len = qk_seq_end - S + 1 + qk_s
+        qk_win_v = pl.min(WIN, qk_seq_len)
+        qk_tk_v = pl.min(IDX_TOPK, qk_seq_len - qk_win_v)
+        qk_sparse_k = qk_win_v + qk_tk_v
+        qk_kv_base = qk_t * TOPK
+        qk_token_base = qk_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
+        for qk_h_idx in pl.range((H // H_TILE)):
+            qk_h0 = qk_h_idx * H_TILE
+            qk_head_row = qk_t * H + qk_h0
+            qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
+            qk_blk_base = qk_token_base + qk_h_idx * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
-                for qk_sb in pl.range((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
-                    qk_s0 = qk_sb * SPARSE_ATTN_TILE
-                    if qk_s0 < qk_sparse_k:
-                        qk_s_v = pl.min(SPARSE_ATTN_TILE, qk_sparse_k - qk_s0)
-                        qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
-                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                        qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
-                        qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
-                        qk_mi = pl.row_max(qk_scores)
-                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
-                        qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
-                        qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
-                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                        qk_row = qk_sb * H_TILE
-                        sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
-                        sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
-                        sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
+            for qk_sb in pl.range(((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+                qk_s0 = qk_sb * ATTN_K_TILE
+                if qk_s0 < qk_sparse_k:
+                    qk_s_v = pl.min(ATTN_K_TILE, qk_sparse_k - qk_s0)
+                    qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                    qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
+                    qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
+                    qk_mi = pl.row_max(qk_scores)
+                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
+                    qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
+                    qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                    qk_row = qk_blk_base + qk_sb * H_TILE
+                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
+                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
+                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
 
-            # Online-softmax merge across sparse-K tiles, then sink-norm.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="merge_norm"):
-                m_t = attn_t0
-                m_b = m_t // S
-                m_s = m_t - m_b * S
-                m_seq_end = pl.read(seqused_kv, [m_b])
-                m_seq_len = m_seq_end - S + 1 + m_s
-                m_win_v = pl.min(WIN, m_seq_len)
-                m_tk_v = pl.min(IDX_TOPK, m_seq_len - m_win_v)
-                m_sparse_k = m_win_v + m_tk_v
-                m_mi = sparse_blk_mi[0 : H_TILE, 0 : 1]
-                m_li = sparse_blk_li[0 : H_TILE, 0 : 1]
-                m_oi = sparse_blk_oi[0 : H_TILE, 0 : HEAD_DIM]
+    # Online-softmax merge across sparse-K tiles, then sink-norm.
+    for m_t in pl.spmd(T, name_hint="merge_norm"):
+        m_b = m_t // S
+        m_s = m_t - m_b * S
+        m_seq_end = pl.read(seqused_kv, [m_b])
+        m_seq_len = m_seq_end - S + 1 + m_s
+        m_win_v = pl.min(WIN, m_seq_len)
+        m_tk_v = pl.min(IDX_TOPK, m_seq_len - m_win_v)
+        m_sparse_k = m_win_v + m_tk_v
+        m_token_base = m_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
-                for m_sb in pl.range(1, (TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
-                    m_s0 = m_sb * SPARSE_ATTN_TILE
-                    if m_s0 < m_sparse_k:
-                        m_row = m_sb * H_TILE
-                        m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                        m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                        m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                        m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                        m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                        m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                        m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                        m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                        m_mi = m_mi_new
+        for m_h_idx in pl.range((H // H_TILE)):
+            m_h0 = m_h_idx * H_TILE
+            m_blk_base = m_token_base + m_h_idx * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
+            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-                n_sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
-                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-                n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
-                n_rope_row = m_t * H + h0
-                attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+            for m_sb in pl.range(1, ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+                m_s0 = m_sb * ATTN_K_TILE
+                if m_s0 < m_sparse_k:
+                    m_row = m_blk_base + m_sb * H_TILE
+                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                    m_mi = m_mi_new
 
-                for n_hi in pl.range(H_TILE):
-                    n_gh = h0 + n_hi
-                    n_g = n_gh // HEADS_PER_GROUP
-                    n_hh = n_gh - n_g * HEADS_PER_GROUP
-                    n_pack_row = n_g * T + m_t
-                    n_col = n_hh * HEAD_DIM
-                    o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
+            n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+            n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
+            n_rope_row = m_t * H + m_h0
+            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+
+            for n_hi in pl.range(H_TILE):
+                n_gh = m_h0 + n_hi
+                n_g = n_gh // HEADS_PER_GROUP
+                n_hh = n_gh - n_g * HEADS_PER_GROUP
+                n_pack_row = n_g * T + m_t
+                n_col = n_hh * HEAD_DIM
+                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
     # Inverse RoPE: deinterleave even/odd lanes, rotate with cos/sin, reinterleave.
     rope_even_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
@@ -469,8 +473,8 @@ def golden_sparse_attn(tensors):
         block_mi = []
         block_li = []
         block_oi = []
-        for tile_start in range(0, kv_b.shape[0], SPARSE_ATTN_TILE):
-            kv_tile = kv_b[tile_start:tile_start + SPARSE_ATTN_TILE]
+        for tile_start in range(0, kv_b.shape[0], ATTN_K_TILE):
+            kv_tile = kv_b[tile_start:tile_start + ATTN_K_TILE]
             scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
             mi = scores.max(dim=-1, keepdim=True).values
             exp_scores = torch.exp(scores - mi).to(torch.bfloat16).float()
