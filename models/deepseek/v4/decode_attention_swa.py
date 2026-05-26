@@ -77,7 +77,7 @@ def attention_swa(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -234,7 +234,7 @@ def attention_swa_test(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -484,7 +484,6 @@ def build_tensor_specs():
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
-    wq_b_scale = wq_b_scale.view(Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
@@ -496,7 +495,7 @@ def build_tensor_specs():
         TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
-        TensorSpec("wq_b_scale", [Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], torch.float32, init_value=lambda: wq_b_scale),
+        TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
