@@ -46,7 +46,7 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
-MATMUL_ROW_PAD = 16
+H_TILE = 16
 SPARSE_ATTN_TILE = 64
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -151,17 +151,14 @@ def sparse_attn(
                     sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_sparse_kv_base + gather_pad_kk, 0])
 
     # Stage 2: per-tile QK / PV / merge / norm produce the dense attention output.
-    sparse_exp = pl.create_tensor([T * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE), SPARSE_ATTN_TILE], dtype=pl.BF16)
-    sparse_blk_mi = pl.create_tensor([T * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE), 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([T * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE), 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([T * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE), HEAD_DIM], dtype=pl.FP32)
-    sparse_mi = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_li = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    sparse_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     for attn_t0 in pl.parallel(T):
-        for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
+        for h0 in pl.parallel(0, H, H_TILE):
+            sparse_exp = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, SPARSE_ATTN_TILE], dtype=pl.BF16)
+            sparse_blk_mi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
+            sparse_blk_li = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
+
             # Stage 2a: QK + tile-local softmax for every sparse-K tile.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_softmax"):
                 qk_t = attn_t0
@@ -175,7 +172,7 @@ def sparse_attn(
                 qk_sparse_k = qk_window_valid + qk_cmp_topk_valid
                 qk_sparse_kv_base = qk_t * TOPK
                 qk_head_row = qk_t * H + h0
-                qk_q_batch = q_flat[qk_head_row : qk_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM]
+                qk_q_batch = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
 
                 for qk_sb in pl.range((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
                     qk_tile_start = qk_sb * SPARSE_ATTN_TILE
@@ -188,19 +185,21 @@ def sparse_attn(
                         qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
                         qk_scores_valid = pl.slice(
                             pl.mul(qk_raw_scores, SOFTMAX_SCALE),
-                            [MATMUL_ROW_PAD, SPARSE_ATTN_TILE],
+                            [H_TILE, SPARSE_ATTN_TILE],
                             [0, 0],
-                            valid_shape=[MATMUL_ROW_PAD, qk_tile_valid],
+                            valid_shape=[H_TILE, qk_tile_valid],
                         )
                         qk_scores = pl.fillpad(qk_scores_valid, pad_value=pl.PadValue.min)
                         qk_mi = pl.row_max(qk_scores)
                         qk_exp_scores = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                         qk_exp_scores_bf16 = pl.cast(qk_exp_scores, target_type=pl.BF16)
                         qk_li = pl.row_sum(pl.cast(qk_exp_scores_bf16, target_type=pl.FP32))
-                        qk_block_row = qk_t * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) + qk_sb * H + h0
+                        qk_block_row = qk_sb * H_TILE
                         sparse_exp = pl.assemble(sparse_exp, qk_exp_scores_bf16, [qk_block_row, 0])
                         sparse_blk_mi = pl.assemble(sparse_blk_mi, qk_mi, [qk_block_row, 0])
                         sparse_blk_li = pl.assemble(sparse_blk_li, qk_li, [qk_block_row, 0])
+
+            sparse_blk_oi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
             # Stage 2b: PV for each sparse-K tile. Keep the online merge in a
             # separate scope under FLASH so the AIV live set stays bounded.
@@ -218,14 +217,18 @@ def sparse_attn(
                 for pv_sb in pl.range((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
                     pv_tile_start = pv_sb * SPARSE_ATTN_TILE
                     if pv_tile_start < pv_sparse_k:
-                        pv_block_row = pv_t * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) + pv_sb * H + h0
-                        pv_exp = sparse_exp[pv_block_row : pv_block_row + MATMUL_ROW_PAD, 0 : SPARSE_ATTN_TILE]
+                        pv_block_row = pv_sb * H_TILE
+                        pv_exp = sparse_exp[pv_block_row : pv_block_row + H_TILE, 0 : SPARSE_ATTN_TILE]
                         pv_kv_tile = sparse_kv[
                             pv_sparse_kv_base + pv_tile_start : pv_sparse_kv_base + pv_tile_start + SPARSE_ATTN_TILE,
                             0 : HEAD_DIM,
                         ]
                         pv_oi_tmp = pl.matmul(pv_exp, pv_kv_tile, out_dtype=pl.FP32)
                         sparse_blk_oi = pl.assemble(sparse_blk_oi, pv_oi_tmp, [pv_block_row, 0])
+
+            sparse_mi = pl.create_tensor([H_TILE, 1], dtype=pl.FP32)
+            sparse_li = pl.create_tensor([H_TILE, 1], dtype=pl.FP32)
+            sparse_oi = pl.create_tensor([H_TILE, HEAD_DIM], dtype=pl.FP32)
 
             # Stage 2c: online-softmax merge across sparse-K tiles.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="merge"):
@@ -238,19 +241,17 @@ def sparse_attn(
                 merge_cmp_valid = merge_seq_used - merge_window_valid
                 merge_cmp_topk_valid = pl.min(IDX_TOPK, merge_cmp_valid)
                 merge_sparse_k = merge_window_valid + merge_cmp_topk_valid
-                merge_head_row = merge_t * H + h0
-                merge_block_row0 = merge_t * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) + h0
-                merge_mi = sparse_blk_mi[merge_block_row0 : merge_block_row0 + MATMUL_ROW_PAD, 0 : 1]
-                merge_li = sparse_blk_li[merge_block_row0 : merge_block_row0 + MATMUL_ROW_PAD, 0 : 1]
-                merge_oi = sparse_blk_oi[merge_block_row0 : merge_block_row0 + MATMUL_ROW_PAD, 0 : HEAD_DIM]
+                merge_mi = sparse_blk_mi[0 : H_TILE, 0 : 1]
+                merge_li = sparse_blk_li[0 : H_TILE, 0 : 1]
+                merge_oi = sparse_blk_oi[0 : H_TILE, 0 : HEAD_DIM]
 
                 for merge_sb in pl.range(1, (TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
                     merge_tile_start = merge_sb * SPARSE_ATTN_TILE
                     if merge_tile_start < merge_sparse_k:
-                        merge_block_row = merge_t * H * ((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) + merge_sb * H + h0
-                        merge_cur_mi = sparse_blk_mi[merge_block_row : merge_block_row + MATMUL_ROW_PAD, 0 : 1]
-                        merge_cur_li = sparse_blk_li[merge_block_row : merge_block_row + MATMUL_ROW_PAD, 0 : 1]
-                        merge_cur_oi = sparse_blk_oi[merge_block_row : merge_block_row + MATMUL_ROW_PAD, 0 : HEAD_DIM]
+                        merge_block_row = merge_sb * H_TILE
+                        merge_cur_mi = sparse_blk_mi[merge_block_row : merge_block_row + H_TILE, 0 : 1]
+                        merge_cur_li = sparse_blk_li[merge_block_row : merge_block_row + H_TILE, 0 : 1]
+                        merge_cur_oi = sparse_blk_oi[merge_block_row : merge_block_row + H_TILE, 0 : HEAD_DIM]
                         merge_mi_new = pl.maximum(merge_mi, merge_cur_mi)
                         merge_alpha = pl.exp(pl.sub(merge_mi, merge_mi_new))
                         merge_beta = pl.exp(pl.sub(merge_cur_mi, merge_mi_new))
@@ -261,31 +262,30 @@ def sparse_attn(
                         )
                         merge_mi = merge_mi_new
 
-                sparse_mi = pl.assemble(sparse_mi, merge_mi, [merge_head_row, 0])
-                sparse_li = pl.assemble(sparse_li, merge_li, [merge_head_row, 0])
-                sparse_oi = pl.assemble(sparse_oi, merge_oi, [merge_head_row, 0])
+                sparse_mi = pl.assemble(sparse_mi, merge_mi, [0, 0])
+                sparse_li = pl.assemble(sparse_li, merge_li, [0, 0])
+                sparse_oi = pl.assemble(sparse_oi, merge_oi, [0, 0])
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="norm"):
                 norm_t = attn_t0
-                norm_attn_head_row = norm_t * H + h0
-                norm_oi = sparse_oi[norm_attn_head_row : norm_attn_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM]
-                norm_mi = sparse_mi[norm_attn_head_row : norm_attn_head_row + MATMUL_ROW_PAD, 0 : 1]
-                norm_li = sparse_li[norm_attn_head_row : norm_attn_head_row + MATMUL_ROW_PAD, 0 : 1]
-                norm_sink_bias = pl.reshape(attn_sink[h0 : h0 + MATMUL_ROW_PAD], [MATMUL_ROW_PAD, 1])
+                norm_oi = sparse_oi[0 : H_TILE, 0 : HEAD_DIM]
+                norm_mi = sparse_mi[0 : H_TILE, 0 : 1]
+                norm_li = sparse_li[0 : H_TILE, 0 : 1]
+                norm_sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
                 norm_sink_tile = pl.add(pl.sub(norm_mi, norm_mi), norm_sink_bias)
                 norm_denom = pl.add(norm_li, pl.exp(pl.sub(norm_sink_tile, norm_mi)))
                 oi_out = pl.row_expand_div(norm_oi, norm_denom)
                 attn_stage_row = pl.cast(
-                    oi_out[0 : MATMUL_ROW_PAD, 0 : HEAD_DIM],
+                    oi_out[0 : H_TILE, 0 : HEAD_DIM],
                     target_type=pl.BF16,
                 )
                 attn_rope_stage = pl.assemble(
                     attn_rope_stage,
-                    attn_stage_row[0 : MATMUL_ROW_PAD, NOPE_DIM:HEAD_DIM],
-                    [norm_attn_head_row, 0],
+                    attn_stage_row[0 : H_TILE, NOPE_DIM:HEAD_DIM],
+                    [norm_t * H + h0, 0],
                 )
 
-                for norm_head_i in pl.range(MATMUL_ROW_PAD):
+                for norm_head_i in pl.range(H_TILE):
                     norm_global_head = h0 + norm_head_i
                     norm_g = norm_global_head // HEADS_PER_GROUP
                     norm_hh = norm_global_head - norm_g * HEADS_PER_GROUP
