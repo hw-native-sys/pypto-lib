@@ -56,11 +56,17 @@ def hc_pre(
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
+    # mixes GM intermediate is required as the bridge into split_pre_post:
+    # fusing split_pre_post here would need sub-MIX_HC-wide vec slicing of the
+    # row_expand_mul result, but pto.tpop_from_aic drops valid_shape across
+    # the cube->vec bridge (pypto#1507), breaking the downstream subview.
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
     for t0 in pl.parallel(0, T, LINEAR_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="linear"):
             sq_sum = pl.full([1, LINEAR_T_TILE], dtype=pl.FP32, value=0.0)
 
+            # Peel-first-iter matmul instead of pl.create_tensor acc + if-kb==0 carry.
+            # pl.pipeline + create_tensor carry crashes pto_codegen (pypto#1501).
             x_lin_0 = pl.cast(x_flat[t0:t0 + LINEAR_T_TILE, 0:LINEAR_K_CHUNK], target_type=pl.FP32)
             x_sq_0 = pl.mul(x_lin_0, x_lin_0)
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(x_sq_0), [1, LINEAR_T_TILE]))
@@ -169,6 +175,9 @@ def hc_pre(
                 row2_cur = pl.div(row2_norm, col_sum)
                 row3_cur = pl.div(row3_norm, col_sum)
 
+            # Narrow tile->GM write via pl.store (respects valid_shape). The
+            # equivalent subscript-write `comb_flat[t0:t0+16, k*4:k*4+4] = row_k_cur`
+            # is rejected today (static_shape [16,8] vs slot [16,4]) — pypto#1509.
             row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
             row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
             row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
@@ -178,6 +187,10 @@ def hc_pre(
             comb_flat = pl.store(row2_out, [t0, 2 * HC_MULT], comb_flat)
             comb_flat = pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
 
+    # transpose_pre stays as a separate scope writing through pre_val_t GM:
+    # fusing pl.transpose + per-row tile.slice + pl.reshape inline in mix_x emits
+    # pto.alloc_tile with the parent's base addr for every reshape-of-subview,
+    # so all 4 pre_k tiles silently read row 0 of pre_val_store — pypto#1510.
     pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
     for t0 in pl.parallel(0, T, LINEAR_T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="transpose_pre"):
@@ -310,12 +323,16 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=hc_pre_test,
         specs=build_tensor_specs(),
         golden_fn=golden_hc_pre,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
