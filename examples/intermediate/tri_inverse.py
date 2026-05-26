@@ -46,12 +46,24 @@ def build_tri_inverse_program(
     m_tile: int = M_TILE,
     k_tile: int = K_TILE,
     m_chunk: int = M_CHUNK,
+    refinement_steps: int = 1,
 ):
     """Build the @pl.program for n x n triangular inverse.
 
     Specialises the doubling-step count via ceil(log2(n)).
+
+    ``refinement_steps`` runs that many Newton iterative-refinement steps
+    after the doubling loop: at each step ``X <- X + X (I - (I - A) X)``,
+    which is quadratically convergent and crushes the FP16-cube roundoff
+    error from O(eps) to O(eps^2).  Default 1 — bring n=64 inside the 2e-2
+    tolerance and tighten accuracy at all sizes.  Set to 0 for raw speed
+    when O(eps) accuracy is acceptable.
     """
     n_steps = max(1, (n - 1).bit_length())  # 7 for n=128
+    if n % m_tile != 0:
+        raise ValueError(f"n ({n}) must be a multiple of m_tile ({m_tile})")
+    if n % k_tile != 0:
+        raise ValueError(f"n ({n}) must be a multiple of k_tile ({k_tile})")
     k_blocks = n // k_tile  # 2 for n=128, k_tile=64
 
     @pl.program
@@ -79,15 +91,18 @@ def build_tri_inverse_program(
             [m_tile, n] @ [n, n] matmul, fitting comfortably in the 192 KB
             Vec budget.
 
-            Y_temp snapshots Y before Y = Y @ Y: reading the full Y while
-            another parallel iter writes to its own row slab would race;
-            snapshotting first makes the matmul read-only on Y_temp and
-            write-only on Y_state.
+            Y is double-buffered across two tensors (Y_a, Y_b) so the
+            Y = Y @ Y step reads from one buffer and writes to the other.
+            Without double-buffering the matmul would read the full Y while
+            other M-parallel iters write to row slabs of that same tensor,
+            which races; reading and writing distinct tensors removes the
+            race without needing an explicit GM-to-GM snapshot copy.
             """
             X_state = pl.create_tensor([n, n], dtype=pl.FP32)
-            Y_state = pl.create_tensor([n, n], dtype=pl.FP32)
-            Y_temp = pl.create_tensor([n, n], dtype=pl.FP32)
+            Y_a = pl.create_tensor([n, n], dtype=pl.FP32)
+            Y_b = pl.create_tensor([n, n], dtype=pl.FP32)
             X_acc = pl.create_tensor([n, n], dtype=pl.FP32)
+            R_state = pl.create_tensor([n, n], dtype=pl.FP32)  # newton refinement residual
 
             with pl.at(level=pl.Level.CORE_GROUP,
                        optimization=pl.chunked_loop_optimizer,
@@ -96,9 +111,14 @@ def build_tri_inverse_program(
                     id_row = pl.slice(identity, [m_tile, n], [mb, 0])
                     a_row = pl.slice(A, [m_tile, n], [mb, 0])
                     X_state = pl.assemble(X_state, id_row, [mb, 0])
-                    Y_state = pl.assemble(Y_state, a_row, [mb, 0])
+                    Y_a = pl.assemble(Y_a, a_row, [mb, 0])
 
             for step in pl.unroll(n_steps):
+                # Double-buffered Y: each step reads Y_a, writes Y_b, then
+                # swaps the Python-level bindings so the next iteration reads
+                # the freshly-written buffer.  No explicit snapshot/copy scope
+                # needed — the read and write target distinct GM tensors.
+                #
                 # Split X update: matmul first (writes X_acc), then add(X, X_acc).
                 # Keeping x_row + acc + x_new alive in one scope is the dominant
                 # Vec cost at n=256 (3 row tiles of size m_tile*n*4 bytes); splitting
@@ -109,12 +129,12 @@ def build_tri_inverse_program(
                            name_hint="cayley_x_matmul"):
                     for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
                         xa0 = pl.slice(X_state, [m_tile, k_tile], [mb, 0])
-                        yb0 = pl.slice(Y_state, [k_tile, n], [0, 0])
+                        yb0 = pl.slice(Y_a, [k_tile, n], [0, 0])
                         acc = pl.matmul(xa0, yb0)
                         for kb in pl.range(1, k_blocks):
                             k0 = kb * k_tile
                             xa = pl.slice(X_state, [m_tile, k_tile], [mb, k0])
-                            yb = pl.slice(Y_state, [k_tile, n], [k0, 0])
+                            yb = pl.slice(Y_a, [k_tile, n], [k0, 0])
                             acc = pl.matmul_acc(acc, xa, yb)
                         X_acc = pl.assemble(X_acc, acc, [mb, 0])
 
@@ -129,24 +149,90 @@ def build_tri_inverse_program(
 
                 with pl.at(level=pl.Level.CORE_GROUP,
                            optimization=pl.chunked_loop_optimizer,
-                           name_hint="cayley_y_snapshot"):
-                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
-                        y_row = pl.slice(Y_state, [m_tile, n], [mb, 0])
-                        Y_temp = pl.assemble(Y_temp, y_row, [mb, 0])
-
-                with pl.at(level=pl.Level.CORE_GROUP,
-                           optimization=pl.chunked_loop_optimizer,
                            name_hint="cayley_y_square"):
                     for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
-                        ya0 = pl.slice(Y_temp, [m_tile, k_tile], [mb, 0])
-                        yb0 = pl.slice(Y_temp, [k_tile, n], [0, 0])
+                        ya0 = pl.slice(Y_a, [m_tile, k_tile], [mb, 0])
+                        yb0 = pl.slice(Y_a, [k_tile, n], [0, 0])
                         acc = pl.matmul(ya0, yb0)
                         for kb in pl.range(1, k_blocks):
                             k0 = kb * k_tile
-                            ya = pl.slice(Y_temp, [m_tile, k_tile], [mb, k0])
-                            yb = pl.slice(Y_temp, [k_tile, n], [k0, 0])
+                            ya = pl.slice(Y_a, [m_tile, k_tile], [mb, k0])
+                            yb = pl.slice(Y_a, [k_tile, n], [k0, 0])
                             acc = pl.matmul_acc(acc, ya, yb)
-                        Y_state = pl.assemble(Y_state, acc, [mb, 0])
+                        Y_b = pl.assemble(Y_b, acc, [mb, 0])
+
+                Y_a, Y_b = Y_b, Y_a
+
+            # Newton iterative refinement.  Reference numpy implementation:
+            #     for _ in range(refinement_steps):
+            #         R = I - A @ X        # using A_eff = (I - A); R = I - A_eff X
+            #         X = X + X @ R
+            # In our setting A_eff = (I - A), so:
+            #     R = I - (I - A) X = I - X + A X
+            # Computed in five scopes per step (K-blocked matmuls split as
+            # matmul + add for the same Vec-budget reason as the doubling X
+            # update).  Each step uses no extra GM beyond R_state + the
+            # existing X_acc scratch.
+            for _ in pl.unroll(refinement_steps):
+                # Step 1: R_state = A @ X_state (K-blocked matmul)
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="newton_ax_matmul"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        a0 = pl.slice(A, [m_tile, k_tile], [mb, 0])
+                        x0 = pl.slice(X_state, [k_tile, n], [0, 0])
+                        acc = pl.matmul(a0, x0)
+                        for kb in pl.range(1, k_blocks):
+                            k0 = kb * k_tile
+                            a = pl.slice(A, [m_tile, k_tile], [mb, k0])
+                            x = pl.slice(X_state, [k_tile, n], [k0, 0])
+                            acc = pl.matmul_acc(acc, a, x)
+                        R_state = pl.assemble(R_state, acc, [mb, 0])
+
+                # Step 2: R_state = R_state - X_state  (= A X - X)
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="newton_r_sub_x"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        r_row = pl.slice(R_state, [m_tile, n], [mb, 0])
+                        x_row = pl.slice(X_state, [m_tile, n], [mb, 0])
+                        diff = pl.sub(r_row, x_row)
+                        R_state = pl.assemble(R_state, diff, [mb, 0])
+
+                # Step 3: R_state = R_state + identity  (= A X - X + I = R)
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="newton_r_add_i"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        r_row = pl.slice(R_state, [m_tile, n], [mb, 0])
+                        id_row = pl.slice(identity, [m_tile, n], [mb, 0])
+                        s = pl.add(r_row, id_row)
+                        R_state = pl.assemble(R_state, s, [mb, 0])
+
+                # Step 4: X_acc = X_state @ R_state (K-blocked matmul)
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="newton_xr_matmul"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        xa0 = pl.slice(X_state, [m_tile, k_tile], [mb, 0])
+                        rb0 = pl.slice(R_state, [k_tile, n], [0, 0])
+                        acc = pl.matmul(xa0, rb0)
+                        for kb in pl.range(1, k_blocks):
+                            k0 = kb * k_tile
+                            xa = pl.slice(X_state, [m_tile, k_tile], [mb, k0])
+                            rb = pl.slice(R_state, [k_tile, n], [k0, 0])
+                            acc = pl.matmul_acc(acc, xa, rb)
+                        X_acc = pl.assemble(X_acc, acc, [mb, 0])
+
+                # Step 5: X_state = X_state + X_acc  (= X + X R)
+                with pl.at(level=pl.Level.CORE_GROUP,
+                           optimization=pl.chunked_loop_optimizer,
+                           name_hint="newton_x_add"):
+                    for mb in pl.parallel(0, n, m_tile, chunk=m_chunk):
+                        x_row = pl.slice(X_state, [m_tile, n], [mb, 0])
+                        xr_row = pl.slice(X_acc, [m_tile, n], [mb, 0])
+                        x_new_row = pl.add(x_row, xr_row)
+                        X_state = pl.assemble(X_state, x_new_row, [mb, 0])
 
             with pl.at(level=pl.Level.CORE_GROUP,
                        optimization=pl.chunked_loop_optimizer,
