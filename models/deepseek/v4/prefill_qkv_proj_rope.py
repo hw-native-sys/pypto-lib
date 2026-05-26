@@ -89,7 +89,7 @@ def prefill_qkv_proj_rope_core(
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
     wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
@@ -393,7 +393,8 @@ def prefill_qkv_proj_rope_core(
                         :,
                     ]
                     col_fp32 = pl.cast(col_acc_chunk, target_type=pl.FP32, mode="none")
-                    w_scale = wq_b_scale[hbg + h_inner : hbg + h_inner + 1, :]
+                    w_col0 = (hbg + h_inner) * Q_PROJ_OUT_CHUNK
+                    w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_CHUNK], [1, Q_PROJ_OUT_CHUNK])
                     col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_tile), w_scale)
                     q_proj_fp32[
                         :,
@@ -504,7 +505,7 @@ def prefill_qkv_proj_rope(
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
     wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
