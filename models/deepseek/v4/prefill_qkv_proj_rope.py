@@ -15,7 +15,7 @@ implementation still splits B * S into smaller internal token chunks.
 import pypto.language as pl
 
 from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-from qkv_proj_rope import build_tensor_specs as _build_qkv_tensor_specs
+from decode_qkv_proj_rope import build_tensor_specs as _build_qkv_tensor_specs
 
 
 B = PREFILL_BATCH

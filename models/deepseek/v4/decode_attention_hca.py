@@ -19,7 +19,7 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
-from qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope
 from decode_compressor_ratio128 import compressor
 from decode_sparse_attn import sparse_attn
 
@@ -383,7 +383,7 @@ def golden_attention_hca(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
-    from qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_qkv_proj_rope
     from decode_compressor_ratio128 import golden_compressor
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post

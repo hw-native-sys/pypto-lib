@@ -34,7 +34,7 @@ from decode_compressor_ratio4 import compressor
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
-from qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope
 from decode_sparse_attn import sparse_attn
 
 B = DECODE_BATCH
@@ -465,7 +465,7 @@ def golden_attention_csa(tensors):
     from decode_compressor_ratio4 import golden_compressor
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
-    from qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_qkv_proj_rope
 
     def rms_norm(x, weight):
         x_fp32 = x.float()
