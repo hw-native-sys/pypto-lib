@@ -6,16 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 prefill Q/KV projection + partial RoPE tile.
+"""DeepSeek-V4 prefill Q/KV projection + partial RoPE.
 
-The deployment target is [PREFILL_BATCH, PREFILL_SEQ], but this kernel only
-owns one [PREFILL_BATCH_TILE, PREFILL_SEQ_TILE] tile. The outer prefill
-scheduler is responsible for covering the full prompt with these tiles.
+The kernel shape is [PREFILL_BATCH, PREFILL_SEQ] from config. The
+implementation still splits B * S into smaller internal token chunks.
 """
 
 import pypto.language as pl
 
-from config import FLASH as M, PREFILL_BATCH, PREFILL_BATCH_TILE, PREFILL_SEQ, PREFILL_SEQ_TILE
+from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
 from qkv_proj_rope import (
     ATTN_NORM_GROUP,
     ATTN_RMS_PARTIALS,
@@ -54,19 +53,15 @@ from qkv_proj_rope import (
 )
 
 
-FULL_B = PREFILL_BATCH
-FULL_S = PREFILL_SEQ
-B = PREFILL_BATCH_TILE
-S = PREFILL_SEQ_TILE
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 MAX_SEQ_LEN = M.max_position_embeddings
 PREFILL_START_POS = 0
 PREFILL_QKV_TOKEN_CHUNK = min(64, T)
 PREFILL_QKV_CHUNKS = T // PREFILL_QKV_TOKEN_CHUNK
 PREFILL_ROPE_BATCH_TILE = min(B, max(1, 256 // S))
-assert FULL_B % B == 0, "target prefill batch must be divisible by the NPU batch tile"
-assert FULL_S % S == 0, "target prefill sequence must be divisible by the NPU sequence tile"
-assert T % PREFILL_QKV_TOKEN_CHUNK == 0, "prefill qkv tile must be divisible by the internal token chunk"
+assert T % PREFILL_QKV_TOKEN_CHUNK == 0, "prefill qkv per-call token count must be divisible by the internal token chunk"
 assert B % PREFILL_ROPE_BATCH_TILE == 0, "B must be divisible by PREFILL_ROPE_BATCH_TILE"
 
 
@@ -114,10 +109,9 @@ def prefill_qkv_proj_rope_core(
 
     x_flat = pl.reshape(x, [T, D])
 
-    # Stage 0+: process the [B, S] prefill tile in token chunks. The kernel
-    # owns a 128-token tile today, while the internal chunk keeps the largest
-    # local tensors small enough for the QKV projection, quantization, and RoPE
-    # scopes.
+    # Stage 0+: process this [B, S] QKV invocation in token chunks. The
+    # internal chunk keeps the largest local tensors small enough for the QKV
+    # projection, quantization, and RoPE scopes.
     for chunk_idx in pl.range(PREFILL_QKV_CHUNKS):
         t0 = chunk_idx * PREFILL_QKV_TOKEN_CHUNK
         x_tile = pl.slice(x_flat, [PREFILL_QKV_TOKEN_CHUNK, D], [t0, 0])
