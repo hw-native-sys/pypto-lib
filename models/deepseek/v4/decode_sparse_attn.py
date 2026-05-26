@@ -47,7 +47,7 @@ ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
-SPARSE_ATTN_TILE = 64
+SPARSE_ATTN_TILE = 32
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_T_TILE = 16
@@ -134,12 +134,14 @@ def sparse_attn(
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     for attn_t0 in pl.parallel(T):
         for h0 in pl.parallel(0, H, H_TILE):
-            sparse_exp = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, SPARSE_ATTN_TILE], dtype=pl.BF16)
             sparse_blk_mi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
             sparse_blk_li = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, 1], dtype=pl.FP32)
+            sparse_blk_oi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-            # QK + tile-local softmax for every sparse-K tile.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_softmax"):
+            # QK + softmax + PV fused per sparse-K tile so the BF16 exp scores
+            # stay on chip. SPARSE_ATTN_TILE is halved (vs the unfused form) so
+            # the K and V cube right-buffer copies both fit in L1B (64KB).
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_pv"):
                 qk_t = attn_t0
                 qk_b = qk_t // S
                 qk_s = qk_t - qk_b * S
@@ -156,40 +158,20 @@ def sparse_attn(
                     qk_s0 = qk_sb * SPARSE_ATTN_TILE
                     if qk_s0 < qk_sparse_k:
                         qk_s_v = pl.min(SPARSE_ATTN_TILE, qk_sparse_k - qk_s0)
-                        qk_kv_tile = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
-                        qk_raw = pl.matmul(qk_q_tile, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
+                        qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
+                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                         qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
                         qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
                         qk_mi = pl.row_max(qk_scores)
                         qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                         qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
                         qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
+                        qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
+                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
                         qk_row = qk_sb * H_TILE
-                        sparse_exp[qk_row : qk_row + H_TILE, 0 : SPARSE_ATTN_TILE] = qk_exp_bf16
                         sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
                         sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
-
-            sparse_blk_oi = pl.create_tensor([((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
-
-            # PV for each sparse-K tile.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="pv"):
-                pv_t = attn_t0
-                pv_b = pv_t // S
-                pv_s = pv_t - pv_b * S
-                pv_seq_end = pl.read(seqused_kv, [pv_b])
-                pv_seq_len = pv_seq_end - S + 1 + pv_s
-                pv_win_v = pl.min(WIN, pv_seq_len)
-                pv_tk_v = pl.min(IDX_TOPK, pv_seq_len - pv_win_v)
-                pv_sparse_k = pv_win_v + pv_tk_v
-                pv_kv_base = pv_t * TOPK
-                for pv_sb in pl.range((TOPK + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE):
-                    pv_s0 = pv_sb * SPARSE_ATTN_TILE
-                    if pv_s0 < pv_sparse_k:
-                        pv_row = pv_sb * H_TILE
-                        pv_exp = sparse_exp[pv_row : pv_row + H_TILE, 0 : SPARSE_ATTN_TILE]
-                        pv_kv_tile = sparse_kv[pv_kv_base + pv_s0 : pv_kv_base + pv_s0 + SPARSE_ATTN_TILE, 0 : HEAD_DIM]
-                        pv_oi = pl.matmul(pv_exp, pv_kv_tile, out_dtype=pl.FP32)
-                        sparse_blk_oi[pv_row : pv_row + H_TILE, 0 : HEAD_DIM] = pv_oi
+                        sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
 
             # Online-softmax merge across sparse-K tiles, then sink-norm.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="merge_norm"):
@@ -222,8 +204,7 @@ def sparse_attn(
                 n_sink_bias = pl.reshape(attn_sink[h0 : h0 + H_TILE], [H_TILE, 1])
                 n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
                 n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-                n_out_fp32 = pl.row_expand_div(m_oi, n_denom)
-                n_out = pl.cast(n_out_fp32[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
+                n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
                 n_rope_row = m_t * H + h0
                 attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
 
