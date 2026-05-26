@@ -16,58 +16,52 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AM
 
 
 # model config
-B           = DECODE_BATCH
-S           = DECODE_SEQ
-T           = B * S
-D           = M.hidden_size
-H           = M.num_attention_heads
-HEAD_DIM    = M.head_dim
-ROPE_DIM    = M.qk_rope_head_dim
-ROPE_HALF   = ROPE_DIM // 2
-NOPE_DIM    = M.nope_head_dim
-Q_LORA      = M.q_lora_rank
-EPS         = M.rms_norm_eps
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+ROPE_HALF = ROPE_DIM // 2
+NOPE_DIM = M.nope_head_dim
+Q_LORA = M.q_lora_rank
+EPS = M.rms_norm_eps
 
 # tiling
-# Group constants control pl.parallel(0, N, GROUP) + pl.range(GROUP) folding —
-# how many logical chunks are fused into one InCore task. See Opt J/K/L/N/O/P
-# in docs/dsv4-qkv-proj-rope-perf-tuning.md for the per-scope sweep results.
-ROPE_TILE  = 64
+ROPE_TILE = 64
 ROPE_PAIR_TILE = ROPE_TILE // 2
-HEAD_TILE  = 64
+HEAD_TILE = 64
 Q_PROJ_OUT_TILE = 128
-Q_PROJ_TILE = 512  # K-tile
+Q_PROJ_TILE = 512
 Q_LORA_TILE = 32
-D_TILE     = 128
-KV_TILE    = 32
+D_TILE = 128
+KV_TILE = 32
 QUANT_TILE = 32
-T_TILE      = 16  # T-axis sub-tile for qproj dequant (keeps cube+vec fused scope under Vec UB)
-assert (H * HEAD_DIM) % (HEAD_TILE * 8) == 0, \
-    "HEAD_BLOCKS must be divisible by 8"
+T_TILE = 16
 
 
 @pl.jit.inline
 def qkv_proj_rope(
-    x:         pl.Tensor[[B, S, D],              pl.BF16],
-    norm_w:    pl.Tensor[[D],                    pl.FP32],
-    wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
-    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[(H * HEAD_DIM) // Q_PROJ_OUT_TILE, Q_PROJ_OUT_TILE], pl.FP32],
-    wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
-    rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
-    rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    odd_select_t:  pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    gamma_cq:  pl.Tensor[[Q_LORA],               pl.BF16],
-    gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
-    q:         pl.Tensor[[T, H, HEAD_DIM],        pl.BF16],
-    kv:        pl.Tensor[[T, HEAD_DIM],           pl.BF16],
-    qr:        pl.Tensor[[T, Q_LORA],             pl.INT8],
-    qr_scale:  pl.Tensor[[T, 1],                  pl.FP32],
+    odd_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T, 1], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, D])
 
-    # Stage 0.1+0.2: attn_norm fused RMS + apply, T-tiled SPMD (per-token reduction).
     token_x_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
     for tg_idx in pl.spmd(T // T_TILE, name_hint="attn_norm"):
         tg = tg_idx * T_TILE
@@ -85,9 +79,6 @@ def qkv_proj_rope(
             x_normed = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
             token_x_bf16[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(x_normed, target_type=pl.BF16, mode="rint")
 
-    # Stage 1/2.1: qr = rms_norm(token_x @ wq_a, gamma_cq).
-    # K loop uses pl.pipeline(stage=4) for 4-deep ping-pong on the D=4096 input
-    # projection (D_BLOCKS=32, sufficient iter count for 4-stage replication).
     qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
     for qbg_idx in pl.spmd((Q_LORA // Q_LORA_TILE) // 2, name_hint="qr_proj_matmul"):
         qbg = qbg_idx * 2
@@ -104,11 +95,7 @@ def qkv_proj_rope(
                     q_acc = pl.matmul_acc(q_acc, q_x_chunk_bf16, w_chunk)
             qr_fp32[:, q_a_col0 : q_a_col0 + Q_LORA_TILE] = q_acc
 
-    # Stage 2.1+2.2+2.3: fused qr_rms + norm + amax + INT8 quant, T-tiled SPMD.
-    # Two-pass within block: first pass computes RMS + amax (no qr_bf16 write);
-    # second pass recomputes norm and quantizes directly. Saves the qr_bf16 GM
-    # staging tensor and reduces kernel outputs to 2 (qr_scale, qr), avoiding the
-    # pypto multi-InOut OptimizeOrchTensors alias bug.
+    # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
     for tg_idx in pl.spmd(T // T_TILE, name_hint="qr_rms_norm_quant"):
         tg = tg_idx * T_TILE
         qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -120,7 +107,6 @@ def qkv_proj_rope(
         qr_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS)))
         qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
 
-        # Pass 1: norm + amax accumulation (no GM write of the normalized values).
         for qb in pl.range(Q_LORA // Q_LORA_TILE):
             qr_norm_col0 = qb * Q_LORA_TILE
             qr_norm_chunk = qr_fp32[tg : tg + T_TILE, qr_norm_col0 : qr_norm_col0 + Q_LORA_TILE]
@@ -139,7 +125,6 @@ def qkv_proj_rope(
         qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
         qr_scale[tg : tg + T_TILE, :] = qr_tile_scale_dq
 
-        # Pass 2: recompute norm and quantize directly to qr.
         for qa in pl.range(0, Q_LORA, QUANT_TILE):
             qr_chunk = qr_fp32[tg : tg + T_TILE, qa : qa + QUANT_TILE]
             gamma_q_chunk = pl.reshape(
@@ -154,15 +139,6 @@ def qkv_proj_rope(
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
             qr[tg : tg + T_TILE, qa : qa + QUANT_TILE] = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
 
-    # Stage 3: W8A8C16 q_proj = qr_i8 @ wq_b, then dequantize to FP32.
-    # qproj_matmul is GROUP-chunked (Opt J); qproj_dequant is decoupled into its own
-    # outer pl.parallel with a larger DEQUANT_GROUP (Opt P), fed by a global INT32
-    # staging buffer col_acc_all (16 MB at T=128). Decoupling lets dequant pick its
-    # own task size without forcing matmul to do the same — Opt J showed that
-    # matmul GRP=16 caused dispatcher contention upstream.
-    # `(hg + h_inner) * X` is inlined everywhere — binding it to a Python local
-    # inside pl.range causes pypto AST to thread it through pl.parallel's init_values,
-    # which fails SSA verification (see feedback_pypto_head_group_chunking_loop_carried.md).
     q_proj_fp32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.FP32)
     for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj"):
         hg = hg_idx * 16
@@ -176,7 +152,8 @@ def qkv_proj_rope(
                     col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
                 else:
                     col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
-            w_scale = wq_b_scale[hg + h_inner : hg + h_inner + 1, :]
+            w_col0 = (hg + h_inner) * Q_PROJ_OUT_TILE
+            w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
             for tc in pl.range(0, T, T_TILE):
                 col_acc_t = col_acc[tc : tc + T_TILE, :]
                 col_fp32 = pl.cast(col_acc_t, target_type=pl.FP32, mode="none")
@@ -184,24 +161,10 @@ def qkv_proj_rope(
                 col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_dq_t), w_scale)
                 q_proj_fp32[tc : tc + T_TILE, (hg + h_inner) * Q_PROJ_OUT_TILE : (hg + h_inner) * Q_PROJ_OUT_TILE + Q_PROJ_OUT_TILE] = col_dequant
 
-    # Stage 4: per-head RMSNorm + RoPE on q.
-    # Split into q_head_rms_nope and q_head_rope at T=128 — the fused
-    # [RMS+NOPE+RoPE] scope holds ~7 FP32 [T, ROPE_HALF|ROPE_DIM] tensors in the
-    # RoPE block and exceeds the 192KB Vec UB. inv_rms crosses the boundary via
-    # a [H, T] FP32 staging tensor.
-    #
-    # q_head_rms_nope stays at pl.parallel(0, H, 1) — fine-grained: 64 tasks
-    # saturate the 48 AIV cores, span is already optimal. HEAD_GROUP chunking
-    # was tried (Opt M) and reverted; see perf-tuning doc.
-    #
-    # q_head_rope/reassemble/write are HEAD_GROUP-chunked. q_head_rope writes a
-    # cross-head staging tensor q_rope_pair_stage [H*T, ROPE_DIM]; the ROPE_DIM
-    # trailing axis (not ROPE_HALF) is intentional — pypto's orch-tensor optimizer
-    # would otherwise alias it to the BF16 [T, ROPE_HALF] kv_rot_*_tmp temps later
-    # in the function, triggering a known pypto codegen bug.
+    # Per-head RMS, NOPE projection, and RoPE rotation, staged through
+    # q_head_inv_rms_all and q_rope_pair_stage.
     q_flat = pl.reshape(q, [T, H * HEAD_DIM])
     q_head_inv_rms_all = pl.create_tensor([H, T], dtype=pl.FP32)
-    q_rope_pair_stage = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.BF16)
     for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope"):
         hg = hg_idx * 2
         for h_inner in pl.range(2):
@@ -222,9 +185,7 @@ def qkv_proj_rope(
                 q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
                 q_flat[:, h0 + n0 : h0 + n0 + HEAD_TILE] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
-    # q_head_rope HEAD_GROUP-chunked (Opt K). Only one cross-iter loop-carried
-    # tensor (q_rope_pair_stage), satisfying the success condition for chunked
-    # parallel scopes.
+    q_rope_pair_stage = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.BF16)
     for hg_idx in pl.spmd(H // 8, name_hint="q_head_rope"):
         hg = hg_idx * 8
         q_head_inv_rms_t = pl.create_tensor([T, 1], dtype=pl.FP32)
@@ -243,7 +204,7 @@ def qkv_proj_rope(
             q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, :ROPE_HALF] = q_rot_even_bf16
             q_rope_pair_stage[(hg + h_inner) * T : (hg + h_inner) * T + T, ROPE_HALF : ROPE_DIM] = q_rot_odd_bf16
 
-    # Stage 4d: reassemble (cube) + write (vec) — two SPMD scopes share a GM staging tensor.
+    # Reassemble interleaved pairs (cube matmul) and write back to q_flat (vec cast).
     q_rope_grp_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
     for hg_idx in pl.spmd(H // 8, name_hint="q_rope_reassemble"):
         hg = hg_idx * 8
@@ -270,8 +231,6 @@ def qkv_proj_rope(
 
     q = pl.reshape(q_flat, [T, H, HEAD_DIM])
 
-    # Stage 5/6: kv = rms_norm(token_x @ wkv, gamma_ckv) + RoPE.
-    # K loop uses pl.pipeline(stage=4) per Opt X (D_BLOCKS=32, enough iters).
     kv_fp32 = pl.create_tensor([T, HEAD_DIM], dtype=pl.FP32)
     for kbg in pl.spmd((HEAD_DIM // KV_TILE) // 2, name_hint="kv_proj_matmul"):
         for k_inner in pl.range(2):
@@ -353,22 +312,22 @@ def qkv_proj_rope(
 
 @pl.jit
 def qkv_proj_rope_test(
-    x:         pl.Tensor[[B, S, D],              pl.BF16],
-    norm_w:    pl.Tensor[[D],                    pl.FP32],
-    wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
-    wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[(H * HEAD_DIM) // Q_PROJ_OUT_TILE, Q_PROJ_OUT_TILE], pl.FP32],
-    wkv:       pl.Tensor[[D, HEAD_DIM],          pl.BF16],
-    rope_cos:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
-    rope_sin:  pl.Tensor[[T, ROPE_DIM],          pl.BF16],
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    odd_select_t:  pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    gamma_cq:  pl.Tensor[[Q_LORA],               pl.BF16],
-    gamma_ckv: pl.Tensor[[HEAD_DIM],             pl.BF16],
-    q:         pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
-    kv:        pl.Out[pl.Tensor[[T, HEAD_DIM],    pl.BF16]],
-    qr:        pl.Out[pl.Tensor[[T, Q_LORA],      pl.INT8]],
-    qr_scale:  pl.Out[pl.Tensor[[T, 1],           pl.FP32]],
+    odd_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
+    kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.BF16]],
+    qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
+    qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
 ):
     q = qkv_proj_rope(
         x,
@@ -395,15 +354,15 @@ def golden_qkv_proj_rope(tensors):
     """Torch reference: attn_norm fused, then Q/KV LoRA + RoPE (model.py 692, 495-504)."""
     import torch
 
-    x         = tensors["x"].float()              # [B, S, D]
-    norm_w    = tensors["norm_w"].float()          # [D]
-    wq_a      = tensors["wq_a"].float()
-    wq_b      = tensors["wq_b"]
+    x = tensors["x"].float()
+    norm_w = tensors["norm_w"].float()
+    wq_a = tensors["wq_a"].float()
+    wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
-    wkv       = tensors["wkv"].float()
-    rope_cos  = tensors["rope_cos"].float()
-    rope_sin  = tensors["rope_sin"].float()
-    gamma_cq  = tensors["gamma_cq"].float()
+    wkv = tensors["wkv"].float()
+    rope_cos = tensors["rope_cos"].float()
+    rope_sin = tensors["rope_sin"].float()
+    gamma_cq = tensors["gamma_cq"].float()
     gamma_ckv = tensors["gamma_ckv"].float()
 
     def int8_quant_per_row(x):
@@ -512,14 +471,14 @@ def build_tensor_specs():
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
-    wq_b_scale = wq_b_scale.view((H * HEAD_DIM) // Q_PROJ_OUT_TILE, Q_PROJ_OUT_TILE)
+    wq_b_scale = wq_b_scale.view(H * HEAD_DIM)
 
     return [
         TensorSpec("x",         [B, S, D],              torch.bfloat16, init_value=init_x),
         TensorSpec("norm_w",    [D],                    torch.float32,  init_value=init_norm_w),
         TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),
-        TensorSpec("wq_b_scale", [(H * HEAD_DIM) // Q_PROJ_OUT_TILE, Q_PROJ_OUT_TILE], torch.float32, init_value=lambda: wq_b_scale),
+        TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
