@@ -27,9 +27,9 @@ from config import (
 # leaving cube cores at ~45% utilisation behind dispatch bubbles. Wider
 # N+K plus OB_CHUNK amortises per-task dispatch overhead and lifts the
 # innermost K dim to one L2 cache line (512 B, perf_hint PH001).
-LM_HEAD_K_CHUNK = 256
+LM_HEAD_K_CHUNK = 512
 VOCAB_CHUNK = 256
-LM_HEAD_OB_CHUNK = 4
+LM_HEAD_OB_CHUNK = 2
 
 
 @pl.jit.inline
