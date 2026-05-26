@@ -14,49 +14,67 @@ implementation still splits B * S into smaller internal token chunks.
 
 import pypto.language as pl
 
-from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
-from qkv_proj_rope import (
-    ATTN_NORM_GROUP,
-    ATTN_RMS_PARTIALS,
-    D,
-    D_BLOCKS,
-    D_CHUNK,
-    EPS,
-    H,
-    HEAD_CHUNK,
-    HEAD_GROUP,
-    HEAD_DIM,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
-    KV_BLOCKS,
-    KV_CHUNK,
-    KV_PROJ_GROUP,
-    NOPE_DIM,
-    Q_BLOCKS,
-    Q_LORA,
-    Q_LORA_CHUNK,
-    Q_PROJ_BLOCKS,
-    Q_PROJ_CHUNK,
-    Q_PROJ_DEQUANT_GROUP,
-    Q_PROJ_GROUP,
-    Q_PROJ_HEAD_BLOCKS,
-    Q_PROJ_OUT_CHUNK,
-    QR_NORM_GROUP,
-    QR_RMS_PARTIALS,
-    QUANT_APPLY_CHUNK,
-    QUANT_CHUNK,
-    ROPE_CHUNK,
-    ROPE_DIM,
-    ROPE_HALF,
-    ROPE_PAIR_CHUNK,
-    build_tensor_specs as _build_qkv_tensor_specs,
-)
+from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from qkv_proj_rope import build_tensor_specs as _build_qkv_tensor_specs
 
 
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
+D = M.hidden_size
+H = M.num_attention_heads
+HEAD_DIM = M.head_dim
+ROPE_DIM = M.qk_rope_head_dim
+ROPE_HALF = ROPE_DIM // 2
+NOPE_DIM = M.nope_head_dim
+Q_LORA = M.q_lora_rank
+EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
+
+# Prefill QKV tiling. These constants intentionally live in this file instead
+# of being imported from decode qkv, because some values depend on this
+# kernel's own B/S/T shape.
+ROPE_CHUNK = 64
+ROPE_PAIR_CHUNK = ROPE_CHUNK // 2
+HEAD_CHUNK = 64
+HEAD_GROUP = 8
+Q_PROJ_OUT_CHUNK = 128
+Q_PROJ_CHUNK = 512
+Q_PROJ_GROUP = 8
+QR_NORM_GROUP = 8
+ATTN_NORM_GROUP = 4
+KV_PROJ_GROUP = 1
+Q_PROJ_DEQUANT_GROUP = 32
+ATTN_RMS_PARTIALS = 2
+QR_RMS_PARTIALS = 2
+Q_LORA_TILE = 32
+Q_LORA_CHUNK = Q_LORA_TILE
+D_CHUNK = 128 if T >= 128 else (256 if T >= 64 else 512)
+KV_CHUNK = 32
+QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
+QUANT_APPLY_CHUNK = 256
+assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
+    "HEAD_BLOCKS must be divisible by HEAD_GROUP"
+assert ((H * HEAD_DIM) // Q_PROJ_OUT_CHUNK) % Q_PROJ_GROUP == 0, \
+    "Q_PROJ_HEAD_BLOCKS must be divisible by Q_PROJ_GROUP"
+assert (Q_LORA // Q_LORA_TILE) % QR_NORM_GROUP == 0, \
+    "Q_BLOCKS must be divisible by QR_NORM_GROUP"
+assert (D // D_CHUNK) % ATTN_NORM_GROUP == 0, \
+    "D_BLOCKS must be divisible by ATTN_NORM_GROUP"
+assert (HEAD_DIM // KV_CHUNK) % KV_PROJ_GROUP == 0, \
+    "KV_BLOCKS must be divisible by KV_PROJ_GROUP"
+assert ((H * HEAD_DIM) // Q_PROJ_OUT_CHUNK) % Q_PROJ_DEQUANT_GROUP == 0, \
+    "Q_PROJ_HEAD_BLOCKS must be divisible by Q_PROJ_DEQUANT_GROUP"
+assert (D // D_CHUNK) % ATTN_RMS_PARTIALS == 0, \
+    "D_BLOCKS must be divisible by ATTN_RMS_PARTIALS"
+assert (Q_LORA // Q_LORA_TILE) % QR_RMS_PARTIALS == 0, \
+    "Q_BLOCKS must be divisible by QR_RMS_PARTIALS"
+Q_BLOCKS = Q_LORA // Q_LORA_TILE
+Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
+Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
+D_BLOCKS = D // D_CHUNK
+KV_BLOCKS = HEAD_DIM // KV_CHUNK
+
 PREFILL_START_POS = 0
 PREFILL_QKV_TOKEN_CHUNK = min(64, T)
 PREFILL_QKV_CHUNKS = T // PREFILL_QKV_TOKEN_CHUNK
