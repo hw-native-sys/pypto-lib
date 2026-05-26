@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pypto.language as pl
 
-from prefill_attention_swa_draft import B, D, HC_MULT, S
+from prefill_attention_swa import B, D, HC_MULT, S
 
 
 
@@ -77,7 +77,7 @@ def prefill_swa(
 def golden_prefill_swa(tensors):
     import torch
 
-    from prefill_attention_swa_draft import golden_prefill_attention_swa
+    from prefill_attention_swa import golden_prefill_attention_swa
     from moe import golden_moe
 
     x_attn = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
