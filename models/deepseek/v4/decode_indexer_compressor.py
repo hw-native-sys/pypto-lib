@@ -192,7 +192,10 @@ def indexer_compressor(
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
                 normed_kv[:, k0 : k0 + HEAD_CHUNK] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
+        # Mix: select matmul (cube, FP32-out) + cos/sin rotate cast (vector) in one scope.
+        rope_even_acc = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        rope_odd_acc = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_slice"):
             even_acc = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
             odd_acc = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
             for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
@@ -206,12 +209,11 @@ def indexer_compressor(
                 else:
                     even_acc = pl.matmul_acc(even_acc, kv_rope_tile, even_select_tile)
                     odd_acc = pl.matmul_acc(odd_acc, kv_rope_tile, odd_select_tile)
+            rope_even_acc[:, :] = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos), pl.col_expand_mul(odd_acc, sin)), target_type=pl.BF16, mode="rint")
+            rope_odd_acc[:, :] = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos), pl.col_expand_mul(odd_acc, sin)), target_type=pl.BF16, mode="rint")
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
+        # Mix: assemble matmul (cube, FP32-out) + final BF16 write (vector) in one scope.
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_assemble"):
             rope_acc = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
             for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
                 ra_0 = ra_b * ROPE_CHUCK
@@ -224,8 +226,6 @@ def indexer_compressor(
                 else:
                     rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
             normed_kv[:, NOPE_HEAD_DIM : NOPE_HEAD_DIM + ROPE_HEAD_DIM] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
         if rotate:

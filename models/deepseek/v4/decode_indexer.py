@@ -51,6 +51,8 @@ CACHE_TILE = 32
 MAX_CACHE_BLOCKS = SCORE_LEN // CACHE_TILE
 Q_CHUCK = 128
 Q_OUT_CHUCK = 128
+# Inner row-chunk for the qr_proj dequant epilogue so matmul+dequant fits 192KB Vec.
+QR_PROJ_ROW_CHUNK = 16 if T % 16 == 0 else T
 ROPE_CHUCK = 16
 HEAD_DIM_CHUCK = 32
 D_CHUCK = 32
@@ -59,7 +61,7 @@ QUANT_CHUNK = 128 if T >= 64 else 256
 # Ops are per-row independent, so this just makes the tiles HEAD_GROUP-taller (no
 # GM intermediates, bit-identical numerics). Vec buffer scales with HEAD_ROWS;
 # qr_hadamard_quant Vec buffer caps single-loop GRP at 2: GRP=4 overflows even with
-# chunked_loop_optimizer (199KB, INT8 store needs >=32-col chunk so can't shrink),
+# auto_chunk (199KB, INT8 store needs >=32-col chunk so can't shrink),
 # and GRP=8 overflows L0C (qr_hadamard_acc [GRP*64,128] FP32 = 256KB).
 HEAD_GROUP = 2 if T >= 2 else 1
 HEAD_ROWS = IDX_N_HEADS * HEAD_GROUP
@@ -112,7 +114,8 @@ def indexer(
 
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
     for o0 in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, Q_OUT_CHUCK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj"):
+        # Mix: matmul (cube, INT32-out) + dequant cast (vector) in one scope.
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_proj"):
             qr_acc = pl.create_tensor([T, Q_OUT_CHUCK], dtype=pl.INT32)
             for kb in pl.pipeline(0, Q_LORA // Q_CHUCK, stage=2):
                 q0 = kb * Q_CHUCK
@@ -122,12 +125,12 @@ def indexer(
                     qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
                 else:
                     qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_write"):
-            qr_acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
             wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_CHUCK], [1, Q_OUT_CHUCK])
-            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(qr_acc_fp32, qr_scale_dq), wq_scale)
-            qr_proj[:, o0 : o0 + Q_OUT_CHUCK] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
+            for r0 in pl.range(0, T, QR_PROJ_ROW_CHUNK):
+                acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_CHUNK, :], target_type=pl.FP32, mode="none")
+                scale_dq = qr_scale_dq[r0 : r0 + QR_PROJ_ROW_CHUNK, :]
+                qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
+                qr_proj[r0 : r0 + QR_PROJ_ROW_CHUNK, o0 : o0 + Q_OUT_CHUCK] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
@@ -140,9 +143,6 @@ def indexer(
     # all iterations onto a single cube+vector core pair. qr_hadamard below K-splits its
     # matmul accordingly: NOPE half from qr_proj_flat[:,0:NOPE], ROPE half from qr_rope_out.
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
-    # Hadamard matmul output, carried from the GRP=4 qr_hadamard loop to the GRP=2
-    # qr_hadamard_quant loop (the matmul is cube-only and fits a larger group).
-    qr_hadamard_acc_g = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
 
     # GROUP-chunked: each task folds HEAD_GROUP tokens (HEAD_ROWS rows) so the tiny
     # per-head matmuls/vector ops amortize the per-task launch overhead over more
@@ -174,7 +174,8 @@ def indexer(
                 rope_odd_acc[ro : ro + ROPE_ROW_CHUNK, :] = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin), pl.col_expand_mul(odd_acc, cos)), target_type=pl.BF16, mode="rint")
 
         # Mix: assemble matmul (cube, FP32-out) + final BF16 cast (vector) in one scope.
-        # rope_acc never round-trips GM; merging drops the assemble->write handshake.
+        # Kept separate from rope_slice: even/odd_select is loaded non-transposed there
+        # and transposed (b_trans) here, which one InCore param can't satisfy.
         with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_assemble"):
             for ro in pl.range(0, HEAD_ROWS_ROPE, ROPE_ROW_CHUNK):
                 rope_acc = pl.create_tensor([ROPE_ROW_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32)
@@ -191,35 +192,33 @@ def indexer(
                     rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
                 qr_rope_out[o0 + ro : o0 + ro + ROPE_ROW_CHUNK, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
-    # qr_hadamard is a cube-only matmul (output [HEAD_ROWS_ROPE, IDX_HEAD_DIM] FP32 =
-    # 128KB L0C at GRP=4), so it folds at the larger rope group in its own loop.
+    # Mix: hadamard matmul (cube, FP32-out) + amax/quant (vector) in one scope at the
+    # larger HEAD_ROWS_ROPE group; the FP32 acc stays scope-local (no qr_hadamard_acc_g
+    # GM). The Vec-buffer-bound quant inner-chunks over HEAD_ROWS rows so each tile fits.
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_ROPE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_hadamard"):
+        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_hadamard"):
             qh_nope = qr_proj_flat[o0 : o0 + HEAD_ROWS_ROPE, 0 : IDX_NOPE_HEAD_DIM]
             qh_rope = qr_rope_out[o0 : o0 + HEAD_ROWS_ROPE, :]
             qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
-            qr_hadamard_acc_g[o0 : o0 + HEAD_ROWS_ROPE, :] = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
-
-    # qr_hadamard_quant is Vec-buffer bound, so it stays at the smaller HEAD_ROWS group.
-    for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_hadamard_quant"):
-            qh_amax = pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                qh_a_f32 = qr_hadamard_acc_g[o0 : o0 + HEAD_ROWS, h0 : h0 + HEAD_DIM_CHUCK]
-                qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
-                qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, HEAD_ROWS])
-                qh_amax = pl.maximum(qh_amax, qh_a_max)
-            qh_scale_quant_row = pl.div(pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
-            qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [HEAD_ROWS, 1])
-            qr_hadamard_scale_dq[o0 : o0 + HEAD_ROWS, :] = qh_scale_dq
-            qh_scale_quant = pl.reshape(qh_scale_quant_row, [HEAD_ROWS, 1])
-            for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                qh_q_f32 = qr_hadamard_acc_g[o0 : o0 + HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK]
-                qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
-                qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
-                qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
-                qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
-                qr_hadamard_i8[o0 : o0 + HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK] = qh_i8
+            qr_hadamard_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
+            for ro in pl.range(0, HEAD_ROWS_ROPE, HEAD_ROWS):
+                qh_amax = pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
+                    qh_a_f32 = qr_hadamard_acc[ro : ro + HEAD_ROWS, h0 : h0 + HEAD_DIM_CHUCK]
+                    qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
+                    qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, HEAD_ROWS])
+                    qh_amax = pl.maximum(qh_amax, qh_a_max)
+                qh_scale_quant_row = pl.div(pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
+                qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [HEAD_ROWS, 1])
+                qr_hadamard_scale_dq[o0 + ro : o0 + ro + HEAD_ROWS, :] = qh_scale_dq
+                qh_scale_quant = pl.reshape(qh_scale_quant_row, [HEAD_ROWS, 1])
+                for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
+                    qh_q_f32 = qr_hadamard_acc[ro : ro + HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK]
+                    qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
+                    qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
+                    qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
+                    qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
+                    qr_hadamard_i8[o0 + ro : o0 + ro + HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK] = qh_i8
 
 
     x_flat = pl.reshape(x, [T, D])
@@ -257,17 +256,9 @@ def indexer(
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [B * IDX_KV_LEN, IDX_HEAD_DIM])
-    # score_logits width is S * IDX_N_HEADS because score_accum matmuls
-    # qr_hadamard for all S query tokens of the batch at once.
     score_kv_scale = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, 1], dtype=pl.FP32)
     score_flat = pl.reshape(score, [T, SCORE_LEN])
-    # SCORE_B_GROUP-chunk the per-(batch, cache-block) score loop: fold SCORE_B_GROUP
-    # batches into one task via inner pl.range. The quantized kv tile and the score
-    # matmul output are carried across the quant/accum/store scopes through GM tensors
-    # indexed by the global score_row0 (= (b*MAX_CACHE_BLOCKS+cb)*CACHE_TILE), so each
-    # (b, cb) writes a disjoint slice (race-free, same scheme as score_kv_scale).
     kv_tile_i8_g = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, IDX_HEAD_DIM], dtype=pl.INT8)
-    score_acc_g = pl.create_tensor([B * MAX_CACHE_BLOCKS * CACHE_TILE, S * IDX_N_HEADS], dtype=pl.INT32)
 
     for bg in pl.parallel(0, B, SCORE_B_GROUP):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_init"):
@@ -277,7 +268,7 @@ def indexer(
             cache0 = cb * CACHE_TILE
             valid_len = pl.min(CACHE_TILE, cache_len - cache0)
 
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="score_quant"):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="score_quant"):
                 for bi in pl.range(SCORE_B_GROUP):
                     b = bg + bi
                     kv0 = b * IDX_KV_LEN
@@ -302,32 +293,21 @@ def indexer(
                         kv_tile_i8_g[score_row0 : score_row0 + CACHE_TILE, h1 : h1 + HEAD_DIM_CHUCK] = kv_q_i8
                     score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :] = kv_cache_scale_dq
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_accum"):
-                for bi in pl.range(SCORE_B_GROUP):
-                    b = bg + bi
-                    q0 = b * S * IDX_N_HEADS
-                    score_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
-                    qr_hadamard_tile = qr_hadamard_i8[q0 : q0 + S * IDX_N_HEADS, :]
-                    score_acc_g[score_row0 : score_row0 + CACHE_TILE, :] = pl.matmul(kv_tile_i8_g[score_row0 : score_row0 + CACHE_TILE, :], qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
-
-            # Fused: dequant + per-query-token weighted reduce in ONE scope; the
-            # per-token reduce reads the score_tile directly (no score_logits GM
-            # round-trip, no cross-task windowed-write -> full-read dependency).
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_store"):
+            # Mix (NONE): score matmul (cube, INT32) + dequant/weighted-reduce (vec) per-s.
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.NONE)], name_hint="score_store"):
                 for bi in pl.range(SCORE_B_GROUP):
                     b = bg + bi
                     t0 = b * S
                     q0 = b * S * IDX_N_HEADS
                     score_row0 = (b * MAX_CACHE_BLOCKS + cb) * CACHE_TILE
                     kv_cache_scale_dq = score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :]
-                    qh_scale = pl.reshape(qr_hadamard_scale_dq[q0 : q0 + S * IDX_N_HEADS, :], [1, S * IDX_N_HEADS])
-                    score_tile = pl.cast(score_acc_g[score_row0 : score_row0 + CACHE_TILE, :], target_type=pl.FP32, mode="none")
-                    score_tile = pl.col_expand_mul(pl.row_expand_mul(score_tile, kv_cache_scale_dq), qh_scale)
-
-                    # col_expand_mul requires the right-hand "row" dim to be 1, so we
-                    # cannot collapse the S tokens into a single multi-row weights_tile.
+                    kv_i8_tile = kv_tile_i8_g[score_row0 : score_row0 + CACHE_TILE, :]
                     for s in pl.range(S):
-                        score_tile_s = score_tile[:, s * IDX_N_HEADS : (s + 1) * IDX_N_HEADS]
+                        qr_s = qr_hadamard_i8[q0 + s * IDX_N_HEADS : q0 + (s + 1) * IDX_N_HEADS, :]
+                        score_acc_s = pl.matmul(kv_i8_tile, qr_s, out_dtype=pl.INT32, b_trans=True)
+                        qh_scale_s = pl.reshape(qr_hadamard_scale_dq[q0 + s * IDX_N_HEADS : q0 + (s + 1) * IDX_N_HEADS, :], [1, IDX_N_HEADS])
+                        score_tile_s = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
+                        score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
                         relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
                         weights_row_s = pl.reshape(weights[t0 + s : t0 + s + 1, :], [1, IDX_N_HEADS])
                         weighted_score_s_t = pl.col_expand_mul(relu_score_s, weights_row_s)
