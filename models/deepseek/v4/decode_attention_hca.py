@@ -152,15 +152,18 @@ def attention_hca(
         rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
         rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
 
-    # Compressor RoPE is only consumed on compression steps. Warmup positions
-    # before the first compressed slot keep a zero placeholder to avoid a
-    # negative table row.
-    cmp_cos = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    # Compressor keeps a per-batch start_pos/cos/sin contract for future
+    # grouped/var-len batching. HCA still has a scalar decode step, so build
+    # uniform per-batch tensors at the boundary.
+    cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
+    cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
-            cmp_cos_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-            cmp_sin_base = pl.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            for b in pl.range(B):
+                pl.write(cmp_start_pos, [b], pl.cast(start_pos, pl.INT32))
+            cmp_cos_base = pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+            cmp_sin_base = pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
             cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
             cmp_cos = pl.col_expand(
                 cmp_cos_base,
@@ -172,10 +175,14 @@ def attention_hca(
             )
     else:
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope_zero"):
+            for b in pl.range(B):
+                pl.write(cmp_start_pos, [b], pl.cast(start_pos, pl.INT32))
             zero_cos = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
             zero_sin = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
-            cmp_cos = pl.sub(zero_cos, zero_cos)
-            cmp_sin = pl.sub(zero_sin, zero_sin)
+            zero_cos_row = pl.sub(zero_cos, zero_cos)
+            zero_sin_row = pl.sub(zero_sin, zero_sin)
+            cmp_cos = pl.col_expand(pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0), zero_cos_row)
+            cmp_sin = pl.col_expand(pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0), zero_sin_row)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -239,7 +246,7 @@ def attention_hca(
         cmp_odd_select,
         hadamard_identity,
         cmp_kv_buf,
-        start_pos,
+        cmp_start_pos,
         cmp_rotate,
     )
 
@@ -420,11 +427,12 @@ def golden_attention_hca(tensors):
     half_rd = rd // 2
     if should_compress:
         cmp_pos = start_pos + compress_offset - ratio
-        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :half_rd]   # ratio128 compressor: half-vec [1, rd//2]
-        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :half_rd]
+        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :half_rd].float().expand(B, half_rd).contiguous()
+        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :half_rd].float().expand(B, half_rd).contiguous()
     else:
-        cmp_cos = torch.zeros(1, half_rd, dtype=torch.bfloat16)
-        cmp_sin = torch.zeros(1, half_rd, dtype=torch.bfloat16)
+        cmp_cos = torch.zeros(B, half_rd, dtype=torch.float32)
+        cmp_sin = torch.zeros(B, half_rd, dtype=torch.float32)
+    cmp_start_pos = torch.full((B,), start_pos, dtype=torch.int32)
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -493,7 +501,7 @@ def golden_attention_hca(tensors):
         "odd_select": tensors["cmp_odd_select"],
         "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),                 # rotate=False; identity placeholder
         "kv_cache": cmp_kv_cache_buf,
-        "start_pos": tensors["start_pos"],
+        "start_pos": cmp_start_pos,
         "rotate": torch.tensor(False),
     })
     if should_compress:
