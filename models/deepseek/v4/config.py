@@ -239,8 +239,10 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 64          # B: tokens per decode step
-DECODE_SEQ = 2             # S: 2 tokens per step (MTP)
+DECODE_BATCH = 64                 # B: tokens per decode step
+DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
+PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
+PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size

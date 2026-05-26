@@ -34,7 +34,7 @@ from decode_compressor_ratio4 import compressor
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
-from qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope
 from decode_sparse_attn import sparse_attn
 
 B = DECODE_BATCH
@@ -115,7 +115,7 @@ def attention_csa(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -365,7 +365,7 @@ def attention_csa_test_refresh(
     attn_norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], pl.FP32],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
@@ -465,7 +465,7 @@ def golden_attention_csa(tensors):
     from decode_compressor_ratio4 import golden_compressor
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
-    from qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_qkv_proj_rope
 
     def rms_norm(x, weight):
         x_fp32 = x.float()
@@ -969,7 +969,6 @@ def build_tensor_specs(start_pos: int = START_POS):
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
-    wq_b_scale = wq_b_scale.view(Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
@@ -981,7 +980,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("attn_norm_w", [D], torch.float32, init_value=lambda: shared_attn_norm_w.clone()),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=lambda: shared_wq_a.clone()),
         TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
-        TensorSpec("wq_b_scale", [Q_PROJ_HEAD_BLOCKS, Q_PROJ_OUT_CHUNK], torch.float32, init_value=lambda: wq_b_scale),
+        TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv", [D, HEAD_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("gamma_cq", [Q_LORA], torch.bfloat16, init_value=lambda: shared_gamma_cq.clone()),
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),

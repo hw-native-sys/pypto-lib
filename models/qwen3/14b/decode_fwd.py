@@ -93,6 +93,16 @@ def decode_fwd(
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]],
 ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
+    hidden_states.bind_dynamic(0, USER_BATCH_DYN)
+    seq_lens.bind_dynamic(0, USER_BATCH_DYN)
+    slot_mapping.bind_dynamic(0, USER_BATCH_DYN)
+    out.bind_dynamic(0, USER_BATCH_DYN)
+    block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
+    rope_cos.bind_dynamic(0, ROPE_SEQ_DYN)
+    rope_sin.bind_dynamic(0, ROPE_SEQ_DYN)
+    k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+    v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+
     user_batch = pl.tensor.dim(hidden_states, 0)
     batch_padded = BATCH
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)

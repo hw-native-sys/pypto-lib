@@ -11,7 +11,7 @@
     output = matmul(attn_out, wo) + hidden_states
 
 Stage 0 (matmul: attn_out x wo) and Stage 1 (residual add) can be:
-  - Fused: single pl.at block with chunked_loop_optimizer (mix mode)
+  - Fused: single pl.at block with auto_chunk (mix mode)
   - Split: separate pl.at blocks for each stage (split mode)
 
 Input and hidden_states are BF16; wo is BF16; output is FP32.
@@ -36,7 +36,7 @@ def build_gemm_eltwise_mix_program(
     batch_tile: int = BATCH_TILE,
     chunk: int = 4,
 ):
-    """Build fused matmul + elementwise program with chunked_loop_optimizer."""
+    """Build fused matmul + elementwise program with auto_chunk."""
     k_blocks = hidden // k_chunk
     n_blocks = hidden // n_chunk
 

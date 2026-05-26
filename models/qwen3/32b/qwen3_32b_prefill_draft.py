@@ -136,7 +136,7 @@ def build_prefill_scope123_program(
 
                     # Stage 1.2: Q projection (matmul + matmul_acc, FP32 output).
                     q_proj_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                         for ob in pl.parallel(q_out_blocks, chunk=4):
                             q0 = ob * Q_OUT_CHUNK
                             tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
@@ -152,7 +152,7 @@ def build_prefill_scope123_program(
                     # Stage 1.3: K/V projection (matmul + matmul_acc in single incore).
                     k_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
                     v_proj_tile = pl.create_tensor([TOK_TILE, kv_hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                         for ob in pl.parallel(kv_out_blocks, chunk=4):
                             kv0 = ob * KV_OUT_CHUNK
 
@@ -198,7 +198,7 @@ def build_prefill_scope123_program(
                                     pl.cast(pl.full([Q_HEAD_PAD, head_dim], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                                     [gi * Q_HEAD_PAD, 0],
                                 )
-                        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                             for ki in pl.parallel(0, num_kv_heads, chunk=8):
                                 # K RoPE + cache update.
                                 kv_col = ki * head_dim
@@ -271,7 +271,7 @@ def build_prefill_scope123_program(
                             all_cur_li = pl.create_tensor([max_ctx_blocks * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
                             # Stage 2.2: QK matmul for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                                 for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                     s0 = sb * SEQ_TILE
                                     cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
@@ -280,7 +280,7 @@ def build_prefill_scope123_program(
                                     all_raw_scores = pl.assemble(all_raw_scores, raw_scores, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.3: softmax for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                                 for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                     s0 = sb * SEQ_TILE
                                     valid_len = pl.min(SEQ_TILE, ctx_len - s0)
@@ -300,7 +300,7 @@ def build_prefill_scope123_program(
                                     all_cur_li = pl.assemble(all_cur_li, cur_li, [sb * Q_HEAD_PAD, 0])
 
                             # Stage 2.4: SV matmul for all active sb blocks.
-                            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                                 for sb in pl.parallel(ctx_blocks, chunk=SB_BATCH):
                                     s0 = sb * SEQ_TILE
                                     cache_row0 = b * num_kv_heads * max_seq + kvh * max_seq + s0
@@ -429,7 +429,7 @@ def build_prefill_scope123_program(
 
                     # Stage 3.3b: Down projection (matmul_acc chain over intermediate dim).
                     down_fp32_tile = pl.create_tensor([TOK_TILE, hidden], dtype=pl.FP32)
-                    with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+                    with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                         for dob in pl.parallel(hidden_blocks, chunk=4):
                             d0 = dob * K_CHUNK
                             dn_a = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, 0])

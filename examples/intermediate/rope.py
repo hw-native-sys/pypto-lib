@@ -57,7 +57,7 @@ def build_rope_program(
             sin: pl.Tensor[[1, head_dim], pl.FP32],
             y: pl.Out[pl.Tensor[[total_rows, head_dim], pl.FP32]],
         ) -> pl.Tensor[[total_rows, head_dim], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for b in pl.parallel(0, batch, 1, chunk=batch_chunk):
                     # Slice cos/sin lo/hi halves directly from tensor
                     # so each becomes a separate tile.load (no textract).

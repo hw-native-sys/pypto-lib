@@ -61,9 +61,9 @@ def golden_prefill_attention_swa(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
-    from qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_qkv_proj_rope
     from hc_post import golden_hc_post
-    from prefill_sparse_attn_draft import golden_prefill_sparse_attn
+    from prefill_sparse_attn import golden_prefill_sparse_attn
 
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post_t = torch.zeros(B, S, HC_MULT)

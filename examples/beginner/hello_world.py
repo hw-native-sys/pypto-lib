@@ -38,7 +38,7 @@ def build_hello_world_program(
             a: pl.Scalar[pl.FP32],
             y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
         ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
                 for r in pl.parallel(0, rows, 1, chunk=row_chunk):
                     tile_x = pl.slice(x, [1, cols], [r, 0])
                     tile_y = pl.add(tile_x, a)
