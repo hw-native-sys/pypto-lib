@@ -405,7 +405,10 @@ def prefill_qkv_proj_rope_core(
                         q_head_sq_sum,
                         pl.reshape(pl.row_sum(pl.mul(q_head_chunk, q_head_chunk)), [1, PREFILL_QKV_TOKEN_CHUNK]),
                     )
-                q_head_inv_rms = pl.rsqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS))
+                # Match decode qkv: rsqrt is mathematically equivalent, but this
+                # backend rounds pl.recip(pl.sqrt(...)) differently and that
+                # precision matters after q-path quantization.
+                q_head_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS)))
                 q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [PREFILL_QKV_TOKEN_CHUNK, 1])
                 q_head_inv_rms_all[h : h + 1, :] = q_head_inv_rms
 
