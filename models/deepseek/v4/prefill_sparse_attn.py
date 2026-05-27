@@ -868,28 +868,6 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     ]
 
 
-def _run_golden_only(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
-    import torch
-
-    specs = build_tensor_specs(compress_ratio)
-    tensors = {
-        spec.name: spec.create_tensor() if hasattr(spec, "create_tensor") else spec.value
-        for spec in specs
-    }
-    golden_prefill_sparse_attn(tensors)
-    out = tensors["attn_out"]
-    if out.shape != (T, D):
-        raise RuntimeError(f"unexpected attn_out shape: {tuple(out.shape)}")
-    if out.dtype is not torch.bfloat16:
-        raise RuntimeError(f"unexpected attn_out dtype: {out.dtype}")
-    if not torch.isfinite(out.float()).all():
-        raise RuntimeError("golden attn_out contains NaN or Inf")
-    print(
-        f"[golden] PASS prefill_sparse_attn compress_ratio={compress_ratio} "
-        f"attn_out shape={tuple(out.shape)} dtype={out.dtype}"
-    )
-
-
 if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
@@ -900,8 +878,6 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
-    parser.add_argument("--run-kernel", action="store_true", default=False,
-                        help="Compile and run the PyPTO kernel. Default only validates the golden scaffold.")
     parser.add_argument(
         "--enable-l2-swimlane",
         nargs="?",
@@ -912,10 +888,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
-
-    if not args.run_kernel:
-        _run_golden_only(args.compress_ratio)
-        raise SystemExit(0)
 
     result = run_jit(
         fn=prefill_sparse_attn_test,
