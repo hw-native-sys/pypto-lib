@@ -33,11 +33,11 @@ EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
 RECV_TILE = 32
-K_CHUNK = 512
+K_TILE = 512
 INTER_K = 512
-INTER_CHUNK = 64
-D_OUT_CHUNK = 64
-QUANT_CHUNK = 256
+INTER_TILE = 64
+D_OUT_TILE = 64
+QUANT_TILE = 256
 
 
 @pl.jit.inline
@@ -70,52 +70,51 @@ def expert_routed(
             # Stage 1a: gate/up matmul + dequant + SwiGLU + routing-weight mul.
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
 
-            for n_base in pl.parallel(0, MOE_INTER, 8 * INTER_CHUNK):
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    optimizations=[pl.split(pl.SplitMode.NONE)],
-                    name_hint="exp_gate_up",
-                ):
-                    for ng in pl.range(8):
-                        n0 = n_base + ng * INTER_CHUNK
-                        x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_CHUNK]
-                        w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
-                        w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, 0 : K_CHUNK]
-                        gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
-                        up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
-                        for k0 in pl.range(K_CHUNK, D, K_CHUNK):
-                            x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_CHUNK]
-                            w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
-                            w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_CHUNK, k0 : k0 + K_CHUNK]
-                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
-                            up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
+            for nb_idx in pl.spmd(MOE_INTER // (4 * INTER_TILE), name_hint="exp_gate_up"):
+                n_base = nb_idx * (4 * INTER_TILE)
+                for ng in pl.range(4):
+                    n0 = n_base + ng * INTER_TILE
+                    # Peel-first-iter K loop: 3D-rhs b_trans=True matmul under
+                    # pl.pipeline + create_tensor + if-kb==0 carry triggers a
+                    # TLOAD DN->NZ ISA assertion (pypto#1540).
+                    x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_TILE]
+                    w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
+                    w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
+                    gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
+                    up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
+                    for k0 in pl.range(K_TILE, D, K_TILE):
+                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
+                        w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
+                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                        up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
 
-                        gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_CHUNK])
-                        up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_CHUNK])
-                        recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
-                        w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
-                        w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_CHUNK]
-                        gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
-                        up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
-                        gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
-                        up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
-                        if SWIGLU_LIMIT > 0.0:
-                            gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
-                            up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
-                        silu = pl.mul(gate_2d, sigmoid)
-                        gated = pl.mul(silu, up_2d)
-                        # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
-                        gated_valid = pl.tensor.set_validshape(gated, valid_rows, INTER_CHUNK)
-                        gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
-                        h_tile_fp32[:, n0 : n0 + INTER_CHUNK] = gated_masked
+                    gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_TILE])
+                    up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_TILE])
+                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
+                    w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
+                    w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
+                    gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
+                    up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
+                    gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
+                    up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
+                    if SWIGLU_LIMIT > 0.0:
+                        gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
+                        up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
+                    silu = pl.mul(gate_2d, sigmoid)
+                    gated = pl.mul(silu, up_2d)
+                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
+                    gated_valid = pl.tensor.set_validshape(gated, valid_rows, INTER_TILE)
+                    gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
+                    h_tile_fp32[:, n0 : n0 + INTER_TILE] = gated_masked
 
             # Per-row A8 requant of h_tile (amax across full MOE_INTER row).
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.range(0, MOE_INTER, QUANT_CHUNK):
-                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_CHUNK]
+                for k0 in pl.range(0, MOE_INTER, QUANT_TILE):
+                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
                     eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
                     eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
                     eh_amax = pl.maximum(eh_amax, eh_a_max)
@@ -124,37 +123,34 @@ def expert_routed(
                 )
                 h_tile_scale_dq = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
                 eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                for k1 in pl.range(0, MOE_INTER, QUANT_CHUNK):
-                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_CHUNK]
+                for k1 in pl.range(0, MOE_INTER, QUANT_TILE):
+                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
                     eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
                     eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                    h_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
+                    h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
             # Stage 1b: w2 matmul + dequant + write recv_y.
-            for d_base in pl.parallel(0, D, 16 * D_OUT_CHUNK):
-                with pl.at(
-                    level=pl.Level.CORE_GROUP,
-                    optimizations=[pl.split(pl.SplitMode.NONE)],
-                    name_hint="exp_w2",
-                ):
-                    for dg in pl.range(16):
-                        d0 = d_base + dg * D_OUT_CHUNK
-                        h_init = h_tile_i8[:, 0 : INTER_K]
-                        w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, 0 : INTER_K]
-                        y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
-                        for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
-                            h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                            w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK, k0 : k0 + INTER_K]
-                            y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+            for db_idx in pl.spmd(D // (16 * D_OUT_TILE), name_hint="exp_w2"):
+                d_base = db_idx * (16 * D_OUT_TILE)
+                for dg in pl.range(16):
+                    d0 = d_base + dg * D_OUT_TILE
+                    # Peel-first-iter K loop: see pypto#1540 note in exp_gate_up.
+                    h_init = h_tile_i8[:, 0 : INTER_K]
+                    w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, 0 : INTER_K]
+                    y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
+                    for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
+                        h_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                        w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                        y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
 
-                        y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_CHUNK])
-                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_CHUNK]
-                        y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                        y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
-                        recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_CHUNK] = pl.cast(
-                            y_2d, target_type=pl.BF16, mode="rint"
-                        )
+                    y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+                    w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE]
+                    y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
+                    recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE] = pl.cast(
+                        y_2d, target_type=pl.BF16, mode="rint"
+                    )
 
 
 @pl.jit
