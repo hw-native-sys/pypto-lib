@@ -14,9 +14,9 @@ the contract is stable.
 
 Current standalone contract:
 - `ori_kv` is the causal prompt KV cache.
-- `cmp_kv`, `cmp_block_table`, and `cmp_sparse_indices` are kept in the
-  signature for future sparse/compressed prefill work, but are not consumed by
-  the first golden.
+- `cmp_kv` is an optional compressed-cache tail selected by `cmp_sparse_indices`.
+- `cmp_sparse_indices` uses the prefill/model.py concatenated-KV convention:
+  raw indices `< S` read prompt KV, raw indices `>= S` read compressed KV.
 - `seqused_kv[b]` is the valid prompt length for batch item `b`.
 """
 
@@ -38,7 +38,8 @@ ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 IDX_TOPK = M.index_topk
-TOPK = M.sliding_window + IDX_TOPK
+WIN = M.sliding_window
+TOPK = WIN + IDX_TOPK
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -46,9 +47,13 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # cache shapes
+SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
+DEFAULT_COMPRESS_RATIO = 0
+PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, S // 4))
+PREFILL_SPARSE_TOPK = min(TOPK, min(M.sliding_window, S) + PREFILL_MAX_COMPRESSED)
 ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = 1
+CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # RoPE selector shapes kept to match the decode sparse-attn interface.
@@ -66,8 +71,8 @@ MATMUL_ROW_PAD = 16
 PV_HEAD_TILE = 16
 MERGE_NORM_TOKEN_TILE = 16
 PREFILL_ATTN_TILE = 64
-PREFILL_ATTN_BLOCKS = (S + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
-PREFILL_KV_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
+PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 ROPE_PACK_SPMD_BLOCKS = ((T + ROPE_PACK_TOKEN_TILE - 1) // ROPE_PACK_TOKEN_TILE) * O_GROUPS
 A_K_CHUNK = 128
 A_N_CHUNK = 128
@@ -105,15 +110,18 @@ def prefill_sparse_attn(
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
+    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
 
-    prompt_kv = pl.create_tensor([B * PREFILL_KV_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     prefill_raw_scores = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.FP32)
     prefill_exp = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.BF16)
     prefill_blk_mi = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
     prefill_blk_li = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
     prefill_blk_oi0 = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     prefill_blk_oi1 = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
+    prefill_blk_oi2 = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     even_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
     odd_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
@@ -121,7 +129,7 @@ def prefill_sparse_attn(
     rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
-    # Stage 1: make the causal prompt KV rows contiguous per batch.
+    # Stage 1: gather the per-token sparse prompt/compressed KV rows.
     for gather_t0 in pl.parallel(0, T, GATHER_TOKEN_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gather_prompt_kv_tile"):
             zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -130,31 +138,41 @@ def prefill_sparse_attn(
                 gather_b = gather_t // S
                 gather_s = gather_t - gather_b * S
                 gather_seq_len = pl.read(seqused_kv, [gather_b])
-                gather_dst_row = gather_b * PREFILL_KV_PAD + gather_s
                 if gather_s < gather_seq_len:
-                    gather_block_slot = gather_s // BLOCK_SIZE
-                    gather_block_pos = gather_b * ORI_MAX_BLOCKS + gather_block_slot
-                    gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
-                    gather_intra = gather_s - gather_block_slot * BLOCK_SIZE
-                    gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
-                    prompt_kv = pl.assemble(
-                        prompt_kv,
-                        ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
-                        [gather_dst_row, 0],
-                    )
+                    for gather_k in pl.range(PREFILL_SPARSE_PAD):
+                        gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
+                        gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
+                        if gather_raw >= 0:
+                            if gather_raw < S:
+                                gather_ori_slot = gather_raw
+                                gather_block_slot = gather_ori_slot // BLOCK_SIZE
+                                gather_block_pos = gather_b * ORI_MAX_BLOCKS + gather_block_slot
+                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
+                                gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
+                                gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                            else:
+                                gather_cmp_slot = gather_raw - S
+                                gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
+                                gather_cmp_block_pos = gather_b * CMP_MAX_BLOCKS + gather_cmp_block_slot
+                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
+                                gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
+                                gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                        else:
+                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
                 else:
-                    prompt_kv = pl.assemble(prompt_kv, zero_kv_row, [gather_dst_row, 0])
-
-    if S < PREFILL_KV_PAD:
-        for gather_b0 in pl.parallel(0, B, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_zero_prompt_kv_pad"):
-                zero_pad_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                for gather_pad_s in pl.range(S, PREFILL_KV_PAD):
-                    prompt_kv = pl.assemble(
-                        prompt_kv,
-                        zero_pad_row,
-                        [gather_b0 * PREFILL_KV_PAD + gather_pad_s, 0],
-                    )
+                    for gather_k in pl.range(PREFILL_SPARSE_PAD):
+                        gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
+                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
 
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, ATTN_TOKEN_TILE):
@@ -166,15 +184,19 @@ def prefill_sparse_attn(
                     qk_s = qk_t - qk_b * S
                     qk_seq_len = pl.read(seqused_kv, [qk_b])
                     if qk_s < qk_seq_len:
-                        qk_ctx_len = pl.min(qk_s + 1, qk_seq_len)
                         qk_head_row = qk_t * H + h0
                         qk_q_batch = q_flat[qk_head_row : qk_head_row + MATMUL_ROW_PAD, 0 : HEAD_DIM]
-                        qk_kv_base = qk_b * PREFILL_KV_PAD
+                        qk_kv_base = qk_t * PREFILL_SPARSE_PAD
 
                         for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
                             qk_tile_start = qk_sb * PREFILL_ATTN_TILE
-                            if qk_tile_start < qk_ctx_len:
-                                qk_kv_tile = prompt_kv[
+                            qk_tile_valid = 0
+                            for qk_valid_i in pl.range(PREFILL_ATTN_TILE):
+                                qk_valid_raw = pl.read(cmp_sparse_indices, [qk_t, qk_tile_start + qk_valid_i])
+                                if qk_valid_raw >= 0:
+                                    qk_tile_valid = qk_valid_i + 1
+                            if qk_tile_valid > 0:
+                                qk_kv_tile = sparse_kv[
                                     qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + PREFILL_ATTN_TILE,
                                     0 : HEAD_DIM,
                                 ]
@@ -189,12 +211,18 @@ def prefill_sparse_attn(
                     softmax_s = softmax_t - softmax_b * S
                     softmax_seq_len = pl.read(seqused_kv, [softmax_b])
                     if softmax_s < softmax_seq_len:
-                        softmax_ctx_len = pl.min(softmax_s + 1, softmax_seq_len)
 
                         for softmax_sb in pl.range(PREFILL_ATTN_BLOCKS):
                             softmax_tile_start = softmax_sb * PREFILL_ATTN_TILE
-                            if softmax_tile_start < softmax_ctx_len:
-                                softmax_tile_valid = pl.min(PREFILL_ATTN_TILE, softmax_ctx_len - softmax_tile_start)
+                            softmax_tile_valid = 0
+                            for softmax_valid_i in pl.range(PREFILL_ATTN_TILE):
+                                softmax_valid_raw = pl.read(
+                                    cmp_sparse_indices,
+                                    [softmax_t, softmax_tile_start + softmax_valid_i],
+                                )
+                                if softmax_valid_raw >= 0:
+                                    softmax_tile_valid = softmax_valid_i + 1
+                            if softmax_tile_valid > 0:
                                 softmax_block_row = softmax_t * H * PREFILL_ATTN_BLOCKS + softmax_sb * H + h0
                                 softmax_raw_scores = prefill_raw_scores[
                                     softmax_block_row : softmax_block_row + MATMUL_ROW_PAD,
@@ -225,13 +253,13 @@ def prefill_sparse_attn(
                         pv_s = pv_t - pv_b * S
                         pv_seq_len = pl.read(seqused_kv, [pv_b])
                         if pv_s < pv_seq_len:
-                            pv_ctx_len = pl.min(pv_s + 1, pv_seq_len)
-                            pv_kv_base = pv_b * PREFILL_KV_PAD
+                            pv_kv_base = pv_t * PREFILL_SPARSE_PAD
 
                             for pv_sb in pl.range(PREFILL_ATTN_BLOCKS):
                                 pv_tile_start = pv_sb * PREFILL_ATTN_TILE
-                                if pv_tile_start < pv_ctx_len:
-                                    pv_kv_tile = prompt_kv[
+                                pv_tile_valid_raw = pl.read(cmp_sparse_indices, [pv_t, pv_tile_start])
+                                if pv_tile_valid_raw >= 0:
+                                    pv_kv_tile = sparse_kv[
                                         pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + PREFILL_ATTN_TILE,
                                         0 : HEAD_DIM,
                                     ]
@@ -244,8 +272,10 @@ def prefill_sparse_attn(
                                     pv_head_row = pv_t * H + pv_h0
                                     if pv_sb == 0:
                                         prefill_blk_oi0 = pl.assemble(prefill_blk_oi0, pv_oi, [pv_head_row, 0])
-                                    else:
+                                    if pv_sb == 1:
                                         prefill_blk_oi1 = pl.assemble(prefill_blk_oi1, pv_oi, [pv_head_row, 0])
+                                    if pv_sb == 2:
+                                        prefill_blk_oi2 = pl.assemble(prefill_blk_oi2, pv_oi, [pv_head_row, 0])
 
                 for merge_norm_t_delta in pl.parallel(0, ATTN_TOKEN_TILE, MERGE_NORM_TOKEN_TILE):
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_merge_norm_head_tile"):
@@ -257,7 +287,6 @@ def prefill_sparse_attn(
                             merge_norm_seq_len = pl.read(seqused_kv, [merge_norm_b])
                             merge_norm_head_row = merge_norm_t * H + pv_h0
                             if merge_norm_s < merge_norm_seq_len:
-                                merge_norm_ctx_len = pl.min(merge_norm_s + 1, merge_norm_seq_len)
                                 merge_norm_block_row0 = merge_norm_t * H * PREFILL_ATTN_BLOCKS + pv_h0
                                 merge_norm_mi = prefill_blk_mi[
                                     merge_norm_block_row0 : merge_norm_block_row0 + PV_HEAD_TILE,
@@ -274,7 +303,8 @@ def prefill_sparse_attn(
 
                                 if PREFILL_ATTN_BLOCKS > 1:
                                     merge_norm_tile_start1 = PREFILL_ATTN_TILE
-                                    if merge_norm_tile_start1 < merge_norm_ctx_len:
+                                    merge_norm_block1_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start1])
+                                    if merge_norm_block1_raw >= 0:
                                         merge_norm_block_row1 = merge_norm_t * H * PREFILL_ATTN_BLOCKS + H + pv_h0
                                         merge_norm_cur_mi = prefill_blk_mi[
                                             merge_norm_block_row1 : merge_norm_block_row1 + PV_HEAD_TILE,
@@ -300,6 +330,36 @@ def prefill_sparse_attn(
                                             pl.row_expand_mul(merge_norm_cur_oi, merge_norm_beta),
                                         )
                                         merge_norm_mi = merge_norm_mi_new
+
+                                if PREFILL_ATTN_BLOCKS > 2:
+                                    merge_norm_tile_start2 = 2 * PREFILL_ATTN_TILE
+                                    merge_norm_block2_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start2])
+                                    if merge_norm_block2_raw >= 0:
+                                        merge_norm_block_row2 = merge_norm_t * H * PREFILL_ATTN_BLOCKS + 2 * H + pv_h0
+                                        merge_norm_cur_mi2 = prefill_blk_mi[
+                                            merge_norm_block_row2 : merge_norm_block_row2 + PV_HEAD_TILE,
+                                            0 : 1,
+                                        ]
+                                        merge_norm_cur_li2 = prefill_blk_li[
+                                            merge_norm_block_row2 : merge_norm_block_row2 + PV_HEAD_TILE,
+                                            0 : 1,
+                                        ]
+                                        merge_norm_cur_oi2 = prefill_blk_oi2[
+                                            merge_norm_head_row : merge_norm_head_row + PV_HEAD_TILE,
+                                            0 : HEAD_DIM,
+                                        ]
+                                        merge_norm_mi_new2 = pl.maximum(merge_norm_mi, merge_norm_cur_mi2)
+                                        merge_norm_alpha2 = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new2))
+                                        merge_norm_beta2 = pl.exp(pl.sub(merge_norm_cur_mi2, merge_norm_mi_new2))
+                                        merge_norm_li = pl.add(
+                                            pl.mul(merge_norm_alpha2, merge_norm_li),
+                                            pl.mul(merge_norm_beta2, merge_norm_cur_li2),
+                                        )
+                                        merge_norm_oi = pl.add(
+                                            pl.row_expand_mul(merge_norm_oi, merge_norm_alpha2),
+                                            pl.row_expand_mul(merge_norm_cur_oi2, merge_norm_beta2),
+                                        )
+                                        merge_norm_mi = merge_norm_mi_new2
 
                                 merge_norm_sink_bias = pl.reshape(attn_sink[pv_h0 : pv_h0 + PV_HEAD_TILE], [PV_HEAD_TILE, 1])
                                 merge_norm_sink_tile = pl.add(pl.sub(merge_norm_mi, merge_norm_mi), merge_norm_sink_bias)
@@ -582,6 +642,17 @@ def _quant_w_per_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
+def get_prefill_cmp_valid(compress_ratio: int) -> int:
+    """Map standalone prefill ratio modes to visible compressed-cache length."""
+    if compress_ratio == 0:
+        return 0
+    if compress_ratio == 4:
+        return min(IDX_TOPK, S // compress_ratio)
+    if compress_ratio == 128:
+        return min(IDX_TOPK, S // compress_ratio)
+    raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
+
+
 def golden_prefill_sparse_attn(tensors):
     """Torch reference for the first standalone prefill sparse-attn contract."""
     import torch
@@ -589,8 +660,11 @@ def golden_prefill_sparse_attn(tensors):
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
     ori_block_table = tensors["ori_block_table"]
+    cmp_kv = tensors.get("cmp_kv")
+    cmp_block_table = tensors.get("cmp_block_table")
+    cmp_sparse_indices = tensors.get("cmp_sparse_indices")
     attn_sink = tensors["attn_sink"].float()
-    seqused_kv = tensors["seqused_kv"]
+    seqused_kv = tensors.get("seqused_kv")
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
     wo_a = tensors["wo_a"].float()
@@ -601,22 +675,45 @@ def golden_prefill_sparse_attn(tensors):
     for t in range(T):
         b = t // S
         s = t - b * S
-        seq_len = int(seqused_kv[b].item())
+        seq_len = int(seqused_kv[b].item()) if seqused_kv is not None else S
         if s >= seq_len:
             continue
 
-        ctx_len = min(s + 1, seq_len)
         gathered = []
-        for raw in range(ctx_len):
-            blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-            intra = raw % BLOCK_SIZE
-            gathered.append(ori_kv[blk_id, intra, 0])
+        if cmp_sparse_indices is None:
+            for raw in range(min(s + 1, seq_len)):
+                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
+                intra = raw % BLOCK_SIZE
+                gathered.append(ori_kv[blk_id, intra, 0])
+        else:
+            for raw_i in cmp_sparse_indices[t, :PREFILL_SPARSE_TOPK].tolist():
+                raw = int(raw_i)
+                if raw < 0:
+                    continue
+                if raw < S:
+                    if raw >= seq_len:
+                        continue
+                    blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
+                    intra = raw % BLOCK_SIZE
+                    gathered.append(ori_kv[blk_id, intra, 0])
+                else:
+                    cmp_slot = raw - S
+                    if cmp_kv is None or cmp_block_table is None:
+                        continue
+                    if cmp_slot >= CMP_BLOCK_NUM * BLOCK_SIZE:
+                        continue
+                    blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
+                    intra = cmp_slot % BLOCK_SIZE
+                    gathered.append(cmp_kv.float()[blk_id, intra, 0])
+
+        if not gathered:
+            continue
         kv_b = torch.stack(gathered, dim=0)
 
         mi = None
         li = None
         oi = None
-        for tile_start in range(0, ctx_len, PREFILL_ATTN_TILE):
+        for tile_start in range(0, kv_b.shape[0], PREFILL_ATTN_TILE):
             kv_tile = kv_b[tile_start : tile_start + PREFILL_ATTN_TILE]
             scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
             cur_mi = scores.max(dim=-1, keepdim=True).values
@@ -635,8 +732,9 @@ def golden_prefill_sparse_attn(tensors):
                 oi = oi * alpha + cur_oi * beta
                 mi = mi_new
 
-        denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
-        o[t] = oi / denom
+        if mi is not None:
+            denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
+            o[t] = oi / denom
 
     rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
     rope_even = rope_pair[..., 0]
@@ -659,10 +757,12 @@ def golden_prefill_sparse_attn(tensors):
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
 
-def build_tensor_specs():
+def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     """Build deterministic tensors for the prefill standalone harness."""
     import torch
     from golden import TensorSpec
+
+    cmp_valid = get_prefill_cmp_valid(compress_ratio)
 
     def seeded_uniform(shape, seed):
         generator = torch.Generator()
@@ -693,7 +793,20 @@ def build_tensor_specs():
         return tbl
 
     def init_cmp_sparse_indices():
-        return torch.full((T, TOPK), -1, dtype=torch.int32)
+        idx = torch.full((T, TOPK), -1, dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            s = t - b * S
+            del b
+            win_start = max(0, s - M.sliding_window + 1)
+            window = torch.arange(win_start, s + 1, dtype=torch.int32)
+            idx[t, : window.numel()] = window
+            if compress_ratio:
+                comp_count = min(cmp_valid, (s + 1) // compress_ratio)
+                if comp_count > 0:
+                    comp = torch.arange(comp_count, dtype=torch.int32) + S
+                    idx[t, window.numel() : window.numel() + comp_count] = comp
+        return idx
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -755,11 +868,14 @@ def build_tensor_specs():
     ]
 
 
-def _run_golden_only():
+def _run_golden_only(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     import torch
 
-    specs = build_tensor_specs()
-    tensors = {spec.name: spec.create_tensor() for spec in specs}
+    specs = build_tensor_specs(compress_ratio)
+    tensors = {
+        spec.name: spec.create_tensor() if hasattr(spec, "create_tensor") else spec.value
+        for spec in specs
+    }
     golden_prefill_sparse_attn(tensors)
     out = tensors["attn_out"]
     if out.shape != (T, D):
@@ -768,7 +884,10 @@ def _run_golden_only():
         raise RuntimeError(f"unexpected attn_out dtype: {out.dtype}")
     if not torch.isfinite(out.float()).all():
         raise RuntimeError("golden attn_out contains NaN or Inf")
-    print(f"[golden] PASS prefill_sparse_attn attn_out shape={tuple(out.shape)} dtype={out.dtype}")
+    print(
+        f"[golden] PASS prefill_sparse_attn compress_ratio={compress_ratio} "
+        f"attn_out shape={tuple(out.shape)} dtype={out.dtype}"
+    )
 
 
 if __name__ == "__main__":
@@ -779,6 +898,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
+                        choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--run-kernel", action="store_true", default=False,
                         help="Compile and run the PyPTO kernel. Default only validates the golden scaffold.")
     parser.add_argument(
@@ -793,12 +914,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not args.run_kernel:
-        _run_golden_only()
+        _run_golden_only(args.compress_ratio)
         raise SystemExit(0)
 
     result = run_jit(
         fn=prefill_sparse_attn_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.compress_ratio),
         golden_fn=golden_prefill_sparse_attn,
         runtime_cfg=dict(
             platform=args.platform,
