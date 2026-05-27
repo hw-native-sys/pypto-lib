@@ -97,7 +97,7 @@ def decode_hca(
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    # ---- main compressor (ratio=128, rotate=False) ----
+    # ---- main compressor (ratio=128) ----
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -144,7 +144,6 @@ def decode_hca(
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     # ---- scalars ----
     start_pos: pl.Scalar[pl.INT32],   # static standalone fixture uses compile-time START_POS
-    cmp_rotate: pl.Scalar[pl.BOOL],   # always False on the ratio=128 path
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block (HCA): hc_pre + attention(+compressor) + hc_post → x_attn.
@@ -163,7 +162,7 @@ def decode_hca(
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_attn,
-        start_pos, cmp_rotate,
+        start_pos,
     )
 
     # MoE sub-block.
@@ -240,7 +239,6 @@ def decode_hca_test(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
-    cmp_rotate: pl.Scalar[pl.BOOL],
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_hca(
@@ -264,7 +262,7 @@ def decode_hca_test(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next,
-        start_pos, cmp_rotate, layer_id,
+        start_pos, layer_id,
     )
     return x_next
 
@@ -331,7 +329,7 @@ def build_tensor_specs(layer_id: int = 0):
         # ---- output ----
         "x_next",
         # ---- scalars ----
-        "start_pos", "cmp_rotate", "layer_id",
+        "start_pos", "layer_id",
     ]
 
     missing = [n for n in order if n not in by_name]

@@ -173,10 +173,8 @@ def attention_csa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    step_cos = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
-    step_sin = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
-    cmp_cos = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([1, HALF_ROPE], dtype=pl.FP32)
+    step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         pos = pl.cast(start_pos, pl.INDEX)
         cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
@@ -192,27 +190,29 @@ def attention_csa(
         rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16)
         rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16)
         step_cos = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
+            pl.full([B, HALF_ROPE], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [pos, 0]), target_type=pl.FP32),
         )
         step_sin = pl.col_expand(
-            pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0),
+            pl.full([B, HALF_ROPE], dtype=pl.FP32, value=0.0),
             pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [pos, 0]), target_type=pl.FP32),
         )
-        cmp_cos_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
-        cmp_sin_base = pl.full([1, HALF_ROPE], dtype=pl.FP32, value=0.0)
-        cmp_cos = cmp_cos_base
-        cmp_sin = cmp_sin_base
-        if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos = pl.col_expand(
-                cmp_cos_base,
-                pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-            )
-            cmp_sin = pl.col_expand(
-                cmp_sin_base,
-                pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
-            )
+
+    cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
+    cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
+        for b in pl.range(B):
+            pl.write(cmp_start_pos, [b], pl.cast(start_pos, pl.INT32))
+        cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
+        cmp_cos = pl.col_expand(
+            pl.full([B, HALF_ROPE], dtype=pl.FP32, value=0.0),
+            pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+        )
+        cmp_sin = pl.col_expand(
+            pl.full([B, HALF_ROPE], dtype=pl.FP32, value=0.0),
+            pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos, 0]), target_type=pl.FP32),
+        )
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -269,7 +269,7 @@ def attention_csa(
         odd_select,
         hadamard_main,
         cmp_dense_unused,
-        start_pos,
+        cmp_start_pos,
         ROTATE_MAIN,
     )
 
@@ -312,7 +312,7 @@ def attention_csa(
         idx_kv_cache,
         idx_score_unused,
         idx_topk_full,
-        start_pos,
+        cmp_start_pos,
         WIN,
         ROTATE_INNER,
     )
@@ -607,17 +607,14 @@ def golden_attention_csa(tensors):
     freqs_sin = tensors["freqs_sin"]
     rope_cos_t = freqs_cos[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
     rope_sin_t = freqs_sin[start_pos:start_pos + 1].expand(T, ROPE_HEAD_DIM).contiguous()
-    step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
-    step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].contiguous()
+    step_cos = freqs_cos[start_pos:start_pos + 1, :HALF_ROPE].float().expand(B, HALF_ROPE).contiguous()
+    step_sin = freqs_sin[start_pos:start_pos + 1, :HALF_ROPE].float().expand(B, HALF_ROPE).contiguous()
     compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
     should_compress = compress_offset <= S
-    if should_compress:
-        cmp_pos = start_pos + compress_offset - COMPRESS_RATIO
-        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
-        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :HALF_ROPE].contiguous()
-    else:
-        cmp_cos = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
-        cmp_sin = torch.zeros(1, HALF_ROPE, dtype=torch.bfloat16)
+    cmp_pos = start_pos + compress_offset - COMPRESS_RATIO
+    cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :HALF_ROPE].float().expand(B, HALF_ROPE).contiguous()
+    cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :HALF_ROPE].float().expand(B, HALF_ROPE).contiguous()
+    cmp_start_pos = torch.full((B,), start_pos, dtype=torch.int32)
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -671,7 +668,7 @@ def golden_attention_csa(tensors):
         "odd_select": tensors["odd_select"],
         "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),
         "kv_cache": cmp_dense,
-        "start_pos": tensors["start_pos"],
+        "start_pos": cmp_start_pos,
         "rotate": False,
     })
     if should_compress:
@@ -706,7 +703,7 @@ def golden_attention_csa(tensors):
         "idx_kv_cache": tensors["idx_kv_cache"],
         "score": idx_score,
         "topk_idxs": idx_topk_full,
-        "start_pos": tensors["start_pos"],
+        "start_pos": cmp_start_pos,
         "offset": torch.tensor(WIN, dtype=torch.int32),
         "inner_rotate": torch.tensor(ROTATE_INNER, dtype=torch.bool),
     })
