@@ -26,7 +26,7 @@ from config import FLASH as M, BLOCK_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX
 
 
 # Standalone prefill target shape for correctness bring-up.
-B = 16
+B = 1
 S = 128
 T = B * S
 
@@ -59,11 +59,12 @@ ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 # shapes where possible, while padding prompt-K tiles so S=16 can still use
 # cube-friendly 64-column attention blocks without out-of-bounds slices.
 GATHER_TOKEN_TILE = 8
-ATTN_TOKEN_TILE = 16
+ATTN_TOKEN_TILE = 32
 ROPE_TOKEN_TILE = 8
 ROPE_PACK_TOKEN_TILE = 16
 MATMUL_ROW_PAD = 16
 PV_HEAD_TILE = 16
+MERGE_NORM_TOKEN_TILE = 16
 PREFILL_ATTN_TILE = 64
 PREFILL_ATTN_BLOCKS = (S + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
 PREFILL_KV_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
@@ -72,8 +73,8 @@ A_K_CHUNK = 128
 A_N_CHUNK = 128
 B_K_CHUNK = 128
 B_N_CHUNK = 128 if T >= 128 else 256
-QUANT_CHUNK = 32 if T >= 128 else (128 if T >= 64 else 256)
-QUANT_TOKEN_TILE = 8
+QUANT_CHUNK = 128 if T >= 128 else (128 if T >= 64 else 256)
+QUANT_TOKEN_TILE = 32
 PROJ_TOKEN_TILE = 128 if T >= 128 else T
 
 
@@ -111,13 +112,11 @@ def prefill_sparse_attn(
     prefill_exp = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.BF16)
     prefill_blk_mi = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
     prefill_blk_li = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
-    prefill_blk_oi = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, HEAD_DIM], dtype=pl.FP32)
-    prefill_mi = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    prefill_li = pl.create_tensor([T * H, 1], dtype=pl.FP32)
-    prefill_oi = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
+    prefill_blk_oi0 = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
+    prefill_blk_oi1 = pl.create_tensor([T * H, HEAD_DIM], dtype=pl.FP32)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
-    o_proj_even = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
-    o_proj_odd = pl.create_tensor([T * H, HALF_ROPE], dtype=pl.FP32)
+    even_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
+    odd_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
     rope_even_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -212,13 +211,9 @@ def prefill_sparse_attn(
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
                                 softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16)
                                 softmax_li = pl.row_sum(pl.cast(softmax_exp_scores_bf16, target_type=pl.FP32))
-                                prefill_exp = pl.assemble(
-                                    prefill_exp,
-                                    softmax_exp_scores_bf16,
-                                    [softmax_block_row, 0],
-                                )
                                 prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [softmax_block_row, 0])
                                 prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [softmax_block_row, 0])
+                                prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [softmax_block_row, 0])
 
             for pv_h_delta in pl.parallel(0, MATMUL_ROW_PAD, PV_HEAD_TILE):
                 pv_h0 = h0 + pv_h_delta
@@ -232,111 +227,123 @@ def prefill_sparse_attn(
                         if pv_s < pv_seq_len:
                             pv_ctx_len = pl.min(pv_s + 1, pv_seq_len)
                             pv_kv_base = pv_b * PREFILL_KV_PAD
+
                             for pv_sb in pl.range(PREFILL_ATTN_BLOCKS):
                                 pv_tile_start = pv_sb * PREFILL_ATTN_TILE
                                 if pv_tile_start < pv_ctx_len:
-                                    pv_block_row = pv_t * H * PREFILL_ATTN_BLOCKS + pv_sb * H + pv_h0
-                                    pv_exp = prefill_exp[pv_block_row : pv_block_row + PV_HEAD_TILE, 0 : PREFILL_ATTN_TILE]
                                     pv_kv_tile = prompt_kv[
                                         pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + PREFILL_ATTN_TILE,
                                         0 : HEAD_DIM,
                                     ]
-                                    pv_oi_tmp = pl.matmul(pv_exp, pv_kv_tile, out_dtype=pl.FP32)
-                                    prefill_blk_oi = pl.assemble(prefill_blk_oi, pv_oi_tmp, [pv_block_row, 0])
+                                    pv_block_row = pv_t * H * PREFILL_ATTN_BLOCKS + pv_sb * H + pv_h0
+                                    pv_exp_scores = prefill_exp[
+                                        pv_block_row : pv_block_row + PV_HEAD_TILE,
+                                        0 : PREFILL_ATTN_TILE,
+                                    ]
+                                    pv_oi = pl.matmul(pv_exp_scores, pv_kv_tile, out_dtype=pl.FP32)
+                                    pv_head_row = pv_t * H + pv_h0
+                                    if pv_sb == 0:
+                                        prefill_blk_oi0 = pl.assemble(prefill_blk_oi0, pv_oi, [pv_head_row, 0])
+                                    else:
+                                        prefill_blk_oi1 = pl.assemble(prefill_blk_oi1, pv_oi, [pv_head_row, 0])
 
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_merge_head_tile"):
-                    for merge_dt in pl.range(ATTN_TOKEN_TILE):
-                        merge_t = attn_t0 + merge_dt
-                        merge_b = merge_t // S
-                        merge_s = merge_t - merge_b * S
-                        merge_seq_len = pl.read(seqused_kv, [merge_b])
-                        if merge_s < merge_seq_len:
-                            merge_ctx_len = pl.min(merge_s + 1, merge_seq_len)
-                            merge_head_row = merge_t * H + pv_h0
-                            merge_block_row0 = merge_t * H * PREFILL_ATTN_BLOCKS + pv_h0
-                            merge_mi = prefill_blk_mi[merge_block_row0 : merge_block_row0 + PV_HEAD_TILE, 0 : 1]
-                            merge_li = prefill_blk_li[merge_block_row0 : merge_block_row0 + PV_HEAD_TILE, 0 : 1]
-                            merge_oi = prefill_blk_oi[merge_block_row0 : merge_block_row0 + PV_HEAD_TILE, 0 : HEAD_DIM]
+                for merge_norm_t_delta in pl.parallel(0, ATTN_TOKEN_TILE, MERGE_NORM_TOKEN_TILE):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_merge_norm_head_tile"):
+                        zero_head_tile = pl.full([PV_HEAD_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        for merge_norm_dt in pl.range(MERGE_NORM_TOKEN_TILE):
+                            merge_norm_t = attn_t0 + merge_norm_t_delta + merge_norm_dt
+                            merge_norm_b = merge_norm_t // S
+                            merge_norm_s = merge_norm_t - merge_norm_b * S
+                            merge_norm_seq_len = pl.read(seqused_kv, [merge_norm_b])
+                            merge_norm_head_row = merge_norm_t * H + pv_h0
+                            if merge_norm_s < merge_norm_seq_len:
+                                merge_norm_ctx_len = pl.min(merge_norm_s + 1, merge_norm_seq_len)
+                                merge_norm_block_row0 = merge_norm_t * H * PREFILL_ATTN_BLOCKS + pv_h0
+                                merge_norm_mi = prefill_blk_mi[
+                                    merge_norm_block_row0 : merge_norm_block_row0 + PV_HEAD_TILE,
+                                    0 : 1,
+                                ]
+                                merge_norm_li = prefill_blk_li[
+                                    merge_norm_block_row0 : merge_norm_block_row0 + PV_HEAD_TILE,
+                                    0 : 1,
+                                ]
+                                merge_norm_oi = prefill_blk_oi0[
+                                    merge_norm_head_row : merge_norm_head_row + PV_HEAD_TILE,
+                                    0 : HEAD_DIM,
+                                ]
 
-                            for merge_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
-                                merge_tile_start = merge_sb * PREFILL_ATTN_TILE
-                                if merge_tile_start < merge_ctx_len:
-                                    merge_block_row = merge_t * H * PREFILL_ATTN_BLOCKS + merge_sb * H + pv_h0
-                                    merge_cur_mi = prefill_blk_mi[merge_block_row : merge_block_row + PV_HEAD_TILE, 0 : 1]
-                                    merge_cur_li = prefill_blk_li[merge_block_row : merge_block_row + PV_HEAD_TILE, 0 : 1]
-                                    merge_cur_oi = prefill_blk_oi[merge_block_row : merge_block_row + PV_HEAD_TILE, 0 : HEAD_DIM]
-                                    merge_mi_new = pl.maximum(merge_mi, merge_cur_mi)
-                                    merge_alpha = pl.exp(pl.sub(merge_mi, merge_mi_new))
-                                    merge_beta = pl.exp(pl.sub(merge_cur_mi, merge_mi_new))
-                                    merge_li = pl.add(pl.mul(merge_alpha, merge_li), pl.mul(merge_beta, merge_cur_li))
-                                    merge_oi = pl.add(
-                                        pl.row_expand_mul(merge_oi, merge_alpha),
-                                        pl.row_expand_mul(merge_cur_oi, merge_beta),
-                                    )
-                                    merge_mi = merge_mi_new
+                                if PREFILL_ATTN_BLOCKS > 1:
+                                    merge_norm_tile_start1 = PREFILL_ATTN_TILE
+                                    if merge_norm_tile_start1 < merge_norm_ctx_len:
+                                        merge_norm_block_row1 = merge_norm_t * H * PREFILL_ATTN_BLOCKS + H + pv_h0
+                                        merge_norm_cur_mi = prefill_blk_mi[
+                                            merge_norm_block_row1 : merge_norm_block_row1 + PV_HEAD_TILE,
+                                            0 : 1,
+                                        ]
+                                        merge_norm_cur_li = prefill_blk_li[
+                                            merge_norm_block_row1 : merge_norm_block_row1 + PV_HEAD_TILE,
+                                            0 : 1,
+                                        ]
+                                        merge_norm_cur_oi = prefill_blk_oi1[
+                                            merge_norm_head_row : merge_norm_head_row + PV_HEAD_TILE,
+                                            0 : HEAD_DIM,
+                                        ]
+                                        merge_norm_mi_new = pl.maximum(merge_norm_mi, merge_norm_cur_mi)
+                                        merge_norm_alpha = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new))
+                                        merge_norm_beta = pl.exp(pl.sub(merge_norm_cur_mi, merge_norm_mi_new))
+                                        merge_norm_li = pl.add(
+                                            pl.mul(merge_norm_alpha, merge_norm_li),
+                                            pl.mul(merge_norm_beta, merge_norm_cur_li),
+                                        )
+                                        merge_norm_oi = pl.add(
+                                            pl.row_expand_mul(merge_norm_oi, merge_norm_alpha),
+                                            pl.row_expand_mul(merge_norm_cur_oi, merge_norm_beta),
+                                        )
+                                        merge_norm_mi = merge_norm_mi_new
 
-                            prefill_mi = pl.assemble(prefill_mi, merge_mi, [merge_head_row, 0])
-                            prefill_li = pl.assemble(prefill_li, merge_li, [merge_head_row, 0])
-                            prefill_oi = pl.assemble(prefill_oi, merge_oi, [merge_head_row, 0])
+                                merge_norm_sink_bias = pl.reshape(attn_sink[pv_h0 : pv_h0 + PV_HEAD_TILE], [PV_HEAD_TILE, 1])
+                                merge_norm_sink_tile = pl.add(pl.sub(merge_norm_mi, merge_norm_mi), merge_norm_sink_bias)
+                                merge_norm_denom = pl.add(
+                                    merge_norm_li,
+                                    pl.exp(pl.sub(merge_norm_sink_tile, merge_norm_mi)),
+                                )
+                                merge_norm_out = pl.row_expand_div(merge_norm_oi, merge_norm_denom)
+                                attn_stage_row = pl.cast(
+                                    merge_norm_out[0 : PV_HEAD_TILE, 0 : HEAD_DIM],
+                                    target_type=pl.BF16,
+                                )
+                            else:
+                                attn_stage_row = zero_head_tile
 
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_norm_head_tile"):
-                    zero_head_tile = pl.full([PV_HEAD_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                    for norm_dt in pl.range(ATTN_TOKEN_TILE):
-                        norm_t = attn_t0 + norm_dt
-                        norm_b = norm_t // S
-                        norm_s = norm_t - norm_b * S
-                        norm_seq_len = pl.read(seqused_kv, [norm_b])
-                        norm_attn_head_row = norm_t * H + pv_h0
-                        if norm_s < norm_seq_len:
-                            norm_oi = prefill_oi[norm_attn_head_row : norm_attn_head_row + PV_HEAD_TILE, 0 : HEAD_DIM]
-                            norm_mi = prefill_mi[norm_attn_head_row : norm_attn_head_row + PV_HEAD_TILE, 0 : 1]
-                            norm_li = prefill_li[norm_attn_head_row : norm_attn_head_row + PV_HEAD_TILE, 0 : 1]
-                            norm_sink_bias = pl.reshape(attn_sink[pv_h0 : pv_h0 + PV_HEAD_TILE], [PV_HEAD_TILE, 1])
-                            norm_sink_tile = pl.add(pl.sub(norm_mi, norm_mi), norm_sink_bias)
-                            norm_denom = pl.add(norm_li, pl.exp(pl.sub(norm_sink_tile, norm_mi)))
-                            norm_out = pl.row_expand_div(norm_oi, norm_denom)
-                            attn_stage_row = pl.cast(
-                                norm_out[0 : PV_HEAD_TILE, 0 : HEAD_DIM],
-                                target_type=pl.BF16,
+                            attn_rope_stage = pl.assemble(
+                                attn_rope_stage,
+                                attn_stage_row[0 : PV_HEAD_TILE, NOPE_DIM:HEAD_DIM],
+                                [merge_norm_head_row, 0],
                             )
-                        else:
-                            attn_stage_row = zero_head_tile
 
-                        attn_rope_stage = pl.assemble(
-                            attn_rope_stage,
-                            attn_stage_row[0 : PV_HEAD_TILE, NOPE_DIM:HEAD_DIM],
-                            [norm_attn_head_row, 0],
-                        )
+                            for merge_norm_head_i in pl.range(PV_HEAD_TILE):
+                                merge_norm_global_head = pv_h0 + merge_norm_head_i
+                                merge_norm_g = merge_norm_global_head // HEADS_PER_GROUP
+                                merge_norm_hh = merge_norm_global_head - merge_norm_g * HEADS_PER_GROUP
+                                merge_norm_pack_row = merge_norm_g * T + merge_norm_t
+                                merge_norm_head_col = merge_norm_hh * HEAD_DIM
+                                o_packed = pl.assemble(
+                                    o_packed,
+                                    attn_stage_row[merge_norm_head_i : merge_norm_head_i + 1, 0:NOPE_DIM],
+                                    [merge_norm_pack_row, merge_norm_head_col],
+                                )
 
-                        for norm_head_i in pl.range(PV_HEAD_TILE):
-                            norm_global_head = pv_h0 + norm_head_i
-                            norm_g = norm_global_head // HEADS_PER_GROUP
-                            norm_hh = norm_global_head - norm_g * HEADS_PER_GROUP
-                            norm_pack_row = norm_g * T + norm_t
-                            norm_head_col = norm_hh * HEAD_DIM
-                            o_packed = pl.assemble(
-                                o_packed,
-                                attn_stage_row[norm_head_i : norm_head_i + 1, 0:NOPE_DIM],
-                                [norm_pack_row, norm_head_col],
-                            )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_selector_copy"):
+        even_select_stage[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK] = even_select_local[
+            0:ROPE_INTERLEAVE_CHUNK,
+            0:ROPE_CHUNK,
+        ]
+        odd_select_stage[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK] = odd_select_local[
+            0:ROPE_INTERLEAVE_CHUNK,
+            0:ROPE_CHUNK,
+        ]
 
     # Stage 3: inverse RoPE on the rope slice of the attention output.
-    for rope_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_slice_tile"):
-            for rope_dt in pl.range(ROPE_TOKEN_TILE):
-                rope_slice_t = rope_t0 + rope_dt
-                rope_slice_head_row = rope_slice_t * H
-
-                for rope_slice_r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
-                    rope_tile = attn_rope_stage[
-                        rope_slice_head_row : rope_slice_head_row + H,
-                        2 * rope_slice_r0 : 2 * rope_slice_r0 + ROPE_INTERLEAVE_CHUNK,
-                    ]
-                    rope_slice_even_chunk = pl.matmul(rope_tile, even_select_local, out_dtype=pl.FP32)
-                    rope_slice_odd_chunk = pl.matmul(rope_tile, odd_select_local, out_dtype=pl.FP32)
-                    o_proj_even = pl.assemble(o_proj_even, rope_slice_even_chunk, [rope_slice_head_row, rope_slice_r0])
-                    o_proj_odd = pl.assemble(o_proj_odd, rope_slice_odd_chunk, [rope_slice_head_row, rope_slice_r0])
-
     for rope_apply_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_apply_assemble_tile"):
             for rope_apply_dt in pl.range(ROPE_TOKEN_TILE):
@@ -352,14 +359,12 @@ def prefill_sparse_attn(
                         freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
                         target_type=pl.FP32,
                     )
-                    rope_apply_even_chunk = o_proj_even[
+                    rope_tile = attn_rope_stage[
                         rope_apply_head_row : rope_apply_head_row + H,
-                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
+                        2 * rope_asm_r0 : 2 * rope_asm_r0 + ROPE_INTERLEAVE_CHUNK,
                     ]
-                    rope_apply_odd_chunk = o_proj_odd[
-                        rope_apply_head_row : rope_apply_head_row + H,
-                        rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK,
-                    ]
+                    rope_apply_even_chunk = pl.matmul(rope_tile, even_select_stage, out_dtype=pl.FP32)
+                    rope_apply_odd_chunk = pl.matmul(rope_tile, odd_select_stage, out_dtype=pl.FP32)
                     rope_even_acc = pl.add(
                         pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
                         pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),
@@ -608,13 +613,30 @@ def golden_prefill_sparse_attn(tensors):
             gathered.append(ori_kv[blk_id, intra, 0])
         kv_b = torch.stack(gathered, dim=0)
 
-        scores = (q[t] @ kv_b.T) * SOFTMAX_SCALE
-        score_max = scores.max(dim=-1, keepdim=True).values
-        exp_scores = torch.exp(scores - score_max)
-        oi_num = exp_scores @ kv_b
-        li = exp_scores.sum(dim=-1, keepdim=True)
-        denom = li + torch.exp(attn_sink.unsqueeze(-1) - score_max)
-        o[t] = oi_num / denom
+        mi = None
+        li = None
+        oi = None
+        for tile_start in range(0, ctx_len, PREFILL_ATTN_TILE):
+            kv_tile = kv_b[tile_start : tile_start + PREFILL_ATTN_TILE]
+            scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
+            cur_mi = scores.max(dim=-1, keepdim=True).values
+            exp_scores_bf16 = torch.exp(scores - cur_mi).to(torch.bfloat16)
+            cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
+            cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
+            if mi is None:
+                mi = cur_mi
+                li = cur_li
+                oi = cur_oi
+            else:
+                mi_new = torch.maximum(mi, cur_mi)
+                alpha = torch.exp(mi - mi_new)
+                beta = torch.exp(cur_mi - mi_new)
+                li = alpha * li + beta * cur_li
+                oi = oi * alpha + cur_oi * beta
+                mi = mi_new
+
+        denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
+        o[t] = oi / denom
 
     rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
     rope_even = rope_pair[..., 0]
@@ -759,7 +781,14 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--run-kernel", action="store_true", default=False,
                         help="Compile and run the PyPTO kernel. Default only validates the golden scaffold.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+    )
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
