@@ -28,7 +28,8 @@ VOCAB = M.vocab_size
 N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
-T_TILE = 16
+T_TILE = 8
+GATE_T_TILE = 16
 D_CHUNK = 128
 GATE_D_CHUNK = 512
 QUANT_CHUNK = 32
@@ -54,130 +55,129 @@ def gate(
 ):
     x_mixed_flat = pl.reshape(x_mixed, [T, D])
     input_ids_flat = pl.reshape(input_ids, [T])
-    for ts0 in pl.parallel(0, T, T_TILE):
-        # FFN RMSNorm.
-        x_norm_gate_tile = pl.create_tensor([T_TILE, D], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm"):
-            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-            for rms_d0 in pl.range(0, D, D_CHUNK):
-                rms_x = pl.cast(x_mixed_flat[ts0 : ts0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
-                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
-            inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
-            for an_d0 in pl.range(0, D, D_CHUNK):
-                an_x = pl.cast(x_mixed_flat[ts0 : ts0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
-                an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_CHUNK], [1, D_CHUNK])
-                an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
-                an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
-                x_norm_gate_tile[:, an_d0 : an_d0 + D_CHUNK] = pl.cast(an_bf16, pl.FP32)
-                x_norm[ts0 : ts0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = an_bf16
 
-        # Per-token symmetric INT8 quant of x_norm.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
-            xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for xq_a_k in pl.range(0, D, QUANT_CHUNK):
-                xn_a_f32 = x_norm_gate_tile[:, xq_a_k : xq_a_k + QUANT_CHUNK]
-                xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
-                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
-                xn_amax = pl.maximum(xn_amax, xn_a_max)
-            xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
-            x_norm_scale[ts0 : ts0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
-            xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
-            for xq_b_k in pl.range(0, D, QUANT_CHUNK):
-                xn_q_scaled = pl.row_expand_mul(x_norm_gate_tile[:, xq_b_k : xq_b_k + QUANT_CHUNK], xn_sq_col)
-                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-                x_norm_i8[ts0 : ts0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
+    x_norm_gate_buf = pl.create_tensor([T, D], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
 
-        # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
-        route_scores_tile = pl.create_tensor([T_TILE, SCORE_PAD], dtype=pl.FP32)
-        biased_scores_tile = pl.create_tensor([T_TILE, SCORE_PAD], dtype=pl.FP32)
+    for ob_n in pl.spmd(T // T_TILE, name_hint="ffn_norm"):
+        t0 = ob_n * T_TILE
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for rms_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
+            rms_x = pl.cast(x_mixed_flat[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
+        inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
+        for an_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
+            an_x = pl.cast(x_mixed_flat[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
+            an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_CHUNK], [1, D_CHUNK])
+            an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
+            an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
+            x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = pl.cast(an_bf16, pl.FP32)
+            x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = an_bf16
+
+    # Per-token symmetric INT8 quant of x_norm.
+    for ob_q in pl.spmd(T // T_TILE, name_hint="x_norm_quant"):
+        t0 = ob_q * T_TILE
+        xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for xq_a_k in pl.pipeline(0, D, QUANT_CHUNK, stage=2):
+            xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_CHUNK]
+            xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
+            xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
+            xn_amax = pl.maximum(xn_amax, xn_a_max)
+        xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
+        x_norm_scale[t0 : t0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
+        xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
+        for xq_b_k in pl.pipeline(0, D, QUANT_CHUNK, stage=2):
+            xn_q_scaled = pl.row_expand_mul(x_norm_gate_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK], xn_sq_col)
+            xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+            xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+            x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
+
+    # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
+    for ob_g in pl.spmd(T // GATE_T_TILE, name_hint="gate"):
+        t1 = ob_g * GATE_T_TILE
         gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            optimizations=[pl.split(pl.SplitMode.NONE)],
-            name_hint="gate",
-        ):
-            gate_logits_tile = pl.create_tensor([T_TILE, N_EXPERTS], dtype=pl.FP32)
-            for kb in pl.range(0, D // GATE_D_CHUNK):
-                gd_kd = kb * GATE_D_CHUNK
-                gd_x = x_norm_gate_tile[:, gd_kd : gd_kd + GATE_D_CHUNK]
-                gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_CHUNK]
-                if gd_kd == 0:
-                    gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
-                else:
-                    gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-            route_scores_tile[:, :] = pl.full([T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
-            biased_scores_tile[:, :] = pl.full([T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
-            gp_relu = pl.maximum(gate_logits_tile, 0.0)
-            gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
-            gp_softplus = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
-            gp_score = pl.sqrt(gp_softplus)
-            gp_bias = pl.col_expand_mul(pl.full([T_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
-            gp_biased = pl.add(gp_score, gp_bias)
-            route_scores_tile[:, 0:N_EXPERTS] = gp_score
-            biased_scores_tile[:, 0:N_EXPERTS] = gp_biased
+        gate_logits_tile = pl.create_tensor([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32)
+        for kb in pl.range(0, D // GATE_D_CHUNK):
+            gd_kd = kb * GATE_D_CHUNK
+            gd_x = x_norm_gate_buf[t1 : t1 + GATE_T_TILE, gd_kd : gd_kd + GATE_D_CHUNK]
+            gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_CHUNK]
+            if gd_kd == 0:
+                gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
+            else:
+                gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
+        route_scores_buf[t1 : t1 + GATE_T_TILE, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
+        biased_scores_buf[t1 : t1 + GATE_T_TILE, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
+        gp_relu = pl.maximum(gate_logits_tile, 0.0)
+        gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
+        gp_softplus = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+        gp_score = pl.sqrt(gp_softplus)
+        gp_bias = pl.col_expand_mul(pl.full([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
+        gp_biased = pl.add(gp_score, gp_bias)
+        route_scores_buf[t1 : t1 + GATE_T_TILE, 0:N_EXPERTS] = gp_score
+        biased_scores_buf[t1 : t1 + GATE_T_TILE, 0:N_EXPERTS] = gp_biased
 
-        # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
-        # topk_idx_tile stays Tensor (out of pl.at) so the batched tensor.gather
-        # below accepts it — Tile index against Tensor src is rejected.
-        topk_idx_tile = pl.create_tensor([T_TILE, TOPK_PAD], dtype=pl.INT32)
-        if layer_id < N_HASH_LAYERS:
-            # Hash branch: select + normalize + write in one scope (ptoas-696
-            # cross-scope stale-cache bug). hs_*_buf MUST be inside pl.at; outer
-            # alloc shares one buffer across parallel iters → NaN weights.
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_hash"):
-                # Scalar gather TOPK (eid, unbiased score) per row; tail
-                # [TOPK, TOPK_PAD) stays zero so row_sum below sums only TOPK.
-                hs_vals_buf = pl.full([T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
-                hs_idx_buf = pl.full([T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
-                for hs_tt in pl.range(T_TILE):
-                    hs_token = pl.cast(pl.read(input_ids_flat, [ts0 + hs_tt]), pl.INDEX)
-                    for hs_k in pl.range(TOPK):
-                        hs_eid = pl.read(tid2eid, [hs_token, hs_k])
-                        hs_epos = pl.cast(hs_eid, pl.INDEX)
-                        hs_unbiased = pl.read(route_scores_tile, [hs_tt, hs_epos])
-                        pl.write(hs_idx_buf, [hs_tt, hs_k], hs_eid)
-                        pl.write(hs_vals_buf, [hs_tt, hs_k], hs_unbiased)
-                # Normalize+scale, then scalar-scatter to GM. Slice-assign would
-                # alloc a [T_TILE, TOPK=6] temp (24B row, under alloc_tile's 32B
-                # alignment), so write element-by-element.
-                hs_denom = pl.reshape(pl.row_sum(hs_vals_buf), [T_TILE, 1])
-                hs_weights_buf = pl.mul(pl.row_expand_div(hs_vals_buf, hs_denom), ROUTE_SCALE)
-                for hs_wt_tt in pl.range(T_TILE):
-                    for hs_wt_k in pl.range(TOPK):
-                        pl.write(indices, [ts0 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
-                        pl.write(weights, [ts0 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
-        else:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="route_sort"):
-                # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
-                # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
-                # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
-                for sr_tt in pl.range(T_TILE):
-                    sr_row = biased_scores_tile[sr_tt : sr_tt + 1, :]
-                    sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
-                    sr_sorted = pl.sort32(sr_row, sr_idx_init)
-                    sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                    sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
-                    sr_pairs = sr_sorted[:, 0:SORT_PAD]
-                    sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
-                # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
-                # tail so the normalize sum below sees only real TOPK entries.
-                gather_all = pl.gather(route_scores_tile, dim=-1, index=topk_idx_tile)
-                gather_valid = pl.set_validshape(gather_all, T_TILE, TOPK)
-                topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
-                # Copy topk_idx_tile to dodge the tensor_view-vs-ptr SSA conflict
-                # between sort's slice-assign and scalar pl.read (pypto #1493).
-                # Scalar scatter avoids the 24B-row alloc that slice-assign to
-                # [T_TILE, TOPK] would need (under alloc_tile's 32B alignment).
-                topk_idx_read = pl.create_tensor([T_TILE, TOPK_PAD], dtype=pl.INT32)
-                topk_idx_read[:, :] = topk_idx_tile[:, :]
-                nm_denom = pl.reshape(pl.row_sum(topk_vals_pad), [T_TILE, 1])
-                nm_weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, nm_denom), ROUTE_SCALE)
-                for nm_tt in pl.range(T_TILE):
-                    for nm_k in pl.range(TOPK):
-                        pl.write(indices, [ts0 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
-                        pl.write(weights, [ts0 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
+    # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
+    if layer_id < N_HASH_LAYERS:
+        for ob_h in pl.spmd(T // GATE_T_TILE, name_hint="route_hash"):
+            t1 = ob_h * GATE_T_TILE
+            # Scalar gather TOPK (eid, unbiased score) per row; tail
+            # [TOPK, TOPK_PAD) stays zero so row_sum below sums only TOPK.
+            hs_vals_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
+            hs_idx_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
+            for hs_tt in pl.range(GATE_T_TILE):
+                hs_token = pl.cast(pl.read(input_ids_flat, [t1 + hs_tt]), pl.INDEX)
+                for hs_k in pl.range(TOPK):
+                    hs_eid = pl.read(tid2eid, [hs_token, hs_k])
+                    hs_epos = pl.cast(hs_eid, pl.INDEX)
+                    hs_unbiased = pl.read(route_scores_buf, [t1 + hs_tt, hs_epos])
+                    pl.write(hs_idx_buf, [hs_tt, hs_k], hs_eid)
+                    pl.write(hs_vals_buf, [hs_tt, hs_k], hs_unbiased)
+            # Normalize+scale, then scalar-scatter to GM. Slice-assign would
+            # alloc a [GATE_T_TILE, TOPK=6] temp (24B row, under alloc_tile's
+            # 32B alignment), so write element-by-element.
+            hs_denom = pl.reshape(pl.row_sum(hs_vals_buf), [GATE_T_TILE, 1])
+            hs_weights_buf = pl.mul(pl.row_expand_div(hs_vals_buf, hs_denom), ROUTE_SCALE)
+            for hs_wt_tt in pl.range(GATE_T_TILE):
+                for hs_wt_k in pl.range(TOPK):
+                    pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
+                    pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
+    else:
+        for ob_s in pl.spmd(T // GATE_T_TILE, name_hint="route_sort"):
+            t1 = ob_s * GATE_T_TILE
+            # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
+            # the batched pl.gather below accepts it — Tile-against-Tensor src
+            # is rejected.
+            topk_idx_tile = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            # ptoas pto.tmrgsort requires src rows == 1; sort path iterates
+            # row-by-row. sort32: [1,256]→[1,512] (8 runs of 64). mrgsort
+            # format1 4-way: 8→2 runs of 256. format2 2-way: 2→1 run of 512.
+            for sr_tt in pl.range(GATE_T_TILE):
+                sr_row = biased_scores_buf[t1 + sr_tt : t1 + sr_tt + 1, :]
+                sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
+                sr_sorted = pl.sort32(sr_row, sr_idx_init)
+                sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
+                sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                sr_pairs = sr_sorted[:, 0:SORT_PAD]
+                sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i
+            # Batched gather; set_validshape+fillpad zeros the [TOPK, TOPK_PAD)
+            # tail so the normalize sum below sees only real TOPK entries.
+            local_scores = pl.create_tensor([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32)
+            local_scores[:, :] = route_scores_buf[t1 : t1 + GATE_T_TILE, :]
+            gather_all = pl.gather(local_scores, dim=-1, index=topk_idx_tile)
+            gather_valid = pl.set_validshape(gather_all, GATE_T_TILE, TOPK)
+            topk_vals_pad = pl.fillpad(gather_valid, pad_value=pl.PadValue.zero)
+            # Copy topk_idx_tile to dodge the tensor_view-vs-ptr SSA conflict
+            # between sort's slice-assign and scalar pl.read (pypto #1493).
+            topk_idx_read = pl.create_tensor([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32)
+            topk_idx_read[:, :] = topk_idx_tile[:, :]
+            nm_denom = pl.reshape(pl.row_sum(topk_vals_pad), [GATE_T_TILE, 1])
+            nm_weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, nm_denom), ROUTE_SCALE)
+            for nm_tt in pl.range(GATE_T_TILE):
+                for nm_k in pl.range(TOPK):
+                    pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
+                    pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
 
 
 @pl.jit
