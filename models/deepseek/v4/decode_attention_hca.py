@@ -62,6 +62,7 @@ IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO  # matches compressor_ratio128 kv_cac
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 HCA_TOPK_CHUNK = 16 if DECODE_BATCH * DECODE_SEQ >= 64 else DECODE_BATCH * DECODE_SEQ
+HCA_SCATTER_BATCH_CHUNK = 16 if B >= 16 else B
 # Default fixture is a post-window non-compression step. The --start-pos fixture
 # option covers post-window no-compression/aligned/boundary positions.
 START_POS = 128
@@ -115,11 +116,9 @@ def attention_hca(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    start_pos: pl.Scalar[pl.INT32],  # scalar decode step shared by the batch
+    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
-    compress_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
-
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
@@ -136,51 +135,35 @@ def attention_hca(
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope_step"):
-        pos = pl.cast(start_pos, pl.INDEX)
-        cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-        sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-        rope_cos_fp32 = pl.col_expand(
-            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-            cos_row,
-        )
-        rope_sin_fp32 = pl.col_expand(
-            pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-            sin_row,
-        )
-        rope_cos_t = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
-        rope_sin_t = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
+        for b in pl.range(B):
+            start_pos_b = pl.read(start_pos, [b])
+            for s in pl.range(S):
+                t = b * S + s
+                pos_b = pl.cast(start_pos_b + s, pl.INDEX)
+                cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
+                rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
 
-    # Compressor keeps a per-batch start_pos/cos/sin contract for future
-    # grouped/var-len batching. HCA still has a scalar decode step, so build
-    # uniform per-batch tensors at the boundary.
     cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
-            for b in pl.range(B):
-                pl.write(cmp_start_pos, [b], pl.cast(start_pos, pl.INT32))
-            cmp_cos_base = pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-            cmp_sin_base = pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-            cmp_pos = pl.cast(start_pos + compress_offset - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos = pl.col_expand(
-                cmp_cos_base,
-                pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope"):
+        for b in pl.range(B):
+            start_pos_b = pl.read(start_pos, [b])
+            pl.write(cmp_start_pos, [b], pl.cast(start_pos_b, pl.INT32))
+            cmp_offset_b = COMPRESS_RATIO - (start_pos_b % COMPRESS_RATIO)
+            cmp_pos_b = pl.cast(start_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
+            cmp_cos = pl.assemble(
+                cmp_cos,
+                pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [cmp_pos_b, 0]), target_type=pl.FP32),
+                [b, 0],
             )
-            cmp_sin = pl.col_expand(
-                cmp_sin_base,
-                pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos, 0]), target_type=pl.FP32),
+            cmp_sin = pl.assemble(
+                cmp_sin,
+                pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [cmp_pos_b, 0]), target_type=pl.FP32),
+                [b, 0],
             )
-    else:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cmp_rope_zero"):
-            for b in pl.range(B):
-                pl.write(cmp_start_pos, [b], pl.cast(start_pos, pl.INT32))
-            zero_cos = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
-            zero_sin = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM // 2], [0, 0]), target_type=pl.FP32)
-            zero_cos_row = pl.sub(zero_cos, zero_cos)
-            zero_sin_row = pl.sub(zero_sin, zero_sin)
-            cmp_cos = pl.col_expand(pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0), zero_cos_row)
-            cmp_sin = pl.col_expand(pl.full([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0), zero_sin_row)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -209,11 +192,13 @@ def attention_hca(
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
     for s_idx in pl.range(S):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_ori"):
-            ori_slot = (start_pos + s_idx) % WIN
-            for b in pl.parallel(0, B, 1):
-                blk_id = pl.cast(pl.read(ori_block_table_flat, [b]), pl.INDEX)
-                dst_row = blk_id * BLOCK_SIZE + ori_slot
+        for b0 in pl.parallel(0, B, HCA_SCATTER_BATCH_CHUNK):
+            for bi in pl.spmd(HCA_SCATTER_BATCH_CHUNK, name_hint="hca_scatter_ori"):
+                b = b0 + bi
+                start_pos_b = pl.read(start_pos, [b])
+                ori_slot = (start_pos_b + s_idx) % WIN
+                blk_id = pl.cast(pl.read(ori_block_table_flat, [b * ORI_MAX_BLOCKS + ori_slot // BLOCK_SIZE]), pl.INDEX)
+                dst_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
                 kv_cache_flat = pl.assemble(
                     kv_cache_flat,
                     kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
@@ -226,6 +211,25 @@ def attention_hca(
     # compressed row we want is `cmp_kv_buf[:, start_pos // COMPRESS_RATIO, :]`.
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     cmp_kv_buf = pl.create_tensor([B, IDX_KV_LEN, HEAD_DIM], dtype=pl.BF16)
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+    cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
+    for b0 in pl.parallel(0, B, HCA_SCATTER_BATCH_CHUNK):
+        for bi in pl.spmd(HCA_SCATTER_BATCH_CHUNK, name_hint="hca_seed_cmp_buf"):
+            b = b0 + bi
+            start_pos_b = pl.read(start_pos, [b])
+            cmp_slot_rel = start_pos_b // COMPRESS_RATIO
+            cmp_intra = cmp_slot_rel % BLOCK_SIZE
+            cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
+            cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
+            cmp_src_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+            cmp_buf_row = b * IDX_KV_LEN + cmp_slot_rel
+            cmp_kv_buf_flat = pl.assemble(
+                cmp_kv_buf_flat,
+                cmp_kv_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
+                [cmp_buf_row, 0],
+            )
+    cmp_kv_buf = pl.reshape(cmp_kv_buf_flat, [B, IDX_KV_LEN, HEAD_DIM])
     cmp_kv_proj, cmp_kv_state, cmp_score_state, cmp_kv_buf = compressor(
         x_mixed,
         cmp_kv_proj,
@@ -244,25 +248,26 @@ def attention_hca(
     )
 
     # cmp_kv scatter only happens on compression steps. Non-compression steps
-    # update compressor state but keep the existing compressed cache intact.
-    if (start_pos % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-        cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-        cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
-        cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_scatter_cmp"):
-            cmp_slot_rel = start_pos // COMPRESS_RATIO
+    # write back the pre-seeded old value, preserving the compressed cache.
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
+    cmp_kv_buf_flat = pl.reshape(cmp_kv_buf, [B * IDX_KV_LEN, HEAD_DIM])
+    for b0 in pl.parallel(0, B, HCA_SCATTER_BATCH_CHUNK):
+        for bi in pl.spmd(HCA_SCATTER_BATCH_CHUNK, name_hint="hca_scatter_cmp"):
+            b = b0 + bi
+            start_pos_b = pl.read(start_pos, [b])
+            cmp_slot_rel = start_pos_b // COMPRESS_RATIO
             cmp_intra = cmp_slot_rel % BLOCK_SIZE
             cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
-            for b in pl.parallel(0, B, 1):
-                cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
-                cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-                cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel
-                cmp_kv_flat = pl.assemble(
-                    cmp_kv_flat,
-                    cmp_kv_buf_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
-                    [cmp_dst_row, 0],
-                )
-        cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+            cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
+            cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+            cmp_src_row = b * IDX_KV_LEN + cmp_slot_rel
+            cmp_kv_flat = pl.assemble(
+                cmp_kv_flat,
+                cmp_kv_buf_flat[cmp_src_row:cmp_src_row + 1, 0:HEAD_DIM],
+                [cmp_dst_row, 0],
+            )
+    cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     # topk_idxs: [0..WIN) window plus deterministic compressed slots.
     # sparse_attn's static TOPK contract is SPARSE_TOPK (= WIN+IDX_TOPK = 640 in demo);
@@ -354,7 +359,7 @@ def attention_hca_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_hca(
         x_hc,
@@ -401,29 +406,30 @@ def golden_attention_hca(tensors):
     })
 
     # ===== Attention.forward, ratio==128 branch =====
-    start_pos = int(tensors["start_pos"])
+    start_pos_t = tensors["start_pos"].to(torch.int64)
     bsz, seqlen, _ = x_mixed.shape
     win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
-    compress_offset = ratio - (start_pos % ratio)
-    should_compress = compress_offset <= S
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
-    step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
-    step_sin = freqs_sin[start_pos:start_pos + 1]
-    rope_cos_T = step_cos.expand(T, rd).contiguous()
-    rope_sin_T = step_sin.expand(T, rd).contiguous()
+    rope_cos_T = torch.empty(T, rd, dtype=freqs_cos.dtype)
+    rope_sin_T = torch.empty(T, rd, dtype=freqs_sin.dtype)
     half_rd = rd // 2
-    if should_compress:
-        cmp_pos = start_pos + compress_offset - ratio
-        cmp_cos = freqs_cos[cmp_pos:cmp_pos + 1, :half_rd].float().expand(B, half_rd).contiguous()
-        cmp_sin = freqs_sin[cmp_pos:cmp_pos + 1, :half_rd].float().expand(B, half_rd).contiguous()
-    else:
-        cmp_cos = torch.zeros(B, half_rd, dtype=torch.float32)
-        cmp_sin = torch.zeros(B, half_rd, dtype=torch.float32)
-    cmp_start_pos = torch.full((B,), start_pos, dtype=torch.int32)
+    cmp_cos = torch.empty(B, half_rd, dtype=torch.float32)
+    cmp_sin = torch.empty(B, half_rd, dtype=torch.float32)
+    cmp_start_pos = start_pos_t.to(torch.int32).contiguous()
+    for b in range(B):
+        start_pos_b = int(start_pos_t[b].item())
+        for s in range(S):
+            t = b * S + s
+            pos = start_pos_b + s
+            rope_cos_T[t] = freqs_cos[pos]
+            rope_sin_T[t] = freqs_sin[pos]
+        cmp_pos_b = start_pos_b + (ratio - (start_pos_b % ratio)) - ratio
+        cmp_cos[b] = freqs_cos[cmp_pos_b, :half_rd].float()
+        cmp_sin[b] = freqs_sin[cmp_pos_b, :half_rd].float()
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -452,10 +458,7 @@ def golden_attention_hca(tensors):
     topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     topk_idxs[:, :win] = torch.arange(win, dtype=torch.int32)
     offset = win
-    cache_len = (start_pos + seqlen) // ratio
-    if cache_len > 0:
-        k = min(cache_len, CMP_TOPK)
-        topk_idxs[:, win:win + k] = torch.arange(k, dtype=torch.int32) + offset
+    topk_idxs[:, win:win + CMP_TOPK] = torch.arange(CMP_TOPK, dtype=torch.int32) + offset
     topk_idxs = topk_idxs.int()
 
     # ori_kv scatter
@@ -467,7 +470,8 @@ def golden_attention_hca(tensors):
     for t in range(T):
         b = t // S
         s = t % S
-        ori_slot = (start_pos + s) % win
+        start_pos_b = int(start_pos_t[b].item())
+        ori_slot = (start_pos_b + s) % win
         blk_id = int(ori_block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
         kv_cache[blk_id, intra, 0] = kv[t]
@@ -477,6 +481,12 @@ def golden_attention_hca(tensors):
     # writes the BF16 compressed row into kv_cache[:bsz, start_pos // ratio].
     cmp_kv_proj = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     cmp_kv_cache_buf = torch.zeros(B, MAX_SEQ_LEN // ratio, HEAD_DIM, dtype=torch.bfloat16)
+    for b in range(B):
+        start_pos_b = int(start_pos_t[b].item())
+        cmp_slot_rel = start_pos_b // ratio
+        blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
+        intra = cmp_slot_rel % BLOCK_SIZE
+        cmp_kv_cache_buf[b, cmp_slot_rel] = cmp_kv[blk_id, intra, 0]
     golden_compressor({
         "x": x_mixed,
         "kv": cmp_kv_proj,
@@ -493,12 +503,12 @@ def golden_attention_hca(tensors):
         "kv_cache": cmp_kv_cache_buf,
         "start_pos": cmp_start_pos,
     })
-    if should_compress:
-        cmp_slot_rel = start_pos // ratio
-        for b in range(B):
-            blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
-            intra = cmp_slot_rel % BLOCK_SIZE
-            cmp_kv[blk_id, intra, 0] = cmp_kv_cache_buf[b, cmp_slot_rel]
+    for b in range(B):
+        start_pos_b = int(start_pos_t[b].item())
+        cmp_slot_rel = start_pos_b // ratio
+        blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
+        intra = cmp_slot_rel % BLOCK_SIZE
+        cmp_kv[blk_id, intra, 0] = cmp_kv_cache_buf[b, cmp_slot_rel]
 
     # sparse_attn + fused o_proj
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -534,9 +544,9 @@ def golden_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
     import torch  # type: ignore[import]
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -649,11 +659,16 @@ def build_tensor_specs(start_pos: int = START_POS):
 
     def init_attn_sink():
         return torch.zeros(H)
+    def init_start_pos():
+        if not hetero_start_pos:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        pattern = torch.tensor([start_pos, max(start_pos - 1, 0)], dtype=torch.int32)
+        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
     def init_seqused_kv():
         # sparse_attn derives per-token causal lengths from this final sparse length.
-        seq = start_pos + S
-        sparse_len = seq if seq <= WIN else WIN + seq // COMPRESS_RATIO
-        return torch.full((B,), sparse_len, dtype=torch.int32)
+        seq = init_start_pos().to(torch.int64) + S
+        sparse_len = torch.where(seq <= WIN, seq, WIN + seq // COMPRESS_RATIO)
+        return sparse_len.to(torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -700,7 +715,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        ScalarSpec("start_pos", torch.int32, start_pos),
+        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
 
@@ -714,12 +729,14 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Decode start position for no-compression/aligned/crossing coverage.")
+    parser.add_argument("--hetero-start-pos", action="store_true", default=False,
+                        help="Use per-row start_pos values in the standalone fixture.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_hca_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
         golden_fn=golden_attention_hca,
         runtime_cfg=dict(
             platform=args.platform,

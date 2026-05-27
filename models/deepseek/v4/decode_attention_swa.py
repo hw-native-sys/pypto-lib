@@ -53,7 +53,7 @@ TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
-START_POS = 127      # ScalarSpec default; full-window decode fixture; SWA has no compression constraint
+START_POS = 127      # full-window decode fixture; SWA has no compression constraint
 
 # tiling
 SPARSE_ROPE_TILE = 16
@@ -92,7 +92,7 @@ def attention_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post_t = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
@@ -110,13 +110,15 @@ def attention_swa(
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        pos = pl.cast(start_pos, pl.INDEX)
-        cos_row = pl.cast(freqs_cos[pos:pos+1, :], target_type=pl.FP32)
-        sin_row = pl.cast(freqs_sin[pos:pos+1, :], target_type=pl.FP32)
-        rope_cos_fp32 = pl.col_expand(pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), cos_row)
-        rope_sin_fp32 = pl.col_expand(pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), sin_row)
-        rope_cos_t[:, :] = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
-        rope_sin_t[:, :] = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
+        for b in pl.parallel(B):
+            start_pos_b = pl.read(start_pos, [b])
+            for s_idx in pl.range(S):
+                pos_b = pl.cast(start_pos_b + s_idx, pl.INDEX)
+                cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                t = b * S + s_idx
+                rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
+                rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -154,10 +156,11 @@ def attention_swa(
             sparse_topk[t:t+1, :] = sparse_topk_row
         # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
         for b in pl.range(B):
-            blk_id = pl.cast(pl.read(block_table, [b, 0]), pl.INDEX)
+            start_pos_b = pl.read(start_pos, [b])
             for s_idx in pl.range(S):
-                ori_slot = (start_pos + s_idx) % WIN
-                dst_row = blk_id * BLOCK_SIZE + ori_slot
+                ori_slot = (start_pos_b + s_idx) % WIN
+                blk_id = pl.cast(pl.read(block_table, [b, ori_slot // BLOCK_SIZE]), pl.INDEX)
+                dst_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
                 kv_cache_flat[dst_row:dst_row+1, :] = kv[b * S + s_idx : b * S + s_idx + 1, :]
     kv_cache = pl.reshape(kv_cache_flat, [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM])
 
@@ -225,7 +228,7 @@ def attention_swa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_swa(
         x_hc,
@@ -269,20 +272,22 @@ def golden_attention_swa(tensors):
     })
 
     # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
-    start_pos = int(tensors["start_pos"])
+    start_pos_t = tensors["start_pos"].to(torch.int64)
     bsz, seqlen, _ = x_mixed.shape
     win = WIN
     rd = ROPE_HEAD_DIM
 
-    if start_pos == 0:
-        return  # prefill — decode-only orchestration skips
-
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
-    step_cos = freqs_cos[start_pos:start_pos + 1]                            # [1, rd]
-    step_sin = freqs_sin[start_pos:start_pos + 1]
-    rope_cos_T = step_cos.expand(T, rd).contiguous()
-    rope_sin_T = step_sin.expand(T, rd).contiguous()
+    rope_cos_T = torch.empty(T, rd, dtype=freqs_cos.dtype)
+    rope_sin_T = torch.empty(T, rd, dtype=freqs_sin.dtype)
+    for b in range(B):
+        start_pos_b = int(start_pos_t[b].item())
+        for s in range(S):
+            t = b * S + s
+            pos = start_pos_b + s
+            rope_cos_T[t] = freqs_cos[pos]
+            rope_sin_T[t] = freqs_sin[pos]
 
     # q + win kv (model.py:495-504)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -317,7 +322,8 @@ def golden_attention_swa(tensors):
     for t in range(T):
         b = t // S
         s = t % S
-        ori_slot = (start_pos + s) % win
+        start_pos_b = int(start_pos_t[b].item())
+        ori_slot = (start_pos_b + s) % win
         blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
         intra = ori_slot % BLOCK_SIZE
         kv_cache[blk_id, intra, 0] = kv[t]
@@ -361,9 +367,9 @@ def golden_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs():
+def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
     import torch  # type: ignore[import]
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -445,8 +451,14 @@ def build_tensor_specs():
 
     def init_attn_sink():
         return torch.zeros(H)
+    def init_start_pos():
+        if not hetero_start_pos:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        pattern = torch.tensor([start_pos, max(start_pos - 1, 0)], dtype=torch.int32)
+        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
     def init_seqused_kv():
-        return torch.full((B,), min(WIN, START_POS + S), dtype=torch.int32)
+        seq = init_start_pos().to(torch.int64) + S
+        return torch.minimum(seq, torch.full_like(seq, WIN)).to(torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -483,7 +495,7 @@ def build_tensor_specs():
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        ScalarSpec("start_pos", torch.int32, START_POS),
+        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
 
@@ -495,12 +507,15 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--hetero-start-pos", action="store_true", default=False,
+                        help="Use per-row start_pos values in the standalone fixture.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_swa_test,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
         golden_fn=golden_attention_swa,
         runtime_cfg=dict(
             platform=args.platform,

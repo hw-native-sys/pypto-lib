@@ -11,10 +11,9 @@ Composes ``attention_csa`` (hc_pre + qkv_proj + main compressor + indexer +
 sparse_attn + hc_post) with the MoE stack, matching ``Block.forward``
 (model.py:688-700) for layers whose ``compress_ratio == 4`` (the ratio=4
 layers in the demo / flash compress_ratios tuple). Inherits the CSA caller
-contract: runtime ``start_pos`` MUST equal compile-time ``START_POS`` for the
-static standalone fixture. The attention/compressor path supports arbitrary
-scalar ``start_pos`` for no-compression, aligned-compression, and
-boundary-crossing decode steps."""
+contract: ``start_pos`` is a per-row decode position tensor. The standalone
+fixture covers no-compression, aligned-compression, and boundary-crossing
+decode steps."""
 
 
 import pypto.language as pl
@@ -167,8 +166,8 @@ def decode_csa(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],   # static standalone fixture uses compile-time START_POS
+    # ---- decode metadata ----
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block (CSA): hc_pre + attention(+main compressor + indexer) + hc_post → x_attn.
@@ -278,7 +277,7 @@ def decode_csa_test(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_csa(
@@ -333,7 +332,7 @@ def golden_decode_csa(tensors):
     golden_moe(moe_tensors)
 
 
-def build_tensor_specs(layer_id: int = 0):
+def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_start_pos: bool = False):
     """Merges attention_csa and moe specs and reorders them to match the
     positional parameter order of ``decode_csa_test``. The harness binds
     dummy_args positionally, so spec order is load-bearing.
@@ -347,7 +346,7 @@ def build_tensor_specs(layer_id: int = 0):
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}
-    for s in build_attn_specs():
+    for s in build_attn_specs(start_pos=start_pos, hetero_start_pos=hetero_start_pos):
         by_name[s.name] = s
     for s in build_moe_specs(layer_id=layer_id):
         by_name.setdefault(s.name, s)
@@ -382,7 +381,7 @@ def build_tensor_specs(layer_id: int = 0):
         "shared_w2", "shared_w2_scale",
         # ---- output ----
         "x_next",
-        # ---- scalars ----
+        # ---- metadata/scalars ----
         "start_pos", "layer_id",
     ]
 
@@ -402,6 +401,8 @@ if __name__ == "__main__":
                         choices=["a2a3", "a5"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
@@ -409,7 +410,11 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=decode_csa_test,
-        specs=build_tensor_specs(layer_id=args.layer_id),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            start_pos=args.start_pos,
+            hetero_start_pos=args.hetero_start_pos,
+        ),
         golden_fn=golden_decode_csa,
         runtime_cfg=dict(
             platform=args.platform,

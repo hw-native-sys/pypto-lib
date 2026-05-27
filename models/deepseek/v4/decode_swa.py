@@ -10,7 +10,8 @@
 Composes ``attention_swa`` (hc_pre + qkv_proj + sparse_attn + hc_post) with
 the MoE stack (hc_pre + router + dispatch + expert + combine + hc_post),
 matching ``Block.forward`` (model.py:688-700) for layers whose
-``compress_ratio == 0`` (layers 0/1/7 in the demo)."""
+``compress_ratio == 0`` (layers 0/1/7 in the demo). ``start_pos`` follows
+the decode metadata contract and is passed as a per-row tensor."""
 
 
 import pypto.language as pl
@@ -118,8 +119,8 @@ def decode_swa(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # ---- output ----
     x_next: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    # ---- scalars ----
-    start_pos: pl.Scalar[pl.INT32],
+    # ---- decode metadata ----
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     # Attention sub-block: hc_pre + attention + hc_post → x_attn (HC stack).
@@ -201,7 +202,7 @@ def decode_swa_test(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    start_pos: pl.Tensor[[B], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
     x_next = decode_swa(
@@ -246,7 +247,7 @@ def golden_decode_swa(tensors):
     golden_moe(moe_tensors)
 
 
-def build_tensor_specs(layer_id: int = 0):
+def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_start_pos: bool = False):
     """Merges attention_swa and moe specs and reorders them to match the
     positional parameter order of ``decode_swa_test``. The harness binds
     dummy_args positionally, so spec order is load-bearing.
@@ -259,7 +260,7 @@ def build_tensor_specs(layer_id: int = 0):
     from moe import build_tensor_specs as build_moe_specs
 
     by_name = {}
-    for s in build_attn_specs():
+    for s in build_attn_specs(start_pos=start_pos, hetero_start_pos=hetero_start_pos):
         by_name[s.name] = s
     for s in build_moe_specs(layer_id=layer_id):
         by_name.setdefault(s.name, s)
@@ -287,7 +288,7 @@ def build_tensor_specs(layer_id: int = 0):
         "shared_w2", "shared_w2_scale",
         # ---- output ----
         "x_next",
-        # ---- scalars ----
+        # ---- metadata/scalars ----
         "start_pos", "layer_id",
     ]
 
@@ -307,6 +308,8 @@ if __name__ == "__main__":
                         choices=["a2a3", "a5"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
@@ -314,7 +317,11 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=decode_swa_test,
-        specs=build_tensor_specs(layer_id=args.layer_id),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            start_pos=args.start_pos,
+            hetero_start_pos=args.hetero_start_pos,
+        ),
         golden_fn=golden_decode_swa,
         runtime_cfg=dict(
             platform=args.platform,
