@@ -49,21 +49,15 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 # kernel-local (SWA: ratio-0, no compressor/indexer)
 ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
-MAX_BLOCKS = ORI_MAX_BLOCKS         # SWA: only ori, no cmp portion
-BLOCK_NUM = B * MAX_BLOCKS
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
-SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 START_POS = 127      # ScalarSpec default; full-window decode fixture; SWA has no compression constraint
 
 # tiling
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
-SWA_BATCH_CHUNK = 16 if T >= 64 else T
+SPARSE_ROPE_TILE = 16
+SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 
 
 @pl.jit.inline
@@ -85,11 +79,11 @@ def attention_swa(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
-    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
@@ -115,23 +109,14 @@ def attention_swa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for b0 in pl.range(0, T, SWA_BATCH_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-            pos = pl.cast(start_pos, pl.INDEX)
-            cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-            sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos, 0]), target_type=pl.FP32)
-            rope_cos_fp32 = pl.col_expand(
-                pl.full([SWA_BATCH_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-                cos_row,
-            )
-            rope_sin_fp32 = pl.col_expand(
-                pl.full([SWA_BATCH_CHUNK, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0),
-                sin_row,
-            )
-            rope_cos_tile = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
-            rope_sin_tile = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
-            rope_cos_t = pl.assemble(rope_cos_t, rope_cos_tile, [b0, 0])
-            rope_sin_t = pl.assemble(rope_sin_t, rope_sin_tile, [b0, 0])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
+        pos = pl.cast(start_pos, pl.INDEX)
+        cos_row = pl.cast(freqs_cos[pos:pos+1, :], target_type=pl.FP32)
+        sin_row = pl.cast(freqs_sin[pos:pos+1, :], target_type=pl.FP32)
+        rope_cos_fp32 = pl.col_expand(pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), cos_row)
+        rope_sin_fp32 = pl.col_expand(pl.full([T, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0), sin_row)
+        rope_cos_t[:, :] = pl.cast(rope_cos_fp32, target_type=pl.BF16, mode="rint")
+        rope_sin_t[:, :] = pl.cast(rope_sin_fp32, target_type=pl.BF16, mode="rint")
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -156,40 +141,25 @@ def attention_swa(
         qr_scale,
     )
 
-    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    block_table_flat = pl.reshape(block_table, [B * MAX_BLOCKS])
-    # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
-    for s_idx in pl.range(S):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_scatter_kv"):
-            ori_slot = (start_pos + s_idx) % WIN
-            for b in pl.parallel(0, B, 1, chunk=16):
-                blk_id = pl.cast(pl.read(block_table_flat, [b]), pl.INDEX)
-                dst_row = blk_id * BLOCK_SIZE + ori_slot
-                kv_cache_flat = pl.assemble(
-                    kv_cache_flat,
-                    kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM],
-                    [dst_row, 0],
-                )
-    kv_cache = pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-
+    kv_cache_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    for b0 in pl.range(0, T, SWA_BATCH_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_topk"):
-            idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
-            pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
-            sparse_topk_row = pl.concat(idx_row, pad_row)
-            sparse_topk_tile = pl.col_expand(
-                pl.full([SWA_BATCH_CHUNK, SPARSE_TOPK], dtype=pl.INT32, value=-1),
-                sparse_topk_row,
-            )
-            sparse_topk = pl.assemble(sparse_topk, sparse_topk_tile, [b0, 0])
-
-    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_kv_dummy = pl.create_tensor([B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    for b0 in pl.range(0, B, SWA_BATCH_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer, name_hint="swa_cmp_dummy"):
-            cmp_block_table_dummy_tile = pl.full([SWA_BATCH_CHUNK, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
-            cmp_block_table_dummy = pl.assemble(cmp_block_table_dummy, cmp_block_table_dummy_tile, [b0, 0])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_post_qkv"):
+        cmp_block_table_dummy[:, :] = pl.full([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, value=-1)
+        idx_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
+        pad_row = pl.full([1, SPARSE_IDX_TOPK], dtype=pl.INT32, value=-1)
+        sparse_topk_row = pl.concat(idx_row, pad_row)
+        for t in pl.range(T):
+            sparse_topk[t:t+1, :] = sparse_topk_row
+        # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
+        for b in pl.range(B):
+            blk_id = pl.cast(pl.read(block_table, [b, 0]), pl.INDEX)
+            for s_idx in pl.range(S):
+                ori_slot = (start_pos + s_idx) % WIN
+                dst_row = blk_id * BLOCK_SIZE + ori_slot
+                kv_cache_flat[dst_row:dst_row+1, :] = kv[b * S + s_idx : b * S + s_idx + 1, :]
+    kv_cache = pl.reshape(kv_cache_flat, [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
@@ -242,11 +212,11 @@ def attention_swa_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
-    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
@@ -357,7 +327,7 @@ def golden_attention_swa(tensors):
     sparse_topk[:, :WIN] = topk_idxs
     seqused_kv = tensors["seqused_kv"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    cmp_kv_dummy = torch.zeros(SPARSE_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    cmp_kv_dummy = torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
     golden_sparse_attn({
         "q": q,
@@ -448,13 +418,13 @@ def build_tensor_specs():
             m[i, 2 * i + 1] = 1
         return m
     def init_even_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
+        for i in range(SPARSE_ROPE_TILE):
             m[2 * i, i] = 1
         return m
     def init_odd_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
+        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
+        for i in range(SPARSE_ROPE_TILE):
             m[2 * i + 1, i] = 1
         return m
 
@@ -464,13 +434,13 @@ def build_tensor_specs():
         return (cache / denom).to(torch.bfloat16)
 
     def init_kv_cache():
-        return init_normalized_cache((BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
+        return init_normalized_cache((B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
+        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(B):
-            for j in range(MAX_BLOCKS):
-                tbl[b, j] = b * MAX_BLOCKS + j
+            for j in range(ORI_MAX_BLOCKS):
+                tbl[b, j] = b * ORI_MAX_BLOCKS + j
         return tbl
 
     def init_attn_sink():
@@ -503,10 +473,10 @@ def build_tensor_specs():
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
-        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
-        TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
-        TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_even_select_local),
+        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_odd_select_local),
+        TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
