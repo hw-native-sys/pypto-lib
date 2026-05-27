@@ -16,69 +16,52 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
 
 
 # model config
-B       = DECODE_BATCH
-S       = DECODE_SEQ
-T       = B * S
-D       = M.hidden_size
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+D = M.hidden_size
 HC_MULT = M.hc_mult
-HC_DIM  = M.hc_dim
-
-# tiling
-D_CHUNK = 512
-D_BLOCKS = D // D_CHUNK
+HC_DIM = M.hc_dim
 
 
 @pl.jit.inline
 def hc_post(
-    x:        pl.Tensor[[B, S, D],                    pl.BF16],
-    residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
-    post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
-    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
-    y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    residual: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    post: pl.Tensor[[B, S, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
 ):
     x_flat = pl.reshape(x, [T, D])
     residual_flat = pl.reshape(residual, [T, HC_DIM])
-    post_flat = pl.reshape(post, [T * HC_MULT])
-    comb_flat = pl.reshape(comb, [T * HC_MULT * HC_MULT])
+    post_t = pl.reshape(post, [T, HC_MULT])
+    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     y_flat = pl.reshape(y, [T, HC_DIM])
 
-    for out_h in pl.parallel(HC_MULT):
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="hc_post"):
-            for t in pl.parallel(0, T, 1, chunk=16):
-                post_w = pl.read(post_flat, [t * HC_MULT + out_h])
-                for db in pl.range(D_BLOCKS):
-                    d0 = db * D_CHUNK
-                    x_row = pl.cast(
-                        pl.slice(x_flat, [1, D_CHUNK], [t, d0]),
-                        target_type=pl.FP32,
-                    )
-                    y_row = pl.mul(x_row, post_w)
-                    for in_h in pl.range(HC_MULT):
-                        comb_w = pl.read(
-                            comb_flat,
-                            [t * HC_MULT * HC_MULT + in_h * HC_MULT + out_h],
-                        )
-                        residual_row = pl.cast(
-                            pl.slice(residual_flat, [1, D_CHUNK], [t, in_h * D + d0]),
-                            target_type=pl.FP32,
-                        )
-                        y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
-                    y_flat = pl.assemble(
-                        y_flat,
-                        pl.cast(y_row, target_type=pl.BF16, mode="rint"),
-                        [t, out_h * D + d0],
-                    )
+    for t in pl.spmd(T, name_hint="hc_post"):
+        x_row = pl.cast(x_flat[t : t + 1, 0:D], target_type=pl.FP32)
+        for out_h in pl.range(HC_MULT):
+            post_w = pl.read(post_t, [t, out_h])
+            y_row = pl.mul(x_row, post_w)
+            for in_h in pl.range(HC_MULT):
+                comb_w = pl.read(comb_t, [t, in_h * HC_MULT + out_h])
+                res_d = in_h * D
+                residual_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
+                y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
+            y_d = out_h * D
+            y_bf16 = pl.cast(y_row, target_type=pl.BF16, mode="rint")
+            y_flat[t : t + 1, y_d : y_d + D] = y_bf16
     y = pl.reshape(y_flat, [B, S, HC_MULT, D])
     return y
 
 
 @pl.jit
 def hc_post_test(
-    x:        pl.Tensor[[B, S, D],                    pl.BF16],
-    residual: pl.Tensor[[B, S, HC_MULT, D],           pl.BF16],
-    post:     pl.Tensor[[B, S, HC_MULT],              pl.FP32],
-    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT],     pl.FP32],
-    y:        pl.Out[pl.Tensor[[B, S, HC_MULT, D],    pl.BF16]],
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    residual: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    post: pl.Tensor[[B, S, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
 ):
     y = hc_post(x, residual, post, comb, y)
     return y
