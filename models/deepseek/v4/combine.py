@@ -61,15 +61,17 @@ def combine(
                 routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
                 pl.write(routed_w_buf, [t, e], pl.read(recv_weights, [e, s]))
 
-    for t in pl.spmd(T, name_hint="combine_reduce"):
-        base = t * N_LOCAL_EXPERTS
-        acc = pl.cast(sh[t:t+1, :], target_type=pl.FP32)
-        for e in pl.pipeline(N_LOCAL_EXPERTS, stage=2):
-            src = base + e
-            row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
-            w = pl.read(routed_w_buf, [t, e])
-            acc = pl.add(acc, pl.mul(row_fp32, w))
-        ffn_out_flat[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+    for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
+        for tt in pl.range(4):
+            t = tb * 4 + tt
+            base = t * N_LOCAL_EXPERTS
+            acc = pl.cast(sh[t:t+1, :], target_type=pl.FP32)
+            for e in pl.pipeline(N_LOCAL_EXPERTS, stage=2):
+                src = base + e
+                row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
+                w = pl.read(routed_w_buf, [t, e])
+                acc = pl.add(acc, pl.mul(row_fp32, w))
+            ffn_out_flat[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit

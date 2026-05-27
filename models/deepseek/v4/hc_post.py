@@ -38,19 +38,21 @@ def hc_post(
     comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     y_flat = pl.reshape(y, [T, HC_DIM])
 
-    for t in pl.spmd(T, name_hint="hc_post"):
-        x_row = pl.cast(x_flat[t : t + 1, 0:D], target_type=pl.FP32)
-        for out_h in pl.range(HC_MULT):
-            post_w = pl.read(post_t, [t, out_h])
-            y_row = pl.mul(x_row, post_w)
-            for in_h in pl.range(HC_MULT):
-                comb_w = pl.read(comb_t, [t, in_h * HC_MULT + out_h])
-                res_d = in_h * D
-                residual_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
-                y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
-            y_d = out_h * D
-            y_bf16 = pl.cast(y_row, target_type=pl.BF16, mode="rint")
-            y_flat[t : t + 1, y_d : y_d + D] = y_bf16
+    for tb in pl.spmd(T // 2, name_hint="hc_post"):
+        for tt in pl.range(2):
+            t = tb * 2 + tt
+            x_row = pl.cast(x_flat[t : t + 1, 0:D], target_type=pl.FP32)
+            for out_h in pl.range(HC_MULT):
+                post_w = pl.read(post_t, [t, out_h])
+                y_row = pl.mul(x_row, post_w)
+                for in_h in pl.range(HC_MULT):
+                    comb_w = pl.read(comb_t, [t, in_h * HC_MULT + out_h])
+                    res_d = in_h * D
+                    residual_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
+                    y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
+                y_d = out_h * D
+                y_bf16 = pl.cast(y_row, target_type=pl.BF16, mode="rint")
+                y_flat[t : t + 1, y_d : y_d + D] = y_bf16
     y = pl.reshape(y_flat, [B, S, HC_MULT, D])
     return y
 
