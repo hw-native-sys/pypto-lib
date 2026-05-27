@@ -25,19 +25,15 @@ D = M.hidden_size
 TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
-# tiling
-COL_CHUNK = 512
-T_TILE = 4
-
 
 @pl.jit.inline
 def combine(
-    recv_y:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
-    recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
-    recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
-    sh:                pl.Tensor[[T, D],                         pl.BF16],
-    ffn_out:           pl.Tensor[[B, S, D],                      pl.BF16],
+    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    ffn_out: pl.Tensor[[B, S, D], pl.BF16],
 ):
     ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
@@ -65,33 +61,25 @@ def combine(
                 routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
                 pl.write(routed_w_buf, [t, e], pl.read(recv_weights, [e, s]))
 
-    for ts0 in pl.parallel(0, T, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_reduce"):
-            for tt in pl.range(T_TILE):
-                t = ts0 + tt
-                base = t * N_LOCAL_EXPERTS
-                for d0 in pl.range(0, D, COL_CHUNK):
-                    acc = pl.cast(sh[t:t+1, d0:d0+COL_CHUNK], target_type=pl.FP32)
-                    for e in pl.range(N_LOCAL_EXPERTS):
-                        src = base + e
-                        row_fp32 = pl.cast(
-                            routed_y_buf_flat[src:src+1, d0:d0+COL_CHUNK], target_type=pl.FP32
-                        )
-                        w = pl.read(routed_w_buf, [t, e])
-                        acc = pl.add(acc, pl.mul(row_fp32, w))
-                    ffn_out_flat[t:t+1, d0:d0+COL_CHUNK] = pl.cast(
-                        acc, target_type=pl.BF16, mode="rint"
-                    )
+    for t in pl.spmd(T, name_hint="combine_reduce"):
+        base = t * N_LOCAL_EXPERTS
+        acc = pl.cast(sh[t:t+1, :], target_type=pl.FP32)
+        for e in pl.pipeline(N_LOCAL_EXPERTS, stage=2):
+            src = base + e
+            row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
+            w = pl.read(routed_w_buf, [t, e])
+            acc = pl.add(acc, pl.mul(row_fp32, w))
+        ffn_out_flat[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
 def combine_test(
-    recv_y:            pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
-    recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
-    recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
-    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
-    sh:                pl.Tensor[[T, D],                         pl.BF16],
-    ffn_out:           pl.Out[pl.Tensor[[B, S, D],               pl.BF16]],
+    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    ffn_out: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
 ):
     combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
     return ffn_out
@@ -176,12 +164,12 @@ def build_tensor_specs():
         return torch.randn(T, D)
 
     return [
-        TensorSpec("recv_y",            [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, init_value=init_recv_y),
-        TensorSpec("recv_token",        [N_LOCAL_EXPERTS, RECV_MAX],    torch.int32,    init_value=init_recv_token),
-        TensorSpec("recv_weights",      [N_LOCAL_EXPERTS, RECV_MAX],    torch.float32,  init_value=init_recv_weights),
-        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1],           torch.int32,    init_value=init_recv_expert_count),
-        TensorSpec("sh",                [T, D],                         torch.bfloat16, init_value=init_sh),
-        TensorSpec("ffn_out",           [B, S, D],                      torch.bfloat16, is_output=True),
+        TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, init_value=init_recv_y),
+        TensorSpec("recv_token", [N_LOCAL_EXPERTS, RECV_MAX], torch.int32, init_value=init_recv_token),
+        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
+        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
+        TensorSpec("sh", [T, D], torch.bfloat16, init_value=init_sh),
+        TensorSpec("ffn_out", [B, S, D], torch.bfloat16, is_output=True),
     ]
 
 
