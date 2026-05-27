@@ -32,17 +32,17 @@ D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 
 # tiling
-K_CHUNK = 512
-INTER_K = 512
-SH_INTER_CHUNK = 64
-SH_D_OUT_CHUNK = 64
-QUANT_CHUNK = 256
 T_TILE = 32
+K_TILE = 512
+INTER_K = 512
+SH_INTER_TILE = 64
+SH_D_OUT_TILE = 64
+QUANT_TILE = 256
 
 
 @pl.jit.inline
 def expert_shared(
-    x_local_i8:       pl.Tensor[[T, D], pl.INT8],
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
@@ -52,86 +52,86 @@ def expert_shared(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
-    for ts0 in pl.parallel(0, T, T_TILE):
+    sh_tile_fp32 = pl.create_tensor([T, MOE_INTER], dtype=pl.FP32)
+    sh_tile_i8 = pl.create_tensor([T, MOE_INTER], dtype=pl.INT8)
+    sh_tile_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
+
+    for gu_block in pl.spmd((T // T_TILE) * (MOE_INTER // (8 * SH_INTER_TILE)), name_hint="sh_gate_up"):
+        gu_tb = gu_block // (MOE_INTER // (8 * SH_INTER_TILE))
+        gu_nb = gu_block - gu_tb * (MOE_INTER // (8 * SH_INTER_TILE))
+        ts0 = gu_tb * T_TILE
+        n_base = gu_nb * (8 * SH_INTER_TILE)
         x_local_scale_dq_tile = x_local_scale_dq[ts0 : ts0 + T_TILE, 0:1]
+        for ng in pl.range(8):
+            n0 = n_base + ng * SH_INTER_TILE
+            sh_gate_acc = pl.create_tensor([T_TILE, SH_INTER_TILE], dtype=pl.INT32)
+            sh_up_acc = pl.create_tensor([T_TILE, SH_INTER_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                k0 = kb * K_TILE
+                xs_k = x_local_i8[ts0 : ts0 + T_TILE, k0 : k0 + K_TILE]
+                sw1_k = shared_w1[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
+                sw3_k = shared_w3[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    sh_gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
+                    sh_up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    sh_gate_acc = pl.matmul_acc(sh_gate_acc, xs_k, sw1_k, b_trans=True)
+                    sh_up_acc = pl.matmul_acc(sh_up_acc, xs_k, sw3_k, b_trans=True)
 
-        sh_tile_fp32 = pl.create_tensor([T_TILE, MOE_INTER], dtype=pl.FP32)
-        for n_base in pl.parallel(0, MOE_INTER, 8 * SH_INTER_CHUNK):
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                optimizations=[pl.split(pl.SplitMode.NONE)],
-                name_hint="sh_gate_up",
-            ):
-                for ng in pl.range(8):
-                    n0 = n_base + ng * SH_INTER_CHUNK
-                    sh_gate_acc = pl.create_tensor([T_TILE, SH_INTER_CHUNK], dtype=pl.INT32)
-                    sh_up_acc = pl.create_tensor([T_TILE, SH_INTER_CHUNK], dtype=pl.INT32)
-                    for kb in pl.pipeline(0, D // K_CHUNK, stage=2):
-                        k0 = kb * K_CHUNK
-                        xs_k = x_local_i8[ts0 : ts0 + T_TILE, k0 : k0 + K_CHUNK]
-                        sw1_k = shared_w1[n0 : n0 + SH_INTER_CHUNK, k0 : k0 + K_CHUNK]
-                        sw3_k = shared_w3[n0 : n0 + SH_INTER_CHUNK, k0 : k0 + K_CHUNK]
-                        if k0 == 0:
-                            sh_gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
-                            sh_up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            sh_gate_acc = pl.matmul_acc(sh_gate_acc, xs_k, sw1_k, b_trans=True)
-                            sh_up_acc = pl.matmul_acc(sh_up_acc, xs_k, sw3_k, b_trans=True)
+            sw1_scale_chunk = pl.reshape(shared_w1_scale[n0 : n0 + SH_INTER_TILE], [1, SH_INTER_TILE])
+            sw3_scale_chunk = pl.reshape(shared_w3_scale[n0 : n0 + SH_INTER_TILE], [1, SH_INTER_TILE])
+            sh_gate = pl.cast(sh_gate_acc, target_type=pl.FP32, mode="none")
+            sh_up = pl.cast(sh_up_acc, target_type=pl.FP32, mode="none")
+            sh_gate = pl.col_expand_mul(pl.row_expand_mul(sh_gate, x_local_scale_dq_tile), sw1_scale_chunk)
+            sh_up = pl.col_expand_mul(pl.row_expand_mul(sh_up, x_local_scale_dq_tile), sw3_scale_chunk)
+            sh_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(sh_gate)), 1.0))
+            sh_silu = pl.mul(sh_gate, sh_sigmoid)
+            sh_gated = pl.mul(sh_silu, sh_up)
+            sh_tile_fp32[ts0 : ts0 + T_TILE, n0 : n0 + SH_INTER_TILE] = sh_gated
 
-                    sw1_scale_chunk = pl.reshape(shared_w1_scale[n0 : n0 + SH_INTER_CHUNK], [1, SH_INTER_CHUNK])
-                    sw3_scale_chunk = pl.reshape(shared_w3_scale[n0 : n0 + SH_INTER_CHUNK], [1, SH_INTER_CHUNK])
-                    sh_gate = pl.cast(sh_gate_acc, target_type=pl.FP32, mode="none")
-                    sh_up = pl.cast(sh_up_acc, target_type=pl.FP32, mode="none")
-                    sh_gate = pl.col_expand_mul(pl.row_expand_mul(sh_gate, x_local_scale_dq_tile), sw1_scale_chunk)
-                    sh_up = pl.col_expand_mul(pl.row_expand_mul(sh_up, x_local_scale_dq_tile), sw3_scale_chunk)
-                    sh_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(sh_gate)), 1.0))
-                    sh_silu = pl.mul(sh_gate, sh_sigmoid)
-                    sh_gated = pl.mul(sh_silu, sh_up)
-                    sh_tile_fp32[:, n0 : n0 + SH_INTER_CHUNK] = sh_gated
+    for q_tb in pl.spmd(T // T_TILE, name_hint="sh_h_q"):
+        ts0 = q_tb * T_TILE
+        shq_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for k0 in pl.range(0, MOE_INTER, QUANT_TILE):
+            shq_a_f32 = sh_tile_fp32[ts0 : ts0 + T_TILE, k0 : k0 + QUANT_TILE]
+            shq_a_abs = pl.maximum(shq_a_f32, pl.neg(shq_a_f32))
+            shq_a_max = pl.reshape(pl.row_max(shq_a_abs), [1, T_TILE])
+            shq_amax = pl.maximum(shq_amax, shq_a_max)
+        shq_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), shq_amax)
+        sh_tile_scale_dq[ts0 : ts0 + T_TILE, 0:1] = pl.reshape(pl.recip(shq_sq_row), [T_TILE, 1])
+        shq_sq_col = pl.reshape(shq_sq_row, [T_TILE, 1])
+        for k1 in pl.range(0, MOE_INTER, QUANT_TILE):
+            shq_q_f32 = sh_tile_fp32[ts0 : ts0 + T_TILE, k1 : k1 + QUANT_TILE]
+            shq_q_scaled = pl.row_expand_mul(shq_q_f32, shq_sq_col)
+            shq_q_i32 = pl.cast(shq_q_scaled, target_type=pl.INT32, mode="rint")
+            shq_q_half = pl.cast(shq_q_i32, target_type=pl.FP16, mode="round")
+            sh_tile_i8[ts0 : ts0 + T_TILE, k1 : k1 + QUANT_TILE] = pl.cast(shq_q_half, target_type=pl.INT8, mode="trunc")
 
-        sh_tile_i8 = pl.create_tensor([T_TILE, MOE_INTER], dtype=pl.INT8)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_h_q"):
-            shq_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for k0 in pl.range(0, MOE_INTER, QUANT_CHUNK):
-                shq_a_f32 = sh_tile_fp32[:, k0 : k0 + QUANT_CHUNK]
-                shq_a_abs = pl.maximum(shq_a_f32, pl.neg(shq_a_f32))
-                shq_a_max = pl.reshape(pl.row_max(shq_a_abs), [1, T_TILE])
-                shq_amax = pl.maximum(shq_amax, shq_a_max)
-            shq_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), shq_amax)
-            sh_tile_scale_dq = pl.reshape(pl.recip(shq_sq_row), [T_TILE, 1])
-            shq_sq_col = pl.reshape(shq_sq_row, [T_TILE, 1])
-            for k1 in pl.range(0, MOE_INTER, QUANT_CHUNK):
-                shq_q_f32 = sh_tile_fp32[:, k1 : k1 + QUANT_CHUNK]
-                shq_q_scaled = pl.row_expand_mul(shq_q_f32, shq_sq_col)
-                shq_q_i32 = pl.cast(shq_q_scaled, target_type=pl.INT32, mode="rint")
-                shq_q_half = pl.cast(shq_q_i32, target_type=pl.FP16, mode="round")
-                sh_tile_i8[:, k1 : k1 + QUANT_CHUNK] = pl.cast(shq_q_half, target_type=pl.INT8, mode="trunc")
+    for w2_block in pl.spmd((T // T_TILE) * (D // (16 * SH_D_OUT_TILE)), name_hint="sh_w2"):
+        w2_tb = w2_block // (D // (16 * SH_D_OUT_TILE))
+        w2_db = w2_block - w2_tb * (D // (16 * SH_D_OUT_TILE))
+        ts0 = w2_tb * T_TILE
+        d_base = w2_db * (16 * SH_D_OUT_TILE)
+        sh_tile_scale_dq_tile = sh_tile_scale_dq[ts0 : ts0 + T_TILE, 0:1]
+        for dg in pl.range(16):
+            d0 = d_base + dg * SH_D_OUT_TILE
+            hs_init = sh_tile_i8[ts0 : ts0 + T_TILE, 0 : INTER_K]
+            sw2_init = shared_w2[d0 : d0 + SH_D_OUT_TILE, 0 : INTER_K]
+            sh_y_acc = pl.matmul(hs_init, sw2_init, b_trans=True, out_dtype=pl.INT32)
+            for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
+                hs_k = sh_tile_i8[ts0 : ts0 + T_TILE, k0 : k0 + INTER_K]
+                sw2_k = shared_w2[d0 : d0 + SH_D_OUT_TILE, k0 : k0 + INTER_K]
+                sh_y_acc = pl.matmul_acc(sh_y_acc, hs_k, sw2_k, b_trans=True)
 
-        for d_base in pl.parallel(0, D, 16 * SH_D_OUT_CHUNK):
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                optimizations=[pl.split(pl.SplitMode.NONE)],
-                name_hint="sh_w2",
-            ):
-                for dg in pl.range(16):
-                    d0 = d_base + dg * SH_D_OUT_CHUNK
-                    hs_init = sh_tile_i8[:, 0 : INTER_K]
-                    sw2_init = shared_w2[d0 : d0 + SH_D_OUT_CHUNK, 0 : INTER_K]
-                    sh_y_acc = pl.matmul(hs_init, sw2_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
-                        hs_k = sh_tile_i8[:, k0 : k0 + INTER_K]
-                        sw2_k = shared_w2[d0 : d0 + SH_D_OUT_CHUNK, k0 : k0 + INTER_K]
-                        sh_y_acc = pl.matmul_acc(sh_y_acc, hs_k, sw2_k, b_trans=True)
-
-                    sw2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + SH_D_OUT_CHUNK], [1, SH_D_OUT_CHUNK])
-                    sh_y = pl.cast(sh_y_acc, target_type=pl.FP32, mode="none")
-                    sh_y = pl.col_expand_mul(pl.row_expand_mul(sh_y, sh_tile_scale_dq), sw2_scale_chunk)
-                    sh[ts0 : ts0 + T_TILE, d0 : d0 + SH_D_OUT_CHUNK] = pl.cast(sh_y, target_type=pl.BF16, mode="rint")
+            sw2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + SH_D_OUT_TILE], [1, SH_D_OUT_TILE])
+            sh_y = pl.cast(sh_y_acc, target_type=pl.FP32, mode="none")
+            sh_y = pl.col_expand_mul(pl.row_expand_mul(sh_y, sh_tile_scale_dq_tile), sw2_scale_chunk)
+            sh[ts0 : ts0 + T_TILE, d0 : d0 + SH_D_OUT_TILE] = pl.cast(sh_y, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
 def expert_shared_test(
-    x_local_i8:       pl.Tensor[[T, D], pl.INT8],
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
