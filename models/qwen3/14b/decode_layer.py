@@ -140,6 +140,7 @@ def decode_layer(
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     decode_layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     user_batch = pl.tensor.dim(seq_lens, 0)
+    bt_stride = pl.tensor.dim(block_table, 0) // user_batch
     batch_padded = BATCH
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
@@ -439,7 +440,7 @@ def decode_layer(
         fa_b_safe = pl.min(fa_b, user_batch - 1)
         fa_ctx_len = pl.tensor.read(seq_lens, [fa_b_safe])
         fa_ctx_blocks = (fa_ctx_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        fa_block_table_base = fa_b_safe * MAX_BLOCKS_PER_SEQ
+        fa_block_table_base = fa_b_safe * bt_stride
 
         for gp in pl.pipeline(2, stage=2):
             gi = fa_g2 * 2 + gp
