@@ -18,7 +18,7 @@ writes the current KV after attention.
 import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_from_padded
+from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
 from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
 from prefill_sparse_attn import golden_prefill_sparse_attn, prefill_sparse_attn
@@ -71,7 +71,6 @@ PREFILL_CMP_BLOCK_NUM = B * PREFILL_CMP_MAX_BLOCKS
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
-HC_PAD = 8
 NEG_INF = -1e20
 T_TILE = 16
 RMS_T_TILE = 16
@@ -273,24 +272,18 @@ def prefill_attention_swa(
     start_pos: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    post_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb0_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb1_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb2_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb3_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
+    post = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed, post_pad, comb0_pad, comb1_pad, comb2_pad, comb3_pad = prefill_hc_pre(
+    x_mixed, post, comb = prefill_hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
         x_mixed,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
     )
 
     # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
@@ -373,14 +366,11 @@ def prefill_attention_swa(
     # create_tensor seeds static metadata required by the JIT for hc_post input.
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
-    x_out = prefill_hc_post_from_padded(
+    x_out = prefill_hc_post(
         attn_out_3d,
         x_hc,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
         x_out,
     )
     return kv_cache, x_out
@@ -415,48 +405,23 @@ def golden_prefill_attention_swa(tensors):
     import torch
 
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb0_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb1_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb2_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb3_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
+    post = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
     golden_prefill_hc_pre({
         "x": tensors["x_hc"],
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
         "hc_base": tensors["hc_attn_base"],
         "x_mixed": x_mixed,
-        "post_pad": post_pad,
-        "comb0_pad": comb0_pad,
-        "comb1_pad": comb1_pad,
-        "comb2_pad": comb2_pad,
-        "comb3_pad": comb3_pad,
+        "post": post,
+        "comb": comb,
     })
     if "x_mixed" in tensors:
         tensors["x_mixed"][:] = x_mixed
-    if "post_pad" in tensors:
-        tensors["post_pad"][:] = post_pad
-    if "comb0_pad" in tensors:
-        tensors["comb0_pad"][:] = comb0_pad
-    if "comb1_pad" in tensors:
-        tensors["comb1_pad"][:] = comb1_pad
-    if "comb2_pad" in tensors:
-        tensors["comb2_pad"][:] = comb2_pad
-    if "comb3_pad" in tensors:
-        tensors["comb3_pad"][:] = comb3_pad
     if "post_t" in tensors:
-        tensors["post_t"][:] = post_pad.view(B, S, HC_PAD)[:, :, :HC_MULT]
+        tensors["post_t"][:] = post
     if "comb_t" in tensors:
-        comb_t = torch.stack(
-            [
-                comb0_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb1_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb2_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb3_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-            ],
-            dim=2,
-        )
-        tensors["comb_t"][:] = comb_t
+        tensors["comb_t"][:] = comb
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -555,11 +520,8 @@ def golden_prefill_attention_swa(tensors):
     golden_prefill_hc_post({
         "x": attn_out.view(B, S, D),
         "residual": tensors["x_hc"],
-        "post_pad": post_pad,
-        "comb0_pad": comb0_pad,
-        "comb1_pad": comb1_pad,
-        "comb2_pad": comb2_pad,
-        "comb3_pad": comb3_pad,
+        "post": post,
+        "comb": comb,
         "y": y,
     })
     tensors["x_out"][:] = y
