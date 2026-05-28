@@ -95,7 +95,13 @@ MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
 MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
+INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+INNER_STATE_MAX_BLOCKS = 64
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+INNER_STATE_DIM = 2 * INNER_OUT_DIM
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
+IDX_CACHE_MAX_BLOCKS = 64
+IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
@@ -153,13 +159,14 @@ def attention_csa(
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -285,13 +292,14 @@ def attention_csa(
         odd_select,
         hadamard_idx,
         idx_kv_unused,
-        inner_kv_state,
-        inner_score_state,
+        inner_compress_state,
+        inner_compress_state_block_table,
         inner_wkv,
         inner_wgate,
         inner_ape,
         inner_norm_w,
         idx_kv_cache,
+        idx_block_table,
         idx_score_unused,
         idx_topk_full,
         cmp_start_pos,
@@ -373,13 +381,14 @@ def attention_csa_test_refresh(
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -422,13 +431,14 @@ def attention_csa_test_refresh(
         inner_wgate,
         inner_ape,
         inner_norm_w,
-        inner_kv_state,
-        inner_score_state,
+        inner_compress_state,
+        inner_compress_state_block_table,
         kv_cache,
         ori_block_table,
         cmp_kv,
         cmp_block_table,
         idx_kv_cache,
+        idx_block_table,
         attn_sink,
         seqused_kv,
         wo_a,
@@ -680,13 +690,14 @@ def golden_attention_csa(tensors):
         "odd_select": tensors["odd_select"],
         "hadamard": tensors["hadamard_idx"],
         "inner_kv": idx_kv,
-        "inner_kv_state": tensors["inner_kv_state"],
-        "inner_score_state": tensors["inner_score_state"],
+        "inner_compress_state": tensors["inner_compress_state"],
+        "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
         "inner_wkv": tensors["inner_wkv"],
         "inner_wgate": tensors["inner_wgate"],
         "inner_ape": tensors["inner_ape"],
         "inner_norm_w": tensors["inner_norm_w"],
         "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_block_table": tensors["idx_block_table"],
         "score": idx_score,
         "topk_idxs": idx_topk_full,
         "start_pos": cmp_start_pos,
@@ -882,11 +893,17 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_inner_norm_w():
         return torch.ones(IDX_HEAD_DIM)
 
-    def init_inner_kv_state():
-        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
+        state[:, :, INNER_OUT_DIM:] = float("-inf")
+        return state
 
-    def init_inner_score_state():
-        return torch.full((B, INNER_STATE_LEN, INNER_OUT_DIM), float("-inf"))
+    def init_inner_compress_state_block_table():
+        tbl = torch.full((B, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(INNER_STATE_MAX_BLOCKS):
+                tbl[b, j] = b * INNER_STATE_MAX_BLOCKS + j
+        return tbl
 
     def init_kv_cache():
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
@@ -909,7 +926,14 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return tbl
 
     def init_idx_kv_cache():
-        return init_normalized_cache((B, IDX_KV_LEN, IDX_HEAD_DIM))
+        return init_normalized_cache((IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM))
+
+    def init_idx_block_table():
+        tbl = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(IDX_CACHE_MAX_BLOCKS):
+                tbl[b, j] = b * IDX_CACHE_MAX_BLOCKS + j
+        return tbl
 
     def init_attn_sink():
         return torch.zeros(H)
@@ -1006,13 +1030,14 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("inner_wgate", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.float32, init_value=init_inner_norm_w),
-        TensorSpec("inner_kv_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
-        TensorSpec("inner_score_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_score_state),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
+        TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
+        TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
