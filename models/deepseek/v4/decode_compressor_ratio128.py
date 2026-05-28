@@ -39,11 +39,11 @@ ROPE_TILE = 32
 K_TILE = 512
 OUT_TILE = 64
 
-HEAD_TILE = 64 if B * S >= 64 else 128
+HEAD_TILE = 64
 B_TILE = 64
 # TODO: Remove this post-processing row padding once RMSNorm/RoPE are lowered
 # as true row-level vector ops instead of relying on boxed tile matmul shapes.
-POST_TILE = 16
+POST_TILE = 8
 
 # Paged cache layout (mirrors recipes sfa_kv_state / sfa_cmp_kv contract).
 # kv_state_pool merges kv and score into a single FP32 pool with [..., 0:OUT_DIM]=kv,
@@ -162,17 +162,11 @@ def compressor(
 
     # No state shift for non-overlap
 
-    for global_c_idx in pl.parallel(B):
-        start_pos_b = pl.read(start_pos, [global_c_idx])
-        pos_b = start_pos_b % COMPRESS_RATIO
-        ape_row_b = pl.cast(pos_b, target_type=pl.INDEX)
-        pre_tokens_b = COMPRESS_RATIO - pos_b
-        state_blk_id = pl.cast(pl.read(state_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
-        cmp_blk_id = pl.cast(pl.read(cmp_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
-        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    normed_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
+    for global_c_idx in pl.parallel(B):
         # Fused RMSNorm + gather/scatter-based RoPE (FP32 throughout)
-        norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
             cos_b = cos[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
             sin_b = sin[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
@@ -189,9 +183,9 @@ def compressor(
                 kv_norm_chunk = pooled_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
+                normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
 
-            kv_rope_fp32 = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
+            kv_rope_fp32 = normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
             even_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
             odd_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
             rope_even_fp32 = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
@@ -199,12 +193,23 @@ def compressor(
             rope_buf_fp32 = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
             rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=even_idx, src=rope_even_fp32)
             rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=odd_idx, src=rope_odd_fp32)
-            normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf_fp32
+            normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf_fp32
+
+    for global_c_idx in pl.parallel(B):
+        start_pos_b = pl.read(start_pos, [global_c_idx])
+        pos_b = start_pos_b % COMPRESS_RATIO
+        ape_row_b = pl.cast(pos_b, target_type=pl.INDEX)
+        pre_tokens_b = COMPRESS_RATIO - pos_b
+        state_blk_id = pl.cast(pl.read(state_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
+        cmp_blk_id = pl.cast(pl.read(cmp_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
 
         cache_col = start_pos_b // COMPRESS_RATIO
+        # Keep this scope separate from rmsnorm_rope: merging would put 3 outer
+        # carries (kv_flat / cmp_kv_pool_flat / kv_state_pool_flat) on one task,
+        # which hits pypto #1573 (orchestration phi cross-assignment).
         if pos_b + S >= COMPRESS_RATIO:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write_and_scatter_next"):
-                kv_row_fp32 = normed_kv[0 : 1, 0 : HEAD_DIM]
+                kv_row_fp32 = normed_kv[global_c_idx * POST_TILE : global_c_idx * POST_TILE + 1, 0 : HEAD_DIM]
                 kv_flat[global_c_idx * S : global_c_idx * S + 1, :] = kv_row_fp32
                 phys_cmp_row = cmp_blk_id * BLOCK_SIZE + cache_col
                 cmp_kv_pool_flat[phys_cmp_row : phys_cmp_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
