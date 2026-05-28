@@ -176,10 +176,11 @@ def compressor(
         normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.BF16)
         kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
-        # RMSNorm with BF16 intermediate
+        # RMSNorm + Selector-based RoPE
         norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-        kv_rope = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM], dtype=pl.BF16)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_slice"):
+        rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
             partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
             for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=4):
                 kv_rms_chunk = pl.cast(
@@ -201,27 +202,12 @@ def compressor(
                 gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
                 normed_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
-            kv_rope[:, :] = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
 
-        # Selector-based RoPE
-        kv_proj_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        kv_proj_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-        rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
-            even_acc = pl.matmul(kv_rope, even_select, out_dtype=pl.FP32)
-            odd_acc = pl.matmul(kv_rope, odd_select, out_dtype=pl.FP32)
-            kv_proj_even[:, :] = even_acc
-            kv_proj_odd[:, :] = odd_acc
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-            even_tile = kv_proj_even[:, :]
-            odd_tile = kv_proj_odd[:, :]
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
-            rope_even[:, :] = rope_even_acc
-            rope_odd[:, :] = rope_odd_acc
+            kv_rope_fp32 = pl.cast(normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], target_type=pl.FP32)
+            even_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+            rope_even[:, :] = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
+            rope_odd[:, :] = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
             rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
