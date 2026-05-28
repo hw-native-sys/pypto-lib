@@ -41,9 +41,9 @@ OUT_TILE = 64
 
 HEAD_TILE = 64
 B_TILE = 64
-# TODO: Remove this post-processing row padding once RMSNorm/RoPE are lowered
-# as true row-level vector ops instead of relying on boxed tile matmul shapes.
-POST_TILE = 8
+# Batch-tile size for the rmsnorm_rope vec scope. Must be >= 8 so that FP32
+# col-vectors ([RMS_TILE, 1]) hit the ptoas 32B-aligned row stride.
+RMS_TILE = 8
 
 # Paged cache layout (mirrors recipes sfa_kv_state / sfa_cmp_kv contract).
 # kv_state_pool merges kv and score into a single FP32 pool with [..., 0:OUT_DIM]=kv,
@@ -69,8 +69,8 @@ def compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
-    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     cmp_kv_pool: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_BLOCKS_PER_BATCH], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
@@ -109,7 +109,7 @@ def compressor(
 
     cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [B, S * OUT_DIM])
     cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [B, S * OUT_DIM])
-    pooled_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_pre"):
         for global_c_idx in pl.range(B):
@@ -158,42 +158,47 @@ def compressor(
         score_prob = pl.row_expand_div(score_exp, score_sum)
         pooled_chunk_t = pl.row_sum(pl.mul(softmax_kv_state_t, score_prob))
         pooled_chunk = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
-        pooled_kv[global_c_idx * POST_TILE : global_c_idx * POST_TILE + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+        pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     # No state shift for non-overlap
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    normed_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
 
-    for global_c_idx in pl.parallel(B):
-        # Fused RMSNorm + gather/scatter-based RoPE (FP32 throughout)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
-            cos_b = cos[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-            sin_b = sin[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-            partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
-            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
-                kv_rms_chunk = pooled_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
-                kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-                kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, POST_TILE])
-                partial_sq = pl.add(partial_sq, kv_rms_rowsum)
+    # Fused RMSNorm + gather/scatter-based RoPE, processing RMS_TILE real
+    # batches per spmd block so all vec col-vectors hit ptoas's 32B-aligned
+    # row stride without per-batch row padding.
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope"):
+        batch_base = batch_base_idx * RMS_TILE
+        cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
+        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+            kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
+            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [POST_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
-            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
-                kv_norm_chunk = pooled_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
-                gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
-                normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+            kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+            gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
 
-            kv_rope_fp32 = normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-            even_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
-            rope_even_fp32 = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
-            rope_odd_fp32 = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
-            rope_buf_fp32 = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-            rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=even_idx, src=rope_even_fp32)
-            rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=odd_idx, src=rope_odd_fp32)
-            normed_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf_fp32
+        kv_rope_fp32 = normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        even_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even_fp32 = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+        rope_odd_fp32 = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+        idx_target = pl.full([RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.INT32, value=0)
+        even_idx_full = pl.col_expand(idx_target, even_idx)
+        odd_idx_full = pl.col_expand(idx_target, odd_idx)
+        rope_buf_fp32 = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=even_idx_full, src=rope_even_fp32)
+        rope_buf_fp32 = pl.tensor.scatter(rope_buf_fp32, dim=-1, index=odd_idx_full, src=rope_odd_fp32)
+        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf_fp32
 
     for global_c_idx in pl.parallel(B):
         start_pos_b = pl.read(start_pos, [global_c_idx])
@@ -209,7 +214,7 @@ def compressor(
         # which hits pypto #1573 (orchestration phi cross-assignment).
         if pos_b + S >= COMPRESS_RATIO:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write_and_scatter_next"):
-                kv_row_fp32 = normed_kv[global_c_idx * POST_TILE : global_c_idx * POST_TILE + 1, 0 : HEAD_DIM]
+                kv_row_fp32 = normed_kv[global_c_idx : global_c_idx + 1, 0 : HEAD_DIM]
                 kv_flat[global_c_idx * S : global_c_idx * S + 1, :] = kv_row_fp32
                 phys_cmp_row = cmp_blk_id * BLOCK_SIZE + cache_col
                 cmp_kv_pool_flat[phys_cmp_row : phys_cmp_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
@@ -243,8 +248,8 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
-    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     cmp_kv_pool: pl.Out[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_BLOCKS_PER_BATCH], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
@@ -379,11 +384,9 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_sin():
         return torch.rand(B, ROPE_HEAD_DIM // 2)
     def init_even_idx():
-        row = torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32)
-        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
+        return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0)
     def init_odd_idx():
-        row = torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32)
-        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
+        return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0)
     def init_cmp_kv_pool():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, HEAD_DIM)
     def init_state_block_table():
@@ -409,8 +412,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("even_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
-        TensorSpec("odd_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
+        TensorSpec("even_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
+        TensorSpec("odd_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
         TensorSpec("cmp_kv_pool", [CMP_BLOCK_NUM, BLOCK_SIZE, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_pool, is_output=True),
         TensorSpec("cmp_block_table", [B, CMP_BLOCKS_PER_BATCH], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
