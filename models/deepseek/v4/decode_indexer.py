@@ -74,6 +74,16 @@ HEAD_ROWS_ROPE = IDX_N_HEADS * HEAD_GROUP_ROPE
 ROPE_ROW_CHUNK = IDX_N_HEADS
 assert HEAD_ROWS_ROPE % ROPE_ROW_CHUNK == 0, "HEAD_ROWS_ROPE must be divisible by ROPE_ROW_CHUNK"
 assert (T * IDX_N_HEADS) % HEAD_ROWS_ROPE == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS_ROPE"
+# weights_proj fuses the softmax-scale mul into the matmul scope (saves one GM round-trip
+# of `weights`). The matmul streams its K-tiles over the full T; only the FP32 mul epilogue
+# is row-chunked. Empirically the fused epilogue costs ~IDX_N_HEADS*36 B/row of Vec
+# (matmul-out staging + mul in/out + NZ padding under UP_DOWN) -- ~4.5x the naive
+# 2-FP32-tile estimate, so it must be measured, not assumed. Halve the row-chunk until it
+# fits the 192KB Vec limit: at T=128, IDX_N_HEADS=64 this lands on 64 (Vec ~147KB).
+WEIGHTS_ROW_CHUNK = T
+while WEIGHTS_ROW_CHUNK * IDX_N_HEADS * 36 > 196608:
+    WEIGHTS_ROW_CHUNK //= 2
+assert T % WEIGHTS_ROW_CHUNK == 0, "T must be divisible by WEIGHTS_ROW_CHUNK"
 # Fold SCORE_B_GROUP batches into one task in the per-(batch, cache-block) score loop.
 SCORE_B_GROUP = 8 if B >= 8 else B
 assert B % SCORE_B_GROUP == 0, "B must be divisible by SCORE_B_GROUP"
@@ -180,7 +190,8 @@ def indexer(
                 qr_rope_out[o0 + ro : o0 + ro + IDX_N_HEADS, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
     # qr_hadamard is a cube-only matmul (output [HEAD_ROWS_ROPE, IDX_HEAD_DIM] FP32 =
-    # 128KB L0C at GRP=4), so it folds at the larger rope group in its own loop.
+    # 128KB L0C at GRP=4), so it folds at the larger rope group in its own loop. GRP=4
+    # already saturates the 128KB L0C Acc limit, so this group cannot grow further.
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_ROPE):
         with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_hadamard"):
             qh_nope = qr_proj_flat[o0 : o0 + HEAD_ROWS_ROPE, 0 : IDX_NOPE_HEAD_DIM]
@@ -208,19 +219,24 @@ def indexer(
 
 
     x_flat = pl.reshape(x, [T, D])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
-        weights_acc = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
-        for db in pl.pipeline(0, D // D_CHUCK, stage=2):
-            d0 = db * D_CHUCK
-            x_tile = x_flat[:, d0 : d0 + D_CHUCK]
-            weights_proj_tile = weights_proj[d0 : d0 + D_CHUCK, :]
-            if d0 == 0:
-                weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
-            else:
-                weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_write"):
-        weights = pl.mul(weights_acc, WEIGHTS_SCALE)
+    weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
+    # Mix: weights matmul (cube, FP32-out) + softmax-scale mul (vector) in one scope,
+    # row-chunked over T so nothing stays full-T resident. Index x_flat directly per
+    # K-tile ([WEIGHTS_ROW_CHUNK, D_CHUCK]) -- pre-slicing a whole [chunk, D] left operand
+    # pins it in L1 (1MB Mat overflow); a full-T weights_acc keeps the c2v bridge resident
+    # (288KB Vec overflow). Per-chunk both the matmul L1 inputs and the mul epilogue fit.
+    for t0 in pl.range(0, T, WEIGHTS_ROW_CHUNK):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
+            weights_acc = pl.create_tensor([WEIGHTS_ROW_CHUNK, IDX_N_HEADS], dtype=pl.FP32)
+            for db in pl.pipeline(0, D // D_CHUCK, stage=2):
+                d0 = db * D_CHUCK
+                x_tile = x_flat[t0 : t0 + WEIGHTS_ROW_CHUNK, d0 : d0 + D_CHUCK]
+                weights_proj_tile = weights_proj[d0 : d0 + D_CHUCK, :]
+                if d0 == 0:
+                    weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
+                else:
+                    weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
+            weights[t0 : t0 + WEIGHTS_ROW_CHUNK, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     inner_kv, inner_kv_state, inner_score_state, idx_kv_cache = indexer_compressor(
         x,

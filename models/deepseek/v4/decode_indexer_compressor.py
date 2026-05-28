@@ -48,10 +48,21 @@ HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
 OUT_BLOCKS = OUT_DIM // OUT_CHUNK
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
-BATCH_CHUNK_1 = 1
 # TODO: Remove this post-processing row padding once RMSNorm/RoPE/Hadamard are
 # lowered as true row-level vector ops instead of relying on boxed matmul tiles.
 POST_CHUNK = 16
+# Batches processed per parallel iteration of the per-batch compressor loop. The
+# post-processing matmuls (rmsnorm/rope/hadamard) are boxed to POST_CHUNK rows
+# regardless, so at BATCH_CHUNK_1=1 they burn 15/16 of their work on padding; grouping
+# fills that padding with real batches and collapses the swimlane's fragmented 1-4us
+# task storm into a handful of ~50us tasks. Cap at POST_CHUNK (the matmul box). All
+# grouped batches must share start_pos -- the scalar control flow (branch / ape_row /
+# cache_col) is read from the group's first batch; the hetero test groups start_pos by
+# BATCH_CHUNK_1 to honor this. cos/sin and the kv/score state are per-row, so those
+# scale freely.
+BATCH_CHUNK_1 = POST_CHUNK
+assert B % BATCH_CHUNK_1 == 0, "B must be divisible by BATCH_CHUNK_1"
+assert BATCH_CHUNK_1 <= POST_CHUNK, "BATCH_CHUNK_1 must not exceed the POST_CHUNK matmul box"
 
 
 @pl.jit.inline
@@ -206,6 +217,11 @@ def indexer_compressor(
 
             norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
             kv_rope = pl.create_tensor([POST_CHUNK, ROPE_HEAD_DIM], dtype=pl.BF16)
+            # rmsnorm stays its own (NONE) scope: folding it into the UP_DOWN rope_fused scope
+            # below fails codegen -- kv_rope built as an in-scope intermediate (assemble) and then
+            # fed to the slice matmul has no resolvable tile view after the row-split
+            # ("Tensor view not found for parameter kv_rope_inline"). rope_fused works because
+            # kv_rope arrives as a clean scope input from here.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_slice"):
                 partial_sq = pl.full([1, POST_CHUNK], dtype=pl.FP32, value=0.0)
                 for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
@@ -231,30 +247,17 @@ def indexer_compressor(
                     normed_kv = pl.assemble(normed_kv, pl.cast(normed_chunk, target_type=pl.BF16, mode="rint"), [0, k0])
                 kv_rope = pl.assemble(kv_rope, normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], [0, 0])
 
-            kv_proj_even = pl.create_tensor([POST_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            kv_proj_odd = pl.create_tensor([POST_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            rope_even = pl.create_tensor([POST_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-            rope_odd = pl.create_tensor([POST_CHUNK, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
+            # Mix: slice matmul (cube) + cos/sin rotate (vec) + assemble matmul (cube) + BF16
+            # write (vec), all in one UP_DOWN scope. Row-halving keeps each AIV subblock's Vec
+            # bounded; the assemble feeds rope_even/rope_odd whole (K=ROPE_HEAD_DIM//2=32, no
+            # column subview) so it never trips the UP_DOWN valid_row mismatch.
+            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_fused"):
                 even_acc = pl.matmul(kv_rope, even_select, out_dtype=pl.FP32)
                 odd_acc = pl.matmul(kv_rope, odd_select, out_dtype=pl.FP32)
-                kv_proj_even = pl.assemble(kv_proj_even, even_acc, [0, 0])
-                kv_proj_odd = pl.assemble(kv_proj_odd, odd_acc, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-                even_tile = kv_proj_even[:, :]
-                odd_tile = kv_proj_odd[:, :]
-                rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
-                rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
-                rope_even = pl.assemble(rope_even, rope_even_acc, [0, 0])
-                rope_odd = pl.assemble(rope_odd, rope_odd_acc, [0, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
+                rope_even = pl.cast(pl.sub(pl.mul(even_acc, cos_b), pl.mul(odd_acc, sin_b)), target_type=pl.BF16, mode="rint")
+                rope_odd = pl.cast(pl.add(pl.mul(even_acc, sin_b), pl.mul(odd_acc, cos_b)), target_type=pl.BF16, mode="rint")
                 rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
                 normed_kv = pl.assemble(normed_kv, pl.cast(rope_acc, target_type=pl.BF16, mode="rint"), [0, NOPE_HEAD_DIM])
 
             if rotate:
@@ -274,15 +277,21 @@ def indexer_compressor(
                     kv_final = pl.assemble(kv_final, pl.cast(kv_out_tile, target_type=pl.FP32), [0, o0])
 
             cache_col = start_pos_b // COMPRESS_RATIO
+            # kv_flat (row stride S) and kv_cache_flat (row stride IDX_KV_LEN) place one
+            # pooled row per batch at batch-strided locations, so the group's rows can't be
+            # written as one contiguous tile -- scatter each batch row individually. One
+            # CORE_GROUP task still covers the whole group; cache_col is shared (homogeneous
+            # start_pos within the group).
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-                kv_row_fp32 = kv_final[0 : BATCH_CHUNK_1, 0 : HEAD_DIM]
-                kv_flat = pl.assemble(kv_flat, kv_row_fp32, [c_idx * S, 0])
-                cache_row = c_idx * IDX_KV_LEN + cache_col
-                kv_cache_flat = pl.assemble(
-                    kv_cache_flat,
-                    pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
-                    [cache_row, 0],
-                )
+                for r in pl.range(0, BATCH_CHUNK_1):
+                    kv_row_fp32 = kv_final[r : r + 1, 0 : HEAD_DIM]
+                    kv_flat = pl.assemble(kv_flat, kv_row_fp32, [(c_idx + r) * S, 0])
+                    cache_row = (c_idx + r) * IDX_KV_LEN + cache_col
+                    kv_cache_flat = pl.assemble(
+                        kv_cache_flat,
+                        pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint"),
+                        [cache_row, 0],
+                    )
 
             if pos_b + S > COMPRESS_RATIO:
                 for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
