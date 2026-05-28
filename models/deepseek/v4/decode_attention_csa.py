@@ -458,127 +458,8 @@ def golden_attention_csa(tensors):
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
     from decode_qkv_proj_rope import golden_qkv_proj_rope
-
-    def rms_norm(x, weight):
-        x_fp32 = x.float()
-        var = x_fp32.square().mean(-1, keepdim=True)
-        return (x_fp32 * torch.rsqrt(var + EPS) * weight.float()).to(torch.bfloat16)
-
-    def int8_quant_per_row(x):
-        rows = x.float().reshape(-1, x.shape[-1])
-        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = rows * scale_quant
-        out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-        scale_dequant = 1.0 / scale_quant
-        return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-    def golden_hc_post_chunked(local_tensors):
-        x = local_tensors["x"].float().reshape(T, D)
-        residual = local_tensors["residual"].float().reshape(T, HC_MULT * D)
-        post = local_tensors["post"].float().reshape(T * HC_MULT)
-        comb = local_tensors["comb"].float().reshape(T * HC_MULT * HC_MULT)
-        y = torch.empty(T, HC_MULT * D, dtype=torch.bfloat16)
-
-        d_chunk = 512
-        for out_h in range(HC_MULT):
-            for t in range(T):
-                post_w = post[t * HC_MULT + out_h]
-                for d0 in range(0, D, d_chunk):
-                    y_row = x[t:t + 1, d0:d0 + d_chunk] * post_w
-                    for in_h in range(HC_MULT):
-                        comb_w = comb[t * HC_MULT * HC_MULT + in_h * HC_MULT + out_h]
-                        residual_row = residual[
-                            t:t + 1,
-                            in_h * D + d0:in_h * D + d0 + d_chunk,
-                        ]
-                        y_row = y_row + residual_row * comb_w
-                    y[t:t + 1, out_h * D + d0:out_h * D + d0 + d_chunk] = y_row.to(torch.bfloat16)
-
-        local_tensors["y"][:] = y.reshape(B, S, HC_MULT, D)
-
-    def golden_sparse_attn_online(local_tensors):
-        q_local = local_tensors["q"].float()
-        ori_kv = local_tensors["ori_kv"].float()
-        ori_block_table = local_tensors["ori_block_table"]
-        cmp_kv_local = local_tensors["cmp_kv"].float()
-        cmp_block_table = local_tensors["cmp_block_table"]
-        sparse_indices = local_tensors["cmp_sparse_indices"]
-        attn_sink = local_tensors["attn_sink"].float()
-        seqused_kv = local_tensors["seqused_kv"]
-        cos = local_tensors["freqs_cos"].float()
-        sin = local_tensors["freqs_sin"].float()
-        wo_a = local_tensors["wo_a"].float()
-        wo_b_i8 = local_tensors["wo_b"]
-        wo_b_scale = local_tensors["wo_b_scale"].float()
-
-        attn_stage = torch.zeros(T, H, HEAD_DIM, dtype=torch.float32)
-        # Per-token gather + attention; token t belongs to batch t // S.
-        for t in range(T):
-            b = t // S
-            s = t - b * S
-            seq_used = int(seqused_kv[b].item()) - S + 1 + s
-            window_valid = min(WIN, seq_used)
-            cmp_valid = max(seq_used - window_valid, 0)
-            cmp_topk_valid = min(IDX_TOPK, cmp_valid)
-            gathered = []
-
-            for raw in sparse_indices[t, :window_valid + cmp_topk_valid].tolist():
-                if raw < 0:
-                    continue
-                if raw < WIN:
-                    if raw >= window_valid:
-                        continue
-                    blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-                    gathered.append(ori_kv[blk_id, raw % BLOCK_SIZE, 0])
-                else:
-                    cmp_slot = raw - WIN
-                    if cmp_slot >= cmp_valid:
-                        continue
-                    blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
-                    gathered.append(cmp_kv_local[blk_id, cmp_slot % BLOCK_SIZE, 0])
-
-            if not gathered:
-                continue
-
-            kv_t = torch.stack(gathered, dim=0)
-            for h in range(H):
-                q_h = q_local[t, h]
-                mi = (q_h * kv_t[0]).sum() * M.softmax_scale
-                li = torch.exp(mi - mi)
-                oi = kv_t[0].clone()
-                for kk in range(1, kv_t.shape[0]):
-                    cur_mi = (q_h * kv_t[kk]).sum() * M.softmax_scale
-                    mi_new = torch.maximum(mi, cur_mi)
-                    alpha = torch.exp(mi - mi_new)
-                    beta = torch.exp(cur_mi - mi_new)
-                    li = alpha * li + beta
-                    oi = alpha * oi + beta * kv_t[kk]
-                    mi = mi_new
-                denom = li + torch.exp(attn_sink[h] - mi)
-                attn_stage[t, h] = oi / denom
-
-        # The device stores attn_stage as BF16 before inverse RoPE.
-        attn_stage_bf16 = attn_stage.to(torch.bfloat16)
-        rope_pair = attn_stage_bf16.float()[..., NOPE_HEAD_DIM:].unflatten(-1, (-1, 2))
-        rope_even = rope_pair[..., 0]
-        rope_odd = rope_pair[..., 1]
-        cos_half = cos[:, :HALF_ROPE].unsqueeze(1)
-        sin_half = sin[:, :HALF_ROPE].unsqueeze(1)
-        inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-        inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-        o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-        o = torch.cat([attn_stage_bf16.float()[..., :NOPE_HEAD_DIM], o_rope], dim=-1).to(torch.bfloat16)
-
-        seq_per_batch = T // B
-        o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
-        o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
-        o_r = o_r.to(torch.bfloat16).float()
-        o_r_q = o_r.flatten(2).view(T, O_GROUPS * O_LORA)
-        o_r_i8, o_r_scale = int8_quant_per_row(o_r_q)
-        acc = o_r_i8.to(torch.int32) @ wo_b_i8.to(torch.int32).T
-        out = acc.float() * o_r_scale * wo_b_scale.unsqueeze(0)
-        local_tensors["attn_out"][:] = out.to(torch.bfloat16)
+    from decode_sparse_attn import golden_sparse_attn
+    from hc_post import golden_hc_post
 
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post_t = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
@@ -597,25 +478,15 @@ def golden_attention_csa(tensors):
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
-    rope_cos_t = torch.empty(T, ROPE_HEAD_DIM, dtype=freqs_cos.dtype)
-    rope_sin_t = torch.empty(T, ROPE_HEAD_DIM, dtype=freqs_sin.dtype)
-    step_cos = torch.empty(B, HALF_ROPE, dtype=torch.float32)
-    step_sin = torch.empty(B, HALF_ROPE, dtype=torch.float32)
-    cmp_cos = torch.empty(B, HALF_ROPE, dtype=torch.float32)
-    cmp_sin = torch.empty(B, HALF_ROPE, dtype=torch.float32)
+    token_pos = (start_pos_t[:, None] + torch.arange(S, dtype=torch.int64)).reshape(T)
+    rope_cos_t = freqs_cos[token_pos].contiguous()
+    rope_sin_t = freqs_sin[token_pos].contiguous()
+    step_cos = freqs_cos[start_pos_t, :HALF_ROPE].float().contiguous()
+    step_sin = freqs_sin[start_pos_t, :HALF_ROPE].float().contiguous()
+    cmp_pos = start_pos_t + (COMPRESS_RATIO - (start_pos_t % COMPRESS_RATIO)) - COMPRESS_RATIO
+    cmp_cos = freqs_cos[cmp_pos, :HALF_ROPE].float().contiguous()
+    cmp_sin = freqs_sin[cmp_pos, :HALF_ROPE].float().contiguous()
     cmp_start_pos = start_pos_t.to(torch.int32).contiguous()
-    for b in range(B):
-        pos_b = int(start_pos_t[b].item())
-        for s in range(S):
-            t = b * S + s
-            pos = pos_b + s
-            rope_cos_t[t] = freqs_cos[pos]
-            rope_sin_t[t] = freqs_sin[pos]
-        step_cos[b] = freqs_cos[pos_b, :HALF_ROPE].float()
-        step_sin[b] = freqs_sin[pos_b, :HALF_ROPE].float()
-        cmp_pos_b = pos_b + (COMPRESS_RATIO - (pos_b % COMPRESS_RATIO)) - COMPRESS_RATIO
-        cmp_cos[b] = freqs_cos[cmp_pos_b, :HALF_ROPE].float()
-        cmp_sin[b] = freqs_sin[cmp_pos_b, :HALF_ROPE].float()
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -710,7 +581,7 @@ def golden_attention_csa(tensors):
     sparse_topk[:, WIN:WIN + IDX_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :IDX_TOPK]
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_sparse_attn_online({
+    golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": ori_block_table,
@@ -730,7 +601,7 @@ def golden_attention_csa(tensors):
     })
 
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
-    golden_hc_post_chunked({
+    golden_hc_post({
         "x": attn_out.view(B, S, D),
         "residual": tensors["x_hc"],
         "post": post_t,
