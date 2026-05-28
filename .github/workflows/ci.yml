@@ -98,7 +98,7 @@ jobs:
       PTOAS_VERSION: v0.41
       PTOAS_SHA256: 4b1cbdf91faf00d4c87ce80b46b5d6d40b1fffe823df5292b26ccdf2ee7fd359
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: a1d60eb0bcdf3b6a2abe398a2b2ca0a74a18660c
+      PTO_ISA_COMMIT: 2c60793873bc28cfd15b0ec9a2724643cc4b631c
 
     steps:
       - name: Checkout pypto-lib
@@ -229,7 +229,7 @@ jobs:
       PTOAS_VERSION: v0.41
       PTOAS_SHA256: b66a7187a029e5266b38d81d76bb518820e50a49118526014251bb54b0f7f795
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: a1d60eb0bcdf3b6a2abe398a2b2ca0a74a18660c
+      PTO_ISA_COMMIT: 2c60793873bc28cfd15b0ec9a2724643cc4b631c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
