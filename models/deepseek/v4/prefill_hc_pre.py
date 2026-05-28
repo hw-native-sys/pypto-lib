@@ -51,17 +51,17 @@ def prefill_hc_pre(
     hc_scale: pl.Tensor[[3],                pl.FP32],
     hc_base:  pl.Tensor[[MIX_HC],           pl.FP32],
     x_mixed:  pl.Tensor[[B, S, D],          pl.BF16],
-    post_pad_store:  pl.Tensor[[T, HC_PAD], pl.FP32],
-    comb0_pad_store: pl.Tensor[[T, HC_PAD], pl.FP32],
-    comb1_pad_store: pl.Tensor[[T, HC_PAD], pl.FP32],
-    comb2_pad_store: pl.Tensor[[T, HC_PAD], pl.FP32],
-    comb3_pad_store: pl.Tensor[[T, HC_PAD], pl.FP32],
+    post:     pl.Tensor[[B, S, HC_MULT],    pl.FP32],
+    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, HC_DIM])
+    post_2d = pl.reshape(post, [T, HC_MULT])
+    comb_flat = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
     mix_raw = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
     pre_val_store = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
+    post_pad_store = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
     pre_val_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
 
     # Official HC pre starts with RMS over the concatenated hidden-choice lanes.
@@ -158,6 +158,17 @@ def prefill_hc_pre(
             )
             comb_logits = pl.assemble(comb_logits, comb_logits_val, [split_t0, 0])
 
+    for t0 in pl.parallel(0, T, COMB_T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hc_write_post"):
+            post_tile = pl.load(
+                post_pad_store,
+                [t0, 0],
+                [COMB_T_TILE, HC_PAD],
+                valid_shapes=[COMB_T_TILE, HC_MULT],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            post_2d = pl.store(post_tile, [t0, 0], post_2d)
+
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hc_transpose_pre"):
         for t0 in pl.range(0, T, T_TILE):
             pre_tile = pl.load(
@@ -211,10 +222,10 @@ def prefill_hc_pre(
             row2_soft = pl.add(pl.row_expand_div(row2_exp, pl.row_sum(row2_exp, row_sum_tmp)), HC_EPS)
             row3_soft = pl.add(pl.row_expand_div(row3_exp, pl.row_sum(row3_exp, row_sum_tmp)), HC_EPS)
 
-            row0_eff = pl.tile.fillpad(pl.tile.set_validshape(row0_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row1_eff = pl.tile.fillpad(pl.tile.set_validshape(row1_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row2_eff = pl.tile.fillpad(pl.tile.set_validshape(row2_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
-            row3_eff = pl.tile.fillpad(pl.tile.set_validshape(row3_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
+            row0_eff = pl.fillpad(pl.set_validshape(row0_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
+            row1_eff = pl.fillpad(pl.set_validshape(row1_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
+            row2_eff = pl.fillpad(pl.set_validshape(row2_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
+            row3_eff = pl.fillpad(pl.set_validshape(row3_soft, COMB_T_TILE, HC_MULT), pad_value=pl.PadValue.zero)
 
             row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
@@ -236,12 +247,14 @@ def prefill_hc_pre(
                 row2_cur = pl.div(row2_norm, col_sum)
                 row3_cur = pl.div(row3_norm, col_sum)
 
-            # These padded row tensors are the SSA dependency used by the
-            # fused hc_post consumer.
-            comb0_pad_store = pl.store(row0_cur, [t0, 0], comb0_pad_store)
-            comb1_pad_store = pl.store(row1_cur, [t0, 0], comb1_pad_store)
-            comb2_pad_store = pl.store(row2_cur, [t0, 0], comb2_pad_store)
-            comb3_pad_store = pl.store(row3_cur, [t0, 0], comb3_pad_store)
+            row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+            row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+            row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+            row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+            comb_flat = pl.store(row0_out, [t0, 0 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row1_out, [t0, 1 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row2_out, [t0, 2 * HC_MULT], comb_flat)
+            comb_flat = pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
 
     # Mix the HC lanes into the model dimension before qkv projection.
     x_mixed_view = pl.reshape(x_mixed, [T, D])
@@ -291,7 +304,9 @@ def prefill_hc_pre(
                     x_mixed_view,
                 )
     x_mixed = pl.reshape(x_mixed_view, [B, S, D])
-    return x_mixed, post_pad_store, comb0_pad_store, comb1_pad_store, comb2_pad_store, comb3_pad_store
+    post = pl.reshape(post_2d, [B, S, HC_MULT])
+    comb = pl.reshape(comb_flat, [B, S, HC_MULT, HC_MULT])
+    return x_mixed, post, comb
 
 
 @pl.jit
@@ -301,25 +316,19 @@ def prefill_hc_pre_test(
     hc_scale: pl.Tensor[[3],                pl.FP32],
     hc_base:  pl.Tensor[[MIX_HC],           pl.FP32],
     x_mixed:  pl.Out[pl.Tensor[[B, S, D],   pl.BF16]],
-    post_pad:  pl.Out[pl.Tensor[[T, HC_PAD], pl.FP32]],
-    comb0_pad: pl.Out[pl.Tensor[[T, HC_PAD], pl.FP32]],
-    comb1_pad: pl.Out[pl.Tensor[[T, HC_PAD], pl.FP32]],
-    comb2_pad: pl.Out[pl.Tensor[[T, HC_PAD], pl.FP32]],
-    comb3_pad: pl.Out[pl.Tensor[[T, HC_PAD], pl.FP32]],
+    post:      pl.Out[pl.Tensor[[B, S, HC_MULT], pl.FP32]],
+    comb:      pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
 ):
-    x_mixed, post_pad, comb0_pad, comb1_pad, comb2_pad, comb3_pad = prefill_hc_pre(
+    x_mixed, post, comb = prefill_hc_pre(
         x,
         hc_fn,
         hc_scale,
         hc_base,
         x_mixed,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
     )
-    return x_mixed, post_pad, comb0_pad, comb1_pad, comb2_pad, comb3_pad
+    return x_mixed, post, comb
 
 
 def golden_prefill_hc_pre(tensors):
@@ -352,12 +361,11 @@ def golden_prefill_hc_pre(tensors):
     pre_logits = mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]
     pre = torch.sigmoid(pre_logits) + HC_EPS
 
-    post_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
     post_logits = (
         mixes_2d[:, HC_MULT:HC_MULT + HC_PAD] * hc_scale[1]
         + hc_base[HC_MULT:HC_MULT + HC_PAD]
     )
-    post_pad[:, :] = 2 * torch.sigmoid(post_logits)
+    post = (2 * torch.sigmoid(post_logits[:, :HC_MULT])).reshape(B, S, HC_MULT)
 
     comb_t = (mixes[..., HC_MULT * 2:] * hc_scale[2] + hc_base[HC_MULT * 2:]).view(
         B, S, HC_MULT, HC_MULT
@@ -376,15 +384,9 @@ def golden_prefill_hc_pre(tensors):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
         return rounded.view(torch.float32).to(torch.bfloat16)
 
-    comb_pad = torch.zeros(T, HC_MULT, HC_PAD, dtype=torch.float32)
-    comb_pad[:, :, :HC_MULT] = comb_t.reshape(T, HC_MULT, HC_MULT)
-
     tensors["x_mixed"][:] = _to_device_bf16(y)
-    tensors["post_pad"][:] = post_pad
-    tensors["comb0_pad"][:] = comb_pad[:, 0, :]
-    tensors["comb1_pad"][:] = comb_pad[:, 1, :]
-    tensors["comb2_pad"][:] = comb_pad[:, 2, :]
-    tensors["comb3_pad"][:] = comb_pad[:, 3, :]
+    tensors["post"][:] = post
+    tensors["comb"][:] = comb_t
 
 
 def build_tensor_specs():
@@ -406,11 +408,8 @@ def build_tensor_specs():
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
         TensorSpec("x_mixed", [B, S, D], torch.bfloat16, is_output=True),
-        TensorSpec("post_pad", [T, HC_PAD], torch.float32, is_output=True),
-        TensorSpec("comb0_pad", [T, HC_PAD], torch.float32, is_output=True),
-        TensorSpec("comb1_pad", [T, HC_PAD], torch.float32, is_output=True),
-        TensorSpec("comb2_pad", [T, HC_PAD], torch.float32, is_output=True),
-        TensorSpec("comb3_pad", [T, HC_PAD], torch.float32, is_output=True),
+        TensorSpec("post", [B, S, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("comb", [B, S, HC_MULT, HC_MULT], torch.float32, is_output=True),
     ]
 
 
@@ -439,11 +438,8 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "post_pad": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "comb0_pad": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "comb1_pad": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "comb2_pad": ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "comb3_pad": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "post": ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            "comb": ratio_allclose(atol=2.5e-5, rtol=5e-3),
         },
         compile_only=args.compile_only,
     )
