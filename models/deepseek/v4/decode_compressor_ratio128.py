@@ -126,48 +126,45 @@ def compressor(
         kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
         if pos_b + S < COMPRESS_RATIO:
-            for o0 in pl.parallel(0, OUT_DIM, OUT_TILE):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_no_compress"):
-                    for s in pl.range(S):
-                        proj_col0 = s * OUT_DIM + o0
-                        token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                        ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
-                        slot_col0_s = token_ape_row * STATE_CHANNELS
-                        kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                        score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                        ape_base = pl.full([1, OUT_TILE], dtype=pl.FP32, value=0.0)
-                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                        kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
-                        kv_state_pool_flat = pl.assemble(kv_state_pool_flat, score_tile, [state_blk_id, slot_col0_s + OUT_DIM + o0])
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_no_compress"):
+                for s in pl.range(S):
+                    proj_col0 = s * OUT_DIM
+                    token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
+                    slot_col0_s = token_ape_row * STATE_CHANNELS
+                    ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                    kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
+                    score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                    kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
+                    kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
         else:
             if pos_b + S == COMPRESS_RATIO:
-                for o0 in pl.parallel(0, OUT_DIM, OUT_TILE):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_exact_boundary"):
-                        for s in pl.range(S):
-                            proj_col0 = s * OUT_DIM + o0
-                            token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                            ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
-                            slot_col0_s = token_ape_row * STATE_CHANNELS
-                            kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                            score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                            ape_base = pl.full([1, OUT_TILE], dtype=pl.FP32, value=0.0)
-                            score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                            kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
-                            kv_state_pool_flat = pl.assemble(kv_state_pool_flat, score_tile, [state_blk_id, slot_col0_s + OUT_DIM + o0])
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_exact_boundary"):
+                    for s in pl.range(S):
+                        proj_col0 = s * OUT_DIM
+                        token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
+                        slot_col0_s = token_ape_row * STATE_CHANNELS
+                        ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                        kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                        score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                        ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
+                        score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                        kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
+                        kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
             else:
-                for o0 in pl.parallel(0, OUT_DIM, OUT_TILE):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_pre"):
-                        for s in pl.range(pre_tokens_b):
-                            proj_col0 = s * OUT_DIM + o0
-                            token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                            ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
-                            slot_col0_s = token_ape_row * STATE_CHANNELS
-                            kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                            score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                            ape_base = pl.full([1, OUT_TILE], dtype=pl.FP32, value=0.0)
-                            score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                            kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
-                            kv_state_pool_flat = pl.assemble(kv_state_pool_flat, score_tile, [state_blk_id, slot_col0_s + OUT_DIM + o0])
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_pre"):
+                    for s in pl.range(pre_tokens_b):
+                        proj_col0 = s * OUT_DIM
+                        token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
+                        slot_col0_s = token_ape_row * STATE_CHANNELS
+                        ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                        kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                        score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                        ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
+                        score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                        kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
+                        kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
 
             for h0 in pl.parallel(0, HEAD_DIM, HEAD_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
@@ -266,23 +263,22 @@ def compressor(
                 )
 
         if pos_b + S > COMPRESS_RATIO:
-            for o0 in pl.parallel(0, OUT_DIM, OUT_TILE):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
-                    for s in pl.range(pre_tokens_b, S):
-                        proj_col0 = s * OUT_DIM + o0
-                        token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                        ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
-                        slot_col0_s = token_ape_row * STATE_CHANNELS
-                        kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                        score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_TILE]
-                        dep_tile = kv_final[0 : 1, o0 : o0 + OUT_TILE]
-                        dep_zero = pl.sub(dep_tile, dep_tile)
-                        kv_tile = pl.add(kv_tile, dep_zero)
-                        score_tile = pl.add(score_tile, dep_zero)
-                        ape_base = pl.full([1, OUT_TILE], dtype=pl.FP32, value=0.0)
-                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                        kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
-                        kv_state_pool_flat = pl.assemble(kv_state_pool_flat, score_tile, [state_blk_id, slot_col0_s + OUT_DIM + o0])
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
+                for s in pl.range(pre_tokens_b, S):
+                    proj_col0 = s * OUT_DIM
+                    token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
+                    slot_col0_s = token_ape_row * STATE_CHANNELS
+                    ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                    kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    dep_row_full = kv_final[0 : 1, 0 : OUT_DIM]
+                    dep_zero_full = pl.sub(dep_row_full, dep_row_full)
+                    kv_row_full = pl.add(kv_row_full, dep_zero_full)
+                    score_row_full = pl.add(score_row_full, dep_zero_full)
+                    ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
+                    score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                    kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
+                    kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
 
     kv_state_pool = pl.reshape(kv_state_pool_flat, [STATE_BLOCK_NUM, BLOCK_SIZE, STATE_CHANNELS])
     kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
