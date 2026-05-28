@@ -102,6 +102,16 @@ def indexer_compressor(
     # handle, letting its 64 batches spread across cores instead of serializing.
     pooled_all = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     kv_final_all = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    # Window gather buffers (BATCH-major: row = c_idx * STATE_LEN + slot). Pass 1b copies the
+    # STATE_LEN window rows (init/prev/cur, front/back halves) out of the scattered paged
+    # compress_state into the per-batch contiguous block [c_idx*STATE_LEN : +STATE_LEN], so the
+    # softmax (Pass 1c) reads contiguous data with no block-table indirection. Batch-major (not
+    # slot-major) so each gather task writes ONE disjoint contiguous block: the pass then spreads
+    # across cores like the scatter instead of pinning to 1 core (a slot-major layout + a separate
+    # whole-tensor window_init pass serialized it -- the init WAW plus strided slot*B+c_idx writes
+    # were not provably disjoint).
+    window_kv = pl.create_tensor([B * STATE_LEN, HEAD_DIM], dtype=pl.FP32)
+    window_score = pl.create_tensor([B * STATE_LEN, HEAD_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(compress_state, [COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     compress_state_block_table_flat = pl.reshape(compress_state_block_table, [B * COMPRESS_STATE_MAX_BLOCKS])
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
@@ -133,32 +143,18 @@ def indexer_compressor(
     idx_cmp_kv_proj_by_batch = pl.reshape(idx_cmp_kv_proj_scratch, [B, S * OUT_DIM])
     idx_cmp_score_proj_by_batch = pl.reshape(idx_cmp_score_proj_scratch, [B, S * OUT_DIM])
 
-    # Zero-init pooled_all: Pass 2 is coarsened to batch groups and computes every row
-    # unconditionally (the per-batch should_compress gate lives only in Pass 1/3), so the
-    # non-compressing rows must read 0 -- not uninitialized GM -- to avoid NaN propagating
-    # through the rmsnorm/rope/hadamard chain. Pass 3 still gates the actual cache write, so
-    # the garbage-free 0 rows are computed but never stored.
-    for c0 in pl.parallel(0, B, POST_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="pooled_init"):
-            pooled_all = pl.assemble(
-                pooled_all, pl.full([POST_CHUNK, HEAD_DIM], dtype=pl.FP32, value=0.0), [c0, 0]
-            )
+    # pooled_all is fully written by Pass 1c (every batch, including non-compress rows which
+    # gather-fill all-NEG_INF -> pooled 0), and window_kv/window_score are fully written by Pass 1b
+    # (all STATE_LEN slots per batch), so neither needs a separate zero/NEG_INF init pass -- the
+    # old pooled_init/window_init passes are gone (window_init in particular was serializing the
+    # gather via a whole-tensor WAW).
 
-    # Pass 1 (per-batch, block-table-bound): scatter projected kv/score into paged
-    # compress_state (o0 loop folded into one scope -> 1 task/batch, spreads to ~40 cores; the
-    # block-table WAW is not a hard serializer, the old 4-scope-per-batch structure was), then
-    # softmax-pool the completed window into contiguous pooled_all. Kept fused: both splitting
-    # softmax into its own pass and folding its spmd->range were tried and regress (softmax
-    # stays spmd-pinned to ~4 cores; isolating it or folding to a range drops it to 1 core).
-    # The fused folded-scatter + softmax-spmd is the best measured structure.
+    # Pass 1a (per-batch, block-table-bound): scatter projected kv/score into paged
+    # compress_state (o0 loop folded into one scope -> 1 task/batch, spreads across cores).
     for c_idx in pl.parallel(0, B, BATCH_CHUNK_1):
         start_pos_b = pl.read(start_pos, [c_idx])
         pos_b = start_pos_b % COMPRESS_RATIO
         ape_row_b = pl.cast(pos_b, target_type=pl.INDEX)
-        pre_tokens_b = COMPRESS_RATIO - pos_b
-        boundary_end_b = start_pos_b + pre_tokens_b - 1
-        cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
-        prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_paged"):
             for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
@@ -181,10 +177,33 @@ def indexer_compressor(
                     compress_state_flat = pl.assemble(compress_state_flat, kv_tile, [state_row, o0])
                     compress_state_flat = pl.assemble(compress_state_flat, score_tile, [state_row, OUT_DIM + o0])
 
-        if pos_b + S >= COMPRESS_RATIO:
+    # Pass 1b (per-batch, block-table-bound): gather the window rows out of the scattered paged
+    # compress_state into the BATCH-major contiguous block window[c_idx*STATE_LEN : +STATE_LEN].
+    # The block is first filled NEG_INF/0, then for a compressing batch the real rows overwrite
+    # slot 0 (last cur, back halves), slots 1..R (prev, front halves, only when prev_abs >= 0) and
+    # slots R+1.. (cur, back halves). A non-compress batch or a skipped prev keeps NEG_INF/0, which
+    # Pass 1c turns into a no-op (finite NEG_INF -> beta = exp(NEG_INF - mi) ~= 0) -> pooled 0.
+    # Because each task writes exactly its own contiguous STATE_LEN-row range, the per-task ranges
+    # are disjoint and the pass spreads across cores (the earlier slot-major layout gave every task
+    # a row range that spanned almost the whole tensor -> the dep tracker saw them all overlap and
+    # serialized to 1 core). compress_state columns: kv front [0:HEAD_DIM] / kv back
+    # [HEAD_DIM:OUT_DIM] / score front [OUT_DIM:OUT_DIM+HEAD_DIM] / score back [OUT_DIM+HEAD_DIM:].
+    for c_idx in pl.parallel(0, B, BATCH_CHUNK_1):
+        start_pos_b = pl.read(start_pos, [c_idx])
+        pos_b = start_pos_b % COMPRESS_RATIO
+        pre_tokens_b = COMPRESS_RATIO - pos_b
+        boundary_end_b = start_pos_b + pre_tokens_b - 1
+        cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
+        prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
+        base = c_idx * STATE_LEN
 
-            for hb in pl.spmd(HEAD_BLOCKS, name_hint="softmax_pool"):
-                h0 = hb * HEAD_CHUNK
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="window_gather"):
+            for slot in pl.range(0, STATE_LEN):
+                window_score = pl.assemble(window_score, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=FP32_NEG_INF), [base + slot, 0])
+                window_kv = pl.assemble(window_kv, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0), [base + slot, 0])
+
+            if pos_b + S >= COMPRESS_RATIO:
+                # slot 0 = init (last cur token, back halves).
                 last_abs = cur_window_start_b + COMPRESS_RATIO - 1
                 last_blk_off = last_abs // COMPRESS_STATE_BLOCK_SIZE
                 last_intra = last_abs % COMPRESS_STATE_BLOCK_SIZE
@@ -193,11 +212,10 @@ def indexer_compressor(
                     pl.INDEX,
                 )
                 last_row = last_blk_id * COMPRESS_STATE_BLOCK_SIZE + last_intra
-                last_col0 = OUT_DIM + HEAD_DIM + h0
-                mi = compress_state_flat[last_row : last_row + 1, last_col0 : last_col0 + HEAD_CHUNK]
-                li = pl.exp(pl.sub(mi, mi))
-                oi = compress_state_flat[last_row : last_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
+                window_score = pl.assemble(window_score, compress_state_flat[last_row : last_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base, 0])
+                window_kv = pl.assemble(window_kv, compress_state_flat[last_row : last_row + 1, HEAD_DIM : OUT_DIM], [base, 0])
 
+                # slots 1..R = prev (front halves), overwritten only when prev_abs >= 0.
                 for s in pl.range(0, COMPRESS_RATIO):
                     prev_abs = prev_window_start_b + s
                     if prev_abs >= 0:
@@ -208,15 +226,10 @@ def indexer_compressor(
                             pl.INDEX,
                         )
                         prev_row = prev_blk_id * COMPRESS_STATE_BLOCK_SIZE + prev_intra
-                        front_score = compress_state_flat[prev_row : prev_row + 1, OUT_DIM + h0 : OUT_DIM + h0 + HEAD_CHUNK]
-                        front_kv = compress_state_flat[prev_row : prev_row + 1, h0 : h0 + HEAD_CHUNK]
-                        mi_next_front = pl.maximum(mi, front_score)
-                        alpha_front = pl.exp(pl.sub(mi, mi_next_front))
-                        beta_front = pl.exp(pl.sub(front_score, mi_next_front))
-                        li = pl.add(pl.mul(alpha_front, li), beta_front)
-                        oi = pl.add(pl.mul(oi, alpha_front), pl.mul(front_kv, beta_front))
-                        mi = mi_next_front
+                        window_score = pl.assemble(window_score, compress_state_flat[prev_row : prev_row + 1, OUT_DIM : OUT_DIM + HEAD_DIM], [base + 1 + s, 0])
+                        window_kv = pl.assemble(window_kv, compress_state_flat[prev_row : prev_row + 1, 0 : HEAD_DIM], [base + 1 + s, 0])
 
+                # slots R+1.. = cur (back halves).
                 for s in pl.range(0, COMPRESS_RATIO - 1):
                     cur_abs = cur_window_start_b + s
                     cur_blk_off = cur_abs // COMPRESS_STATE_BLOCK_SIZE
@@ -226,18 +239,34 @@ def indexer_compressor(
                         pl.INDEX,
                     )
                     cur_row = cur_blk_id * COMPRESS_STATE_BLOCK_SIZE + cur_intra
-                    back_col0 = OUT_DIM + HEAD_DIM + h0
-                    back_score = compress_state_flat[cur_row : cur_row + 1, back_col0 : back_col0 + HEAD_CHUNK]
-                    back_kv = compress_state_flat[cur_row : cur_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK]
-                    mi_next_back = pl.maximum(mi, back_score)
-                    alpha_back = pl.exp(pl.sub(mi, mi_next_back))
-                    beta_back = pl.exp(pl.sub(back_score, mi_next_back))
-                    li = pl.add(pl.mul(alpha_back, li), beta_back)
-                    oi = pl.add(pl.mul(oi, alpha_back), pl.mul(back_kv, beta_back))
-                    mi = mi_next_back
+                    window_score = pl.assemble(window_score, compress_state_flat[cur_row : cur_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
+                    window_kv = pl.assemble(window_kv, compress_state_flat[cur_row : cur_row + 1, HEAD_DIM : OUT_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
 
-                pooled_chunk = pl.div(oi, li)
-                pooled_all = pl.assemble(pooled_all, pooled_chunk, [c_idx, h0])
+    # Pass 1c (per-batch, NO block table): online softmax-pool over the contiguous batch-major
+    # window block window[c_idx*STATE_LEN : +STATE_LEN] (STATE_LEN rows) -> pooled_all[c_idx]. With
+    # no block-table indirection (unlike the fused-spmd baseline that pinned to ~1 core via the
+    # dynamic paged read) and per-batch-disjoint pooled_all writes, this spreads across cores. Slot
+    # order (0=init/last, 1..R=prev, R+1..=cur) matches the old per-batch online loop, so for valid
+    # batches it is bit-identical; a NEG_INF slot (skipped prev / non-compress) gives alpha=exp(0)=1,
+    # beta=exp(NEG_INF-mi)~=0 -> a no-op update, no NaN.
+    for c_idx in pl.parallel(0, B, BATCH_CHUNK_1):
+        base = c_idx * STATE_LEN
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
+            mi = window_score[base : base + 1, 0 : HEAD_DIM]
+            li = pl.exp(pl.sub(mi, mi))
+            oi = window_kv[base : base + 1, 0 : HEAD_DIM]
+
+            for slot in pl.range(1, STATE_LEN):
+                slot_score = window_score[base + slot : base + slot + 1, 0 : HEAD_DIM]
+                slot_kv = window_kv[base + slot : base + slot + 1, 0 : HEAD_DIM]
+                mi_next = pl.maximum(mi, slot_score)
+                alpha = pl.exp(pl.sub(mi, mi_next))
+                beta = pl.exp(pl.sub(slot_score, mi_next))
+                li = pl.add(pl.mul(alpha, li), beta)
+                oi = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
+                mi = mi_next
+
+            pooled_all = pl.assemble(pooled_all, pl.div(oi, li), [c_idx, 0])
 
     # Pass 2 (batch-group coarsened, NO block-table): rmsnorm + rope + hadamard. Reads
     # pooled_all read-only and writes contiguous kv_final_all -- no in-place RW, no paged
