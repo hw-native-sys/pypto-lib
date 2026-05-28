@@ -173,7 +173,7 @@ def compressor(
         cos_b = cos[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         sin_b = sin[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         pooled_kv = pooled_kv_all[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, :]
-        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.BF16)
+        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
         kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
         # RMSNorm + Selector-based RoPE
@@ -183,27 +183,20 @@ def compressor(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
             partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
             for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=4):
-                kv_rms_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE], target_type=pl.BF16, mode="rint"),
-                    target_type=pl.FP32,
-                )
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, POST_TILE]),
-                )
+                kv_rms_chunk = pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+                kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+                kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, POST_TILE])
+                partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [POST_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
             for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=4):
-                kv_norm_chunk = pl.cast(
-                    pl.cast(pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE], target_type=pl.BF16, mode="rint"),
-                    target_type=pl.FP32,
-                )
+                kv_norm_chunk = pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
+                normed_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
 
-            kv_rope_fp32 = pl.cast(normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM], target_type=pl.FP32)
+            kv_rope_fp32 = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
             even_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
             odd_tile = pl.gather(kv_rope_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
             rope_even[:, :] = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
@@ -212,16 +205,12 @@ def compressor(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
             rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
             rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-            normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
+            normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_acc
 
         cache_col = start_pos_b // COMPRESS_RATIO
         for o0 in pl.parallel(0, HEAD_DIM, OUT_TILE):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
-                kv_out_tile = normed_kv[:, o0 : o0 + OUT_TILE]
-                kv_out_fp32 = pl.cast(kv_out_tile, target_type=pl.FP32)
-                kv_final[:, o0 : o0 + OUT_TILE] = kv_out_fp32
+                kv_final[:, o0 : o0 + OUT_TILE] = normed_kv[:, o0 : o0 + OUT_TILE]
 
         if pos_b + S >= COMPRESS_RATIO:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
@@ -353,21 +342,21 @@ def golden_compressor(tensors):
         x = x.float()
         var = x.square().mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + EPS)
-        return (w * x).to(torch.bfloat16)
+        return w * x
 
     for b in range(bsz):
         if not bool(should_compress_rows[b]):
             continue
         start_pos = int(start_pos_t[b].item())
-        kv_b = rmsnorm(pooled[b : b + 1].to(torch.bfloat16), norm_w)
+        kv_b = rmsnorm(pooled[b : b + 1], norm_w)
 
         x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
         x0, x1 = x_pair[..., 0], x_pair[..., 1]
         cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
-        y0 = (x0 * cos_v - x1 * sin_v).to(torch.bfloat16)
-        y1 = (x0 * sin_v + x1 * cos_v).to(torch.bfloat16)
+        y0 = (x0 * cos_v - x1 * sin_v).to(torch.bfloat16).float()
+        y1 = (x0 * sin_v + x1 * cos_v).to(torch.bfloat16).float()
 
-        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1).float()
+        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0.
         tensors["kv"][b : b + 1, 0:1, :] = kv_b
