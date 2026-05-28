@@ -170,7 +170,6 @@ def compressor(
         state_blk_id = pl.cast(pl.read(state_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
         cmp_blk_id = pl.cast(pl.read(cmp_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
         normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
-        kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
         # Fused RMSNorm + gather/scatter-based RoPE (FP32 throughout)
         norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
@@ -203,13 +202,9 @@ def compressor(
             normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf_fp32
 
         cache_col = start_pos_b // COMPRESS_RATIO
-        for o0 in pl.parallel(0, HEAD_DIM, OUT_TILE):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
-                kv_final[:, o0 : o0 + OUT_TILE] = normed_kv[:, o0 : o0 + OUT_TILE]
-
         if pos_b + S >= COMPRESS_RATIO:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write_and_scatter_next"):
-                kv_row_fp32 = kv_final[0 : 1, 0 : HEAD_DIM]
+                kv_row_fp32 = normed_kv[0 : 1, 0 : HEAD_DIM]
                 kv_flat[global_c_idx * S : global_c_idx * S + 1, :] = kv_row_fp32
                 phys_cmp_row = cmp_blk_id * BLOCK_SIZE + cache_col
                 cmp_kv_pool_flat[phys_cmp_row : phys_cmp_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
