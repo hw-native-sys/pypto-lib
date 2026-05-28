@@ -85,33 +85,33 @@ def compressor(
     # Cmp pool flat view: physical rows are linearized across all blocks.
     cmp_kv_pool_flat = pl.reshape(cmp_kv_pool, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
 
-    for batch_base in pl.parallel(0, B, BATCH_TILE_0):
-        cmp128_kv_proj_scratch = pl.create_tensor([BATCH_TILE_0 * S, OUT_DIM], dtype=pl.FP32)
-        cmp128_score_proj_scratch = pl.create_tensor([BATCH_TILE_0 * S, OUT_DIM], dtype=pl.FP32)
+    cmp128_kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
+    cmp128_score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
+
+    for global_row0 in pl.parallel(0, B * S, BATCH_TILE_0):
         for o0 in pl.parallel(0, OUT_DIM, OUT_TILE):
-            for row0 in pl.parallel(0, BATCH_TILE_0 * S, BATCH_TILE_0):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
-                    global_row0 = batch_base * S + row0
-                    kv_acc = pl.create_tensor([BATCH_TILE_0, OUT_TILE], dtype=pl.FP32)
-                    score_acc = pl.create_tensor([BATCH_TILE_0, OUT_TILE], dtype=pl.FP32)
-                    for kb in pl.pipeline(0, D // K_TILE, stage=2):
-                        k0 = kb * K_TILE
-                        x_tile = x_flat[global_row0 : global_row0 + BATCH_TILE_0, k0 : k0 + K_TILE]
-                        wkv_tile = wkv[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
-                        wgate_tile = wgate[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
-                        if k0 == 0:
-                            kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
-                            score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
-                        else:
-                            kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
-                            score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
+                kv_acc = pl.create_tensor([BATCH_TILE_0, OUT_TILE], dtype=pl.FP32)
+                score_acc = pl.create_tensor([BATCH_TILE_0, OUT_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                    k0 = kb * K_TILE
+                    x_tile = x_flat[global_row0 : global_row0 + BATCH_TILE_0, k0 : k0 + K_TILE]
+                    wkv_tile = wkv[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
+                    wgate_tile = wgate[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
+                    if k0 == 0:
+                        kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
+                        score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+                    else:
+                        kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
+                        score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
 
-                    cmp128_kv_proj_scratch = pl.assemble(cmp128_kv_proj_scratch, kv_acc, [row0, o0])
-                    cmp128_score_proj_scratch = pl.assemble(cmp128_score_proj_scratch, score_acc, [row0, o0])
+                cmp128_kv_proj_scratch[global_row0 : global_row0 + BATCH_TILE_0, o0 : o0 + OUT_TILE] = kv_acc
+                cmp128_score_proj_scratch[global_row0 : global_row0 + BATCH_TILE_0, o0 : o0 + OUT_TILE] = score_acc
 
-        cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [BATCH_TILE_0, S * OUT_DIM])
-        cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [BATCH_TILE_0, S * OUT_DIM])
+    cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [B, S * OUT_DIM])
+    cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [B, S * OUT_DIM])
 
+    for batch_base in pl.parallel(0, B, BATCH_TILE_0):
         for c_idx in pl.parallel(0, BATCH_TILE_0, BATCH_TILE_1):
             global_c_idx = batch_base + c_idx
             start_pos_b = pl.read(start_pos, [global_c_idx])
@@ -136,8 +136,8 @@ def compressor(
                             token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
                             ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
                             slot_col0_s = token_ape_row * STATE_CHANNELS
-                            kv_tile = cmp128_kv_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
-                            score_tile = cmp128_score_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                            kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                            score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
                             ape_base = pl.full([BATCH_TILE_1, OUT_TILE], dtype=pl.FP32, value=0.0)
                             score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
                             kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
@@ -151,8 +151,8 @@ def compressor(
                                 token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
                                 ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
                                 slot_col0_s = token_ape_row * STATE_CHANNELS
-                                kv_tile = cmp128_kv_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
-                                score_tile = cmp128_score_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                                kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                                score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
                                 ape_base = pl.full([BATCH_TILE_1, OUT_TILE], dtype=pl.FP32, value=0.0)
                                 score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
                                 kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
@@ -165,8 +165,8 @@ def compressor(
                                 token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
                                 ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
                                 slot_col0_s = token_ape_row * STATE_CHANNELS
-                                kv_tile = cmp128_kv_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
-                                score_tile = cmp128_score_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                                kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                                score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
                                 ape_base = pl.full([BATCH_TILE_1, OUT_TILE], dtype=pl.FP32, value=0.0)
                                 score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
                                 kv_state_pool_flat = pl.assemble(kv_state_pool_flat, kv_tile, [state_blk_id, slot_col0_s + o0])
@@ -278,8 +278,8 @@ def compressor(
                             token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
                             ape_tile = ape[token_ape_row : token_ape_row + 1, o0 : o0 + OUT_TILE]
                             slot_col0_s = token_ape_row * STATE_CHANNELS
-                            kv_tile = cmp128_kv_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
-                            score_tile = cmp128_score_proj_by_batch[c_idx : c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                            kv_tile = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
+                            score_tile = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + BATCH_TILE_1, proj_col0 : proj_col0 + OUT_TILE]
                             dep_tile = kv_final[0 : BATCH_TILE_1, o0 : o0 + OUT_TILE]
                             dep_zero = pl.sub(dep_tile, dep_tile)
                             kv_tile = pl.add(kv_tile, dep_zero)
