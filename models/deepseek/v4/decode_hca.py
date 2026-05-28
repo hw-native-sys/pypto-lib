@@ -48,21 +48,21 @@ COMPRESS_RATIO = 128
 OVERLAP = COMPRESS_RATIO == 4           # always False for HCA
 COFF = 1 + int(OVERLAP)                 # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
-MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 ORI_MAX_BLOCKS = 1
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+COMPRESS_STATE_MAX_BLOCKS = 64
+COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
+COMPRESS_STATE_BLOCK_SIZE = BLOCK_SIZE
+COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 SPARSE_IDX_TOPK = M.index_topk
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 START_POS = COMPRESS_RATIO - S       # default fixture exercises a compression step
 
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
+SPARSE_ROPE_TILE = 16
+SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 
 # ---- moe-local constants ----
 N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card simplification: router routes over local shard only
@@ -92,17 +92,17 @@ def decode_hca(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # ---- main compressor (ratio=128) ----
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    cmp_even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     # ---- attention KV cache (split into ori + cmp pools) ----
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -153,8 +153,8 @@ def decode_hca(
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_even_select, cmp_odd_select,
-        cmp_kv_state, cmp_score_state,
+        cmp_even_idx, cmp_odd_idx,
+        compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
@@ -195,16 +195,16 @@ def decode_hca_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
+    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    cmp_even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -246,8 +246,8 @@ def decode_hca_test(
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_even_select, cmp_odd_select,
-        cmp_kv_state, cmp_score_state,
+        cmp_even_idx, cmp_odd_idx,
+        compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
@@ -308,8 +308,8 @@ def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_sta
         "freqs_cos", "freqs_sin", "even_select_t", "odd_select_t",
         "even_select_local", "odd_select_local",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
-        "cmp_even_select", "cmp_odd_select",
-        "cmp_kv_state", "cmp_score_state",
+        "cmp_even_idx", "cmp_odd_idx",
+        "compress_state", "compress_state_block_table",
         "kv_cache", "ori_block_table", "cmp_kv", "cmp_block_table",
         "attn_sink", "seqused_kv",
         "wo_a", "wo_b", "wo_b_scale",
@@ -346,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
