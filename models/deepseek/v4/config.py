@@ -246,6 +246,7 @@ PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel p
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
+C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127

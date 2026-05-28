@@ -29,7 +29,15 @@ surface.
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    BLOCK_SIZE,
+    C4A_COMPRESSOR_BLOCK_SIZE,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+)
 from decode_compressor_ratio4 import compressor
 from hc_post import hc_post
 from hc_pre import hc_pre
@@ -81,6 +89,10 @@ COFF = 1 + int(OVERLAP)
 
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
+MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+MAIN_STATE_MAX_BLOCKS = 64
+MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
+MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
@@ -131,8 +143,8 @@ def attention_csa(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -236,15 +248,12 @@ def attention_csa(
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    cmp_dense_unused = pl.create_tensor([B, IDX_KV_LEN, HEAD_DIM], dtype=pl.BF16)
     hadamard_main = pl.create_tensor([HEAD_DIM, HEAD_DIM], dtype=pl.BF16)
-    cmp_kv_state_unused = pl.create_tensor([B, MAIN_STATE_LEN, MAIN_OUT_DIM], dtype=pl.FP32)
-    cmp_score_state_unused = pl.create_tensor([B, MAIN_STATE_LEN, MAIN_OUT_DIM], dtype=pl.FP32)
-    cmp_out, cmp_kv_state_unused, cmp_score_state_unused, cmp_dense_unused = compressor(
+    cmp_out, compress_state, cmp_kv = compressor(
         x_mixed,
         cmp_out,
-        cmp_kv_state,
-        cmp_score_state,
+        compress_state,
+        compress_state_block_table,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -254,25 +263,11 @@ def attention_csa(
         even_select,
         odd_select,
         hadamard_main,
-        cmp_dense_unused,
+        cmp_kv,
+        cmp_block_table,
         cmp_start_pos,
         ROTATE_MAIN,
     )
-
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_cmp"):
-        for b in pl.parallel(B):
-            start_pos_b = pl.read(start_pos, [b])
-            if (start_pos_b % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-                cmp_slot_rel = start_pos_b // COMPRESS_RATIO
-                cmp_intra = cmp_slot_rel % BLOCK_SIZE
-                cmp_blk_off = cmp_slot_rel // BLOCK_SIZE
-                cmp_blk_id = pl.cast(pl.read(cmp_block_table_flat, [b * CMP_MAX_BLOCKS + cmp_blk_off]), pl.INDEX)
-                cmp_dst_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-                cmp_row = pl.cast(pl.reshape(cmp_out[b:b + 1, 0:1, 0:HEAD_DIM], [1, HEAD_DIM]), target_type=pl.BF16)
-                cmp_kv_flat = pl.assemble(cmp_kv_flat, cmp_row, [cmp_dst_row, 0])
-    cmp_kv = pl.reshape(cmp_kv_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
@@ -368,8 +363,8 @@ def attention_csa_test_refresh(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -417,8 +412,8 @@ def attention_csa_test_refresh(
         cmp_wgate,
         cmp_ape,
         cmp_norm_w,
-        cmp_kv_state,
-        cmp_score_state,
+        compress_state,
+        compress_state_block_table,
         idx_wq_b,
         idx_wq_b_scale,
         weights_proj,
@@ -649,12 +644,11 @@ def golden_attention_csa(tensors):
         kv_cache[blk_id, intra, 0] = kv[t]
 
     cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
-    cmp_dense = torch.zeros(B, IDX_KV_LEN, HEAD_DIM, dtype=torch.bfloat16)
     golden_compressor({
         "x": x_mixed,
         "kv": cmp_out,
-        "kv_state": tensors["cmp_kv_state"],
-        "score_state": tensors["cmp_score_state"],
+        "compress_state": tensors["compress_state"],
+        "compress_state_block_table": tensors["compress_state_block_table"],
         "wkv": tensors["cmp_wkv"],
         "wgate": tensors["cmp_wgate"],
         "ape": tensors["cmp_ape"],
@@ -664,17 +658,11 @@ def golden_attention_csa(tensors):
         "even_select": tensors["even_select"],
         "odd_select": tensors["odd_select"],
         "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),
-        "kv_cache": cmp_dense,
+        "cmp_kv_cache": cmp_kv,
+        "cmp_block_table": cmp_block_table,
         "start_pos": cmp_start_pos,
         "rotate": False,
     })
-    for b in range(B):
-        start_pos_b = int(start_pos_t[b].item())
-        if (start_pos_b % COMPRESS_RATIO) + S >= COMPRESS_RATIO:
-            cmp_slot_rel = start_pos_b // COMPRESS_RATIO
-            blk_id = int(cmp_block_table[b, cmp_slot_rel // BLOCK_SIZE].item())
-            intra = cmp_slot_rel % BLOCK_SIZE
-            cmp_kv[blk_id, intra, 0] = cmp_out[b, 0].to(torch.bfloat16)
 
     idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
@@ -855,11 +843,17 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_cmp_norm_w():
         return torch.ones(HEAD_DIM)
 
-    def init_cmp_kv_state():
-        return torch.zeros(B, MAIN_STATE_LEN, MAIN_OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
+        state[:, :, MAIN_OUT_DIM:] = float("-inf")
+        return state
 
-    def init_cmp_score_state():
-        return torch.full((B, MAIN_STATE_LEN, MAIN_OUT_DIM), float("-inf"))
+    def init_compress_state_block_table():
+        tbl = torch.full((B, MAIN_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(MAIN_STATE_MAX_BLOCKS):
+                tbl[b, j] = b * MAIN_STATE_MAX_BLOCKS + j
+        return tbl
 
     def init_idx_wq_b():
         return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
@@ -1002,8 +996,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
-        TensorSpec("cmp_kv_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_kv_state),
-        TensorSpec("cmp_score_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_score_state),
+        TensorSpec("compress_state", [MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], torch.float32, init_value=init_compress_state),
+        TensorSpec("compress_state_block_table", [B, MAIN_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
         TensorSpec("idx_wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: idx_wq_b_scale),
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: shared_weights_proj.clone()),
