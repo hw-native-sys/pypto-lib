@@ -13,7 +13,7 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
 from decode_indexer_compressor import indexer_compressor
 
 # model config
@@ -41,13 +41,20 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
+INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+INNER_STATE_MAX_BLOCKS = 64
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+INNER_STATE_DIM = 2 * INNER_OUT_DIM
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
+IDX_CACHE_MAX_BLOCKS = 64
+IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 SCORE_LEN = IDX_KV_LEN
 START_POS = 254      # ScalarSpec default; >0 (decode) and (START_POS+S)%COMPRESS_RATIO==0
 
 # tiling
 CACHE_TILE = 32
+assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
 MAX_CACHE_BLOCKS = SCORE_LEN // CACHE_TILE
 Q_CHUCK = 128
 # Output-head tile of the qr_proj matmul; also the pl.parallel step over the
@@ -117,13 +124,14 @@ def indexer(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.FP32],
-    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],  # decode step; varies per row
@@ -253,11 +261,11 @@ def indexer(
                     weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
             weights[t0 : t0 + WEIGHTS_ROW_CHUNK, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
-    inner_kv, inner_kv_state, inner_score_state, idx_kv_cache = indexer_compressor(
+    inner_kv, inner_compress_state, idx_kv_cache = indexer_compressor(
         x,
         inner_kv,
-        inner_kv_state,
-        inner_score_state,
+        inner_compress_state,
+        inner_compress_state_block_table,
         inner_wkv,
         inner_wgate,
         inner_ape,
@@ -268,11 +276,13 @@ def indexer(
         odd_select,
         hadamard,
         idx_kv_cache,
+        idx_block_table,
         start_pos,
         inner_rotate,
     )
 
-    kv_cache_flat = pl.reshape(idx_kv_cache, [B * IDX_KV_LEN, IDX_HEAD_DIM])
+    kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
+    idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
     # TODO: For true var-len batching, pass explicit max_cache_len/max_cache_blocks
     # metadata instead of deriving the score loop bound from row0.
@@ -298,13 +308,19 @@ def indexer(
                     cache_len_b = (start_pos_b + S) // COMPRESS_RATIO
                     if cache0 < cache_len_b:
                         valid_len = pl.min(CACHE_TILE, cache_len_b - cache0)
-                        kv0 = b * IDX_KV_LEN
+                        idx_blk_off = cache0 // BLOCK_SIZE
+                        idx_intra = cache0 % BLOCK_SIZE
+                        idx_blk_id = pl.cast(
+                            pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + idx_blk_off]),
+                            pl.INDEX,
+                        )
+                        kv0 = idx_blk_id * BLOCK_SIZE + idx_intra
                         t0 = b * S
                         q0 = b * S * IDX_N_HEADS
                         # --- KV INT8 quant scale (full-128-dim amax), kept in UB ---
                         kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                         for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                            kv_a_tile = kv_cache_flat[kv0 + cache0 : kv0 + cache0 + CACHE_TILE, h0 : h0 + HEAD_DIM_CHUCK]
+                            kv_a_tile = kv_cache_flat[kv0 : kv0 + CACHE_TILE, h0 : h0 + HEAD_DIM_CHUCK]
                             kv_a_f32 = pl.cast(kv_a_tile, target_type=pl.FP32)
                             kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
                             kv_a_max = pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE])
@@ -322,7 +338,7 @@ def indexer(
                         for s in pl.range(S):
                             score_acc_s = pl.create_tensor([CACHE_TILE, IDX_N_HEADS], dtype=pl.INT32)
                             for h in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                                kv_q_f32 = pl.cast(kv_cache_flat[kv0 + cache0 : kv0 + cache0 + CACHE_TILE, h : h + HEAD_DIM_CHUCK], target_type=pl.FP32)
+                                kv_q_f32 = pl.cast(kv_cache_flat[kv0 : kv0 + CACHE_TILE, h : h + HEAD_DIM_CHUCK], target_type=pl.FP32)
                                 kv_q_scaled = pl.row_expand_mul(kv_q_f32, kv_scale_quant)
                                 kv_q_i32 = pl.cast(kv_q_scaled, target_type=pl.INT32, mode="rint")
                                 kv_q_half = pl.cast(kv_q_i32, target_type=pl.FP16, mode="round")
@@ -385,13 +401,14 @@ def indexer_test(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.FP32],
-    idx_kv_cache: pl.Out[pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
     start_pos: pl.Tensor[[B], pl.INT32],
@@ -411,13 +428,14 @@ def indexer_test(
         odd_select,
         hadamard,
         inner_kv,
-        inner_kv_state,
-        inner_score_state,
+        inner_compress_state,
+        inner_compress_state_block_table,
         inner_wkv,
         inner_wgate,
         inner_ape,
         inner_norm_w,
         idx_kv_cache,
+        idx_block_table,
         score,
         topk_idxs,
         start_pos,
@@ -492,8 +510,6 @@ def golden_indexer(tensors):
     inner_tensors = {
         "x": tensors["x"],
         "kv": tensors["inner_kv"],
-        "kv_state": tensors["inner_kv_state"],
-        "score_state": tensors["inner_score_state"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
         "ape": tensors["inner_ape"],
@@ -503,7 +519,10 @@ def golden_indexer(tensors):
         "even_select": tensors["even_select"],
         "odd_select": tensors["odd_select"],
         "hadamard": tensors["hadamard"],
-        "kv_cache": tensors["idx_kv_cache"],
+        "compress_state": tensors["inner_compress_state"],
+        "compress_state_block_table": tensors["inner_compress_state_block_table"],
+        "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_block_table": tensors["idx_block_table"],
         "start_pos": tensors["start_pos"],
         "rotate": tensors["inner_rotate"],
     }
@@ -512,6 +531,7 @@ def golden_indexer(tensors):
     weights = (x @ weights_proj) * WEIGHTS_SCALE
 
     idx_kv_cache = tensors["idx_kv_cache"].float()
+    idx_block_table = tensors["idx_block_table"]
     score_full = torch.full((bsz, seqlen, SCORE_LEN), FP32_NEG_INF, dtype=torch.float32)
     topk_idxs = torch.full((bsz, seqlen, SCORE_LEN), -1, dtype=torch.int32)
     q_i8, q_scale = _int8_quant_per_row(q.reshape(B * S * IDX_N_HEADS, IDX_HEAD_DIM))
@@ -524,7 +544,11 @@ def golden_indexer(tensors):
         if cache_len <= 0:
             continue
 
-        kv_view = idx_kv_cache[b : b + 1, :cache_len]
+        kv_rows = []
+        for slot in range(cache_len):
+            blk_id = int(idx_block_table[b, slot // BLOCK_SIZE].item())
+            kv_rows.append(idx_kv_cache[blk_id, slot % BLOCK_SIZE, 0])
+        kv_view = torch.stack(kv_rows, dim=0).unsqueeze(0)
         kv_i8, kv_scale = _int8_quant_per_row(kv_view.reshape(cache_len, IDX_HEAD_DIM))
         kv_i8 = kv_i8.view(cache_len, IDX_HEAD_DIM)
         kv_scale = kv_scale.view(cache_len, 1)
@@ -571,10 +595,16 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return M
     def init_hadamard():
         return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
-    def init_inner_kv_state():
-        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
-    def init_inner_score_state():
-        return torch.zeros(B, INNER_STATE_LEN, INNER_OUT_DIM)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
+        state[:, :, INNER_OUT_DIM:] = FP32_NEG_INF
+        return state
+    def init_inner_compress_state_block_table():
+        tbl = torch.full((B, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(INNER_STATE_MAX_BLOCKS):
+                tbl[b, j] = b * INNER_STATE_MAX_BLOCKS + j
+        return tbl
     def init_inner_wkv():
         return torch.rand(D, INNER_OUT_DIM)
     def init_inner_wgate():
@@ -584,7 +614,13 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_inner_norm_w():
         return torch.ones(INNER_HEAD_DIM)
     def init_idx_kv_cache():
-        return torch.zeros(B, IDX_KV_LEN, IDX_HEAD_DIM)
+        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+    def init_idx_block_table():
+        tbl = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(IDX_CACHE_MAX_BLOCKS):
+                tbl[b, j] = b * IDX_CACHE_MAX_BLOCKS + j
+        return tbl
     def init_start_pos():
         vals = torch.full((B,), start_pos, dtype=torch.int32)
         if hetero_start_pos:
@@ -610,13 +646,14 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("inner_kv", [B, S, INNER_HEAD_DIM], torch.float32),
-        TensorSpec("inner_kv_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
-        TensorSpec("inner_score_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_score_state),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
+        TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("inner_wkv", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.float32, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [B, IDX_KV_LEN, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.
         TensorSpec("score", [B, S, SCORE_LEN], torch.float32, is_output=True),
         TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32, is_output=True),
@@ -677,7 +714,7 @@ if __name__ == "__main__":
         compare_fn={
             "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs":    topk_idxs_compare,
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE)),
         },
     )
     if not result.passed:
