@@ -125,8 +125,8 @@ def indexer_compressor(
         kv_final = pl.create_tensor([POST_CHUNK, HEAD_DIM], dtype=pl.FP32)
 
         if pos_b + S < COMPRESS_RATIO:
-            for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_no_compress"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_no_compress"):
+                for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
                     for s in pl.range(S):
                         proj_col0 = s * OUT_DIM + o0
                         token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
@@ -140,8 +140,8 @@ def indexer_compressor(
                         score_state_flat = pl.assemble(score_state_flat, score_tile, [c_idx, slot_col0_s + o0])
         else:
             if pos_b + S == COMPRESS_RATIO:
-                for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_exact_boundary"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_exact_boundary"):
+                    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
                         for s in pl.range(S):
                             proj_col0 = s * OUT_DIM + o0
                             token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
@@ -154,8 +154,8 @@ def indexer_compressor(
                             kv_state_flat = pl.assemble(kv_state_flat, kv_tile, [c_idx, slot_col0_s + o0])
                             score_state_flat = pl.assemble(score_state_flat, score_tile, [c_idx, slot_col0_s + o0])
             else:
-                for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_pre"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_pre"):
+                    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
                         for s in pl.range(pre_tokens_b):
                             proj_col0 = s * OUT_DIM + o0
                             token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
@@ -200,8 +200,8 @@ def indexer_compressor(
                 pooled_chunk = pl.div(oi, li)
                 pooled_kv = pl.assemble(pooled_kv, pooled_chunk, [0, h0])
 
-            for s in pl.range(0, COMPRESS_RATIO, 1):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_shift"):
+                for s in pl.range(0, COMPRESS_RATIO, 1):
                     src_col0 = (COMPRESS_RATIO + s) * OUT_DIM
                     dst_col0 = s * OUT_DIM
                     for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
@@ -294,8 +294,8 @@ def indexer_compressor(
                     )
 
             if pos_b + S > COMPRESS_RATIO:
-                for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
-                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_next"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_crossing_next"):
+                    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
                         for s in pl.range(pre_tokens_b, S):
                             proj_col0 = s * OUT_DIM + o0
                             shift_dep_col0 = (COMPRESS_RATIO - 1) * OUT_DIM + o0

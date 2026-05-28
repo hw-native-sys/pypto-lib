@@ -50,7 +50,12 @@ START_POS = 254      # ScalarSpec default; >0 (decode) and (START_POS+S)%COMPRES
 CACHE_TILE = 32
 MAX_CACHE_BLOCKS = SCORE_LEN // CACHE_TILE
 Q_CHUCK = 128
-Q_OUT_CHUCK = 128
+# Output-head tile of the qr_proj matmul; also the pl.parallel step over the
+# IDX_N_HEADS*IDX_HEAD_DIM output. Doubled 128->256 to halve the task count (64->32):
+# the [T,256] INT32 acc = 128KB fits the 192KB buffer, and the row-chunked dequant epilogue
+# tile [QR_PROJ_ROW_CHUNK,256] stays small. 512 overflows (acc [T,512]=256KB > 192KB; the
+# UP_DOWN row-split does NOT shrink this create_tensor), so 256 is the ceiling here.
+Q_OUT_CHUCK = 256
 # Inner row-chunk for the qr_proj dequant epilogue so matmul+dequant fits 192KB Vec.
 QR_PROJ_ROW_CHUNK = 16 if T % 16 == 0 else T
 ROPE_CHUCK = 16
@@ -65,10 +70,19 @@ QUANT_CHUNK = 128 if T >= 64 else 256
 # and GRP=8 overflows L0C (qr_hadamard_acc [GRP*64,128] FP32 = 256KB).
 HEAD_GROUP = 2 if T >= 2 else 1
 HEAD_ROWS = IDX_N_HEADS * HEAD_GROUP
-# The 4 rope scopes are not Vec-buffer bound (no [.,128] resident tile like
-# qr_hadamard_quant), so they fold at a larger group in their own loop.
-HEAD_GROUP_ROPE = 4 if T >= 4 else HEAD_GROUP
+# The rope scope is not Vec/L0C-buffer bound: its inner pl.range(ROPE_ROW_CHUNK)
+# keeps the per-chunk matmul/Vec fixed at IDX_N_HEADS rows regardless of the group, so
+# raising HEAD_GROUP_ROPE only adds inner iterations per task (no buffer growth). Doubled
+# 4->8 to halve the task count (32->16). qr_hadamard CANNOT share this group (its whole
+# [HEAD_ROWS,128] FP32 matmul-out is L0C-bound), so it has its own HEAD_GROUP_HAD below.
+HEAD_GROUP_ROPE = 16 if T >= 16 else HEAD_GROUP
 HEAD_ROWS_ROPE = IDX_N_HEADS * HEAD_GROUP_ROPE
+# qr_hadamard's matmul output [HEAD_ROWS_HAD, IDX_HEAD_DIM] FP32 sits whole in L0C, so its
+# group is capped at 4 (256 rows -> 128KB L0C). Decoupled from HEAD_GROUP_ROPE so rope can
+# grow without overflowing the hadamard accumulator.
+HEAD_GROUP_HAD = 4 if T >= 4 else HEAD_GROUP
+HEAD_ROWS_HAD = IDX_N_HEADS * HEAD_GROUP_HAD
+assert (T * IDX_N_HEADS) % HEAD_ROWS_HAD == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS_HAD"
 # Inner row-chunk for the mix-fused rope_slice: matmul+cast per ROPE_ROW_CHUNK rows so
 # the fused acc+epilogue fits 192KB Vec at GRP=4 (vs whole HEAD_ROWS_ROPE at once = 344KB).
 ROPE_ROW_CHUNK = IDX_N_HEADS
@@ -189,16 +203,17 @@ def indexer(
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
                 qr_rope_out[o0 + ro : o0 + ro + IDX_N_HEADS, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
-    # qr_hadamard is a cube-only matmul (output [HEAD_ROWS_ROPE, IDX_HEAD_DIM] FP32 =
-    # 128KB L0C at GRP=4), so it folds at the larger rope group in its own loop. GRP=4
-    # already saturates the 128KB L0C Acc limit, so this group cannot grow further.
-    for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_ROPE):
+    # qr_hadamard is a cube-only matmul (output [HEAD_ROWS_HAD, IDX_HEAD_DIM] FP32 =
+    # 128KB L0C at GRP=4), so it runs in its own loop. GRP=4 already saturates the 128KB
+    # L0C Acc limit, so this group cannot grow further (it is decoupled from HEAD_ROWS_ROPE
+    # precisely so rope can fold larger without overflowing this accumulator).
+    for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_HAD):
         with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_hadamard"):
-            qh_nope = qr_proj_flat[o0 : o0 + HEAD_ROWS_ROPE, 0 : IDX_NOPE_HEAD_DIM]
-            qh_rope = qr_rope_out[o0 : o0 + HEAD_ROWS_ROPE, :]
+            qh_nope = qr_proj_flat[o0 : o0 + HEAD_ROWS_HAD, 0 : IDX_NOPE_HEAD_DIM]
+            qh_rope = qr_rope_out[o0 : o0 + HEAD_ROWS_HAD, :]
             qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
             qr_hadamard_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
-            for ro in pl.range(0, HEAD_ROWS_ROPE, HEAD_ROWS):
+            for ro in pl.range(0, HEAD_ROWS_HAD, HEAD_ROWS):
                 qh_amax = pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
                     qh_a_f32 = qr_hadamard_acc[ro : ro + HEAD_ROWS, h0 : h0 + HEAD_DIM_CHUCK]
