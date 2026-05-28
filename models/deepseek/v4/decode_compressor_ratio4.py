@@ -189,20 +189,17 @@ def compressor(
         pos_b = start_pos_b % COMPRESS_RATIO
         cos_b = cos[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         sin_b = sin[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.BF16)
+        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
         kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
         if pos_b + S >= COMPRESS_RATIO:
             norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-            kv_rope = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM], dtype=pl.BF16)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_slice"):
+            rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+            rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
                 partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
                 for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                    # Golden applies rmsnorm to kv.to(torch.bfloat16), then casts to FP32 inside rmsnorm.
-                    kv_rms_chunk = pl.cast(
-                        pl.cast(pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE], target_type=pl.BF16, mode="rint"),
-                        target_type=pl.FP32,
-                    )
+                    kv_rms_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
                     partial_sq = pl.add(
                         partial_sq,
                         pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, POST_TILE]),
@@ -211,56 +208,35 @@ def compressor(
                 variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [POST_TILE, 1])
                 inv_rms = pl.recip(pl.sqrt(variance))
                 for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                    kv_norm_chunk = pl.cast(
-                        pl.cast(pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE], target_type=pl.BF16, mode="rint"),
-                        target_type=pl.FP32,
-                    )
+                    kv_norm_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
                     gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
                     normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                    normed_kv[:, k0 : k0 + HEAD_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
-                kv_rope[:, :] = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
+                    normed_kv[:, k0 : k0 + HEAD_TILE] = normed_chunk
 
-            kv_proj_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            kv_proj_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-            rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_slice"):
-                even_acc = pl.matmul(kv_rope, even_select, out_dtype=pl.FP32)
-                odd_acc = pl.matmul(kv_rope, odd_select, out_dtype=pl.FP32)
-                kv_proj_even[:, :] = even_acc
-                kv_proj_odd[:, :] = odd_acc
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_apply"):
-                even_tile = kv_proj_even[:, :]
-                odd_tile = kv_proj_odd[:, :]
-                rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
-                rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
-                rope_even[:, :] = rope_even_acc
-                rope_odd[:, :] = rope_odd_acc
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_assemble"):
-                rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
-                rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
+                kv_rope_slice = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
+                even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
+                odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+                rope_even[:, :] = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
+                rope_odd[:, :] = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
 
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-                normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
+                rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
+                rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
+                normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_acc
 
             if rotate:
                 # TODO: Match pypto2.0 by moving Hadamard into a separate
                 # batch-level post pass over compressed rows instead of this
                 # per-row matmul that depends on POST_TILE padding.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-                    kv_proj_tile = normed_kv[:, 0 : HEAD_DIM]
+                    kv_proj_tile = pl.cast(normed_kv[:, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
                     for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
                         hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
                         kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
                         kv_final[:, o0 : o0 + OUT_TILE] = kv_hadamard_acc
             else:
-                for oi in pl.spmd(HEAD_DIM // OUT_TILE, name_hint="kv_write"):
-                    o0 = oi * OUT_TILE
-                    kv_out_tile = normed_kv[:, o0 : o0 + OUT_TILE]
-                    kv_final[:, o0 : o0 + OUT_TILE] = pl.cast(kv_out_tile, target_type=pl.FP32)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
+                    kv_final[:, :] = normed_kv[:, :]
 
             cache_col = start_pos_b // COMPRESS_RATIO
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
@@ -399,24 +375,24 @@ def golden_compressor(tensors):
         x = x.float()
         var = x.square().mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + EPS)
-        return (w * x).to(torch.bfloat16)
+        return w * x
 
     for b in range(bsz):
         if not bool(should_compress_rows[b]):
             continue
         start_pos = int(start_pos_t[b].item())
-        kv_b = rmsnorm(pooled[b : b + 1].to(torch.bfloat16), norm_w)
+        kv_b = rmsnorm(pooled[b : b + 1], norm_w)
 
         x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
         x0, x1 = x_pair[..., 0], x_pair[..., 1]
         cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
-        y0 = (x0 * cos_v - x1 * sin_v).to(torch.bfloat16)
-        y1 = (x0 * sin_v + x1 * cos_v).to(torch.bfloat16)
+        y0 = x0 * cos_v - x1 * sin_v
+        y1 = x0 * sin_v + x1 * cos_v
 
-        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1).float()
+        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
         if rotate:
-            kv_b = kv_b @ hadamard
+            kv_b = kv_b.to(torch.bfloat16).float() @ hadamard
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0
         # so the golden matches its [B, S, HEAD_DIM] zero-init.
         tensors["kv"][b : b + 1, 0:1, :] = kv_b
