@@ -21,14 +21,16 @@ Every batch-dependent kernel signature dim is a `pl.dynamic(...)` variable
 `BLOCK_TABLE_FLAT_DYN`), so a single compiled program serves any
 `user_batch <= host KV-cache capacity`. Host allocates the input/output
 hidden states and slot mapping as packed token-major tensors with leading
-dim `T = sum(seq_lens)` (no `[batch, max_seq]` padding).
+dim `T = sum(chunk_lens)` (no `[batch, max_seq]` padding). `seq_lens`
+stores the absolute sequence length after the current chunk; `chunk_lens`
+and `chunk_offsets` identify each batch row's slice inside the packed chunk.
 
 Unlike the decode path, prefill iterates the batch dim with step 1 (one
 batch element per outer iteration) and every matmul tile's M dim is
 governed by `TOK_TILE` (independent of batch). Therefore prefill does
 NOT need decode's `batch_padded` round-up + `valid_shape` zero-pad +
 vec-to-vec textract trim machinery on the batch axis. The per-token
-`valid_tok = pl.min(TOK_TILE, seq_len_b - p0)` + `valid_shape` pattern
+`valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)` + `valid_shape` pattern
 already handles intra-batch sequence-length variation.
 """
 import pypto.language as pl
@@ -51,6 +53,7 @@ from config import (
     LAYER_HIDDEN_ROWS_DYN,
     LAYER_INTER_ROWS_DYN,
     LM_HEAD_K_CHUNK,
+    MAX_SEQ as MODEL_MAX_SEQ,
     NUM_HEADS,
     NUM_KV_HEADS,
     NUM_LAYERS,
@@ -69,7 +72,8 @@ PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
 
 # Single-layer prefill constants. Keep these local because config.py is shared
 # with the decode kernels and uses decode-tuned tiling constants.
-MAX_SEQ = 128
+MAX_SEQ = MODEL_MAX_SEQ
+DEFAULT_TEST_MAX_SEQ = 128
 K_CHUNK = 128
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
@@ -90,6 +94,8 @@ MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
@@ -124,15 +130,15 @@ def prefill_layer(
     layer_cache_base = layer_idx * layer_cache_rows
     max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
     for b in pl.parallel(0, user_batch, 1):
-        token_base = pl.cast(0, pl.INDEX)
-        for prev_b in pl.range(b):
-            token_base = token_base + pl.cast(pl.tensor.read(seq_lens, [prev_b]), pl.INDEX)
+        token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
-        tok_blocks = (seq_len_b + TOK_TILE - 1) // TOK_TILE
+        chunk_len_b = pl.tensor.read(chunk_lens, [b])
+        chunk_start = seq_len_b - chunk_len_b
+        tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
         for p0_idx in pl.range(tok_blocks):
             p0 = p0_idx * TOK_TILE
             token_p0 = token_base + p0
-            valid_tok = pl.min(TOK_TILE, seq_len_b - p0)
+            valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
 
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
             normed_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
@@ -247,7 +253,8 @@ def prefill_layer(
             # ── Scope 2: RoPE + KV cache update + causal attention ──
             attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
             for ti in pl.range(valid_tok):
-                pos = p0 + ti
+                chunk_pos = p0 + ti
+                pos = chunk_start + chunk_pos
                 ctx_len = pos + 1
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
                 cos_row = pl.slice(rope_cos, [1, HEAD_DIM], [pos, 0])
@@ -267,7 +274,7 @@ def prefill_layer(
                                 pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0), target_type=pl.BF16),
                                 [gi * Q_HEAD_PAD + Q_HEAD_BATCH, 0],
                             )
-                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [token_base + pos]), pl.INDEX)
+                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [token_base + chunk_pos]), pl.INDEX)
                 cache_slot_block = cache_slot // BLOCK_SIZE
                 cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
                 for ki_chunk in pl.parallel(0, NUM_KV_HEADS, 8):
@@ -555,6 +562,8 @@ def prefill_layer(
 def prefill_fwd(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
@@ -578,6 +587,8 @@ def prefill_fwd(
 ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     seq_lens.bind_dynamic(0, USER_BATCH_DYN)
+    chunk_lens.bind_dynamic(0, USER_BATCH_DYN)
+    chunk_offsets.bind_dynamic(0, USER_BATCH_DYN)
     out.bind_dynamic(0, USER_BATCH_DYN)
     block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
     slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -593,6 +604,8 @@ def prefill_fwd(
         hidden_states = prefill_layer(
             hidden_states,
             seq_lens,
+            chunk_lens,
+            chunk_offsets,
             input_rms_weight,
             wq,
             wk,
@@ -620,12 +633,10 @@ def prefill_fwd(
             for bi in pl.range(BATCH_TILE):
                 b = b0 + bi
                 if b < user_batch:
-                    token_base = pl.cast(0, pl.INDEX)
-                    for prev_b in pl.range(b):
-                        token_base = token_base + pl.cast(pl.tensor.read(seq_lens, [prev_b]), pl.INDEX)
-                    seq_len_b = pl.tensor.read(seq_lens, [b])
-                    if seq_len_b > 0:
-                        last_token = token_base + pl.cast(seq_len_b, pl.INDEX) - 1
+                    token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
+                    chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                    if chunk_len_b > 0:
+                        last_token = token_base + pl.cast(chunk_len_b, pl.INDEX) - 1
                         for kb in pl.range(HIDDEN_BLOCKS):
                             k0 = kb * K_CHUNK
                             final_hidden_chunk = pl.slice(
@@ -650,6 +661,8 @@ def build_tensor_specs(
     num_layers: int = NUM_LAYERS,
     vocab_size: int = VOCAB,
     use_max_seq: bool = False,
+    chunk_start: int = 0,
+    chunk_size: int = 0,
 ):
     import torch
     from golden import TensorSpec
@@ -657,23 +670,61 @@ def build_tensor_specs(
     assert hidden_size == num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
     vocab = vocab_size
+    if max_seq <= 0:
+        raise ValueError(f"max_seq must be positive, got {max_seq}")
+    if max_seq > MAX_SEQ:
+        raise ValueError(f"max_seq must be <= model MAX_SEQ ({MAX_SEQ}), got {max_seq}")
+    if chunk_start < 0:
+        raise ValueError(f"chunk_start must be non-negative, got {chunk_start}")
+    if chunk_size < 0:
+        raise ValueError(f"chunk_size must be non-negative, got {chunk_size}")
     max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
     num_blocks = batch * max_blocks_per_seq
     layer_cache_rows = num_blocks * num_kv_heads * BLOCK_SIZE
     cache_rows = num_layers * layer_cache_rows
 
     if use_max_seq:
-        seq_lens_values = torch.full((batch,), max_seq, dtype=torch.int32)
+        prompt_lens_values = torch.full((batch,), max_seq, dtype=torch.int32)
     else:
-        n_blocks = max(1, max_seq // TOK_TILE)
-        seq_lens_values = ((torch.arange(batch, dtype=torch.int32) % n_blocks) + 1) * TOK_TILE
-    total_tokens = int(seq_lens_values.sum().item())
+        n_blocks = max(1, (max_seq + TOK_TILE - 1) // TOK_TILE)
+        prompt_lens_values = torch.minimum(
+            ((torch.arange(batch, dtype=torch.int32) % n_blocks) + 1) * TOK_TILE,
+            torch.full((batch,), max_seq, dtype=torch.int32),
+        )
+
+    if chunk_size > 0:
+        chunk_end = min(max_seq, chunk_start + chunk_size)
+        prompt_lens_values[-1] = max(int(prompt_lens_values[-1].item()), chunk_end)
+        seq_lens_values = torch.minimum(
+            prompt_lens_values,
+            torch.full((batch,), chunk_end, dtype=torch.int32),
+        )
+        chunk_lens_values = torch.clamp(
+            seq_lens_values - chunk_start,
+            min=0,
+        ).to(torch.int32)
+    else:
+        seq_lens_values = prompt_lens_values
+        chunk_lens_values = seq_lens_values.clone()
+
+    chunk_offsets_values = torch.zeros(batch, dtype=torch.int32)
+    if batch > 1:
+        chunk_offsets_values[1:] = torch.cumsum(chunk_lens_values[:-1], dim=0)
+    total_tokens = int(chunk_lens_values.sum().item())
+    if total_tokens <= 0:
+        raise ValueError("chunked prefill requires at least one token in the current chunk")
 
     def init_hidden_states():
         return torch.rand(total_tokens, hidden_size) - 0.5
 
     def init_seq_lens():
         return seq_lens_values.clone()
+
+    def init_chunk_lens():
+        return chunk_lens_values.clone()
+
+    def init_chunk_offsets():
+        return chunk_offsets_values.clone()
 
     def init_rms_weight():
         return torch.rand(num_layers, hidden_size) - 0.5
@@ -694,20 +745,23 @@ def build_tensor_specs(
         return torch.rand(num_layers, head_dim) - 0.5
 
     def init_rope_cos():
-        return torch.rand(max_seq, head_dim) - 0.5
+        return torch.rand(MAX_SEQ, head_dim) - 0.5
 
     def init_rope_sin():
-        return torch.rand(max_seq, head_dim) - 0.5
+        return torch.rand(MAX_SEQ, head_dim) - 0.5
 
     def init_block_table():
         return torch.arange(num_blocks, dtype=torch.int32)
 
     def init_slot_mapping():
         slots = torch.empty(total_tokens, dtype=torch.int32)
-        token_idx = 0
         for b in range(batch):
             seq_len = int(seq_lens_values[b].item())
-            for pos in range(seq_len):
+            chunk_len = int(chunk_lens_values[b].item())
+            token_idx = int(chunk_offsets_values[b].item())
+            chunk_start_b = seq_len - chunk_len
+            for local_pos in range(chunk_len):
+                pos = chunk_start_b + local_pos
                 logical_block = pos // BLOCK_SIZE
                 page_offset = pos % BLOCK_SIZE
                 phys_block = b * max_blocks_per_seq + logical_block
@@ -746,6 +800,8 @@ def build_tensor_specs(
         TensorSpec("hidden_states", [total_tokens, hidden_size], torch.bfloat16,
                    init_value=init_hidden_states),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
+        TensorSpec("chunk_lens", [batch], torch.int32, init_value=init_chunk_lens),
+        TensorSpec("chunk_offsets", [batch], torch.int32, init_value=init_chunk_offsets),
         TensorSpec("input_rms_weight", [num_layers, hidden_size], torch.float32,
                    init_value=init_rms_weight),
         TensorSpec("wq", [num_layers * hidden_size, hidden_size], torch.bfloat16,
@@ -758,9 +814,9 @@ def build_tensor_specs(
                    init_value=init_q_norm_weight),
         TensorSpec("k_norm_weight", [num_layers, head_dim], torch.float32,
                    init_value=init_k_norm_weight),
-        TensorSpec("rope_cos", [max_seq, head_dim], torch.float32,
+        TensorSpec("rope_cos", [MAX_SEQ, head_dim], torch.float32,
                    init_value=init_rope_cos),
-        TensorSpec("rope_sin", [max_seq, head_dim], torch.float32,
+        TensorSpec("rope_sin", [MAX_SEQ, head_dim], torch.float32,
                    init_value=init_rope_sin),
         TensorSpec("block_table", [batch * max_blocks_per_seq], torch.int32,
                    init_value=init_block_table),
@@ -801,6 +857,8 @@ def golden_qwen3_14b_prefill(tensors):
 
     hidden_states = tensors["hidden_states"]
     seq_lens = tensors["seq_lens"]
+    chunk_lens = tensors["chunk_lens"]
+    chunk_offsets = tensors["chunk_offsets"]
     input_rms_weight = tensors["input_rms_weight"]
     wq = tensors["wq"]
     wk = tensors["wk"]
@@ -834,7 +892,7 @@ def golden_qwen3_14b_prefill(tensors):
     half = head_dim // 2
     scale = 1.0 / math.sqrt(head_dim)
     eps = EPS
-    max_blocks_per_seq = (max_seq + BLOCK_SIZE - 1) // BLOCK_SIZE
+    max_blocks_per_seq = block_table.shape[0] // batch
     num_layers = input_rms_weight.shape[0]
     intermediate_size = w_gate.shape[1]
     layer_cache_rows = batch * max_blocks_per_seq * num_kv_heads * BLOCK_SIZE
@@ -862,14 +920,15 @@ def golden_qwen3_14b_prefill(tensors):
         w_down_f = w_down[layer_inter_base:layer_inter_base + intermediate_size, :].float()
 
         out_t = torch.zeros(total_tokens, hidden_size, dtype=torch.float32)
-        token_base = 0
         for b in range(batch):
             seq_len_b = int(seq_lens[b].item())
-            if seq_len_b <= 0:
-                token_base += seq_len_b
+            chunk_len_b = int(chunk_lens[b].item())
+            token_base = int(chunk_offsets[b].item())
+            if chunk_len_b <= 0:
                 continue
 
-            S = seq_len_b
+            S = chunk_len_b
+            chunk_start_b = seq_len_b - chunk_len_b
 
             # ── Scope 1: RMSNorm + Q/K/V projection ──
             x = hidden[token_base:token_base + S, :].float()
@@ -895,8 +954,8 @@ def golden_qwen3_14b_prefill(tensors):
             k_proj_f = k_proj_view.reshape(S, kv_hidden)
 
             # ── Scope 2: RoPE + KV cache + causal attention ──
-            cos_row = rope_cos[:S, :]
-            sin_row = rope_sin[:S, :]
+            cos_row = rope_cos[chunk_start_b:seq_len_b, :]
+            sin_row = rope_sin[chunk_start_b:seq_len_b, :]
             cos_lo, cos_hi = cos_row[:, :half], cos_row[:, half:]
             sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
 
@@ -934,9 +993,9 @@ def golden_qwen3_14b_prefill(tensors):
             ], dim=-1).to(torch.bfloat16)
 
             # Causal attention with tiled online softmax.
-            max_blocks = (S + SEQ_TILE - 1) // SEQ_TILE
+            max_blocks = (seq_len_b + SEQ_TILE - 1) // SEQ_TILE
             padded_len = max_blocks * SEQ_TILE
-            ctx_lens = torch.arange(1, S + 1)
+            ctx_lens = torch.arange(chunk_start_b + 1, seq_len_b + 1)
             col_idx = torch.arange(SEQ_TILE)
             attn_result = torch.zeros(S, hidden_size, dtype=torch.float32)
 
@@ -1016,17 +1075,15 @@ def golden_qwen3_14b_prefill(tensors):
 
             # Final residual -> BF16.
             out_t[token_base:token_base + S, :] = (down + resid1).bfloat16().float()
-            token_base += S
 
         hidden = out_t.to(torch.bfloat16)
 
     final_hidden = torch.zeros(batch, hidden_size, dtype=torch.bfloat16)
-    token_base = 0
     for b in range(batch):
-        seq_len_b = int(seq_lens[b].item())
-        if seq_len_b > 0:
-            final_hidden[b, :] = hidden[token_base + seq_len_b - 1, :]
-        token_base += seq_len_b
+        chunk_len_b = int(chunk_lens[b].item())
+        token_base = int(chunk_offsets[b].item())
+        if chunk_len_b > 0:
+            final_hidden[b, :] = hidden[token_base + chunk_len_b - 1, :]
 
     variance = final_hidden.float().pow(2).mean(dim=-1, keepdim=True)
     final_normed = (
@@ -1054,13 +1111,27 @@ if __name__ == "__main__":
                               "program serves any batch <= host KV-cache "
                               "capacity. Default: %(default)s"))
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
-    parser.add_argument("--max-seq", action="store_true", default=False, help="set all seq_lens to MAX_SEQ")
+    parser.add_argument("--max-seq", type=int, default=DEFAULT_TEST_MAX_SEQ,
+                        help="synthetic max sequence length, up to model MAX_SEQ")
+    parser.add_argument("--use-max-seq", action="store_true", default=False,
+                        help="set all synthetic seq_lens to --max-seq")
+    parser.add_argument("--chunk-start", type=int, default=0,
+                        help="absolute start position for a synthetic current chunk")
+    parser.add_argument("--chunk-size", type=int, default=0,
+                        help="current chunk size for synthetic chunked-prefill tests; 0 means full prompt")
     parser.add_argument("--num-layers", type=int, default=2)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_fwd,
-        specs=build_tensor_specs(batch=args.batch, num_layers=args.num_layers, use_max_seq=args.max_seq),
+        specs=build_tensor_specs(
+            batch=args.batch,
+            max_seq=args.max_seq,
+            num_layers=args.num_layers,
+            use_max_seq=args.use_max_seq,
+            chunk_start=args.chunk_start,
+            chunk_size=args.chunk_size,
+        ),
         golden_fn=golden_qwen3_14b_prefill,
         runtime_cfg=dict(
             platform=args.platform,
