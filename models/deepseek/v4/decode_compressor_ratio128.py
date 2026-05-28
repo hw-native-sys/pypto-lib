@@ -109,7 +109,7 @@ def compressor(
 
     cmp128_kv_proj_by_batch = pl.reshape(cmp128_kv_proj_scratch, [B, S * OUT_DIM])
     cmp128_score_proj_by_batch = pl.reshape(cmp128_score_proj_scratch, [B, S * OUT_DIM])
-    pooled_kv_all = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    pooled_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_pre"):
         for global_c_idx in pl.range(B):
@@ -129,12 +129,11 @@ def compressor(
                 ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
                 kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
                 score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
-                score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                score_row_full = pl.add(score_row_full, ape_row_full)
                 kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
                 kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
 
-    # Unconditional: gating the pooled_kv_all write inside pl.spmd hits pypto
+    # Unconditional: gating the pooled_kv write inside pl.spmd hits pypto
     # #1569. Non-compress batches' pooled value is unused (downstream gates).
     for idx in pl.spmd(B * HEAD_DIM // HEAD_TILE, name_hint="softmax_pool"):
         global_c_idx = idx // (HEAD_DIM // HEAD_TILE)
@@ -159,7 +158,7 @@ def compressor(
         score_prob = pl.row_expand_div(score_exp, score_sum)
         pooled_chunk_t = pl.row_sum(pl.mul(softmax_kv_state_t, score_prob))
         pooled_chunk = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
-        pooled_kv_all[global_c_idx * POST_TILE : global_c_idx * POST_TILE + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+        pooled_kv[global_c_idx * POST_TILE : global_c_idx * POST_TILE + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     # No state shift for non-overlap
 
@@ -170,9 +169,6 @@ def compressor(
         pre_tokens_b = COMPRESS_RATIO - pos_b
         state_blk_id = pl.cast(pl.read(state_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
         cmp_blk_id = pl.cast(pl.read(cmp_block_table, [global_c_idx, 0]), target_type=pl.INDEX)
-        cos_b = cos[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        pooled_kv = pooled_kv_all[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, :]
         normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
         kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
@@ -181,17 +177,19 @@ def compressor(
         rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
         rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
+            cos_b = cos[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+            sin_b = sin[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
             partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
-            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=4):
-                kv_rms_chunk = pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+                kv_rms_chunk = pooled_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
                 kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, POST_TILE])
                 partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [POST_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
-            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=4):
-                kv_norm_chunk = pooled_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
+            for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+                kv_norm_chunk = pooled_kv[global_c_idx * POST_TILE : (global_c_idx + 1) * POST_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
                 normed_kv[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
@@ -213,14 +211,12 @@ def compressor(
                 kv_final[:, o0 : o0 + OUT_TILE] = normed_kv[:, o0 : o0 + OUT_TILE]
 
         if pos_b + S >= COMPRESS_RATIO:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write_and_scatter_next"):
                 kv_row_fp32 = kv_final[0 : 1, 0 : HEAD_DIM]
                 kv_flat[global_c_idx * S : global_c_idx * S + 1, :] = kv_row_fp32
                 phys_cmp_row = cmp_blk_id * BLOCK_SIZE + cache_col
                 cmp_kv_pool_flat[phys_cmp_row : phys_cmp_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
-        if pos_b + S > COMPRESS_RATIO:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_next"):
                 for s in pl.range(pre_tokens_b, S):
                     proj_col0 = s * OUT_DIM
                     token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
@@ -228,12 +224,7 @@ def compressor(
                     ape_row_full = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
                     kv_row_full = cmp128_kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
                     score_row_full = cmp128_score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                    dep_row_full = kv_final[0 : 1, 0 : OUT_DIM]
-                    dep_zero_full = pl.sub(dep_row_full, dep_row_full)
-                    kv_row_full = pl.add(kv_row_full, dep_zero_full)
-                    score_row_full = pl.add(score_row_full, dep_zero_full)
-                    ape_base_full = pl.full([1, OUT_DIM], dtype=pl.FP32, value=0.0)
-                    score_row_full = pl.add(score_row_full, pl.col_expand(ape_base_full, ape_row_full))
+                    score_row_full = pl.add(score_row_full, ape_row_full)
                     kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row_full
                     kv_state_pool_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row_full
 
