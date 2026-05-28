@@ -49,6 +49,13 @@ START_POS = COMPRESS_RATIO - 1       # ScalarSpec default exercises S-token wind
 ROPE_CHUCK = 32
 K_CHUNK = 512
 OUT_CHUNK = 64
+# kv_score_proj output-column tile = 64 (4 parallel tasks). This scope is parallelism/overlap-
+# limited, NOT HBM-bandwidth-limited: each task is a small M=B*S matmul over sequential K-tiles
+# and cube is only lightly busy, so the lever is running MORE tasks in parallel to overlap with
+# the concurrent rope/qr_hadamard work. A wider N (fewer tasks) cuts x re-reads but under-fills
+# the cores and regresses Total, so keep 4-way (N=64).
+KV_SCORE_PROJ_N = 64
+assert OUT_DIM % KV_SCORE_PROJ_N == 0, "OUT_DIM must be divisible by KV_SCORE_PROJ_N"
 HEAD_CHUNK = 32
 HEAD_DIM_CHUCK = 128
 K_BLOCKS = D // K_CHUNK
@@ -93,18 +100,22 @@ def indexer_compressor(
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
 
-    for o0 in pl.range(0, OUT_DIM, OUT_CHUNK):
+    # pl.parallel (not pl.range): the KV_SCORE_PROJ_N output-column chunks are independent
+    # (disjoint wkv/wgate columns + disjoint scratch assemble, x read-only), so they spread
+    # across cube cores instead of running serially. As pl.range they ran ~serially, and this
+    # is the compressor's first matmul, delaying everything downstream that reads the proj.
+    for o0 in pl.parallel(0, OUT_DIM, KV_SCORE_PROJ_N):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_proj"):
             x_tile = x_flat[:, 0 : K_CHUNK]
-            wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
-            wgate_tile = wgate[0 : K_CHUNK, o0 : o0 + OUT_CHUNK]
+            wkv_tile = wkv[0 : K_CHUNK, o0 : o0 + KV_SCORE_PROJ_N]
+            wgate_tile = wgate[0 : K_CHUNK, o0 : o0 + KV_SCORE_PROJ_N]
             kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
             score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
 
             for k0 in pl.range(K_CHUNK, D, K_CHUNK):
                 x_tile = x_flat[:, k0 : k0 + K_CHUNK]
-                wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
-                wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + OUT_CHUNK]
+                wkv_tile = wkv[k0 : k0 + K_CHUNK, o0 : o0 + KV_SCORE_PROJ_N]
+                wgate_tile = wgate[k0 : k0 + K_CHUNK, o0 : o0 + KV_SCORE_PROJ_N]
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
 
