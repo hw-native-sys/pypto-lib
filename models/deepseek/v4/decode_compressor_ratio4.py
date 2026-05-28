@@ -69,8 +69,8 @@ def compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -194,8 +194,6 @@ def compressor(
 
         if pos_b + S >= COMPRESS_RATIO:
             norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-            rope_even = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
-            rope_odd = pl.create_tensor([POST_TILE, ROPE_HEAD_DIM // 2], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
                 partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
                 for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
@@ -216,13 +214,12 @@ def compressor(
                 kv_rope_slice = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
                 even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
                 odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-                rope_even[:, :] = pl.cast(pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b)), target_type=pl.BF16, mode="rint")
-                rope_odd[:, :] = pl.cast(pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b)), target_type=pl.BF16, mode="rint")
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_write"):
-                rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
-                rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
-                normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_acc
+                rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
+                rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
+                rope_buf = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+                rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
+                rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
+                normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
             if rotate:
                 # TODO: Match pypto2.0 by moving Hadamard into a separate
@@ -266,8 +263,8 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Out[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -285,8 +282,8 @@ def compressor_test(
         norm_w,
         cos,
         sin,
-        even_select,
-        odd_select,
+        even_idx,
+        odd_idx,
         hadamard,
         cmp_kv_cache,
         cmp_block_table,
@@ -315,7 +312,7 @@ def golden_compressor(tensors):
     start_pos_t = tensors["start_pos"]
     rotate = bool(tensors["rotate"])
     bsz, _, _ = x.shape
-    ratio, d, rd = COMPRESS_RATIO, hadamard.shape[0], tensors["even_select"].shape[0]
+    ratio, d, rd = COMPRESS_RATIO, hadamard.shape[0], ROPE_HEAD_DIM
 
     kv = x @ wkv                        # [B, S, OUT_DIM]
     score = x @ wgate                   # [B, S, OUT_DIM]
@@ -432,16 +429,12 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return torch.rand(B, ROPE_HEAD_DIM // 2)
     def init_sin():
         return torch.rand(B, ROPE_HEAD_DIM // 2)
-    def init_odd_select():
-        M = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            M[2*i+1, i] = 1
-        return M
-    def init_even_select():
-        M = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            M[2*i, i] = 1
-        return M
+    def init_even_idx():
+        row = torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32)
+        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
+    def init_odd_idx():
+        row = torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32)
+        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_cmp_kv_cache():
@@ -471,8 +464,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("even_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_even_select),
-        TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
+        TensorSpec("even_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
+        TensorSpec("odd_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache, is_output=True),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
