@@ -133,6 +133,8 @@ def indexer(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],   # inner Compressor RoPE scatter index
+    odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
@@ -285,8 +287,8 @@ def indexer(
         inner_norm_w,
         cos,
         sin,
-        even_select,
-        odd_select,
+        even_idx,
+        odd_idx,
         hadamard,
         idx_kv_cache,
         idx_block_table,
@@ -413,6 +415,8 @@ def indexer_test(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],   # inner Compressor RoPE scatter index
+    odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
@@ -440,6 +444,8 @@ def indexer_test(
         sin,
         even_select,
         odd_select,
+        even_idx,
+        odd_idx,
         hadamard,
         inner_kv,
         inner_compress_state,
@@ -530,8 +536,6 @@ def golden_indexer(tensors):
         "norm_w": tensors["inner_norm_w"],
         "cos": tensors["cos"],
         "sin": tensors["sin"],
-        "even_select": tensors["even_select"],
-        "odd_select": tensors["odd_select"],
         "hadamard": tensors["hadamard"],
         "compress_state": tensors["inner_compress_state"],
         "compress_state_block_table": tensors["inner_compress_state_block_table"],
@@ -607,6 +611,10 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         for i in range(ROPE_HEAD_DIM // 2):
             M[2*i, i] = 1
         return M
+    def init_even_idx():
+        return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
+    def init_odd_idx():
+        return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
     def init_hadamard():
         return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
     def init_inner_compress_state():
@@ -658,6 +666,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("even_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_even_select),
         TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
+        TensorSpec("even_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
+        TensorSpec("odd_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("inner_kv", [B, S, INNER_HEAD_DIM], torch.float32),
         TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
