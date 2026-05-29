@@ -309,7 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()

@@ -699,7 +699,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     # topk_pair_compare expects a tensor whose [..., i] entry is the score paired
