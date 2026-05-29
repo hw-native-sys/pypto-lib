@@ -68,6 +68,9 @@ PREFILL_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
 PREFILL_ORI_BLOCK_NUM = B * PREFILL_ORI_MAX_BLOCKS
 PREFILL_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 PREFILL_CMP_BLOCK_NUM = B * PREFILL_CMP_MAX_BLOCKS
+PREFILL_ATTN_TILE = 64
+PREFILL_SPARSE_TOPK = min(PREFILL_CORE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
+PREFILL_SPARSE_PAD = ((PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE) * PREFILL_ATTN_TILE
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
@@ -222,14 +225,15 @@ def prefill_swa_prepare_sparse_inputs(
     # raw < S reads current prompt KV, raw >= S reads the historical tail above.
     for idx_t0 in pl.parallel(0, T, ATTN_TASK_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_sparse_indices"):
-            invalid_row = pl.full([1, PREFILL_CORE_TOPK], dtype=pl.INT32, value=-1)
             for idx_dt in pl.range(ATTN_TASK_TILE):
                 idx_t = idx_t0 + idx_dt
                 idx_s = idx_t % S
                 abs_pos = tile_start_pos + idx_s
                 window_valid = pl.min(WIN, abs_pos + 1)
                 key_start_abs = abs_pos + 1 - window_valid
-                sparse_indices = pl.assemble(sparse_indices, invalid_row, [idx_t, 0])
+                # The unified core reads the padded prefix, so clear every consumed slot first.
+                for pad_i in pl.range(PREFILL_SPARSE_PAD):
+                    pl.write(sparse_indices, [idx_t, pad_i], pl.cast(-1, pl.INT32))
                 for key_i in pl.range(WIN):
                     if key_i < window_valid:
                         key_abs_pos = key_start_abs + key_i
