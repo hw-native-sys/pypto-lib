@@ -52,9 +52,10 @@ OUT_TILE = 64
 B_TILE = 64
 HEAD_TILE = 64 if B * S >= 64 else 128
 HEAD_DIM_TILE = 128
-# TODO: Remove this post-processing row padding once RMSNorm/RoPE are lowered
-# as true row-level vector ops instead of relying on boxed tile matmul shapes.
-POST_TILE = 16
+# Group RMS_TILE real batches per rmsnorm_rope / kv_hadamard spmd block. 16
+# satisfies (a) col_vec 32B-aligned row stride (FP32 needs ≥8 rows),
+# (b) pypto #1586 scatter row >= 2, (c) matmul innerRows = 16 for hadamard.
+RMS_TILE = 16
 
 
 @pl.jit.inline
@@ -69,8 +70,8 @@ def compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
-    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    even_idx: pl.Tensor[[RMS_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[RMS_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -134,14 +135,13 @@ def compressor(
     # the runtime loses the cross-block partial writes (~5% drift on kv /
     # cmp_kv_cache). Hand-patching `add_output(pooled_kv…)` → `add_inout(…)`
     # in the generated orchestration cpp also fixes it.
-    pooled_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(B * (HEAD_DIM // HEAD_TILE), name_hint="softmax_pool"):
         c_idx = idx // (HEAD_DIM // HEAD_TILE)
         h0 = (idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
-        # Zero-init the full POST_TILE-row slot so non-compress batches and
-        # padding rows (1..POST_TILE-1) propagate as 0 through downstream
-        # RMSNorm/RoPE/Hadamard without needing per-batch gates there.
-        pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, h0 : h0 + HEAD_TILE] = pl.full([POST_TILE, HEAD_TILE], dtype=pl.FP32, value=0.0)
+        # Zero-init non-compress batches so downstream RMSNorm/RoPE/Hadamard
+        # propagate 0 without per-batch gates.
+        pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
         start_pos_b = pl.read(start_pos, [c_idx])
         pos_b = start_pos_b % COMPRESS_RATIO
         pre_tokens_b = COMPRESS_RATIO - pos_b
@@ -193,68 +193,60 @@ def compressor(
                 mi = mi_next_back
 
             pooled_chunk = pl.div(oi, li)
-            pooled_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+            pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
-    normed_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
-    kv_final = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for c_idx in pl.spmd(B, name_hint="rmsnorm_rope"):
-        cos_b = cos[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
-        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
-            partial_sq = pl.add(
-                partial_sq,
-                pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, POST_TILE]),
-            )
+    for batch_base_idx in pl.range(B // RMS_TILE):
+        batch_base = batch_base_idx * RMS_TILE
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
+            cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+            sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+            partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
+            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+                kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+                partial_sq = pl.add(
+                    partial_sq,
+                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, RMS_TILE]),
+                )
 
-        variance = pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS)
-        inv_rms = pl.recip(pl.sqrt(variance))
-        inv_rms_scalar = pl.read(inv_rms, [0, 0])
-        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE]
-            gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
-            inv_gamma = pl.mul(gamma, inv_rms_scalar)
-            normed_chunk = pl.mul(kv_norm_chunk, inv_gamma)
-            normed_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE] = normed_chunk
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
+            inv_rms = pl.recip(pl.sqrt(variance))
+            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+                kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+                gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
+                normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+                normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
-        # Keep RoPE reassembly at POST_TILE rows. Shrinking to 1 row
-        # (kv_rope_slice / rope_buf / scatter src all [1, …]) hits
-        # pypto #1586: `pl.tensor.scatter` on a 1-row dst/src triggers
-        # an internal `tile.ci cols != 1` ISA check during codegen. With
-        # ≥ 2 rows the same chain compiles fine. Repro:
-        # `models/deepseek/v4/repro_1row_scatter_draft.py`.
-        kv_rope_slice = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-        even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-        rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
-        rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
-        rope_buf = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
-        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
-        normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
+            kv_rope_slice = normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+            even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+            rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+            rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+            rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+            rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
+            rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
+            normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
-    for c_idx in pl.range(B):
-        start_pos_b = pl.read(start_pos, [c_idx])
-
+    for batch_base_idx in pl.range(B // RMS_TILE):
+        batch_base = batch_base_idx * RMS_TILE
         if rotate:
-            # TODO: Match pypto2.0 by moving Hadamard into a separate
-            # batch-level post pass over compressed rows instead of this
-            # per-row matmul that depends on POST_TILE padding.
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-                kv_proj_tile = pl.cast(normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
+                kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
                 for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
                     hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
                     kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                    kv_final[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+                    kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
         else:
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
-                kv_final[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, :] = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, :]
+                kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
 
+    for c_idx in pl.range(B):
+        start_pos_b = pl.read(start_pos, [c_idx])
         cache_col = start_pos_b // COMPRESS_RATIO
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-            kv_row_fp32 = kv_final[c_idx * POST_TILE : c_idx * POST_TILE + 1, 0 : HEAD_DIM]
+            kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
             kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
             cmp_blk_off = cache_col // BLOCK_SIZE
             cmp_intra = cache_col % BLOCK_SIZE
@@ -280,8 +272,8 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
-    odd_idx: pl.Tensor[[POST_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    even_idx: pl.Tensor[[RMS_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
+    odd_idx: pl.Tensor[[RMS_TILE, ROPE_HEAD_DIM // 2], pl.INT32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Out[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -448,10 +440,10 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return torch.rand(B, ROPE_HEAD_DIM // 2)
     def init_even_idx():
         row = torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32)
-        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
+        return row.unsqueeze(0).expand(RMS_TILE, -1).contiguous()
     def init_odd_idx():
         row = torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32)
-        return row.unsqueeze(0).expand(POST_TILE, -1).contiguous()
+        return row.unsqueeze(0).expand(RMS_TILE, -1).contiguous()
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_cmp_kv_cache():
@@ -481,8 +473,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("even_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
-        TensorSpec("odd_idx", [POST_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
+        TensorSpec("even_idx", [RMS_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
+        TensorSpec("odd_idx", [RMS_TILE, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache, is_output=True),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
