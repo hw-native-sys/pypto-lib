@@ -145,6 +145,8 @@ def attention_csa(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -267,8 +269,8 @@ def attention_csa(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
-        even_select,
-        odd_select,
+        cmp_even_idx,
+        cmp_odd_idx,
         hadamard_main,
         cmp_kv,
         cmp_block_table,
@@ -367,6 +369,8 @@ def attention_csa_test_refresh(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -417,6 +421,8 @@ def attention_csa_test_refresh(
         odd_select,
         even_select_local,
         odd_select_local,
+        cmp_even_idx,
+        cmp_odd_idx,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -536,8 +542,6 @@ def golden_attention_csa(tensors):
         "norm_w": tensors["cmp_norm_w"],
         "cos": cmp_cos,
         "sin": cmp_sin,
-        "even_select": tensors["even_select"],
-        "odd_select": tensors["odd_select"],
         "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),
         "cmp_kv_cache": cmp_kv,
         "cmp_block_table": cmp_block_table,
@@ -707,6 +711,12 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         for i in range(SPARSE_ROPE_CHUNK):
             m[2 * i + 1, i] = 1
         return m
+
+    def init_cmp_even_idx():
+        return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
+
+    def init_cmp_odd_idx():
+        return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
 
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
@@ -887,6 +897,8 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("odd_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
         TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
+        TensorSpec("cmp_even_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_even_idx),
+        TensorSpec("cmp_odd_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_odd_idx),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
@@ -928,7 +940,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Decode start position for no-compression/aligned/crossing coverage.")
-    parser.add_argument("--hetero-start-pos", action="store_true", default=False,
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
                         help="Use per-row start_pos values in the standalone fixture.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()

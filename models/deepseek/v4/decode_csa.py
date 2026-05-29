@@ -120,6 +120,8 @@ def decode_csa(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     # ---- main compressor (ratio=4, overlap=True, rotate=False) ----
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -192,6 +194,7 @@ def decode_csa(
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select, odd_select,
         even_select_local, odd_select_local,
+        cmp_even_idx, cmp_odd_idx,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -242,6 +245,8 @@ def decode_csa_test(
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
+    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -301,6 +306,7 @@ def decode_csa_test(
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         even_select, odd_select,
         even_select_local, odd_select_local,
+        cmp_even_idx, cmp_odd_idx,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
@@ -373,6 +379,7 @@ def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_sta
         "freqs_cos", "freqs_sin", "even_select_t", "odd_select_t",
         "even_select", "odd_select",
         "even_select_local", "odd_select_local",
+        "cmp_even_idx", "cmp_odd_idx",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
         "compress_state", "compress_state_block_table",
         "idx_wq_b", "idx_wq_b_scale", "weights_proj", "hadamard_idx",
@@ -415,7 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action="store_true", default=False)
+    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
