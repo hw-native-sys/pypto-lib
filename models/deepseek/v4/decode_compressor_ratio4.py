@@ -127,6 +127,13 @@ def compressor(
                 compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
                 compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
+    # Keep the spmd dimension flat (one slice per task). Refactoring to
+    # `pl.spmd(B)` + inner `pl.range(HEAD_DIM // HEAD_TILE)` triggers pypto
+    # #1585: orchestration mis-infers `pooled_kv` as add_output instead of
+    # add_inout when one spmd block writes multiple disjoint sub-slices, and
+    # the runtime loses the cross-block partial writes (~5% drift on kv /
+    # cmp_kv_cache). Hand-patching `add_output(pooled_kv…)` → `add_inout(…)`
+    # in the generated orchestration cpp also fixes it.
     pooled_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(B * (HEAD_DIM // HEAD_TILE), name_hint="softmax_pool"):
         c_idx = idx // (HEAD_DIM // HEAD_TILE)
@@ -184,13 +191,13 @@ def compressor(
             pooled_chunk = pl.div(oi, li)
             pooled_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
+    normed_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
+    kv_final = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
     for c_idx in pl.parallel(B):
         start_pos_b = pl.read(start_pos, [c_idx])
         pos_b = start_pos_b % COMPRESS_RATIO
         cos_b = cos[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
         sin_b = sin[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        normed_kv = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
-        kv_final = pl.create_tensor([POST_TILE, HEAD_DIM], dtype=pl.FP32)
 
         if pos_b + S >= COMPRESS_RATIO:
             norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
@@ -209,9 +216,9 @@ def compressor(
                     kv_norm_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
                     gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
                     normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                    normed_kv[:, k0 : k0 + HEAD_TILE] = normed_chunk
+                    normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
-                kv_rope_slice = normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM]
+                kv_rope_slice = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
                 even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
                 odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
                 rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
@@ -219,25 +226,30 @@ def compressor(
                 rope_buf = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
                 rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
                 rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
-                normed_kv[:, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
+                normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
+    for c_idx in pl.parallel(B):
+        start_pos_b = pl.read(start_pos, [c_idx])
+        pos_b = start_pos_b % COMPRESS_RATIO
+
+        if pos_b + S >= COMPRESS_RATIO:
             if rotate:
                 # TODO: Match pypto2.0 by moving Hadamard into a separate
                 # batch-level post pass over compressed rows instead of this
                 # per-row matmul that depends on POST_TILE padding.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-                    kv_proj_tile = pl.cast(normed_kv[:, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
+                    kv_proj_tile = pl.cast(normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
                     for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
                         hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
                         kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                        kv_final[:, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+                        kv_final[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
             else:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
-                    kv_final[:, :] = normed_kv[:, :]
+                    kv_final[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, :] = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, :]
 
             cache_col = start_pos_b // COMPRESS_RATIO
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-                kv_row_fp32 = kv_final[0 : 1, 0 : HEAD_DIM]
+                kv_row_fp32 = kv_final[c_idx * POST_TILE : c_idx * POST_TILE + 1, 0 : HEAD_DIM]
                 kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
                 cmp_blk_off = cache_col // BLOCK_SIZE
                 cmp_intra = cache_col % BLOCK_SIZE
