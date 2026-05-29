@@ -21,41 +21,34 @@ D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 
-# kernel-local
-HC_PAD = 8
-
 # tiling
 D_CHUNK = 512
 D_BLOCKS = D // D_CHUNK
 
 
 @pl.jit.inline
-def prefill_hc_post_from_padded(
+def prefill_hc_post(
     x:               pl.Tensor[[B, S, D],             pl.BF16],
     residual:        pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
-    post_pad:        pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb0_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb1_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb2_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb3_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
+    post:            pl.Tensor[[B, S, HC_MULT],       pl.FP32],
+    comb:            pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
     y:               pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
 ):
     x_flat = pl.reshape(x, [T, D])
     residual_flat = pl.reshape(residual, [T, HC_DIM])
+    post_t = pl.reshape(post, [T, HC_MULT])
+    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     y_flat = pl.reshape(y, [T, HC_DIM])
 
-    # Same math as prefill_hc_post, but consume the padded SSA tensors emitted
-    # by prefill_hc_pre.  This gives the scheduler explicit producer->consumer
-    # dependencies and avoids using side-effect-only post/comb scratch writes.
     for out_h in pl.parallel(HC_MULT):
         with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer,
-                   name_hint="prefill_hc_post_from_padded"):
+                   name_hint="prefill_hc_post"):
             for t in pl.parallel(0, T, 1, chunk=16):
-                post_w = pl.read(post_pad, [t, out_h])
-                comb0_w = pl.read(comb0_pad, [t, out_h])
-                comb1_w = pl.read(comb1_pad, [t, out_h])
-                comb2_w = pl.read(comb2_pad, [t, out_h])
-                comb3_w = pl.read(comb3_pad, [t, out_h])
+                post_w = pl.read(post_t, [t, out_h])
+                comb0_w = pl.read(comb_t, [t, 0 * HC_MULT + out_h])
+                comb1_w = pl.read(comb_t, [t, 1 * HC_MULT + out_h])
+                comb2_w = pl.read(comb_t, [t, 2 * HC_MULT + out_h])
+                comb3_w = pl.read(comb_t, [t, 3 * HC_MULT + out_h])
                 for db in pl.range(D_BLOCKS):
                     d0 = db * D_CHUNK
                     x_row = pl.cast(
@@ -96,21 +89,15 @@ def prefill_hc_post_from_padded(
 def prefill_hc_post_test(
     x:               pl.Tensor[[B, S, D],             pl.BF16],
     residual:        pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
-    post_pad:        pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb0_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb1_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb2_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
-    comb3_pad:       pl.Tensor[[T, HC_PAD],           pl.FP32],
+    post:            pl.Tensor[[B, S, HC_MULT],       pl.FP32],
+    comb:            pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
     y:               pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
 ):
-    y = prefill_hc_post_from_padded(
+    y = prefill_hc_post(
         x,
         residual,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
         y,
     )
     return y
@@ -121,19 +108,14 @@ def golden_prefill_hc_post(tensors):
 
     x = tensors["x"].float()
     residual = tensors["residual"].float()
-    post_pad = tensors["post_pad"].float().view(B, S, HC_PAD)
-    comb_pads = [
-        tensors["comb0_pad"].float().view(B, S, HC_PAD),
-        tensors["comb1_pad"].float().view(B, S, HC_PAD),
-        tensors["comb2_pad"].float().view(B, S, HC_PAD),
-        tensors["comb3_pad"].float().view(B, S, HC_PAD),
-    ]
+    post = tensors["post"].float()
+    comb = tensors["comb"].float()
 
     y_fp32 = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
     for out_h in range(HC_MULT):
-        y_row = x * post_pad[:, :, out_h:out_h + 1]
+        y_row = x * post[:, :, out_h:out_h + 1]
         for in_h in range(HC_MULT):
-            y_row = y_row + residual[:, :, in_h, :] * comb_pads[in_h][:, :, out_h:out_h + 1]
+            y_row = y_row + residual[:, :, in_h, :] * comb[:, :, in_h, out_h:out_h + 1]
         y_fp32[:, :, out_h, :] = y_row
     tensors["y"][:] = y_fp32.to(torch.bfloat16)
 
@@ -146,23 +128,16 @@ def build_tensor_specs():
         return torch.randn(B, S, D) * 0.05
     def init_residual():
         return torch.randn(B, S, HC_MULT, D) * 0.05
-    def init_post_pad():
-        pad = torch.zeros(T, HC_PAD)
-        pad[:, :HC_MULT] = torch.rand(T, HC_MULT) + 0.1
-        return pad
-    def init_comb_pad():
-        pad = torch.zeros(T, HC_PAD)
-        pad[:, :HC_MULT] = torch.rand(T, HC_MULT) * 0.25
-        return pad
+    def init_post():
+        return torch.rand(B, S, HC_MULT) + 0.1
+    def init_comb():
+        return torch.rand(B, S, HC_MULT, HC_MULT) * 0.25
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("residual", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_residual),
-        TensorSpec("post_pad", [T, HC_PAD], torch.float32, init_value=init_post_pad),
-        TensorSpec("comb0_pad", [T, HC_PAD], torch.float32, init_value=init_comb_pad),
-        TensorSpec("comb1_pad", [T, HC_PAD], torch.float32, init_value=init_comb_pad),
-        TensorSpec("comb2_pad", [T, HC_PAD], torch.float32, init_value=init_comb_pad),
-        TensorSpec("comb3_pad", [T, HC_PAD], torch.float32, init_value=init_comb_pad),
+        TensorSpec("post", [B, S, HC_MULT], torch.float32, init_value=init_post),
+        TensorSpec("comb", [B, S, HC_MULT, HC_MULT], torch.float32, init_value=init_comb),
         TensorSpec("y", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
     ]
 

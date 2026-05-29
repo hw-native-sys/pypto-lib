@@ -22,12 +22,12 @@ Current standalone contract:
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX
+from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 
 
-# Standalone prefill target shape for correctness bring-up.
-B = 1
-S = 128
+# Prefill target shape for correctness bring-up.
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 
 # model config
@@ -72,6 +72,10 @@ PV_HEAD_TILE = 16
 MERGE_NORM_TOKEN_TILE = 16
 PREFILL_ATTN_TILE = 64
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+assert 1 <= PREFILL_ATTN_BLOCKS <= 3, (
+    f"PREFILL_ATTN_BLOCKS={PREFILL_ATTN_BLOCKS} from PREFILL_ATTN_TILE={PREFILL_ATTN_TILE} "
+    "must fit the 3-way merge buffers"
+)
 PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 ROPE_PACK_SPMD_BLOCKS = ((T + ROPE_PACK_TOKEN_TILE - 1) // ROPE_PACK_TOKEN_TILE) * O_GROUPS
 A_K_CHUNK = 128

@@ -18,10 +18,10 @@ writes the current KV after attention.
 import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_from_padded
+from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
 from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
-from prefill_swa_sparse_attn import _quant_w_per_row, golden_prefill_swa_sparse_attn, prefill_swa_sparse_attn
+from prefill_sparse_attn import golden_prefill_sparse_attn, prefill_sparse_attn
 
 
 # model config
@@ -57,14 +57,23 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 ORI_MAX_BLOCKS = 1
 MAX_BLOCKS = ORI_MAX_BLOCKS
 BLOCK_NUM = B * MAX_BLOCKS
-TOPK = WIN
 SPARSE_IDX_TOPK = M.index_topk
-SPARSE_TOPK = WIN
 START_POS = 0
+
+# Unified prefill sparse-attn shape contract, derived from the same public config
+# as prefill_sparse_attn.py rather than imported from that module's internals.
+PREFILL_MAX_COMPRESSED = max(1, min(SPARSE_IDX_TOPK, S // 4))
+PREFILL_CORE_TOPK = WIN + SPARSE_IDX_TOPK
+PREFILL_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+PREFILL_ORI_BLOCK_NUM = B * PREFILL_ORI_MAX_BLOCKS
+PREFILL_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+PREFILL_CMP_BLOCK_NUM = B * PREFILL_CMP_MAX_BLOCKS
+PREFILL_ATTN_TILE = 64
+PREFILL_SPARSE_TOPK = min(PREFILL_CORE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
+PREFILL_SPARSE_PAD = ((PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE) * PREFILL_ATTN_TILE
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
-HC_PAD = 8
 NEG_INF = -1e20
 T_TILE = 16
 RMS_T_TILE = 16
@@ -107,6 +116,134 @@ assert HEAD_DIM % ATTN_ONLINE_VALUE_CHUNK == 0, "online attention value chunk mu
 assert NOPE_DIM % ATTN_ONLINE_VALUE_CHUNK == 0, "online attention chunk must split noPE/rope boundary"
 assert S % KV_CACHE_WRITE_TILE == 0, "KV cache write tile must divide prefill S tile"
 assert T % O_PROJ_T_TILE == 0, "o_proj token tile must divide prefill T"
+assert B == 1, "SWA adapter to unified prefill sparse-attn currently assumes PREFILL_BATCH == 1"
+assert PREFILL_ORI_BLOCK_NUM == BLOCK_NUM, "unified prefill sparse-attn ori cache must match SWA cache"
+assert PREFILL_ORI_MAX_BLOCKS == MAX_BLOCKS, "unified prefill sparse-attn block table must match SWA table"
+
+
+@pl.jit.inline
+def prefill_swa_write_kv_cache(
+    kv:          pl.Tensor[[T, HEAD_DIM],                    pl.BF16],
+    kv_cache:    pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[B, MAX_BLOCKS],                  pl.INT32],
+    start_pos:   pl.Scalar[pl.INT32],
+):
+    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    tile_start_pos = pl.cast(start_pos, pl.INDEX)
+
+    # Write the current prefill KV into the sliding-window ring through block_table.
+    for s0 in pl.range(0, S, KV_CACHE_WRITE_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_kv_cache_store"):
+            slot0 = (tile_start_pos + s0) % WIN
+            intra0 = slot0 % BLOCK_SIZE
+            for b in pl.range(B):
+                if intra0 + KV_CACHE_WRITE_TILE <= BLOCK_SIZE:
+                    blk_id = pl.cast(pl.read(block_table, [b, slot0 // BLOCK_SIZE]), pl.INDEX)
+                    dst_row = blk_id * BLOCK_SIZE + intra0
+                    kv_tile = pl.load(
+                        kv,
+                        [b * S + s0, 0],
+                        [KV_CACHE_WRITE_TILE, HEAD_DIM],
+                        target_memory=pl.MemorySpace.Vec,
+                    )
+                    kv_cache_flat = pl.store(kv_tile, [dst_row, 0], kv_cache_flat)
+                else:
+                    for ds in pl.range(KV_CACHE_WRITE_TILE):
+                        slot = (tile_start_pos + s0 + ds) % WIN
+                        blk_id = pl.cast(pl.read(block_table, [b, slot // BLOCK_SIZE]), pl.INDEX)
+                        dst_row = blk_id * BLOCK_SIZE + (slot % BLOCK_SIZE)
+                        kv_row = pl.load(
+                            kv,
+                            [b * S + s0 + ds, 0],
+                            [1, HEAD_DIM],
+                            target_memory=pl.MemorySpace.Vec,
+                        )
+                        kv_cache_flat = pl.store(kv_row, [dst_row, 0], kv_cache_flat)
+
+    return pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+
+
+@pl.jit.inline
+def prefill_swa_prepare_sparse_inputs(
+    kv:                 pl.Tensor[[T, HEAD_DIM],                    pl.BF16],
+    kv_cache:           pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table:        pl.Tensor[[B, MAX_BLOCKS],                  pl.INT32],
+    ori_kv:             pl.Tensor[[PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv:             pl.Tensor[[PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_block_table:    pl.Tensor[[B, PREFILL_ORI_MAX_BLOCKS],      pl.INT32],
+    cmp_block_table:    pl.Tensor[[B, PREFILL_CMP_MAX_BLOCKS],      pl.INT32],
+    sparse_indices:     pl.Tensor[[T, PREFILL_CORE_TOPK],           pl.INT32],
+    start_pos:          pl.Scalar[pl.INT32],
+):
+    ori_kv_flat = pl.reshape(ori_kv, [PREFILL_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [PREFILL_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    tile_start_pos = pl.cast(start_pos, pl.INDEX)
+    hist_valid = pl.min(tile_start_pos, WIN - 1)
+    hist_start_abs = tile_start_pos - hist_valid
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_sparse_tables"):
+        pl.write(ori_block_table, [0, 0], pl.cast(0, pl.INT32))
+        pl.write(cmp_block_table, [0, 0], pl.cast(0, pl.INT32))
+
+    for s0 in pl.range(0, S, KV_CACHE_WRITE_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_prompt_kv"):
+            kv_tile = pl.load(
+                kv,
+                [s0, 0],
+                [KV_CACHE_WRITE_TILE, HEAD_DIM],
+                target_memory=pl.MemorySpace.Vec,
+            )
+            ori_kv_flat = pl.store(kv_tile, [s0, 0], ori_kv_flat)
+    ori_kv = pl.reshape(ori_kv_flat, [PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+
+    # Materialize the historical part of the sliding window as the unified
+    # sparse-attn compressed tail. Current-prompt KV remains in ori_kv.
+    for hist0 in pl.range(0, WIN, KV_CACHE_WRITE_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_history_kv"):
+            unused_row = pl.load(kv, [0, 0], [1, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
+            for ds in pl.range(KV_CACHE_WRITE_TILE):
+                hist_i = hist0 + ds
+                if hist_i < hist_valid:
+                    key_abs_pos = hist_start_abs + hist_i
+                    ori_slot = key_abs_pos % WIN
+                    blk_id = pl.cast(pl.read(block_table, [0, ori_slot // BLOCK_SIZE]), pl.INDEX)
+                    cache_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
+                    hist_row = pl.load(
+                        kv_cache_flat,
+                        [cache_row, 0],
+                        [1, HEAD_DIM],
+                        target_memory=pl.MemorySpace.Vec,
+                    )
+                    cmp_kv_flat = pl.store(hist_row, [hist_i, 0], cmp_kv_flat)
+                else:
+                    cmp_kv_flat = pl.store(unused_row, [hist_i, 0], cmp_kv_flat)
+
+    cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+
+    # Build per-token causal SWA indices in the unified prefill convention:
+    # raw < S reads current prompt KV, raw >= S reads the historical tail above.
+    for idx_t0 in pl.parallel(0, T, ATTN_TASK_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_sparse_indices"):
+            for idx_dt in pl.range(ATTN_TASK_TILE):
+                idx_t = idx_t0 + idx_dt
+                idx_s = idx_t % S
+                abs_pos = tile_start_pos + idx_s
+                window_valid = pl.min(WIN, abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                # The unified core reads the padded prefix, so clear every consumed slot first.
+                for pad_i in pl.range(PREFILL_SPARSE_PAD):
+                    pl.write(sparse_indices, [idx_t, pad_i], pl.cast(-1, pl.INT32))
+                for key_i in pl.range(WIN):
+                    if key_i < window_valid:
+                        key_abs_pos = key_start_abs + key_i
+                        if key_abs_pos >= tile_start_pos:
+                            raw_idx = key_abs_pos - tile_start_pos
+                        else:
+                            raw_idx = S + key_abs_pos - hist_start_abs
+                        pl.write(sparse_indices, [idx_t, key_i], pl.cast(raw_idx, pl.INT32))
+
+    return ori_kv, cmp_kv, ori_block_table, cmp_block_table, sparse_indices
 
 
 @pl.jit
@@ -139,24 +276,18 @@ def prefill_attention_swa(
     start_pos: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    post_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb0_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb1_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb2_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    comb3_pad = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
+    post = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed, post_pad, comb0_pad, comb1_pad, comb2_pad, comb3_pad = prefill_hc_pre(
+    x_mixed, post, comb = prefill_hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
         x_mixed,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
     )
 
     # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
@@ -195,14 +326,36 @@ def prefill_attention_swa(
             rope_cos_t = pl.assemble(rope_cos_t, cos_rows, [b * S, 0])
             rope_sin_t = pl.assemble(rope_sin_t, sin_rows, [b * S, 0])
 
-    # SWA attention computes grouped head values, projects them, then updates KV cache.
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    kv_cache, attn_out = prefill_swa_sparse_attn(
-        q,
+    # SWA attention now feeds the unified prefill sparse-attn core. The SWA
+    # orchestration still owns sliding-window history materialization and cache
+    # writeback.
+    ori_kv = pl.create_tensor([PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_kv = pl.create_tensor([PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    ori_block_table = pl.create_tensor([B, PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
+    cmp_block_table = pl.create_tensor([B, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    sparse_indices = pl.create_tensor([T, PREFILL_CORE_TOPK], dtype=pl.INT32)
+    ori_kv, cmp_kv, ori_block_table, cmp_block_table, sparse_indices = prefill_swa_prepare_sparse_inputs(
         kv,
         kv_cache,
         block_table,
+        ori_kv,
+        cmp_kv,
+        ori_block_table,
+        cmp_block_table,
+        sparse_indices,
+        start_pos,
+    )
+
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    attn_out = prefill_sparse_attn(
+        q,
+        ori_kv,
+        ori_block_table,
+        cmp_kv,
+        cmp_block_table,
+        sparse_indices,
         attn_sink,
+        seqused_kv,
         rope_cos_t,
         rope_sin_t,
         even_select_local,
@@ -211,20 +364,17 @@ def prefill_attention_swa(
         wo_b,
         wo_b_scale,
         attn_out,
-        start_pos,
     )
+    kv_cache = prefill_swa_write_kv_cache(kv, kv_cache, block_table, start_pos)
 
     # create_tensor seeds static metadata required by the JIT for hc_post input.
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
-    x_out = prefill_hc_post_from_padded(
+    x_out = prefill_hc_post(
         attn_out_3d,
         x_hc,
-        post_pad,
-        comb0_pad,
-        comb1_pad,
-        comb2_pad,
-        comb3_pad,
+        post,
+        comb,
         x_out,
     )
     return kv_cache, x_out
@@ -242,53 +392,40 @@ def _quant_w_per_output_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
+def _quant_w_per_row(w):
+    import torch
+
+    amax = w.float().abs().amax(dim=1).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = w.float() * scale_quant.view(-1, 1)
+    w_i32 = torch.round(scaled).to(torch.int32)
+    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+    w_i8 = w_i32.to(torch.float16).to(torch.int8)
+    return w_i8, (1.0 / scale_quant).float()
+
+
 def golden_prefill_attention_swa(tensors):
     """Torch reference for the official SWA prefill branch."""
     import torch
 
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb0_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb1_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb2_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
-    comb3_pad = torch.zeros(T, HC_PAD, dtype=torch.float32)
+    post = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
     golden_prefill_hc_pre({
         "x": tensors["x_hc"],
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
         "hc_base": tensors["hc_attn_base"],
         "x_mixed": x_mixed,
-        "post_pad": post_pad,
-        "comb0_pad": comb0_pad,
-        "comb1_pad": comb1_pad,
-        "comb2_pad": comb2_pad,
-        "comb3_pad": comb3_pad,
+        "post": post,
+        "comb": comb,
     })
     if "x_mixed" in tensors:
         tensors["x_mixed"][:] = x_mixed
-    if "post_pad" in tensors:
-        tensors["post_pad"][:] = post_pad
-    if "comb0_pad" in tensors:
-        tensors["comb0_pad"][:] = comb0_pad
-    if "comb1_pad" in tensors:
-        tensors["comb1_pad"][:] = comb1_pad
-    if "comb2_pad" in tensors:
-        tensors["comb2_pad"][:] = comb2_pad
-    if "comb3_pad" in tensors:
-        tensors["comb3_pad"][:] = comb3_pad
     if "post_t" in tensors:
-        tensors["post_t"][:] = post_pad.view(B, S, HC_PAD)[:, :, :HC_MULT]
+        tensors["post_t"][:] = post
     if "comb_t" in tensors:
-        comb_t = torch.stack(
-            [
-                comb0_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb1_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb2_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-                comb3_pad.view(B, S, HC_PAD)[:, :, :HC_MULT],
-            ],
-            dim=2,
-        )
-        tensors["comb_t"][:] = comb_t
+        tensors["comb_t"][:] = comb
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
@@ -326,22 +463,60 @@ def golden_prefill_attention_swa(tensors):
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).unsqueeze(0).expand(B, S, ROPE_HEAD_DIM)
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_prefill_swa_sparse_attn({
+    ori_kv = torch.zeros(PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    ori_kv[0, :S, 0] = kv.view(B, S, HEAD_DIM)[0]
+    ori_block_table = torch.zeros(B, PREFILL_ORI_MAX_BLOCKS, dtype=torch.int32)
+    cmp_kv = torch.zeros(PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    cmp_block_table = torch.zeros(B, PREFILL_CMP_MAX_BLOCKS, dtype=torch.int32)
+    sparse_indices = torch.full((T, PREFILL_CORE_TOPK), -1, dtype=torch.int32)
+
+    hist_valid = min(start_pos, WIN - 1)
+    hist_start_abs = start_pos - hist_valid
+    kv_cache_for_attn = tensors["kv_cache"]
+    block_table = tensors["block_table"]
+    for hist_i in range(hist_valid):
+        key_abs_pos = hist_start_abs + hist_i
+        ori_slot = key_abs_pos % WIN
+        blk_id = int(block_table[0, ori_slot // BLOCK_SIZE].item())
+        cmp_kv[0, hist_i, 0] = kv_cache_for_attn[blk_id, ori_slot % BLOCK_SIZE, 0]
+
+    for t in range(T):
+        s = t % S
+        abs_pos = start_pos + s
+        window_valid = min(WIN, abs_pos + 1)
+        key_start_abs = abs_pos + 1 - window_valid
+        for key_i in range(window_valid):
+            key_abs_pos = key_start_abs + key_i
+            if key_abs_pos >= start_pos:
+                raw_idx = key_abs_pos - start_pos
+            else:
+                raw_idx = S + key_abs_pos - hist_start_abs
+            sparse_indices[t, key_i] = raw_idx
+
+    golden_prefill_sparse_attn({
         "q": q,
-        "kv": kv,
-        "kv_cache": tensors["kv_cache"],
-        "block_table": tensors["block_table"],
+        "ori_kv": ori_kv,
+        "ori_block_table": ori_block_table,
+        "cmp_kv": cmp_kv,
+        "cmp_block_table": cmp_block_table,
+        "cmp_sparse_indices": sparse_indices,
         "attn_sink": tensors["attn_sink"],
-        "freqs_cos_t": rope_cos_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
-        "freqs_sin_t": rope_sin_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
+        "seqused_kv": tensors["seqused_kv"],
+        "freqs_cos": rope_cos_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
+        "freqs_sin": rope_sin_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
         "even_select_local": tensors["even_select_local"],
         "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
-        "start_pos": tensors["start_pos"],
     })
+    kv_cache = tensors["kv_cache"]
+    for b in range(B):
+        for s in range(S):
+            ori_slot = (start_pos + s) % WIN
+            blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
+            kv_cache[blk_id, ori_slot % BLOCK_SIZE, 0] = kv.view(B, S, HEAD_DIM)[b, s]
     if "attn_out" in tensors:
         tensors["attn_out"][:] = attn_out
 
@@ -349,11 +524,8 @@ def golden_prefill_attention_swa(tensors):
     golden_prefill_hc_post({
         "x": attn_out.view(B, S, D),
         "residual": tensors["x_hc"],
-        "post_pad": post_pad,
-        "comb0_pad": comb0_pad,
-        "comb1_pad": comb1_pad,
-        "comb2_pad": comb2_pad,
-        "comb3_pad": comb3_pad,
+        "post": post,
+        "comb": comb,
         "y": y,
     })
     tensors["x_out"][:] = y
