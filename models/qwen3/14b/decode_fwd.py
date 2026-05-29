@@ -535,7 +535,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=BATCH)
     parser.add_argument("--max-seq", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=NUM_LAYERS)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument(

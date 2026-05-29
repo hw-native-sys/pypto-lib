@@ -19,6 +19,7 @@ def test_qwen3_decode_fwd_cli_accepts_ci_platforms_and_omits_disabled_out_window
     tree = ast.parse(script.read_text())
 
     platform_choices = None
+    num_layers_default = None
     out_window_help = None
     compile_cfg = None
 
@@ -32,6 +33,10 @@ def test_qwen3_decode_fwd_cli_accepts_ci_platforms_and_omits_disabled_out_window
                 for keyword in node.keywords:
                     if keyword.arg == "choices" and isinstance(keyword.value, ast.List):
                         platform_choices = [elt.value for elt in keyword.value.elts]
+            if "--num-layers" in arg_names:
+                for keyword in node.keywords:
+                    if keyword.arg == "default" and isinstance(keyword.value, ast.Constant):
+                        num_layers_default = keyword.value.value
             if "--enable-out-window-externalization" in arg_names:
                 for keyword in node.keywords:
                     if keyword.arg == "help" and isinstance(keyword.value, ast.Constant):
@@ -42,6 +47,7 @@ def test_qwen3_decode_fwd_cli_accepts_ci_platforms_and_omits_disabled_out_window
                     compile_cfg = keyword.value
 
     assert platform_choices == ["a2a3", "a2a3sim", "a5", "a5sim"]
+    assert num_layers_default == 2
     assert out_window_help == "Enable out-window externalization compiler pass."
     assert isinstance(compile_cfg, ast.IfExp)
     assert isinstance(compile_cfg.orelse, ast.Dict)
