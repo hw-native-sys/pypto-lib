@@ -16,7 +16,15 @@ Companion files: attention_swa.py (ratio=0)
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    BLOCK_SIZE,
+    C128_COMPRESSOR_BLOCK_SIZE,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+)
 from hc_pre import hc_pre
 from hc_post import hc_post
 from decode_qkv_proj_rope import qkv_proj_rope
@@ -59,7 +67,7 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS  # cmp KV pool size (shared with the compress
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_MAX_BLOCKS = 64
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
-COMPRESS_STATE_BLOCK_SIZE = BLOCK_SIZE
+COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
