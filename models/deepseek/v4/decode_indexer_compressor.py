@@ -69,6 +69,15 @@ POST_CHUNK = 16
 BATCH_CHUNK_1 = 1
 assert B % BATCH_CHUNK_1 == 0, "B must be divisible by BATCH_CHUNK_1"
 assert BATCH_CHUNK_1 <= POST_CHUNK, "BATCH_CHUNK_1 must not exceed the POST_CHUNK matmul box"
+# Window gather (Pass 1b) and softmax-pool (Pass 1c) batch group. These only READ the block table
+# / scratch and WRITE per-batch-disjoint contiguous window/pooled rows, so (unlike the scatter)
+# they are not pinned to row granularity. Each task does POOL_GROUP batches via pl.unroll (trace-time
+# unroll, NOT pl.range) -> fewer, coarser tasks so the AICPU dispatch cost (the spread limiter for 64
+# tiny tasks) amortizes. pl.unroll gives each batch independent AST values; a runtime pl.range here
+# loop-carries the per-batch names (mi/li/oi) and was suspected of threading a cross-batch SSA chain
+# that produced intermittent NaN/deadlock.
+POOL_GROUP = 4
+assert B % POOL_GROUP == 0, "B must be divisible by POOL_GROUP"
 
 
 @pl.jit.inline
@@ -188,59 +197,61 @@ def indexer_compressor(
     # a row range that spanned almost the whole tensor -> the dep tracker saw them all overlap and
     # serialized to 1 core). compress_state columns: kv front [0:HEAD_DIM] / kv back
     # [HEAD_DIM:OUT_DIM] / score front [OUT_DIM:OUT_DIM+HEAD_DIM] / score back [OUT_DIM+HEAD_DIM:].
-    for c_idx in pl.parallel(0, B, BATCH_CHUNK_1):
-        start_pos_b = pl.read(start_pos, [c_idx])
-        pos_b = start_pos_b % COMPRESS_RATIO
-        pre_tokens_b = COMPRESS_RATIO - pos_b
-        boundary_end_b = start_pos_b + pre_tokens_b - 1
-        cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
-        prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
-        base = c_idx * STATE_LEN
-
+    for cg in pl.parallel(0, B, POOL_GROUP):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="window_gather"):
-            for slot in pl.range(0, STATE_LEN):
-                window_score = pl.assemble(window_score, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=FP32_NEG_INF), [base + slot, 0])
-                window_kv = pl.assemble(window_kv, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0), [base + slot, 0])
+            for ci in pl.unroll(POOL_GROUP):
+                c_idx = cg + ci
+                start_pos_b = pl.read(start_pos, [c_idx])
+                pos_b = start_pos_b % COMPRESS_RATIO
+                pre_tokens_b = COMPRESS_RATIO - pos_b
+                boundary_end_b = start_pos_b + pre_tokens_b - 1
+                cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
+                prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
+                base = c_idx * STATE_LEN
 
-            if pos_b + S >= COMPRESS_RATIO:
-                # slot 0 = init (last cur token, back halves).
-                last_abs = cur_window_start_b + COMPRESS_RATIO - 1
-                last_blk_off = last_abs // COMPRESS_STATE_BLOCK_SIZE
-                last_intra = last_abs % COMPRESS_STATE_BLOCK_SIZE
-                last_blk_id = pl.cast(
-                    pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + last_blk_off]),
-                    pl.INDEX,
-                )
-                last_row = last_blk_id * COMPRESS_STATE_BLOCK_SIZE + last_intra
-                window_score = pl.assemble(window_score, compress_state_flat[last_row : last_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base, 0])
-                window_kv = pl.assemble(window_kv, compress_state_flat[last_row : last_row + 1, HEAD_DIM : OUT_DIM], [base, 0])
+                for slot in pl.range(0, STATE_LEN):
+                    window_score = pl.assemble(window_score, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=FP32_NEG_INF), [base + slot, 0])
+                    window_kv = pl.assemble(window_kv, pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0), [base + slot, 0])
 
-                # slots 1..R = prev (front halves), overwritten only when prev_abs >= 0.
-                for s in pl.range(0, COMPRESS_RATIO):
-                    prev_abs = prev_window_start_b + s
-                    if prev_abs >= 0:
-                        prev_blk_off = prev_abs // COMPRESS_STATE_BLOCK_SIZE
-                        prev_intra = prev_abs % COMPRESS_STATE_BLOCK_SIZE
-                        prev_blk_id = pl.cast(
-                            pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + prev_blk_off]),
-                            pl.INDEX,
-                        )
-                        prev_row = prev_blk_id * COMPRESS_STATE_BLOCK_SIZE + prev_intra
-                        window_score = pl.assemble(window_score, compress_state_flat[prev_row : prev_row + 1, OUT_DIM : OUT_DIM + HEAD_DIM], [base + 1 + s, 0])
-                        window_kv = pl.assemble(window_kv, compress_state_flat[prev_row : prev_row + 1, 0 : HEAD_DIM], [base + 1 + s, 0])
-
-                # slots R+1.. = cur (back halves).
-                for s in pl.range(0, COMPRESS_RATIO - 1):
-                    cur_abs = cur_window_start_b + s
-                    cur_blk_off = cur_abs // COMPRESS_STATE_BLOCK_SIZE
-                    cur_intra = cur_abs % COMPRESS_STATE_BLOCK_SIZE
-                    cur_blk_id = pl.cast(
-                        pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + cur_blk_off]),
+                if pos_b + S >= COMPRESS_RATIO:
+                    # slot 0 = init (last cur token, back halves).
+                    last_abs = cur_window_start_b + COMPRESS_RATIO - 1
+                    last_blk_off = last_abs // COMPRESS_STATE_BLOCK_SIZE
+                    last_intra = last_abs % COMPRESS_STATE_BLOCK_SIZE
+                    last_blk_id = pl.cast(
+                        pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + last_blk_off]),
                         pl.INDEX,
                     )
-                    cur_row = cur_blk_id * COMPRESS_STATE_BLOCK_SIZE + cur_intra
-                    window_score = pl.assemble(window_score, compress_state_flat[cur_row : cur_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
-                    window_kv = pl.assemble(window_kv, compress_state_flat[cur_row : cur_row + 1, HEAD_DIM : OUT_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
+                    last_row = last_blk_id * COMPRESS_STATE_BLOCK_SIZE + last_intra
+                    window_score = pl.assemble(window_score, compress_state_flat[last_row : last_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base, 0])
+                    window_kv = pl.assemble(window_kv, compress_state_flat[last_row : last_row + 1, HEAD_DIM : OUT_DIM], [base, 0])
+
+                    # slots 1..R = prev (front halves), overwritten only when prev_abs >= 0.
+                    for s in pl.range(0, COMPRESS_RATIO):
+                        prev_abs = prev_window_start_b + s
+                        if prev_abs >= 0:
+                            prev_blk_off = prev_abs // COMPRESS_STATE_BLOCK_SIZE
+                            prev_intra = prev_abs % COMPRESS_STATE_BLOCK_SIZE
+                            prev_blk_id = pl.cast(
+                                pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + prev_blk_off]),
+                                pl.INDEX,
+                            )
+                            prev_row = prev_blk_id * COMPRESS_STATE_BLOCK_SIZE + prev_intra
+                            window_score = pl.assemble(window_score, compress_state_flat[prev_row : prev_row + 1, OUT_DIM : OUT_DIM + HEAD_DIM], [base + 1 + s, 0])
+                            window_kv = pl.assemble(window_kv, compress_state_flat[prev_row : prev_row + 1, 0 : HEAD_DIM], [base + 1 + s, 0])
+
+                    # slots R+1.. = cur (back halves).
+                    for s in pl.range(0, COMPRESS_RATIO - 1):
+                        cur_abs = cur_window_start_b + s
+                        cur_blk_off = cur_abs // COMPRESS_STATE_BLOCK_SIZE
+                        cur_intra = cur_abs % COMPRESS_STATE_BLOCK_SIZE
+                        cur_blk_id = pl.cast(
+                            pl.read(compress_state_block_table_flat, [c_idx * COMPRESS_STATE_MAX_BLOCKS + cur_blk_off]),
+                            pl.INDEX,
+                        )
+                        cur_row = cur_blk_id * COMPRESS_STATE_BLOCK_SIZE + cur_intra
+                        window_score = pl.assemble(window_score, compress_state_flat[cur_row : cur_row + 1, OUT_DIM + HEAD_DIM : OUT_DIM + HEAD_DIM + HEAD_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
+                        window_kv = pl.assemble(window_kv, compress_state_flat[cur_row : cur_row + 1, HEAD_DIM : OUT_DIM], [base + 1 + COMPRESS_RATIO + s, 0])
 
     # Pass 1c (per-batch, NO block table): online softmax-pool over the contiguous batch-major
     # window block window[c_idx*STATE_LEN : +STATE_LEN] (STATE_LEN rows) -> pooled_all[c_idx]. With
@@ -249,24 +260,26 @@ def indexer_compressor(
     # order (0=init/last, 1..R=prev, R+1..=cur) matches the old per-batch online loop, so for valid
     # batches it is bit-identical; a NEG_INF slot (skipped prev / non-compress) gives alpha=exp(0)=1,
     # beta=exp(NEG_INF-mi)~=0 -> a no-op update, no NaN.
-    for c_idx in pl.parallel(0, B, BATCH_CHUNK_1):
-        base = c_idx * STATE_LEN
+    for cg in pl.parallel(0, B, POOL_GROUP):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_pool"):
-            mi = window_score[base : base + 1, 0 : HEAD_DIM]
-            li = pl.exp(pl.sub(mi, mi))
-            oi = window_kv[base : base + 1, 0 : HEAD_DIM]
+            for ci in pl.unroll(POOL_GROUP):
+                c_idx = cg + ci
+                base = c_idx * STATE_LEN
+                mi = window_score[base : base + 1, 0 : HEAD_DIM]
+                li = pl.exp(pl.sub(mi, mi))
+                oi = window_kv[base : base + 1, 0 : HEAD_DIM]
 
-            for slot in pl.range(1, STATE_LEN):
-                slot_score = window_score[base + slot : base + slot + 1, 0 : HEAD_DIM]
-                slot_kv = window_kv[base + slot : base + slot + 1, 0 : HEAD_DIM]
-                mi_next = pl.maximum(mi, slot_score)
-                alpha = pl.exp(pl.sub(mi, mi_next))
-                beta = pl.exp(pl.sub(slot_score, mi_next))
-                li = pl.add(pl.mul(alpha, li), beta)
-                oi = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-                mi = mi_next
+                for slot in pl.range(1, STATE_LEN):
+                    slot_score = window_score[base + slot : base + slot + 1, 0 : HEAD_DIM]
+                    slot_kv = window_kv[base + slot : base + slot + 1, 0 : HEAD_DIM]
+                    mi_next = pl.maximum(mi, slot_score)
+                    alpha = pl.exp(pl.sub(mi, mi_next))
+                    beta = pl.exp(pl.sub(slot_score, mi_next))
+                    li = pl.add(pl.mul(alpha, li), beta)
+                    oi = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
+                    mi = mi_next
 
-            pooled_all = pl.assemble(pooled_all, pl.div(oi, li), [c_idx, 0])
+                pooled_all = pl.assemble(pooled_all, pl.div(oi, li), [c_idx, 0])
 
     # Pass 2 (batch-group coarsened, NO block-table): rmsnorm + rope + hadamard. Reads
     # pooled_all read-only and writes contiguous kv_final_all -- no in-place RW, no paged
