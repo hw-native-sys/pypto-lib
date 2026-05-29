@@ -197,47 +197,43 @@ def compressor(
 
     normed_kv = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
     kv_final = pl.create_tensor([B * POST_TILE, HEAD_DIM], dtype=pl.FP32)
-    for c_idx in pl.range(B):
-        start_pos_b = pl.read(start_pos, [c_idx])
-        pos_b = start_pos_b % COMPRESS_RATIO
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    for c_idx in pl.spmd(B, name_hint="rmsnorm_rope"):
+        cos_b = cos[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        sin_b = sin[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            kv_rms_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
+            partial_sq = pl.add(
+                partial_sq,
+                pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, POST_TILE]),
+            )
 
-        norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
-            cos_b = cos[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-            sin_b = sin[c_idx : c_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-            partial_sq = pl.full([1, POST_TILE], dtype=pl.FP32, value=0.0)
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                kv_rms_chunk = pooled_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, k0 : k0 + HEAD_TILE]
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, POST_TILE]),
-                )
+        variance = pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS)
+        inv_rms = pl.recip(pl.sqrt(variance))
+        inv_rms_scalar = pl.read(inv_rms, [0, 0])
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            kv_norm_chunk = pooled_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE]
+            gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
+            inv_gamma = pl.mul(gamma, inv_rms_scalar)
+            normed_chunk = pl.mul(kv_norm_chunk, inv_gamma)
+            normed_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE] = normed_chunk
 
-            variance = pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS)
-            inv_rms = pl.recip(pl.sqrt(variance))
-            inv_rms_scalar = pl.read(inv_rms, [0, 0])
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                kv_norm_chunk = pooled_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE]
-                gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
-                inv_gamma = pl.mul(gamma, inv_rms_scalar)
-                normed_chunk = pl.mul(kv_norm_chunk, inv_gamma)
-                normed_kv[c_idx * POST_TILE : c_idx * POST_TILE + 1, k0 : k0 + HEAD_TILE] = normed_chunk
-
-            # Keep RoPE reassembly at POST_TILE rows. Shrinking to 1 row
-            # (kv_rope_slice / rope_buf / scatter src all [1, …]) hits
-            # pypto #1586: `pl.tensor.scatter` on a 1-row dst/src triggers
-            # an internal `tile.ci cols != 1` ISA check during codegen. With
-            # ≥ 2 rows the same chain compiles fine. Repro:
-            # `models/deepseek/v4/repro_1row_scatter_draft.py`.
-            kv_rope_slice = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-            even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-            rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
-            rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
-            rope_buf = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-            rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
-            rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
-            normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
+        # Keep RoPE reassembly at POST_TILE rows. Shrinking to 1 row
+        # (kv_rope_slice / rope_buf / scatter src all [1, …]) hits
+        # pypto #1586: `pl.tensor.scatter` on a 1-row dst/src triggers
+        # an internal `tile.ci cols != 1` ISA check during codegen. With
+        # ≥ 2 rows the same chain compiles fine. Repro:
+        # `models/deepseek/v4/repro_1row_scatter_draft.py`.
+        kv_rope_slice = normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_b), pl.col_expand_mul(odd_tile, sin_b))
+        rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_b), pl.col_expand_mul(odd_tile, cos_b))
+        rope_buf = pl.full([POST_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx, src=rope_even)
+        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
+        normed_kv[c_idx * POST_TILE : (c_idx + 1) * POST_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
     for c_idx in pl.range(B):
         start_pos_b = pl.read(start_pos, [c_idx])
