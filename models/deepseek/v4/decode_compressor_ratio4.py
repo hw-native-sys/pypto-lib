@@ -50,11 +50,8 @@ ROPE_TILE = 32
 K_TILE = 512
 OUT_TILE = 64
 B_TILE = 64
-HEAD_TILE = 64 if B * S >= 64 else 128
+HEAD_TILE = 64
 HEAD_DIM_TILE = 128
-# Group RMS_TILE real batches per rmsnorm_rope / kv_hadamard spmd block. 16
-# satisfies (a) col_vec 32B-aligned row stride (FP32 needs ≥8 rows),
-# (b) pypto #1586 scatter row >= 2, (c) matmul innerRows = 16 for hadamard.
 RMS_TILE = 16
 
 
@@ -200,10 +197,9 @@ def compressor(
             partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
             for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
                 kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(kv_rms_chunk, kv_rms_chunk)), [1, RMS_TILE]),
-                )
+                kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+                kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
+                partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
