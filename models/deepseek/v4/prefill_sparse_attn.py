@@ -22,12 +22,12 @@ Current standalone contract:
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, INT8_AMAX_EPS, INT8_SCALE_MAX
+from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 
 
-# Standalone prefill target shape for correctness bring-up.
-B = 1
-S = 128
+# Prefill target shape for correctness bring-up.
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 
 # model config
