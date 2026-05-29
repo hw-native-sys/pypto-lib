@@ -292,6 +292,8 @@ def attention_csa(
         step_sin,
         even_select,
         odd_select,
+        cmp_even_idx,
+        cmp_odd_idx,
         hadamard_idx,
         idx_kv_unused,
         inner_compress_state,
