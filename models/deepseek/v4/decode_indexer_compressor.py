@@ -82,6 +82,14 @@ def indexer_compressor(
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
 
+    # Inline-context workaround: pin kv_final to a dedicated GM buffer via an early
+    # full-tensor write so MemoryReuse cannot alias it with a concurrently-live tensor
+    # when this compressor is inlined into the larger decode_indexer kernel (idx_kv_cache
+    # is corrupted ~4% otherwise). Standalone compressor_test is unaffected.
+    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_final_pin"):
+        kv_final[0:B, 0:HEAD_DIM] = pl.full([B, HEAD_DIM], dtype=pl.FP32, value=0.0)
+
     for idx in pl.spmd(B * S * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"):
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
@@ -190,7 +198,6 @@ def indexer_compressor(
             pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for batch_base_idx in pl.range(B // RMS_TILE):
         batch_base = batch_base_idx * RMS_TILE
