@@ -23,6 +23,7 @@ from config import (
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
+    C4A_COMPRESSOR_BLOCK_SIZE,
     EP_WORLD_SIZE,
 )
 from decode_attention_csa import attention_csa
@@ -59,9 +60,19 @@ IDX_TOPK = M.index_topk
 
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
+MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+MAIN_STATE_MAX_BLOCKS = 64
+MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
+MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
+INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+INNER_STATE_MAX_BLOCKS = 64
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+INNER_STATE_DIM = 2 * INNER_OUT_DIM
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
+IDX_CACHE_MAX_BLOCKS = 64
+IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
@@ -114,8 +125,8 @@ def decode_csa(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
     # ---- indexer weights + hadamard ----
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -126,15 +137,16 @@ def decode_csa(
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     # ---- attention KV cache (split into ori + cmp pools) ----
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     # ---- indexer-cached compressed KV (written by inner compressor, read for scoring) ----
-    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     # ---- sparse_attn ----
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
@@ -181,12 +193,12 @@ def decode_csa(
         even_select, odd_select,
         even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_kv_state, cmp_score_state,
+        compress_state, compress_state_block_table,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        inner_kv_state, inner_score_state,
+        inner_compress_state, inner_compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
-        idx_kv_cache,
+        idx_kv_cache, idx_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_attn,
@@ -234,8 +246,8 @@ def decode_csa_test(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, MAIN_STATE_MAX_BLOCKS], pl.INT32],
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -244,13 +256,14 @@ def decode_csa_test(
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.FP32],
-    inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[B, IDX_KV_LEN, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -289,12 +302,12 @@ def decode_csa_test(
         even_select, odd_select,
         even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_kv_state, cmp_score_state,
+        compress_state, compress_state_block_table,
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        inner_kv_state, inner_score_state,
+        inner_compress_state, inner_compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
-        idx_kv_cache,
+        idx_kv_cache, idx_block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -361,12 +374,12 @@ def build_tensor_specs(layer_id: int = 0, start_pos: int = START_POS, hetero_sta
         "even_select", "odd_select",
         "even_select_local", "odd_select_local",
         "cmp_wkv", "cmp_wgate", "cmp_ape", "cmp_norm_w",
-        "cmp_kv_state", "cmp_score_state",
+        "compress_state", "compress_state_block_table",
         "idx_wq_b", "idx_wq_b_scale", "weights_proj", "hadamard_idx",
         "inner_wkv", "inner_wgate", "inner_ape", "inner_norm_w",
-        "inner_kv_state", "inner_score_state",
+        "inner_compress_state", "inner_compress_state_block_table",
         "kv_cache", "ori_block_table", "cmp_kv", "cmp_block_table",
-        "idx_kv_cache",
+        "idx_kv_cache", "idx_block_table",
         "attn_sink", "seqused_kv",
         "wo_a", "wo_b", "wo_b_scale",
         # ---- moe inputs ----

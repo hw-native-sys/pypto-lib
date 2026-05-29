@@ -69,7 +69,7 @@ def golden_prefill_attention_hca(tensors):
     attention path. Ratio-128 compressor cache side effects are outside this
     single-rank golden's current scope.
     """
-    from prefill_attention_swa_draft import golden_prefill_attention_swa
+    from prefill_attention_swa import golden_prefill_attention_swa
 
     local = dict(tensors)
     local["block_table"] = tensors["ori_block_table"]

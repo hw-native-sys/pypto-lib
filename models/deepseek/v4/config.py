@@ -174,7 +174,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=8192,
+    max_position_embeddings=8192,  # official 1M;
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -246,6 +246,8 @@ PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel p
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
+C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
+C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127

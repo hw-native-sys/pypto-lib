@@ -79,7 +79,7 @@ def golden_prefill_attention_csa(tensors):
     runs causal sparse attention. Compressor/indexer state updates are ignored
     here because this golden is scoped to single-rank functional output.
     """
-    from prefill_attention_swa_draft import golden_prefill_attention_swa
+    from prefill_attention_swa import golden_prefill_attention_swa
 
     local = dict(tensors)
     local["block_table"] = tensors["ori_block_table"]
