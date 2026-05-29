@@ -223,20 +223,21 @@ def compressor(
             rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx, src=rope_odd)
             normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
-    for batch_base_idx in pl.range(B // RMS_TILE):
-        batch_base = batch_base_idx * RMS_TILE
-        if rotate:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-                kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
-                for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
-                    hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-                    kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                    kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
-        else:
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_write"):
-                kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
+    if rotate:
+        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_hadamard"):
+            batch_base = batch_base_idx * RMS_TILE
+            kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
+            for o_kb in pl.pipeline(HEAD_DIM // OUT_TILE, stage=2):
+                o0 = o_kb * OUT_TILE
+                hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
+                kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+                kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+    else:
+        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_write"):
+            batch_base = batch_base_idx * RMS_TILE
+            kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
 
-    for c_idx in pl.range(B):
+    for c_idx in pl.parallel(B):
         start_pos_b = pl.read(start_pos, [c_idx])
         cache_col = start_pos_b // COMPRESS_RATIO
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
@@ -490,12 +491,14 @@ if __name__ == "__main__":
     parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
                         help="Use a grouped per-batch start_pos pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=compressor_test,
         specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
         golden_fn=golden_compressor,
+        runtime_dir=args.runtime_dir,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
