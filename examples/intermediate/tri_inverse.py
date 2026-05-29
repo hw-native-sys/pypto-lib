@@ -80,7 +80,7 @@ def build_tri_inverse_program(n: int = N):
             # as iter_args across iterations — they're GM tensor handles, not
             # L0 tiles, so the loop never needs to keep cube state alive
             # across boundaries.
-            for k, (X_iter, Y_iter) in pl.range(n_steps, init_values=(X_buf, Y_buf)):
+            for _k, (X_iter, Y_iter) in pl.range(n_steps, init_values=(X_buf, Y_buf)):
                 X_mat = pl.load(X_iter, [0, 0], [n, n], target_memory=pl.MemorySpace.Mat)
                 Y_mat = pl.load(Y_iter, [0, 0], [n, n], target_memory=pl.MemorySpace.Mat)
 
@@ -173,7 +173,7 @@ def build_tri_inverse_program_batched(n: int = N, batch: int = 1):
             )
             Y_buf = pl.store(A_l0c, [0, 0], Y_buf)
 
-            for k, (X_iter, Y_iter) in pl.range(n_steps, init_values=(X_buf, Y_buf)):
+            for _k, (X_iter, Y_iter) in pl.range(n_steps, init_values=(X_buf, Y_buf)):
                 X_mat = pl.load(X_iter, [0, 0], [n, n], target_memory=pl.MemorySpace.Mat)
                 Y_mat = pl.load(Y_iter, [0, 0], [n, n], target_memory=pl.MemorySpace.Mat)
 
