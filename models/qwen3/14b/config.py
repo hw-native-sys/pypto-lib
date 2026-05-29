@@ -47,8 +47,11 @@ BATCH_TILE = 16
 
 # Scope 2 tiling constants.
 # Q_HEAD_BATCH = q_per_kv = 40/8 = 5 for the official Qwen3-14B config.
-# The Q_HEAD_BATCH-row trim runs in the non-UP_DOWN online_softmax region, so
-# the odd 5 is fine; fa_fused itself splits on Q_HEAD_PAD=16 (always even).
+# The Q_HEAD_BATCH-row trim runs inside the fa_fused mixed cube+vec root.
+# The lane-1 dual-AIV no-op replay rewrites the [0:5] subview to
+# valid_row=0; this is accepted by ptoas >= 0.43 (hw-native-sys/PTOAS#708)
+# and lowered as a no-op via pto-isa's GetValidRow/GetValidCol valid==0
+# support (hw-native-sys/pto-isa#151).
 Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16
 # SEQ_TILE = 128 keeps each K/V tile at 32 KB (BLOCK_SIZE * HEAD_DIM * BF16),
@@ -81,10 +84,13 @@ Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
 assert Q_PER_KV % Q_HEAD_BATCH == 0, (
     f"Q_PER_KV ({Q_PER_KV}) must be divisible by Q_HEAD_BATCH ({Q_HEAD_BATCH})"
 )
-# Q_HEAD_PAD is the padded Q row count fa_fused operates on. It must be even
-# (ExpandMixedKernel applies an UP_DOWN row split inside the spmd body, and
-# set_validshape uses Q_HEAD_PAD // 2 as the post-split height) and large
-# enough to hold a Q_HEAD_BATCH chunk before the trim.
+# Q_HEAD_PAD is the padded Q row count fa_fused operates on. Must be even
+# and >= Q_HEAD_BATCH; fa_fused does set_validshape(scores, Q_HEAD_PAD // 2,
+# ...) on the vec-side scores tile, so Q_HEAD_PAD // 2 must itself be a
+# legal even-or-tolerated valid_row. (Q_HEAD_PAD // 2 = 8 here is just an
+# even value >= Q_HEAD_BATCH — NOT a post-UP_DOWN-split height; fa_fused
+# runs with SplitMode=None and the a2a3 backend handles the mixed cube+vec
+# body via a dual-AIV no-op replay rather than row halving.)
 assert Q_HEAD_PAD % 2 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH, (
     f"Q_HEAD_PAD ({Q_HEAD_PAD}) must be even and >= Q_HEAD_BATCH ({Q_HEAD_BATCH})"
 )
