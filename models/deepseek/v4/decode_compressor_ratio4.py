@@ -125,8 +125,17 @@ def compressor(
                 compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
                 compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
+    # Keep softmax_pool spmd dim flat (B * HEAD_DIM // HEAD_TILE). Nesting as
+    # pl.spmd(B) + inner pl.range(HEAD_DIM // HEAD_TILE) compiles & passes
+    # standalone but, combined with the downstream pl.spmd scopes, triggers
+    # intermittent AICPU 507046 stalls (~20% of runs). See issue #419.
     pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-    for c_idx in pl.spmd(B, name_hint="softmax_pool"):
+    for idx in pl.spmd(B * (HEAD_DIM // HEAD_TILE), name_hint="softmax_pool"):
+        c_idx = idx // (HEAD_DIM // HEAD_TILE)
+        h0 = (idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
+        # Zero-init non-compress batches so downstream RMSNorm/RoPE/Hadamard
+        # propagate 0 without per-batch gates.
+        pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
         start_pos_b = pl.read(start_pos, [c_idx])
         pos_b = start_pos_b % COMPRESS_RATIO
         pre_tokens_b = COMPRESS_RATIO - pos_b
@@ -134,57 +143,51 @@ def compressor(
         cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
         prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
 
-        for h_kb in pl.range(HEAD_DIM // HEAD_TILE):
-            h0 = h_kb * HEAD_TILE
-            # Zero-init non-compress batches so downstream RMSNorm/RoPE/Hadamard
-            # propagate 0 without per-batch gates.
-            pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+        if pos_b + S >= COMPRESS_RATIO:
+            last_abs = cur_window_start_b + COMPRESS_RATIO - 1
+            last_blk_off = last_abs // COMPRESS_STATE_BLOCK_SIZE
+            last_intra = last_abs % COMPRESS_STATE_BLOCK_SIZE
+            last_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, last_blk_off]), pl.INDEX)
+            last_row = last_blk_id * COMPRESS_STATE_BLOCK_SIZE + last_intra
+            last_col0 = OUT_DIM + HEAD_DIM + h0
+            mi = compress_state_flat[last_row : last_row + 1, last_col0 : last_col0 + HEAD_TILE]
+            li = pl.exp(pl.sub(mi, mi))
+            oi = compress_state_flat[last_row : last_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE]
 
-            if pos_b + S >= COMPRESS_RATIO:
-                last_abs = cur_window_start_b + COMPRESS_RATIO - 1
-                last_blk_off = last_abs // COMPRESS_STATE_BLOCK_SIZE
-                last_intra = last_abs % COMPRESS_STATE_BLOCK_SIZE
-                last_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, last_blk_off]), pl.INDEX)
-                last_row = last_blk_id * COMPRESS_STATE_BLOCK_SIZE + last_intra
-                last_col0 = OUT_DIM + HEAD_DIM + h0
-                mi = compress_state_flat[last_row : last_row + 1, last_col0 : last_col0 + HEAD_TILE]
-                li = pl.exp(pl.sub(mi, mi))
-                oi = compress_state_flat[last_row : last_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE]
+            for s in pl.range(0, COMPRESS_RATIO):
+                prev_abs = prev_window_start_b + s
+                if prev_abs >= 0:
+                    prev_blk_off = prev_abs // COMPRESS_STATE_BLOCK_SIZE
+                    prev_intra = prev_abs % COMPRESS_STATE_BLOCK_SIZE
+                    prev_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, prev_blk_off]), pl.INDEX)
+                    prev_row = prev_blk_id * COMPRESS_STATE_BLOCK_SIZE + prev_intra
+                    front_score = compress_state_flat[prev_row : prev_row + 1, OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE]
+                    front_kv = compress_state_flat[prev_row : prev_row + 1, h0 : h0 + HEAD_TILE]
+                    mi_next_front = pl.maximum(mi, front_score)
+                    alpha_front = pl.exp(pl.sub(mi, mi_next_front))
+                    beta_front = pl.exp(pl.sub(front_score, mi_next_front))
+                    li = pl.add(pl.mul(alpha_front, li), beta_front)
+                    oi = pl.add(pl.mul(oi, alpha_front), pl.mul(front_kv, beta_front))
+                    mi = mi_next_front
 
-                for s in pl.range(0, COMPRESS_RATIO):
-                    prev_abs = prev_window_start_b + s
-                    if prev_abs >= 0:
-                        prev_blk_off = prev_abs // COMPRESS_STATE_BLOCK_SIZE
-                        prev_intra = prev_abs % COMPRESS_STATE_BLOCK_SIZE
-                        prev_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, prev_blk_off]), pl.INDEX)
-                        prev_row = prev_blk_id * COMPRESS_STATE_BLOCK_SIZE + prev_intra
-                        front_score = compress_state_flat[prev_row : prev_row + 1, OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE]
-                        front_kv = compress_state_flat[prev_row : prev_row + 1, h0 : h0 + HEAD_TILE]
-                        mi_next_front = pl.maximum(mi, front_score)
-                        alpha_front = pl.exp(pl.sub(mi, mi_next_front))
-                        beta_front = pl.exp(pl.sub(front_score, mi_next_front))
-                        li = pl.add(pl.mul(alpha_front, li), beta_front)
-                        oi = pl.add(pl.mul(oi, alpha_front), pl.mul(front_kv, beta_front))
-                        mi = mi_next_front
+            for s in pl.range(0, COMPRESS_RATIO - 1):
+                cur_abs = cur_window_start_b + s
+                cur_blk_off = cur_abs // COMPRESS_STATE_BLOCK_SIZE
+                cur_intra = cur_abs % COMPRESS_STATE_BLOCK_SIZE
+                cur_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, cur_blk_off]), pl.INDEX)
+                cur_row = cur_blk_id * COMPRESS_STATE_BLOCK_SIZE + cur_intra
+                back_col0 = OUT_DIM + HEAD_DIM + h0
+                back_score = compress_state_flat[cur_row : cur_row + 1, back_col0 : back_col0 + HEAD_TILE]
+                back_kv = compress_state_flat[cur_row : cur_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE]
+                mi_next_back = pl.maximum(mi, back_score)
+                alpha_back = pl.exp(pl.sub(mi, mi_next_back))
+                beta_back = pl.exp(pl.sub(back_score, mi_next_back))
+                li = pl.add(pl.mul(alpha_back, li), beta_back)
+                oi = pl.add(pl.mul(oi, alpha_back), pl.mul(back_kv, beta_back))
+                mi = mi_next_back
 
-                for s in pl.range(0, COMPRESS_RATIO - 1):
-                    cur_abs = cur_window_start_b + s
-                    cur_blk_off = cur_abs // COMPRESS_STATE_BLOCK_SIZE
-                    cur_intra = cur_abs % COMPRESS_STATE_BLOCK_SIZE
-                    cur_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, cur_blk_off]), pl.INDEX)
-                    cur_row = cur_blk_id * COMPRESS_STATE_BLOCK_SIZE + cur_intra
-                    back_col0 = OUT_DIM + HEAD_DIM + h0
-                    back_score = compress_state_flat[cur_row : cur_row + 1, back_col0 : back_col0 + HEAD_TILE]
-                    back_kv = compress_state_flat[cur_row : cur_row + 1, HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_TILE]
-                    mi_next_back = pl.maximum(mi, back_score)
-                    alpha_back = pl.exp(pl.sub(mi, mi_next_back))
-                    beta_back = pl.exp(pl.sub(back_score, mi_next_back))
-                    li = pl.add(pl.mul(alpha_back, li), beta_back)
-                    oi = pl.add(pl.mul(oi, alpha_back), pl.mul(back_kv, beta_back))
-                    mi = mi_next_back
-
-                pooled_chunk = pl.div(oi, li)
-                pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+            pooled_chunk = pl.div(oi, li)
+            pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
@@ -236,16 +239,20 @@ def compressor(
             batch_base = batch_base_idx * RMS_TILE
             kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
 
-    for c_idx in pl.spmd(B, name_hint="kv_and_cache_write"):
-        start_pos_b = pl.read(start_pos, [c_idx])
-        cache_col = start_pos_b // COMPRESS_RATIO
-        kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
-        kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-        cmp_blk_off = cache_col // BLOCK_SIZE
-        cmp_intra = cache_col % BLOCK_SIZE
-        cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
-        cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-        cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
+    # Keep this as one big pl.at wrapping pl.range(B), not pl.spmd(B). The spmd
+    # form passes in isolation but combined with the upstream pl.spmd scopes
+    # contributes to the intermittent AICPU 507046 stall tracked in issue #419.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
+        for c_idx in pl.range(B):
+            start_pos_b = pl.read(start_pos, [c_idx])
+            cache_col = start_pos_b // COMPRESS_RATIO
+            kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
+            kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
+            cmp_blk_off = cache_col // BLOCK_SIZE
+            cmp_intra = cache_col % BLOCK_SIZE
+            cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
+            cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+            cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_cache = pl.reshape(cmp_kv_cache_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
