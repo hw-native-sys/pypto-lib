@@ -240,17 +240,16 @@ def compressor(
             batch_base = batch_base_idx * RMS_TILE
             kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
 
-    for c_idx in pl.parallel(B):
+    for c_idx in pl.spmd(B, name_hint="kv_and_cache_write"):
         start_pos_b = pl.read(start_pos, [c_idx])
         cache_col = start_pos_b // COMPRESS_RATIO
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-            kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
-            kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-            cmp_blk_off = cache_col // BLOCK_SIZE
-            cmp_intra = cache_col % BLOCK_SIZE
-            cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
-            cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-            cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
+        kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
+        kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
+        cmp_blk_off = cache_col // BLOCK_SIZE
+        cmp_intra = cache_col % BLOCK_SIZE
+        cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
+        cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+        cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_cache = pl.reshape(cmp_kv_cache_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
