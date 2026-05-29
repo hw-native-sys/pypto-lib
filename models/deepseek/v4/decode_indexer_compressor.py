@@ -82,14 +82,6 @@ def indexer_compressor(
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
 
-    # Inline-context workaround: pin kv_final to a dedicated GM buffer via an early
-    # full-tensor write so MemoryReuse cannot alias it with a concurrently-live tensor
-    # when this compressor is inlined into the larger decode_indexer kernel (idx_kv_cache
-    # is corrupted ~4% otherwise). Standalone compressor_test is unaffected.
-    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_final_pin"):
-        kv_final[0:B, 0:HEAD_DIM] = pl.full([B, HEAD_DIM], dtype=pl.FP32, value=0.0)
-
     for idx in pl.spmd(B * S * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"):
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
@@ -113,7 +105,13 @@ def indexer_compressor(
     kv_proj_by_batch = pl.reshape(kv_proj_scratch, [B, S * OUT_DIM])
     score_proj_by_batch = pl.reshape(score_proj_scratch, [B, S * OUT_DIM])
 
+    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_paged"):
+        # Inline-context workaround (folded into this scope): pin kv_final to a dedicated
+        # GM buffer with an early full-tensor write so MemoryReuse cannot alias it with a
+        # concurrently-live tensor when this compressor is inlined into decode_indexer
+        # (idx_kv_cache ~4% corruption otherwise). Standalone compressor_test is unaffected.
+        kv_final[0:B, 0:HEAD_DIM] = pl.full([B, HEAD_DIM], dtype=pl.FP32, value=0.0)
         for c_idx in pl.range(B):
             start_pos_b = pl.read(start_pos, [c_idx])
             ape_row_b = pl.cast(start_pos_b % COMPRESS_RATIO, target_type=pl.INDEX)
