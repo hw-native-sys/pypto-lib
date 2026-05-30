@@ -44,6 +44,7 @@ QUANT_TILE = 256
 def expert_routed(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
@@ -130,7 +131,12 @@ def expert_routed(
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
-            # Stage 1b: w2 matmul + dequant + write recv_y.
+            # Stage 1b: w2 matmul + dequant + routing-weight mul + write recv_y.
+            #
+            # The routing weight is applied row-wise here (vs. the legacy
+            # single-card path that applied it in combine's reduce). Multi-card
+            # combine then just sums the TOPK rows per token, saving one
+            # cross-rank weight channel.
             for db_idx in pl.spmd(D // (16 * D_OUT_TILE), name_hint="exp_w2"):
                 d_base = db_idx * (16 * D_OUT_TILE)
                 for dg in pl.range(16):
@@ -146,17 +152,36 @@ def expert_routed(
 
                     y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
                     w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE]
+                    # Re-fetch the per-row routing weight slice on each spmd
+                    # tile (same pattern as recv_x_scale_dq above) to keep the
+                    # tile contiguous in vec memory.
+                    w_col = pl.reshape(
+                        recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
+                        [RECV_TILE, 1],
+                    )
                     y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                     y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
+                    y_2d = pl.row_expand_mul(y_2d, w_col)
                     recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE] = pl.cast(
                         y_2d, target_type=pl.BF16, mode="rint"
                     )
+
+    # The @pl.inline parser requires inline call expressions to have a return
+    # value; recv_y is convenient because it's already pl.Out.
+    return recv_y
+
+
+# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
+# (e.g. moe_ep.py). Reuses expert_routed's raw body parsed against this
+# module's globals (N_LOCAL_EXPERTS / RECV_MAX / MOE_INTER ...).
+expert_routed_inline = pl.inline(expert_routed._func)
 
 
 @pl.jit
 def expert_routed_test(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
@@ -167,7 +192,7 @@ def expert_routed_test(
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
     expert_routed(
-        recv_x, recv_scale_dq, recv_expert_count,
+        recv_x, recv_scale_dq, recv_weights, recv_expert_count,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
@@ -201,10 +226,8 @@ def _quant_w_per_channel(w):
 
 
 def golden_expert_routed(tensors):
-    """Torch reference for the routed expert. recv_y is the partial routed
-    contribution only (without routing-weight scaling — that is applied in
-    combine); AllToAllv combine and the shared-expert add happen in the
-    host orchestrator.
+    """Torch reference for the routed expert. recv_y is the per-row routing-
+    weight-scaled SwiGLU output, ready for combine reduce to simply sum.
 
     Per-expert layout: recv_x[e, 0:cnt[e], :] is the valid INT8 receive
     payload; recv_y[e, cnt[e]:, :] stays at zero."""
@@ -216,6 +239,7 @@ def golden_expert_routed(tensors):
 
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
+    recv_weights = tensors["recv_weights"].float()  # [E, RECV_MAX]
     recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
     w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
     w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
@@ -229,6 +253,7 @@ def golden_expert_routed(tensors):
         x_sub_i8 = recv_x_i8[e, :n_rows, :]
         x_sub_sd = recv_scale_dq[e, :n_rows].reshape(-1, 1)
         x_sub_q = x_sub_i8.float() * x_sub_sd
+        w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
 
         gate = x_sub_q @ w1[e].T
         up = x_sub_q @ w3[e].T
@@ -239,7 +264,7 @@ def golden_expert_routed(tensors):
         # A8 requant before w2 matmul.
         h_i8, h_sd = _int8_quant_per_row(h)
         h = h_i8.float() * h_sd
-        recv_y[e, :n_rows, :] = h @ w2[e].T
+        recv_y[e, :n_rows, :] = (h @ w2[e].T) * w_per_row
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
@@ -281,6 +306,16 @@ def build_tensor_specs():
     def init_recv_expert_count():
         return counts_2d
 
+    # Per-row routing weight in [0, 1); tail rows (slot >= count) stay 0 so
+    # they don't perturb the BF16 round-trip in expert_routed.
+    recv_weights_pre = torch.rand(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
+    recv_weights_pre = torch.where(
+        valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre)
+    )
+
+    def init_recv_weights():
+        return recv_weights_pre
+
     # Pre-quantize all three weights once so the i8 / scale specs see consistent values.
     w1_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
     w3_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
@@ -293,6 +328,7 @@ def build_tensor_specs():
     return [
         TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
         TensorSpec("recv_scale_dq", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
+        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
         TensorSpec("routed_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
         TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),

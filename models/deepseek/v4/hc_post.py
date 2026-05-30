@@ -57,6 +57,12 @@ def hc_post(
     return y
 
 
+# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
+# (e.g. moe_ep.py). Reuses hc_post's raw body parsed against this module's
+# globals.
+hc_post_inline = pl.inline(hc_post._func)
+
+
 @pl.jit
 def hc_post_test(
     x: pl.Tensor[[B, S, D], pl.BF16],

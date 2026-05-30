@@ -114,21 +114,25 @@ def hc_pre(
         row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
         row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
         row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        row0 = pl.fillpad(row0, pad_value=pl.PadValue.min)
-        row1 = pl.fillpad(row1, pad_value=pl.PadValue.min)
-        row2 = pl.fillpad(row2, pad_value=pl.PadValue.min)
-        row3 = pl.fillpad(row3, pad_value=pl.PadValue.min)
+        # Distinct name after fillpad: TileView changes (valid_shape → pad), so
+        # the @pl.inline parser rejects a same-name rebind. The JIT specializer
+        # alpha-renames automatically — see pypto issue #1603 for the parser
+        # discipline difference.
+        row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
+        row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
+        row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
+        row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
         row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        row0_max = pl.row_max(row0, row_max_tmp)
-        row1_max = pl.row_max(row1, row_max_tmp)
-        row2_max = pl.row_max(row2, row_max_tmp)
-        row3_max = pl.row_max(row3, row_max_tmp)
-        row0_exp = pl.exp(pl.row_expand_sub(row0, row0_max))
-        row1_exp = pl.exp(pl.row_expand_sub(row1, row1_max))
-        row2_exp = pl.exp(pl.row_expand_sub(row2, row2_max))
-        row3_exp = pl.exp(pl.row_expand_sub(row3, row3_max))
+        row0_max = pl.row_max(row0_p, row_max_tmp)
+        row1_max = pl.row_max(row1_p, row_max_tmp)
+        row2_max = pl.row_max(row2_p, row_max_tmp)
+        row3_max = pl.row_max(row3_p, row_max_tmp)
+        row0_exp = pl.exp(pl.row_expand_sub(row0_p, row0_max))
+        row1_exp = pl.exp(pl.row_expand_sub(row1_p, row1_max))
+        row2_exp = pl.exp(pl.row_expand_sub(row2_p, row2_max))
+        row3_exp = pl.exp(pl.row_expand_sub(row3_p, row3_max))
         row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
         row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
         row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
@@ -206,6 +210,13 @@ def hc_pre(
             x_mixed_view[t0:t0 + T_TILE, d0:d0 + D_TILE] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
     x_mixed = pl.reshape(x_mixed_view, [B, S, D])
     return x_mixed
+
+
+# @pl.inline alias for callers inside @pl.program / @pl.function(type=InCore)
+# methods (e.g. moe_ep.py). The same body, parsed against this module's
+# globals so constants like T / D / M / HC_MULT resolve correctly.
+hc_pre_inline = pl.inline(hc_pre._func)
+
 
 @pl.jit
 def hc_pre_test(

@@ -112,7 +112,7 @@ DEMO = DeepSeekV4Config(
     rms_norm_eps=1e-6,
     vocab_size=129280,
     moe_intermediate_size=4096,
-    n_routed_experts=8,
+    n_routed_experts=16,
     n_shared_experts=1,
     num_experts_per_tok=2,
     scoring_func="sqrtsoftplus",
@@ -260,3 +260,9 @@ EP_RANK = 0
 RECV_SAFETY = 4
 RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
             // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY
+
+# When True, gate.py's N_EXPERTS uses the full global expert space
+# (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
+# keeps the legacy single-card behavior where each rank only routes over its
+# own shard. moe_ep.py flips this before importing gate.
+EP_ROUTING_GLOBAL = False

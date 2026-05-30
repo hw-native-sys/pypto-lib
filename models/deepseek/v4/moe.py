@@ -117,7 +117,7 @@ def moe(
 
     recv_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
     expert_routed(
-        recv_x, recv_scale_dq, recv_expert_count,
+        recv_x, recv_scale_dq, recv_weights, recv_expert_count,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
@@ -128,7 +128,7 @@ def moe(
     # the SSA-rebound output to ``routed_y_buf__rv_v2`` and trips a runtime
     # valid_reshape numel mismatch.
     ffn_out = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
+    combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
@@ -254,6 +254,7 @@ def golden_moe(tensors):
     golden_expert_routed({
         "recv_x":           recv_x,
         "recv_scale_dq":    recv_scale_dq,
+        "recv_weights":     recv_weights,
         "recv_expert_count": recv_expert_count_actual,
         "routed_w1":        tensors["routed_w1"],
         "routed_w1_scale":  tensors["routed_w1_scale"],
@@ -268,7 +269,6 @@ def golden_moe(tensors):
     golden_combine({
         "recv_y":            recv_y,
         "recv_token":        recv_token,
-        "recv_weights":      recv_weights,
         "recv_expert_count": recv_expert_count_actual,
         "sh":                sh,
         "ffn_out":           ffn_out,

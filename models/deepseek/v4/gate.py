@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 
+import config as _cfg
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD_SIZE,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
@@ -21,7 +22,12 @@ S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
-N_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE   # single-card view: route only over local shard
+# Routing space:
+#   EP_ROUTING_GLOBAL=False (default, legacy single-card): each rank only routes
+#     over its own [n_routed_experts // EP_WORLD_SIZE] shard.
+#   EP_ROUTING_GLOBAL=True (used by moe_ep.py): every rank routes over the full
+#     global expert set so dispatch can fan tokens across ranks.
+N_EXPERTS = M.n_routed_experts if _cfg.EP_ROUTING_GLOBAL else M.n_routed_experts // EP_WORLD_SIZE
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 VOCAB = M.vocab_size
@@ -178,6 +184,16 @@ def gate(
                 for nm_k in pl.range(TOPK):
                     pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
                     pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
+
+    # The @pl.inline parser requires inline call expressions to have a return
+    # value. weights is convenient because it's already pl.Out and reads as
+    # the same SSA name on the caller side.
+    return weights
+
+
+# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
+# (e.g. moe_ep.py). Reuses gate's raw body parsed against this module's globals.
+gate_inline = pl.inline(gate._func)
 
 
 @pl.jit

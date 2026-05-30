@@ -128,6 +128,16 @@ def expert_shared(
             sh_y = pl.col_expand_mul(pl.row_expand_mul(sh_y, sh_tile_scale_dq_tile), sw2_scale_chunk)
             sh[ts0 : ts0 + T_TILE, d0 : d0 + SH_D_OUT_TILE] = pl.cast(sh_y, target_type=pl.BF16, mode="rint")
 
+    # The @pl.inline parser requires inline call expressions to have a return
+    # value; sh is convenient because it's already pl.Out.
+    return sh
+
+
+# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
+# (e.g. moe_ep.py). Reuses expert_shared's raw body parsed against this
+# module's globals.
+expert_shared_inline = pl.inline(expert_shared._func)
+
 
 @pl.jit
 def expert_shared_test(

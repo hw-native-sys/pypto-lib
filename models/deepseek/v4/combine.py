@@ -30,27 +30,24 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 def combine(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[B, S, D], pl.BF16],
 ):
+    # recv_y already has the per-row routing weight applied by expert_routed,
+    # so combine is a pure scatter + dense reduce (sum, no second mul).
     ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
     # [T, N_LOCAL_EXPERTS, D] scratch indexed by (token, expert). Padding
     # (t, e) slots stay zero and contribute nothing to the dense reduce.
     routed_y_buf = pl.create_tensor([T, N_LOCAL_EXPERTS, D], dtype=pl.BF16)
-    routed_w_buf = pl.create_tensor([T, N_LOCAL_EXPERTS], dtype=pl.FP32)
-    # Flat 2D views for slice ops: ptoas tensor.slice rejects 3D bases.
+    # Flat 2D view for slice ops: ptoas tensor.slice rejects 3D bases.
     routed_y_buf_flat = pl.reshape(routed_y_buf, [T * N_LOCAL_EXPERTS, D])
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_scatter"):
-        # Init via pl.write to keep routed_w_buf single-access-style.
         for r0 in pl.range(T):
             routed_y_buf[r0, :, :] = pl.full([N_LOCAL_EXPERTS, D], dtype=pl.BF16, value=0.0)
-            for e0 in pl.range(N_LOCAL_EXPERTS):
-                pl.write(routed_w_buf, [r0, e0], 0.0)
 
         for e in pl.range(N_LOCAL_EXPERTS):
             n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
@@ -59,7 +56,6 @@ def combine(
                 t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
                 dst = t * N_LOCAL_EXPERTS + e
                 routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
-                pl.write(routed_w_buf, [t, e], pl.read(recv_weights, [e, s]))
 
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
@@ -69,8 +65,7 @@ def combine(
             for e in pl.pipeline(N_LOCAL_EXPERTS, stage=2):
                 src = base + e
                 row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
-                w = pl.read(routed_w_buf, [t, e])
-                acc = pl.add(acc, pl.mul(row_fp32, w))
+                acc = pl.add(acc, row_fp32)
             ffn_out_flat[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
@@ -78,12 +73,11 @@ def combine(
 def combine_test(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
 ):
-    combine(recv_y, recv_token, recv_weights, recv_expert_count, sh, ffn_out)
+    combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
     return ffn_out
 
 
@@ -92,21 +86,20 @@ def golden_combine(tensors):
 
     recv_y = tensors["recv_y"]
     recv_token = tensors["recv_token"]
-    recv_weights = tensors["recv_weights"]
     recv_expert_count = tensors["recv_expert_count"]
     sh = tensors["sh"]
 
+    # recv_y already carries the per-row routing weight applied by
+    # expert_routed; combine just scatters by token and sums.
     routed_y_buf = torch.zeros(T, N_LOCAL_EXPERTS, D, dtype=torch.bfloat16)
-    routed_w_buf = torch.zeros(T, N_LOCAL_EXPERTS, dtype=torch.float32)
     for e in range(N_LOCAL_EXPERTS):
         for s in range(int(recv_expert_count[e, 0].item())):
             t = int(recv_token[e, s].item())
             routed_y_buf[t, e, :] = recv_y[e, s, :]
-            routed_w_buf[t, e] = float(recv_weights[e, s].item())
 
     ffn_out = sh.float()
     for e in range(N_LOCAL_EXPERTS):
-        ffn_out = ffn_out + routed_y_buf[:, e, :].float() * routed_w_buf[:, e : e + 1]
+        ffn_out = ffn_out + routed_y_buf[:, e, :].float()
     tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16).reshape(B, S, D)
 
 
@@ -146,19 +139,6 @@ def build_tensor_specs():
                 )
         return recv_token
 
-    def init_recv_weights():
-        # Tail slots poisoned with large garbage to verify the kernel reads
-        # only s < recv_expert_count[e].
-        mean_w = M.routed_scaling_factor / M.num_experts_per_tok
-        w = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
-        for e in range(N_LOCAL_EXPERTS):
-            count = int(counts[e].item())
-            if count > 0:
-                w[e, :count] = (torch.rand(count) * mean_w + mean_w * 0.5).float()
-            if count < RECV_MAX:
-                w[e, count:] = (torch.randn(RECV_MAX - count) * 1e3).float()
-        return w
-
     def init_recv_expert_count():
         return counts.reshape(N_LOCAL_EXPERTS, 1)
 
@@ -168,7 +148,6 @@ def build_tensor_specs():
     return [
         TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, init_value=init_recv_y),
         TensorSpec("recv_token", [N_LOCAL_EXPERTS, RECV_MAX], torch.int32, init_value=init_recv_token),
-        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
         TensorSpec("sh", [T, D], torch.bfloat16, init_value=init_sh),
         TensorSpec("ffn_out", [B, S, D], torch.bfloat16, is_output=True),
