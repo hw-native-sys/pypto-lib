@@ -220,9 +220,6 @@ jobs:
     if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 30
-    concurrency:
-      group: a2a3-serial
-      cancel-in-progress: false
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
