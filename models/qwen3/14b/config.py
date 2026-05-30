@@ -79,20 +79,26 @@ VOCAB_CHUNK = 64
 
 # Decode grouping.
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS
-# fa_fused groups attention work by (KV head, Q-head batch). Each KV head must
-# map to an integer number of Q_HEAD_BATCH chunks.
-assert Q_PER_KV % Q_HEAD_BATCH == 0, (
-    f"Q_PER_KV ({Q_PER_KV}) must be divisible by Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+# fa_fused groups attention work by (KV head, Q-head batch). qk_norm and
+# rope_kv_cache currently loop over NUM_KV_HEADS only (one Q-head batch per
+# KV head), so the Q heads per KV head must equal Q_HEAD_BATCH exactly --
+# supporting Q_GROUPS > 1 would require also iterating the inner Q groups
+# in those two regions.
+assert Q_PER_KV == Q_HEAD_BATCH, (
+    f"Q_PER_KV ({Q_PER_KV}) must equal Q_HEAD_BATCH ({Q_HEAD_BATCH}) "
+    f"(qk_norm / rope_kv_cache assume one Q group per KV head)"
 )
-# Q_HEAD_PAD is the padded Q row count fa_fused operates on. Must be even
-# and >= Q_HEAD_BATCH; fa_fused does set_validshape(scores, Q_HEAD_PAD // 2,
-# ...) on the vec-side scores tile, so Q_HEAD_PAD // 2 must itself be a
-# legal even-or-tolerated valid_row. (Q_HEAD_PAD // 2 = 8 here is just an
-# even value >= Q_HEAD_BATCH — NOT a post-UP_DOWN-split height; fa_fused
-# runs with SplitMode=None and the a2a3 backend handles the mixed cube+vec
-# body via a dual-AIV no-op replay rather than row halving.)
-assert Q_HEAD_PAD % 2 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH, (
-    f"Q_HEAD_PAD ({Q_HEAD_PAD}) must be even and >= Q_HEAD_BATCH ({Q_HEAD_BATCH})"
+# Q_HEAD_PAD is the padded Q row count fa_fused operates on. fa_fused does
+# set_validshape(scores, Q_HEAD_PAD // 2, ...) on the vec-side scores tile
+# and then trims oi/li to Q_HEAD_BATCH rows, so the *half* must (a) be even
+# (an odd valid_row without an explicit operand hits pypto#1031) and
+# (b) be >= Q_HEAD_BATCH so the trim is fully covered. Both reduce to
+# Q_HEAD_PAD % 4 == 0 and Q_HEAD_PAD // 2 >= Q_HEAD_BATCH. (Q_HEAD_PAD = 16
+# here -> //2 = 8 >= 5; fa_fused runs SplitMode=None / dual-AIV no-op
+# replay, not row halving — see the module docstring.)
+assert Q_HEAD_PAD % 4 == 0 and Q_HEAD_PAD // 2 >= Q_HEAD_BATCH, (
+    f"Q_HEAD_PAD ({Q_HEAD_PAD}) must be a multiple of 4 with "
+    f"Q_HEAD_PAD // 2 ({Q_HEAD_PAD // 2}) >= Q_HEAD_BATCH ({Q_HEAD_BATCH})"
 )
 Q_GROUPS = Q_PER_KV // Q_HEAD_BATCH
 TOTAL_Q_GROUPS = NUM_KV_HEADS * Q_GROUPS
