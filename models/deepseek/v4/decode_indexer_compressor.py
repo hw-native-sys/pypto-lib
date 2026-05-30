@@ -231,16 +231,14 @@ def indexer_compressor(
             normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
     if rotate:
-        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_hadamard"):
-            batch_base = batch_base_idx * RMS_TILE
-            kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
-            # pl.range, not pl.pipeline: HEAD_DIM // OUT_TILE = 2 here, and a degenerate
-            # 2-iteration pl.pipeline(stage=2) miscompiles the matmul (~3% low). ratio4
-            # pipelines because its HEAD_DIM=512 gives 8 iterations.
-            for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
-                hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-                kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
+            for batch_base_idx in pl.range(B // RMS_TILE):
+                batch_base = batch_base_idx * RMS_TILE
+                kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
+                for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
+                    hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
+                    kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+                    kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
     else:
         for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_write"):
             batch_base = batch_base_idx * RMS_TILE
