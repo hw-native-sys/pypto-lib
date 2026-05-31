@@ -41,10 +41,13 @@ HEAD_GROUP = 8
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_CHUNK = 512
 Q_PROJ_GROUP = 8
+Q_HEAD_RMS_GROUP = 2
+Q_PROJ_DEQUANT_GROUP = 16
+QR_PROJ_GROUP = 2
 QR_NORM_GROUP = 8
 ATTN_NORM_GROUP = 4
 KV_PROJ_GROUP = 1
-Q_PROJ_DEQUANT_GROUP = 32
+KV_PROJ_SPMD_GROUP = 2
 ATTN_RMS_PARTIALS = 2
 QR_RMS_PARTIALS = 2
 Q_LORA_TILE = 32
@@ -57,14 +60,20 @@ assert (H * HEAD_DIM) % (HEAD_CHUNK * HEAD_GROUP) == 0, \
     "HEAD_BLOCKS must be divisible by HEAD_GROUP"
 assert ((H * HEAD_DIM) // Q_PROJ_OUT_CHUNK) % Q_PROJ_GROUP == 0, \
     "Q_PROJ_HEAD_BLOCKS must be divisible by Q_PROJ_GROUP"
+assert H % Q_HEAD_RMS_GROUP == 0, \
+    "H must be divisible by Q_HEAD_RMS_GROUP"
+assert ((H * HEAD_DIM) // Q_PROJ_OUT_CHUNK) % Q_PROJ_DEQUANT_GROUP == 0, \
+    "Q_PROJ_HEAD_BLOCKS must be divisible by Q_PROJ_DEQUANT_GROUP"
 assert (Q_LORA // Q_LORA_TILE) % QR_NORM_GROUP == 0, \
     "Q_BLOCKS must be divisible by QR_NORM_GROUP"
+assert (Q_LORA // Q_LORA_TILE) % QR_PROJ_GROUP == 0, \
+    "Q_BLOCKS must be divisible by QR_PROJ_GROUP"
 assert (D // D_CHUNK) % ATTN_NORM_GROUP == 0, \
     "D_BLOCKS must be divisible by ATTN_NORM_GROUP"
 assert (HEAD_DIM // KV_CHUNK) % KV_PROJ_GROUP == 0, \
     "KV_BLOCKS must be divisible by KV_PROJ_GROUP"
-assert ((H * HEAD_DIM) // Q_PROJ_OUT_CHUNK) % Q_PROJ_DEQUANT_GROUP == 0, \
-    "Q_PROJ_HEAD_BLOCKS must be divisible by Q_PROJ_DEQUANT_GROUP"
+assert (HEAD_DIM // KV_CHUNK) % KV_PROJ_SPMD_GROUP == 0, \
+    "KV_BLOCKS must be divisible by KV_PROJ_SPMD_GROUP"
 assert (D // D_CHUNK) % ATTN_RMS_PARTIALS == 0, \
     "D_BLOCKS must be divisible by ATTN_RMS_PARTIALS"
 assert (Q_LORA // Q_LORA_TILE) % QR_RMS_PARTIALS == 0, \
@@ -183,9 +192,10 @@ def prefill_qkv_proj_rope_core(
         # Stage 1: LoRA A projection for the query path, qr_fp32 =
         # RMSNorm(x) @ wq_a. Inputs are BF16, accumulation stays FP32.
         qr_fp32 = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, Q_LORA], dtype=pl.FP32)
-        for qb in pl.parallel(0, Q_BLOCKS, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_qr_proj_matmul"):
-                q_a_col0 = qb * Q_LORA_CHUNK
+        for qbg_idx in pl.spmd(Q_BLOCKS // QR_PROJ_GROUP, name_hint="prefill_qr_proj_matmul"):
+            qbg = qbg_idx * QR_PROJ_GROUP
+            for q_inner in pl.range(QR_PROJ_GROUP):
+                q_a_col0 = (qbg + q_inner) * Q_LORA_CHUNK
                 q_acc = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, Q_LORA_CHUNK], dtype=pl.FP32)
                 for db in pl.pipeline(0, D_BLOCKS, stage=4):
                     qr_d0 = db * D_CHUNK
@@ -272,20 +282,20 @@ def prefill_qkv_proj_rope_core(
         # Stage 3.1: KV projection from the same normalized activation,
         # kv_fp32 = RMSNorm(x) @ wkv.
         kv_fp32 = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, HEAD_DIM], dtype=pl.FP32)
-        for kbg in pl.parallel(0, KV_BLOCKS, KV_PROJ_GROUP):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_proj_matmul"):
+        for kbg_idx in pl.spmd(KV_BLOCKS // KV_PROJ_SPMD_GROUP, name_hint="prefill_kv_proj_matmul"):
+            kbg = kbg_idx * KV_PROJ_SPMD_GROUP
+            for k_inner in pl.range(KV_PROJ_SPMD_GROUP):
                 kv_acc = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, KV_CHUNK], dtype=pl.FP32)
-                for k_inner in pl.range(KV_PROJ_GROUP):
-                    kv_col0 = (kbg + k_inner) * KV_CHUNK
-                    for db in pl.pipeline(0, D_BLOCKS, stage=4):
-                        d0 = db * D_CHUNK
-                        kv_x_chunk_bf16 = token_x_bf16[:, d0 : d0 + D_CHUNK]
-                        wkv_chunk = wkv[d0 : d0 + D_CHUNK, kv_col0 : kv_col0 + KV_CHUNK]
-                        if d0 == 0:
-                            kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
-                        else:
-                            kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
-                    kv_fp32[:, kv_col0 : kv_col0 + KV_CHUNK] = kv_acc
+                kv_col0 = (kbg + k_inner) * KV_CHUNK
+                for db in pl.pipeline(0, D_BLOCKS, stage=4):
+                    d0 = db * D_CHUNK
+                    kv_x_chunk_bf16 = token_x_bf16[:, d0 : d0 + D_CHUNK]
+                    wkv_chunk = wkv[d0 : d0 + D_CHUNK, kv_col0 : kv_col0 + KV_CHUNK]
+                    if d0 == 0:
+                        kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
+                    else:
+                        kv_acc = pl.matmul_acc(kv_acc, kv_x_chunk_bf16, wkv_chunk)
+                kv_fp32[:, kv_col0 : kv_col0 + KV_CHUNK] = kv_acc
 
         # Stage 3.2: apply kv_a_layernorm over the full 512-dim KV vector.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_rms"):
@@ -361,45 +371,45 @@ def prefill_qkv_proj_rope_core(
         qr_scale = pl.assemble(qr_scale, qr_scale_tile, [t0, 0])
 
         # Stage 4: W8A8C16 q_proj. INT8 qr_tile multiplies INT8 wq_b into INT32
-        # accumulators; a separate dequant pass applies qr_scale and per-output
-        # wq_b_scale to recover FP32 q projection values.
+        # accumulators; matmul and dequant are separate SPMD fan-outs to stay
+        # within Vec buffer limits while avoiding a long AICPU dispatch trail.
         q_proj_fp32 = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, H * HEAD_DIM], dtype=pl.FP32)
         col_acc_all = pl.create_tensor([Q_PROJ_HEAD_BLOCKS * PREFILL_QKV_TOKEN_CHUNK, Q_PROJ_OUT_CHUNK], dtype=pl.INT32)
-        for hg in pl.parallel(0, Q_PROJ_HEAD_BLOCKS, Q_PROJ_GROUP):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_qproj_matmul"):
-                col_acc = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, Q_PROJ_OUT_CHUNK], dtype=pl.INT32)
-                for h_inner in pl.range(Q_PROJ_GROUP):
-                    for qb in pl.pipeline(0, Q_PROJ_BLOCKS, stage=2):
-                        qr_proj_col0 = qb * Q_PROJ_CHUNK
-                        qr_i8_chunk = qr_tile[:, qr_proj_col0 : qr_proj_col0 + Q_PROJ_CHUNK]
-                        wq_chunk = wq_b[
-                            qr_proj_col0 : qr_proj_col0 + Q_PROJ_CHUNK,
-                            (hg + h_inner) * Q_PROJ_OUT_CHUNK : (hg + h_inner) * Q_PROJ_OUT_CHUNK + Q_PROJ_OUT_CHUNK,
-                        ]
-                        if qr_proj_col0 == 0:
-                            col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                        else:
-                            col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
-                    col_acc_all[
-                        (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :,
-                    ] = col_acc
-
-        for hbg in pl.parallel(0, Q_PROJ_HEAD_BLOCKS, Q_PROJ_DEQUANT_GROUP):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_qproj_dequant"):
-                for h_inner in pl.range(Q_PROJ_DEQUANT_GROUP):
-                    col_acc_chunk = col_acc_all[
-                        (hbg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hbg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :,
+        for hg_idx in pl.spmd(Q_PROJ_HEAD_BLOCKS // Q_PROJ_GROUP, name_hint="prefill_qproj_matmul"):
+            hg = hg_idx * Q_PROJ_GROUP
+            col_acc = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, Q_PROJ_OUT_CHUNK], dtype=pl.INT32)
+            for h_inner in pl.range(Q_PROJ_GROUP):
+                for qb in pl.pipeline(0, Q_PROJ_BLOCKS, stage=2):
+                    qr_proj_col0 = qb * Q_PROJ_CHUNK
+                    qr_i8_chunk = qr_tile[:, qr_proj_col0 : qr_proj_col0 + Q_PROJ_CHUNK]
+                    wq_chunk = wq_b[
+                        qr_proj_col0 : qr_proj_col0 + Q_PROJ_CHUNK,
+                        (hg + h_inner) * Q_PROJ_OUT_CHUNK : (hg + h_inner) * Q_PROJ_OUT_CHUNK + Q_PROJ_OUT_CHUNK,
                     ]
-                    col_fp32 = pl.cast(col_acc_chunk, target_type=pl.FP32, mode="none")
-                    w_col0 = (hbg + h_inner) * Q_PROJ_OUT_CHUNK
-                    w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_CHUNK], [1, Q_PROJ_OUT_CHUNK])
-                    col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_tile), w_scale)
-                    q_proj_fp32[
-                        :,
-                        (hbg + h_inner) * Q_PROJ_OUT_CHUNK : (hbg + h_inner) * Q_PROJ_OUT_CHUNK + Q_PROJ_OUT_CHUNK,
-                    ] = col_dequant
+                    if qr_proj_col0 == 0:
+                        col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
+                    else:
+                        col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+                col_acc_all[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :,
+                ] = col_acc
+
+        for hbg_idx in pl.spmd(Q_PROJ_HEAD_BLOCKS // Q_PROJ_DEQUANT_GROUP, name_hint="prefill_qproj_dequant"):
+            hbg = hbg_idx * Q_PROJ_DEQUANT_GROUP
+            for h_inner in pl.range(Q_PROJ_DEQUANT_GROUP):
+                col_acc_chunk = col_acc_all[
+                    (hbg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hbg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :,
+                ]
+                col_fp32 = pl.cast(col_acc_chunk, target_type=pl.FP32, mode="none")
+                w_col0 = (hbg + h_inner) * Q_PROJ_OUT_CHUNK
+                w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_CHUNK], [1, Q_PROJ_OUT_CHUNK])
+                col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_tile), w_scale)
+                q_proj_fp32[
+                    :,
+                    (hbg + h_inner) * Q_PROJ_OUT_CHUNK : (hbg + h_inner) * Q_PROJ_OUT_CHUNK + Q_PROJ_OUT_CHUNK,
+                ] = col_dequant
 
         q_flat = pl.reshape(q, [T, H * HEAD_DIM])
         q_head_inv_rms_all = pl.create_tensor([H, PREFILL_QKV_TOKEN_CHUNK], dtype=pl.FP32)
@@ -407,11 +417,13 @@ def prefill_qkv_proj_rope_core(
         # Stage 5.1: per-head RMSNorm for q_proj output. The noPE portion can
         # be written directly to q; the RoPE portion keeps the per-head inverse
         # RMS for the next rotation stage.
-        for h in pl.parallel(0, H, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_head_rms_nope"):
+        for hg_idx in pl.spmd(H // Q_HEAD_RMS_GROUP, name_hint="prefill_q_head_rms_nope"):
+            hg = hg_idx * Q_HEAD_RMS_GROUP
+            for h_inner in pl.range(Q_HEAD_RMS_GROUP):
+                h = hg + h_inner
                 h0 = h * HEAD_DIM
                 q_head_sq_sum = pl.full([1, PREFILL_QKV_TOKEN_CHUNK], dtype=pl.FP32, value=0.0)
-                for db in pl.range(HEAD_DIM // HEAD_CHUNK):
+                for db in pl.pipeline(HEAD_DIM // HEAD_CHUNK, stage=2):
                     d0 = h0 + db * HEAD_CHUNK
                     q_head_chunk = q_proj_fp32[:, d0 : d0 + HEAD_CHUNK]
                     q_head_sq_sum = pl.add(
@@ -425,7 +437,7 @@ def prefill_qkv_proj_rope_core(
                 q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [PREFILL_QKV_TOKEN_CHUNK, 1])
                 q_head_inv_rms_all[h : h + 1, :] = q_head_inv_rms
 
-                for nb in pl.range(NOPE_DIM // HEAD_CHUNK):
+                for nb in pl.pipeline(NOPE_DIM // HEAD_CHUNK, stage=2):
                     n0 = nb * HEAD_CHUNK
                     q_nope_chunk = q_proj_fp32[:, h0 + n0 : h0 + n0 + HEAD_CHUNK]
                     q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
@@ -437,65 +449,68 @@ def prefill_qkv_proj_rope_core(
         # Stage 5.2: apply partial RoPE to q for each head group. Intermediate
         # even/odd rotated pairs are staged in grouped layout to reduce tiny
         # per-head tasks.
-        for hg in pl.parallel(0, H, HEAD_GROUP):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_head_rope"):
-                q_head_inv_rms_t = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, 1], dtype=pl.FP32)
-                rope_cos_fp32 = pl.cast(rope_cos_tile[:, :ROPE_HALF], target_type=pl.FP32)
-                rope_sin_fp32 = pl.cast(rope_sin_tile[:, :ROPE_HALF], target_type=pl.FP32)
-                for h_inner in pl.range(HEAD_GROUP):
-                    q_head_inv_rms_t = pl.reshape(
-                        q_head_inv_rms_all[hg + h_inner : hg + h_inner + 1, :],
-                        [PREFILL_QKV_TOKEN_CHUNK, 1],
-                    )
-                    q_rope = q_proj_fp32[
-                        :,
-                        (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
-                    ]
-                    q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
-                    q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-                    q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
-                    q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
-                    q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
-                    q_rope_pair_stage[
-                        (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :ROPE_HALF,
-                    ] = pl.cast(q_rot_even, target_type=pl.BF16, mode="rint")
-                    q_rope_pair_stage[
-                        (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        ROPE_HALF : ROPE_DIM,
-                    ] = pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint")
+        for hg_idx in pl.spmd(H // HEAD_GROUP, name_hint="prefill_q_head_rope"):
+            hg = hg_idx * HEAD_GROUP
+            q_head_inv_rms_t = pl.create_tensor([PREFILL_QKV_TOKEN_CHUNK, 1], dtype=pl.FP32)
+            rope_cos_fp32 = pl.cast(rope_cos_tile[:, :ROPE_HALF], target_type=pl.FP32)
+            rope_sin_fp32 = pl.cast(rope_sin_tile[:, :ROPE_HALF], target_type=pl.FP32)
+            for h_inner in pl.range(HEAD_GROUP):
+                q_head_inv_rms_t = pl.reshape(
+                    q_head_inv_rms_all[hg + h_inner : hg + h_inner + 1, :],
+                    [PREFILL_QKV_TOKEN_CHUNK, 1],
+                )
+                q_rope = q_proj_fp32[
+                    :,
+                    (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
+                ]
+                q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
+                q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
+                q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
+                q_rope_pair_stage[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :ROPE_HALF,
+                ] = pl.cast(q_rot_even, target_type=pl.BF16, mode="rint")
+                q_rope_pair_stage[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    ROPE_HALF : ROPE_DIM,
+                ] = pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint")
 
         # Stage 5.3: reassemble q RoPE even/odd pairs into interleaved head
         # layout and write the RoPE tail back into q_flat.
-        for hg in pl.parallel(0, H, HEAD_GROUP):
-            q_rope_grp_fp32 = pl.create_tensor([HEAD_GROUP * PREFILL_QKV_TOKEN_CHUNK, ROPE_DIM], dtype=pl.FP32)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_reassemble"):
-                for h_inner in pl.range(HEAD_GROUP):
-                    even_chunk = q_rope_pair_stage[
-                        (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :ROPE_HALF,
-                    ]
-                    odd_chunk = q_rope_pair_stage[
-                        (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        ROPE_HALF : ROPE_DIM,
-                    ]
-                    rot = pl.matmul(even_chunk, even_select_t[:, :], out_dtype=pl.FP32)
-                    rot = pl.matmul_acc(rot, odd_chunk, odd_select_t[:, :])
-                    q_rope_grp_fp32[
-                        h_inner * PREFILL_QKV_TOKEN_CHUNK : h_inner * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :,
-                    ] = rot
+        q_rope_grp_fp32 = pl.create_tensor([H * PREFILL_QKV_TOKEN_CHUNK, ROPE_DIM], dtype=pl.FP32)
+        for hg_idx in pl.spmd(H // HEAD_GROUP, name_hint="prefill_q_rope_reassemble"):
+            hg = hg_idx * HEAD_GROUP
+            for h_inner in pl.pipeline(HEAD_GROUP, stage=2):
+                even_chunk = q_rope_pair_stage[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :ROPE_HALF,
+                ]
+                odd_chunk = q_rope_pair_stage[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    ROPE_HALF : ROPE_DIM,
+                ]
+                rot = pl.matmul(even_chunk, even_select_t[:, :], out_dtype=pl.FP32)
+                rot = pl.matmul_acc(rot, odd_chunk, odd_select_t[:, :])
+                q_rope_grp_fp32[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :,
+                ] = rot
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_write"):
-                for h_inner in pl.range(HEAD_GROUP):
-                    rot_fp32 = q_rope_grp_fp32[
-                        h_inner * PREFILL_QKV_TOKEN_CHUNK : h_inner * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
-                        :,
-                    ]
-                    q_flat[
-                        t0 : t0 + PREFILL_QKV_TOKEN_CHUNK,
-                        (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
-                    ] = pl.cast(rot_fp32, target_type=pl.BF16, mode="rint")
+        for hg_idx in pl.spmd(H // HEAD_GROUP, name_hint="prefill_q_rope_write"):
+            hg = hg_idx * HEAD_GROUP
+            for h_inner in pl.pipeline(HEAD_GROUP, stage=2):
+                rot_fp32 = q_rope_grp_fp32[
+                    (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * PREFILL_QKV_TOKEN_CHUNK + PREFILL_QKV_TOKEN_CHUNK,
+                    :,
+                ]
+                q_flat[
+                    t0 : t0 + PREFILL_QKV_TOKEN_CHUNK,
+                    (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
+                ] = pl.cast(rot_fp32, target_type=pl.BF16, mode="rint")
+
+        q = pl.reshape(q_flat, [T, H, HEAD_DIM])
     return q, kv, qr, qr_scale
 
 
