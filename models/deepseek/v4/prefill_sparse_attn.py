@@ -174,12 +174,21 @@ def prefill_sparse_attn(
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, ATTN_TOKEN_TILE):
         for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
-            prefill_exp = pl.create_tensor([ATTN_TOKEN_TILE * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.BF16)
-            prefill_blk_mi = pl.create_tensor([ATTN_TOKEN_TILE * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
-            prefill_blk_li = pl.create_tensor([ATTN_TOKEN_TILE * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
-            prefill_blk_oi0 = pl.create_tensor([ATTN_TOKEN_TILE * H, HEAD_DIM], dtype=pl.FP32)
-            prefill_blk_oi1 = pl.create_tensor([ATTN_TOKEN_TILE * H, HEAD_DIM], dtype=pl.FP32)
-            prefill_blk_oi2 = pl.create_tensor([ATTN_TOKEN_TILE * H, HEAD_DIM], dtype=pl.FP32)
+            prefill_exp = pl.create_tensor(
+                [ATTN_TOKEN_TILE * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE],
+                dtype=pl.BF16,
+            )
+            prefill_blk_mi = pl.create_tensor(
+                [ATTN_TOKEN_TILE * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS, 1],
+                dtype=pl.FP32,
+            )
+            prefill_blk_li = pl.create_tensor(
+                [ATTN_TOKEN_TILE * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS, 1],
+                dtype=pl.FP32,
+            )
+            prefill_blk_oi0 = pl.create_tensor([ATTN_TOKEN_TILE * MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
+            prefill_blk_oi1 = pl.create_tensor([ATTN_TOKEN_TILE * MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
+            prefill_blk_oi2 = pl.create_tensor([ATTN_TOKEN_TILE * MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_qk_softmax_tile"):
                 for qk_dt in pl.range(ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
@@ -204,7 +213,9 @@ def prefill_sparse_attn(
                                     0 : HEAD_DIM,
                                 ]
                                 qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
-                                qk_block_row = qk_dt * H * PREFILL_ATTN_BLOCKS + qk_sb * H + h0
+                                qk_block_row = (
+                                    qk_dt * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS + qk_sb * MATMUL_ROW_PAD
+                                )
                                 softmax_scores_valid = pl.slice(
                                     pl.mul(qk_raw_scores, SOFTMAX_SCALE),
                                     [MATMUL_ROW_PAD, PREFILL_ATTN_TILE],
@@ -222,6 +233,7 @@ def prefill_sparse_attn(
 
             for pv_h_delta in pl.parallel(0, MATMUL_ROW_PAD, PV_HEAD_TILE):
                 pv_h0 = h0 + pv_h_delta
+                pv_h_local = pv_h_delta
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_pv_head_tile"):
                     for pv_dt in pl.range(ATTN_TOKEN_TILE):
@@ -240,13 +252,17 @@ def prefill_sparse_attn(
                                         pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + PREFILL_ATTN_TILE,
                                         0 : HEAD_DIM,
                                     ]
-                                    pv_block_row = pv_dt * H * PREFILL_ATTN_BLOCKS + pv_sb * H + pv_h0
+                                    pv_block_row = (
+                                        pv_dt * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS
+                                        + pv_sb * MATMUL_ROW_PAD
+                                        + pv_h_local
+                                    )
                                     pv_exp_scores = prefill_exp[
                                         pv_block_row : pv_block_row + PV_HEAD_TILE,
                                         0 : PREFILL_ATTN_TILE,
                                     ]
                                     pv_oi = pl.matmul(pv_exp_scores, pv_kv_tile, out_dtype=pl.FP32)
-                                    pv_head_row = pv_dt * H + pv_h0
+                                    pv_head_row = pv_dt * MATMUL_ROW_PAD + pv_h_local
                                     if pv_sb == 0:
                                         prefill_blk_oi0 = pl.assemble(prefill_blk_oi0, pv_oi, [pv_head_row, 0])
                                     if pv_sb == 1:
@@ -264,9 +280,11 @@ def prefill_sparse_attn(
                             merge_norm_s = merge_norm_t - merge_norm_b * S
                             merge_norm_seq_len = pl.read(seqused_kv, [merge_norm_b])
                             merge_norm_head_row = merge_norm_t * H + pv_h0
-                            merge_norm_head_row_local = merge_norm_t_local * H + pv_h0
+                            merge_norm_head_row_local = merge_norm_t_local * MATMUL_ROW_PAD + pv_h_local
                             if merge_norm_s < merge_norm_seq_len:
-                                merge_norm_block_row0 = merge_norm_t_local * H * PREFILL_ATTN_BLOCKS + pv_h0
+                                merge_norm_block_row0 = (
+                                    merge_norm_t_local * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS + pv_h_local
+                                )
                                 merge_norm_mi = prefill_blk_mi[
                                     merge_norm_block_row0 : merge_norm_block_row0 + PV_HEAD_TILE,
                                     0 : 1,
@@ -284,7 +302,11 @@ def prefill_sparse_attn(
                                     merge_norm_tile_start1 = PREFILL_ATTN_TILE
                                     merge_norm_block1_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start1])
                                     if merge_norm_block1_raw >= 0:
-                                        merge_norm_block_row1 = merge_norm_t_local * H * PREFILL_ATTN_BLOCKS + H + pv_h0
+                                        merge_norm_block_row1 = (
+                                            merge_norm_t_local * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS
+                                            + MATMUL_ROW_PAD
+                                            + pv_h_local
+                                        )
                                         merge_norm_cur_mi = prefill_blk_mi[
                                             merge_norm_block_row1 : merge_norm_block_row1 + PV_HEAD_TILE,
                                             0 : 1,
@@ -314,7 +336,11 @@ def prefill_sparse_attn(
                                     merge_norm_tile_start2 = 2 * PREFILL_ATTN_TILE
                                     merge_norm_block2_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start2])
                                     if merge_norm_block2_raw >= 0:
-                                        merge_norm_block_row2 = merge_norm_t_local * H * PREFILL_ATTN_BLOCKS + 2 * H + pv_h0
+                                        merge_norm_block_row2 = (
+                                            merge_norm_t_local * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS
+                                            + 2 * MATMUL_ROW_PAD
+                                            + pv_h_local
+                                        )
                                         merge_norm_cur_mi2 = prefill_blk_mi[
                                             merge_norm_block_row2 : merge_norm_block_row2 + PV_HEAD_TILE,
                                             0 : 1,
