@@ -119,7 +119,6 @@ def prefill_sparse_attn(
     cmp_block_table_flat = pl.reshape(cmp_block_table, [B * CMP_MAX_BLOCKS])
 
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
-    prefill_raw_scores = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.FP32)
     prefill_exp = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, PREFILL_ATTN_TILE], dtype=pl.BF16)
     prefill_blk_mi = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
     prefill_blk_li = pl.create_tensor([T * H * PREFILL_ATTN_BLOCKS, 1], dtype=pl.FP32)
@@ -181,7 +180,7 @@ def prefill_sparse_attn(
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, ATTN_TOKEN_TILE):
         for h0 in pl.parallel(0, H, MATMUL_ROW_PAD):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_qk_matmul_tile"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_qk_softmax_tile"):
                 for qk_dt in pl.range(ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
                     qk_b = qk_t // S
@@ -206,46 +205,20 @@ def prefill_sparse_attn(
                                 ]
                                 qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
                                 qk_block_row = qk_t * H * PREFILL_ATTN_BLOCKS + qk_sb * H + h0
-                                prefill_raw_scores = pl.assemble(prefill_raw_scores, qk_raw_scores, [qk_block_row, 0])
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_softmax_tile"):
-                for softmax_dt in pl.range(ATTN_TOKEN_TILE):
-                    softmax_t = attn_t0 + softmax_dt
-                    softmax_b = softmax_t // S
-                    softmax_s = softmax_t - softmax_b * S
-                    softmax_seq_len = pl.read(seqused_kv, [softmax_b])
-                    if softmax_s < softmax_seq_len:
-
-                        for softmax_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                            softmax_tile_start = softmax_sb * PREFILL_ATTN_TILE
-                            softmax_tile_valid = 0
-                            for softmax_valid_i in pl.range(PREFILL_ATTN_TILE):
-                                softmax_valid_raw = pl.read(
-                                    cmp_sparse_indices,
-                                    [softmax_t, softmax_tile_start + softmax_valid_i],
-                                )
-                                if softmax_valid_raw >= 0:
-                                    softmax_tile_valid = softmax_valid_i + 1
-                            if softmax_tile_valid > 0:
-                                softmax_block_row = softmax_t * H * PREFILL_ATTN_BLOCKS + softmax_sb * H + h0
-                                softmax_raw_scores = prefill_raw_scores[
-                                    softmax_block_row : softmax_block_row + MATMUL_ROW_PAD,
-                                    0 : PREFILL_ATTN_TILE,
-                                ]
                                 softmax_scores_valid = pl.slice(
-                                    pl.mul(softmax_raw_scores, SOFTMAX_SCALE),
+                                    pl.mul(qk_raw_scores, SOFTMAX_SCALE),
                                     [MATMUL_ROW_PAD, PREFILL_ATTN_TILE],
                                     [0, 0],
-                                    valid_shape=[MATMUL_ROW_PAD, softmax_tile_valid],
+                                    valid_shape=[MATMUL_ROW_PAD, qk_tile_valid],
                                 )
                                 softmax_scores = pl.fillpad(softmax_scores_valid, pad_value=pl.PadValue.min)
                                 softmax_mi = pl.row_max(softmax_scores)
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
                                 softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16)
                                 softmax_li = pl.row_sum(pl.cast(softmax_exp_scores_bf16, target_type=pl.FP32))
-                                prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [softmax_block_row, 0])
-                                prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [softmax_block_row, 0])
-                                prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [softmax_block_row, 0])
+                                prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
+                                prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
+                                prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [qk_block_row, 0])
 
             for pv_h_delta in pl.parallel(0, MATMUL_ROW_PAD, PV_HEAD_TILE):
                 pv_h0 = h0 + pv_h_delta
