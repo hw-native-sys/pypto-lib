@@ -241,6 +241,7 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 # Deployment constants
 DECODE_BATCH = 64                 # B: tokens per decode step
 DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
+DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 
@@ -248,6 +249,7 @@ PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel p
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
 C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
+LM_HEAD_TP_SIZE = 16
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
