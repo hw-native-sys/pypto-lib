@@ -23,6 +23,7 @@ HEAD_CHUNK = 32
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_CHUNK = 512
 OUT_CHUNK = 64
+ROPE_CHUCK = 32
 
 @pl.jit.inline
 def prefill_indexer_compressor(
@@ -338,19 +339,19 @@ def golden_prefill_indexer_compressor(tensors):
         value = value.float()
         var = value.square().mean(-1, keepdim=True)
         value = value * torch.rsqrt(var + EPS)
-        return (weight * value).to(torch.bfloat16)
+        return weight * value
 
-    kv = rmsnorm(kv.to(torch.bfloat16), norm_w)
+    kv = rmsnorm(kv, norm_w)
 
     x_pair = kv[..., -rd:].unflatten(-1, (-1, 2))
     x0, x1 = x_pair[..., 0], x_pair[..., 1]
     cos_v, sin_v = cos[:n_comp].view(1, n_comp, -1), sin[:n_comp].view(1, n_comp, -1)
-    y0 = (x0 * cos_v - x1 * sin_v).to(torch.bfloat16)
-    y1 = (x0 * sin_v + x1 * cos_v).to(torch.bfloat16)
-    kv = torch.cat([kv[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1).float()
+    y0 = x0 * cos_v - x1 * sin_v
+    y1 = x0 * sin_v + x1 * cos_v
+    kv = torch.cat([kv[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
     if rotate:
-        kv = kv @ hadamard
+        kv = kv.to(torch.bfloat16).float() @ hadamard
 
     tensors["kv"][:] = kv
     kv_cache[:bsz, :n_comp] = kv.to(kv_cache.dtype)
@@ -441,7 +442,7 @@ if __name__ == "__main__":
             "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
             "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_KV_LEN),
+            "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE)),
         },
     )
     if not result.passed:
