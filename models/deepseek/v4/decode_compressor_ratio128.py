@@ -76,17 +76,9 @@ def compressor(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
-    x_flat = pl.reshape(x, [B * S, D])
-    # Flatten paged block dim into row. Slot s in a block occupies cols
-    # [s*COMPRESS_STATE_DIM, (s+1)*COMPRESS_STATE_DIM); kv channel is [:OUT_DIM],
-    # score channel is [OUT_DIM:].
-    compress_state_flat = pl.reshape(compress_state, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE * COMPRESS_STATE_DIM])
-    kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
-    cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-
     kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
-
+    x_flat = pl.reshape(x, [B * S, D])
     for idx in pl.spmd(B * S * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"):
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
@@ -109,7 +101,7 @@ def compressor(
 
     kv_proj_by_batch = pl.reshape(kv_proj_scratch, [B, S * OUT_DIM])
     score_proj_by_batch = pl.reshape(score_proj_scratch, [B, S * OUT_DIM])
-
+    compress_state_flat = pl.reshape(compress_state, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE * COMPRESS_STATE_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_pre"):
         for global_c_idx in pl.range(B):
             start_pos_b = pl.read(start_pos, [global_c_idx])
@@ -123,8 +115,6 @@ def compressor(
             for s in pl.pipeline(scatter_n, stage=2):
                 proj_col0 = s * OUT_DIM
                 token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                # State cache uses absolute-position block-table addressing;
-                # only APE indexing wraps modulo COMPRESS_RATIO.
                 state_pos = start_pos_b + s
                 state_logical_blk = state_pos // COMPRESS_STATE_BLOCK_SIZE
                 state_intra = state_pos % COMPRESS_STATE_BLOCK_SIZE
@@ -141,7 +131,6 @@ def compressor(
     for idx in pl.spmd(B * HEAD_DIM // HEAD_TILE, name_hint="softmax_pool"):
         global_c_idx = idx // (HEAD_DIM // HEAD_TILE)
         h0 = (idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
-        pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
         start_pos_gate = pl.read(start_pos, [global_c_idx])
         pos_gate = start_pos_gate % COMPRESS_RATIO
         if pos_gate + S >= COMPRESS_RATIO:
@@ -150,8 +139,6 @@ def compressor(
             for s in pl.pipeline(STATE_LEN, stage=2):
                 start_pos_b = pl.read(start_pos, [global_c_idx])
                 pos_b = start_pos_b % COMPRESS_RATIO
-                # Read the absolute state window ending at the next compression
-                # boundary. This mirrors vLLM's `start = position - ratio + 1`.
                 compress_pos = start_pos_b + (COMPRESS_RATIO - 1 - pos_b)
                 state_pos = compress_pos - (COMPRESS_RATIO - 1) + s
                 state_logical_blk = state_pos // COMPRESS_STATE_BLOCK_SIZE
@@ -174,14 +161,8 @@ def compressor(
             pooled_chunk = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
             pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
-    # No state shift for non-overlap
-
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-
-    # Fused RMSNorm + gather/scatter-based RoPE, processing RMS_TILE real
-    # batches per spmd block so all vec col-vectors hit ptoas's 32B-aligned
-    # row stride without per-batch row padding.
     for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope"):
         batch_base = batch_base_idx * RMS_TILE
         cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
@@ -195,16 +176,12 @@ def compressor(
 
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
-        # Normalize the NOPE span; the rope span [NOPE_HEAD_DIM:HEAD_DIM] is
-        # written once below by the RoPE'd rope_buf.
         for rms_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
             kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
             gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
             normed_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
 
-        # Re-derive the RoPE input slice (the HEAD_TILE chunk the loop above
-        # skipped) from pooled_kv with the same inv_rms/gamma.
         kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
@@ -213,16 +190,12 @@ def compressor(
         rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
         rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
         rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        # Mask-form scatter: re-interleave rotated even/odd halves into the
-        # P0101/P1010-selected columns (inverse of the gathers above). Drops the
-        # explicit even/odd index tiles the index-form scatter required. A3/sim only.
         rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
         rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
         normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
-    # Keep this scope separate from rmsnorm_rope: merging would put 3 outer
-    # carries (kv_flat / cmp_kv_cache_flat / compress_state_flat) on one task,
-    # which hits pypto #1573 (orchestration phi cross-assignment).
+    kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
+    cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_finalize"):
         batch_base = batch_base_idx * RMS_TILE
         for inner in pl.range(RMS_TILE):
@@ -244,8 +217,6 @@ def compressor(
                 for s in pl.pipeline(pre_tokens_b, S, stage=2):
                     proj_col0 = s * OUT_DIM
                     token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                    # Tokens after the boundary start the next absolute state
-                    # window; they are not written to a modulo-128 ring slot.
                     state_pos = start_pos_b + s
                     state_logical_blk = state_pos // COMPRESS_STATE_BLOCK_SIZE
                     state_intra = state_pos % COMPRESS_STATE_BLOCK_SIZE
