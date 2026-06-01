@@ -6,11 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 Indexer KV Compressor (decode incremental, ratio=4 overlap).
-
-Uses overlapping state layout with 8 slots.
-Front slots 0-3 at columns [0:HEAD_DIM], back slots 4-7 at columns [HEAD_DIM:OUT_DIM].
-Tree reduction for softmax+pool. State shift after compression."""
+"""DeepSeek-V4 Indexer KV Compressor (decode incremental, ratio=4 overlap)."""
 
 
 import pypto.language as pl
@@ -31,7 +27,6 @@ MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local (ratio-4 overlapping compressor)
 COMPRESS_RATIO = 4
-ROTATE = True
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
@@ -43,7 +38,7 @@ COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 IDX_CACHE_MAX_BLOCKS = 64
 IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
-START_POS = COMPRESS_RATIO - 1       # ScalarSpec default exercises S-token window-boundary scatter
+START_POS = COMPRESS_RATIO - 1       # default start_pos exercises S-token window-boundary scatter
 
 # tiling
 ROPE_TILE = 32
@@ -71,7 +66,6 @@ def indexer_compressor(
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
@@ -103,13 +97,7 @@ def indexer_compressor(
     kv_proj_by_batch = pl.reshape(kv_proj_scratch, [B, S * OUT_DIM])
     score_proj_by_batch = pl.reshape(score_proj_scratch, [B, S * OUT_DIM])
 
-    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_paged"):
-        # Inline-context workaround (folded into this scope): pin kv_final to a dedicated
-        # GM buffer with an early full-tensor write so MemoryReuse cannot alias it with a
-        # concurrently-live tensor when this compressor is inlined into decode_indexer
-        # (idx_kv_cache ~4% corruption otherwise). Standalone compressor_test is unaffected.
-        kv_final[0:B, 0:HEAD_DIM] = pl.full([B, HEAD_DIM], dtype=pl.FP32, value=0.0)
         for c_idx in pl.range(B):
             start_pos_b = pl.read(start_pos, [c_idx])
             ape_row_b = pl.cast(start_pos_b % COMPRESS_RATIO, target_type=pl.INDEX)
@@ -129,17 +117,10 @@ def indexer_compressor(
                 compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
                 compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
-    # Keep softmax_pool spmd dim flat (B * HEAD_DIM // HEAD_TILE). Nesting as
-    # pl.spmd(B) + inner pl.range(HEAD_DIM // HEAD_TILE) compiles & passes
-    # standalone but, combined with the downstream pl.spmd scopes, triggers
-    # intermittent AICPU 507046 stalls (~20% of runs). See issue #419.
     pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(B * (HEAD_DIM // HEAD_TILE), name_hint="softmax_pool"):
         c_idx = idx // (HEAD_DIM // HEAD_TILE)
         h0 = (idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
-        # Zero-init non-compress batches so downstream RMSNorm/RoPE/Hadamard
-        # propagate 0 without per-batch gates.
-        pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
         start_pos_b = pl.read(start_pos, [c_idx])
         pos_b = start_pos_b % COMPRESS_RATIO
         pre_tokens_b = COMPRESS_RATIO - pos_b
@@ -193,69 +174,63 @@ def indexer_compressor(
             pooled_chunk = pl.div(oi, li)
             pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
-    normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.BF16)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for batch_base_idx in pl.range(B // RMS_TILE):
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope"):
         batch_base = batch_base_idx * RMS_TILE
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
-            cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-            sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-            partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
-                kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-                kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
-                partial_sq = pl.add(partial_sq, kv_rms_rowsum)
+        cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
+            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
-                gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
-                normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
+            kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
 
-            kv_rope_slice = normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-            even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
-            rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
-            rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
-            rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-            # Mask-form scatter: re-interleave rotated even/odd halves into the
-            # P0101/P1010-selected columns (inverse of the gathers above). Drops the
-            # explicit even/odd index tiles the index-form scatter required. A3/sim only.
-            rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
-            rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
-            normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
+        kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+        rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+        rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
+        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
+        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
 
-    if rotate:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
-            for batch_base_idx in pl.range(B // RMS_TILE):
-                batch_base = batch_base_idx * RMS_TILE
-                kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
-                for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
-                    hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-                    kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                    kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
-    else:
-        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_write"):
-            batch_base = batch_base_idx * RMS_TILE
-            kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
+    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_hadamard"):
+        batch_base = batch_base_idx * RMS_TILE
+        kv_proj_tile = normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM]
+        for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
+            hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
+            kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
+            kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
-    # Keep this as one big pl.at wrapping pl.range(B), not pl.spmd(B). The spmd
-    # form passes in isolation but combined with the upstream pl.spmd scopes
-    # contributes to the intermittent AICPU 507046 stall tracked in issue #419.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-        for c_idx in pl.range(B):
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_and_cache_write"):
+        batch_base = batch_base_idx * RMS_TILE
+        for inner in pl.range(RMS_TILE):
+            c_idx = batch_base + inner
             start_pos_b = pl.read(start_pos, [c_idx])
+            pos_b = start_pos_b % COMPRESS_RATIO
             cache_col = start_pos_b // COMPRESS_RATIO
-            kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
-            kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-            idx_blk_off = cache_col // BLOCK_SIZE
-            idx_intra = cache_col % BLOCK_SIZE
-            idx_blk_id = pl.cast(pl.read(idx_block_table, [c_idx, idx_blk_off]), pl.INDEX)
-            cache_row = idx_blk_id * BLOCK_SIZE + idx_intra
-            idx_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
+            if pos_b + S >= COMPRESS_RATIO:
+                kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
+                kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
+                idx_blk_off = cache_col // BLOCK_SIZE
+                idx_intra = cache_col % BLOCK_SIZE
+                idx_blk_id = pl.cast(pl.read(idx_block_table, [c_idx, idx_blk_off]), pl.INDEX)
+                cache_row = idx_blk_id * BLOCK_SIZE + idx_intra
+                idx_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     idx_kv_cache = pl.reshape(idx_kv_cache_flat, [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
@@ -279,7 +254,6 @@ def compressor_test(
     idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     kv, compress_state, idx_kv_cache = indexer_compressor(
         x,
@@ -296,7 +270,6 @@ def compressor_test(
         idx_kv_cache,
         idx_block_table,
         start_pos,
-        rotate,
     )
     return kv, compress_state, idx_kv_cache
 
@@ -318,7 +291,6 @@ def golden_compressor(tensors):
     idx_kv_cache = tensors["idx_kv_cache"]
     idx_block_table = tensors["idx_block_table"]
     start_pos_t = tensors["start_pos"]
-    rotate = bool(tensors["rotate"])
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
@@ -396,8 +368,7 @@ def golden_compressor(tensors):
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-        if rotate:
-            kv_b = kv_b.to(torch.bfloat16).float() @ hadamard
+        kv_b = kv_b.to(torch.bfloat16).float() @ hadamard
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0.
         tensors["kv"][b : b + 1, 0:1, :] = kv_b
 
@@ -410,7 +381,7 @@ def golden_compressor(tensors):
 
 def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
     import torch  # type: ignore[import]
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     def init_x():
         return torch.rand(B, S, D)
@@ -469,7 +440,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
-        ScalarSpec("rotate", torch.bool, ROTATE),
     ]
 
 
