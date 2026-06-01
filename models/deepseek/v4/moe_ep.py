@@ -1042,9 +1042,12 @@ def build_tensor_specs(layer_id=0):
         w1_i8, w1_s = _quant_w_per_channel(w1_bf16)
         w3_i8, w3_s = _quant_w_per_channel(w3_bf16)
         w2_i8, w2_s = _quant_w_per_channel(w2_bf16)
-        routed_w1_i8_list.append(w1_i8); routed_w1_s_list.append(w1_s)
-        routed_w3_i8_list.append(w3_i8); routed_w3_s_list.append(w3_s)
-        routed_w2_i8_list.append(w2_i8); routed_w2_s_list.append(w2_s)
+        routed_w1_i8_list.append(w1_i8)
+        routed_w1_s_list.append(w1_s)
+        routed_w3_i8_list.append(w3_i8)
+        routed_w3_s_list.append(w3_s)
+        routed_w2_i8_list.append(w2_i8)
+        routed_w2_s_list.append(w2_s)
 
     rw1_i8 = torch.stack(routed_w1_i8_list)
     rw1_s = torch.stack(routed_w1_s_list)
@@ -1067,7 +1070,6 @@ def build_tensor_specs(layer_id=0):
     sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
     sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
-    out = lambda name, shape, dtype: TensorSpec(name, shape, dtype, is_output=True)
     return [
         TensorSpec("x_hc",          [N_RANKS, B, S, HC_MULT, D],     torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_ffn_fn",     [N_RANKS, MIX_HC, HC_DIM],       torch.float32,  init_value=init_hc_ffn_fn),
@@ -1090,7 +1092,7 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
         TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
-        out("x_next",           [N_RANKS, B, S, HC_MULT, D],                 torch.bfloat16),
+        TensorSpec("x_next",           [N_RANKS, B, S, HC_MULT, D],      torch.bfloat16, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
     ]
 
