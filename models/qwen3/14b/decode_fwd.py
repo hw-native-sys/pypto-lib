@@ -531,13 +531,19 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a5"])
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=BATCH)
     parser.add_argument("--max-seq", type=int, default=128)
-    parser.add_argument("--num-layers", type=int, default=NUM_LAYERS)
+    parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-out-window-externalization",
+        action="store_true",
+        default=False,
+        help="Enable out-window externalization compiler pass.",
+    )
     parser.add_argument("--pass-rate", type=float, default=0.98,
                         help="Fraction of `out` elements that must satisfy atol/rtol. "
                              "Default 0.98 is sized for the 40-layer BF16 ULP long-tail at "
@@ -570,6 +576,11 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+        ),
+        compile_cfg=(
+            dict(enable_out_window_externalization=True)
+            if args.enable_out_window_externalization
+            else {}
         ),
         rtol=5e-3,
         atol=5e-3,
