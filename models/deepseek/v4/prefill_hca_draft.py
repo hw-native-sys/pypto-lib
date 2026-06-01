@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pypto.language as pl
 
-from prefill_attention_hca_draft import B, D, HC_MULT, S
+from prefill_attention_hca import B, D, HC_MULT, S
 
 
 
@@ -88,7 +88,7 @@ def prefill_hca(
 def golden_prefill_hca(tensors):
     import torch
 
-    from prefill_attention_hca_draft import golden_prefill_attention_hca
+    from prefill_attention_hca import golden_prefill_attention_hca
     from moe import golden_moe
 
     x_attn = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
