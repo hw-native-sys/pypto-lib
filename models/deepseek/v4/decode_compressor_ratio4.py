@@ -31,7 +31,6 @@ MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local (ratio-4 overlapping compressor)
 COMPRESS_RATIO = 4
-ROTATE = False
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
@@ -69,11 +68,9 @@ def compressor(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
-    hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     cmp4_kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
@@ -125,10 +122,6 @@ def compressor(
                 compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
                 compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
-    # Keep softmax_pool spmd dim flat (B * HEAD_DIM // HEAD_TILE). Nesting as
-    # pl.spmd(B) + inner pl.range(HEAD_DIM // HEAD_TILE) compiles & passes
-    # standalone but, combined with the downstream pl.spmd scopes, triggers
-    # intermittent AICPU 507046 stalls (~20% of runs). See issue #419.
     pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(B * (HEAD_DIM // HEAD_TILE), name_hint="softmax_pool"):
         c_idx = idx // (HEAD_DIM // HEAD_TILE)
@@ -190,7 +183,6 @@ def compressor(
             pooled_kv[c_idx : c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
-    kv_final = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for batch_base_idx in pl.range(B // RMS_TILE):
         batch_base = batch_base_idx * RMS_TILE
@@ -206,15 +198,21 @@ def compressor(
 
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            # Normalize the NOPE span; the rope span [NOPE_HEAD_DIM:HEAD_DIM] is
+            # written once below by the RoPE'd rope_buf.
+            for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
                 kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
                 gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
                 normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
                 normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
-            kv_rope_slice = normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-            even_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_tile = pl.gather(kv_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+            # Re-derive the RoPE input slice (the HEAD_TILE chunk the loop above
+            # skipped) from pooled_kv with the same inv_rms/gamma.
+            kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+            gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
+            rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+            even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+            odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
             rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
             rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
             idx_target = pl.full([RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.INT32, value=0)
@@ -225,28 +223,11 @@ def compressor(
             rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx_full, src=rope_odd)
             normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
-    if rotate:
-        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_hadamard"):
-            batch_base = batch_base_idx * RMS_TILE
-            kv_proj_tile = pl.cast(normed_kv[batch_base : batch_base + RMS_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint")
-            for o_kb in pl.pipeline(HEAD_DIM // OUT_TILE, stage=2):
-                o0 = o_kb * OUT_TILE
-                hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
-                kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-                kv_final[batch_base : batch_base + RMS_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
-    else:
-        for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_write"):
-            batch_base = batch_base_idx * RMS_TILE
-            kv_final[batch_base : batch_base + RMS_TILE, :] = normed_kv[batch_base : batch_base + RMS_TILE, :]
-
-    # Keep this as one big pl.at wrapping pl.range(B), not pl.spmd(B). The spmd
-    # form passes in isolation but combined with the upstream pl.spmd scopes
-    # contributes to the intermittent AICPU 507046 stall tracked in issue #419.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
         for c_idx in pl.range(B):
             start_pos_b = pl.read(start_pos, [c_idx])
             cache_col = start_pos_b // COMPRESS_RATIO
-            kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
+            kv_row_fp32 = normed_kv[c_idx : c_idx + 1, 0 : HEAD_DIM]
             kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
             cmp_blk_off = cache_col // BLOCK_SIZE
             cmp_intra = cache_col % BLOCK_SIZE
@@ -274,11 +255,9 @@ def compressor_test(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
-    hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     cmp_kv_cache: pl.Out[pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     kv, compress_state, cmp_kv_cache = compressor(
         x,
@@ -293,11 +272,9 @@ def compressor_test(
         sin,
         even_idx,
         odd_idx,
-        hadamard,
         cmp_kv_cache,
         cmp_block_table,
         start_pos,
-        rotate,
     )
     return kv, compress_state, cmp_kv_cache
 
@@ -315,13 +292,11 @@ def golden_compressor(tensors):
     norm_w = tensors["norm_w"]
     cos = tensors["cos"]
     sin = tensors["sin"]
-    hadamard = tensors["hadamard"].float()
     cmp_kv_cache = tensors["cmp_kv_cache"]
     cmp_block_table = tensors["cmp_block_table"]
     start_pos_t = tensors["start_pos"]
-    rotate = bool(tensors["rotate"])
     bsz, _, _ = x.shape
-    ratio, d, rd = COMPRESS_RATIO, hadamard.shape[0], ROPE_HEAD_DIM
+    ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
     kv = x @ wkv                        # [B, S, OUT_DIM]
     score = x @ wgate                   # [B, S, OUT_DIM]
@@ -397,8 +372,6 @@ def golden_compressor(tensors):
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-        if rotate:
-            kv_b = kv_b.to(torch.bfloat16).float() @ hadamard
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0
         # so the golden matches its [B, S, HEAD_DIM] zero-init.
         tensors["kv"][b : b + 1, 0:1, :] = kv_b
@@ -412,7 +385,7 @@ def golden_compressor(tensors):
 
 def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
     import torch  # type: ignore[import]
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     def init_x():
         return torch.rand(B, S, D)
@@ -442,8 +415,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
     def init_odd_idx():
         return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
-    def init_hadamard():
-        return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_cmp_block_table():
@@ -473,11 +444,9 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("even_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_even_idx),
         TensorSpec("odd_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_odd_idx),
-        TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache, is_output=True),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
-        ScalarSpec("rotate", torch.bool, ROTATE),
     ]
 
 
@@ -495,6 +464,7 @@ if __name__ == "__main__":
                         help="Use a grouped per-batch start_pos pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
@@ -502,6 +472,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
         golden_fn=golden_compressor,
         runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

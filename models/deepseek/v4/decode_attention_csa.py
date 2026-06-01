@@ -116,7 +116,6 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-ROTATE_MAIN = False
 ROTATE_INNER = True
 
 # Keep the default fixture on a full-window compression step so sparse_attn
@@ -257,7 +256,6 @@ def attention_csa(
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    hadamard_main = pl.create_tensor([HEAD_DIM, HEAD_DIM], dtype=pl.BF16)
     cmp_out, compress_state, cmp_kv = compressor(
         x_mixed,
         cmp_out,
@@ -271,11 +269,9 @@ def attention_csa(
         cmp_sin,
         cmp_even_idx,
         cmp_odd_idx,
-        hadamard_main,
         cmp_kv,
         cmp_block_table,
         cmp_start_pos,
-        ROTATE_MAIN,
     )
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
@@ -544,11 +540,9 @@ def golden_attention_csa(tensors):
         "norm_w": tensors["cmp_norm_w"],
         "cos": cmp_cos,
         "sin": cmp_sin,
-        "hadamard": torch.eye(HEAD_DIM, dtype=torch.bfloat16),
         "cmp_kv_cache": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "start_pos": cmp_start_pos,
-        "rotate": False,
     })
 
     idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
