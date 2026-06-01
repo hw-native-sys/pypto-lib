@@ -26,21 +26,19 @@ ROPE_HEAD_DIM = M.qk_rope_head_dim
 IDX_N_HEADS = M.index_n_heads
 IDX_HEAD_DIM = M.index_head_dim
 IDX_NOPE_HEAD_DIM = M.index_nope_head_dim
-WEIGHTS_SCALE = M.index_weights_scale  # softmax_scale folded with n_heads**-0.5 (model.py Indexer:418)
+WEIGHTS_SCALE = M.index_weights_scale
 MAX_SEQ_LEN = M.max_position_embeddings
-OFFSET = M.sliding_window  # ScalarSpec default; = win in attention orch; added to topk_idxs (model.py:432)
+OFFSET = M.sliding_window
 
 # kernel-local
 COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
 IDX_TOPK = M.index_topk
 
 
-INNER_ROTATE = True
 INNER_OVERLAP = COMPRESS_RATIO == 4
 INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
-INNER_STATE_LEN = INNER_COFF * COMPRESS_RATIO
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 INNER_STATE_MAX_BLOCKS = 64
 INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
@@ -50,76 +48,29 @@ IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 IDX_CACHE_MAX_BLOCKS = 64
 IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 SCORE_LEN = IDX_KV_LEN
-START_POS = 254      # ScalarSpec default; >0 (decode) and (START_POS+S)%COMPRESS_RATIO==0
+START_POS = 254
 
 # tiling
 CACHE_TILE = 32
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
-MAX_CACHE_BLOCKS = SCORE_LEN // CACHE_TILE
-Q_CHUCK = 128
-# Output-head tile of the qr_proj matmul; also the pl.parallel step over the
-# IDX_N_HEADS*IDX_HEAD_DIM output. Doubled 128->256 to halve the task count (64->32):
-# the [T,256] INT32 acc = 128KB fits the 192KB buffer, and the row-chunked dequant epilogue
-# tile [QR_PROJ_ROW_CHUNK,256] stays small. 512 overflows (acc [T,512]=256KB > 192KB; the
-# UP_DOWN row-split does NOT shrink this create_tensor), so 256 is the ceiling here.
-Q_OUT_CHUCK = 256
-# Inner row-chunk for the qr_proj dequant epilogue so matmul+dequant fits 192KB Vec.
-QR_PROJ_ROW_CHUNK = 16 if T % 16 == 0 else T
-ROPE_CHUCK = 16
-HEAD_DIM_CHUCK = 32
-D_CHUCK = 32
-QUANT_CHUNK = 128 if T >= 64 else 256
-# GROUP-chunking: fold HEAD_GROUP tokens into one task in the rope/hadamard loop.
-# Ops are per-row independent, so this just makes the tiles HEAD_GROUP-taller (no
-# GM intermediates, bit-identical numerics). Vec buffer scales with HEAD_ROWS;
-# qr_hadamard_quant Vec buffer caps single-loop GRP at 2: GRP=4 overflows even with
-# auto_chunk (199KB, INT8 store needs >=32-col chunk so can't shrink),
-# and GRP=8 overflows L0C (qr_hadamard_acc [GRP*64,128] FP32 = 256KB).
-HEAD_GROUP = 2 if T >= 2 else 1
+Q_TILE = 128
+Q_OUT_TILE = 256
+QR_PROJ_ROW_TILE = 16
+ROPE_TILE = 16
+HEAD_DIM_TILE = 32
+D_TILE = 32
+HEAD_GROUP = 2
 HEAD_ROWS = IDX_N_HEADS * HEAD_GROUP
-# The rope scope is not Vec/L0C-buffer bound: its inner pl.range(ROPE_ROW_CHUNK) keeps the
-# per-chunk matmul/Vec fixed at IDX_N_HEADS rows regardless of the group, so task size is
-# linear in HEAD_GROUP_ROPE (the group must divide T -- assert below). GRP=8 balances the
-# per-task size for cube overlap with the parallel kv_score_proj. qr_hadamard CANNOT share
-# this group (its whole [HEAD_ROWS,128] FP32 matmul-out is L0C-bound), so it has its own
-# HEAD_GROUP_HAD below.
-HEAD_GROUP_ROPE = 8 if T >= 8 else HEAD_GROUP
+HEAD_GROUP_ROPE = 8
 HEAD_ROWS_ROPE = IDX_N_HEADS * HEAD_GROUP_ROPE
-# qr_hadamard row-tiles its matmul by HEAD_ROWS *inside* the scope (loop below), so the L0C
-# accumulator is only [HEAD_ROWS, IDX_HEAD_DIM] FP32 (64KB) no matter how big the group is.
-# That decouples task size from the L0C cap, so HEAD_GROUP_HAD can fold larger than the
-# accumulator alone would allow. Must be a multiple of HEAD_GROUP (the row-tile step).
-HEAD_GROUP_HAD = 8 if T >= 8 else HEAD_GROUP
+HEAD_GROUP_HAD = 8
 HEAD_ROWS_HAD = IDX_N_HEADS * HEAD_GROUP_HAD
-assert (T * IDX_N_HEADS) % HEAD_ROWS_HAD == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS_HAD"
-assert HEAD_ROWS_HAD % HEAD_ROWS == 0, "HEAD_ROWS_HAD must be divisible by HEAD_ROWS (row-tile step)"
-# Inner row-chunk for the mix-fused rope_slice: matmul+cast per ROPE_ROW_CHUNK rows so
-# the fused acc+epilogue fits 192KB Vec at GRP=4 (vs whole HEAD_ROWS_ROPE at once = 344KB).
-ROPE_ROW_CHUNK = IDX_N_HEADS
-assert HEAD_ROWS_ROPE % ROPE_ROW_CHUNK == 0, "HEAD_ROWS_ROPE must be divisible by ROPE_ROW_CHUNK"
-assert (T * IDX_N_HEADS) % HEAD_ROWS_ROPE == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS_ROPE"
-# weights_proj fuses the softmax-scale mul into the matmul scope (saves one GM round-trip
-# of `weights`). The matmul streams its K-tiles over the full T; only the FP32 mul epilogue
-# is row-chunked. The fused epilogue costs ~IDX_N_HEADS*36 B/row of Vec (matmul-out staging
-# + mul in/out + NZ padding under UP_DOWN), so halve the row-chunk until it fits the 192KB
-# Vec limit. Then halve once more for task granularity: the row loop is pl.parallel
-# (independent rows), so smaller chunks spread across cores instead of running serially.
-WEIGHTS_ROW_CHUNK = T
-while WEIGHTS_ROW_CHUNK * IDX_N_HEADS * 36 > 196608:
-    WEIGHTS_ROW_CHUNK //= 2
-WEIGHTS_ROW_CHUNK = max(WEIGHTS_ROW_CHUNK // 2, 1)
-assert T % WEIGHTS_ROW_CHUNK == 0, "T must be divisible by WEIGHTS_ROW_CHUNK"
-# Fold SCORE_B_GROUP batches into one task in the per-(batch, cache-block) score loop.
-# 4 (not 8): at 8 the score_fused task becomes the largest single task and a critical-path
-# floor; 4 keeps it small enough to overlap with the rest.
-SCORE_B_GROUP = 4 if B >= 4 else B
-assert B % SCORE_B_GROUP == 0, "B must be divisible by SCORE_B_GROUP"
-assert (T * IDX_N_HEADS) % HEAD_ROWS == 0, "T*IDX_N_HEADS must be divisible by HEAD_ROWS"
-# Fold TOPK_GROUP rows into one topk task via an inner pl.range (each row's sort is
-# per-row independent, so this is bit-identical) -- collapses the T-task topk leaf into
-# T/TOPK_GROUP bigger tasks to amortize per-task launch overhead.
-TOPK_GROUP = 16 if T % 16 == 0 else (8 if T % 8 == 0 else 1)
-assert T % TOPK_GROUP == 0, "T must be divisible by TOPK_GROUP"
+WEIGHTS_ROW_TILE = T
+while WEIGHTS_ROW_TILE * IDX_N_HEADS * 36 > 196608:
+    WEIGHTS_ROW_TILE //= 2
+WEIGHTS_ROW_TILE = max(WEIGHTS_ROW_TILE // 2, 1)
+SCORE_B_GROUP = 4
+TOPK_GROUP = 16
 
 @pl.jit.inline
 def indexer(
@@ -129,7 +80,7 @@ def indexer(
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],  # caller passes freqs_cis[start_pos[b]]
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
@@ -145,53 +96,32 @@ def indexer(
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
-    start_pos: pl.Tensor[[B], pl.INT32],  # decode step; varies per row
-    offset: pl.Scalar[pl.INT32],     # added to topk_idxs (= win from attention orch)
-    inner_rotate: pl.Scalar[pl.BOOL],
+    start_pos: pl.Tensor[[B], pl.INT32],
+    offset: pl.Scalar[pl.INT32], 
 ):
-    qr_i8 = qr
-    qr_scale_dq = qr_scale
-
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
-    for o0 in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, Q_OUT_CHUCK):
-        # Mix: matmul (cube, INT32-out) + dequant cast (vector) in one scope.
-        with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_proj"):
-            qr_acc = pl.create_tensor([T, Q_OUT_CHUCK], dtype=pl.INT32)
-            for kb in pl.pipeline(0, Q_LORA // Q_CHUCK, stage=2):
-                q0 = kb * Q_CHUCK
-                qr_tile = qr_i8[:, q0 : q0 + Q_CHUCK]
-                wq_tile = wq_b[q0 : q0 + Q_CHUCK, o0 : o0 + Q_OUT_CHUCK]
-                if q0 == 0:
-                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                else:
-                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
-            wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_CHUCK], [1, Q_OUT_CHUCK])
-            for r0 in pl.range(0, T, QR_PROJ_ROW_CHUNK):
-                acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_CHUNK, :], target_type=pl.FP32, mode="none")
-                scale_dq = qr_scale_dq[r0 : r0 + QR_PROJ_ROW_CHUNK, :]
-                qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
-                qr_proj[r0 : r0 + QR_PROJ_ROW_CHUNK, o0 : o0 + Q_OUT_CHUCK] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
+    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="qr_proj", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+        o0 = idx * Q_OUT_TILE
+        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+            q0 = kb * Q_TILE
+            qr_tile = qr[:, q0 : q0 + Q_TILE]
+            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+            if q0 == 0:
+                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+            else:
+                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+        wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
+        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
+            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
+            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
-    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    # rope writes its output to this fresh tensor instead of in-place into qr_proj_flat's
-    # ROPE columns. Keeping qr_proj_flat read-only across the rope loop lets the dataflow
-    # scheduler prove the per-o0 iterations are independent and spread them across many
-    # cube/vector cores; writing back in-place created a read+write (RAW/WAR) hazard on
-    # qr_proj_flat that the scheduler could not disambiguate at slice granularity, pinning
-    # all iterations onto a single cube+vector core pair. qr_hadamard below K-splits its
-    # matmul accordingly: NOPE half from qr_proj_flat[:,0:NOPE], ROPE half from qr_rope_out.
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
 
-    # GROUP-chunked: each task folds HEAD_GROUP tokens (HEAD_ROWS rows) so the tiny
-    # per-head matmuls/vector ops amortize the per-task launch overhead over more
-    # rows. All ops are per-row independent and cos/sin are shared across tokens,
-    # so the taller tiles are numerically identical to the per-token form.
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_ROPE):
-        # Mix: slice matmul + cos/sin apply + assemble matmul + write, all in one scope;
-        # inner row-chunk by IDX_N_HEADS so the per-chunk Vec/L0C fits 192KB. The chunk is
-        # one token's heads, so cos_b/sin_b (per-batch) are constant across the chunk.
         with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="rope_fused"):
             for ro in pl.range(0, HEAD_ROWS_ROPE, IDX_N_HEADS):
                 even_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
@@ -200,11 +130,11 @@ def indexer(
                 batch_idx = token_idx // S
                 cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
                 sin_b = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-                for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=1):
-                    r0 = rb * ROPE_CHUCK
-                    qr_proj_rope_tile = qr_proj_flat[o0 + ro : o0 + ro + IDX_N_HEADS, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
-                    even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
-                    odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
+                for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_TILE, stage=1):
+                    r0 = rb * ROPE_TILE
+                    qr_proj_rope_tile = qr_proj_flat[o0 + ro : o0 + ro + IDX_N_HEADS, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_TILE]
+                    even_select_tile = even_select[r0 : r0 + ROPE_TILE, :]
+                    odd_select_tile = odd_select[r0 : r0 + ROPE_TILE, :]
                     if r0 == 0:
                         even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
                         odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
@@ -213,21 +143,12 @@ def indexer(
                         odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
                 rope_even = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos_b), pl.col_expand_mul(odd_acc, sin_b)), target_type=pl.BF16, mode="rint")
                 rope_odd = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin_b), pl.col_expand_mul(odd_acc, cos_b)), target_type=pl.BF16, mode="rint")
-                # Assemble in a single matmul over the full K=ROPE_HEAD_DIM//2 (=32) instead
-                # of K-tiling rope_even/rope_odd by column. Under UP_DOWN these vec tiles are
-                # row-halved, but a `rope_even[:, k0:k0+16]` column slice keeps the pre-split
-                # static row size (64) and trips ptoas `pto.subview valid_shape[0] != valid_row`.
-                # Passing them whole avoids the subview; K=32 is small enough for one matmul.
                 rope_acc = pl.matmul(rope_even, even_select, out_dtype=pl.FP32, b_trans=True)
                 rope_acc = pl.matmul_acc(rope_acc, rope_odd, odd_select, b_trans=True)
                 qr_rope_out[o0 + ro : o0 + ro + IDX_N_HEADS, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
 
-    # qr_hadamard is a cube matmul + INT8 quant epilogue. The matmul output is L0C-bound at
-    # [HEAD_ROWS, IDX_HEAD_DIM] FP32 = 64KB, so we tile the matmul by HEAD_ROWS *inside* the
-    # scope: each row-chunk does its own matmul + quant, keeping the accumulator at 64KB
-    # regardless of HEAD_ROWS_HAD. This decouples the task size from the L0C cap, letting the
-    # group fold larger. Each row-chunk is independent (per-row matmul + per-row amax quant)
-    # so this is bit-identical.
+    qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
+    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS_HAD):
         with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)], name_hint="qr_hadamard"):
             for ro in pl.range(0, HEAD_ROWS_HAD, HEAD_ROWS):
@@ -236,8 +157,8 @@ def indexer(
                 qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
                 qr_hadamard_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
                 qh_amax = pl.full([1, HEAD_ROWS], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                    qh_a_f32 = qr_hadamard_acc[0 : HEAD_ROWS, h0 : h0 + HEAD_DIM_CHUCK]
+                for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                    qh_a_f32 = qr_hadamard_acc[0 : HEAD_ROWS, h0 : h0 + HEAD_DIM_TILE]
                     qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
                     qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, HEAD_ROWS])
                     qh_amax = pl.maximum(qh_amax, qh_a_max)
@@ -245,34 +166,28 @@ def indexer(
                 qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [HEAD_ROWS, 1])
                 qr_hadamard_scale_dq[o0 + ro : o0 + ro + HEAD_ROWS, :] = qh_scale_dq
                 qh_scale_quant = pl.reshape(qh_scale_quant_row, [HEAD_ROWS, 1])
-                for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                    qh_q_f32 = qr_hadamard_acc[0 : HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK]
+                for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                    qh_q_f32 = qr_hadamard_acc[0 : HEAD_ROWS, h1 : h1 + HEAD_DIM_TILE]
                     qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
                     qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
                     qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
                     qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
-                    qr_hadamard_i8[o0 + ro : o0 + ro + HEAD_ROWS, h1 : h1 + HEAD_DIM_CHUCK] = qh_i8
-
+                    qr_hadamard_i8[o0 + ro : o0 + ro + HEAD_ROWS, h1 : h1 + HEAD_DIM_TILE] = qh_i8
 
     x_flat = pl.reshape(x, [T, D])
     weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
-    # Mix: weights matmul (cube, FP32-out) + softmax-scale mul (vector) in one scope,
-    # row-chunked over T so nothing stays full-T resident. Index x_flat directly per
-    # K-tile ([WEIGHTS_ROW_CHUNK, D_CHUCK]) -- pre-slicing a whole [chunk, D] left operand
-    # pins it in L1 (1MB Mat overflow); a full-T weights_acc keeps the c2v bridge resident
-    # (288KB Vec overflow). Per-chunk both the matmul L1 inputs and the mul epilogue fit.
-    for t0 in pl.parallel(0, T, WEIGHTS_ROW_CHUNK):
+    for t0 in pl.parallel(0, T, WEIGHTS_ROW_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
-            weights_acc = pl.create_tensor([WEIGHTS_ROW_CHUNK, IDX_N_HEADS], dtype=pl.FP32)
-            for db in pl.pipeline(0, D // D_CHUCK, stage=2):
-                d0 = db * D_CHUCK
-                x_tile = x_flat[t0 : t0 + WEIGHTS_ROW_CHUNK, d0 : d0 + D_CHUCK]
-                weights_proj_tile = weights_proj[d0 : d0 + D_CHUCK, :]
+            weights_acc = pl.create_tensor([WEIGHTS_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+            for db in pl.pipeline(0, D // D_TILE, stage=2):
+                d0 = db * D_TILE
+                x_tile = x_flat[t0 : t0 + WEIGHTS_ROW_TILE, d0 : d0 + D_TILE]
+                weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
                 if d0 == 0:
                     weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
                 else:
                     weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
-            weights[t0 : t0 + WEIGHTS_ROW_CHUNK, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
+            weights[t0 : t0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     inner_kv, inner_compress_state, idx_kv_cache = indexer_compressor(
         x,
@@ -289,7 +204,6 @@ def indexer(
         idx_kv_cache,
         idx_block_table,
         start_pos,
-        inner_rotate,
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
@@ -307,12 +221,7 @@ def indexer(
 
         for cb in pl.parallel(cache_blocks):
             cache0 = cb * CACHE_TILE
-
-            # Mix (NONE): per-block KV INT8 quant (vec) folded with the score matmul (cube,
-            # INT32) + dequant / ReLU / weighted-reduce (vec) per-s. The quantized KV tile and
-            # its dequant scale stay in UB instead of round-tripping through kv_tile_i8_g /
-            # score_kv_scale GM (was two scopes: score_quant + score_store).
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.NONE)], name_hint="score_fused"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_fused"):
                 for bi in pl.range(SCORE_B_GROUP):
                     b = bg + bi
                     start_pos_b = pl.read(start_pos, [b])
@@ -330,8 +239,8 @@ def indexer(
                         q0 = b * S * IDX_N_HEADS
                         # --- KV INT8 quant scale (full-128-dim amax), kept in UB ---
                         kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                        for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_CHUCK):
-                            kv_a_tile = kv_cache_flat[kv0 : kv0 + CACHE_TILE, h0 : h0 + HEAD_DIM_CHUCK]
+                        for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                            kv_a_tile = kv_cache_flat[kv0 : kv0 + CACHE_TILE, h0 : h0 + HEAD_DIM_TILE]
                             kv_a_f32 = pl.cast(kv_a_tile, target_type=pl.FP32)
                             kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
                             kv_a_max = pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE])
@@ -339,15 +248,6 @@ def indexer(
                         kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
                         kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
                         kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
-                        # --- score matmul + dequant + weighted reduce (was score_store) ---
-                        # KV is s-independent: quantize the whole [CACHE_TILE, IDX_HEAD_DIM] tile
-                        # ONCE (per-row scale from the full-128-dim amax) and reuse it for both query
-                        # tokens via a single K=IDX_HEAD_DIM matmul. No K-chunk loop or column-subview
-                        # slicing -- a sliced kv_q_i8_full[:, h:h+C] operand trips ptoas 'pto.tmov
-                        # matching src/dst shapes', a column-write assemble trips valid_row, and two
-                        # live accumulators deadlock the AICPU. Bit-identical: per-row scale unchanged,
-                        # INT32 accumulation is exact regardless of K order. kv0 already includes the
-                        # paged intra-block offset (idx_block_table lookup above), so index [kv0:+CACHE_TILE].
                         kv_q_full_f32 = pl.cast(kv_cache_flat[kv0 : kv0 + CACHE_TILE, 0 : IDX_HEAD_DIM], target_type=pl.FP32)
                         kv_q_full_scaled = pl.row_expand_mul(kv_q_full_f32, kv_scale_quant)
                         kv_q_full_i32 = pl.cast(kv_q_full_scaled, target_type=pl.INT32, mode="rint")
@@ -371,8 +271,6 @@ def indexer(
                             score_flat[t0 + s : t0 + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    # GROUP-chunked: fold TOPK_GROUP rows into one task via an inner pl.range so the small
-    # per-row sort amortizes the per-task launch overhead. Each row is independent.
     for t0 in pl.parallel(0, T, TOPK_GROUP):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
             for ti in pl.range(0, TOPK_GROUP):
@@ -425,7 +323,6 @@ def indexer_test(
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
     start_pos: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
-    inner_rotate: pl.Scalar[pl.BOOL],
 ):
     score, idx_kv_cache, topk_idxs = indexer(
         x,
@@ -452,7 +349,6 @@ def indexer_test(
         topk_idxs,
         start_pos,
         offset,
-        inner_rotate,
     )
     return score, idx_kv_cache, topk_idxs
 
@@ -534,7 +430,6 @@ def golden_indexer(tensors):
         "idx_kv_cache": tensors["idx_kv_cache"],
         "idx_block_table": tensors["idx_block_table"],
         "start_pos": tensors["start_pos"],
-        "rotate": tensors["inner_rotate"],
     }
     golden_compressor(inner_tensors)
 
@@ -669,7 +564,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32, is_output=True),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
         ScalarSpec("offset", torch.int32, OFFSET),
-        ScalarSpec("inner_rotate", torch.bool, INNER_ROTATE),
     ]
 
 
