@@ -142,8 +142,6 @@ def attention_csa(
     odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -332,8 +330,6 @@ def attention_csa(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
-        even_select_local,
-        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -365,8 +361,6 @@ def attention_csa_test_refresh(
     odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -417,8 +411,6 @@ def attention_csa_test_refresh(
         odd_select_t,
         even_select,
         odd_select,
-        even_select_local,
-        odd_select_local,
         cmp_even_idx,
         cmp_odd_idx,
         cmp_wkv,
@@ -592,8 +584,6 @@ def golden_attention_csa(tensors):
         "seqused_kv": tensors["seqused_kv"],
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
-        "even_select_local": tensors["even_select_local"],
-        "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
@@ -693,18 +683,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_odd_select():
         m = torch.zeros((ROPE_HEAD_DIM, HALF_ROPE))
         for i in range(HALF_ROPE):
-            m[2 * i + 1, i] = 1
-        return m
-
-    def init_even_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
-            m[2 * i, i] = 1
-        return m
-
-    def init_odd_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
             m[2 * i + 1, i] = 1
         return m
 
@@ -891,8 +869,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("odd_select_t", [HALF_ROPE, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("even_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_even_select),
         TensorSpec("odd_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_odd_select),
-        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("cmp_even_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_even_idx),
         TensorSpec("cmp_odd_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_odd_idx),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),

@@ -43,7 +43,7 @@ CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
-ROPE_TOKEN_TILE = 4
+ROPE_TOKEN_TILE = 1
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
@@ -84,8 +84,6 @@ def sparse_attn(
     seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[ROPE_INTERLEAVE_TILE, ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[ROPE_INTERLEAVE_TILE, ROPE_TILE], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -221,14 +219,13 @@ def sparse_attn(
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
     # Inverse RoPE: gather even/odd lanes (HW native TGATHER<mask>) for de-interleave,
-    # rotate with cos/sin, then matmul-based re-interleave back to interleaved layout.
-    # Note: tried scatter index-form re-interleave (commit history) — it caused ~11%
-    # precision FAIL on attn_out vs the matmul re-interleave baseline, even with an
-    # explicit BF16 round-trip on the rotated values. ratio128's gather+scatter is
-    # safe because its golden compares FP32; sparse_attn's golden ends in BF16 cast
-    # which amplifies the scatter-vs-matmul precision delta. Keep matmul re-interleave.
-    rope_even_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
-    rope_odd_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
+    # rotate with cos/sin, then mask-form scatter (TSCATTER<mask>) re-interleaves back
+    # to interleaved layout — the exact inverse of the gathers, mirroring
+    # decode_qkv_proj_rope's gather-rotate-scatter. An earlier *index-form* scatter
+    # (hand-built even/odd index tiles) caused ~11% attn_out precision FAIL; mask-form
+    # drops those index tiles and the intermediate BF16 round-trip entirely.
+    # Note: mask-form scatter is A3/sim only — A5 rejects it.
+    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
         r_t0 = r_idx * ROPE_TOKEN_TILE
         for r_dt in pl.range(ROPE_TOKEN_TILE):
@@ -245,15 +242,20 @@ def sparse_attn(
                 r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_even_rot = pl.add(pl.col_expand_mul(r_even, r_cos), pl.col_expand_mul(r_odd, r_sin))
                 r_odd_rot = pl.sub(pl.col_expand_mul(r_odd, r_cos), pl.col_expand_mul(r_even, r_sin))
-                r_even_bf16 = pl.cast(r_even_rot, target_type=pl.BF16, mode="rint")
-                r_odd_bf16 = pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint")
+                # Match golden's BF16 round-trip on the rotated values (golden does
+                # `.to(bfloat16).float()` after the rotation, which the original NPU
+                # matmul reassemble matched by casting BF16 before the matmul).
+                # Without this, FP32-only output exceeds the precision tolerance.
+                r_even_rot = pl.cast(pl.cast(r_even_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                r_odd_rot = pl.cast(pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
 
-                # Re-interleave via matmul (precision-stable). Each writes half-zero;
-                # rope_pack adds them.
-                r_even_il = pl.matmul(r_even_bf16, even_select_local, b_trans=True, out_dtype=pl.FP32)
-                r_odd_il = pl.matmul(r_odd_bf16, odd_select_local, b_trans=True, out_dtype=pl.FP32)
-                rope_even_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_even_il
-                rope_odd_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_odd_il
+                # Re-interleave via mask-form scatter: write the FP32 rotated even/odd
+                # halves into the interleaved columns selected by the P0101/P1010 mask
+                # (inverse of the gathers above). One buffer, no add, no BF16 round-trip.
+                r_rope_buf = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
+                r_rope_buf = pl.tensor.scatter(r_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_rope_buf)
+                r_rope_buf = pl.tensor.scatter(r_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_rope_buf)
+                rope_buf[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE] = r_rope_buf
 
     for rp_block in pl.spmd((T // ROPE_PACK_TOKEN_TILE) * O_GROUPS, name_hint="rope_pack"):
         rp_tb = rp_block // O_GROUPS
@@ -264,11 +266,10 @@ def sparse_attn(
             rp_t = rp_t0 + rp_dt
             rp_row = rp_t * H + rp_g * HEADS_PER_GROUP
 
-            # Merge and write only this group's inverse-RoPE tail of o_packed.
-            # Merge two half-zero bufs from the matmul re-interleave and cast to BF16.
-            rp_even = rope_even_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
-            rp_odd = rope_odd_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
-            rp_full = pl.cast(pl.add(rp_even, rp_odd), target_type=pl.BF16)
+            # Write only this group's inverse-RoPE tail of o_packed: cast the single
+            # scatter-merged FP32 buffer to BF16.
+            rp_rope = rope_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
+            rp_full = pl.cast(rp_rope, target_type=pl.BF16)
             rp_pack_row = rp_g * T + rp_t
             for rp_hh in pl.range(HEADS_PER_GROUP):
                 rp_col = rp_hh * HEAD_DIM + NOPE_DIM
@@ -372,8 +373,6 @@ def sparse_attn_test(
     seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[ROPE_INTERLEAVE_TILE, ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[ROPE_INTERLEAVE_TILE, ROPE_TILE], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -390,8 +389,6 @@ def sparse_attn_test(
         seqused_kv,
         freqs_cos,
         freqs_sin,
-        even_select_local,
-        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -608,20 +605,6 @@ def build_tensor_specs(
         sin_half = torch.sin(angles)
         return torch.cat([sin_half, sin_half], dim=-1)
 
-    def init_odd_select_local():
-        """Build the chunk-local selector that extracts odd rope lanes from interleaved inputs."""
-        matrix = torch.zeros((ROPE_INTERLEAVE_TILE, ROPE_TILE))
-        for i in range(ROPE_TILE):
-            matrix[2 * i + 1, i] = 1
-        return matrix
-
-    def init_even_select_local():
-        """Build the chunk-local selector that extracts even rope lanes from interleaved inputs."""
-        matrix = torch.zeros((ROPE_INTERLEAVE_TILE, ROPE_TILE))
-        for i in range(ROPE_TILE):
-            matrix[2 * i, i] = 1
-        return matrix
-
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
         return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 4) / (O_GROUP_IN ** 0.5)
@@ -648,8 +631,6 @@ def build_tensor_specs(
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
-        TensorSpec("even_select_local", [ROPE_INTERLEAVE_TILE, ROPE_TILE], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [ROPE_INTERLEAVE_TILE, ROPE_TILE], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),

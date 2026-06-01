@@ -79,8 +79,6 @@ def attention_swa(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -176,8 +174,6 @@ def attention_swa(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
-        even_select_local,
-        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -215,8 +211,6 @@ def attention_swa_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -236,7 +230,6 @@ def attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
         kv_cache, block_table,
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
@@ -346,8 +339,6 @@ def golden_attention_swa(tensors):
         "seqused_kv": seqused_kv,
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
-        "even_select_local": tensors["even_select_local"],
-        "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
@@ -423,16 +414,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         for i in range(ROPE_HEAD_DIM // 2):
             m[i, 2 * i + 1] = 1
         return m
-    def init_even_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
-        for i in range(SPARSE_ROPE_TILE):
-            m[2 * i, i] = 1
-        return m
-    def init_odd_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
-        for i in range(SPARSE_ROPE_TILE):
-            m[2 * i + 1, i] = 1
-        return m
 
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
@@ -485,8 +466,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
-        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
         TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),

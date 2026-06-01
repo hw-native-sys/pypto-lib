@@ -99,8 +99,6 @@ def attention_hca(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     # main compressor (head_dim=HEAD_DIM, ratio=128, overlap=False)
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -246,8 +244,6 @@ def attention_hca(
         seqused_kv,
         rope_cos_t,
         rope_sin_t,
-        even_select_local,
-        odd_select_local,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -283,8 +279,6 @@ def attention_hca_test(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -310,7 +304,6 @@ def attention_hca_test(
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
-        even_select_local, odd_select_local,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_even_idx, cmp_odd_idx,
         compress_state, compress_state_block_table,
@@ -449,8 +442,6 @@ def golden_attention_hca(tensors):
         "seqused_kv": tensors["seqused_kv"],
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
-        "even_select_local": tensors["even_select_local"],
-        "odd_select_local": tensors["odd_select_local"],
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],
@@ -525,16 +516,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         m = torch.zeros((ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM))
         for i in range(ROPE_HEAD_DIM // 2):
             m[i, 2 * i + 1] = 1
-        return m
-    def init_even_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
-        for i in range(SPARSE_ROPE_TILE):
-            m[2 * i, i] = 1
-        return m
-    def init_odd_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE))
-        for i in range(SPARSE_ROPE_TILE):
-            m[2 * i + 1, i] = 1
         return m
 
     def init_normalized_cache(shape):
@@ -619,8 +600,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
         TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
-        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_TILE, SPARSE_ROPE_TILE], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),

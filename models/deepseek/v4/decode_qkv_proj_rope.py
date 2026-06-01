@@ -196,17 +196,9 @@ def qkv_proj_rope(
     # (mirrors compressor's normed_kv intermediate), then the original-style
     # writeback scope casts FP32 -> BF16 and copies into q_flat.
     q_rope_stage_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
-    for hg_idx in pl.spmd(H // 4, name_hint="q_head_rope_fused"):
-        hg = hg_idx * 4
-        even_idx_row = pl.add(
-            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
-            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
-        )
-        odd_idx_row = pl.add(even_idx_row, pl.full([1, ROPE_HALF], dtype=pl.INT32, value=1))
-        idx_target = pl.full([Q_ROPE_T_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
-        even_idx_full = pl.col_expand(idx_target, even_idx_row)
-        odd_idx_full = pl.col_expand(idx_target, odd_idx_row)
-        for h_inner in pl.range(4):
+    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rope_fused"):
+        hg = hg_idx * 2
+        for h_inner in pl.range(2):
             h = hg + h_inner
             h0 = h * HEAD_DIM
             for tg_idx in pl.range(T // Q_ROPE_T_TILE):
@@ -223,8 +215,12 @@ def qkv_proj_rope(
                 q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
                 q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
                 q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                q_rope_buf = pl.tensor.scatter(q_rope_buf, dim=-1, index=even_idx_full, src=q_rot_even)
-                q_rope_buf = pl.tensor.scatter(q_rope_buf, dim=-1, index=odd_idx_full, src=q_rot_odd)
+                # Mask-form scatter: write the rotated even/odd halves back into the
+                # interleaved RoPE columns selected by the hardware mask pattern
+                # (inverse of the P0101/P1010 gathers above). Drops the explicit
+                # even/odd index tiles the index-form scatter required.
+                q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
+                q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
                 q_rope_stage_fp32[h * T + tg : h * T + tg + Q_ROPE_T_TILE, :] = q_rope_buf
 
     # Writeback: cast FP32 stage -> BF16 and write into q_flat. Mirrors the
@@ -280,14 +276,6 @@ def qkv_proj_rope(
     # Fused KV RoPE: rmsnorm-scaled rope slice, gather-rotate-scatter, write back.
     # Inner T-chunk keeps Vec UB under the 192 KB cap at T=128.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_rope_fused"):
-        even_idx_row = pl.add(
-            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
-            pl.arange(0, [1, ROPE_HALF], dtype=pl.INT32),
-        )
-        odd_idx_row = pl.add(even_idx_row, pl.full([1, ROPE_HALF], dtype=pl.INT32, value=1))
-        idx_target = pl.full([KV_ROPE_T_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
-        even_idx_full = pl.col_expand(idx_target, even_idx_row)
-        odd_idx_full = pl.col_expand(idx_target, odd_idx_row)
         gamma_rope = pl.reshape(
             pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32),
             [1, ROPE_DIM],
@@ -306,8 +294,9 @@ def qkv_proj_rope(
             kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
             kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
             kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            kv_rope_buf = pl.tensor.scatter(kv_rope_buf, dim=-1, index=even_idx_full, src=kv_rot_even)
-            kv_rope_buf = pl.tensor.scatter(kv_rope_buf, dim=-1, index=odd_idx_full, src=kv_rot_odd)
+            # Mask-form scatter: inverse of the P0101/P1010 gathers above.
+            kv_rope_buf = pl.tensor.scatter(kv_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=kv_rope_buf)
+            kv_rope_buf = pl.tensor.scatter(kv_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=kv_rope_buf)
             kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
                 kv_rope_buf, target_type=pl.BF16, mode="rint"
             )
