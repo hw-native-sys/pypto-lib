@@ -196,15 +196,21 @@ def compressor(
 
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
-        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
+        # Normalize the NOPE span; the rope span [NOPE_HEAD_DIM:HEAD_DIM] is
+        # written once below by the RoPE'd rope_buf.
+        for rms_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
             kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
             gamma = norm_w_2d[:, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE]
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
             normed_kv[batch_base : batch_base + RMS_TILE, rms_kb * HEAD_TILE : (rms_kb + 1) * HEAD_TILE] = normed_chunk
 
-        kv_rope = normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-        even_tile = pl.gather(kv_rope, mask_pattern=pl.tile.MaskPattern.P0101)
-        odd_tile = pl.gather(kv_rope, mask_pattern=pl.tile.MaskPattern.P1010)
+        # Re-derive the RoPE input slice (the HEAD_TILE chunk the loop above
+        # skipped) from pooled_kv with the same inv_rms/gamma.
+        kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
         rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
         rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
         idx_target = pl.full([RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.INT32, value=0)
