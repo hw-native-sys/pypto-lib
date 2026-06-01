@@ -182,56 +182,65 @@ def compressor(
 
     normed_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for batch_base_idx in pl.range(B // RMS_TILE):
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope"):
         batch_base = batch_base_idx * RMS_TILE
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
-            cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-            sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-            partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
-            for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-                kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
-                kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-                kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
-                partial_sq = pl.add(partial_sq, kv_rms_rowsum)
+        cos_b = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        sin_b = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            kv_rms_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
+            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
-            # Normalize the NOPE span; the rope span [NOPE_HEAD_DIM:HEAD_DIM] is
-            # written once below by the RoPE'd rope_buf.
-            for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-                kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
-                gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
-                normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-                normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        # Normalize the NOPE span; the rope span [NOPE_HEAD_DIM:HEAD_DIM] is
+        # written once below by the RoPE'd rope_buf.
+        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
+            kv_norm_chunk = pooled_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv[batch_base : batch_base + RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
-            # Re-derive the RoPE input slice (the HEAD_TILE chunk the loop above
-            # skipped) from pooled_kv with the same inv_rms/gamma.
-            kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-            gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
-            rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-            even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
-            odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
-            rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
-            rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
-            rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-            # Mask-form scatter: re-interleave rotated even/odd halves into the
-            # P0101/P1010-selected columns (inverse of the gathers above). Drops the
-            # explicit even/odd index tiles the index-form scatter required. A3/sim only.
-            rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
-            rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
-            normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
+        # Re-derive the RoPE input slice (the HEAD_TILE chunk the loop above
+        # skipped) from pooled_kv with the same inv_rms/gamma.
+        kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+        rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+        rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        # Mask-form scatter: re-interleave rotated even/odd halves into the
+        # P0101/P1010-selected columns (inverse of the gathers above). Drops the
+        # explicit even/odd index tiles the index-form scatter required. A3/sim only.
+        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
+        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
+        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
-        for c_idx in pl.range(B):
+    # spmd → spmd (matching rmsnorm_rope): a pl.at consumer here does not
+    # reliably observe the spmd rmsnorm_rope's last normed_kv sub-write (rope
+    # span), so mirror ratio128's kv_finalize and keep both scopes spmd.
+    for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_and_cache_write"):
+        batch_base = batch_base_idx * RMS_TILE
+        for inner in pl.range(RMS_TILE):
+            c_idx = batch_base + inner
             start_pos_b = pl.read(start_pos, [c_idx])
+            pos_b = start_pos_b % COMPRESS_RATIO
             cache_col = start_pos_b // COMPRESS_RATIO
-            kv_row_fp32 = normed_kv[c_idx : c_idx + 1, 0 : HEAD_DIM]
-            kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-            cmp_blk_off = cache_col // BLOCK_SIZE
-            cmp_intra = cache_col % BLOCK_SIZE
-            cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
-            cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
-            cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
+            # Only compress rows produce output; non-compress rows leave kv /
+            # cmp_kv_cache at their zero-init (mirrors the official Compressor,
+            # which early-returns when not compressing).
+            if pos_b + S >= COMPRESS_RATIO:
+                kv_row_fp32 = normed_kv[c_idx : c_idx + 1, 0 : HEAD_DIM]
+                kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
+                cmp_blk_off = cache_col // BLOCK_SIZE
+                cmp_intra = cache_col % BLOCK_SIZE
+                cmp_blk_id = pl.cast(pl.read(cmp_block_table, [c_idx, cmp_blk_off]), pl.INDEX)
+                cache_row = cmp_blk_id * BLOCK_SIZE + cmp_intra
+                cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_cache = pl.reshape(cmp_kv_cache_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
