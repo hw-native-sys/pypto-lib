@@ -116,8 +116,6 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-ROTATE_INNER = True
-
 # Keep the default fixture on a full-window compression step so sparse_attn
 # exercises both the window and compressed paths. The --start-pos fixture option
 # covers post-window no-compression/aligned/boundary positions.
@@ -138,10 +136,6 @@ def attention_csa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -228,8 +222,6 @@ def attention_csa(
         wkv,
         rope_cos_t,
         rope_sin_t,
-        even_select_t,
-        odd_select_t,
         gamma_cq,
         gamma_ckv,
         q,
@@ -241,14 +233,14 @@ def attention_csa(
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
     # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
-    for s_idx in pl.range(S):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_ori"):
-            for b in pl.parallel(B):
-                start_pos_b = pl.read(start_pos, [b])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_ori"):
+        for b in pl.range(B):
+            start_pos_b = pl.read(start_pos, [b])
+            for s_idx in pl.range(S):
                 ori_slot = (start_pos_b + s_idx) % WIN
                 blk_id = pl.cast(pl.read(ori_block_table_flat, [b * ORI_MAX_BLOCKS + ori_slot // BLOCK_SIZE]), pl.INDEX)
                 dst_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
-                kv_cache_flat = pl.assemble(kv_cache_flat, kv[b * S + s_idx : b * S + s_idx + 1, 0:HEAD_DIM], [dst_row, 0])
+                kv_cache_flat[dst_row : dst_row + 1, 0 : HEAD_DIM] = kv[b * S + s_idx : b * S + s_idx + 1, 0 : HEAD_DIM]
     kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
@@ -280,8 +272,6 @@ def attention_csa(
         weights_proj,
         step_cos,
         step_sin,
-        even_select,
-        odd_select,
         hadamard_idx,
         idx_kv_unused,
         inner_compress_state,
@@ -296,21 +286,20 @@ def attention_csa(
         idx_topk_full,
         cmp_start_pos,
         WIN,
-        ROTATE_INNER,
     )
 
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
     # fixed metadata while the CSA path still composes indexer at runtime.
     cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
-    for t_idx in pl.parallel(T):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_sparse_idx"):
-            window_row = pl.tensor.arange(0, [1, WIN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_sparse_idx"):
+        for t_idx in pl.range(T):
+            window_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
             invalid_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, invalid_row, [t_idx, 0])
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, window_row, [t_idx, 0])
-            cmp_topk = pl.slice(idx_topk_flat, [1, IDX_TOPK], [t_idx, 0])
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, cmp_topk, [t_idx, WIN])
+            cmp_sparse_indices[t_idx : t_idx + 1, 0 : SPARSE_TOPK] = invalid_row
+            cmp_sparse_indices[t_idx : t_idx + 1, 0 : WIN] = window_row
+            cmp_topk = idx_topk_flat[t_idx : t_idx + 1, 0 : IDX_TOPK]
+            cmp_sparse_indices[t_idx : t_idx + 1, WIN : WIN + IDX_TOPK] = cmp_topk
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     attn_out = sparse_attn(
@@ -337,7 +326,7 @@ def attention_csa(
 
 
 @pl.jit
-def attention_csa_test_refresh(
+def attention_csa_test(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -351,10 +340,6 @@ def attention_csa_test_refresh(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -399,10 +384,6 @@ def attention_csa_test_refresh(
         gamma_ckv,
         freqs_cos,
         freqs_sin,
-        even_select_t,
-        odd_select_t,
-        even_select,
-        odd_select,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -539,8 +520,6 @@ def golden_attention_csa(tensors):
         "weights_proj": tensors["weights_proj"],
         "cos": step_cos,
         "sin": step_sin,
-        "even_select": tensors["even_select"],
-        "odd_select": tensors["odd_select"],
         "hadamard": tensors["hadamard_idx"],
         "inner_kv": idx_kv,
         "inner_compress_state": tensors["inner_compress_state"],
@@ -555,7 +534,6 @@ def golden_attention_csa(tensors):
         "topk_idxs": idx_topk_full,
         "start_pos": cmp_start_pos,
         "offset": torch.tensor(WIN, dtype=torch.int32),
-        "inner_rotate": torch.tensor(ROTATE_INNER, dtype=torch.bool),
     })
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -651,30 +629,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
 
     def init_freqs_sin():
         return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
-
-    def init_even_select_t():
-        m = torch.zeros((HALF_ROPE, ROPE_HEAD_DIM))
-        for i in range(HALF_ROPE):
-            m[i, 2 * i] = 1
-        return m
-
-    def init_odd_select_t():
-        m = torch.zeros((HALF_ROPE, ROPE_HEAD_DIM))
-        for i in range(HALF_ROPE):
-            m[i, 2 * i + 1] = 1
-        return m
-
-    def init_even_select():
-        m = torch.zeros((ROPE_HEAD_DIM, HALF_ROPE))
-        for i in range(HALF_ROPE):
-            m[2 * i, i] = 1
-        return m
-
-    def init_odd_select():
-        m = torch.zeros((ROPE_HEAD_DIM, HALF_ROPE))
-        for i in range(HALF_ROPE):
-            m[2 * i + 1, i] = 1
-        return m
 
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
@@ -849,10 +803,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_cos.clone()),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_freqs_sin.clone()),
-        TensorSpec("even_select_t", [HALF_ROPE, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
-        TensorSpec("odd_select_t", [HALF_ROPE, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
-        TensorSpec("even_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_even_select),
-        TensorSpec("odd_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
@@ -901,7 +851,7 @@ if __name__ == "__main__":
     max_error_ratio = 0.01 if args.hetero_start_pos else 0.005
 
     result = run_jit(
-        fn=attention_csa_test_refresh,
+        fn=attention_csa_test,
         specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
         golden_fn=golden_attention_csa,
         runtime_cfg=dict(

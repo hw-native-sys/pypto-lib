@@ -41,9 +41,6 @@ QUANT_TILE = 32
 T_TILE = 8
 QPROJ_T_TILE = 16
 KV_RMS_T_TILE = 16
-# Per-T-chunk for the fused gather-rotate-scatter scopes. Caps Vec UB usage:
-# rope_buf [TILE, ROPE_DIM] FP32 + 3 INT32 index tiles + working FP32 tiles fit
-# the 192 KB Vec UB only when TILE keeps the scope under ~150 KB at T=128.
 Q_ROPE_T_TILE = 32
 KV_ROPE_T_TILE = 32
 
@@ -58,8 +55,6 @@ def qkv_proj_rope(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -208,17 +203,13 @@ def qkv_proj_rope(
                 )
                 q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
                 q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
-                q_rope_even = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_rope_odd = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_rope_even = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_rope_odd = pl.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
                 q_rope_cos_chunk = pl.cast(rope_cos[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
                 q_rope_sin_chunk = pl.cast(rope_sin[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
                 q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
                 q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
                 q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                # Mask-form scatter: write the rotated even/odd halves back into the
-                # interleaved RoPE columns selected by the hardware mask pattern
-                # (inverse of the P0101/P1010 gathers above). Drops the explicit
-                # even/odd index tiles the index-form scatter required.
                 q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
                 q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
                 q_rope_stage_fp32[h * T + tg : h * T + tg + Q_ROPE_T_TILE, :] = q_rope_buf
@@ -314,8 +305,6 @@ def qkv_proj_rope_test(
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HALF, ROPE_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     q: pl.Out[pl.Tensor[[T, H, HEAD_DIM], pl.BF16]],
@@ -332,8 +321,6 @@ def qkv_proj_rope_test(
         wkv,
         rope_cos,
         rope_sin,
-        even_select_t,
-        odd_select_t,
         gamma_cq,
         gamma_ckv,
         q,
@@ -448,16 +435,6 @@ def build_tensor_specs():
         return torch.cos(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
     def init_sin():
         return torch.sin(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
-    def init_even_select_t():
-        m = torch.zeros((ROPE_HALF, ROPE_DIM))
-        for i in range(ROPE_HALF):
-            m[i, 2 * i] = 1
-        return m
-    def init_odd_select_t():
-        m = torch.zeros((ROPE_HALF, ROPE_DIM))
-        for i in range(ROPE_HALF):
-            m[i, 2 * i + 1] = 1
-        return m
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -476,8 +453,6 @@ def build_tensor_specs():
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
         TensorSpec("rope_sin",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_sin),
-        TensorSpec("even_select_t", [ROPE_HALF, ROPE_DIM], torch.bfloat16, init_value=init_even_select_t),
-        TensorSpec("odd_select_t",  [ROPE_HALF, ROPE_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("gamma_cq",  [Q_LORA],               torch.bfloat16, init_value=init_gamma_cq),
         TensorSpec("gamma_ckv", [HEAD_DIM],             torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("q",         [T, H, HEAD_DIM],       torch.bfloat16, is_output=True),
