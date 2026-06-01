@@ -57,8 +57,8 @@ QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 32
 WEIGHTS_ROW_TILE = 32
-SCORE_B_GROUP = 4
-TOPK_GROUP = 16
+B_TILE = 4
+TOPK_TILE = 16
 
 @pl.jit.inline
 def indexer(
@@ -184,90 +184,84 @@ def indexer(
     kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
-    # TODO: For true var-len batching, pass explicit max_cache_len/max_cache_blocks
-    # metadata instead of deriving the score loop bound from row0.
-    start_pos0 = pl.read(start_pos, [0])
-    cache_len0 = (start_pos0 + S) // COMPRESS_RATIO
-    cache_blocks = (cache_len0 + CACHE_TILE - 1) // CACHE_TILE
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_init"):
+        for si0 in pl.range(0, T, S):
+            score_flat[si0 : si0 + S, :] = pl.full([S, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
-    for bg in pl.parallel(0, B, SCORE_B_GROUP):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_init"):
-            score_flat[bg * S : (bg + SCORE_B_GROUP) * S, :] = pl.full([SCORE_B_GROUP * S, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-
-        for cb in pl.parallel(cache_blocks):
-            cache0 = cb * CACHE_TILE
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_fused"):
-                for bi in pl.range(SCORE_B_GROUP):
-                    b = bg + bi
-                    start_pos_b = pl.read(start_pos, [b])
-                    cache_len_b = (start_pos_b + S) // COMPRESS_RATIO
-                    if cache0 < cache_len_b:
-                        valid_len = pl.min(CACHE_TILE, cache_len_b - cache0)
-                        idx_blk_off = cache0 // BLOCK_SIZE
-                        idx_intra = cache0 % BLOCK_SIZE
-                        idx_blk_id = pl.cast(
-                            pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + idx_blk_off]),
-                            pl.INDEX,
-                        )
-                        kv0 = idx_blk_id * BLOCK_SIZE + idx_intra
-                        t0 = b * S
-                        q0 = b * S * IDX_N_HEADS
-                        # --- KV INT8 quant scale (full-128-dim amax), kept in UB ---
-                        kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                        for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                            kv_a_tile = kv_cache_flat[kv0 : kv0 + CACHE_TILE, h0 : h0 + HEAD_DIM_TILE]
-                            kv_a_f32 = pl.cast(kv_a_tile, target_type=pl.FP32)
-                            kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
-                            kv_a_max = pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE])
-                            kv_amax = pl.maximum(kv_amax, kv_a_max)
-                        kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
-                        kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
-                        kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
-                        kv_q_full_f32 = pl.cast(kv_cache_flat[kv0 : kv0 + CACHE_TILE, 0 : IDX_HEAD_DIM], target_type=pl.FP32)
-                        kv_q_full_scaled = pl.row_expand_mul(kv_q_full_f32, kv_scale_quant)
-                        kv_q_full_i32 = pl.cast(kv_q_full_scaled, target_type=pl.INT32, mode="rint")
-                        kv_q_full_half = pl.cast(kv_q_full_i32, target_type=pl.FP16, mode="round")
-                        kv_q_i8_full = pl.cast(kv_q_full_half, target_type=pl.INT8, mode="trunc")
-                        for s in pl.range(S):
-                            qr_full = qr_hadamard_i8[q0 + s * IDX_N_HEADS : q0 + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
-                            score_acc_s = pl.matmul(kv_q_i8_full, qr_full, out_dtype=pl.INT32, b_trans=True)
-                            qh_scale_s = pl.reshape(qr_hadamard_scale_dq[q0 + s * IDX_N_HEADS : q0 + (s + 1) * IDX_N_HEADS, :], [1, IDX_N_HEADS])
-                            score_tile_s = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
-                            score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
-                            relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
-                            weights_row_s = pl.reshape(weights[t0 + s : t0 + s + 1, :], [1, IDX_N_HEADS])
-                            weighted_score_s_t = pl.col_expand_mul(relu_score_s, weights_row_s)
-                            weighted_score_s = pl.reshape(pl.row_sum(weighted_score_s_t), [1, CACHE_TILE])
-                            weighted_score_valid_s = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len), pad_value=pl.PadValue.min)
-                            weighted_score_valid_s = pl.maximum(
-                                weighted_score_valid_s,
-                                pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF),
-                            )
-                            score_flat[t0 + s : t0 + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
+    for bg in pl.spmd(B // B_TILE, name_hint="score"):
+        for bi in pl.range(B_TILE):
+            b = bg * B_TILE + bi
+            sp_b = pl.read(start_pos, [b])
+            clen_b = (sp_b + S) // COMPRESS_RATIO
+            cblk_b = (clen_b + CACHE_TILE - 1) // CACHE_TILE
+            tb = b * S
+            qb = b * S * IDX_N_HEADS
+            for cb in pl.range(cblk_b):
+                cache0 = cb * CACHE_TILE
+                valid_len = pl.min(CACHE_TILE, clen_b - cache0)
+                idx_blk_off = cache0 // BLOCK_SIZE
+                idx_intra = cache0 % BLOCK_SIZE
+                idx_blk_id = pl.cast(
+                    pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + idx_blk_off]),
+                    pl.INDEX,
+                )
+                kv0 = idx_blk_id * BLOCK_SIZE + idx_intra
+                # --- KV INT8 quant scale (full-128-dim amax), kept in UB ---
+                kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
+                    kv_a_tile = kv_cache_flat[kv0 : kv0 + CACHE_TILE, h0 : h0 + HEAD_DIM_TILE]
+                    kv_a_f32 = pl.cast(kv_a_tile, target_type=pl.FP32)
+                    kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
+                    kv_a_max = pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE])
+                    kv_amax = pl.maximum(kv_amax, kv_a_max)
+                kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
+                kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
+                kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
+                kv_q_full_f32 = pl.cast(kv_cache_flat[kv0 : kv0 + CACHE_TILE, 0 : IDX_HEAD_DIM], target_type=pl.FP32)
+                kv_q_full_scaled = pl.row_expand_mul(kv_q_full_f32, kv_scale_quant)
+                kv_q_full_i32 = pl.cast(kv_q_full_scaled, target_type=pl.INT32, mode="rint")
+                kv_q_full_half = pl.cast(kv_q_full_i32, target_type=pl.FP16, mode="round")
+                kv_q_i8_full = pl.cast(kv_q_full_half, target_type=pl.INT8, mode="trunc")
+                for s in pl.range(S):
+                    qr_full = qr_hadamard_i8[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
+                    score_acc_s = pl.matmul(kv_q_i8_full, qr_full, out_dtype=pl.INT32, b_trans=True)
+                    qh_scale_s = pl.reshape(qr_hadamard_scale_dq[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, :], [1, IDX_N_HEADS])
+                    score_tile_s = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
+                    score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
+                    relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
+                    weights_row_s = pl.reshape(weights[tb + s : tb + s + 1, :], [1, IDX_N_HEADS])
+                    weighted_score_s_t = pl.col_expand_mul(relu_score_s, weights_row_s)
+                    weighted_score_s = pl.reshape(pl.row_sum(weighted_score_s_t), [1, CACHE_TILE])
+                    weighted_score_valid_s = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len), pad_value=pl.PadValue.min)
+                    weighted_score_valid_s = pl.maximum(
+                        weighted_score_valid_s,
+                        pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF),
+                    )
+                    score_flat[tb + s : tb + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    for t0 in pl.parallel(0, T, TOPK_GROUP):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk"):
-            for ti in pl.range(0, TOPK_GROUP):
-                t = t0 + ti
-                invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
-                topk_idxs_flat[t : t + 1, :] = invalid_idxs
-                batch_idx = t // S
-                start_pos_b = pl.read(start_pos, [batch_idx])
-                cache_len_b = (start_pos_b + S) // COMPRESS_RATIO
-                if cache_len_b > 0:
-                    offset_i32 = pl.cast(offset, target_type=pl.INT32)
-                    score_row = score_flat[t : t + 1, :]
-                    idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
-                    sorted_score_tile = pl.tensor.sort32(score_row, idx_init)
-                    sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=64)
-                    sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=256)
-                    sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)
-                    topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
-                    topk_idxs_tile = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    valid_topk = pl.min(IDX_TOPK, cache_len_b)
-                    topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
-                    topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
+    for idx in pl.spmd(T // TOPK_TILE, name_hint="topk"):
+        t0 = idx * TOPK_TILE
+        for ti in pl.range(0, TOPK_TILE):
+            t = t0 + ti
+            invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
+            topk_idxs_flat[t : t + 1, :] = invalid_idxs
+            batch_idx = t // S
+            start_pos_b = pl.read(start_pos, [batch_idx])
+            cache_len_b = (start_pos_b + S) // COMPRESS_RATIO
+            if cache_len_b > 0:
+                offset_i32 = pl.cast(offset, target_type=pl.INT32)
+                score_row = score_flat[t : t + 1, :]
+                idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+                sorted_score_tile = pl.sort32(score_row, idx_init)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=64)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=256)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=1024)
+                topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
+                topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                valid_topk = pl.min(IDX_TOPK, cache_len_b)
+                topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+                topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
     return score, idx_kv_cache, topk_idxs
 
