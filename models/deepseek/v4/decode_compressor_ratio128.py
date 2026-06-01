@@ -109,7 +109,6 @@ def compressor(
 
     kv_proj_by_batch = pl.reshape(kv_proj_scratch, [B, S * OUT_DIM])
     score_proj_by_batch = pl.reshape(score_proj_scratch, [B, S * OUT_DIM])
-    pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_pre"):
         for global_c_idx in pl.range(B):
@@ -138,40 +137,42 @@ def compressor(
                 compress_state_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row
                 compress_state_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row
 
-    # Unconditional — gating pooled_kv inside pl.spmd hits pypto #1569;
-    # non-compress batches' pooled value is discarded by downstream gates.
+    pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(B * HEAD_DIM // HEAD_TILE, name_hint="softmax_pool"):
         global_c_idx = idx // (HEAD_DIM // HEAD_TILE)
         h0 = (idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
+        pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pl.full([1, HEAD_TILE], dtype=pl.FP32, value=0.0)
+        start_pos_gate = pl.read(start_pos, [global_c_idx])
+        pos_gate = start_pos_gate % COMPRESS_RATIO
+        if pos_gate + S >= COMPRESS_RATIO:
+            softmax_score_state = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+            softmax_kv_state = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
+            for s in pl.pipeline(STATE_LEN, stage=2):
+                start_pos_b = pl.read(start_pos, [global_c_idx])
+                pos_b = start_pos_b % COMPRESS_RATIO
+                # Read the absolute state window ending at the next compression
+                # boundary. This mirrors vLLM's `start = position - ratio + 1`.
+                compress_pos = start_pos_b + (COMPRESS_RATIO - 1 - pos_b)
+                state_pos = compress_pos - (COMPRESS_RATIO - 1) + s
+                state_logical_blk = state_pos // COMPRESS_STATE_BLOCK_SIZE
+                state_intra = state_pos % COMPRESS_STATE_BLOCK_SIZE
+                state_blk_id = pl.cast(pl.read(compress_state_block_table, [global_c_idx, state_logical_blk]), target_type=pl.INDEX)
+                kv_col0 = state_intra * COMPRESS_STATE_DIM + h0
+                score_col0 = state_intra * COMPRESS_STATE_DIM + OUT_DIM + h0
+                slot_score = compress_state_flat[state_blk_id : state_blk_id + 1, score_col0 : score_col0 + HEAD_TILE]
+                slot_kv = compress_state_flat[state_blk_id : state_blk_id + 1, kv_col0 : kv_col0 + HEAD_TILE]
+                softmax_score_state[s : s + 1, :] = slot_score
+                softmax_kv_state[s : s + 1, :] = slot_kv
 
-        softmax_score_state = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
-        softmax_kv_state = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
-        for s in pl.pipeline(STATE_LEN, stage=2):
-            start_pos_b = pl.read(start_pos, [global_c_idx])
-            pos_b = start_pos_b % COMPRESS_RATIO
-            # Read the absolute state window ending at the next compression
-            # boundary. This mirrors vLLM's `start = position - ratio + 1`.
-            compress_pos = start_pos_b + (COMPRESS_RATIO - 1 - pos_b)
-            state_pos = compress_pos - (COMPRESS_RATIO - 1) + s
-            state_logical_blk = state_pos // COMPRESS_STATE_BLOCK_SIZE
-            state_intra = state_pos % COMPRESS_STATE_BLOCK_SIZE
-            state_blk_id = pl.cast(pl.read(compress_state_block_table, [global_c_idx, state_logical_blk]), target_type=pl.INDEX)
-            kv_col0 = state_intra * COMPRESS_STATE_DIM + h0
-            score_col0 = state_intra * COMPRESS_STATE_DIM + OUT_DIM + h0
-            slot_score = compress_state_flat[state_blk_id : state_blk_id + 1, score_col0 : score_col0 + HEAD_TILE]
-            slot_kv = compress_state_flat[state_blk_id : state_blk_id + 1, kv_col0 : kv_col0 + HEAD_TILE]
-            softmax_score_state[s : s + 1, :] = slot_score
-            softmax_kv_state[s : s + 1, :] = slot_kv
-
-        softmax_score_state_t = pl.transpose(softmax_score_state, axis1=0, axis2=1)
-        softmax_kv_state_t = pl.transpose(softmax_kv_state, axis1=0, axis2=1)
-        score_max = pl.row_max(softmax_score_state_t)
-        score_exp = pl.exp(pl.row_expand_sub(softmax_score_state_t, score_max))
-        score_sum = pl.row_sum(score_exp)
-        score_prob = pl.row_expand_div(score_exp, score_sum)
-        pooled_chunk_t = pl.row_sum(pl.mul(softmax_kv_state_t, score_prob))
-        pooled_chunk = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
-        pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+            softmax_score_state_t = pl.transpose(softmax_score_state, axis1=0, axis2=1)
+            softmax_kv_state_t = pl.transpose(softmax_kv_state, axis1=0, axis2=1)
+            score_max = pl.row_max(softmax_score_state_t)
+            score_exp = pl.exp(pl.row_expand_sub(softmax_score_state_t, score_max))
+            score_sum = pl.row_sum(score_exp)
+            score_prob = pl.row_expand_div(score_exp, score_sum)
+            pooled_chunk_t = pl.row_sum(pl.mul(softmax_kv_state_t, score_prob))
+            pooled_chunk = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
+            pooled_kv[global_c_idx : global_c_idx + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
 
     # No state shift for non-overlap
 
