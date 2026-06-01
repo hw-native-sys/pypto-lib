@@ -104,8 +104,6 @@ def attention_hca(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
-    cmp_odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     # KV cache split into ori (sliding window) and cmp (compressed) pools to match sparse_attn's contract.
@@ -208,8 +206,6 @@ def attention_hca(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
-        cmp_even_idx,
-        cmp_odd_idx,
         cmp_kv,
         cmp_block_table,
         cmp_start_pos,
@@ -283,8 +279,6 @@ def attention_hca_test(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
-    cmp_odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -305,7 +299,6 @@ def attention_hca_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin, even_select_t, odd_select_t,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_even_idx, cmp_odd_idx,
         compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
         attn_sink, seqused_kv,
@@ -423,8 +416,6 @@ def golden_attention_hca(tensors):
         "norm_w": tensors["cmp_norm_w"],
         "cos": cmp_cos,
         "sin": cmp_sin,
-        "even_idx": tensors["cmp_even_idx"],
-        "odd_idx": tensors["cmp_odd_idx"],
         "cmp_kv_cache": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "start_pos": cmp_start_pos,
@@ -531,10 +522,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.01
     def init_cmp_norm_w():
         return torch.ones(HEAD_DIM)
-    def init_cmp_even_idx():
-        return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0)
-    def init_cmp_odd_idx():
-        return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0)
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
     def init_compress_state_block_table():
@@ -604,8 +591,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
-        TensorSpec("cmp_even_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_cmp_even_idx),
-        TensorSpec("cmp_odd_idx", [1, ROPE_HEAD_DIM // 2], torch.int32, init_value=init_cmp_odd_idx),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),

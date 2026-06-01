@@ -142,8 +142,6 @@ def attention_csa(
     odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
-    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -265,8 +263,6 @@ def attention_csa(
         cmp_norm_w,
         cmp_cos,
         cmp_sin,
-        cmp_even_idx,
-        cmp_odd_idx,
         cmp_kv,
         cmp_block_table,
         cmp_start_pos,
@@ -286,8 +282,6 @@ def attention_csa(
         step_sin,
         even_select,
         odd_select,
-        cmp_even_idx,
-        cmp_odd_idx,
         hadamard_idx,
         idx_kv_unused,
         inner_compress_state,
@@ -361,8 +355,6 @@ def attention_csa_test_refresh(
     odd_select_t: pl.Tensor[[HALF_ROPE, ROPE_HEAD_DIM], pl.BF16],
     even_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
     odd_select: pl.Tensor[[ROPE_HEAD_DIM, HALF_ROPE], pl.BF16],
-    cmp_even_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
-    cmp_odd_idx: pl.Tensor[[1, HALF_ROPE], pl.INT32],
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
@@ -411,8 +403,6 @@ def attention_csa_test_refresh(
         odd_select_t,
         even_select,
         odd_select,
-        cmp_even_idx,
-        cmp_odd_idx,
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
@@ -686,12 +676,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
             m[2 * i + 1, i] = 1
         return m
 
-    def init_cmp_even_idx():
-        return torch.arange(0, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
-
-    def init_cmp_odd_idx():
-        return torch.arange(1, ROPE_HEAD_DIM, 2, dtype=torch.int32).unsqueeze(0).contiguous()
-
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
@@ -869,8 +853,6 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
         TensorSpec("odd_select_t", [HALF_ROPE, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("even_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_even_select),
         TensorSpec("odd_select", [ROPE_HEAD_DIM, HALF_ROPE], torch.bfloat16, init_value=init_odd_select),
-        TensorSpec("cmp_even_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_even_idx),
-        TensorSpec("cmp_odd_idx", [1, HALF_ROPE], torch.int32, init_value=init_cmp_odd_idx),
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
