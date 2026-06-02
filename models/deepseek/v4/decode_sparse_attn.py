@@ -48,6 +48,8 @@ ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
 ATTN_K_TILE = 32
+SHORT_K_TILE = ATTN_K_TILE
+NOPE_CHUNK = 64
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_T_TILE = 16
@@ -152,24 +154,100 @@ def sparse_attn(
             qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
             qk_blk_base = qk_token_base + qk_h_idx * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
-            for qk_sb in pl.range(((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
-                qk_s0 = qk_sb * ATTN_K_TILE
-                if qk_s0 < qk_sparse_k:
-                    qk_s_v = pl.min(ATTN_K_TILE, qk_sparse_k - qk_s0)
-                    qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                    qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
-                    qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
-                    qk_mi = pl.row_max(qk_scores)
-                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
-                    qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
-                    qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
+            if qk_sparse_k > ATTN_K_TILE:
+                for qk_sb in pl.range(((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+                    qk_s0 = qk_sb * ATTN_K_TILE
+                    if qk_s0 < qk_sparse_k:
+                        qk_s_v = pl.min(ATTN_K_TILE, qk_sparse_k - qk_s0)
+                        qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                        qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                        qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
+                        qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
+                        qk_mi = pl.row_max(qk_scores)
+                        qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                        qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
+                        qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
+                        qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                        qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                        qk_row = qk_blk_base + qk_sb * H_TILE
+                        sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
+                        sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
+                        sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
+
+    for sh_idx in pl.spmd(T * (H // H_TILE) * (NOPE_DIM // NOPE_CHUNK), name_hint="short_attn_nope"):
+        sh_th_idx = sh_idx // (NOPE_DIM // NOPE_CHUNK)
+        sh_chunk_idx = sh_idx - sh_th_idx * (NOPE_DIM // NOPE_CHUNK)
+        sh_t = sh_th_idx // (H // H_TILE)
+        sh_h_idx = sh_th_idx - sh_t * (H // H_TILE)
+        sh_c0 = sh_chunk_idx * NOPE_CHUNK
+        sh_b = sh_t // S
+        sh_s = sh_t - sh_b * S
+        sh_seq_end = pl.read(seqused_kv, [sh_b])
+        sh_seq_len = sh_seq_end - S + 1 + sh_s
+        sh_win_v = pl.min(WIN, sh_seq_len)
+        sh_tk_v = pl.min(IDX_TOPK, sh_seq_len - sh_win_v)
+        sh_sparse_k = sh_win_v + sh_tk_v
+        sh_kv_base = sh_t * TOPK
+        if sh_sparse_k <= SHORT_K_TILE:
+            sh_h0 = sh_h_idx * H_TILE
+            sh_head_row = sh_t * H + sh_h0
+            sh_q_tile = q_flat[sh_head_row : sh_head_row + H_TILE, 0 : HEAD_DIM]
+            sh_s_v0 = pl.min(SHORT_K_TILE, sh_sparse_k)
+            sh_kv_k = sparse_kv[sh_kv_base : sh_kv_base + SHORT_K_TILE, 0 : HEAD_DIM]
+            sh_raw = pl.matmul(sh_q_tile, sh_kv_k, b_trans=True, out_dtype=pl.FP32)
+            sh_scores_v = pl.set_validshape(pl.mul(sh_raw, SOFTMAX_SCALE), H_TILE, sh_s_v0)
+            sh_scores = pl.fillpad(sh_scores_v, pad_value=pl.PadValue.min)
+            sh_mi = pl.row_max(sh_scores)
+            sh_exp = pl.exp(pl.row_expand_sub(sh_scores, sh_mi))
+            sh_exp_bf16 = pl.cast(sh_exp, target_type=pl.BF16, mode="rint")
+            sh_li = pl.row_sum(pl.cast(sh_exp_bf16, target_type=pl.FP32))
+            sh_kv_v = sparse_kv[sh_kv_base : sh_kv_base + SHORT_K_TILE, sh_c0 : sh_c0 + NOPE_CHUNK]
+            sh_oi = pl.matmul(sh_exp_bf16, sh_kv_v, out_dtype=pl.FP32)
+            sh_sink_bias = pl.reshape(attn_sink[sh_h0 : sh_h0 + H_TILE], [H_TILE, 1])
+            sh_sink_tile = pl.add(pl.sub(sh_mi, sh_mi), sh_sink_bias)
+            sh_denom = pl.add(sh_li, pl.exp(pl.sub(sh_sink_tile, sh_mi)))
+            sh_out_nope = pl.cast(pl.row_expand_div(sh_oi, sh_denom), target_type=pl.BF16, mode="rint")
+
+            for sh_hi in pl.range(H_TILE):
+                sh_gh = sh_h0 + sh_hi
+                sh_g = sh_gh // HEADS_PER_GROUP
+                sh_hh = sh_gh - sh_g * HEADS_PER_GROUP
+                sh_pack_row = sh_g * T + sh_t
+                sh_col = sh_hh * HEAD_DIM + sh_c0
+                o_packed[sh_pack_row : sh_pack_row + 1, sh_col : sh_col + NOPE_CHUNK] = sh_out_nope[sh_hi : sh_hi + 1, 0 : NOPE_CHUNK]
+
+    for sr_idx in pl.spmd(T * (H // H_TILE), name_hint="short_attn_rope"):
+        sr_t = sr_idx // (H // H_TILE)
+        sr_h_idx = sr_idx - sr_t * (H // H_TILE)
+        sr_b = sr_t // S
+        sr_s = sr_t - sr_b * S
+        sr_seq_end = pl.read(seqused_kv, [sr_b])
+        sr_seq_len = sr_seq_end - S + 1 + sr_s
+        sr_win_v = pl.min(WIN, sr_seq_len)
+        sr_tk_v = pl.min(IDX_TOPK, sr_seq_len - sr_win_v)
+        sr_sparse_k = sr_win_v + sr_tk_v
+        sr_kv_base = sr_t * TOPK
+        if sr_sparse_k <= SHORT_K_TILE:
+            sr_h0 = sr_h_idx * H_TILE
+            sr_head_row = sr_t * H + sr_h0
+            sr_q_tile = q_flat[sr_head_row : sr_head_row + H_TILE, 0 : HEAD_DIM]
+            sr_s_v0 = pl.min(SHORT_K_TILE, sr_sparse_k)
+            sr_kv_k = sparse_kv[sr_kv_base : sr_kv_base + SHORT_K_TILE, 0 : HEAD_DIM]
+            sr_raw = pl.matmul(sr_q_tile, sr_kv_k, b_trans=True, out_dtype=pl.FP32)
+            sr_scores_v = pl.set_validshape(pl.mul(sr_raw, SOFTMAX_SCALE), H_TILE, sr_s_v0)
+            sr_scores = pl.fillpad(sr_scores_v, pad_value=pl.PadValue.min)
+            sr_mi = pl.row_max(sr_scores)
+            sr_exp = pl.exp(pl.row_expand_sub(sr_scores, sr_mi))
+            sr_exp_bf16 = pl.cast(sr_exp, target_type=pl.BF16, mode="rint")
+            sr_li = pl.row_sum(pl.cast(sr_exp_bf16, target_type=pl.FP32))
+            sr_kv_v = sparse_kv[sr_kv_base : sr_kv_base + SHORT_K_TILE, NOPE_DIM : HEAD_DIM]
+            sr_oi = pl.matmul(sr_exp_bf16, sr_kv_v, out_dtype=pl.FP32)
+            sr_sink_bias = pl.reshape(attn_sink[sr_h0 : sr_h0 + H_TILE], [H_TILE, 1])
+            sr_sink_tile = pl.add(pl.sub(sr_mi, sr_mi), sr_sink_bias)
+            sr_denom = pl.add(sr_li, pl.exp(pl.sub(sr_sink_tile, sr_mi)))
+            sr_out_rope = pl.cast(pl.row_expand_div(sr_oi, sr_denom), target_type=pl.BF16, mode="rint")
+            sr_rope_row = sr_t * H + sr_h0
+            attn_rope_stage[sr_rope_row : sr_rope_row + H_TILE, 0 : ROPE_DIM] = sr_out_rope[0 : H_TILE, 0 : ROPE_DIM]
 
     # Online-softmax merge across sparse-K tiles, then sink-norm.
     for m_t in pl.spmd(T, name_hint="merge_norm"):
@@ -182,41 +260,41 @@ def sparse_attn(
         m_sparse_k = m_win_v + m_tk_v
         m_token_base = m_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
-        for m_h_idx in pl.range((H // H_TILE)):
-            m_h0 = m_h_idx * H_TILE
-            m_blk_base = m_token_base + m_h_idx * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
-            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
+        if m_sparse_k > ATTN_K_TILE:
+            for m_h_idx in pl.range((H // H_TILE)):
+                m_h0 = m_h_idx * H_TILE
+                m_blk_base = m_token_base + m_h_idx * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
+                m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+                m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+                m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-            for m_sb in pl.range(1, ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
-                m_s0 = m_sb * ATTN_K_TILE
-                if m_s0 < m_sparse_k:
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                    m_mi = m_mi_new
+                for m_sb in pl.range(1, ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+                    m_s0 = m_sb * ATTN_K_TILE
+                    if m_s0 < m_sparse_k:
+                        m_row = m_blk_base + m_sb * H_TILE
+                        m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                        m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                        m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                        m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                        m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                        m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                        m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                        m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                        m_mi = m_mi_new
+                n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+                n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
+                n_rope_row = m_t * H + m_h0
+                attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
 
-            n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-            n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
-            n_rope_row = m_t * H + m_h0
-            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
-
-            for n_hi in pl.range(H_TILE):
-                n_gh = m_h0 + n_hi
-                n_g = n_gh // HEADS_PER_GROUP
-                n_hh = n_gh - n_g * HEADS_PER_GROUP
-                n_pack_row = n_g * T + m_t
-                n_col = n_hh * HEAD_DIM
-                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
+                for n_hi in pl.range(H_TILE):
+                    n_gh = m_h0 + n_hi
+                    n_g = n_gh // HEADS_PER_GROUP
+                    n_hh = n_gh - n_g * HEADS_PER_GROUP
+                    n_pack_row = n_g * T + m_t
+                    n_col = n_hh * HEAD_DIM
+                    o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
     # Inverse RoPE: gather even/odd lanes (HW native TGATHER<mask>) for de-interleave,
     # rotate with cos/sin, then mask-form scatter (TSCATTER<mask>) re-interleaves back
