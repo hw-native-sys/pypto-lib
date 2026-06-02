@@ -262,7 +262,7 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Bootstrap conda + per-job venv + write activate.sh
-        # Per-job venv layered on conda py310; activate.sh lets each later step
+        # Per-job venv layered on conda py310-lib; activate.sh lets each later step
         # enter the env with a single `source activate.sh`. set_env.sh wires up
         # the Ascend/HCCL host environment; LD_LIBRARY_PATH is prepended with
         # $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
@@ -270,11 +270,11 @@ jobs:
         # run step — they break HCCL, so multi-card files unset them there.
         run: |
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310
+          conda activate py310-lib
           python -m venv venv --system-site-packages
           cat > activate.sh <<'EOF'
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310
+          conda activate py310-lib
           source "$GITHUB_WORKSPACE/dist-checkout/venv/bin/activate"
           source /usr/local/Ascend/cann-9.0.0/set_env.sh
           export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"

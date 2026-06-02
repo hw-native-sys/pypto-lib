@@ -482,6 +482,13 @@ def run(
             platform = runtime_cfg.get("platform")
             if platform is not None:
                 compile_kwargs.setdefault("backend_type", _backend_for_platform(platform))
+                # L3 distributed programs bake the platform into compiled.platform
+                # at compile time (the runtime config's platform is ignored when
+                # assembling chip callables). Without this, compiled.platform falls
+                # back to the backend's default sim platform, so a `-p a2a3` run
+                # silently compiles incore kernels for a2a3sim (g++-15) instead of
+                # the real device (ccec).
+                compile_kwargs.setdefault("platform", platform)
             compiled = ir.compile(program, **compile_kwargs)
             work_dir = Path(compiled.output_dir)
         if compile_only:
