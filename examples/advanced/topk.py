@@ -32,10 +32,10 @@ def topk(
 ):
     for blk in pl.spmd(ROWS // ROW_TILE, name_hint="topk_block"):
         r0 = blk * ROW_TILE
+        idx_init = pl.arange(0, [1, N], dtype=pl.UINT32)
         for ri in pl.range(ROW_TILE):
             r = r0 + ri
-            score_row = scores[r : r + 1, :]                         # [1, N]
-            idx_init = pl.arange(0, [1, N], dtype=pl.UINT32)         # [1, N]
+            score_row = scores[r : r + 1, :]
             s = pl.sort32(score_row, idx_init)                      # [1, 2N], 32-runs sorted
             s = pl.mrgsort(s, block_len=64)                         # 4-way merge -> 256-pos runs
             s = pl.mrgsort(s, block_len=256)                        # 4-way merge -> whole row, descending
