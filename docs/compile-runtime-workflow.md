@@ -38,6 +38,31 @@ result = run(
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
 
+### Multi-card kernels in CI
+
+Most kernels take a single `-d <id>`. A kernel that needs several NPUs
+(e.g. a 2-rank EP program parsing `-d` as a comma-separated list) must
+declare its card count with a marker comment near the top of the file:
+
+```python
+# ci: devices=2
+```
+
+The real-NPU CI job greps for `# ci: devices=N`; when `N > 1` it runs the
+file with `$DEVICE_RANGE` (a comma-separated id list such as `0,1`)
+instead of the single `$DEVICE_ID`. Files without the marker default to
+one device. See the `a2a3` job in
+[.github/workflows/ci.yml](../.github/workflows/ci.yml).
+
+Multi-card kernels use HCCL, which silent-crashes inside docker and breaks
+when `PTO2_RING_*` are set. For this reason the real-NPU job runs **on the
+host (no container)** — set up via conda + `set_env.sh`, mirroring pypto's
+`dist-system-tests` — and unsets `PTO2_RING_*` for multi-card files while
+keeping the large ring sizes for single-card ones. Running a multi-card
+kernel locally needs the same: a real `set_env.sh`-sourced shell with
+`PTO2_RING_*` unset, e.g.
+`python models/deepseek/v4/moe_ep.py -p a2a3 -d 0,1`.
+
 ## Phases inside `golden.run`
 
 The harness prints `[RUN] <stage> ...` / `[RUN] <stage> done (Xs)` around
