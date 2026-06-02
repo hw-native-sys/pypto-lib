@@ -16,7 +16,7 @@ import pypto.language as pl
 
 from decode_indexer import *  # noqa: F401,F403
 from decode_indexer import _int8_quant_per_row, _quant_w_per_output_channel
-from prefill_indexer_compressor import prefill_indexer_compressor
+from prefill_indexer_compressor import STATE_LEN as INNER_STATE_LEN, prefill_indexer_compressor
 
 B = 1
 S = 128
@@ -27,6 +27,10 @@ PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 PREFILL_CACHE_BLOCKS = (PREFILL_COMPRESSED_LEN + CACHE_TILE - 1) // CACHE_TILE
 SCORE_B_GROUP = 1
 PREFILL_Q_OUT_CHUCK = 128
+D_CHUCK = 32
+Q_CHUCK = 128
+HEAD_ROWS = IDX_N_HEADS * 2
+HEAD_DIM_CHUCK = 32
 
 @pl.jit.inline
 def prefill_indexer(
@@ -38,8 +42,6 @@ def prefill_indexer(
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[S, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[S, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, PREFILL_COMPRESSED_LEN, INNER_HEAD_DIM], pl.FP32],
     inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
@@ -53,12 +55,11 @@ def prefill_indexer(
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
     start_pos: pl.Scalar[pl.INT32],
     offset: pl.Scalar[pl.INT32],
-    inner_rotate: pl.Scalar[pl.BOOL],
 ):
     qr_i8 = qr
     qr_scale_dq = qr_scale
 
-    qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.BF16)
+    qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for o0 in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, PREFILL_Q_OUT_CHUCK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_qr_proj"):
             qr_acc = pl.create_tensor([T, PREFILL_Q_OUT_CHUCK], dtype=pl.INT32)
@@ -75,7 +76,7 @@ def prefill_indexer(
             qr_acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
             wq_scale = pl.reshape(wq_b_scale[o0 : o0 + PREFILL_Q_OUT_CHUCK], [1, PREFILL_Q_OUT_CHUCK])
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(qr_acc_fp32, qr_scale_dq), wq_scale)
-            qr_proj[:, o0 : o0 + PREFILL_Q_OUT_CHUCK] = pl.cast(qr_dequant, target_type=pl.BF16, mode="rint")
+            qr_proj[:, o0 : o0 + PREFILL_Q_OUT_CHUCK] = qr_dequant
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -83,49 +84,24 @@ def prefill_indexer(
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
 
-    for t in pl.parallel(T):
-        row0 = t * IDX_N_HEADS
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_slice"):
-            even_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            odd_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-            for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
-                r0 = rb * ROPE_CHUCK
-                qr_proj_rope_tile = qr_proj_flat[row0 : row0 + IDX_N_HEADS, IDX_NOPE_HEAD_DIM + r0 : IDX_NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
-                even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
-                odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
-                if r0 == 0:
-                    even_acc = pl.matmul(qr_proj_rope_tile, even_select_tile, out_dtype=pl.FP32)
-                    odd_acc = pl.matmul(qr_proj_rope_tile, odd_select_tile, out_dtype=pl.FP32)
-                else:
-                    even_acc = pl.matmul_acc(even_acc, qr_proj_rope_tile, even_select_tile)
-                    odd_acc = pl.matmul_acc(odd_acc, qr_proj_rope_tile, odd_select_tile)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_apply"):
-            cos_t = cos[t : t + 1, :]
-            sin_t = sin[t : t + 1, :]
-            rope_even_acc = pl.cast(pl.sub(pl.col_expand_mul(even_acc, cos_t), pl.col_expand_mul(odd_acc, sin_t)), target_type=pl.BF16, mode="rint")
-            rope_odd_acc = pl.cast(pl.add(pl.col_expand_mul(even_acc, sin_t), pl.col_expand_mul(odd_acc, cos_t)), target_type=pl.BF16, mode="rint")
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_assemble"):
-            rope_acc = pl.create_tensor([IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.FP32)
-            for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
-                ra_0 = ra_b * ROPE_CHUCK
-                rope_even_tile = rope_even_acc[:, ra_0 : ra_0 + ROPE_CHUCK]
-                rope_odd_tile = rope_odd_acc[:, ra_0 : ra_0 + ROPE_CHUCK]
-                even_select_tile_t = even_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-                odd_select_tile_t = odd_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-                if ra_0 == 0:
-                    rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
-                else:
-                    rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
-                rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_q_rope_write"):
-            qr_rope_out[row0 : row0 + IDX_N_HEADS, :] = pl.cast(rope_acc, target_type=pl.BF16, mode="rint")
+    for idx in pl.spmd(T * IDX_N_HEADS // 32, name_hint="prefill_qr_rope"):
+        o0 = idx * 32
+        token_idx = o0 // IDX_N_HEADS
+        cos_t = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        sin_t = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        qr_rope_slice = qr_proj_flat[o0 : o0 + 32, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+        even_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(qr_rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.col_expand_mul(even_tile, cos_t), pl.col_expand_mul(odd_tile, sin_t))
+        rope_odd = pl.add(pl.col_expand_mul(even_tile, sin_t), pl.col_expand_mul(odd_tile, cos_t))
+        rope_buf = pl.full([32, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
+        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
+        qr_rope_out[o0 : o0 + 32, :] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
 
     for o0 in pl.parallel(0, T * IDX_N_HEADS, HEAD_ROWS):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_qr_hadamard"):
-            qh_nope = qr_proj_flat[o0 : o0 + HEAD_ROWS, 0 : IDX_NOPE_HEAD_DIM]
+            qh_nope = pl.cast(qr_proj_flat[o0 : o0 + HEAD_ROWS, 0 : IDX_NOPE_HEAD_DIM], target_type=pl.BF16, mode="rint")
             qh_rope = qr_rope_out[o0 : o0 + HEAD_ROWS, :]
             qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
             qh_hadamard = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
@@ -187,12 +163,9 @@ def prefill_indexer(
         inner_norm_w,
         cmp_cos,
         cmp_sin,
-        even_select,
-        odd_select,
         hadamard,
         idx_kv_cache,
         start_pos,
-        inner_rotate,
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [B * IDX_KV_LEN, IDX_HEAD_DIM])
@@ -331,8 +304,6 @@ def prefill_indexer_test(
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     cos: pl.Tensor[[S, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[S, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     inner_kv: pl.Tensor[[B, PREFILL_COMPRESSED_LEN, INNER_HEAD_DIM], pl.FP32],
     inner_kv_state: pl.Tensor[[B, INNER_STATE_LEN, INNER_OUT_DIM], pl.FP32],
@@ -346,7 +317,6 @@ def prefill_indexer_test(
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
     start_pos: pl.Scalar[pl.INT32],
     offset: pl.Scalar[pl.INT32],
-    inner_rotate: pl.Scalar[pl.BOOL],
 ):
     score, idx_kv_cache, topk_idxs = prefill_indexer(
         x,
@@ -357,8 +327,6 @@ def prefill_indexer_test(
         weights_proj,
         cos,
         sin,
-        even_select,
-        odd_select,
         hadamard,
         inner_kv,
         inner_kv_state,
@@ -372,7 +340,6 @@ def prefill_indexer_test(
         topk_idxs,
         start_pos,
         offset,
-        inner_rotate,
     )
     return score, idx_kv_cache, topk_idxs
 
@@ -423,12 +390,9 @@ def golden_prefill_indexer(tensors):
         "norm_w": tensors["inner_norm_w"],
         "cos": tensors["cos"][::ratio],
         "sin": tensors["sin"][::ratio],
-        "even_select": tensors["even_select"],
-        "odd_select": tensors["odd_select"],
         "hadamard": tensors["hadamard"],
         "kv_cache": tensors["idx_kv_cache"],
         "start_pos": tensors["start_pos"],
-        "rotate": tensors["inner_rotate"],
     }
     golden_prefill_indexer_compressor(inner_tensors)
 
@@ -485,16 +449,6 @@ def build_tensor_specs(*args, **kwargs):
         return torch.rand(S, ROPE_HEAD_DIM // 2)
     def init_sin():
         return torch.rand(S, ROPE_HEAD_DIM // 2)
-    def init_odd_select():
-        matrix = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            matrix[2 * i + 1, i] = 1
-        return matrix
-    def init_even_select():
-        matrix = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            matrix[2 * i, i] = 1
-        return matrix
     def init_hadamard():
         return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
     def init_inner_kv_state():
@@ -525,8 +479,6 @@ def build_tensor_specs(*args, **kwargs):
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
         TensorSpec("cos", [S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [S, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("even_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_even_select),
-        TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("inner_kv", [B, PREFILL_COMPRESSED_LEN, INNER_HEAD_DIM], torch.float32),
         TensorSpec("inner_kv_state", [B, INNER_STATE_LEN, INNER_OUT_DIM], torch.float32, init_value=init_inner_kv_state),
@@ -540,7 +492,6 @@ def build_tensor_specs(*args, **kwargs):
         TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32, is_output=True),
         ScalarSpec("start_pos", torch.int32, START_POS),
         ScalarSpec("offset", torch.int32, OFFSET),
-        ScalarSpec("inner_rotate", torch.bool, INNER_ROTATE),
     ]
 
 
@@ -590,7 +541,7 @@ if __name__ == "__main__":
         compare_fn={
             "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs":    topk_idxs_compare,
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / IDX_CACHE_BLOCK_NUM * BLOCK_SIZE),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },
     )
     if not result.passed:

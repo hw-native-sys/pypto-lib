@@ -23,7 +23,6 @@ HEAD_CHUNK = 32
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_CHUNK = 512
 OUT_CHUNK = 64
-ROPE_CHUCK = 32
 
 @pl.jit.inline
 def prefill_indexer_compressor(
@@ -37,12 +36,9 @@ def prefill_indexer_compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[B, IDX_KV_LEN, HEAD_DIM], pl.BF16],
     start_pos: pl.Scalar[pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
@@ -159,84 +155,43 @@ def prefill_indexer_compressor(
 
     normed_kv_all = pl.create_tensor([PREFILL_COMPRESSED_LEN, HEAD_DIM], dtype=pl.BF16)
     kv_final_all = pl.create_tensor([PREFILL_COMPRESSED_LEN, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rmsnorm"):
-        partial_sq = pl.full([PREFILL_COMPRESSED_LEN, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
-        for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
-            kv_rms_chunk = pl.cast(
-                pl.cast(pooled_kv_all[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
-            partial_sq = pl.add(partial_sq, pl.mul(kv_rms_chunk, kv_rms_chunk))
+    for row_base_idx in pl.spmd(PREFILL_COMPRESSED_LEN // RMS_TILE, name_hint="prefill_rmsnorm_rope"):
+        row_base = row_base_idx * RMS_TILE
+        cos_b = cos[row_base : row_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        sin_b = sin[row_base : row_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        partial_sq = pl.full([1, RMS_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
+            kv_rms_chunk = pooled_kv_all[row_base : row_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_TILE])
+            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
 
-        reduce_ones = pl.full([HEAD_CHUNK, HEAD_CHUNK], dtype=pl.FP32, value=1.0)
-        sq_sum = pl.matmul(partial_sq, reduce_ones, out_dtype=pl.FP32)
-        inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HEAD_DIM_INV), EPS)))
-        for k0 in pl.range(0, HEAD_DIM, HEAD_CHUNK):
-            kv_norm_chunk = pl.cast(
-                pl.cast(pooled_kv_all[:, k0 : k0 + HEAD_CHUNK], target_type=pl.BF16, mode="rint"),
-                target_type=pl.FP32,
-            )
-            gamma = norm_w_2d[:, k0 : k0 + HEAD_CHUNK]
-            normed_chunk = pl.col_expand_mul(pl.mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv_all[:, k0 : k0 + HEAD_CHUNK] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
+            kv_norm_chunk = pooled_kv_all[row_base : row_base + RMS_TILE, k0 : k0 + HEAD_TILE]
+            gamma = norm_w_2d[:, k0 : k0 + HEAD_TILE]
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv_all[row_base : row_base + RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_slice"):
-        even_acc = pl.create_tensor([PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        odd_acc = pl.create_tensor([PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-        for rb in pl.pipeline(0, ROPE_HEAD_DIM // ROPE_CHUCK, stage=2):
-            r0 = rb * ROPE_CHUCK
-            kv_rope_tile = normed_kv_all[:, NOPE_HEAD_DIM + r0 : NOPE_HEAD_DIM + r0 + ROPE_CHUCK]
-            even_select_tile = even_select[r0 : r0 + ROPE_CHUCK, :]
-            odd_select_tile = odd_select[r0 : r0 + ROPE_CHUCK, :]
-            if r0 == 0:
-                even_acc = pl.matmul(kv_rope_tile, even_select_tile, out_dtype=pl.FP32)
-                odd_acc = pl.matmul(kv_rope_tile, odd_select_tile, out_dtype=pl.FP32)
-            else:
-                even_acc = pl.matmul_acc(even_acc, kv_rope_tile, even_select_tile)
-                odd_acc = pl.matmul_acc(odd_acc, kv_rope_tile, odd_select_tile)
+        kv_rope_norm = pooled_kv_all[row_base : row_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+        rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+        rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
+        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
+        normed_kv_all[row_base : row_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(rope_buf, target_type=pl.BF16, mode="rint")
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_apply"):
-        rope_even_acc = pl.cast(
-            pl.sub(pl.mul(even_acc, cos[:, :]), pl.mul(odd_acc, sin[:, :])),
-            target_type=pl.BF16,
-            mode="rint",
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_hadamard"):
+        kv_final_all[:, :] = pl.matmul(
+            normed_kv_all[:, 0 : HEAD_DIM],
+            hadamard[0 : HEAD_DIM, 0 : HEAD_DIM],
+            out_dtype=pl.FP32,
         )
-        rope_odd_acc = pl.cast(
-            pl.add(pl.mul(even_acc, sin[:, :]), pl.mul(odd_acc, cos[:, :])),
-            target_type=pl.BF16,
-            mode="rint",
-        )
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_assemble"):
-        rope_acc = pl.create_tensor([PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM], dtype=pl.FP32)
-        for ra_b in pl.pipeline(0, (ROPE_HEAD_DIM // 2) // ROPE_CHUCK, stage=2):
-            ra_0 = ra_b * ROPE_CHUCK
-            rope_even_tile = rope_even_acc[:, ra_0 : ra_0 + ROPE_CHUCK]
-            rope_odd_tile = rope_odd_acc[:, ra_0 : ra_0 + ROPE_CHUCK]
-            even_select_tile_t = even_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-            odd_select_tile_t = odd_select[:, ra_0 : ra_0 + ROPE_CHUCK]
-            if ra_0 == 0:
-                rope_acc = pl.matmul(rope_even_tile, even_select_tile_t, out_dtype=pl.FP32, b_trans=True)
-            else:
-                rope_acc = pl.matmul_acc(rope_acc, rope_even_tile, even_select_tile_t, b_trans=True)
-            rope_acc = pl.matmul_acc(rope_acc, rope_odd_tile, odd_select_tile_t, b_trans=True)
-
-        normed_kv_all[:, NOPE_HEAD_DIM : NOPE_HEAD_DIM + ROPE_HEAD_DIM] = pl.cast(
-            rope_acc,
-            target_type=pl.BF16,
-            mode="rint",
-        )
-
-    if rotate:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_hadamard"):
-            kv_final_all[:, :] = pl.matmul(
-                normed_kv_all[:, 0 : HEAD_DIM],
-                hadamard[0 : HEAD_DIM, 0 : HEAD_DIM],
-                out_dtype=pl.FP32,
-            )
-    else:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_write"):
-            kv_final_all[:, :] = pl.cast(normed_kv_all[:, 0 : HEAD_DIM], target_type=pl.FP32)
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_and_cache_write"):
         kv_flat[:, :] = kv_final_all
@@ -265,15 +220,12 @@ def prefill_indexer_compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     cos: pl.Tensor[[PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], pl.FP32],
-    even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     kv_cache: pl.Out[pl.Tensor[[B, IDX_KV_LEN, HEAD_DIM], pl.BF16]],
     start_pos: pl.Scalar[pl.INT32],
-    rotate: pl.Scalar[pl.BOOL],
 ):
     kv, kv_state, score_state, kv_cache = prefill_indexer_compressor(
-        x, kv, kv_state, score_state, wkv, wgate, ape, norm_w, cos, sin, even_select, odd_select, hadamard, kv_cache, start_pos, rotate
+        x, kv, kv_state, score_state, wkv, wgate, ape, norm_w, cos, sin, hadamard, kv_cache, start_pos
     )
     return kv, kv_state, score_state, kv_cache
 
@@ -294,7 +246,6 @@ def golden_prefill_indexer_compressor(tensors):
     hadamard = tensors["hadamard"].float()
     kv_cache = tensors["kv_cache"]
     start_pos = int(tensors["start_pos"])
-    rotate = bool(tensors["rotate"])
     bsz, seqlen, _ = x.shape
     ratio, d, rd = COMPRESS_RATIO, HEAD_DIM, ROPE_HEAD_DIM
 
@@ -350,8 +301,7 @@ def golden_prefill_indexer_compressor(tensors):
     y1 = x0 * sin_v + x1 * cos_v
     kv = torch.cat([kv[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-    if rotate:
-        kv = kv.to(torch.bfloat16).float() @ hadamard
+    kv = kv.to(torch.bfloat16).float() @ hadamard
 
     tensors["kv"][:] = kv
     kv_cache[:bsz, :n_comp] = kv.to(kv_cache.dtype)
@@ -380,16 +330,6 @@ def build_tensor_specs():
         return torch.rand(PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2)
     def init_sin():
         return torch.rand(PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2)
-    def init_odd_select():
-        matrix = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            matrix[2 * i + 1, i] = 1
-        return matrix
-    def init_even_select():
-        matrix = torch.zeros((ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2))
-        for i in range(ROPE_HEAD_DIM // 2):
-            matrix[2 * i, i] = 1
-        return matrix
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_kv_cache():
@@ -406,12 +346,9 @@ def build_tensor_specs():
         TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
         TensorSpec("cos", [PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [PREFILL_COMPRESSED_LEN, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("even_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_even_select),
-        TensorSpec("odd_select", [ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], torch.bfloat16, init_value=init_odd_select),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("kv_cache", [B, IDX_KV_LEN, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         ScalarSpec("start_pos", torch.int32, START_POS),
-        ScalarSpec("rotate", torch.bool, ROTATE),
     ]
 
 if __name__ == "__main__":
@@ -442,7 +379,7 @@ if __name__ == "__main__":
             "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
             "kv_state":    ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE)),
+            "kv_cache":    ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },
     )
     if not result.passed:
