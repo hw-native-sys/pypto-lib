@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
-"""DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer).
+"""DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer demo).
 
 Mirrors moe.py but assembles the 7 stages as a ``@pl.program`` with explicit
 cross-rank dispatch/combine over an HCCL window scratch, following the
@@ -15,90 +15,75 @@ cross-rank dispatch/combine over an HCCL window scratch, following the
 (hc_pre / gate / expert_shared / expert_routed / hc_post) are reused as
 ``@pl.jit.inline`` calls inside ``InCore`` methods.
 
-Demo sizing (set in the module preamble below):
-  N_RANKS = 2, DEMO preset, EP_WORLD_SIZE = 2, EP_ROUTING_GLOBAL = True
-  T = 128, D = 4096, N_LOCAL = 4, RECV_MAX = 256, TOPK = 2,
-  N_EXPERTS_GLOBAL = 8, MOE_INTER = 4096
+Run via ``python moe_ep.py`` (see ``--help``). Tested default: P=2, DEMO_EP preset,
+TOPK=2, hash routing (``--layer-id 0``), ``N_EXPERTS_GLOBAL=16``, ``N_LOCAL=8``.
+
+Importing this module does **not** configure EP demo sizing; ``__main__`` calls
+``_setup_demo_ep()`` before compile/run.
 """
 
-
-# === Module preamble: override config BEFORE importing sub-kernels ==========
-# Sub-kernels (hc_pre / gate / expert_routed / ...) bind preset constants at
-# module-import time via ``from config import FLASH as M``. By the time those
-# modules execute their first line, the overrides below must already be in
-# place — otherwise they'd capture FLASH and EP_WORLD_SIZE=16 instead.
-import dataclasses
+import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
 
 import config
-
-# Use DEMO sizing instead of FLASH:
-#   FLASH's n_routed_experts=256 combined with EP_ROUTING_GLOBAL=True makes
-#   gate.py's matmul allocate a single gate_w[:, 0:GATE_D_CHUNK=512] slice of
-#   256 × 512 × 4 = 512 KB, which saturates the cube Mat buffer once the LHS
-#   x slice is added. DEMO's n_routed_experts=16 keeps the slices comfortable.
-#   gate.py does not chunk along the N_EXPERTS dim today; supporting FLASH-EP
-#   would require that change.
-#
-# Override num_hash_layers 0 -> 1:
-#   DEMO ships with num_hash_layers=0. gate.py picks the hash routing branch
-#   when ``layer_id < N_HASH_LAYERS``, so with num_hash_layers=0 every
-#   non-negative layer_id (including the CLI default of 0) falls into the
-#   ELSE branch — the sort routing path. That path has an independent
-#   precision regression (single-card ``python moe.py --layer-id 3`` reproduces
-#   the same x_next mismatch, ratio_reldiff ≈ 7%), unrelated to the EP
-#   changes. Bumping num_hash_layers to 1 makes layer_id=0 satisfy 0 < 1 and
-#   pick hash, so EpMoE runs the validated route end-to-end. Pass
-#   ``--layer-id 1`` (or any layer_id >= num_hash_layers) to exercise the sort
-#   path explicitly once that regression is investigated.
-#
-# dataclasses.replace creates a fresh DeepSeekV4Config copy, so the DEMO
-# preset in config.py stays untouched for any other importer.
-config.FLASH = dataclasses.replace(config.DEMO, num_hash_layers=1)
-config.EP_WORLD_SIZE = 2
-config.EP_ROUTING_GLOBAL = True
-config.RECV_MAX = (
-    config.DECODE_BATCH * config.DECODE_SEQ * config.FLASH.num_experts_per_tok
-    // (config.FLASH.n_routed_experts // config.EP_WORLD_SIZE)
-) * config.RECV_SAFETY
-
-# Now safe to import the compute sub-kernels.
-import pypto.language as pl  # noqa: E402
-import pypto.language.distributed as pld  # noqa: E402
-from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: E402
-
-from hc_pre import hc_pre_inline as hc_pre  # noqa: E402
-from hc_post import hc_post_inline as hc_post  # noqa: E402
-from gate import gate_inline as gate  # noqa: E402
-from expert_shared import expert_shared_inline as expert_shared  # noqa: E402
-from expert_routed import expert_routed_inline as expert_routed  # noqa: E402
-
-
-# === Demo / EP constants ====================================================
-M = config.FLASH  # alias (now DEMO after the override above)
-N_RANKS = config.EP_WORLD_SIZE
-B = config.DECODE_BATCH
-S = config.DECODE_SEQ
-T = B * S
-D = M.hidden_size
-TOPK = M.num_experts_per_tok
-VOCAB = M.vocab_size
-HC_MULT = M.hc_mult
-MIX_HC = M.mix_hc
-HC_DIM = M.hc_dim
-MOE_INTER = M.moe_intermediate_size
-N_EXPERTS_GLOBAL = M.n_routed_experts
-N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
-RECV_MAX = config.RECV_MAX
-N_ROUTES = T * TOPK
 
 # Padding widths required by tile vector ops (32 B minimum tile).
 W_PAD = 8  # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
 
-# Single-program sanity asserts catch preset mismatches early.
-assert N_RANKS == 2, "moe_ep demo is wired for 2 ranks"
-assert TOPK == 2, "moe_ep demo assumes TOPK == 2 for combine reduce"
-assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
+
+def _setup_demo_ep():
+    """Apply EP demo config overrides and import compute sub-kernels.
+
+    Sub-kernels bind ``config.FLASH`` and ``EP_WORLD_SIZE`` at import time, so
+    this must run before ``_build_ep_moe_program()``. Not called on plain
+    ``import moe_ep``.
+    """
+    global M, N_RANKS, B, S, T, D, TOPK, VOCAB, HC_MULT, MIX_HC, HC_DIM
+    global MOE_INTER, N_EXPERTS_GLOBAL, N_LOCAL, RECV_MAX, N_ROUTES
+    global hc_pre, hc_post, gate, expert_shared, expert_routed
+
+    config.FLASH = config.DEMO_EP
+    config.EP_WORLD_SIZE = 2
+    config.EP_ROUTING_GLOBAL = True
+    config.RECV_MAX = (
+        config.DECODE_BATCH * config.DECODE_SEQ * config.FLASH.num_experts_per_tok
+        // (config.FLASH.n_routed_experts // config.EP_WORLD_SIZE)
+    ) * config.RECV_SAFETY
+
+    from hc_pre import hc_pre_inline as hc_pre_fn
+    from hc_post import hc_post_inline as hc_post_fn
+    from gate import gate_inline as gate_fn
+    from expert_shared import expert_shared_inline as expert_shared_fn
+    from expert_routed import expert_routed_inline as expert_routed_fn
+
+    hc_pre = hc_pre_fn
+    hc_post = hc_post_fn
+    gate = gate_fn
+    expert_shared = expert_shared_fn
+    expert_routed = expert_routed_fn
+
+    M = config.FLASH
+    N_RANKS = config.EP_WORLD_SIZE
+    B = config.DECODE_BATCH
+    S = config.DECODE_SEQ
+    T = B * S
+    D = M.hidden_size
+    TOPK = M.num_experts_per_tok
+    VOCAB = M.vocab_size
+    HC_MULT = M.hc_mult
+    MIX_HC = M.mix_hc
+    HC_DIM = M.hc_dim
+    MOE_INTER = M.moe_intermediate_size
+    N_EXPERTS_GLOBAL = M.n_routed_experts
+    N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
+    RECV_MAX = config.RECV_MAX
+    N_ROUTES = T * TOPK
+
+    assert N_RANKS == 2, "moe_ep demo is wired for 2 ranks"
+    assert TOPK == 2, "moe_ep demo assumes TOPK == 2 for combine reduce"
+    assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 
 
 # === Program ================================================================
@@ -1106,15 +1091,18 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=str, default="0,1",
-                        help="comma-separated device ids; need at least 2")
+                        help="comma-separated device ids; need exactly 2")
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
 
+    _setup_demo_ep()
+
     device_ids = [int(d) for d in args.device.split(",")]
-    assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+    if len(device_ids) != N_RANKS:
+        raise SystemExit(f"need exactly {N_RANKS} devices, got {device_ids}")
 
     program = _build_ep_moe_program()
     result = run(
@@ -1125,7 +1113,7 @@ if __name__ == "__main__":
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
             distributed_config=DistributedConfig(
-                device_ids=device_ids[:N_RANKS],
+                device_ids=device_ids,
                 num_sub_workers=0,
             ),
         ),
