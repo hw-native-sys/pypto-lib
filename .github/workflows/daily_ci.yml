@@ -160,6 +160,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: dist-checkout
+          persist-credentials: false
 
       - name: Check NPU
         working-directory: .
@@ -288,8 +289,17 @@ jobs:
                 echo "::endgroup::"
                 return
               fi
+              local actual_ndev
+              actual_ndev=$(tr ',' '\n' <<<"$DEVICE_RANGE" | sed '/^$/d' | wc -l)
+              if [ "$actual_ndev" -lt "$ndev" ]; then
+                echo "::error file=${file}::needs $ndev devices but DEVICE_RANGE only provides $actual_ndev ($DEVICE_RANGE)"
+                failed+=("$label")
+                printf '%s\tfail\n' "$label" >> results.tsv
+                echo "::endgroup::"
+                return
+              fi
               ( unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL
-                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_RANGE" "$@" )
+                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" )
             else
               ( export PTO2_RING_DEP_POOL=1048576 \
                        PTO2_RING_TASK_WINDOW=1048576 \
