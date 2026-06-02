@@ -7,7 +7,7 @@ programming framework, targeting Ascend NPUs (910B/C, 950).
 examples/        Self-contained kernels for learning the DSL
   beginner/        hello_world, matmul, etc.
   intermediate/    softmax, rms_norm, rope, etc.
-  advanced/        Multi-stage fused kernels (gemm_eltwise, multi_proj)
+  advanced/        Multi-stage fused + instruction-combo kernels (gemm_eltwise, multi_proj, topk)
 models/          End-to-end LLM kernels organized by family
   qwen3/14b/       Qwen3-14B prefill + decode
   qwen3/32b/       Qwen3-32B decode
@@ -34,18 +34,26 @@ python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0   # real NPU, device 0
 Every example accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`,
 and exits non-zero on validation mismatch. See
 [docs/compile-runtime-workflow.md](docs/compile-runtime-workflow.md) for the
-full flow (compile → input gen → runtime → golden → validate).
+full flow (compile → input gen → golden → runtime → validate).
 
 ## Writing a kernel
 
 Read [docs/pypto-coding-style.md](docs/pypto-coding-style.md) — it covers
-program structure (`@pl.program` + `@pl.function` + `pl.at`
-scopes), the four loop constructs (`pl.range`, `pl.parallel`,
-`pl.pipeline`, `pl.spmd`), and the vector / cube / mte op set.
+the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
+`@pl.function`), `pl.at` scopes, the four loop constructs (`pl.range`,
+`pl.parallel`, `pl.pipeline`, `pl.spmd`), and the vector / cube / mte op
+set.
 
 Existing kernels under `examples/intermediate/` are the best reference for
 single-stage patterns; `models/qwen3/14b/qwen3_14b_decode.py` shows a
 full-model fused kernel.
+
+## Debugging
+
+See [docs/debugging.md](docs/debugging.md) for the debugging workflow —
+reading pypto/ptoas errors, replaying failing data with `golden_data`,
+reusing a compile with `runtime_dir`, device logs for runtime hangs, and
+the dump-tensor / dep-gen DFX flags.
 
 ## Performance tuning
 

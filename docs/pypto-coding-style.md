@@ -11,13 +11,58 @@ import pypto.language as pl
 
 ---
 
-## 1. Program Structure and `pl.at` Scopes
+## 1. Defining a Kernel: `@pl.jit` and `@pl.program`
 
-PyPTO-Lib kernels are written as **opaque** functions. The frontend does not
-draw the InCore / Orchestration boundary explicitly; instead, each compute
-region is wrapped in `with pl.at(level=pl.Level.CORE_GROUP, ...)` and the
-compiler lowers that region to InCore. Code outside any `pl.at` block stays in
-orchestration (host/AICPU control flow).
+A PyPTO-Lib kernel can be written in **two parallel forms** — module-level
+`@pl.jit` functions or a `@pl.program` class. Both lower through the same
+compiler pipeline. Pick one per kernel and do not mix them: a `@pl.program`
+method calling a `@pl.jit` kernel (or the reverse) is discouraged.
+
+Either way, signatures look the same — tensor params are
+`pl.Tensor[[shape...], dtype]`, outputs are wrapped in `pl.Out[...]`, scalars
+are `pl.Scalar[dtype]` — and the function is written as an **opaque** function:
+the frontend does not draw the InCore / Orchestration boundary explicitly.
+Each compute region is wrapped in `with pl.at(level=pl.Level.CORE_GROUP, ...)`
+and the compiler lowers that region to InCore; code outside any `pl.at` block
+stays in orchestration (host / AICPU control flow). See `pl.at` scopes below.
+
+### Form A — module-level `@pl.jit` / `@pl.jit.inline`
+
+The form used by most DeepSeek-V4 kernels: plain module-level functions.
+
+`@pl.jit` decorates the top-level function the harness compiles and runs — the
+boundary the golden test invokes; its `pl.Out` params are the kernel outputs.
+
+`@pl.jit.inline` marks a reusable sub-kernel that is **inlined** into each
+caller rather than compiled as its own entry. Write the real compute once in an
+inline function, then call it from a thin `@pl.jit` entry. An inline function
+**must return a value** — the parser requires every inline call expression to
+have a result; when the kernel writes in place, returning the `pl.Out` tensor
+is idiomatic.
+
+```python
+@pl.jit.inline
+def expert_routed(recv_x, ..., recv_y):        # the real compute
+    for local_i in pl.parallel(N_LOCAL_EXPERTS):
+        for nb_idx in pl.spmd(..., name_hint="exp_gate_up"):
+            ...                                # matmul / dequant / SwiGLU
+    return recv_y                              # inline call must return a value
+
+
+@pl.jit                                        # compilation entry
+def expert_routed_test(
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
+    ...,
+    recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
+):
+    expert_routed(recv_x, ..., recv_y)         # call the inline sub-kernel
+    return recv_y
+```
+
+### Form B — `@pl.program` class with `@pl.function` methods
+
+A class groups related kernels as methods; `type=` on each method selects how
+it lowers.
 
 ```python
 @pl.program
@@ -34,25 +79,58 @@ class Qwen3Decode:
         return out
 ```
 
-### `pl.at` parameters
+| `pl.FunctionType` | Role |
+|-------------------|------|
+| `Opaque` | Self-contained compute kernel; the frontend draws the InCore boundary from its `pl.at` blocks (the example above). |
+| `Orchestration` | Top-level entry that sequences other methods (host / AICPU control flow, cross-rank dispatch). |
+| `InCore` | A single InCore region authored directly — `pl.spmd` / `pl.parallel` / `pl.pipeline` and scalar loops, no surrounding `pl.at`. |
+
+### `pl.at` scopes
 
 | Parameter | Required | Purpose |
 |-----------|----------|---------|
 | `level=pl.Level.CORE_GROUP` | yes | Lowering target. `CORE_GROUP` is the only level used in pypto-lib. |
 | `name_hint="..."` | recommended | Stable label for the region. Appears in generated kernel filenames and profiling traces; aids per-region debugging. |
+| `optimizations=[...]` | optional | Per-region codegen passes (see below). |
 
 `pl.at` blocks may nest: an outer `pl.at` defining the InCore scope, with
 inner `pl.at` blocks (each with its own `name_hint`) splitting it into named
 sub-kernels.
 
+### `optimizations`
+
+`optimizations=[...]` attaches per-region codegen passes to a `pl.at` block
+(or a `pl.spmd` loop — same kwarg). The one in common use:
+
+- **`pl.split(pl.SplitMode...)`** — split the region in half so the cube and
+  vector units ping-pong on the two halves (cube on one half while vec runs
+  the epilogue on the other). It applies **only to a mixed cube + vector
+  region** (§6); a pure-cube or pure-vector region has nothing to ping-pong.
+  The mode picks the axis:
+  - `pl.SplitMode.NONE` — the default; no split.
+  - `pl.SplitMode.UP_DOWN` — split vertically (rows / height halved).
+  - `pl.SplitMode.LEFT_RIGHT` — split horizontally (cols / width halved).
+
+  Reach for it when a region's unified buffer (UB) would otherwise exceed the
+  per-core limit — typically a wide FP32 vector epilogue stacked on a matmul
+  accumulator — since splitting also keeps the accumulator on-chip instead of
+  spilling to a GM scratch round-trip.
+
+```python
+# split form on a mixed region whose FP32 epilogue would blow the UB budget
+for ob in pl.spmd(N_BLOCKS, name_hint="gate_up_silu",
+                  optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+    ...
+```
+
 ---
 
 ## 2. Vector Ops
 
-Run on the vector unit, inside an InCore region (a `pl.at` block, a
-`pl.spmd` body, or a `pl.parallel(chunk=N)` body — see §5). Vector ops are
-the standard tools for the cast / activation / norm epilogue around a
-matmul, and for small standalone reductions.
+Run on the vector unit, inside an InCore region (a `pl.at` block or a
+`pl.spmd` body — see §5). Vector ops are the standard tools for the cast /
+activation / norm epilogue around a matmul, and for small standalone
+reductions.
 
 ### Elementwise
 
@@ -114,14 +192,95 @@ partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
 scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)   # -inf in tail
 ```
 
+`pl.set_validshape(tile, valid_rows, valid_cols)` re-marks the valid
+region of an **already-computed** tile. Where `valid_shape=` on a
+`pl.slice` (§4) is a load-time marker on data coming from GM,
+`set_validshape` annotates a tile produced on chip — typically when the
+valid row/col count is only known at runtime (a `pl.read` of a dynamic
+count). The returned view has the same nominal shape; downstream ops
+(reductions, `fillpad`) then operate on the valid region only. It is the
+standard partner of `fillpad`: set the valid extent, then mask the tail.
+
+```python
+valid_rows = pl.min(RECV_TILE, n_rows - t0)                    # runtime count
+gated_valid = pl.set_validshape(gated, valid_rows, INTER_TILE)
+# softmax tail-masking idiom: set extent, then fill the pad with -inf
+scores = pl.fillpad(pl.set_validshape(weighted, 1, valid_len),
+                    pad_value=pl.PadValue.min)
+```
+
+### Sort and top-k: `pl.sort32` + `pl.mrgsort`
+
+Top-k is built from two primitives that operate on a **single row**
+(`[1, N]`):
+
+- `pl.sort32(values, idx_init)` sorts each contiguous 32-element run in
+  descending order, carrying the indices along. `idx_init` is a `[1, N]`
+  UINT32 index ramp (`pl.arange(0, [1, N], dtype=pl.UINT32)`). The result is
+  `[1, 2*N]` of interleaved `(value, index)` pairs.
+- `pl.mrgsort(sorted, block_len=B)` 4-way-merges adjacent sorted blocks
+  (format stays interleaved pairs). `block_len` is the **input** run length,
+  counted in interleaved-array positions — twice the element count. `sort32`
+  leaves runs of 32 elements (64 positions), so each merge grows the run ×4
+  and `block_len` steps ×4 per stage until a single run remains: `64 → 256`
+  sorts 512 elements, `64 → 256 → 1024` sorts 2048.
+
+Both require **row count == 1** — an ISA constraint on `mrgsort`; for a
+multi-row tile, loop the rows with `pl.range`. After sorting, slice the
+leading `2*k` pairs and `pl.gather` the odd lanes (the indices) for the top-k
+index list.
+
+```python
+score_row = score_flat[t : t + 1, :]                  # [1, N], N = 512
+idx_init = pl.arange(0, [1, N], dtype=pl.UINT32)
+s = pl.sort32(score_row, idx_init)                    # [1, 2N], 32-runs sorted
+s = pl.mrgsort(s, block_len=64)                       # 4-way merge of the 64-position runs
+s = pl.mrgsort(s, block_len=256)                      # one sorted run
+topk_pairs = s[:, 0 : 2 * K]                          # leading k (value, index) pairs
+topk_idxs = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010,
+                      output_dtype=pl.INT32)          # odd lanes = indices
+```
+
+A full runnable kernel is in [examples/advanced/topk.py](../examples/advanced/topk.py).
+
+### Gather / scatter
+
+Two flavours.
+
+**Mask form** — de-interleave / re-interleave even and odd lanes (the RoPE
+idiom). `pl.gather(tile, mask_pattern=...)` selects alternate lanes of a
+`[H, W]` tile, returning `[H, W/2]`; `pl.tensor.scatter(src, mask_pattern=...,
+dst=buf)` writes them back into the matching lanes of `dst`.
+`pl.tile.MaskPattern.P0101` picks the even lanes (0, 2, 4, …), `P1010` the odd
+lanes (1, 3, 5, …). The optional `output_dtype=` casts on the way out.
+
+```python
+even = pl.gather(rope_slice, mask_pattern=pl.tile.MaskPattern.P0101)   # [H, W/2]
+odd  = pl.gather(rope_slice, mask_pattern=pl.tile.MaskPattern.P1010)
+rot_even = pl.sub(pl.col_expand_mul(even, cos_b), pl.col_expand_mul(odd, sin_b))
+rot_odd  = pl.add(pl.col_expand_mul(even, sin_b), pl.col_expand_mul(odd, cos_b))
+buf = pl.full([H, W], dtype=pl.FP32, value=0.0)
+buf = pl.tensor.scatter(rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=buf)
+buf = pl.tensor.scatter(rot_odd,  mask_pattern=pl.tile.MaskPattern.P1010, dst=buf)
+```
+
+**Index form** — batched per-row gather by an index tile.
+`pl.gather(src, dim=-1, index=idx)` gathers along the last axis: for a
+`[B, W]` source and a `[B, K]` INT32 index it returns `[B, K]`, where row `i`
+picks `src[i, idx[i, :]]`. The index must be a real **tensor** (e.g. from
+`pl.create_tensor`), not a `pl.full` tile — a tile index is rejected.
+
+```python
+gathered = pl.gather(local_scores, dim=-1, index=topk_idx_tile)   # [B, K]
+```
+
 ---
 
 ## 3. Cube Ops
 
 Matrix multiply primitives. They run on the cube unit, inside an InCore
-region (a `pl.at` block, a `pl.spmd` body, or a `pl.parallel(chunk=N)`
-body — see §5), and produce FP32 results by default (`out_dtype` may
-override).
+region (a `pl.at` block or a `pl.spmd` body — see §5), and produce FP32
+results by default (`out_dtype` may override).
 
 ### `pl.matmul(lhs, rhs, *, out_dtype=None, a_trans=False, b_trans=False)`
 
@@ -345,32 +504,6 @@ Keyword args:
 |-------|---------|---------|
 | `sync_start` | `False` | If True, all blocks start execution simultaneously. |
 | `name_hint` | `""` | Stable label for the outlined function. |
-
-### `pl.parallel(chunk=N)` — sugar for parallel + InCore + in-chunk loop
-
-`pl.parallel(..., chunk=N)` partitions the iteration range into groups of
-`N` and is shorthand for an outer parallel chunk loop, an InCore region per
-chunk, and an inner sequential in-chunk loop:
-
-```python
-for b in pl.parallel(0, BATCH, 1, chunk=4):
-    # body runs InCore for each iteration
-    ...
-```
-
-is equivalent to:
-
-```python
-for b_chunk in pl.parallel(0, BATCH, 4):
-    with pl.at(level=pl.Level.CORE_GROUP):
-        for b in pl.range(b_chunk, b_chunk + 4):
-            # same body
-            ...
-```
-
-Use the sugared form when each chunk is a self-contained InCore region with
-no further sub-stages; expand to the explicit form when you need named
-sub-regions (each with its own `name_hint`) inside the chunk.
 
 ---
 

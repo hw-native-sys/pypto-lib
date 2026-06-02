@@ -13,7 +13,7 @@ Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
 - `models/{qwen3,deepseek}/` — end-to-end LLM kernels by family
 - `golden/` — test harness: compile, run on device, validate against torch
 - `tests/` — lint checks and golden-fn unit tests
-- `docs/` — coding-style and workflow reference
+- `docs/` — coding-style, compile/runtime workflow, performance-tuning, and debugging references
 - `build_output/` — generated compilation artifacts (gitignored)
 
 Files ending in `_draft.py` are works-in-progress and excluded from CI.
@@ -21,8 +21,10 @@ Files ending in `_draft.py` are works-in-progress and excluded from CI.
 ## Key Documentation
 
 - `README.md` — project intro, quick start, dependencies
-- `docs/pypto-coding-style.md` — **canonical** coding style: `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops
-- `docs/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → runtime → golden → validate)
+- `docs/pypto-coding-style.md` — **canonical** coding style: the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` / `@pl.function`), `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops
+- `docs/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → input gen → golden → runtime → validate)
+- `docs/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
+- `docs/debugging.md` — debugging playbook: pypto/ptoas errors, `golden_data` replay, `runtime_dir` reuse, runtime-hang device logs, dump-tensor / dep-gen
 
 ## External Dependencies
 
@@ -54,7 +56,7 @@ Every script accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`.
 ## Important Rules
 
 1. **Read `docs/pypto-coding-style.md` first** before writing or modifying any kernel — it is the authoritative coding-style reference.
-2. **`docs/compile-runtime-workflow.md`** explains the harness flow; consult it when debugging compile/runtime/validation failures.
+2. **`docs/compile-runtime-workflow.md`** explains the harness flow end-to-end; **`docs/debugging.md`** is the debugging playbook (compile/runtime/validation failures, hangs, precision) and **`docs/performance-tuning.md`** the tuning guide.
 3. **Consult `.claude/skills/`** for task-specific workflows (e.g. `setup_env/`, `bisect-precision/`).
 4. **No private information** (usernames, absolute paths with usernames, etc.) in code or docs.
 5. **All code comments and documentation in English** unless the user explicitly requests otherwise.

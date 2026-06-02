@@ -47,8 +47,8 @@ Look for these shapes on the swimlane that indicate a problem:
 | Cores idle while AICPU lane is solid | Kernels too small; AICPU scheduling is the bottleneck | Make kernels larger (item 2) |
 | Long tail on a single AIC/AIV | One kernel is too big and serializes | Split it (item 3) |
 | Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the core buffers | Re-tile to fill `mat_left` / `mat_right` / vector buffers (item 4) |
-| Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 5) |
-| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 6) |
+| Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
+| Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 5) |
 
 ### Tuning rules
 
@@ -69,21 +69,61 @@ A `pl.range` over an independent dimension forces the swimlane into a
 single lane; switching to `pl.parallel` is usually the largest single
 win at this stage.
 
-#### 2. Kernels too small — fold loops into `pl.at`
+#### 2. Kernels too small — make each kernel do more
 
 When the swimlane shows cores idling while the AICPU lane is fully
 saturated, the AICPU dispatcher is the bottleneck. Target ~50 µs per
 kernel on A3 / 910C (smaller kernels add dispatch overhead that the AICPU
-can't hide).
+can't hide). Three ways to grow each kernel:
 
-Move tight sequential loops **into** the `pl.at` region so one larger
-InCore kernel replaces many tiny ones:
+**a. Fold outer iterations into the core.** Move part of an outer
+`pl.range` / `pl.parallel`'s iterations **into** the `pl.at` region as an
+inner `pl.range`, so each dispatched kernel processes a tile of iterations
+instead of one:
 
 ```python
-# Multiple short loop iterations folded into one InCore kernel
-with pl.at(level=pl.Level.CORE_GROUP, name_hint="kproj"):
-    for kb in pl.range(0, K_BLOCKS):   # all K-iterations in one kernel
+# Before: one kernel per outer iteration — many tiny dispatches
+for b in pl.parallel(0, BATCH):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="step"):
         ...
+
+# After: fold BATCH_TILE iterations into each kernel via an inner pl.range
+for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="step"):
+        for b in pl.range(b0, b0 + BATCH_TILE):
+            ...
+```
+
+**b. Merge consecutive `pl.at` blocks.** Adjacent `pl.at` regions in the
+same scope each become a separate kernel with an AICPU hand-off between
+them. Fuse back-to-back regions into one `pl.at` so a single kernel covers
+the whole sequence:
+
+```python
+# Before: two adjacent regions → two kernels + a hand-off
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
+    ...
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    ...
+
+# After: one region → one kernel
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_q_proj"):
+    ...   # rmsnorm, then q_proj
+```
+
+**c. Merge cube + vector into a mixed kernel.** When a matmul (cube) and
+its epilogue (cast / add / norm — vector) sit in separate `pl.at` regions,
+every projection generates two kernels and an AICPU hand-off between them.
+Place both inside the **same** `pl.at` and the compiler co-schedules cube
+and vector on the right unit internally, removing the hand-off:
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
+    for kb in pl.pipeline(0, input_proj_k_blocks, stage=2):
+        ...
+        q_acc = pl.matmul_acc(q_acc, tile_a, tile_b)     # cube
+    q_bf16 = pl.cast(q_acc, target_type=pl.BF16)         # vector
+    q_proj[b0:b0 + BATCH_TILE, q0:q0 + Q_OUT_CHUNK] = q_bf16
 ```
 
 #### 3. Kernels too big — split and parallelize
@@ -118,6 +158,38 @@ iteration.
 - Too large → tile spills, the compiler falls back to smaller transfer
   units, or compile-time shape checks fail.
 
+**Check actual occupancy.** Every compile writes a per-kernel buffer
+report to
+
+```
+build_output/<ProgramName>_<ts>/report/memory_after_AllocateMemoryAddr.txt
+```
+
+listing, for each compute function, how full each on-chip space runs
+against its hardware limit (on 910C: vector `Vec` 192 KB; cube `Mat`
+512 KB, `Left` / `Right` 64 KB each, `Acc` 128 KB):
+
+```
+--- gather_kv ---
+  Space  |  Used       |  Limit      |  Usage   |  MemRefs
+  -------+-------------+-------------+----------+---------
+  Vec    |   129.0 KB  |   192.0 KB  |   67.2%  |  2
+
+--- kv_proj_matmul ---
+  Space  |  Used       |  Limit      |  Usage   |  MemRefs
+  -------+-------------+-------------+----------+---------
+  Mat    |    80.0 KB  |   512.0 KB  |   15.6%  |  4
+  Left   |    32.0 KB  |    64.0 KB  |   50.0%  |  1
+  Right  |    16.0 KB  |    64.0 KB  |   25.0%  |  1
+  Acc    |     4.0 KB  |   128.0 KB  |    3.1%  |  1
+```
+
+Scan the `Usage` column: a kernel sitting far below its limit has
+headroom to enlarge its tiles, while one near 100 % is already
+buffer-bound. Aim to grow each kernel's bottleneck space — `Vec` for
+vector kernels, `Left` / `Right` / `Acc` for cube kernels — close to (but
+under) its limit; ideally every kernel runs each buffer it uses near full.
+
 Pick tile sizes so that one tile of the cube left operand (`[BATCH_TILE,
 K_STEP]`) and one tile of the right operand (`[K_STEP, N_CHUNK]`) each
 sit just under the per-core buffer budget — i.e. cube `mat_left` /
@@ -133,26 +205,9 @@ Practical procedure:
    size that pushes the cube (or vector) unit closer to 100 %.
 
 The K loop is then driven by `pl.pipeline(stage=2 or 4)` so the next
-tile's MTE2 overlaps the current tile's compute (see Part 2 item 1).
+tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
 
-#### 5. Mixed cube + vector kernels — fewer hand-offs
-
-When the matmul (cube) and its epilogue (cast / add / norm — vector) sit
-in separate `pl.at` regions, every projection generates two kernels and
-an AICPU hand-off between them. Place both inside the **same** `pl.at`
-and the compiler co-schedules cube and vector on the right unit
-internally, removing the hand-off:
-
-```python
-with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-    for kb in pl.pipeline(0, input_proj_k_blocks, stage=2):
-        ...
-        q_acc = pl.matmul_acc(q_acc, tile_a, tile_b)     # cube
-    q_bf16 = pl.cast(q_acc, target_type=pl.BF16)         # vector
-    q_proj[b0:b0 + BATCH_TILE, q0:q0 + Q_OUT_CHUNK] = q_bf16
-```
-
-#### 6. `pl.spmd` for parallel sub-kernel dispatch
+#### 5. `pl.spmd` for parallel sub-kernel dispatch
 
 `pl.spmd(N)` dispatches `N` blocks of an InCore body in parallel from
 **one** AICPU schedule entry, instead of N successive `pl.parallel +
@@ -165,6 +220,12 @@ overhead is visible per iteration on the swimlane, replace the explicit
 for qi in pl.spmd(Q_OUT_BLOCKS, name_hint="q_proj"):
     ...
 ```
+
+Collapsing N dispatches into one schedule entry cuts AICPU scheduling
+overhead sharply. The win is largest for **MPMD-shaped** regions with
+heavy fan-in / fan-out — where each block depends on (or feeds) many
+others, the AICPU would otherwise track a dependency edge per block, and
+`pl.spmd` replaces that whole fan with a single dispatch and its barrier.
 
 Use `pl.spmd` once the per-iteration body is self-contained and the
 AICPU lane shows a dispatch trail; keep the explicit form when you need
@@ -199,7 +260,32 @@ Or run the exporter directly on an existing build via
 
 ### Tuning rules
 
-#### 1. `pl.pipeline` for ping-pong on the K loop
+#### 1. Fix tile-shape MTE hints from `perf_hints.log`
+
+Every compile writes a perf-hint log next to the memory report:
+
+```
+build_output/<ProgramName>_<ts>/report/perf_hints.log
+```
+
+The compiler flags every `tile.load` / `tile.store` whose innermost
+(trailing) dimension is smaller than the 512 B L2 cache line — the case
+that forces MTE into many short, cache-line-straddling transfers. Each
+hint carries the exact source location:
+
+```
+[perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost
+dim = 256B; recommended >= 512B for backend a2a3 (L2 cache line = 512B).
+Consider increasing tile shape on the innermost axis.
+at models/deepseek/v4/decode_qkv_proj_rope.py:68:4
+```
+
+Walk the log and widen the trailing tile dimension at each flagged site
+so the innermost slice is a multiple of 512 B (item 3 gives the per-dtype
+element counts). Bringing every flagged `tile.load` / `tile.store` up to
+≥ 512 B is usually the single biggest MTE-efficiency win at this level.
+
+#### 2. `pl.pipeline` for ping-pong on the K loop
 
 Inside a `pl.at` region, the reduction loop of a matmul (the K loop)
 should be `pl.pipeline(..., stage=2 or 4)`. The compiler replicates the
@@ -219,7 +305,7 @@ for kb in pl.pipeline(0, hidden_blocks, stage=2):
 A `pl.range` here forces strictly serial K iterations — the cube unit
 will stall on every load. Always prefer `pl.pipeline` in the K loop.
 
-#### 2. Watch `pl.slice` / `pl.assemble` granularity
+#### 3. Watch `pl.slice` / `pl.assemble` granularity
 
 MTE transfers prefer 512-byte aligned addresses and lengths on A3 / 910C.
 Pick the trailing-dim tile size so the slice is a multiple of 512 B:
@@ -232,7 +318,7 @@ Misaligned slices fall back to slower paths visible as long MTE2 bars in
 the kernel-insight swimlane. In the qwen3-14b kernels, all `K_STEP` /
 `Q_OUT_CHUNK` constants are picked to keep the inner load 512 B aligned.
 
-#### 3. Read PMU utilization
+#### 4. Read PMU utilization
 
 Recommended PMU counters to collect per kernel:
 
