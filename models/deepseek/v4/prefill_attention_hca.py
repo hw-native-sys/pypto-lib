@@ -155,8 +155,8 @@ def prefill_attention_hca(
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
-    cmp_even_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
-    cmp_odd_select: pl.Tensor[[ROPE_HEAD_DIM, ROPE_HEAD_DIM // 2], pl.BF16],
+    cmp_even_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
+    cmp_odd_idx: pl.Tensor[[1, ROPE_HEAD_DIM // 2], pl.INT32],
     cmp_kv_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     cmp_score_state: pl.Tensor[[B, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     kv_cache: pl.Tensor[[SPARSE_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -234,6 +234,11 @@ def prefill_attention_hca(
         cmp_wkv,
         cmp_wgate,
         cmp_ape,
+        cmp_norm_w,
+        cmp_cos,
+        cmp_sin,
+        cmp_even_idx,
+        cmp_odd_idx,
         cmp_dense_cache,
         start_pos,
     )
@@ -350,6 +355,9 @@ def golden_prefill_attention_hca(tensors):
     cmp_kv.zero_()
     dense_kv = torch.zeros(B, PREFILL_COMPRESSED_LEN, HEAD_DIM, dtype=torch.float32)
     dense_cache = torch.zeros(B, IDX_KV_LEN, HEAD_DIM, dtype=torch.bfloat16)
+    start_pos = int(tensors["start_pos"])
+    cmp_offset = COMPRESS_RATIO - (start_pos % COMPRESS_RATIO)
+    cmp_pos = start_pos + cmp_offset - COMPRESS_RATIO
     cmp_tensors = {
         "x": x_mixed,
         "kv": dense_kv,
@@ -358,13 +366,15 @@ def golden_prefill_attention_hca(tensors):
         "wkv": tensors["cmp_wkv"],
         "wgate": tensors["cmp_wgate"],
         "ape": tensors["cmp_ape"],
+        "norm_w": tensors["cmp_norm_w"],
+        "cos": tensors["freqs_cos"][cmp_pos : cmp_pos + 1, 0 : ROPE_HALF].float(),
+        "sin": tensors["freqs_sin"][cmp_pos : cmp_pos + 1, 0 : ROPE_HALF].float(),
         "kv_cache": dense_cache,
         "start_pos": tensors["start_pos"],
     }
     golden_prefill_compressor_ratio128(cmp_tensors)
     tensors["cmp_kv_state"][:] = cmp_tensors["kv_state"]
     tensors["cmp_score_state"][:] = cmp_tensors["score_state"]
-    start_pos = int(tensors["start_pos"])
     cmp_cache_slot = start_pos // COMPRESS_RATIO
     for b in range(B):
         blk_id = int(tensors["cmp_block_table"][b, cmp_cache_slot // BLOCK_SIZE].item())
@@ -469,16 +479,10 @@ def build_tensor_specs(start_pos: int = START_POS):
         return seeded_uniform((COMPRESS_RATIO, MAIN_OUT_DIM), 8, 0.1)
     def init_cmp_norm_w():
         return torch.ones(HEAD_DIM)
-    def init_cmp_even_select():
-        matrix = torch.zeros((ROPE_DIM, ROPE_HALF))
-        for i in range(ROPE_HALF):
-            matrix[2 * i, i] = 1
-        return matrix
-    def init_cmp_odd_select():
-        matrix = torch.zeros((ROPE_DIM, ROPE_HALF))
-        for i in range(ROPE_HALF):
-            matrix[2 * i + 1, i] = 1
-        return matrix
+    def init_cmp_even_idx():
+        return torch.arange(0, ROPE_DIM, 2, dtype=torch.int32).unsqueeze(0)
+    def init_cmp_odd_idx():
+        return torch.arange(1, ROPE_DIM, 2, dtype=torch.int32).unsqueeze(0)
     def init_cmp_state():
         return torch.zeros(B, MAIN_STATE_LEN, MAIN_OUT_DIM)
     def init_kv_cache():
@@ -541,8 +545,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
-        TensorSpec("cmp_even_select", [ROPE_DIM, ROPE_HALF], torch.bfloat16, init_value=init_cmp_even_select),
-        TensorSpec("cmp_odd_select", [ROPE_DIM, ROPE_HALF], torch.bfloat16, init_value=init_cmp_odd_select),
+        TensorSpec("cmp_even_idx", [1, ROPE_HALF], torch.int32, init_value=init_cmp_even_idx),
+        TensorSpec("cmp_odd_idx", [1, ROPE_HALF], torch.int32, init_value=init_cmp_odd_idx),
         TensorSpec("cmp_kv_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_state),
         TensorSpec("cmp_score_state", [B, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_state),
         TensorSpec("kv_cache", [SPARSE_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
