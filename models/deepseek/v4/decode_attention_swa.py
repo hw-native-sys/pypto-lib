@@ -20,7 +20,7 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
-from decode_qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import attn_norm, qkv_proj_rope
 from decode_sparse_attn import sparse_attn
 
 
@@ -120,9 +120,10 @@ def attention_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
     q = qkv_proj_rope(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -240,7 +241,7 @@ def golden_attention_swa(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
-    from decode_qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_attn_norm, golden_qkv_proj_rope
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -281,9 +282,9 @@ def golden_attention_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
-        "x": x_mixed,
-        "norm_w": tensors["attn_norm_w"],
+        "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],

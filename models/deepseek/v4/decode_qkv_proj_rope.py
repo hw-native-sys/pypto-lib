@@ -46,25 +46,14 @@ KV_ROPE_T_TILE = 32
 
 
 @pl.jit.inline
-def qkv_proj_rope(
+def attn_norm(
     x: pl.Tensor[[B, S, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
-    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
-    rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    qr: pl.Tensor[[T, Q_LORA], pl.INT8],
-    qr_scale: pl.Tensor[[T, 1], pl.FP32],
+    x_normed: pl.Tensor[[B, S, D], pl.BF16],
 ):
     x_flat = pl.reshape(x, [T, D])
+    x_normed_flat = pl.reshape(x_normed, [T, D])
 
-    token_x_bf16 = pl.create_tensor([T, D], dtype=pl.BF16)
     for tg_idx in pl.spmd(T // T_TILE, name_hint="attn_norm"):
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -78,8 +67,32 @@ def qkv_proj_rope(
             apply_d0 = apply_db * D_TILE
             apply_x_chunk = pl.cast(x_flat[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
             norm_w_chunk = pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE])
-            x_normed = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            token_x_bf16[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(x_normed, target_type=pl.BF16, mode="rint")
+            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
+            x_normed_flat[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
+                x_normed_chunk, target_type=pl.BF16, mode="rint"
+            )
+
+    x_normed = pl.reshape(x_normed_flat, [B, S, D])
+    return x_normed
+
+
+@pl.jit.inline
+def qkv_proj_rope(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T, 1], pl.FP32],
+):
+    token_x_bf16 = pl.reshape(x, [T, D])
 
     qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
     for qbg_idx in pl.spmd((Q_LORA // Q_LORA_TILE) // 2, name_hint="qr_proj_matmul"):
@@ -312,9 +325,10 @@ def qkv_proj_rope_test(
     qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
 ):
+    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = attn_norm(x, norm_w, x_normed)
     q = qkv_proj_rope(
-        x,
-        norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -331,12 +345,22 @@ def qkv_proj_rope_test(
     return q
 
 
+def golden_attn_norm(x, norm_w):
+    import torch
+
+    x = x.float()
+    norm_w = norm_w.float()
+    inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
+    return (x * inv * norm_w).to(torch.bfloat16)
+
+
 def golden_qkv_proj_rope(tensors):
-    """Torch reference: attn_norm fused, then Q/KV LoRA + RoPE (model.py 692, 495-504)."""
+    """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
 
     x = tensors["x"].float()
-    norm_w = tensors["norm_w"].float()
+    if "norm_w" in tensors:
+        x = golden_attn_norm(x, tensors["norm_w"]).float()
     wq_a = tensors["wq_a"].float()
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
@@ -378,8 +402,7 @@ def golden_qkv_proj_rope(tensors):
         y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
         return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
 
-    # attn_norm fused (model.py:692)
-    token_x = rms_norm(x.view(T, D), norm_w)                        # [T, D]
+    token_x = x.view(T, D)
 
     # Q path
     qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]

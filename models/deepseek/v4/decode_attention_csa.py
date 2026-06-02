@@ -42,7 +42,7 @@ from decode_compressor_ratio4 import compressor
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
-from decode_qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import attn_norm, qkv_proj_rope
 from decode_sparse_attn import sparse_attn
 
 B = DECODE_BATCH
@@ -213,9 +213,10 @@ def attention_csa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
     q = qkv_proj_rope(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -245,7 +246,7 @@ def attention_csa(
 
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     cmp_out, compress_state, cmp_kv = compressor(
-        x_mixed,
+        x_normed,
         cmp_out,
         compress_state,
         compress_state_block_table,
@@ -264,7 +265,7 @@ def attention_csa(
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
     idx_score_unused, idx_kv_cache, idx_topk_full = indexer(
-        x_mixed,
+        x_normed,
         qr,
         qr_scale,
         idx_wq_b,
@@ -424,7 +425,7 @@ def golden_attention_csa(tensors):
     from decode_compressor_ratio4 import golden_compressor
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
-    from decode_qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_attn_norm, golden_qkv_proj_rope
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -459,9 +460,9 @@ def golden_attention_csa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr_i8 = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
-        "x": x_mixed,
-        "norm_w": tensors["attn_norm_w"],
+        "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -493,7 +494,7 @@ def golden_attention_csa(tensors):
 
     cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     golden_compressor({
-        "x": x_mixed,
+        "x": x_normed,
         "kv": cmp_out,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
@@ -512,7 +513,7 @@ def golden_attention_csa(tensors):
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
     idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
     golden_indexer({
-        "x": x_mixed,
+        "x": x_normed,
         "qr": qr_i8,
         "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],

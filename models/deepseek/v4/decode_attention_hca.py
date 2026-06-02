@@ -27,7 +27,7 @@ from config import (
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
-from decode_qkv_proj_rope import qkv_proj_rope
+from decode_qkv_proj_rope import attn_norm, qkv_proj_rope
 from decode_compressor_ratio128 import compressor
 from decode_sparse_attn import sparse_attn
 
@@ -161,9 +161,10 @@ def attention_hca(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)        # unused on HCA path
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
     q = qkv_proj_rope(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -192,7 +193,7 @@ def attention_hca(
 
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     cmp_kv_proj, compress_state, cmp_kv = compressor(
-        x_mixed,
+        x_normed,
         cmp_kv_proj,
         compress_state,
         compress_state_block_table,
@@ -310,7 +311,7 @@ def golden_attention_hca(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
-    from decode_qkv_proj_rope import golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_attn_norm, golden_qkv_proj_rope
     from decode_compressor_ratio128 import golden_compressor
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
@@ -360,9 +361,9 @@ def golden_attention_hca(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
-        "x": x_mixed,
-        "norm_w": tensors["attn_norm_w"],
+        "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -400,7 +401,7 @@ def golden_attention_hca(tensors):
 
     cmp_kv_proj = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     golden_compressor({
-        "x": x_mixed,
+        "x": x_normed,
         "kv": cmp_kv_proj,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
