@@ -20,7 +20,12 @@ import pypto.language as pl
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
-from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
+from prefill_qkv_proj_rope import (
+    golden_prefill_attn_norm,
+    golden_prefill_qkv_proj_rope,
+    prefill_attn_norm,
+    prefill_qkv_proj_rope_core,
+)
 from prefill_sparse_attn import golden_prefill_sparse_attn, prefill_sparse_attn
 
 
@@ -261,8 +266,6 @@ def prefill_attention_swa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
-    odd_select_t: pl.Tensor[[ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], pl.BF16],
     even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -295,17 +298,16 @@ def prefill_attention_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = prefill_attn_norm(x_mixed, attn_norm_w, x_normed)
     q, kv, qr, qr_scale = prefill_qkv_proj_rope_core(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
         wkv,
         freqs_cos,
         freqs_sin,
-        even_select_t,
-        odd_select_t,
         gamma_cq,
         gamma_ckv,
         q,
@@ -431,9 +433,9 @@ def golden_prefill_attention_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
+    x_normed = golden_prefill_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_prefill_qkv_proj_rope({
-        "x": x_mixed,
-        "norm_w": tensors["attn_norm_w"],
+        "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -559,16 +561,6 @@ def build_tensor_specs(start_pos: int = START_POS):
         return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
     def init_freqs_sin():
         return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
-    def init_even_select_t():
-        m = torch.zeros((ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM))
-        for i in range(ROPE_HEAD_DIM // 2):
-            m[i, 2 * i] = 1
-        return m
-    def init_odd_select_t():
-        m = torch.zeros((ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM))
-        for i in range(ROPE_HEAD_DIM // 2):
-            m[i, 2 * i + 1] = 1
-        return m
     def init_even_select_local():
         m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
         for i in range(SPARSE_ROPE_CHUNK):
@@ -616,8 +608,6 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("even_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_even_select_t),
-        TensorSpec("odd_select_t", [ROPE_HEAD_DIM // 2, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_odd_select_t),
         TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
         TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
