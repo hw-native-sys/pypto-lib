@@ -66,6 +66,7 @@ Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 D_BLOCKS = D // D_CHUNK
 KV_BLOCKS = HEAD_DIM // KV_CHUNK
+Q_ROPE_T_BLOCKS = T // Q_ROPE_T_TILE
 
 PREFILL_START_POS = 0
 PREFILL_ROPE_BATCH_TILE = min(B, max(1, 256 // S))
@@ -266,29 +267,30 @@ def prefill_qkv_proj_rope_core(
                 q_flat[:, h0 + n0 : h0 + n0 + HEAD_CHUNK] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
     q_rope_stage_fp32 = pl.create_tensor([H * T, ROPE_DIM], dtype=pl.FP32)
-    for hg_idx in pl.spmd(H // Q_HEAD_RMS_GROUP, name_hint="prefill_q_head_rope_fused"):
+    for rope_idx in pl.spmd((H // Q_HEAD_RMS_GROUP) * Q_ROPE_T_BLOCKS, name_hint="prefill_q_head_rope_fused"):
+        hg_idx = rope_idx // Q_ROPE_T_BLOCKS
+        tg_idx = rope_idx % Q_ROPE_T_BLOCKS
         hg = hg_idx * Q_HEAD_RMS_GROUP
+        tg = tg_idx * Q_ROPE_T_TILE
         for h_inner in pl.range(Q_HEAD_RMS_GROUP):
             h = hg + h_inner
             h0 = h * HEAD_DIM
-            for tg_idx in pl.range(T // Q_ROPE_T_TILE):
-                tg = tg_idx * Q_ROPE_T_TILE
-                q_rope_inv_rms_chunk = pl.reshape(
-                    q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE],
-                    [Q_ROPE_T_TILE, 1],
-                )
-                q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
-                q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
-                q_rope_even = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_rope_odd = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-                q_rope_cos_chunk = pl.cast(rope_cos_t[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rope_sin_chunk = pl.cast(rope_sin_t[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-                q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
-                q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
-                q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-                q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
-                q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
-                q_rope_stage_fp32[h * T + tg : h * T + tg + Q_ROPE_T_TILE, :] = q_rope_buf
+            q_rope_inv_rms_chunk = pl.reshape(
+                q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE],
+                [Q_ROPE_T_TILE, 1],
+            )
+            q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
+            q_rope_norm_chunk = pl.row_expand_mul(q_rope_chunk, q_rope_inv_rms_chunk)
+            q_rope_even = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+            q_rope_odd = pl.tensor.gather(q_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+            q_rope_cos_chunk = pl.cast(rope_cos_t[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+            q_rope_sin_chunk = pl.cast(rope_sin_t[tg : tg + Q_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+            q_rot_even = pl.sub(pl.mul(q_rope_even, q_rope_cos_chunk), pl.mul(q_rope_odd, q_rope_sin_chunk))
+            q_rot_odd = pl.add(pl.mul(q_rope_even, q_rope_sin_chunk), pl.mul(q_rope_odd, q_rope_cos_chunk))
+            q_rope_buf = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+            q_rope_buf = pl.tensor.scatter(q_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=q_rope_buf)
+            q_rope_buf = pl.tensor.scatter(q_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=q_rope_buf)
+            q_rope_stage_fp32[h * T + tg : h * T + tg + Q_ROPE_T_TILE, :] = q_rope_buf
 
     for hg_idx in pl.spmd(H // HEAD_GROUP, name_hint="prefill_q_rope_writeback"):
         hg = hg_idx * HEAD_GROUP
@@ -338,33 +340,32 @@ def prefill_qkv_proj_rope_core(
             kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
             kv[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_CHUNK] = pl.cast(kv_normed, target_type=pl.BF16, mode="rint")
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_rope_fused"):
+    for tg_idx in pl.spmd(T // KV_ROPE_T_TILE, name_hint="prefill_kv_rope_fused"):
+        tg = tg_idx * KV_ROPE_T_TILE
         gamma_rope = pl.reshape(
             pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32),
             [1, ROPE_DIM],
         )
-        for tg_idx in pl.range(T // KV_ROPE_T_TILE):
-            tg = tg_idx * KV_ROPE_T_TILE
-            kv_rope_inv_rms_chunk = pl.reshape(
-                kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE],
-                [KV_ROPE_T_TILE, 1],
-            )
-            kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
-            kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
-            kv_rope_even = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-            kv_rope_odd = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
-            kv_rope_cos_chunk = pl.cast(rope_cos_t[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-            kv_rope_sin_chunk = pl.cast(rope_sin_t[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
-            kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
-            kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
-            kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
-            kv_rope_buf = pl.tensor.scatter(kv_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=kv_rope_buf)
-            kv_rope_buf = pl.tensor.scatter(kv_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=kv_rope_buf)
-            kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
-                kv_rope_buf,
-                target_type=pl.BF16,
-                mode="rint",
-            )
+        kv_rope_inv_rms_chunk = pl.reshape(
+            kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE],
+            [KV_ROPE_T_TILE, 1],
+        )
+        kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
+        kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
+        kv_rope_even = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+        kv_rope_odd = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+        kv_rope_cos_chunk = pl.cast(rope_cos_t[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+        kv_rope_sin_chunk = pl.cast(rope_sin_t[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
+        kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))
+        kv_rot_odd = pl.add(pl.mul(kv_rope_even, kv_rope_sin_chunk), pl.mul(kv_rope_odd, kv_rope_cos_chunk))
+        kv_rope_buf = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        kv_rope_buf = pl.tensor.scatter(kv_rot_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=kv_rope_buf)
+        kv_rope_buf = pl.tensor.scatter(kv_rot_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=kv_rope_buf)
+        kv[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
+            kv_rope_buf,
+            target_type=pl.BF16,
+            mode="rint",
+        )
     return q, kv, qr, qr_scale
 
 
