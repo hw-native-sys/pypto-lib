@@ -61,12 +61,17 @@ assert (Q_LORA // Q_LORA_TILE) % QR_PROJ_GROUP == 0, \
     "Q_BLOCKS must be divisible by QR_PROJ_GROUP"
 assert (HEAD_DIM // KV_CHUNK) % KV_PROJ_SPMD_GROUP == 0, \
     "KV_BLOCKS must be divisible by KV_PROJ_SPMD_GROUP"
+assert T % Q_ROPE_T_TILE == 0, \
+    "T must be divisible by Q_ROPE_T_TILE"
+assert T % KV_ROPE_T_TILE == 0, \
+    "T must be divisible by KV_ROPE_T_TILE"
 Q_BLOCKS = Q_LORA // Q_LORA_TILE
 Q_PROJ_BLOCKS = Q_LORA // Q_PROJ_CHUNK
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 D_BLOCKS = D // D_CHUNK
 KV_BLOCKS = HEAD_DIM // KV_CHUNK
 Q_ROPE_T_BLOCKS = T // Q_ROPE_T_TILE
+KV_ROPE_T_BLOCKS = T // KV_ROPE_T_TILE
 
 PREFILL_START_POS = 0
 PREFILL_ROPE_BATCH_TILE = min(B, max(1, 256 // S))
@@ -340,7 +345,7 @@ def prefill_qkv_proj_rope_core(
             kv_normed = pl.col_expand_mul(pl.row_expand_mul(kv_chunk, kv_inv_rms_t), gamma_kv_chunk)
             kv[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_CHUNK] = pl.cast(kv_normed, target_type=pl.BF16, mode="rint")
 
-    for tg_idx in pl.spmd(T // KV_ROPE_T_TILE, name_hint="prefill_kv_rope_fused"):
+    for tg_idx in pl.spmd(KV_ROPE_T_BLOCKS, name_hint="prefill_kv_rope_fused"):
         tg = tg_idx * KV_ROPE_T_TILE
         gamma_rope = pl.reshape(
             pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32),
