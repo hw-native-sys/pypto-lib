@@ -497,6 +497,8 @@ if __name__ == "__main__":
         # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
         rtol=5e-3,
         atol=5e-3,
+        # Precision reference: pypto mla_prolog —
+        # cann-recipes-infer/ops/pypto_python/example/test_mla_prolog_pypto.py
         compare_fn={
             "q":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "kv":       ratio_allclose(atol=1e-4, rtol=1.0 / 128),

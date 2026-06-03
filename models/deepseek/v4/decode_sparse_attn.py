@@ -36,7 +36,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 0
+DEFAULT_COMPRESS_RATIO = 128
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
@@ -180,6 +180,7 @@ def sparse_attn(
         m_win_v = pl.min(WIN, m_seq_len)
         m_tk_v = pl.min(IDX_TOPK, m_seq_len - m_win_v)
         m_sparse_k = m_win_v + m_tk_v
+        m_num_tiles = (m_sparse_k + ATTN_K_TILE - 1) // ATTN_K_TILE
         m_token_base = m_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
         for m_h_idx in pl.range((H // H_TILE)):
@@ -189,7 +190,8 @@ def sparse_attn(
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-            for m_sb in pl.range(1, ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+            # Bound the merge by the actual number of occupied K-tiles.
+            for m_sb in pl.range(1, m_num_tiles):
                 m_s0 = m_sb * ATTN_K_TILE
                 if m_s0 < m_sparse_k:
                     m_row = m_blk_base + m_sb * H_TILE
@@ -218,13 +220,7 @@ def sparse_attn(
                 n_col = n_hh * HEAD_DIM
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
-    # Inverse RoPE: gather even/odd lanes (HW native TGATHER<mask>) for de-interleave,
-    # rotate with cos/sin, then mask-form scatter (TSCATTER<mask>) re-interleaves back
-    # to interleaved layout — the exact inverse of the gathers, mirroring
-    # decode_qkv_proj_rope's gather-rotate-scatter. An earlier *index-form* scatter
-    # (hand-built even/odd index tiles) caused ~11% attn_out precision FAIL; mask-form
-    # drops those index tiles and the intermediate BF16 round-trip entirely.
-    # Note: mask-form scatter is A3/sim only — A5 rejects it.
+    # Inverse RoPE
     rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
         r_t0 = r_idx * ROPE_TOKEN_TILE
@@ -242,16 +238,8 @@ def sparse_attn(
                 r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_even_rot = pl.add(pl.col_expand_mul(r_even, r_cos), pl.col_expand_mul(r_odd, r_sin))
                 r_odd_rot = pl.sub(pl.col_expand_mul(r_odd, r_cos), pl.col_expand_mul(r_even, r_sin))
-                # Match golden's BF16 round-trip on the rotated values (golden does
-                # `.to(bfloat16).float()` after the rotation, which the original NPU
-                # matmul reassemble matched by casting BF16 before the matmul).
-                # Without this, FP32-only output exceeds the precision tolerance.
                 r_even_rot = pl.cast(pl.cast(r_even_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
                 r_odd_rot = pl.cast(pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
-
-                # Re-interleave via mask-form scatter: write the FP32 rotated even/odd
-                # halves into the interleaved columns selected by the P0101/P1010 mask
-                # (inverse of the gathers above). One buffer, no add, no BF16 round-trip.
                 r_rope_buf = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
                 r_rope_buf = pl.tensor.scatter(r_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_rope_buf)
                 r_rope_buf = pl.tensor.scatter(r_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_rope_buf)
@@ -527,6 +515,7 @@ def golden_sparse_attn(tensors):
 def build_tensor_specs(
     compress_ratio: int = DEFAULT_COMPRESS_RATIO,
     causal_regression_fixture: bool = False,
+    seqused=None,
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
@@ -590,7 +579,36 @@ def build_tensor_specs(
         return indices
 
     def init_seqused_kv():
-        """Expose the demo sequence-used length that matches the chosen ratio mode."""
+        """Per-batch sparse length. ratio-128 and ratio-0 use per-row coverage
+        patterns (ratio-0 stays <= WIN as it has no compressed tail); both
+        exercise partial window (seq<WIN), the single/multi tile boundary, and
+        full attention. --seqused N overrides with one homogeneous length;
+        ratio-4 keeps the homogeneous full length."""
+        if seqused is not None:
+            return torch.full((B,), seqused, dtype=torch.int32)
+        if compress_ratio == 128:
+            # 11  : partial window, sub-tile (<ATTN_K_TILE), 0 cmp
+            # 50  : partial window, ~1.5 tiles, 0 cmp
+            # WIN : exactly the window boundary, 0 cmp
+            # WIN+1            : full window + 1 cmp (partial cmp tile)
+            # WIN+ATTN_K_TILE  : full window + a full cmp tile (tile boundary)
+            # sparse_k         : full window + full cmp tail (the legacy point)
+            pattern = torch.tensor(
+                [11, 50, WIN, WIN + 1, WIN + ATTN_K_TILE, sparse_k],
+                dtype=torch.int32,
+            )
+            return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+        if compress_ratio == 0:
+            # Pure SWA (no compressed tail), all <= WIN:
+            # 11             : single tile (seq <= ATTN_K_TILE)
+            # ATTN_K_TILE+1  : single/multi-tile boundary (seq_used {32, 33})
+            # WIN // 2       : multi-tile partial window
+            # WIN            : full window
+            pattern = torch.tensor(
+                [11, ATTN_K_TILE + 1, WIN // 2, WIN],
+                dtype=torch.int32,
+            )
+            return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
         return torch.full((B,), sparse_k, dtype=torch.int32)
 
     def init_cos():
@@ -650,13 +668,16 @@ if __name__ == "__main__":
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
                         help="Amplify the S=2 future-window-slot regression; use with --compress-ratio 0.")
+    parser.add_argument("--seqused", type=int, default=None,
+                        help="Override per-batch sparse length with one homogeneous value "
+                             "(ratio-128 default is a per-row coverage pattern).")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
     result = run_jit(
         fn=sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.causal_regression_fixture),
+        specs=build_tensor_specs(args.compress_ratio, args.causal_regression_fixture, args.seqused),
         golden_fn=golden_sparse_attn,
         runtime_cfg=dict(
             platform=args.platform,
@@ -666,6 +687,8 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
+        # Precision reference: AscendC npu_sparse_attn_sharedkv —
+        # ops-transformer/experimental/attention/sparse_attn_sharedkv/tests/pytest/result_compare_method.py
         compare_fn={
             "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },

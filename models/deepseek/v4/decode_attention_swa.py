@@ -53,7 +53,6 @@ TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
-START_POS = 127      # full-window decode fixture; SWA has no compression constraint
 
 # tiling
 SPARSE_ROPE_TILE = 16
@@ -353,7 +352,7 @@ def golden_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import TensorSpec
 
@@ -417,9 +416,15 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_attn_sink():
         return torch.zeros(H)
     def init_start_pos():
-        if not hetero_start_pos:
+        if start_pos is not None:
             return torch.full((B,), start_pos, dtype=torch.int32)
-        pattern = torch.tensor([start_pos, max(start_pos - 1, 0)], dtype=torch.int32)
+        # Per-row start_pos -> seqused_kv = min(start_pos + S, WIN). Values span
+        # the sliding-window regimes (K-tile = 32 inside sparse_attn):
+        #   9      -> seqused 11   (single tile, seq <= 32)
+        #   31     -> seqused 33   (single/multi-tile boundary)
+        #   62     -> seqused 64   (multi-tile partial window)
+        #   WIN-1  -> seqused WIN  (full window, slot wraparound 127/0)
+        pattern = torch.tensor([9, 31, 62, WIN - 1], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
     def init_seqused_kv():
         seq = init_start_pos().to(torch.int64) + S
@@ -462,21 +467,21 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use per-row start_pos values in the standalone fixture.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="If set, use this single start_pos for all batches; "
+                             "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_swa_test,
-        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_swa,
         runtime_cfg=dict(
             platform=args.platform,
@@ -486,7 +491,9 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
+            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
+            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
         },
     )
     if not result.passed:

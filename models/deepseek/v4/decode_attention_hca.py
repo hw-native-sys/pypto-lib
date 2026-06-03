@@ -72,9 +72,6 @@ COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
-# Default fixture is a post-window non-compression step. The --start-pos fixture
-# option covers post-window no-compression/aligned/boundary positions.
-START_POS = 128
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
@@ -447,7 +444,7 @@ def golden_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import TensorSpec
 
@@ -536,9 +533,21 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_attn_sink():
         return torch.zeros(H)
     def init_start_pos():
-        if not hetero_start_pos:
+        if start_pos is not None:
             return torch.full((B,), start_pos, dtype=torch.int32)
-        pattern = torch.tensor([start_pos, max(start_pos - 1, 0)], dtype=torch.int32)
+        # Default per-batch pattern spans both HCA coverage axes at once: the
+        # sparse length / #compressed blocks (via seqused_kv) and the inner
+        # compressor branch. Values yield sparse regimes {pre-window (single
+        # K-tile), WIN boundary, 1/1/2/3 cmp blocks} and compressor branches
+        # {no-compress, aligned, crossing} across the first three blocks.
+        pattern = torch.tensor([
+            10,
+            COMPRESS_RATIO - S,
+            COMPRESS_RATIO - 1,
+            COMPRESS_RATIO,
+            COMPRESS_RATIO * 2 - S,
+            COMPRESS_RATIO * 3 - 1,
+        ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
     def init_seqused_kv():
         # sparse_attn derives per-token causal lengths from this final sparse length.
@@ -591,22 +600,21 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Decode start position for no-compression/aligned/crossing coverage.")
-    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use per-row start_pos values in the standalone fixture.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="If set, use this single start_pos for all batches; "
+                             "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_hca_test,
-        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_hca,
         runtime_cfg=dict(
             platform=args.platform,
@@ -615,7 +623,9 @@ if __name__ == "__main__":
         ),
         atol=1e-2,
         compare_fn={
-            "x_out": ratio_allclose(atol=3e-3, rtol=2.0 / 128),
+            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
+            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
+            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
         },
         rtol=1e-2,
     )

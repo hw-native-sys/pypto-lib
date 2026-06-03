@@ -338,6 +338,8 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
+        # Precision reference: pypto hc_pre —
+        # cann-recipes-infer/ops/pypto_python/example/test_hc_pre_pypto.py
         compare_fn={
             "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
