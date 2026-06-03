@@ -19,13 +19,12 @@ S = 128
 START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 PREFILL_ROWS = B * PREFILL_COMPRESSED_LEN
-HEAD_CHUNK = 32 if B * S >= 64 else 128
+HEAD_CHUNK = 256
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_CHUNK = 512
 OUT_CHUNK = 32
 HEAD_TILE = 64
 RMS_TILE = 16
-OVERLAP_SLOTS = 2 * COMPRESS_RATIO
 
 @pl.jit.inline
 def prefill_compressor_ratio4(
@@ -49,8 +48,6 @@ def prefill_compressor_ratio4(
     score_state_flat = pl.reshape(score_state, [B, STATE_LEN * OUT_DIM])
     kv_flat = pl.reshape(kv, [B * PREFILL_COMPRESSED_LEN, HEAD_DIM])
     kv_cache_flat = pl.reshape(kv_cache, [B * IDX_KV_LEN, HEAD_DIM])
-    kv_overlap_flat = pl.create_tensor([B * PREFILL_COMPRESSED_LEN, OVERLAP_SLOTS * HEAD_DIM], dtype=pl.FP32)
-    score_overlap_flat = pl.create_tensor([B * PREFILL_COMPRESSED_LEN, OVERLAP_SLOTS * HEAD_DIM], dtype=pl.FP32)
 
     for o0 in pl.parallel(0, OUT_DIM, OUT_CHUNK):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_kv_score_proj"):
@@ -87,93 +84,110 @@ def prefill_compressor_ratio4(
                 kv_state_flat[:, state_col0 : state_col0 + OUT_CHUNK] = kv_tile
                 score_state_flat[:, state_col0 : state_col0 + OUT_CHUNK] = score_tile
 
-    # Initialize score_overlap to -inf (front slots of position 0 stay -inf)
-    for o0 in pl.parallel(0, OVERLAP_SLOTS * HEAD_DIM, OUT_CHUNK):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_overlap_init"):
-            neg_inf_base = pl.full([B * PREFILL_COMPRESSED_LEN, OUT_CHUNK], dtype=pl.FP32, value=FP32_NEG_INF)
-            score_overlap_flat[:, o0 : o0 + OUT_CHUNK] = neg_inf_base
-            zero_base = pl.full([B * PREFILL_COMPRESSED_LEN, OUT_CHUNK], dtype=pl.FP32, value=0.0)
-            kv_overlap_flat[:, o0 : o0 + OUT_CHUNK] = zero_base
-
-    for c in pl.range(PREFILL_COMPRESSED_LEN):
-        token0 = c * COMPRESS_RATIO
-        for hb in pl.parallel(0, HEAD_BLOCKS, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_overlap_write"):
-                h0 = hb * HEAD_CHUNK
-                ape_base = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
-                # Back slots (COMPRESS_RATIO to OVERLAP_SLOTS-1): current block, columns [HEAD_DIM:OUT_DIM]
-                for s in pl.range(COMPRESS_RATIO):
-                    back_token = token0 + s
-                    slot = COMPRESS_RATIO + s
-                    col0 = slot * HEAD_DIM + h0
-                    src_col0 = HEAD_DIM + h0
-                    kv_tile = pl.reshape(
-                        kv_proj[:, back_token : back_token + 1, src_col0 : src_col0 + HEAD_CHUNK],
-                        [B, HEAD_CHUNK],
-                    )
-                    score_tile = pl.reshape(
-                        score_proj[:, back_token : back_token + 1, src_col0 : src_col0 + HEAD_CHUNK],
-                        [B, HEAD_CHUNK],
-                    )
-                    ape_tile = ape[s : s + 1, src_col0 : src_col0 + HEAD_CHUNK]
-                    score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                    kv_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK] = kv_tile
-                    score_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK] = score_tile
-
-                # Front slots (0 to COMPRESS_RATIO-1): previous block, columns [0:HEAD_DIM]
-                if c > 0:
-                    prev_token0 = token0 - COMPRESS_RATIO
-                    for s in pl.range(COMPRESS_RATIO):
-                        front_token = prev_token0 + s
-                        slot = s
-                        col0 = slot * HEAD_DIM + h0
-                        src_col0 = h0
-                        kv_tile = pl.reshape(
-                            kv_proj[:, front_token : front_token + 1, src_col0 : src_col0 + HEAD_CHUNK],
-                            [B, HEAD_CHUNK],
-                        )
-                        score_tile = pl.reshape(
-                            score_proj[:, front_token : front_token + 1, src_col0 : src_col0 + HEAD_CHUNK],
-                            [B, HEAD_CHUNK],
-                        )
-                        ape_tile = ape[s : s + 1, src_col0 : src_col0 + HEAD_CHUNK]
-                        score_tile = pl.add(score_tile, pl.col_expand(ape_base, ape_tile))
-                        kv_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK] = kv_tile
-                        score_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK] = score_tile
-
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     cache_base = start_pos // COMPRESS_RATIO
     pooled_kv_all = pl.create_tensor([PREFILL_COMPRESSED_LEN, HEAD_DIM], dtype=pl.FP32)
 
-    for c in pl.range(PREFILL_COMPRESSED_LEN):
-        pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
+    # c=0 only has current back slots; c>=1 also consumes the previous block's front slots.
+    for hb in pl.parallel(0, HEAD_BLOCKS, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_softmax_pool"):
+            h0 = hb * HEAD_CHUNK
+            pool_ape_base = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+            back_col0 = HEAD_DIM + h0
+            init_token = COMPRESS_RATIO - 1
+            mi = pl.reshape(
+                score_proj[:, init_token : init_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            oi = pl.reshape(
+                kv_proj[:, init_token : init_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            init_ape = ape[COMPRESS_RATIO - 1 : COMPRESS_RATIO, back_col0 : back_col0 + HEAD_CHUNK]
+            mi = pl.add(mi, pl.col_expand(pool_ape_base, init_ape))
+            li = pl.exp(pl.sub(mi, mi))
 
-        for hb in pl.parallel(0, HEAD_BLOCKS, 1):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_softmax_pool"):
-                h0 = hb * HEAD_CHUNK
+            for s in pl.range(0, COMPRESS_RATIO - 1):
+                back_score = pl.reshape(
+                    score_proj[:, s : s + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                    [B, HEAD_CHUNK],
+                )
+                back_kv = pl.reshape(
+                    kv_proj[:, s : s + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                    [B, HEAD_CHUNK],
+                )
+                back_ape = ape[s : s + 1, back_col0 : back_col0 + HEAD_CHUNK]
+                back_score = pl.add(back_score, pl.col_expand(pool_ape_base, back_ape))
+                mi_next = pl.maximum(mi, back_score)
+                alpha = pl.exp(pl.sub(mi, mi_next))
+                beta = pl.exp(pl.sub(back_score, mi_next))
+                li = pl.add(pl.mul(alpha, li), beta)
+                oi = pl.add(pl.mul(oi, alpha), pl.mul(back_kv, beta))
+                mi = mi_next
 
-                # Pass 1: find global max across all OVERLAP_SLOTS slots
-                col0_s0 = 0 * HEAD_DIM + h0
-                m = score_overlap_flat[c : c + B, col0_s0 : col0_s0 + HEAD_CHUNK]
-                for s in pl.range(1, OVERLAP_SLOTS):
-                    col0 = s * HEAD_DIM + h0
-                    score_s = score_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK]
-                    m = pl.maximum(m, score_s)
+            pooled_kv_all[0:B, h0 : h0 + HEAD_CHUNK] = pl.div(oi, li)
 
-                # Pass 2: compute sum(exp) and sum(kv * exp) in one sweep
-                sum_exp = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
-                weighted_kv = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
-                for s in pl.range(OVERLAP_SLOTS):
-                    col0 = s * HEAD_DIM + h0
-                    score_s = score_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK]
-                    kv_s = kv_overlap_flat[c : c + B, col0 : col0 + HEAD_CHUNK]
-                    w = pl.exp(pl.sub(score_s, m))
-                    sum_exp = pl.add(sum_exp, w)
-                    weighted_kv = pl.add(weighted_kv, pl.mul(kv_s, w))
+    for pool_idx in pl.spmd((PREFILL_COMPRESSED_LEN - 1) * HEAD_BLOCKS, name_hint="prefill_softmax_pool"):
+        c_block = pool_idx // HEAD_BLOCKS
+        c = c_block + 1
+        hb = pool_idx - c_block * HEAD_BLOCKS
+        h0 = hb * HEAD_CHUNK
+        pool_ape_base = pl.full([B, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+        token0 = c * COMPRESS_RATIO
+        back_col0 = HEAD_DIM + h0
+        init_token = token0 + COMPRESS_RATIO - 1
+        mi = pl.reshape(
+            score_proj[:, init_token : init_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+            [B, HEAD_CHUNK],
+        )
+        oi = pl.reshape(
+            kv_proj[:, init_token : init_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+            [B, HEAD_CHUNK],
+        )
+        init_ape = ape[COMPRESS_RATIO - 1 : COMPRESS_RATIO, back_col0 : back_col0 + HEAD_CHUNK]
+        mi = pl.add(mi, pl.col_expand(pool_ape_base, init_ape))
+        li = pl.exp(pl.sub(mi, mi))
 
-                pooled_kv[:, h0 : h0 + HEAD_CHUNK] = pl.div(weighted_kv, sum_exp)
+        prev_token0 = token0 - COMPRESS_RATIO
+        for s in pl.range(COMPRESS_RATIO):
+            front_token = prev_token0 + s
+            front_score = pl.reshape(
+                score_proj[:, front_token : front_token + 1, h0 : h0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            front_kv = pl.reshape(
+                kv_proj[:, front_token : front_token + 1, h0 : h0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            front_ape = ape[s : s + 1, h0 : h0 + HEAD_CHUNK]
+            front_score = pl.add(front_score, pl.col_expand(pool_ape_base, front_ape))
+            mi_next = pl.maximum(mi, front_score)
+            alpha = pl.exp(pl.sub(mi, mi_next))
+            beta = pl.exp(pl.sub(front_score, mi_next))
+            li = pl.add(pl.mul(alpha, li), beta)
+            oi = pl.add(pl.mul(oi, alpha), pl.mul(front_kv, beta))
+            mi = mi_next
 
-        pooled_kv_all = pl.assemble(pooled_kv_all, pooled_kv, [c, 0])
+        for s in pl.range(0, COMPRESS_RATIO - 1):
+            back_token = token0 + s
+            back_score = pl.reshape(
+                score_proj[:, back_token : back_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            back_kv = pl.reshape(
+                kv_proj[:, back_token : back_token + 1, back_col0 : back_col0 + HEAD_CHUNK],
+                [B, HEAD_CHUNK],
+            )
+            back_ape = ape[s : s + 1, back_col0 : back_col0 + HEAD_CHUNK]
+            back_score = pl.add(back_score, pl.col_expand(pool_ape_base, back_ape))
+            mi_next = pl.maximum(mi, back_score)
+            alpha = pl.exp(pl.sub(mi, mi_next))
+            beta = pl.exp(pl.sub(back_score, mi_next))
+            li = pl.add(pl.mul(alpha, li), beta)
+            oi = pl.add(pl.mul(oi, alpha), pl.mul(back_kv, beta))
+            mi = mi_next
+
+        pooled_kv_all[c : c + B, h0 : h0 + HEAD_CHUNK] = pl.div(oi, li)
 
     normed_kv_all = pl.create_tensor([PREFILL_COMPRESSED_LEN, HEAD_DIM], dtype=pl.FP32)
     kv_final_all = pl.create_tensor([PREFILL_COMPRESSED_LEN, HEAD_DIM], dtype=pl.FP32)
