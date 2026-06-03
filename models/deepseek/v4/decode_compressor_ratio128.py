@@ -47,7 +47,6 @@ COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
-START_POS = COMPRESS_RATIO - 1
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 
@@ -372,12 +371,7 @@ def golden_compressor(tensors):
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
 
 
-def build_tensor_specs(
-    start_pos: int = START_POS,
-    hetero_start_pos: bool = False,
-    non_contiguous_state_blocks: bool = False,
-    non_contiguous_cmp_blocks: bool = False,
-):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import TensorSpec
 
@@ -400,23 +394,38 @@ def build_tensor_specs(
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
+        # Always non-contiguous: swap logical blocks 0<->31 so the fixture
+        # validates block-table indirection rather than a contiguous layout.
         tbl = torch.arange(B * COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32).view(B, COMPRESS_STATE_MAX_BLOCKS)
-        if non_contiguous_state_blocks:
-            for b in range(B):
-                tbl[b, 0], tbl[b, 31] = tbl[b, 31].clone(), tbl[b, 0].clone()
+        for b in range(B):
+            tbl[b, 0], tbl[b, 31] = tbl[b, 31].clone(), tbl[b, 0].clone()
         return tbl
     def init_cmp_block_table():
         tbl = torch.arange(B * CMP_MAX_BLOCKS, dtype=torch.int32).view(B, CMP_MAX_BLOCKS)
-        if non_contiguous_cmp_blocks:
-            for b in range(B):
-                tbl[b, 0], tbl[b, 1] = tbl[b, 1].clone(), tbl[b, 0].clone()
+        for b in range(B):
+            tbl[b, 0], tbl[b, 1] = tbl[b, 1].clone(), tbl[b, 0].clone()
         return tbl
     def init_start_pos():
-        vals = torch.full((B,), start_pos, dtype=torch.int32)
-        if hetero_start_pos:
-            pattern = torch.tensor([0, COMPRESS_RATIO - S, COMPRESS_RATIO - 1, COMPRESS_RATIO * 2 - 1], dtype=torch.int32)
-            for b in range(B):
-                vals[b] = pattern[b % int(pattern.numel())]
+        if start_pos is not None:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        # Default per-batch pattern covers every ratio-128 decode branch:
+        #   STATE_BLK-1 : no-compress, two MTP tokens straddle the state page (size 8)
+        #   10          : no-compress, mid-window, single state page
+        #   RATIO-S     : compress, boundary on 2nd token (pre-scatter writes both)
+        #   RATIO-1     : compress, boundary on 1st token (2nd token spills to next window)
+        #   2*RATIO-S   : compress aligned in the 2nd compressed block (cache_col=1)
+        #   2*RATIO-1   : compress crossing in the 2nd block (state logical block 31->32)
+        pattern = torch.tensor([
+            COMPRESS_STATE_BLOCK_SIZE - 1,
+            10,
+            COMPRESS_RATIO - S,
+            COMPRESS_RATIO - 1,
+            COMPRESS_RATIO * 2 - S,
+            COMPRESS_RATIO * 2 - 1,
+        ], dtype=torch.int32)
+        vals = torch.empty((B,), dtype=torch.int32)
+        for b in range(B):
+            vals[b] = pattern[b % int(pattern.numel())]
         return vals
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
@@ -443,25 +452,15 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Decode start position for no-compression/aligned/crossing coverage.")
-    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use a grouped per-batch start_pos pattern.")
-    parser.add_argument("--non-contiguous-state-blocks", action=argparse.BooleanOptionalAction, default=False,
-                        help="Swap state logical blocks in the fixture to validate state block-table addressing.")
-    parser.add_argument("--non-contiguous-cmp-blocks", action=argparse.BooleanOptionalAction, default=False,
-                        help="Swap logical compressed blocks in the fixture to validate block-table addressing.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="If set, use this single start_pos for all batches; "
+                             "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=compressor_test,
-        specs=build_tensor_specs(
-            args.start_pos,
-            args.hetero_start_pos,
-            args.non_contiguous_state_blocks,
-            args.non_contiguous_cmp_blocks,
-        ),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_compressor,
         runtime_cfg=dict(
             platform=args.platform,
@@ -470,6 +469,8 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
+        # Precision reference: AscendC torch.ops.custom.compressor —
+        # ops-transformer/experimental/attention/compressor/tests/pytest/compressor_golden.py
         compare_fn={
             "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
