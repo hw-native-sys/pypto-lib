@@ -46,22 +46,19 @@ assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
 def gate(
-    x_mixed: pl.Tensor[[B, S, D], pl.BF16],
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[B, S], pl.INT64],
+    input_ids: pl.Tensor[[T], pl.INT64],
     x_norm: pl.Tensor[[T, D], pl.BF16],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    x_mixed_flat = pl.reshape(x_mixed, [T, D])
-    input_ids_flat = pl.reshape(input_ids, [T])
-
     x_norm_gate_buf = pl.create_tensor([T, D], dtype=pl.FP32)
     route_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
     biased_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
@@ -70,11 +67,11 @@ def gate(
         t0 = ob_n * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
-            rms_x = pl.cast(x_mixed_flat[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
+            rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
         inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
         for an_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
-            an_x = pl.cast(x_mixed_flat[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
+            an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
             an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_CHUNK], [1, D_CHUNK])
             an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
             an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
@@ -132,7 +129,7 @@ def gate(
             hs_vals_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.FP32, value=0.0)
             hs_idx_buf = pl.full([GATE_T_TILE, TOPK_PAD], dtype=pl.INT32, value=0)
             for hs_tt in pl.range(GATE_T_TILE):
-                hs_token = pl.cast(pl.read(input_ids_flat, [t1 + hs_tt]), pl.INDEX)
+                hs_token = pl.cast(pl.read(input_ids, [t1 + hs_tt]), pl.INDEX)
                 for hs_k in pl.range(TOPK):
                     hs_eid = pl.read(tid2eid, [hs_token, hs_k])
                     hs_epos = pl.cast(hs_eid, pl.INDEX)
@@ -198,13 +195,13 @@ gate_inline = pl.inline(gate._func)
 
 @pl.jit
 def gate_test(
-    x_mixed: pl.Tensor[[B, S, D], pl.BF16],
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[B, S], pl.INT64],
+    input_ids: pl.Tensor[[T], pl.INT64],
     x_norm: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     x_norm_i8: pl.Out[pl.Tensor[[T, D], pl.INT8]],
     x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
@@ -284,7 +281,7 @@ def build_tensor_specs(layer_id=0):
 
     def init_x_mixed():
         # Mirror post-RMSNorm activation magnitude (~ N(0, 1)).
-        return torch.randn(B, S, D)
+        return torch.randn(T, D)
     def init_norm_w():
         return torch.ones(D)
     def init_gate_w():
@@ -294,15 +291,15 @@ def build_tensor_specs(layer_id=0):
     def init_tid2eid():
         return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
     def init_input_ids():
-        return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
+        return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
     return [
-        TensorSpec("x_mixed", [B, S, D], torch.bfloat16, init_value=init_x_mixed),
+        TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
         TensorSpec("norm_w", [D], torch.float32, init_value=init_norm_w),
         TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
         TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
         ScalarSpec("layer_id", torch.int32, layer_id),
         TensorSpec("tid2eid", [VOCAB, TOPK], torch.int32, init_value=init_tid2eid),
-        TensorSpec("input_ids", [B, S], torch.int64, init_value=init_input_ids),
+        TensorSpec("input_ids", [T], torch.int64, init_value=init_input_ids),
         TensorSpec("x_norm", [T, D], torch.bfloat16, is_output=True),
         TensorSpec("x_norm_i8", [T, D], torch.int8, is_output=True),
         TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),

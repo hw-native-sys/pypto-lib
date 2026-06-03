@@ -47,38 +47,34 @@ KV_ROPE_T_TILE = 32
 
 @pl.jit.inline
 def attn_norm(
-    x: pl.Tensor[[B, S, D], pl.BF16],
+    x: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
-    x_normed: pl.Tensor[[B, S, D], pl.BF16],
+    x_normed: pl.Tensor[[T, D], pl.BF16],
 ):
-    x_flat = pl.reshape(x, [T, D])
-    x_normed_flat = pl.reshape(x_normed, [T, D])
-
     for tg_idx in pl.spmd(T // T_TILE, name_hint="attn_norm"):
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
             rms_d0 = rms_db * D_TILE
-            rms_x_chunk = pl.cast(x_flat[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
+            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
             x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
         x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
-            apply_x_chunk = pl.cast(x_flat[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
+            apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
             norm_w_chunk = pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE])
             x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed_flat[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
+            x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
                 x_normed_chunk, target_type=pl.BF16, mode="rint"
             )
 
-    x_normed = pl.reshape(x_normed_flat, [B, S, D])
     return x_normed
 
 
 @pl.jit.inline
 def qkv_proj_rope(
-    x: pl.Tensor[[B, S, D], pl.BF16],
+    x: pl.Tensor[[T, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -92,8 +88,6 @@ def qkv_proj_rope(
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
 ):
-    token_x_bf16 = pl.reshape(x, [T, D])
-
     qr_fp32 = pl.create_tensor([T, Q_LORA], dtype=pl.FP32)
     for qbg_idx in pl.spmd((Q_LORA // Q_LORA_TILE) // 2, name_hint="qr_proj_matmul"):
         qbg = qbg_idx * 2
@@ -102,7 +96,7 @@ def qkv_proj_rope(
             q_acc = pl.create_tensor([T, Q_LORA_TILE], dtype=pl.FP32)
             for db in pl.pipeline(0, D // D_TILE, stage=2):
                 qr_d0 = db * D_TILE
-                q_x_chunk_bf16 = token_x_bf16[:, qr_d0 : qr_d0 + D_TILE]
+                q_x_chunk_bf16 = x[:, qr_d0 : qr_d0 + D_TILE]
                 w_chunk = wq_a[qr_d0 : qr_d0 + D_TILE, q_a_col0 : q_a_col0 + Q_LORA_TILE]
                 if qr_d0 == 0:
                     q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
@@ -239,7 +233,7 @@ def qkv_proj_rope(
             kv_col0 = (kbg * 2 + k_inner) * KV_TILE
             for db in pl.pipeline(0, D // D_TILE, stage=2):
                 d0 = db * D_TILE
-                kv_x_chunk_bf16 = token_x_bf16[:, d0 : d0 + D_TILE]
+                kv_x_chunk_bf16 = x[:, d0 : d0 + D_TILE]
                 wkv_chunk = wkv[d0 : d0 + D_TILE, kv_col0 : kv_col0 + KV_TILE]
                 if d0 == 0:
                     kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)
@@ -304,7 +298,7 @@ def qkv_proj_rope(
 
 @pl.jit
 def qkv_proj_rope_test(
-    x: pl.Tensor[[B, S, D], pl.BF16],
+    x: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
@@ -319,7 +313,7 @@ def qkv_proj_rope_test(
     qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
 ):
-    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     x_normed = attn_norm(x, norm_w, x_normed)
     q = qkv_proj_rope(
         x_normed,
@@ -439,7 +433,7 @@ def build_tensor_specs():
         return w_i8, (1.0 / scale_quant).float()
 
     def init_x():
-        return (torch.randn(B, S, D) - 0.5)
+        return (torch.randn(T, D) - 0.5)
     def init_norm_w():
         return torch.ones(D)
     def init_wq_a():
@@ -462,7 +456,7 @@ def build_tensor_specs():
     wq_b_scale = wq_b_scale.view(H * HEAD_DIM)
 
     return [
-        TensorSpec("x",         [B, S, D],              torch.bfloat16, init_value=init_x),
+        TensorSpec("x",         [T, D],                 torch.bfloat16, init_value=init_x),
         TensorSpec("norm_w",    [D],                    torch.float32,  init_value=init_norm_w),
         TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),

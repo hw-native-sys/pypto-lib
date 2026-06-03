@@ -51,7 +51,7 @@ EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 @pl.jit.inline
 def moe(
-    x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    x_hc:           pl.Tensor[[T, HC_MULT, D],               pl.BF16],
     hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
     hc_ffn_scale:   pl.Tensor[[3],                           pl.FP32],
     hc_ffn_base:    pl.Tensor[[MIX_HC],                      pl.FP32],
@@ -59,7 +59,7 @@ def moe(
     gate_w:         pl.Tensor[[N_EXPERTS, D],                pl.FP32],
     gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
     tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    input_ids:      pl.Tensor[[T],                           pl.INT64],
     routed_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
     routed_w3:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
@@ -72,12 +72,12 @@ def moe(
     shared_w3_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
     shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
     shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
-    x_next:         pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    x_next:         pl.Tensor[[T, HC_MULT, D],               pl.BF16],
     layer_id:       pl.Scalar[pl.INT32],
 ):
-    x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    post_ffn = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
-    comb_ffn = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         x_mixed, post_ffn, comb_ffn,
@@ -123,11 +123,7 @@ def moe(
         recv_y,
     )
 
-    # ffn_out kept as [B, S, D] so hc_post consumes it without a post-write
-    # reshape — works around a codegen alias bug that resolves the reshape on
-    # the SSA-rebound output to ``routed_y_buf__rv_v2`` and trips a runtime
-    # valid_reshape numel mismatch.
-    ffn_out = pl.create_tensor([B, S, D], dtype=pl.BF16)
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
@@ -136,7 +132,7 @@ def moe(
 
 @pl.jit
 def moe_test(
-    x_hc:           pl.Tensor[[B, S, HC_MULT, D],            pl.BF16],
+    x_hc:           pl.Tensor[[T, HC_MULT, D],               pl.BF16],
     hc_ffn_fn:      pl.Tensor[[MIX_HC, HC_DIM],              pl.FP32],
     hc_ffn_scale:   pl.Tensor[[3],                           pl.FP32],
     hc_ffn_base:    pl.Tensor[[MIX_HC],                      pl.FP32],
@@ -145,7 +141,7 @@ def moe_test(
     gate_bias:      pl.Tensor[[N_EXPERTS],                   pl.FP32],
     layer_id:       pl.Scalar[pl.INT32],
     tid2eid:        pl.Tensor[[VOCAB, TOPK],                 pl.INT32],
-    input_ids:      pl.Tensor[[B, S],                        pl.INT64],
+    input_ids:      pl.Tensor[[T],                           pl.INT64],
     routed_w1:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER],    pl.FP32],
     routed_w3:      pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D],  pl.INT8],
@@ -158,7 +154,7 @@ def moe_test(
     shared_w3_scale: pl.Tensor[[MOE_INTER],                  pl.FP32],
     shared_w2:      pl.Tensor[[D, MOE_INTER],                pl.INT8],
     shared_w2_scale: pl.Tensor[[D],                          pl.FP32],
-    x_next:         pl.Out[pl.Tensor[[B, S, HC_MULT, D],     pl.BF16]],
+    x_next:         pl.Out[pl.Tensor[[T, HC_MULT, D],        pl.BF16]],
 ):
     x_next = moe(
         x_hc,
@@ -187,9 +183,9 @@ def golden_moe(tensors):
     from expert_shared import golden_expert_shared
     from combine import golden_combine
 
-    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post_t = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
-    comb_t = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
+    x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
+    post_t = torch.zeros(T, HC_MULT, dtype=torch.float32)
+    comb_t = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
     golden_hc_pre({
         "x":        tensors["x_hc"],
         "hc_fn":    tensors["hc_ffn_fn"],
@@ -265,7 +261,7 @@ def golden_moe(tensors):
         "recv_y":           recv_y,
     })
 
-    ffn_out = torch.zeros(B, S, D, dtype=torch.bfloat16)
+    ffn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_combine({
         "recv_y":            recv_y,
         "recv_token":        recv_token,
@@ -274,7 +270,7 @@ def golden_moe(tensors):
         "ffn_out":           ffn_out,
     })
 
-    x_next = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
+    x_next = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
         "x":        ffn_out,
         "residual": tensors["x_hc"],
@@ -300,7 +296,7 @@ def build_tensor_specs(layer_id=0):
         w_i8 = round_haz(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
 
-    def init_x_hc():           return torch.randn(B, S, HC_MULT, D)
+    def init_x_hc():           return torch.randn(T, HC_MULT, D)
     def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
     def init_hc_ffn_scale():   return torch.ones(3) * 0.5
     def init_hc_ffn_base():    return torch.zeros(MIX_HC)
@@ -310,7 +306,7 @@ def build_tensor_specs(layer_id=0):
     def init_tid2eid():
         return torch.randint(0, N_EXPERTS, (VOCAB, TOPK), dtype=torch.int32)
     def init_input_ids():
-        return torch.randint(0, VOCAB, (B, S), dtype=torch.int64)
+        return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
 
     w1_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
     w3_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
@@ -326,7 +322,7 @@ def build_tensor_specs(layer_id=0):
     sw2_i8, sw2_s = quant_w_per_channel_last(sw2_bf16)
 
     return [
-        TensorSpec("x_hc",          [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc",          [T, HC_MULT, D],    torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_ffn_fn",     [MIX_HC, HC_DIM],   torch.float32,  init_value=init_hc_ffn_fn),
         TensorSpec("hc_ffn_scale",  [3],                torch.float32,  init_value=init_hc_ffn_scale),
         TensorSpec("hc_ffn_base",   [MIX_HC],           torch.float32,  init_value=init_hc_ffn_base),
@@ -335,7 +331,7 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("gate_bias",     [N_EXPERTS],        torch.float32,  init_value=init_gate_bias),
         ScalarSpec("layer_id",      torch.int32,        layer_id),
         TensorSpec("tid2eid",       [VOCAB, TOPK],      torch.int32,    init_value=init_tid2eid),
-        TensorSpec("input_ids",     [B, S],             torch.int64,    init_value=init_input_ids),
+        TensorSpec("input_ids",     [T],                torch.int64,    init_value=init_input_ids),
         TensorSpec("routed_w1",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w1_i8),
         TensorSpec("routed_w1_scale",  [N_LOCAL_EXPERTS, MOE_INTER],    torch.float32, init_value=lambda: w1_s),
         TensorSpec("routed_w3",        [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8,    init_value=lambda: w3_i8),
@@ -348,7 +344,7 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("shared_w3_scale",  [MOE_INTER],                     torch.float32, init_value=lambda: sw3_s),
         TensorSpec("shared_w2",        [D, MOE_INTER],                  torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [D],                             torch.float32, init_value=lambda: sw2_s),
-        TensorSpec("x_next",        [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_next",        [T, HC_MULT, D],    torch.bfloat16, is_output=True),
     ]
 
 
