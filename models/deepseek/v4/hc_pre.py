@@ -44,13 +44,13 @@ D_TILE = 512
 
 @pl.jit.inline
 def hc_pre(
-    x: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Tensor[[B, S, D], pl.BF16],
-    post: pl.Tensor[[B, S, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    post: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
@@ -99,15 +99,13 @@ def hc_pre(
         comb_scaled = pl.mul(mixes[0:T, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], scale2)
         comb_logits = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
 
-    post_2d = pl.reshape(post, [T, HC_MULT])
     for ob in pl.spmd(T // COMB_T_TILE, name_hint="write_post"):
         t0 = ob * COMB_T_TILE
         post_tile = pl.load(post_pad, [t0, 0], [COMB_T_TILE, HC_PAD],
                             valid_shapes=[COMB_T_TILE, HC_MULT],
                             target_memory=pl.MemorySpace.Vec)
-        pl.store(post_tile, [t0, 0], post_2d)
+        pl.store(post_tile, [t0, 0], post)
 
-    comb_flat = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     for ob in pl.spmd(T // COMB_T_TILE, name_hint="comb_sinkhorn"):
         t0 = ob * COMB_T_TILE
         row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -182,12 +180,11 @@ def hc_pre(
         row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
         row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
         row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
-        pl.store(row0_out, [t0, 0 * HC_MULT], comb_flat)
-        pl.store(row1_out, [t0, 1 * HC_MULT], comb_flat)
-        pl.store(row2_out, [t0, 2 * HC_MULT], comb_flat)
-        pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
+        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
-    x_mixed_view = pl.reshape(x_mixed, [T, D])
     for ob in pl.spmd(T // T_TILE, name_hint="mix_x"):
         t0 = ob * T_TILE
         pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
@@ -207,8 +204,7 @@ def hc_pre(
             y2 = pl.row_expand_mul(x2, pre2)
             y3 = pl.row_expand_mul(x3, pre3)
             y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-            x_mixed_view[t0:t0 + T_TILE, d0:d0 + D_TILE] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
-    x_mixed = pl.reshape(x_mixed_view, [B, S, D])
+            x_mixed[t0:t0 + T_TILE, d0:d0 + D_TILE] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
     return x_mixed
 
 
@@ -220,13 +216,13 @@ hc_pre_inline = pl.inline(hc_pre._func)
 
 @pl.jit
 def hc_pre_test(
-    x: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
-    post: pl.Out[pl.Tensor[[B, S, HC_MULT], pl.FP32]],
-    comb: pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32]],
 ):
     x_mixed = hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
@@ -235,7 +231,7 @@ def golden_hc_pre(tensors):
     """Torch reference, direct port of model.py Block.hc_pre 674-682 + hc_split_sinkhorn."""
     import torch
 
-    x = tensors["x"].float()  # [B, S, hc, D]
+    x = tensors["x"].float().reshape(B, S, HC_MULT, D)  # [B, S, hc, D]
     hc_fn = tensors["hc_fn"].float()  # [mix_hc, hc*D]
     hc_scale = tensors["hc_scale"].float()  # [3]
     hc_base = tensors["hc_base"].float()  # [mix_hc]
@@ -283,9 +279,9 @@ def golden_hc_pre(tensors):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
         return rounded.view(torch.float32).to(torch.bfloat16)
 
-    tensors["x_mixed"][:] = _to_device_bf16(y)
-    tensors["post"][:] = post_t
-    tensors["comb"][:] = comb_t
+    tensors["x_mixed"][:] = _to_device_bf16(y).reshape(T, D)
+    tensors["post"][:] = post_t.reshape(T, HC_MULT)
+    tensors["comb"][:] = comb_t.reshape(T, HC_MULT * HC_MULT)
 
 
 def build_tensor_specs():
@@ -293,7 +289,7 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_x():
-        return torch.rand(B, S, HC_MULT, D) - 0.5
+        return torch.rand(T, HC_MULT, D) - 0.5
     def init_hc_fn():
         return (torch.randn(MIX_HC, HC_DIM) - 0.5) / (HC_DIM ** 0.5)
     def init_hc_scale():
@@ -302,13 +298,13 @@ def build_tensor_specs():
         return torch.zeros(MIX_HC)
 
     return [
-        TensorSpec("x", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [T, HC_MULT, D], torch.bfloat16, init_value=init_x),
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
-        TensorSpec("x_mixed", [B, S, D], torch.bfloat16, is_output=True),
-        TensorSpec("post", [B, S, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb", [B, S, HC_MULT, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("x_mixed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("comb", [T, HC_MULT * HC_MULT], torch.float32, is_output=True),
     ]
 
 

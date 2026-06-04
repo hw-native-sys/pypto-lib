@@ -26,34 +26,31 @@ HC_DIM = M.hc_dim
 
 @pl.jit.inline
 def hc_post(
-    x: pl.Tensor[[B, S, D], pl.BF16],
-    residual: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    post: pl.Tensor[[B, S, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor[[T, D], pl.BF16],
+    residual: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    post: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
-    x_flat = pl.reshape(x, [T, D])
     residual_flat = pl.reshape(residual, [T, HC_DIM])
-    post_t = pl.reshape(post, [T, HC_MULT])
-    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     y_flat = pl.reshape(y, [T, HC_DIM])
 
     for tb in pl.spmd(T // 2, name_hint="hc_post"):
         for tt in pl.range(2):
             t = tb * 2 + tt
-            x_row = pl.cast(x_flat[t : t + 1, 0:D], target_type=pl.FP32)
+            x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
             for out_h in pl.range(HC_MULT):
-                post_w = pl.read(post_t, [t, out_h])
+                post_w = pl.read(post, [t, out_h])
                 y_row = pl.mul(x_row, post_w)
                 for in_h in pl.range(HC_MULT):
-                    comb_w = pl.read(comb_t, [t, in_h * HC_MULT + out_h])
+                    comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
                     res_d = in_h * D
                     residual_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
                     y_row = pl.add(y_row, pl.mul(residual_row, comb_w))
                 y_d = out_h * D
                 y_bf16 = pl.cast(y_row, target_type=pl.BF16, mode="rint")
                 y_flat[t : t + 1, y_d : y_d + D] = y_bf16
-    y = pl.reshape(y_flat, [B, S, HC_MULT, D])
+    y = pl.reshape(y_flat, [T, HC_MULT, D])
     return y
 
 
@@ -65,11 +62,11 @@ hc_post_inline = pl.inline(hc_post._func)
 
 @pl.jit
 def hc_post_test(
-    x: pl.Tensor[[B, S, D], pl.BF16],
-    residual: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    post: pl.Tensor[[B, S, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
+    x: pl.Tensor[[T, D], pl.BF16],
+    residual: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    post: pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
     y = hc_post(x, residual, post, comb, y)
     return y
@@ -79,10 +76,10 @@ def golden_hc_post(tensors):
     """Torch reference, direct port of model.py Block.hc_post 684-687."""
     import torch
 
-    x        = tensors["x"].float()           # [B, S, D]
-    residual = tensors["residual"].float()    # [B, S, HC, D]
-    post     = tensors["post"].float()        # [B, S, HC]
-    comb     = tensors["comb"].float()        # [B, S, HC, HC]
+    x        = tensors["x"].float().reshape(B, S, D)  # [B, S, D]
+    residual = tensors["residual"].float().reshape(B, S, HC_MULT, D)  # [B, S, HC, D]
+    post     = tensors["post"].float().reshape(B, S, HC_MULT)  # [B, S, HC]
+    comb     = tensors["comb"].float().reshape(B, S, HC_MULT, HC_MULT)  # [B, S, HC, HC]
 
     y_fp32 = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
     for out_h in range(HC_MULT):
@@ -92,7 +89,7 @@ def golden_hc_post(tensors):
         y_fp32[:, :, out_h, :] = y_row
     y = y_fp32.to(torch.bfloat16)
 
-    tensors["y"][:] = y
+    tensors["y"][:] = y.reshape(T, HC_MULT, D)
 
 
 def build_tensor_specs():
@@ -100,22 +97,22 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_x():
-        return torch.randn(B, S, D) * 0.1
+        return torch.randn(T, D) * 0.1
     def init_residual():
-        return torch.randn(B, S, HC_MULT, D) * 0.1
+        return torch.randn(T, HC_MULT, D) * 0.1
     def init_post():
         p = torch.rand(B, S, HC_MULT) + 0.1
-        return p / p.sum(dim=-1, keepdim=True)
+        return (p / p.sum(dim=-1, keepdim=True)).reshape(T, HC_MULT)
     def init_comb():
         c = torch.rand(B, S, HC_MULT, HC_MULT) + 0.1
-        return c / c.sum(dim=-1, keepdim=True)
+        return (c / c.sum(dim=-1, keepdim=True)).reshape(T, HC_MULT * HC_MULT)
 
     return [
-        TensorSpec("x",        [B, S, D],                 torch.bfloat16, init_value=init_x),
-        TensorSpec("residual", [B, S, HC_MULT, D],        torch.bfloat16, init_value=init_residual),
-        TensorSpec("post",     [B, S, HC_MULT],           torch.float32,  init_value=init_post),
-        TensorSpec("comb",     [B, S, HC_MULT, HC_MULT],  torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [B, S, HC_MULT, D],        torch.bfloat16, is_output=True),
+        TensorSpec("x",        [T, D],                    torch.bfloat16, init_value=init_x),
+        TensorSpec("residual", [T, HC_MULT, D],           torch.bfloat16, init_value=init_residual),
+        TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
+        TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
+        TensorSpec("y",        [T, HC_MULT, D],           torch.bfloat16, is_output=True),
     ]
 
 

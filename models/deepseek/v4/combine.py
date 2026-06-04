@@ -32,11 +32,10 @@ def combine(
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
-    ffn_out: pl.Tensor[[B, S, D], pl.BF16],
+    ffn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     # recv_y already has the per-row routing weight applied by expert_routed,
     # so combine is a pure scatter + dense reduce (sum, no second mul).
-    ffn_out_flat = pl.reshape(ffn_out, [T, D])
 
     # [T, N_LOCAL_EXPERTS, D] scratch indexed by (token, expert). Padding
     # (t, e) slots stay zero and contribute nothing to the dense reduce.
@@ -66,7 +65,7 @@ def combine(
                 src = base + e
                 row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
                 acc = pl.add(acc, row_fp32)
-            ffn_out_flat[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            ffn_out[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
@@ -75,7 +74,7 @@ def combine_test(
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
-    ffn_out: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+    ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
     return ffn_out
@@ -100,7 +99,7 @@ def golden_combine(tensors):
     ffn_out = sh.float()
     for e in range(N_LOCAL_EXPERTS):
         ffn_out = ffn_out + routed_y_buf[:, e, :].float()
-    tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16).reshape(B, S, D)
+    tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16)
 
 
 def build_tensor_specs():
@@ -150,7 +149,7 @@ def build_tensor_specs():
         TensorSpec("recv_token", [N_LOCAL_EXPERTS, RECV_MAX], torch.int32, init_value=init_recv_token),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
         TensorSpec("sh", [T, D], torch.bfloat16, init_value=init_sh),
-        TensorSpec("ffn_out", [B, S, D], torch.bfloat16, is_output=True),
+        TensorSpec("ffn_out", [T, D], torch.bfloat16, is_output=True),
     ]
 
 
