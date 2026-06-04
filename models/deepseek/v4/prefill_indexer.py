@@ -31,6 +31,7 @@ D_CHUCK = 32
 Q_CHUCK = 128
 HEAD_ROWS = IDX_N_HEADS * 2
 HEAD_DIM_CHUCK = 32
+TOPK_TILE = 16
 
 @pl.jit.inline
 def prefill_indexer(
@@ -273,8 +274,10 @@ def prefill_indexer(
                         score_flat[t0 + s : t0 + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    for t in pl.parallel(T):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_topk"):
+    for topk_idx in pl.spmd(T // TOPK_TILE, name_hint="prefill_topk"):
+        t0 = topk_idx * TOPK_TILE
+        for ti in pl.range(TOPK_TILE):
+            t = t0 + ti
             invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
             topk_idxs_flat[t : t + 1, :] = invalid_idxs
             visible_len = (t + 1) // COMPRESS_RATIO
