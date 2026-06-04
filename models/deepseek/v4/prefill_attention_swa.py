@@ -6,13 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 prefill SWA attention.
+"""DeepSeek-V4 packed prefill SWA attention.
 
-This kernel uses the current [PREFILL_BATCH, PREFILL_SEQ] kernel shape from
-config through prefill_qkv_proj_rope. Q/KV projection is shared with
-prefill_qkv_proj_rope; SWA attention reads the previous sliding-window cache
-when `start_pos > 0`, uses current KV for keys inside this invocation, and
-writes the current KV after attention.
+The public contract is token-major packed prefill with static capacity and
+runtime active sizes. SWA consumes lowered metadata such as token_to_request,
+position_ids, slot mappings, and window-ring sparse indices.
 """
 
 import pypto.language as pl
@@ -20,19 +18,25 @@ import pypto.language as pl
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
-from prefill_qkv_proj_rope import (
-    golden_prefill_attn_norm,
-    golden_prefill_qkv_proj_rope,
-    prefill_attn_norm,
-    prefill_qkv_proj_rope_core,
+from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
+from prefill_sparse_attn import (
+    CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
+    ORI_BLOCK_NUM as SPARSE_ORI_BLOCK_NUM,
+    ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
+    PREFILL_ATTN_TILE as SPARSE_PREFILL_ATTN_TILE,
+    TOPK as SPARSE_TOPK,
+    _int8_quant_per_row,
+    _quant_w_per_channel,
+    prefill_hca_packed_sparse_attn,
 )
-from prefill_sparse_attn import golden_prefill_sparse_attn, prefill_sparse_attn
 
 
 # model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
+MAX_REQS = 2
+MAX_TOKENS = T
 EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
@@ -61,21 +65,9 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # SWA cache/topk contract. The ratio-0 path has only the sliding-window cache.
 ORI_MAX_BLOCKS = 1
 MAX_BLOCKS = ORI_MAX_BLOCKS
-BLOCK_NUM = B * MAX_BLOCKS
-SPARSE_IDX_TOPK = M.index_topk
+BLOCK_NUM = MAX_REQS * MAX_BLOCKS
 START_POS = 0
-
-# Unified prefill sparse-attn shape contract, derived from the same public config
-# as prefill_sparse_attn.py rather than imported from that module's internals.
-PREFILL_MAX_COMPRESSED = max(1, min(SPARSE_IDX_TOPK, S // 4))
-PREFILL_CORE_TOPK = WIN + SPARSE_IDX_TOPK
-PREFILL_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
-PREFILL_ORI_BLOCK_NUM = B * PREFILL_ORI_MAX_BLOCKS
-PREFILL_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
-PREFILL_CMP_BLOCK_NUM = B * PREFILL_CMP_MAX_BLOCKS
-PREFILL_ATTN_TILE = 64
-PREFILL_SPARSE_TOPK = min(PREFILL_CORE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
-PREFILL_SPARSE_PAD = ((PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE) * PREFILL_ATTN_TILE
+SWA_CMP_BLOCK_NUM = MAX_REQS * SPARSE_CMP_MAX_BLOCKS
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
@@ -92,168 +84,36 @@ LINEAR_K_BLOCKS = HC_DIM // LINEAR_K_CHUNK
 D_BLOCKS = D // D_CHUNK
 RMS_PIPE_STAGE = 1 if T >= 64 else 4
 
-# SWA + o_proj tiling.
-ATTN_HEAD_TILE = 16
-ATTN_TASK_TILE = 4
-ATTN_ONLINE_VALUE_CHUNK = 64
-SPARSE_ATTN_TILE = 64
-SPARSE_ATTN_BLOCKS = (WIN + SPARSE_ATTN_TILE - 1) // SPARSE_ATTN_TILE
 KV_CACHE_WRITE_TILE = 16
-KV_WINDOW_ROWS = T * SPARSE_ATTN_BLOCKS * SPARSE_ATTN_TILE
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
-ROPE_TOKEN_TILE = 4
-ROPE_PACK_TOKEN_TILE = 16
-ROPE_PACK_SPMD_BLOCKS = (T // ROPE_PACK_TOKEN_TILE) * O_GROUPS
-O_PROJ_T_TILE = 16
-A_K_CHUNK = 128
-A_N_CHUNK = 128
-B_K_CHUNK = 128
-B_N_CHUNK = 128
-QUANT_CHUNK = 32
-QUANT_TOKEN_TILE = 8
 
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert S <= WIN, "SWA prefill tile must not exceed the sliding-window ring size"
-assert H % ATTN_HEAD_TILE == 0, "attention head tile must divide H"
-assert T % ATTN_TASK_TILE == 0, "attention token task tile must divide prefill T"
-assert HEAD_DIM % ATTN_ONLINE_VALUE_CHUNK == 0, "online attention value chunk must divide head dim"
-assert NOPE_DIM % ATTN_ONLINE_VALUE_CHUNK == 0, "online attention chunk must split noPE/rope boundary"
-assert S % KV_CACHE_WRITE_TILE == 0, "KV cache write tile must divide prefill S tile"
-assert T % O_PROJ_T_TILE == 0, "o_proj token tile must divide prefill T"
-assert B == 1, "SWA adapter to unified prefill sparse-attn currently assumes PREFILL_BATCH == 1"
-assert PREFILL_ORI_BLOCK_NUM == BLOCK_NUM, "unified prefill sparse-attn ori cache must match SWA cache"
-assert PREFILL_ORI_MAX_BLOCKS == MAX_BLOCKS, "unified prefill sparse-attn block table must match SWA table"
+assert T % KV_CACHE_WRITE_TILE == 0, "KV cache write tile must divide packed token capacity"
+assert SPARSE_ORI_BLOCK_NUM == B * SPARSE_ORI_MAX_BLOCKS
+assert SPARSE_ORI_MAX_BLOCKS == ORI_MAX_BLOCKS
 
 
 @pl.jit.inline
-def prefill_swa_write_kv_cache(
-    kv:          pl.Tensor[[T, HEAD_DIM],                    pl.BF16],
-    kv_cache:    pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[B, MAX_BLOCKS],                  pl.INT32],
-    start_pos:   pl.Scalar[pl.INT32],
+def prefill_swa_write_kv_cache_packed(
+    kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
+    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    tile_start_pos = pl.cast(start_pos, pl.INDEX)
-
-    # Write the current prefill KV into the sliding-window ring through block_table.
-    for s0 in pl.range(0, S, KV_CACHE_WRITE_TILE):
+    for t0 in pl.parallel(0, MAX_TOKENS, KV_CACHE_WRITE_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_kv_cache_store"):
-            slot0 = (tile_start_pos + s0) % WIN
-            intra0 = slot0 % BLOCK_SIZE
-            for b in pl.range(B):
-                if intra0 + KV_CACHE_WRITE_TILE <= BLOCK_SIZE:
-                    blk_id = pl.cast(pl.read(block_table, [b, slot0 // BLOCK_SIZE]), pl.INDEX)
-                    dst_row = blk_id * BLOCK_SIZE + intra0
-                    kv_tile = pl.load(
-                        kv,
-                        [b * S + s0, 0],
-                        [KV_CACHE_WRITE_TILE, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    kv_cache_flat = pl.store(kv_tile, [dst_row, 0], kv_cache_flat)
-                else:
-                    for ds in pl.range(KV_CACHE_WRITE_TILE):
-                        slot = (tile_start_pos + s0 + ds) % WIN
-                        blk_id = pl.cast(pl.read(block_table, [b, slot // BLOCK_SIZE]), pl.INDEX)
-                        dst_row = blk_id * BLOCK_SIZE + (slot % BLOCK_SIZE)
-                        kv_row = pl.load(
-                            kv,
-                            [b * S + s0 + ds, 0],
-                            [1, HEAD_DIM],
-                            target_memory=pl.MemorySpace.Vec,
-                        )
-                        kv_cache_flat = pl.store(kv_row, [dst_row, 0], kv_cache_flat)
-
+            for dt in pl.range(KV_CACHE_WRITE_TILE):
+                t = t0 + dt
+                if t < num_tokens:
+                    dst_row = pl.cast(pl.read(ori_slot_mapping, [t]), pl.INDEX)
+                    kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv[t : t + 1, 0:HEAD_DIM]
     return pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-
-
-@pl.jit.inline
-def prefill_swa_prepare_sparse_inputs(
-    kv:                 pl.Tensor[[T, HEAD_DIM],                    pl.BF16],
-    kv_cache:           pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    block_table:        pl.Tensor[[B, MAX_BLOCKS],                  pl.INT32],
-    ori_kv:             pl.Tensor[[PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_kv:             pl.Tensor[[PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table:    pl.Tensor[[B, PREFILL_ORI_MAX_BLOCKS],      pl.INT32],
-    cmp_block_table:    pl.Tensor[[B, PREFILL_CMP_MAX_BLOCKS],      pl.INT32],
-    sparse_indices:     pl.Tensor[[T, PREFILL_CORE_TOPK],           pl.INT32],
-    start_pos:          pl.Scalar[pl.INT32],
-):
-    ori_kv_flat = pl.reshape(ori_kv, [PREFILL_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [PREFILL_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    tile_start_pos = pl.cast(start_pos, pl.INDEX)
-    hist_valid = pl.min(tile_start_pos, WIN - 1)
-    hist_start_abs = tile_start_pos - hist_valid
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_sparse_tables"):
-        pl.write(ori_block_table, [0, 0], pl.cast(0, pl.INT32))
-        pl.write(cmp_block_table, [0, 0], pl.cast(0, pl.INT32))
-
-    for s0 in pl.range(0, S, KV_CACHE_WRITE_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_prompt_kv"):
-            kv_tile = pl.load(
-                kv,
-                [s0, 0],
-                [KV_CACHE_WRITE_TILE, HEAD_DIM],
-                target_memory=pl.MemorySpace.Vec,
-            )
-            ori_kv_flat = pl.store(kv_tile, [s0, 0], ori_kv_flat)
-    ori_kv = pl.reshape(ori_kv_flat, [PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-
-    # Materialize the historical part of the sliding window as the unified
-    # sparse-attn compressed tail. Current-prompt KV remains in ori_kv.
-    for hist0 in pl.range(0, WIN, KV_CACHE_WRITE_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_history_kv"):
-            unused_row = pl.load(kv, [0, 0], [1, HEAD_DIM], target_memory=pl.MemorySpace.Vec)
-            for ds in pl.range(KV_CACHE_WRITE_TILE):
-                hist_i = hist0 + ds
-                if hist_i < hist_valid:
-                    key_abs_pos = hist_start_abs + hist_i
-                    ori_slot = key_abs_pos % WIN
-                    blk_id = pl.cast(pl.read(block_table, [0, ori_slot // BLOCK_SIZE]), pl.INDEX)
-                    cache_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
-                    hist_row = pl.load(
-                        kv_cache_flat,
-                        [cache_row, 0],
-                        [1, HEAD_DIM],
-                        target_memory=pl.MemorySpace.Vec,
-                    )
-                    cmp_kv_flat = pl.store(hist_row, [hist_i, 0], cmp_kv_flat)
-                else:
-                    cmp_kv_flat = pl.store(unused_row, [hist_i, 0], cmp_kv_flat)
-
-    cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-
-    # Build per-token causal SWA indices in the unified prefill convention:
-    # raw < S reads current prompt KV, raw >= S reads the historical tail above.
-    for idx_t0 in pl.parallel(0, T, ATTN_TASK_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_sparse_indices"):
-            for idx_dt in pl.range(ATTN_TASK_TILE):
-                idx_t = idx_t0 + idx_dt
-                idx_s = idx_t % S
-                abs_pos = tile_start_pos + idx_s
-                window_valid = pl.min(WIN, abs_pos + 1)
-                key_start_abs = abs_pos + 1 - window_valid
-                # The unified core reads the padded prefix, so clear every consumed slot first.
-                for pad_i in pl.range(PREFILL_SPARSE_PAD):
-                    pl.write(sparse_indices, [idx_t, pad_i], pl.cast(-1, pl.INT32))
-                for key_i in pl.range(WIN):
-                    if key_i < window_valid:
-                        key_abs_pos = key_start_abs + key_i
-                        if key_abs_pos >= tile_start_pos:
-                            raw_idx = key_abs_pos - tile_start_pos
-                        else:
-                            raw_idx = S + key_abs_pos - hist_start_abs
-                        pl.write(sparse_indices, [idx_t, key_i], pl.cast(raw_idx, pl.INT32))
-
-    return ori_kv, cmp_kv, ori_block_table, cmp_block_table, sparse_indices
 
 
 @pl.jit
 def prefill_attention_swa(
-    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -266,25 +126,28 @@ def prefill_attention_swa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    even_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
-    odd_select_local: pl.Tensor[[SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], pl.BF16],
     kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    block_table: pl.Tensor[[B, MAX_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[MAX_REQS, MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[B, S, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Scalar[pl.INT32],
+    x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
+    x_hc_rect = pl.create_tensor([B, S, HC_MULT, D], dtype=pl.BF16)
+    x_hc_rect = pl.reshape(x_hc, [B, S, HC_MULT, D])
     x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     post = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
     x_mixed, post, comb = prefill_hc_pre(
-        x_hc,
+        x_hc_rect,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
@@ -298,10 +161,11 @@ def prefill_attention_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    x_normed = prefill_attn_norm(x_mixed, attn_norm_w, x_normed)
-    q, kv, qr, qr_scale = prefill_qkv_proj_rope_core(
-        x_normed,
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    q, kv, qr, qr_scale = prefill_packed_qkv_proj_rope_core(
+        x_mixed,
+        attn_norm_w,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -314,72 +178,47 @@ def prefill_attention_swa(
         kv,
         qr,
         qr_scale,
-        start_pos,
-    )
-
-    # Gather the RoPE rows used later to undo RoPE on the attention output.
-    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for b in pl.range(B):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_rope_rows"):
-            pos = pl.cast(start_pos, pl.INDEX)
-            cos_rows = pl.slice(freqs_cos, [S, ROPE_HEAD_DIM], [pos, 0])
-            sin_rows = pl.slice(freqs_sin, [S, ROPE_HEAD_DIM], [pos, 0])
-            rope_cos_t = pl.assemble(rope_cos_t, cos_rows, [b * S, 0])
-            rope_sin_t = pl.assemble(rope_sin_t, sin_rows, [b * S, 0])
-
-    # SWA attention now feeds the unified prefill sparse-attn core. The SWA
-    # orchestration still owns sliding-window history materialization and cache
-    # writeback.
-    ori_kv = pl.create_tensor([PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_kv = pl.create_tensor([PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    ori_block_table = pl.create_tensor([B, PREFILL_ORI_MAX_BLOCKS], dtype=pl.INT32)
-    cmp_block_table = pl.create_tensor([B, PREFILL_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    sparse_indices = pl.create_tensor([T, PREFILL_CORE_TOPK], dtype=pl.INT32)
-    ori_kv, cmp_kv, ori_block_table, cmp_block_table, sparse_indices = prefill_swa_prepare_sparse_inputs(
-        kv,
-        kv_cache,
-        block_table,
-        ori_kv,
-        cmp_kv,
-        ori_block_table,
-        cmp_block_table,
-        sparse_indices,
-        start_pos,
-    )
-
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn(
-        q,
-        ori_kv,
-        ori_block_table,
-        cmp_kv,
-        cmp_block_table,
-        sparse_indices,
-        attn_sink,
-        seqused_kv,
         rope_cos_t,
         rope_sin_t,
-        even_select_local,
-        odd_select_local,
+        position_ids,
+    )
+
+    kv_cache = prefill_swa_write_kv_cache_packed(kv, kv_cache, ori_slot_mapping, num_tokens)
+    cmp_kv = pl.create_tensor([SWA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_block_table = pl.create_tensor([MAX_REQS, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    attn_out = prefill_hca_packed_sparse_attn(
+        q,
+        kv_cache,
+        block_table,
+        cmp_kv,
+        cmp_block_table,
+        cmp_sparse_indices,
+        attn_sink,
+        token_to_request,
+        num_tokens,
+        rope_cos_t,
+        rope_sin_t,
         wo_a,
         wo_b,
         wo_b_scale,
         attn_out,
     )
-    kv_cache = prefill_swa_write_kv_cache(kv, kv_cache, block_table, start_pos)
 
     # create_tensor seeds static metadata required by the JIT for hc_post input.
     attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
     attn_out_3d = pl.reshape(attn_out, [B, S, D])
+    x_out_rect = pl.create_tensor([B, S, HC_MULT, D], dtype=pl.BF16)
+    x_out_rect = pl.reshape(x_out, [B, S, HC_MULT, D])
     x_out = prefill_hc_post(
         attn_out_3d,
-        x_hc,
+        x_hc_rect,
         post,
         comb,
-        x_out,
+        x_out_rect,
     )
-    return kv_cache, x_out
+    return kv_cache, pl.reshape(x_out, [MAX_TOKENS, HC_MULT, D])
 
 
 def _quant_w_per_output_channel(w):
@@ -406,15 +245,157 @@ def _quant_w_per_row(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def golden_prefill_attention_swa(tensors):
-    """Torch reference for the official SWA prefill branch."""
+def _golden_swa_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale):
     import torch
 
+    x = x_mixed.float()
+    norm_w = tensors["attn_norm_w"].float()
+    wq_a = tensors["wq_a"].float()
+    wq_b = tensors["wq_b"]
+    wq_b_scale = tensors["wq_b_scale"].float().view(-1)
+    wkv = tensors["wkv"].float()
+    freqs_cos = tensors["freqs_cos"]
+    freqs_sin = tensors["freqs_sin"]
+    gamma_cq = tensors["gamma_cq"].float()
+    gamma_ckv = tensors["gamma_ckv"].float()
+    positions = tensors["position_ids"].to(torch.long)
+    rope_cos_flat = freqs_cos.index_select(0, positions).contiguous()
+    rope_sin_flat = freqs_sin.index_select(0, positions).contiguous()
+
+    def rms_norm(v, gamma, eps=EPS):
+        inv = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
+        return v * inv * gamma
+
+    def matmul_bf16_input_fp32(a, b):
+        return torch.matmul(a.to(torch.bfloat16).float(), b.to(torch.bfloat16).float()).float()
+
+    def apply_rope(x_rope, cos, sin):
+        x_pair = x_rope.unflatten(-1, (-1, 2))
+        x_even, x_odd = x_pair[..., 0], x_pair[..., 1]
+        cos_v = cos[..., :ROPE_HALF]
+        sin_v = sin[..., :ROPE_HALF]
+        while cos_v.ndim < x_even.ndim:
+            cos_v = cos_v.unsqueeze(-2)
+            sin_v = sin_v.unsqueeze(-2)
+        y_even = (x_even * cos_v - x_odd * sin_v).to(torch.bfloat16)
+        y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
+        return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
+
+    token_x = rms_norm(x.reshape(T, D), norm_w)
+    qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)
+    qr_i8, qr_scale_out = _int8_quant_per_row(qr_out.to(torch.bfloat16).float())
+    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
+    q_full = (q_i32.float() * qr_scale_out * wq_b_scale.view(1, -1)).view(T, H, HEAD_DIM)
+    q_full = q_full * torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
+    q_nope = q_full[..., :NOPE_DIM]
+    q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos_flat, rope_sin_flat)
+    q_out = torch.cat([q_nope, q_rope], dim=-1)
+
+    kv_full = rms_norm(matmul_bf16_input_fp32(token_x, wkv), gamma_ckv)
+    kv_nope = kv_full[..., :NOPE_DIM]
+    kv_rope_in = kv_full[..., NOPE_DIM:].unsqueeze(1)
+    kv_rope = apply_rope(kv_rope_in, rope_cos_flat, rope_sin_flat).squeeze(1)
+    kv_out = torch.cat([kv_nope, kv_rope], dim=-1)
+
+    q[:] = q_out.to(torch.bfloat16)
+    kv[:] = kv_out.to(torch.bfloat16)
+    qr[:] = qr_i8
+    qr_scale[:] = qr_scale_out
+
+
+def _golden_swa_packed_sparse_attn(tensors, q, ori_kv, cmp_kv, rope_cos_t, rope_sin_t, attn_out):
+    import torch
+
+    num_tokens = int(tensors["num_tokens"])
+    q_f32 = q.float()
+    ori_kv_f32 = ori_kv.float()
+    cmp_kv_f32 = cmp_kv.float()
+    ori_block_table = tensors["block_table"]
+    cmp_sparse_indices = tensors["cmp_sparse_indices"]
+    token_to_request = tensors["token_to_request"]
+    attn_sink = tensors["attn_sink"].float()
+    wo_a = tensors["wo_a"].float()
+    wo_b_i8 = tensors["wo_b"]
+    wo_b_scale = tensors["wo_b_scale"].float()
+
+    o = torch.zeros(T, H, HEAD_DIM)
+    for t in range(num_tokens):
+        req = int(token_to_request[t].item())
+        gathered = []
+        for raw_i in cmp_sparse_indices[t, :SPARSE_TOPK].tolist():
+            raw = int(raw_i)
+            if raw < 0:
+                continue
+            if raw < S:
+                blk_id = int(ori_block_table[req, raw // BLOCK_SIZE].item())
+                intra = raw % BLOCK_SIZE
+                gathered.append(ori_kv_f32[blk_id, intra, 0])
+            else:
+                cmp_slot = raw - S
+                if cmp_slot >= SWA_CMP_BLOCK_NUM * BLOCK_SIZE:
+                    continue
+                gathered.append(cmp_kv_f32[0, cmp_slot % BLOCK_SIZE, 0])
+        if not gathered:
+            continue
+        kv_b = torch.stack(gathered, dim=0)
+
+        mi = None
+        li = None
+        oi = None
+        for tile_start in range(0, kv_b.shape[0], SPARSE_PREFILL_ATTN_TILE):
+            kv_tile = kv_b[tile_start : tile_start + SPARSE_PREFILL_ATTN_TILE]
+            scores = (q_f32[t] @ kv_tile.T) * SOFTMAX_SCALE
+            cur_mi = scores.max(dim=-1, keepdim=True).values
+            exp_scores_bf16 = torch.exp(scores - cur_mi).to(torch.bfloat16)
+            cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
+            cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
+            if mi is None:
+                mi = cur_mi
+                li = cur_li
+                oi = cur_oi
+            else:
+                mi_new = torch.maximum(mi, cur_mi)
+                alpha = torch.exp(mi - mi_new)
+                beta = torch.exp(cur_mi - mi_new)
+                li = alpha * li + beta * cur_li
+                oi = oi * alpha + cur_oi * beta
+                mi = mi_new
+
+        if mi is not None:
+            denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
+            o[t] = oi / denom
+
+    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+    rope_even = rope_pair[..., 0]
+    rope_odd = rope_pair[..., 1]
+    cos_half = rope_cos_t.float()[:, :ROPE_HALF].unsqueeze(1)
+    sin_half = rope_sin_t.float()[:, :ROPE_HALF].unsqueeze(1)
+    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
+    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
+    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
+
+    o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
+    o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)
+    o_r = o_r.to(torch.bfloat16).float()
+    o_r_q = o_r.flatten(1).view(T, O_GROUPS * O_LORA)
+    o_r_i8, o_r_scale = _int8_quant_per_row(o_r_q)
+    acc = o_r_i8.to(torch.int32) @ wo_b_i8.to(torch.int32).T
+    out = acc.float() * o_r_scale * wo_b_scale.unsqueeze(0)
+    attn_out[:] = out.to(torch.bfloat16)
+
+
+def golden_prefill_attention_swa(tensors):
+    """Torch reference for token-major packed SWA prefill."""
+    import torch
+
+    num_tokens = int(tensors["num_tokens"])
+    x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
     x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
     post = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
     comb = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
     golden_prefill_hc_pre({
-        "x": tensors["x_hc"],
+        "x": x_hc_rect,
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
         "hc_base": tensors["hc_attn_base"],
@@ -422,125 +403,95 @@ def golden_prefill_attention_swa(tensors):
         "post": post,
         "comb": comb,
     })
-    if "x_mixed" in tensors:
-        tensors["x_mixed"][:] = x_mixed
-    if "post_t" in tensors:
-        tensors["post_t"][:] = post
-    if "comb_t" in tensors:
-        tensors["comb_t"][:] = comb
 
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_prefill_attn_norm(x_mixed, tensors["attn_norm_w"])
-    golden_prefill_qkv_proj_rope({
-        "x": x_normed,
-        "wq_a": tensors["wq_a"],
-        "wq_b": tensors["wq_b"],
-        "wq_b_scale": tensors["wq_b_scale"],
-        "wkv": tensors["wkv"],
-        "freqs_cos": tensors["freqs_cos"],
-        "freqs_sin": tensors["freqs_sin"],
-        "gamma_cq": tensors["gamma_cq"],
-        "gamma_ckv": tensors["gamma_ckv"],
-        "q": q,
-        "kv": kv,
-        "qr": qr,
-        "qr_scale": qr_scale,
-        "start_pos": tensors["start_pos"],
-    })
-    if "q_out" in tensors:
-        tensors["q_out"][:] = q
-    if "kv_out" in tensors:
-        tensors["kv_out"][:] = kv
-    if "qr_out" in tensors:
-        tensors["qr_out"][:] = qr
-    if "qr_scale_out" in tensors:
-        tensors["qr_scale_out"][:] = qr_scale
+    _golden_swa_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale)
 
-    start_pos = int(tensors["start_pos"])
-    positions = torch.arange(start_pos, start_pos + S, device=tensors["freqs_cos"].device)
-    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).unsqueeze(0).expand(B, S, ROPE_HEAD_DIM)
-    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).unsqueeze(0).expand(B, S, ROPE_HEAD_DIM)
-
-    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    ori_kv = torch.zeros(PREFILL_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
-    ori_kv[0, :S, 0] = kv.view(B, S, HEAD_DIM)[0]
-    ori_block_table = torch.zeros(B, PREFILL_ORI_MAX_BLOCKS, dtype=torch.int32)
-    cmp_kv = torch.zeros(PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
-    cmp_block_table = torch.zeros(B, PREFILL_CMP_MAX_BLOCKS, dtype=torch.int32)
-    sparse_indices = torch.full((T, PREFILL_CORE_TOPK), -1, dtype=torch.int32)
-
-    hist_valid = min(start_pos, WIN - 1)
-    hist_start_abs = start_pos - hist_valid
-    kv_cache_for_attn = tensors["kv_cache"]
-    block_table = tensors["block_table"]
-    for hist_i in range(hist_valid):
-        key_abs_pos = hist_start_abs + hist_i
-        ori_slot = key_abs_pos % WIN
-        blk_id = int(block_table[0, ori_slot // BLOCK_SIZE].item())
-        cmp_kv[0, hist_i, 0] = kv_cache_for_attn[blk_id, ori_slot % BLOCK_SIZE, 0]
-
-    for t in range(T):
-        s = t % S
-        abs_pos = start_pos + s
-        window_valid = min(WIN, abs_pos + 1)
-        key_start_abs = abs_pos + 1 - window_valid
-        for key_i in range(window_valid):
-            key_abs_pos = key_start_abs + key_i
-            if key_abs_pos >= start_pos:
-                raw_idx = key_abs_pos - start_pos
-            else:
-                raw_idx = S + key_abs_pos - hist_start_abs
-            sparse_indices[t, key_i] = raw_idx
-
-    golden_prefill_sparse_attn({
-        "q": q,
-        "ori_kv": ori_kv,
-        "ori_block_table": ori_block_table,
-        "cmp_kv": cmp_kv,
-        "cmp_block_table": cmp_block_table,
-        "cmp_sparse_indices": sparse_indices,
-        "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"],
-        "freqs_cos": rope_cos_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
-        "freqs_sin": rope_sin_t.reshape(T, ROPE_HEAD_DIM).contiguous(),
-        "even_select_local": tensors["even_select_local"],
-        "odd_select_local": tensors["odd_select_local"],
-        "wo_a": tensors["wo_a"],
-        "wo_b": tensors["wo_b"],
-        "wo_b_scale": tensors["wo_b_scale"],
-        "attn_out": attn_out,
-    })
     kv_cache = tensors["kv_cache"]
-    for b in range(B):
-        for s in range(S):
-            ori_slot = (start_pos + s) % WIN
-            blk_id = int(block_table[b, ori_slot // BLOCK_SIZE].item())
-            kv_cache[blk_id, ori_slot % BLOCK_SIZE, 0] = kv.view(B, S, HEAD_DIM)[b, s]
-    if "attn_out" in tensors:
-        tensors["attn_out"][:] = attn_out
+    kv_cache_flat = kv_cache.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    for t in range(num_tokens):
+        dst_row = int(tensors["ori_slot_mapping"][t].item())
+        if dst_row >= 0:
+            kv_cache_flat[dst_row, :] = kv[t]
+
+    cmp_kv = torch.zeros(SWA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+    positions = tensors["position_ids"].to(torch.long)
+    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
+    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
+    attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
+    _golden_swa_packed_sparse_attn(tensors, q, kv_cache, cmp_kv, rope_cos_t, rope_sin_t, attn_out)
 
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
     golden_prefill_hc_post({
         "x": attn_out.view(B, S, D),
-        "residual": tensors["x_hc"],
+        "residual": x_hc_rect,
         "post": post,
         "comb": comb,
         "y": y,
     })
-    tensors["x_out"][:] = y
+    tensors["x_out"][:] = y.view(MAX_TOKENS, HC_MULT, D)
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def build_tensor_specs(
+    start_pos: int = START_POS,
+    num_tokens: int = MAX_TOKENS,
+    hetero_smoke: bool = False,
+    hetero_boundary: bool = False,
+):
     import torch
     from golden import ScalarSpec, TensorSpec
 
+    if hetero_smoke and hetero_boundary:
+        raise ValueError("--hetero-smoke and --hetero-boundary are mutually exclusive")
+    if hetero_boundary:
+        q_lens_values = [32, 32]
+        context_lens_values = [96, 96]
+        num_tokens = sum(q_lens_values)
+    elif hetero_smoke:
+        q_lens_values = [32, 64]
+        context_lens_values = [64, 0]
+        num_tokens = sum(q_lens_values)
+    else:
+        q_lens_values = [num_tokens, 0]
+        context_lens_values = [start_pos, 0]
+
+    if num_tokens <= 0 or num_tokens > MAX_TOKENS:
+        raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}], got {num_tokens}")
+    max_position = max(ctx + q_len for ctx, q_len in zip(context_lens_values, q_lens_values))
+    if start_pos < 0:
+        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
+    if max_position > MAX_SEQ_LEN:
+        raise ValueError(f"position_ids exceed MAX_SEQ_LEN={MAX_SEQ_LEN}: got {max_position}")
+
+    def seeded_uniform(shape, seed, scale=1.0):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return (torch.rand(*shape, generator=generator) - 0.5) * scale
+
+    def token_meta():
+        token_to_req = torch.zeros(MAX_TOKENS, dtype=torch.int32)
+        local_pos = torch.zeros(MAX_TOKENS, dtype=torch.int32)
+        pos = torch.arange(MAX_TOKENS, dtype=torch.int32)
+        cursor = 0
+        for req, q_len in enumerate(q_lens_values):
+            ctx = context_lens_values[req]
+            for local_s in range(q_len):
+                t = cursor + local_s
+                token_to_req[t] = req
+                local_pos[t] = local_s
+                pos[t] = ctx + local_s
+            cursor += q_len
+        return token_to_req, local_pos, pos
+
     def init_x_hc():
-        return torch.randn(B, S, HC_MULT, D) * 0.05
+        x = seeded_uniform((MAX_TOKENS, HC_MULT, D), 1, 0.1)
+        x[num_tokens:] = 0
+        return x
     def init_hc_attn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        return seeded_uniform((MIX_HC, HC_DIM), 2, HC_DIM ** -0.5)
     def init_hc_attn_scale():
         return torch.ones(3) * 0.5
     def init_hc_attn_base():
@@ -548,11 +499,11 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return torch.randn(D, Q_LORA) / D ** 0.5
+        return seeded_uniform((D, Q_LORA), 3, D ** -0.5)
     def init_wq_b():
-        return torch.randn(Q_LORA, H * HEAD_DIM) / Q_LORA ** 0.5
+        return seeded_uniform((Q_LORA, H * HEAD_DIM), 4, Q_LORA ** -0.5)
     def init_wkv():
-        return torch.randn(D, HEAD_DIM) / D ** 0.5
+        return seeded_uniform((D, HEAD_DIM), 5, D ** -0.5)
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -561,41 +512,56 @@ def build_tensor_specs(start_pos: int = START_POS):
         return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
     def init_freqs_sin():
         return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
-    def init_even_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
-            m[2 * i, i] = 1
-        return m
-    def init_odd_select_local():
-        m = torch.zeros((SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK))
-        for i in range(SPARSE_ROPE_CHUNK):
-            m[2 * i + 1, i] = 1
-        return m
     def init_block_table():
-        tbl = torch.full((B, MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            tbl[b, 0] = b
+        tbl = torch.full((MAX_REQS, MAX_BLOCKS), -1, dtype=torch.int32)
+        for req in range(MAX_REQS):
+            tbl[req, 0] = req
         return tbl
     def init_kv_cache():
-        if start_pos == 0:
-            return torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
-        return torch.randn(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) * 0.05
+        cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache_flat = cache.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        for req, ctx in enumerate(context_lens_values):
+            start = max(0, ctx - WIN)
+            for abs_pos in range(start, ctx):
+                row = req * BLOCK_SIZE + abs_pos % WIN
+                value = seeded_uniform((HEAD_DIM,), 11 + req * 4096 + abs_pos, 0.1)
+                cache_flat[row] = value.to(torch.bfloat16)
+        return cache
+    def init_ori_slot_mapping():
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        token_to_req, _, pos = token_meta()
+        for t in range(num_tokens):
+            req = int(token_to_req[t].item())
+            mapping[t] = req * BLOCK_SIZE + int(pos[t].item()) % WIN
+        return mapping
+    def init_cmp_sparse_indices():
+        topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
+        _, _, pos = token_meta()
+        for t in range(num_tokens):
+            abs_pos = int(pos[t].item())
+            window_valid = min(WIN, abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            for key_i in range(window_valid):
+                topk_idxs[t, key_i] = (key_start_abs + key_i) % WIN
+        return topk_idxs
+    def init_token_to_request():
+        return token_meta()[0]
+    def init_position_ids():
+        return token_meta()[2]
     def init_attn_sink():
         return torch.zeros(H)
-    def init_seqused_kv():
-        return torch.full((B,), min(WIN, start_pos + S), dtype=torch.int32)
     def init_wo_a():
-        return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
+        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 9, O_GROUP_IN ** -0.5)
     def init_wo_b():
-        return torch.randn(D, O_GROUPS * O_LORA) / (O_GROUPS * O_LORA) ** 0.5
+        return seeded_uniform((D, O_GROUPS * O_LORA), 10, (O_GROUPS * O_LORA) ** -0.5)
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_row(wo_b_bf16)
+    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
 
     return [
-        TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [MAX_TOKENS, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -608,19 +574,49 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("even_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_even_select_local),
-        TensorSpec("odd_select_local", [SPARSE_ROPE_INTERLEAVE_CHUNK, SPARSE_ROPE_CHUNK], torch.bfloat16, init_value=init_odd_select_local),
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
-        TensorSpec("block_table", [B, MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("block_table", [MAX_REQS, MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
+        TensorSpec("cmp_sparse_indices", [MAX_TOKENS, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
+        TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [B, S, HC_MULT, D], torch.bfloat16, is_output=True),
-        ScalarSpec("start_pos", torch.int32, start_pos),
+        TensorSpec("x_out", [MAX_TOKENS, HC_MULT, D], torch.bfloat16, is_output=True),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
+
+
+def packed_x_out_compare(num_tokens: int):
+    from golden import ratio_allclose
+
+    base_cmp = ratio_allclose(atol=6e-3, rtol=2.0 / 128)
+
+    def cmp(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        return base_cmp(
+            actual[:num_tokens],
+            expected[:num_tokens],
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    cmp.__name__ = f"packed_x_out_compare(num_tokens={num_tokens})"
+    return cmp
 
 
 if __name__ == "__main__":
@@ -632,14 +628,20 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS)
+    parser.add_argument("--num-tokens", type=int, default=MAX_TOKENS)
+    parser.add_argument("--hetero-smoke", action="store_true", default=False)
+    parser.add_argument("--hetero-boundary", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--block-dim", type=int, default=None)
     parser.add_argument("--aicpu-thread-num", type=int, default=None)
     args = parser.parse_args()
+    if args.hetero_smoke and args.hetero_boundary:
+        raise SystemExit("--hetero-smoke and --hetero-boundary are mutually exclusive")
+    compare_tokens = 64 if args.hetero_boundary else (96 if args.hetero_smoke else args.num_tokens)
 
     result = run_jit(
         fn=prefill_attention_swa,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens, args.hetero_smoke, args.hetero_boundary),
         golden_fn=golden_prefill_attention_swa,
         runtime_cfg=dict(
             platform=args.platform,
@@ -651,7 +653,8 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": ratio_allclose(atol=6e-3, rtol=2.0 / 128),
+            "x_out": packed_x_out_compare(compare_tokens),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
         },
     )
     if not result.passed:

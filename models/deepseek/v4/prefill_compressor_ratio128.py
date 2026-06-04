@@ -16,7 +16,8 @@ publishing one compressed KV row.
 
 import pypto.language as pl
 
-from config import FLASH as M, PREFILL_BATCH, PREFILL_SEQ
+from prefill_sparse_attn import CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS
+from config import BLOCK_SIZE, FLASH as M, PREFILL_BATCH, PREFILL_SEQ
 
 
 B = PREFILL_BATCH
@@ -183,12 +184,17 @@ def prefill_compressor_ratio128(
         rope_rot_odd = pl.add(pl.mul(rope_even, sin_b), pl.mul(rope_odd, cos_b))
         rope_even_bf16 = pl.cast(rope_rot_even, target_type=pl.BF16, mode="rint")
         rope_odd_bf16 = pl.cast(rope_rot_odd, target_type=pl.BF16, mode="rint")
-        idx_target = pl.full([RMS_TILE, ROPE_HALF], dtype=pl.INT32, value=0)
-        even_idx_full = pl.col_expand(idx_target, even_idx)
-        odd_idx_full = pl.col_expand(idx_target, odd_idx)
         rope_buf = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=even_idx_full, src=pl.cast(rope_even_bf16, target_type=pl.FP32))
-        rope_buf = pl.tensor.scatter(rope_buf, dim=-1, index=odd_idx_full, src=pl.cast(rope_odd_bf16, target_type=pl.FP32))
+        rope_buf = pl.tensor.scatter(
+            pl.cast(rope_even_bf16, target_type=pl.FP32),
+            mask_pattern=pl.tile.MaskPattern.P0101,
+            dst=rope_buf,
+        )
+        rope_buf = pl.tensor.scatter(
+            pl.cast(rope_odd_bf16, target_type=pl.FP32),
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            dst=rope_buf,
+        )
         normed_kv_pad[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_buf
 
     for final_b in pl.parallel(0, B, 1):
@@ -207,6 +213,206 @@ def prefill_compressor_ratio128(
     kv_state = pl.reshape(kv_state_flat, [B, STATE_LEN, OUT_DIM])
     score_state = pl.reshape(score_state_flat, [B, STATE_LEN, OUT_DIM])
     return kv, kv_state, score_state, kv_cache
+
+
+# Packed HCA ratio-128 adapter. The standalone compressor above remains
+# rectangular; this variant consumes lowered request/token metadata.
+MAX_REQS = 2
+MAX_TOKENS = T
+MAIN_OUT_DIM = OUT_DIM
+MAIN_STATE_LEN = STATE_LEN
+ROPE_DIM = ROPE_HEAD_DIM
+NOPE_DIM = NOPE_HEAD_DIM
+MAX_CMP_WRITES = MAX_REQS * max(1, MAX_TOKENS // COMPRESS_RATIO)
+HCA_CMP_BLOCK_NUM = MAX_REQS * SPARSE_CMP_MAX_BLOCKS
+CMP_K_CHUNK = K_CHUNK
+CMP_OUT_CHUNK = OUT_CHUNK
+CMP_HEAD_CHUNK = HEAD_CHUNK
+CMP_K_BLOCKS = K_BLOCKS
+CMP_OUT_BLOCKS = OUT_BLOCKS
+CMP_HEAD_BLOCKS = HEAD_BLOCKS
+HCA_KV_STORE_TILE = 16
+HCA_C128_RMS_TILE = 8
+HCA_C128_RMS_PAD_ROWS = HCA_C128_RMS_TILE
+
+PACKED_C128_PROJ_BLOCKS = CMP_OUT_BLOCKS
+PACKED_C128_POOL_BLOCKS = MAX_CMP_WRITES * CMP_HEAD_BLOCKS
+
+
+@pl.jit.inline
+def prefill_compressor_ratio128_packed(
+    x: pl.Tensor[[B, S, D], pl.BF16],
+    kv_state: pl.Tensor[[MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    score_state: pl.Tensor[[MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    num_cmp_writes: pl.Scalar[pl.INT32],
+    cmp_write_token_ids: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
+):
+    x_flat = pl.reshape(x, [MAX_TOKENS, D])
+    kv_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
+    kv_state_flat = pl.reshape(kv_state, [MAX_REQS * MAIN_STATE_LEN, MAIN_OUT_DIM])
+    score_state_flat = pl.reshape(score_state, [MAX_REQS * MAIN_STATE_LEN, MAIN_OUT_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_norm_pad_init"):
+        for init_hb in pl.pipeline(CMP_HEAD_BLOCKS, stage=2):
+            init_h0 = init_hb * CMP_HEAD_CHUNK
+            zero_chunk = pl.full([HCA_C128_RMS_TILE, CMP_HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+            pooled_kv_pad[0:HCA_C128_RMS_TILE, init_h0 : init_h0 + CMP_HEAD_CHUNK] = zero_chunk
+            normed_kv_pad[0:HCA_C128_RMS_TILE, init_h0 : init_h0 + CMP_HEAD_CHUNK] = zero_chunk
+
+    for proj_idx in pl.spmd(PACKED_C128_PROJ_BLOCKS, name_hint="prefill_hca_c128_state_proj"):
+        o0 = proj_idx * CMP_OUT_CHUNK
+        kv_acc = pl.create_tensor([MAX_TOKENS, CMP_OUT_CHUNK], dtype=pl.FP32)
+        score_acc = pl.create_tensor([MAX_TOKENS, CMP_OUT_CHUNK], dtype=pl.FP32)
+        for kb in pl.pipeline(0, CMP_K_BLOCKS, stage=2):
+            k0 = kb * CMP_K_CHUNK
+            x_tile = x_flat[0:MAX_TOKENS, k0 : k0 + CMP_K_CHUNK]
+            wkv_tile = wkv[k0 : k0 + CMP_K_CHUNK, o0 : o0 + CMP_OUT_CHUNK]
+            wgate_tile = wgate[k0 : k0 + CMP_K_CHUNK, o0 : o0 + CMP_OUT_CHUNK]
+            if k0 == 0:
+                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
+                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+            else:
+                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
+                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
+        kv_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = kv_acc
+        score_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = score_acc
+
+    for state_t0 in pl.parallel(0, MAX_TOKENS, HCA_KV_STORE_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_update"):
+            for dt in pl.range(HCA_KV_STORE_TILE):
+                t = state_t0 + dt
+                if t < num_tokens:
+                    req = pl.cast(pl.read(token_to_request, [t]), pl.INDEX)
+                    pos = pl.read(position_ids, [t])
+                    state_slot = pl.cast(pos % COMPRESS_RATIO, pl.INDEX)
+                    state_row = req * MAIN_STATE_LEN + state_slot
+                    for ob in pl.pipeline(0, CMP_OUT_BLOCKS, stage=4):
+                        o0 = ob * CMP_OUT_CHUNK
+                        ape_row = ape[state_slot : state_slot + 1, o0 : o0 + CMP_OUT_CHUNK]
+                        score_row = pl.add(score_proj[t : t + 1, o0 : o0 + CMP_OUT_CHUNK], ape_row)
+                        kv_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = kv_proj[
+                            t : t + 1,
+                            o0 : o0 + CMP_OUT_CHUNK,
+                        ]
+                        score_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = score_row
+                else:
+                    kv_state_flat[0:1, 0:CMP_OUT_CHUNK] = kv_state_flat[0:1, 0:CMP_OUT_CHUNK]
+
+    for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
+        write_i = pool_idx // CMP_HEAD_BLOCKS
+        hb = pool_idx - write_i * CMP_HEAD_BLOCKS
+        h0 = hb * CMP_HEAD_CHUNK
+        if write_i < num_cmp_writes:
+            write_token = pl.cast(pl.read(cmp_write_token_ids, [write_i]), pl.INDEX)
+            req = pl.cast(pl.read(token_to_request, [write_token]), pl.INDEX)
+            state_row0 = req * MAIN_STATE_LEN
+            score_tile = score_state_flat[state_row0 : state_row0 + MAIN_STATE_LEN, h0 : h0 + CMP_HEAD_CHUNK]
+            kv_tile = kv_state_flat[state_row0 : state_row0 + MAIN_STATE_LEN, h0 : h0 + CMP_HEAD_CHUNK]
+            score_t = pl.transpose(score_tile, axis1=0, axis2=1)
+            kv_t = pl.transpose(kv_tile, axis1=0, axis2=1)
+            score_max = pl.row_max(score_t)
+            score_exp = pl.exp(pl.row_expand_sub(score_t, score_max))
+            score_sum = pl.row_sum(score_exp)
+            score_prob = pl.row_expand_div(score_exp, score_sum)
+            pooled_t = pl.row_sum(pl.mul(kv_t, score_prob))
+            pooled_chunk = pl.reshape(pooled_t, [1, CMP_HEAD_CHUNK])
+            pooled_bf16 = pl.cast(pooled_chunk, target_type=pl.BF16, mode="rint")
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + CMP_HEAD_CHUNK] = pl.cast(
+                pooled_bf16,
+                target_type=pl.FP32,
+            )
+        else:
+            pooled_kv_pad[0:1, 0:CMP_HEAD_CHUNK] = pooled_kv_pad[0:1, 0:CMP_HEAD_CHUNK]
+
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_norm_rope"):
+        first_write_token = MAX_TOKENS - 1
+        if num_cmp_writes > 0:
+            first_write_token = pl.cast(pl.read(cmp_write_token_ids, [0]), pl.INDEX)
+        norm_cmp_pos = pl.cast(pl.read(position_ids, [first_write_token]) + 1 - COMPRESS_RATIO, pl.INDEX)
+        cos_seed = pl.cast(freqs_cos[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
+        sin_seed = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
+        rope_row_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=1.0)
+        cos_b = pl.col_expand_mul(rope_row_ones, cos_seed)
+        sin_b = pl.col_expand_mul(rope_row_ones, sin_seed)
+        partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
+        for rms_kb in pl.pipeline(CMP_HEAD_BLOCKS, stage=2):
+            rms_h0 = rms_kb * CMP_HEAD_CHUNK
+            kv_rms_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, rms_h0 : rms_h0 + CMP_HEAD_CHUNK]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, HCA_C128_RMS_TILE]))
+
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, 1.0 / HEAD_DIM), EPS), [HCA_C128_RMS_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for norm_kb in pl.pipeline(NOPE_DIM // CMP_HEAD_CHUNK, stage=2):
+            norm_h0 = norm_kb * CMP_HEAD_CHUNK
+            kv_norm_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + CMP_HEAD_CHUNK]
+            gamma = norm_w_2d[:, norm_h0 : norm_h0 + CMP_HEAD_CHUNK]
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_chunk_bf16 = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
+            normed_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + CMP_HEAD_CHUNK] = pl.cast(
+                normed_chunk_bf16,
+                target_type=pl.FP32,
+            )
+
+        kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM]
+        gamma_rope = norm_w_2d[:, NOPE_DIM:HEAD_DIM]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
+        rope_normed_bf16 = pl.cast(rope_normed, target_type=pl.BF16, mode="rint")
+        rope_normed_fp32 = pl.cast(rope_normed_bf16, target_type=pl.FP32)
+        rope_even = pl.gather(rope_normed_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+        rope_odd = pl.gather(rope_normed_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_rot_even = pl.sub(pl.mul(rope_even, cos_b), pl.mul(rope_odd, sin_b))
+        rope_rot_odd = pl.add(pl.mul(rope_even, sin_b), pl.mul(rope_odd, cos_b))
+        rope_even_bf16 = pl.cast(rope_rot_even, target_type=pl.BF16, mode="rint")
+        rope_odd_bf16 = pl.cast(rope_rot_odd, target_type=pl.BF16, mode="rint")
+        rope_buf = pl.full([HCA_C128_RMS_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(
+            pl.cast(rope_even_bf16, target_type=pl.FP32),
+            mask_pattern=pl.tile.MaskPattern.P0101,
+            dst=rope_buf,
+        )
+        rope_buf = pl.tensor.scatter(
+            pl.cast(rope_odd_bf16, target_type=pl.FP32),
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            dst=rope_buf,
+        )
+        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM] = rope_buf
+
+    for final_i in pl.parallel(0, MAX_CMP_WRITES, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_finalize"):
+            if final_i < num_cmp_writes:
+                final_cmp_row = pl.cast(pl.read(cmp_slot_mapping, [final_i]), pl.INDEX)
+                for final_hb in pl.range(CMP_HEAD_BLOCKS):
+                    final_h0 = final_hb * CMP_HEAD_CHUNK
+                    final_chunk = normed_kv_pad[final_i : final_i + 1, final_h0 : final_h0 + CMP_HEAD_CHUNK]
+                    cmp_kv_flat[final_cmp_row : final_cmp_row + 1, final_h0 : final_h0 + CMP_HEAD_CHUNK] = pl.cast(
+                        final_chunk,
+                        target_type=pl.BF16,
+                        mode="rint",
+                    )
+            else:
+                cmp_kv_flat[0:1, 0:CMP_HEAD_CHUNK] = cmp_kv_flat[0:1, 0:CMP_HEAD_CHUNK]
+
+    cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
+    kv_state = pl.reshape(kv_state_flat, [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM])
+    score_state = pl.reshape(score_state_flat, [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM])
+    return cmp_kv, kv_state, score_state
 
 
 @pl.jit
