@@ -59,6 +59,8 @@ D_TILE = 32
 WEIGHTS_ROW_TILE = 32
 B_TILE = 4
 TOPK_TILE = 16
+QH_QUANT_BLOCK = 256
+QH_QUANT_ROW_TILE = 64
 
 @pl.jit.inline
 def indexer(
@@ -83,10 +85,10 @@ def indexer(
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
-    offset: pl.Scalar[pl.INT32], 
+    offset: pl.Scalar[pl.INT32],
 ):
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="qr_proj", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="qr_proj"):
         o0 = idx * Q_OUT_TILE
         qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
         for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
@@ -124,30 +126,34 @@ def indexer(
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // 512, name_hint="qr_hadamard_quant", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-        o0 = idx * 512
-        for ro in pl.range(0, 512, 128):
-            qh_nope = pl.cast(qr_proj_flat[o0 + ro : o0 + ro + 128, 0 : IDX_NOPE_HEAD_DIM], target_type=pl.BF16, mode="rint")
-            qh_rope = qr_rope_out[o0 + ro : o0 + ro + 128, :]
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_BLOCK, name_hint="qr_hadamard_quant"):
+        o0 = idx * QH_QUANT_BLOCK
+        for ro in pl.range(0, QH_QUANT_BLOCK, QH_QUANT_ROW_TILE):
+            qh_nope = pl.cast(
+                qr_proj_flat[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM],
+                target_type=pl.BF16,
+                mode="rint",
+            )
+            qh_rope = qr_rope_out[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, :]
             qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
-            qr_hadamard_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
-            qh_amax = pl.full([1, 128], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            qh_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
+            qh_amax = pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                qh_a_f32 = qr_hadamard_acc[0 : 128, h0 : h0 + HEAD_DIM_TILE]
+                qh_a_f32 = qh_acc[0 : QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
                 qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
-                qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, 128])
+                qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, QH_QUANT_ROW_TILE])
                 qh_amax = pl.maximum(qh_amax, qh_a_max)
-            qh_scale_quant_row = pl.div(pl.full([1, 128], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
-            qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [128, 1])
-            qr_hadamard_scale_dq[o0 + ro : o0 + ro + 128, :] = qh_scale_dq
-            qh_scale_quant = pl.reshape(qh_scale_quant_row, [128, 1])
+            qh_scale_quant_row = pl.div(pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
+            qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [QH_QUANT_ROW_TILE, 1])
+            qr_hadamard_scale_dq[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, :] = qh_scale_dq
+            qh_scale_quant = pl.reshape(qh_scale_quant_row, [QH_QUANT_ROW_TILE, 1])
             for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                qh_q_f32 = qr_hadamard_acc[0 : 128, h1 : h1 + HEAD_DIM_TILE]
+                qh_q_f32 = qh_acc[0 : QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE]
                 qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
                 qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
                 qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
                 qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
-                qr_hadamard_i8[o0 + ro : o0 + ro + 128, h1 : h1 + HEAD_DIM_TILE] = qh_i8
+                qr_hadamard_i8[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
 
     x_flat = pl.reshape(x, [T, D])
     weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
@@ -474,7 +480,7 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_inner_norm_w():
         return torch.ones(INNER_HEAD_DIM)
     def init_idx_kv_cache():
-        return torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+        return torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     def init_idx_block_table():
         tbl = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(B):
