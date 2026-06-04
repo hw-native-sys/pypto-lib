@@ -60,7 +60,7 @@ RMS_TILE = 8
 
 
 @pl.jit.inline
-def compressor(
+def compressor_ratio128(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
@@ -250,7 +250,7 @@ def compressor_test(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
-    kv, compress_state, cmp_kv_cache = compressor(
+    kv, compress_state, cmp_kv_cache = compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, cos, sin,
         cmp_kv_cache, cmp_block_table, start_pos,
     )

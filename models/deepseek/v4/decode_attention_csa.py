@@ -38,7 +38,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from decode_compressor_ratio4 import compressor
+from decode_compressor_ratio4 import compressor_ratio4
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
@@ -247,7 +247,7 @@ def attention_csa(
     x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    cmp_out, compress_state, cmp_kv = compressor(
+    cmp_out, compress_state, cmp_kv = compressor_ratio4(
         x_normed,
         cmp_out,
         compress_state,

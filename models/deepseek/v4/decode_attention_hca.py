@@ -28,7 +28,7 @@ from config import (
 from hc_pre import hc_pre
 from hc_post import hc_post
 from decode_qkv_proj_rope import attn_norm, qkv_proj_rope
-from decode_compressor_ratio128 import compressor
+from decode_compressor_ratio128 import compressor_ratio128
 from decode_sparse_attn import sparse_attn
 
 
@@ -191,7 +191,7 @@ def attention_hca(
     x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    cmp_kv_proj, compress_state, cmp_kv = compressor(
+    cmp_kv_proj, compress_state, cmp_kv = compressor_ratio128(
         x_normed,
         cmp_kv_proj,
         compress_state,
