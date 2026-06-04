@@ -13,6 +13,7 @@
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
 
@@ -24,6 +25,13 @@ T = B * S
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+
+# EP (cross-rank) layout — used only by combine_ep below, which moe_ep.py
+# imports after overriding config to the 2-rank DEMO preset (harmless/uncompiled
+# in the single-card moe.py process).
+N_RANKS = EP_WORLD_SIZE
+N_LOCAL = N_LOCAL_EXPERTS  # all-rank naming used by the EP kernel
+N_ROUTES = T * TOPK
 
 
 @pl.jit.inline
@@ -66,6 +74,79 @@ def combine(
                 row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
                 acc = pl.add(acc, row_fp32)
             ffn_out[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+
+
+@pl.jit.incore
+def combine_ep(
+    recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
+    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, D], pl.BF16]:
+    # ---------- push: TPUT recv_y rows to peer's routed_y_buf ----------
+    # For each dst rank and each local expert e on MY rank, the n rows I sent to
+    # dst's expert e originally landed at slots [src_off, src_off + n) on dst
+    # (src_off = Σ_{s<dst} counts). Per-row pl.load uses 3D indexing on recv_y
+    # directly — DON'T reshape recv_y to 2D first, that would tile.load the full
+    # [N_LOCAL, RECV_MAX, D] tensor into Vec (≫ 192 KB).
+    for dst in pl.range(N_RANKS):
+        for e in pl.range(N_LOCAL):
+            n = pl.cast(pl.read(pub_counts, [dst * N_RANKS + my_rank, e]), pl.INDEX)
+            src_off = pl.const(0, pl.INT32)
+            for s in pl.range(N_RANKS):
+                if s < dst:
+                    src_off = src_off + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+            src_off_idx = pl.cast(src_off, pl.INDEX)
+            for row in pl.range(n):
+                slot = src_off_idx + row
+                r_route = pl.read(recv_r_route_out, [e, slot])
+                y_tile_3d = pl.load(recv_y, [e, slot, 0], [1, 1, D])
+                y_tile = pl.reshape(y_tile_3d, [1, D])
+                pld.tile.remote_store(
+                    y_tile, target=routed_y_buf, peer=dst, offsets=[r_route, 0]
+                )
+
+    # ---------- combine_done barrier ----------
+    # Single-writer per-src cell — Set, not Add.
+    for peer in pl.range(N_RANKS):
+        if peer != my_rank:
+            pld.system.notify(
+                target=combine_done,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.Set,
+            )
+    for src in pl.range(N_RANKS):
+        if src != my_rank:
+            pld.system.wait(
+                signal=combine_done,
+                offsets=[src, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    # ---------- reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k] ----------
+    # Kept in this InCore kernel (after the push + barrier), NOT split into a
+    # separate parallel pl.spmd reducer: the orchestration wouldn't order a
+    # separate routed_y_buf reader after the cross-rank push, since a
+    # remote_store target isn't tracked as a window write — pypto#1670.
+    # Per-row tile load + accumulate (token-major ffn_out [T, D]); the window is
+    # read with pl.load (tensor.slice rejects a DistributedTensor — pypto#1672).
+    for t in pl.range(T):
+        sh_tile = pl.load(sh, [t, 0], [1, D])
+        acc = pl.cast(sh_tile, target_type=pl.FP32)
+        for k in pl.range(TOPK):
+            y_k = pl.load(routed_y_buf, [t * TOPK + k, 0], [1, D])
+            y_k_fp = pl.cast(y_k, target_type=pl.FP32)
+            acc = pl.add(acc, y_k_fp)
+        acc_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+        pl.store(acc_bf16, [t, 0], ffn_out)
+    return ffn_out
 
 
 @pl.jit

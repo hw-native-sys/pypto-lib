@@ -537,7 +537,7 @@ def run(
 
 def _jit_compile_only(
     fn: Any, jit_args: list[Any], platform: str | None, **compile_kwargs: Any,
-) -> Path:
+) -> tuple[Path, Any]:
     """Compile a ``@pl.jit`` function without executing on device.
 
     Replays :meth:`JITFunction.__call__`'s prelude (bind args → cache key →
@@ -545,6 +545,11 @@ def _jit_compile_only(
     surgery — pypto exposes no platform-aware compile-only entry. Extra
     *compile_kwargs* forward to ``fn._compile``, so unsupported keys raise
     ``TypeError`` there rather than being silently dropped.
+
+    Returns ``(output_dir, compiled)``; *compiled* is the cached
+    ``CompiledProgram`` (a ``DistributedCompiledProgram`` for an L3 host
+    orchestrator compiled with ``distributed_config``), so the caller can
+    pick the right dispatch path.
     """
     import pypto.language as pl_mod
     from pypto.jit.cache import make_cache_key
@@ -566,7 +571,8 @@ def _jit_compile_only(
             tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
             platform=platform, **compile_kwargs,
         )
-    return Path(fn._cache[key].output_dir)
+    compiled = fn._cache[key]
+    return Path(compiled.output_dir), compiled
 
 
 def run_jit(
@@ -637,6 +643,7 @@ def run_jit(
         )
 
     # Compile
+    compiled: Any = None  # the CompiledProgram, when we compiled it this call
     if runtime_dir is not None:
         try:
             work_dir = _setup_runtime_dir(runtime_dir, compile_label="JIT compile")
@@ -651,7 +658,7 @@ def run_jit(
                 else torch.empty(spec.shape, dtype=spec.dtype)
                 for spec in specs
             ]
-            work_dir = _jit_compile_only(
+            work_dir, compiled = _jit_compile_only(
                 fn, dummy_args,
                 platform=runtime_cfg.get("platform"),
                 **compile_cfg,
@@ -680,7 +687,13 @@ def run_jit(
 
     # Runtime
     with _Stage("runtime"):
-        _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
+        # An L3 ``DistributedCompiledProgram`` (a @pl.jit.host kernel compiled
+        # with distributed_config) dispatches per-rank via _try_l3_dispatch;
+        # everything else runs through the single-chip runner.
+        if compiled is None or not _try_l3_dispatch(
+            compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
+        ):
+            _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
     # Validate
     if golden_outputs is None:
