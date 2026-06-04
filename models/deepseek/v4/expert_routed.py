@@ -187,12 +187,6 @@ def expert_routed(
     return recv_y
 
 
-# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
-# (e.g. moe_ep.py). Reuses expert_routed's raw body parsed against this
-# module's globals (N_LOCAL_EXPERTS / RECV_MAX / MOE_INTER ...).
-expert_routed_inline = pl.inline(expert_routed._func)
-
-
 @pl.jit
 def expert_routed_test(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],

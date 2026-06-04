@@ -188,11 +188,6 @@ def gate(
     return weights
 
 
-# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
-# (e.g. moe_ep.py). Reuses gate's raw body parsed against this module's globals.
-gate_inline = pl.inline(gate._func)
-
-
 @pl.jit
 def gate_test(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
