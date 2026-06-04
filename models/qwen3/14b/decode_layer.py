@@ -64,6 +64,7 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
+from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -286,6 +287,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
     # Scope 1
     normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    out_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # pre-consolidation layer output
+    dcr_tids = pl.array.create(DOWN_ON, pl.TASK_ID)  # terminal writers of out_partial (filled in manual_scope)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
@@ -924,16 +927,41 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 level=pl.Level.CORE_GROUP,
                 name_hint="down_cast_residual",
                 deps=[down_tids[n_out * K_SPLITS + k] for k in range(K_SPLITS)],
-            ):
+            ) as dcr_tid:
                 resid_block_bf16 = post_norm_partial[:, n0 : n0 + DOWN_TN]
                 resid_block = pl.cast(resid_block_bf16, target_type=pl.FP32)
                 acc_chunk = down_acc_all[:, n0 : n0 + DOWN_TN]
                 out_chunk = pl.add(acc_chunk, resid_block)
-                out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [0, n0])
+                out_partial = pl.assemble(out_partial, pl.cast(out_chunk, target_type=pl.BF16), [0, n0])
+            dcr_tids[n_out] = dcr_tid
+
+    # ── out_consolidate (OUTSIDE manual_scope): copy out_partial -> out in a SINGLE
+    # pl.at task in the AUTO-DEP region. Inside manual_scope, auto-dep (tensormap)
+    # registration is suppressed (explicit deps= only), so a write to `out` there is
+    # invisible to caller-scope readers. The body's terminal write is otherwise the
+    # DOWN_ON-way `down_cast_residual` pl.parallel fan-out inside manual_scope, whose
+    # partial writers register NO tensormap edge to a downstream caller reader (proven
+    # on device: next_hidden's writers had no edge to copy_out). Re-emitting `out` here
+    # as a single full-tensor writer in the auto-dep region — exactly the copy_hidden
+    # -> x_gamma path that works — makes the layer output visible to the next layer /
+    # copy_out / LM head, fixing the fused multi-layer decode_fwd with no caller-side
+    # plumbing. Gated on all down_cast_residual writers via deps=.
+    for oc_b in pl.parallel(0, BATCH, BATCH):
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="out_consolidate",
+            deps=[dcr_tids[k] for k in range(DOWN_ON)],
+        ):
+            for oc_kb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                oc_k0 = oc_kb * RMSNORM_K_CHUNK
+                out = pl.assemble(
+                    out, pl.slice(out_partial, [BATCH, RMSNORM_K_CHUNK], [oc_b, oc_k0]), [oc_b, oc_k0]
+                )
     return out
 
 
 NUM_LAYERS = 40  # full Qwen3-14B depth, for the fused decode_fwd loop
+_FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
 
 
 @pl.jit
@@ -988,26 +1016,19 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     lm_head_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ):
-    # Device-side fused decode: loop the inline body over all NUM_LAYERS, slicing
-    # each layer's weights / KV-cache region by layer_idx, then run the LM head.
-    # Weights are STACKED [NUM_LAYERS*HIDDEN, ...] / [NUM_LAYERS*INTERMEDIATE, ...];
-    # k_cache / v_cache cover [NUM_LAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out is
-    # logits [BATCH, VOCAB].
-    # Seed the loop-carried hidden from hidden_states (create_tensor + tiled copy
-    # under a pl.parallel dispatch — mirrors the original decode_fwd; a create_tensor
-    # seed is required so the loop-carried tensor has inferable metadata).
-    # Seed the loop-carried hidden from hidden_states via a create_tensor + tiled
-    # copy (a create_tensor seed is required: passing the external param to one
-    # _decode_layer call and a create_tensor to the loop trips inline metadata
-    # inference — see the layer-0-external variant which raises that error).
+    # Device-side fused decode: loop the inline body over all _FWD_NLAYERS layers,
+    # slicing each layer's weights / KV-cache region by layer_idx, then run the LM
+    # head. Weights are STACKED [_FWD_NLAYERS*HIDDEN, ...] / [_FWD_NLAYERS*INTERMEDIATE,
+    # ...]; k_cache / v_cache cover [_FWD_NLAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out
+    # is logits [BATCH, VOCAB]. _FWD_NLAYERS defaults to NUM_LAYERS (40) and is settable
+    # for layer-count tests.
     #
-    # KNOWN BUG (WIP): the fused output is currently ALL-ZEROS. Isolation proved the
-    # copy seed itself is correct (a copy-only decode_fwd reproduces hidden_states
-    # exactly, 100%), but the inlined body's pl.spmd reads of `cur` do not establish
-    # a dependency on this copy_hidden write (a plain pl.at read like copy_out does),
-    # so they race and read cur's pre-write zeros. Fix needs an explicit
-    # cross-dispatch fence before the first layer (cf. the body's own `attn_fence`)
-    # or to make the body's first read (x_gamma, a pl.spmd) dep on its input.
+    # The loop-carried `cur` is seeded from hidden_states via a create_tensor + tiled
+    # copy (copy_hidden, a single full-tensor pl.at writer). Each layer's output is made
+    # visible to the next layer / the LM head by _decode_layer's `out_consolidate` scope
+    # (a single full-tensor writer in the auto-dep region) — without it, the inline body's
+    # `down_cast_residual` pl.parallel writes do not register a tensormap edge to the
+    # downstream reader and the fused output is garbage. See decode-fwd-dep-fix notes.
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for cb0 in pl.parallel(0, BATCH, BATCH):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
@@ -1016,7 +1037,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                 cur = pl.assemble(
                     cur, pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]), [cb0, ck0]
                 )
-    for layer_idx in pl.range(NUM_LAYERS):
+    for layer_idx in pl.range(_FWD_NLAYERS):
         next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
@@ -1024,6 +1045,62 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
             post_rms_weight, next_hidden, layer_idx,
         )
     out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
+    return out
+
+
+_CHUNK_NLAYERS = 8  # layers per decode_fwd_layers dispatch (chunked fused decode)
+
+
+@pl.jit
+def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer CHUNK, no LM head
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.Tensor,
+    v_cache: pl.Tensor,
+    wo: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    # Fused decode of _CHUNK_NLAYERS consecutive layers, output = hidden (NO LM head).
+    # Used to run all 40 layers in a few dispatches instead of one — a single 40-layer
+    # dispatch exceeds the device AICPU stream-sync timeout (PLATFORM_STREAM_SYNC_TIMEOUT
+    # _MS=2000ms). Each layer's output is made visible to the next by _decode_layer's
+    # out_consolidate (the fused-decode dependency fix). The caller passes the weight /
+    # KV-cache SLICES for the chunk's layers (stacked [_CHUNK_NLAYERS*dim, ...]); the body
+    # indexes them with layer_idx 0.._CHUNK_NLAYERS-1.
+    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    for cb0 in pl.parallel(0, BATCH, BATCH):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
+            for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                ck0 = ckb * RMSNORM_K_CHUNK
+                cur = pl.assemble(
+                    cur, pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]), [cb0, ck0]
+                )
+    for i in pl.range(_CHUNK_NLAYERS):
+        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        cur = _decode_layer(
+            cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
+            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            post_rms_weight, next_hidden, i,
+        )
+    for ob0 in pl.parallel(0, BATCH, BATCH):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_out"):
+            for okb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                ok0 = okb * RMSNORM_K_CHUNK
+                out = pl.assemble(
+                    out, pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [ob0, ok0]), [ob0, ok0]
+                )
     return out
 
 
@@ -1102,6 +1179,13 @@ if __name__ == "__main__":
         default=Path(__file__).parent / "build_output" / "data",
     )
     parser.add_argument("--smoke", action="store_true", default=False)
+    parser.add_argument("--no-dep-gen", action="store_true", default=False,
+                        help="disable dep_gen (avoids 'register failed: 8' overflow on big graphs)")
+    parser.add_argument("--validate-fwd", action="store_true", default=False,
+                        help="validate the fused decode_fwd (N stacked layers + on-device LM head "
+                             "-> logits) against a host chain reference, instead of the default "
+                             "single-layer golden test.")
+    parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
     args = parser.parse_args()
 
     # Golden data lives under build_output/ (gitignored) and is produced by
@@ -1129,18 +1213,62 @@ if __name__ == "__main__":
     backend_type = _backend_type(args.platform)
     inputs = load_inputs(args.data_dir / "in")
     out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-    qwen3_decode_mpmd(
-        *inputs,
-        out,
-        config=RunConfig(
-            platform=args.platform,
-            device_id=args.device,
-            backend_type=backend_type,
-            enable_l2_swimlane=args.enable_l2_swimlane,
-            enable_dep_gen=True,
-            dump_passes=True,
-        ),
+    run_cfg = RunConfig(
+        platform=args.platform,
+        device_id=args.device,
+        backend_type=backend_type,
+        enable_l2_swimlane=args.enable_l2_swimlane,
+        enable_dep_gen=not args.no_dep_gen,
+        dump_passes=True,
     )
+
+    # Full fused decode_fwd validation: N stacked layers + on-device LM head -> logits,
+    # vs host (chain N hidden -> final RMSNorm + lm_head matmul). Builds N-layer stacks by
+    # replicating the single-layer weights (every layer computes layer 0) and exercises the
+    # runtime layer_idx slicing, the layer->layer out_consolidate dependency, and the LM
+    # head reading the final layer's consolidated output. The host chain feeds each output
+    # as the next hidden (KV past[0:pos] untouched, current pos overwritten each layer, so
+    # it reproduces the in-kernel const-layer-0 chain).
+    if args.validate_fwd:
+        N = args.fwd_layers
+        _FWD_NLAYERS = N
+        def stack0(t, reps):  # replicate along dim 0
+            return torch.cat([t] * reps, dim=0).contiguous()
+        hs, irw, wq_, wk_, wv_, qn, kn, sl, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
+        torch.manual_seed(1234)
+        final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
+        lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
+        stacked = [
+            hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
+            stack0(qn, N), stack0(kn, N), sl, rc, rs, stack0(kc, N), stack0(vc, N),
+            stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
+            final_norm_w, lm_head_w,
+        ]
+        logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
+        decode_fwd(*stacked, logits, config=run_cfg)
+        # host ref: chain N -> final RMSNorm -> lm_head
+        ref_hidden = inputs[0]; ref_out = None
+        for _step in range(N):
+            ci = load_inputs(args.data_dir / "in"); ci[0] = ref_hidden
+            ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+            qwen3_decode_mpmd(*ci, ref_out, config=run_cfg)
+            ref_hidden = ref_out.clone()
+        hn = ref_out.float()
+        inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
+        ref_normed = (hn * inv) * final_norm_w.float()
+        ref_logits = ref_normed @ lm_head_w.float().t()  # [BATCH, VOCAB]
+        a = logits.cpu(); e = ref_logits.cpu()
+        # compare argmax (the actual generation signal) + value closeness
+        amax_k = a.argmax(-1); amax_r = e.argmax(-1)
+        argmax_match = int((amax_k == amax_r).sum())
+        close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
+        print(f"[stacked-fwd {N}L+LMhead] argmax match {argmax_match}/{BATCH} | "
+              f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
+              f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} ref_argmax={amax_r.tolist()}")
+        raise SystemExit(0 if argmax_match == BATCH else 1)
+
+    # Default: single-layer qwen3_decode_mpmd against the golden out.pt.
+    qwen3_decode_mpmd(*inputs, out, config=run_cfg)
 
     expected = torch.load(args.data_dir / "out" / "out.pt", weights_only=True)
     actual = out.cpu()
