@@ -67,6 +67,18 @@ START_POS = 0
 MAX_CMP_WRITES = MAX_REQS * max(1, MAX_TOKENS // COMPRESS_RATIO)
 HCA_ORI_BLOCK_NUM = MAX_REQS * SPARSE_ORI_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = MAX_REQS * SPARSE_CMP_MAX_BLOCKS
+HCA_CASES = (
+    "custom",
+    "basic128",
+    "basic96",
+    "basic17",
+    "suffix96_17",
+    "suffix96_32",
+    "suffix128_17",
+    "hetero_smoke",
+    "hetero_boundary",
+    "hetero_mixed_cmp_pos",
+)
 
 HCA_KV_STORE_TILE = 16
 
@@ -439,7 +451,6 @@ def golden_prefill_attention_hca(tensors):
             ori_kv_flat[dst_row, :] = kv[t]
 
     cmp_kv = tensors["cmp_kv"]
-    cmp_kv.zero_()
     num_cmp_writes = int(tensors["num_cmp_writes"])
     kv_proj = x_mixed.float() @ tensors["cmp_wkv"].float()
     score_proj = x_mixed.float() @ tensors["cmp_wgate"].float()
@@ -491,40 +502,90 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y.view(MAX_TOKENS, HC_MULT, D)
 
 
+def _resolve_hca_case(
+    start_pos: int = START_POS,
+    num_tokens: int = MAX_TOKENS,
+    hca_case: str = "custom",
+    hetero_smoke: bool = False,
+    hetero_boundary: bool = False,
+    hetero_mixed_cmp_pos: bool = False,
+):
+    alias_count = int(hetero_smoke) + int(hetero_boundary) + int(hetero_mixed_cmp_pos)
+    if alias_count > 1:
+        raise ValueError("--hetero-* flags are mutually exclusive")
+    if hca_case != "custom" and alias_count:
+        raise ValueError("--hca-case cannot be combined with --hetero-* aliases")
+    if hetero_smoke:
+        hca_case = "hetero_smoke"
+    elif hetero_boundary:
+        hca_case = "hetero_boundary"
+    elif hetero_mixed_cmp_pos:
+        hca_case = "hetero_mixed_cmp_pos"
+
+    if hca_case == "custom":
+        q_lens_values = [num_tokens, 0]
+        context_lens_values = [start_pos, 0]
+    elif hca_case == "basic128":
+        q_lens_values = [128, 0]
+        context_lens_values = [0, 0]
+    elif hca_case == "basic96":
+        q_lens_values = [96, 0]
+        context_lens_values = [0, 0]
+    elif hca_case == "basic17":
+        q_lens_values = [17, 0]
+        context_lens_values = [0, 0]
+    elif hca_case == "suffix96_17":
+        q_lens_values = [17, 0]
+        context_lens_values = [96, 0]
+    elif hca_case == "suffix96_32":
+        q_lens_values = [32, 0]
+        context_lens_values = [96, 0]
+    elif hca_case == "suffix128_17":
+        q_lens_values = [17, 0]
+        context_lens_values = [128, 0]
+    elif hca_case == "hetero_smoke":
+        q_lens_values = [32, 64]
+        context_lens_values = [64, 0]
+    elif hca_case == "hetero_boundary":
+        q_lens_values = [32, 32]
+        context_lens_values = [96, 96]
+    elif hca_case == "hetero_mixed_cmp_pos":
+        q_lens_values = [32, 32]
+        context_lens_values = [96, 224]
+    else:
+        raise ValueError(f"unknown --hca-case {hca_case!r}; expected one of {HCA_CASES}")
+
+    active_tokens = sum(q_lens_values)
+    if active_tokens <= 0 or active_tokens > MAX_TOKENS:
+        raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}], got {active_tokens}")
+    if min(context_lens_values) < 0:
+        raise ValueError(f"context lengths must be non-negative, got {context_lens_values}")
+    max_position = max((ctx + q_len - 1 for ctx, q_len in zip(context_lens_values, q_lens_values) if q_len > 0), default=0)
+    if max_position >= MAX_SEQ_LEN:
+        raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
+    return hca_case, q_lens_values, context_lens_values, active_tokens
+
+
 def build_tensor_specs(
     start_pos: int = START_POS,
     num_tokens: int = MAX_TOKENS,
+    hca_case: str = "custom",
     hetero_smoke: bool = False,
     hetero_boundary: bool = False,
+    hetero_mixed_cmp_pos: bool = False,
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
 
-    if hetero_smoke and hetero_boundary:
-        raise ValueError("--hetero-smoke and --hetero-boundary are mutually exclusive")
-    if hetero_boundary:
-        start_pos = 0
-        q_lens_values = [32, 32]
-        context_lens_values = [96, 96]
-        num_tokens = sum(q_lens_values)
-    elif hetero_smoke:
-        start_pos = 0
-        q_lens_values = [32, 64]
-        context_lens_values = [64, 0]
-        num_tokens = sum(q_lens_values)
-    else:
-        q_lens_values = [num_tokens, 0]
-        context_lens_values = [start_pos, 0]
+    _, q_lens_values, context_lens_values, num_tokens = _resolve_hca_case(
+        start_pos,
+        num_tokens,
+        hca_case,
+        hetero_smoke,
+        hetero_boundary,
+        hetero_mixed_cmp_pos,
+    )
 
-    if num_tokens <= 0 or num_tokens > MAX_TOKENS:
-        raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}], got {num_tokens}")
-    if start_pos < 0:
-        raise ValueError(f"start_pos must be non-negative, got {start_pos}")
-    if start_pos + num_tokens > MAX_TOKENS:
-        raise ValueError(
-            f"first packed HCA fixture requires start_pos + num_tokens <= {MAX_TOKENS}, "
-            f"got {start_pos}+{num_tokens}"
-        )
     def token_meta():
         token_to_req = torch.zeros(MAX_TOKENS, dtype=torch.int32)
         local_pos = torch.zeros(MAX_TOKENS, dtype=torch.int32)
@@ -596,22 +657,26 @@ def build_tensor_specs(
     def init_cmp_state():
         state = torch.zeros(MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM)
         for req, ctx in enumerate(context_lens_values):
-            if ctx > 0:
-                state[req, :ctx, :] = seeded_uniform((ctx, MAIN_OUT_DIM), 12 + req, 0.1)
+            partial_len = ctx % COMPRESS_RATIO
+            if partial_len > 0:
+                state[req, :partial_len, :] = seeded_uniform((partial_len, MAIN_OUT_DIM), 12 + req, 0.1)
         return state
     def init_cmp_score_state():
         state = torch.zeros(MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM)
         for req, ctx in enumerate(context_lens_values):
-            if ctx > 0:
-                state[req, :ctx, :] = seeded_uniform((ctx, MAIN_OUT_DIM), 13 + req, 0.1)
+            partial_len = ctx % COMPRESS_RATIO
+            if partial_len > 0:
+                state[req, :partial_len, :] = seeded_uniform((partial_len, MAIN_OUT_DIM), 13 + req, 0.1)
         return state
     def init_kv_cache():
         cache = torch.zeros(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
         for req, ctx in enumerate(context_lens_values):
             if ctx > 0:
+                prefix_start = max(0, ctx - WIN)
                 prefix = seeded_uniform((ctx, HEAD_DIM), 11 + req, 0.1).to(torch.bfloat16)
-                cache_flat[req * BLOCK_SIZE : req * BLOCK_SIZE + ctx] = prefix
+                for pos_i in range(prefix_start, ctx):
+                    cache_flat[req * BLOCK_SIZE + pos_i % WIN] = prefix[pos_i]
         return cache
     def init_ori_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
@@ -619,7 +684,7 @@ def build_tensor_specs(
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             logical_pos = context_lens_values[req] + int(local_pos[t].item())
-            mapping[t] = req * BLOCK_SIZE + logical_pos
+            mapping[t] = req * BLOCK_SIZE + logical_pos % WIN
         return mapping
     def init_ori_block_table():
         table = torch.full((MAX_REQS, SPARSE_ORI_MAX_BLOCKS), -1, dtype=torch.int32)
@@ -627,7 +692,15 @@ def build_tensor_specs(
             table[b, 0] = b
         return table
     def init_cmp_kv():
-        return torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache = torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        cache_flat = cache.view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        for req, ctx in enumerate(context_lens_values):
+            completed = ctx // COMPRESS_RATIO
+            if completed > 0:
+                prefix_cmp = seeded_uniform((completed, HEAD_DIM), 14 + req, 0.1).to(torch.bfloat16)
+                for cmp_slot in range(completed):
+                    cache_flat[req * BLOCK_SIZE + cmp_slot] = prefix_cmp[cmp_slot]
+        return cache
     def init_cmp_block_table():
         table = torch.full((MAX_REQS, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(MAX_REQS):
@@ -638,10 +711,18 @@ def build_tensor_specs(
         token_to_req, local_pos, _ = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
-            visible_len = context_lens_values[req] + int(local_pos[t].item()) + 1
-            topk_idxs[t, :visible_len] = torch.arange(visible_len, dtype=torch.int32)
-            if visible_len >= COMPRESS_RATIO:
-                topk_idxs[t, S] = S + visible_len // COMPRESS_RATIO - 1
+            position = context_lens_values[req] + int(local_pos[t].item())
+            window_start = max(0, position - WIN + 1)
+            cursor = 0
+            for visible_pos in range(window_start, position + 1):
+                topk_idxs[t, cursor] = visible_pos % WIN
+                cursor += 1
+            visible_cmp = (position + 1) // COMPRESS_RATIO
+            for cmp_slot in range(visible_cmp):
+                if cursor >= SPARSE_TOPK:
+                    break
+                topk_idxs[t, cursor] = S + cmp_slot
+                cursor += 1
         return topk_idxs
     def init_token_to_request():
         return token_meta()[0]
@@ -687,12 +768,36 @@ def build_tensor_specs(
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
-        TensorSpec("cmp_kv_state", [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_state),
-        TensorSpec("cmp_score_state", [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_score_state),
-        TensorSpec("kv_cache", [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec(
+            "cmp_kv_state",
+            [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM],
+            torch.float32,
+            init_value=init_cmp_state,
+            is_output=True,
+        ),
+        TensorSpec(
+            "cmp_score_state",
+            [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM],
+            torch.float32,
+            init_value=init_cmp_score_state,
+            is_output=True,
+        ),
+        TensorSpec(
+            "kv_cache",
+            [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_kv_cache,
+            is_output=True,
+        ),
         TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
         TensorSpec("ori_block_table", [MAX_REQS, SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec(
+            "cmp_kv",
+            [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=init_cmp_kv,
+            is_output=True,
+        ),
         TensorSpec("cmp_block_table", [MAX_REQS, SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [MAX_TOKENS, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
@@ -742,23 +847,102 @@ if __name__ == "__main__":
     import argparse
     from golden import run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--num-tokens", type=int, default=MAX_TOKENS)
-    parser.add_argument("--hetero-smoke", action="store_true", default=False)
-    parser.add_argument("--hetero-boundary", action="store_true", default=False)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone DeepSeek V4 packed prefill HCA correctness test. "
+            "CLI shape/scenario options only build fixture/golden tensors and lowered metadata; "
+            "the JIT kernel itself consumes num_tokens/token_to_request/position_ids/slot mappings/topk/write records."
+        )
+    )
+    parser.add_argument(
+        "-p", "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
+    )
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=START_POS,
+        help=(
+            "Fixture-only context length for request 0 when --hca-case=custom. "
+            "It is lowered into position_ids, ori_slot_mapping, cmp_sparse_indices, and compressor state; "
+            "it is not a JIT kernel argument."
+        ),
+    )
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        default=MAX_TOKENS,
+        help=(
+            "Fixture active token count for --hca-case=custom, capped by MAX_TOKENS. "
+            "The value is passed to the kernel as num_tokens and also controls x_out active-token comparison."
+        ),
+    )
+    parser.add_argument(
+        "--hca-case",
+        type=str,
+        default="custom",
+        choices=HCA_CASES,
+        help=(
+            "Named fixture scenario. custom uses --start-pos/--num-tokens; other cases cover short prefill, "
+            "suffix prefill, MAX_REQS=2 hetero requests, and mixed compressed write positions."
+        ),
+    )
+    parser.add_argument(
+        "--hetero-smoke",
+        action="store_true",
+        default=False,
+        help="Alias for --hca-case hetero_smoke; validates two requests with different context/q lengths.",
+    )
+    parser.add_argument(
+        "--hetero-boundary",
+        action="store_true",
+        default=False,
+        help="Alias for --hca-case hetero_boundary; both requests close the ratio128 boundary at pos127.",
+    )
+    parser.add_argument(
+        "--hetero-mixed-cmp-pos",
+        action="store_true",
+        default=False,
+        help="Alias for --hca-case hetero_mixed_cmp_pos; req0 writes pos127 and req1 writes pos255.",
+    )
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
+    )
     args = parser.parse_args()
-    if args.hetero_smoke and args.hetero_boundary:
-        raise SystemExit("--hetero-smoke and --hetero-boundary are mutually exclusive")
-    compare_tokens = 64 if args.hetero_boundary else (96 if args.hetero_smoke else args.num_tokens)
+    try:
+        _, _, _, compare_tokens = _resolve_hca_case(
+            args.start_pos,
+            args.num_tokens,
+            args.hca_case,
+            args.hetero_smoke,
+            args.hetero_boundary,
+            args.hetero_mixed_cmp_pos,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     result = run_jit(
         fn=prefill_attention_hca,
-        specs=build_tensor_specs(args.start_pos, args.num_tokens, args.hetero_smoke, args.hetero_boundary),
+        specs=build_tensor_specs(
+            args.start_pos,
+            args.num_tokens,
+            args.hca_case,
+            args.hetero_smoke,
+            args.hetero_boundary,
+            args.hetero_mixed_cmp_pos,
+        ),
         golden_fn=golden_prefill_attention_hca,
         runtime_cfg=dict(
             platform=args.platform,

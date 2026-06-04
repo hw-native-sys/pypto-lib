@@ -623,17 +623,74 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--num-tokens", type=int, default=MAX_TOKENS)
-    parser.add_argument("--hetero-smoke", action="store_true", default=False)
-    parser.add_argument("--hetero-boundary", action="store_true", default=False)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
-    parser.add_argument("--block-dim", type=int, default=None)
-    parser.add_argument("--aicpu-thread-num", type=int, default=None)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone DeepSeek V4 packed prefill SWA correctness test. "
+            "SWA is pure sliding-window attention; CLI scenario options generate fixture/golden tensors "
+            "and lowered token metadata, not extra JIT kernel parameters."
+        )
+    )
+    parser.add_argument(
+        "-p", "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
+    )
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=START_POS,
+        help=(
+            "Fixture-only context length for request 0. It is lowered into position_ids, "
+            "ori_slot_mapping, and window-ring cmp_sparse_indices; it is not a JIT argument."
+        ),
+    )
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        default=MAX_TOKENS,
+        help=(
+            "Fixture active token count, capped by MAX_TOKENS. The value is passed to the kernel as "
+            "num_tokens and controls x_out active-token comparison."
+        ),
+    )
+    parser.add_argument(
+        "--hetero-smoke",
+        action="store_true",
+        default=False,
+        help="Fixture alias for a MAX_REQS=2 smoke case with different context/q lengths.",
+    )
+    parser.add_argument(
+        "--hetero-boundary",
+        action="store_true",
+        default=False,
+        help="Fixture alias for a MAX_REQS=2 boundary/wrap case with independent request window caches.",
+    )
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
+    )
+    parser.add_argument(
+        "--block-dim",
+        type=int,
+        default=None,
+        help="Optional compile/runtime block_dim override forwarded through runtime_cfg; leave unset for default.",
+    )
+    parser.add_argument(
+        "--aicpu-thread-num",
+        type=int,
+        default=None,
+        help="Optional AICPU scheduler thread count override forwarded through runtime_cfg; leave unset for default.",
+    )
     args = parser.parse_args()
     if args.hetero_smoke and args.hetero_boundary:
         raise SystemExit("--hetero-smoke and --hetero-boundary are mutually exclusive")

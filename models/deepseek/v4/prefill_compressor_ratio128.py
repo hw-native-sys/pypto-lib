@@ -341,15 +341,16 @@ def prefill_compressor_ratio128_packed(
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_norm_rope"):
-        first_write_token = MAX_TOKENS - 1
-        if num_cmp_writes > 0:
-            first_write_token = pl.cast(pl.read(cmp_write_token_ids, [0]), pl.INDEX)
-        norm_cmp_pos = pl.cast(pl.read(position_ids, [first_write_token]) + 1 - COMPRESS_RATIO, pl.INDEX)
-        cos_seed = pl.cast(freqs_cos[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
-        sin_seed = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
-        rope_row_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=1.0)
-        cos_b = pl.col_expand_mul(rope_row_ones, cos_seed)
-        sin_b = pl.col_expand_mul(rope_row_ones, sin_seed)
+        cos_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        for norm_i in pl.range(HCA_C128_RMS_TILE):
+            if norm_i < num_cmp_writes:
+                norm_write_token = pl.cast(pl.read(cmp_write_token_ids, [norm_i]), pl.INDEX)
+                norm_cmp_pos = pl.cast(pl.read(position_ids, [norm_write_token]) + 1 - COMPRESS_RATIO, pl.INDEX)
+                cos_row = pl.cast(freqs_cos[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
+                sin_row = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
+                cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
+                sin_b[norm_i : norm_i + 1, 0:ROPE_HALF] = sin_row
         partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
         for rms_kb in pl.pipeline(CMP_HEAD_BLOCKS, stage=2):
             rms_h0 = rms_kb * CMP_HEAD_CHUNK
@@ -547,12 +548,38 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone DeepSeek V4 prefill compressor ratio128 validation. "
+            "This entry tests the rectangular compressor; packed HCA uses prefill_compressor_ratio128_packed "
+            "with lowered token/request/write metadata."
+        )
+    )
+    parser.add_argument(
+        "-p", "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
+    )
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=START_POS,
+        help="Fixture-only absolute compression slot offset; ratio128 standalone expects it aligned to 128.",
+    )
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
+    )
     args = parser.parse_args()
 
     result = run_jit(

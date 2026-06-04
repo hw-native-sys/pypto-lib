@@ -1120,12 +1120,38 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=PREFILL_START_POS)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone DeepSeek V4 prefill QKV/RoPE validation. "
+            "This rectangular module uses --start-pos to build freqs rows for the standalone fixture; "
+            "packed HCA/SWA callers use prefill_packed_qkv_proj_rope_core with position_ids instead."
+        )
+    )
+    parser.add_argument(
+        "-p", "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
+    )
+    parser.add_argument(
+        "--start-pos",
+        type=int,
+        default=PREFILL_START_POS,
+        help="Fixture-only absolute sequence offset used to select RoPE rows for rectangular standalone validation.",
+    )
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
+    )
     args = parser.parse_args()
 
     result = run_jit(

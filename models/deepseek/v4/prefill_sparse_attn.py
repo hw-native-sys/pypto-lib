@@ -1372,12 +1372,36 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
-                        choices=list(SUPPORTED_COMPRESS_RATIOS))
+    parser = argparse.ArgumentParser(
+        description=(
+            "Standalone DeepSeek V4 prefill sparse-attn consumer validation. "
+            "The rectangular path uses seqused_kv; packed HCA/SWA callers use prefill_hca_packed_sparse_attn "
+            "with token_to_request and prebuilt sparse indices."
+        )
+    )
+    parser.add_argument(
+        "-p", "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=int,
+        default=0,
+        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
+    )
+    parser.add_argument(
+        "--compress-ratio",
+        type=int,
+        default=DEFAULT_COMPRESS_RATIO,
+        choices=list(SUPPORTED_COMPRESS_RATIOS),
+        help=(
+            "Standalone sparse-attn KV contract: 0 means sliding-window/prompt KV only; "
+            "4 and 128 append deterministic visible compressed slots to cmp_sparse_indices."
+        ),
+    )
     parser.add_argument(
         "--enable-l2-swimlane",
         nargs="?",
@@ -1385,8 +1409,20 @@ if __name__ == "__main__":
         default=0,
         type=int,
         metavar="PERF_LEVEL",
+        help=(
+            "Enable L2 swimlane profiling/report generation. May be passed without a value "
+            "to use level 4, or with an explicit PERF_LEVEL."
+        ),
     )
-    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument(
+        "--enable-pmu",
+        nargs="?",
+        const=2,
+        default=0,
+        type=int,
+        choices=[0, 1, 2, 4],
+        help="Enable PMU profiling level for runtime_cfg. Omit for 0; pass without value for level 2.",
+    )
     args = parser.parse_args()
 
     result = run_jit(
