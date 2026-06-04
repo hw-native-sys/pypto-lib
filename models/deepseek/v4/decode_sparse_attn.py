@@ -36,7 +36,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 128
+DEFAULT_COMPRESS_RATIO = 0
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
@@ -59,6 +59,7 @@ B_N_TILE = 128
 QUANT_TILE = 32
 QUANT_TOKEN_TILE = 8
 QUANT_K_TILE = O_GROUPS * O_LORA // 2
+NEG_INF = -1.0e20
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
@@ -94,37 +95,29 @@ def sparse_attn(
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * TOPK, HEAD_DIM], dtype=pl.BF16)
+    sparse_valid = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     for g_t in pl.spmd(T, name_hint="gather_kv"):
         g_b = g_t // S
-        g_s = g_t - g_b * S
-        g_seq_end = pl.read(seqused_kv, [g_b])
-        g_seq_len = g_seq_end - S + 1 + g_s
-        g_win_v = pl.min(WIN, g_seq_len)
-        g_cmp_v = g_seq_len - g_win_v
-        g_tk_v = pl.min(IDX_TOPK, g_cmp_v)
-        g_sparse_k = g_win_v + g_tk_v
         g_kv_base = g_t * TOPK
-
-        # Window prefix: contiguous, copy as one row block.
-        g_ori_blk = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX)
-        g_ori_row = g_ori_blk * BLOCK_SIZE
-        window_rows = pl.set_validshape(ori_kv_flat[g_ori_row : g_ori_row + WIN, 0 : HEAD_DIM], g_win_v, HEAD_DIM)
-        sparse_kv[g_kv_base : g_kv_base + WIN, 0 : HEAD_DIM] = window_rows
-
-        # Compressed-cache hits after the window prefix (sparse row-gather).
-        for g_kk in pl.range(g_tk_v):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_win_v + g_kk])
-            g_slot = g_raw - WIN
-            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-            g_dst_row = g_kv_base + g_win_v + g_kk
-            sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-
-        # Zero-pad the tail so ratio-0/128 sanity modes stay deterministic.
         zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_pad_kk in pl.range(g_sparse_k, TOPK):
-            g_pad_row = g_kv_base + g_pad_kk
-            sparse_kv[g_pad_row : g_pad_row + 1, 0 : HEAD_DIM] = zero_kv_row
+
+        for g_kk in pl.range(TOPK):
+            g_raw = pl.read(cmp_sparse_indices, [g_t, g_kk])
+            g_dst_row = g_kv_base + g_kk
+            if g_raw < 0:
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
+                pl.write(sparse_valid, [g_t, g_kk], pl.cast(0, pl.INT32))
+            elif g_raw < WIN:
+                g_ori_blk = pl.cast(pl.read(ori_block_table, [g_b, g_raw // BLOCK_SIZE]), pl.INDEX)
+                g_src_row = g_ori_blk * BLOCK_SIZE + g_raw % BLOCK_SIZE
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                pl.write(sparse_valid, [g_t, g_kk], pl.cast(1, pl.INT32))
+            else:
+                g_slot = g_raw - WIN
+                g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                pl.write(sparse_valid, [g_t, g_kk], pl.cast(1, pl.INT32))
 
     # Sparse-K attention: qk_pv writes per-tile (mi, li, oi) into GM scratch,
     # merge_norm reads them back. ATTN_K_TILE keeps K and V right-buffer
@@ -137,13 +130,6 @@ def sparse_attn(
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
-        qk_b = qk_t // S
-        qk_s = qk_t - qk_b * S
-        qk_seq_end = pl.read(seqused_kv, [qk_b])
-        qk_seq_len = qk_seq_end - S + 1 + qk_s
-        qk_win_v = pl.min(WIN, qk_seq_len)
-        qk_tk_v = pl.min(IDX_TOPK, qk_seq_len - qk_win_v)
-        qk_sparse_k = qk_win_v + qk_tk_v
         qk_kv_base = qk_t * TOPK
         qk_token_base = qk_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
         for qk_h_idx in pl.range((H // H_TILE)):
@@ -154,33 +140,30 @@ def sparse_attn(
 
             for qk_sb in pl.range(((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
                 qk_s0 = qk_sb * ATTN_K_TILE
-                if qk_s0 < qk_sparse_k:
-                    qk_s_v = pl.min(ATTN_K_TILE, qk_sparse_k - qk_s0)
-                    qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                    qk_scores_v = pl.set_validshape(pl.mul(qk_raw, SOFTMAX_SCALE), H_TILE, qk_s_v)
-                    qk_scores = pl.fillpad(qk_scores_v, pad_value=pl.PadValue.min)
-                    qk_mi = pl.row_max(qk_scores)
-                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
-                    qk_li = pl.row_sum(pl.cast(qk_exp_bf16, target_type=pl.FP32))
-                    qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
+                qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                qk_valid_row = pl.cast(sparse_valid[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE], target_type=pl.FP32)
+                qk_valid = pl.col_expand(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_valid_row)
+                qk_invalid = pl.sub(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=1.0), qk_valid)
+                qk_scores = pl.add(
+                    pl.mul(qk_scaled, qk_valid),
+                    pl.mul(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF), qk_invalid),
+                )
+                qk_mi = pl.row_max(qk_scores)
+                qk_exp_raw = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                qk_exp = pl.mul(qk_exp_raw, qk_valid)
+                qk_li = pl.row_sum(qk_exp)
+                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
+                qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                qk_row = qk_blk_base + qk_sb * H_TILE
+                sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
+                sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
+                sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
 
     # Online-softmax merge across sparse-K tiles, then sink-norm.
     for m_t in pl.spmd(T, name_hint="merge_norm"):
-        m_b = m_t // S
-        m_s = m_t - m_b * S
-        m_seq_end = pl.read(seqused_kv, [m_b])
-        m_seq_len = m_seq_end - S + 1 + m_s
-        m_win_v = pl.min(WIN, m_seq_len)
-        m_tk_v = pl.min(IDX_TOPK, m_seq_len - m_win_v)
-        m_sparse_k = m_win_v + m_tk_v
-        m_num_tiles = (m_sparse_k + ATTN_K_TILE - 1) // ATTN_K_TILE
         m_token_base = m_t * (H // H_TILE) * ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE) * H_TILE
 
         for m_h_idx in pl.range((H // H_TILE)):
@@ -190,20 +173,17 @@ def sparse_attn(
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-            # Bound the merge by the actual number of occupied K-tiles.
-            for m_sb in pl.range(1, m_num_tiles):
-                m_s0 = m_sb * ATTN_K_TILE
-                if m_s0 < m_sparse_k:
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                    m_mi = m_mi_new
+            for m_sb in pl.range(1, ((TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)):
+                m_row = m_blk_base + m_sb * H_TILE
+                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                m_mi = m_mi_new
 
             n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
             n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
@@ -220,7 +200,8 @@ def sparse_attn(
                 n_col = n_hh * HEAD_DIM
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
-    # Inverse RoPE
+    # Inverse RoPE: gather even/odd lanes, rotate, then mask-scatter back to
+    # interleaved layout. The BF16 round-trip on rotated values matches golden.
     rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
         r_t0 = r_idx * ROPE_TOKEN_TILE
@@ -240,6 +221,7 @@ def sparse_attn(
                 r_odd_rot = pl.sub(pl.col_expand_mul(r_odd, r_cos), pl.col_expand_mul(r_even, r_sin))
                 r_even_rot = pl.cast(pl.cast(r_even_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
                 r_odd_rot = pl.cast(pl.cast(r_odd_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+
                 r_rope_buf = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=0.0)
                 r_rope_buf = pl.tensor.scatter(r_even_rot, mask_pattern=pl.tile.MaskPattern.P0101, dst=r_rope_buf)
                 r_rope_buf = pl.tensor.scatter(r_odd_rot, mask_pattern=pl.tile.MaskPattern.P1010, dst=r_rope_buf)
@@ -254,8 +236,6 @@ def sparse_attn(
             rp_t = rp_t0 + rp_dt
             rp_row = rp_t * H + rp_g * HEADS_PER_GROUP
 
-            # Write only this group's inverse-RoPE tail of o_packed: cast the single
-            # scatter-merged FP32 buffer to BF16.
             rp_rope = rope_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
             rp_full = pl.cast(rp_rope, target_type=pl.BF16)
             rp_pack_row = rp_g * T + rp_t
@@ -348,7 +328,6 @@ def sparse_attn(
 
     return attn_out
 
-
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -420,7 +399,6 @@ def golden_sparse_attn(tensors):
     cmp_block_table = tensors["cmp_block_table"]
     cmp_sparse_indices = tensors["cmp_sparse_indices"]
     attn_sink = tensors["attn_sink"].float()
-    seqused_kv = tensors["seqused_kv"]
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
     wo_a = tensors["wo_a"].float()
@@ -429,49 +407,50 @@ def golden_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
 
-    # Per-query-token attention. seqused_kv stores each batch's final sparse
-    # length for this decode chunk; token t derives its causal length from s.
+    # Per-query-token attention. cmp_sparse_indices is the authoritative
+    # topk list: -1 means invalid, raw < WIN selects the window/ring cache,
+    # and raw >= WIN selects the compressed-cache tail.
     for t in range(T):
         b = t // S
-        s = t - b * S
-        seq_used = int(seqused_kv[b].item()) - S + 1 + s
-        window_valid = min(WIN, seq_used)
-        cmp_valid = max(seq_used - window_valid, 0)
-        gathered = []
+        kv_rows = []
+        valid = []
 
         for raw in cmp_sparse_indices[t].tolist():
             if raw < 0:
+                kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
+                valid.append(False)
                 continue
             if raw < WIN:
-                if raw >= window_valid:
-                    continue
                 blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
                 intra = raw % BLOCK_SIZE
-                gathered.append(ori_kv[blk_id, intra, 0])
+                kv_rows.append(ori_kv[blk_id, intra, 0])
+                valid.append(True)
             else:
                 cmp_slot = raw - WIN
-                if cmp_slot >= cmp_valid:
-                    continue
                 blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
                 intra = cmp_slot % BLOCK_SIZE
-                gathered.append(cmp_kv[blk_id, intra, 0])
+                kv_rows.append(cmp_kv[blk_id, intra, 0])
+                valid.append(True)
 
-        if not gathered:
+        if not any(valid):
             continue
 
-        kv_b = torch.stack(gathered, dim=0)
+        kv_b = torch.stack(kv_rows, dim=0)
+        valid_b = torch.tensor(valid, dtype=torch.bool)
         q_t = q[t]
 
         block_mi = []
         block_li = []
         block_oi = []
-        for tile_start in range(0, kv_b.shape[0], ATTN_K_TILE):
+        for tile_start in range(0, TOPK, ATTN_K_TILE):
             kv_tile = kv_b[tile_start:tile_start + ATTN_K_TILE]
+            valid_tile = valid_b[tile_start:tile_start + ATTN_K_TILE]
             scores = (q_t @ kv_tile.T) * SOFTMAX_SCALE
+            scores = scores.masked_fill(~valid_tile.unsqueeze(0), NEG_INF)
             mi = scores.max(dim=-1, keepdim=True).values
-            exp_scores = torch.exp(scores - mi).to(torch.bfloat16).float()
+            exp_scores = torch.exp(scores - mi).masked_fill(~valid_tile.unsqueeze(0), 0.0)
             li = exp_scores.sum(dim=-1, keepdim=True)
-            oi = exp_scores @ kv_tile.to(torch.bfloat16).float()
+            oi = exp_scores.to(torch.bfloat16).float() @ kv_tile.to(torch.bfloat16).float()
             block_mi.append(mi)
             block_li.append(li)
             block_oi.append(oi)
@@ -511,11 +490,12 @@ def golden_sparse_attn(tensors):
 
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
-
 def build_tensor_specs(
     compress_ratio: int = DEFAULT_COMPRESS_RATIO,
     causal_regression_fixture: bool = False,
-    seqused=None,
+    short_window_fixture: bool = False,
+    mixed_topk_fixture: bool = False,
+    overlay_replacement_fixture: bool = False,
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
@@ -574,41 +554,27 @@ def build_tensor_specs(
         cmp_part = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
         cmp_part[:, :cmp_valid] = (torch.arange(cmp_valid, dtype=torch.int32) + WIN).unsqueeze(0).expand(T, -1)
         indices = torch.cat([win_part, cmp_part], dim=-1).contiguous()
+        if short_window_fixture:
+            indices[:, :] = -1
+            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+        if mixed_topk_fixture:
+            indices[:, :] = -1
+            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+            mixed_cmp_valid = min(cmp_valid, IDX_TOPK)
+            if mixed_cmp_valid:
+                indices[:, WIN:WIN + mixed_cmp_valid] = (
+                    torch.arange(mixed_cmp_valid, dtype=torch.int32) + WIN
+                ).unsqueeze(0).expand(T, -1)
+        if overlay_replacement_fixture:
+            indices[:, :] = -1
+            indices[:, :17] = torch.arange(17, dtype=torch.int32).unsqueeze(0).expand(T, -1)
+            indices[:, 16] = WIN
         if causal_regression_fixture:
             indices[0, WIN - 1] = WIN - 1
         return indices
 
     def init_seqused_kv():
-        """Per-batch sparse length. ratio-128 and ratio-0 use per-row coverage
-        patterns (ratio-0 stays <= WIN as it has no compressed tail); both
-        exercise partial window (seq<WIN), the single/multi tile boundary, and
-        full attention. --seqused N overrides with one homogeneous length;
-        ratio-4 keeps the homogeneous full length."""
-        if seqused is not None:
-            return torch.full((B,), seqused, dtype=torch.int32)
-        if compress_ratio == 128:
-            # 11  : partial window, sub-tile (<ATTN_K_TILE), 0 cmp
-            # 50  : partial window, ~1.5 tiles, 0 cmp
-            # WIN : exactly the window boundary, 0 cmp
-            # WIN+1            : full window + 1 cmp (partial cmp tile)
-            # WIN+ATTN_K_TILE  : full window + a full cmp tile (tile boundary)
-            # sparse_k         : full window + full cmp tail (the legacy point)
-            pattern = torch.tensor(
-                [11, 50, WIN, WIN + 1, WIN + ATTN_K_TILE, sparse_k],
-                dtype=torch.int32,
-            )
-            return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
-        if compress_ratio == 0:
-            # Pure SWA (no compressed tail), all <= WIN:
-            # 11             : single tile (seq <= ATTN_K_TILE)
-            # ATTN_K_TILE+1  : single/multi-tile boundary (seq_used {32, 33})
-            # WIN // 2       : multi-tile partial window
-            # WIN            : full window
-            pattern = torch.tensor(
-                [11, ATTN_K_TILE + 1, WIN // 2, WIN],
-                dtype=torch.int32,
-            )
-            return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+        """Expose the demo sequence-used length that matches the chosen ratio mode."""
         return torch.full((B,), sparse_k, dtype=torch.int32)
 
     def init_cos():
@@ -668,16 +634,25 @@ if __name__ == "__main__":
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
                         help="Amplify the S=2 future-window-slot regression; use with --compress-ratio 0.")
-    parser.add_argument("--seqused", type=int, default=None,
-                        help="Override per-batch sparse length with one homogeneous value "
-                             "(ratio-128 default is a per-row coverage pattern).")
+    parser.add_argument("--short-window-fixture", action="store_true", default=False,
+                        help="Use a short-window topk row with valid prefix + -1 padding.")
+    parser.add_argument("--mixed-topk-fixture", action="store_true", default=False,
+                        help="Use -1-padded window slots with valid compressed raw indices.")
+    parser.add_argument("--overlay-replacement-fixture", action="store_true", default=False,
+                        help="Place a compressed raw index inside the window prefix order.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
     result = run_jit(
         fn=sparse_attn_test,
-        specs=build_tensor_specs(args.compress_ratio, args.causal_regression_fixture, args.seqused),
+        specs=build_tensor_specs(
+            args.compress_ratio,
+            args.causal_regression_fixture,
+            args.short_window_fixture,
+            args.mixed_topk_fixture,
+            args.overlay_replacement_fixture,
+        ),
         golden_fn=golden_sparse_attn,
         runtime_cfg=dict(
             platform=args.platform,
@@ -687,8 +662,6 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        # Precision reference: AscendC npu_sparse_attn_sharedkv —
-        # ops-transformer/experimental/attention/sparse_attn_sharedkv/tests/pytest/result_compare_method.py
         compare_fn={
             "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },

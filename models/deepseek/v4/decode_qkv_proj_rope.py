@@ -326,14 +326,21 @@ def golden_qkv_proj_rope(tensors):
         out_i8 = out_half.to(torch.int8)
         return out_i8.reshape_as(x), (1.0 / scale_quant).reshape(*x.shape[:-1], 1)
 
-    def rms_norm(x, gamma, eps=EPS):
-        inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    def rms_norm_tiled(x, gamma, tile, eps=EPS):
+        sq_sum = torch.zeros(*x.shape[:-1], 1, dtype=torch.float32)
+        for d0 in range(0, x.shape[-1], tile):
+            x_chunk = x[..., d0:d0 + tile].float()
+            sq_sum = sq_sum + x_chunk.square().sum(dim=-1, keepdim=True)
+        inv = torch.rsqrt(sq_sum * (1.0 / x.shape[-1]) + eps)
         return x * inv * gamma
 
-    def matmul_bf16_input_fp32(a, b):
+    def matmul_bf16_input_fp32_tiled(a, b, tile):
         a_fp32 = a.to(torch.bfloat16).float()
         b_fp32 = b.to(torch.bfloat16).float()
-        return torch.matmul(a_fp32, b_fp32).float()
+        acc = torch.zeros(a_fp32.shape[0], b_fp32.shape[1], dtype=torch.float32)
+        for d0 in range(0, a_fp32.shape[1], tile):
+            acc = acc + torch.matmul(a_fp32[:, d0:d0 + tile], b_fp32[d0:d0 + tile])
+        return acc
 
     def apply_rope(x_rope, cos, sin):
         # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
@@ -351,21 +358,32 @@ def golden_qkv_proj_rope(tensors):
     token_x = x.view(T, D)
 
     # Q path
-    qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
+    qr_fp32 = matmul_bf16_input_fp32_tiled(token_x, wq_a, D_TILE)
+    qr_out = rms_norm_tiled(qr_fp32, gamma_cq, Q_LORA_TILE)   # [T, Q_LORA]
     # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
     qr_out_bf16 = qr_out.to(torch.bfloat16)
     qr_i8, qr_scale = int8_quant_per_row(qr_out_bf16.float())
-    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
+    q_i32 = torch.zeros(T, H * HEAD_DIM, dtype=torch.int32)
+    for q0 in range(0, Q_LORA, Q_PROJ_TILE):
+        q_i32 = q_i32 + torch.matmul(
+            qr_i8[:, q0:q0 + Q_PROJ_TILE].to(torch.int32),
+            wq_b[q0:q0 + Q_PROJ_TILE].to(torch.int32),
+        )
     q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(T, H, HEAD_DIM)
-    inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
+    q_sq_sum = torch.zeros(T, H, 1, dtype=torch.float32)
+    for d0 in range(0, HEAD_DIM, HEAD_TILE):
+        q_chunk = q_full[..., d0:d0 + HEAD_TILE].float()
+        q_sq_sum = q_sq_sum + q_chunk.square().sum(dim=-1, keepdim=True)
+    inv = torch.rsqrt(q_sq_sum * (1.0 / HEAD_DIM) + EPS)
     q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
     q_nope = q_full[..., :NOPE_DIM]
     q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos, rope_sin)
     q_out = torch.cat([q_nope, q_rope], dim=-1)
 
     # KV path
-    kv_full = rms_norm(matmul_bf16_input_fp32(token_x, wkv), gamma_ckv)  # [T, HEAD_DIM]
+    kv_fp32 = matmul_bf16_input_fp32_tiled(token_x, wkv, D_TILE)
+    kv_full = rms_norm_tiled(kv_fp32, gamma_ckv, KV_TILE)  # [T, HEAD_DIM]
     kv_nope = kv_full[..., :NOPE_DIM]
     kv_rope_in = kv_full[..., NOPE_DIM:].unsqueeze(1)               # add a pseudo head dim
     kv_rope = apply_rope(kv_rope_in, rope_cos, rope_sin).squeeze(1)
