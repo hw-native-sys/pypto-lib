@@ -241,7 +241,7 @@ PACKED_C128_POOL_BLOCKS = MAX_CMP_WRITES * CMP_HEAD_BLOCKS
 
 @pl.jit.inline
 def prefill_compressor_ratio128_packed(
-    x: pl.Tensor[[B, S, D], pl.BF16],
+    x: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     kv_state: pl.Tensor[[MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM], pl.FP32],
     wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
@@ -250,7 +250,7 @@ def prefill_compressor_ratio128_packed(
     norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -258,7 +258,7 @@ def prefill_compressor_ratio128_packed(
     cmp_write_token_ids: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
 ):
-    x_flat = pl.reshape(x, [MAX_TOKENS, D])
+    x_flat = x
     kv_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
     score_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
     kv_state_flat = pl.reshape(kv_state, [MAX_REQS * MAIN_STATE_LEN, MAIN_OUT_DIM])
@@ -311,7 +311,7 @@ def prefill_compressor_ratio128_packed(
                         ]
                         score_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = score_row
                 else:
-                    kv_state_flat[0:1, 0:CMP_OUT_CHUNK] = kv_state_flat[0:1, 0:CMP_OUT_CHUNK]
+                    score_proj[t : t + 1, 0:CMP_OUT_CHUNK] = score_proj[t : t + 1, 0:CMP_OUT_CHUNK]
 
     for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
         write_i = pool_idx // CMP_HEAD_BLOCKS
@@ -337,7 +337,10 @@ def prefill_compressor_ratio128_packed(
                 target_type=pl.FP32,
             )
         else:
-            pooled_kv_pad[0:1, 0:CMP_HEAD_CHUNK] = pooled_kv_pad[0:1, 0:CMP_HEAD_CHUNK]
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + CMP_HEAD_CHUNK] = pooled_kv_pad[
+                write_i : write_i + 1,
+                h0 : h0 + CMP_HEAD_CHUNK,
+            ]
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_norm_rope"):
@@ -395,8 +398,8 @@ def prefill_compressor_ratio128_packed(
         )
         normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM] = rope_buf
 
-    for final_i in pl.parallel(0, MAX_CMP_WRITES, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_finalize"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_finalize"):
+        for final_i in pl.range(MAX_CMP_WRITES):
             if final_i < num_cmp_writes:
                 final_cmp_row = pl.cast(pl.read(cmp_slot_mapping, [final_i]), pl.INDEX)
                 for final_hb in pl.range(CMP_HEAD_BLOCKS):
@@ -408,7 +411,10 @@ def prefill_compressor_ratio128_packed(
                         mode="rint",
                     )
             else:
-                cmp_kv_flat[0:1, 0:CMP_HEAD_CHUNK] = cmp_kv_flat[0:1, 0:CMP_HEAD_CHUNK]
+                normed_kv_pad[final_i : final_i + 1, 0:CMP_HEAD_CHUNK] = normed_kv_pad[
+                    final_i : final_i + 1,
+                    0:CMP_HEAD_CHUNK,
+                ]
 
     cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv_state = pl.reshape(kv_state_flat, [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM])

@@ -45,17 +45,17 @@ RMS_PIPE_STAGE = 1 if T >= 64 else 4
 
 
 @pl.jit.inline
-def prefill_hc_pre(
-    x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+def prefill_hc_pre_packed(
+    x:        pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_fn:    pl.Tensor[[MIX_HC, HC_DIM],   pl.FP32],
     hc_scale: pl.Tensor[[3],                pl.FP32],
     hc_base:  pl.Tensor[[MIX_HC],           pl.FP32],
-    x_mixed:  pl.Tensor[[B, S, D],          pl.BF16],
-    post:     pl.Tensor[[B, S, HC_MULT],    pl.FP32],
-    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+    x_mixed:  pl.Tensor[[T, D],             pl.BF16],
+    post:     pl.Tensor[[T, HC_MULT],       pl.FP32],
+    comb:     pl.Tensor[[T, HC_MULT, HC_MULT], pl.FP32],
 ):
     x_flat = pl.reshape(x, [T, HC_DIM])
-    post_2d = pl.reshape(post, [T, HC_MULT])
+    post_2d = post
     comb_flat = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     inv_rms = pl.create_tensor([1, T], dtype=pl.FP32)
     mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
@@ -257,7 +257,7 @@ def prefill_hc_pre(
             comb_flat = pl.store(row3_out, [t0, 3 * HC_MULT], comb_flat)
 
     # Mix the HC lanes into the model dimension before qkv projection.
-    x_mixed_view = pl.reshape(x_mixed, [T, D])
+    x_mixed_view = x_mixed
     for t0 in pl.parallel(0, T, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hc_mix_x"):
             pre0 = pl.reshape(
@@ -303,9 +303,42 @@ def prefill_hc_pre(
                     [t0, d0],
                     x_mixed_view,
                 )
-    x_mixed = pl.reshape(x_mixed_view, [B, S, D])
-    post = pl.reshape(post_2d, [B, S, HC_MULT])
-    comb = pl.reshape(comb_flat, [B, S, HC_MULT, HC_MULT])
+    x_mixed = x_mixed_view
+    post = post_2d
+    comb = pl.reshape(comb_flat, [T, HC_MULT, HC_MULT])
+    return x_mixed, post, comb
+
+
+@pl.jit.inline
+def prefill_hc_pre(
+    x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    hc_fn:    pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base:  pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed:  pl.Tensor[[B, S, D], pl.BF16],
+    post:     pl.Tensor[[B, S, HC_MULT], pl.FP32],
+    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+):
+    x_packed = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_packed = pl.reshape(x, [T, HC_MULT, D])
+    x_mixed_packed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_mixed_packed = pl.reshape(x_mixed, [T, D])
+    post_packed = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    post_packed = pl.reshape(post, [T, HC_MULT])
+    comb_packed = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
+    comb_packed = pl.reshape(comb, [T, HC_MULT, HC_MULT])
+    x_mixed_packed, post_packed, comb_packed = prefill_hc_pre_packed(
+        x_packed,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        x_mixed_packed,
+        post_packed,
+        comb_packed,
+    )
+    x_mixed = pl.reshape(x_mixed_packed, [B, S, D])
+    post = pl.reshape(post_packed, [B, S, HC_MULT])
+    comb = pl.reshape(comb_packed, [B, S, HC_MULT, HC_MULT])
     return x_mixed, post, comb
 
 

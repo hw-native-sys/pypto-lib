@@ -657,8 +657,8 @@ def prefill_hca_packed_sparse_attn(
             zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
             for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
                 gather_t = gather_t0 + gather_dt
-                gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
                 if gather_t < num_tokens:
+                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
                     for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
                         gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
                         gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k

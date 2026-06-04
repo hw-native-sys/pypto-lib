@@ -16,8 +16,8 @@ position_ids, slot mappings, and window-ring sparse indices.
 import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post
-from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
+from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_packed
+from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre_packed
 from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
 from prefill_sparse_attn import (
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
@@ -139,15 +139,13 @@ def prefill_attention_swa(
     x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_hc_rect = pl.create_tensor([B, S, HC_MULT, D], dtype=pl.BF16)
-    x_hc_rect = pl.reshape(x_hc, [B, S, HC_MULT, D])
-    x_mixed = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    post = pl.create_tensor([B, S, HC_MULT], dtype=pl.FP32)
-    comb = pl.create_tensor([B, S, HC_MULT, HC_MULT], dtype=pl.FP32)
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed, post, comb = prefill_hc_pre(
-        x_hc_rect,
+    x_mixed, post, comb = prefill_hc_pre_packed(
+        x_hc,
         hc_attn_fn,
         hc_attn_scale,
         hc_attn_base,
@@ -181,6 +179,7 @@ def prefill_attention_swa(
         rope_cos_t,
         rope_sin_t,
         position_ids,
+        num_tokens,
     )
 
     kv_cache = prefill_swa_write_kv_cache_packed(kv, kv_cache, ori_slot_mapping, num_tokens)
@@ -206,19 +205,14 @@ def prefill_attention_swa(
         attn_out,
     )
 
-    # create_tensor seeds static metadata required by the JIT for hc_post input.
-    attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    attn_out_3d = pl.reshape(attn_out, [B, S, D])
-    x_out_rect = pl.create_tensor([B, S, HC_MULT, D], dtype=pl.BF16)
-    x_out_rect = pl.reshape(x_out, [B, S, HC_MULT, D])
-    x_out = prefill_hc_post(
-        attn_out_3d,
-        x_hc_rect,
+    x_out = prefill_hc_post_packed(
+        attn_out,
+        x_hc,
         post,
         comb,
-        x_out_rect,
+        x_out,
     )
-    return kv_cache, pl.reshape(x_out, [MAX_TOKENS, HC_MULT, D])
+    return kv_cache, x_out
 
 
 def _quant_w_per_output_channel(w):

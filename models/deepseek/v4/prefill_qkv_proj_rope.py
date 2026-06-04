@@ -549,7 +549,7 @@ HCA_KV_STORE_TILE = 16
 
 @pl.jit.inline
 def prefill_packed_qkv_proj_rope_core(
-    x:         pl.Tensor[[B, S, D],              pl.BF16],
+    x:         pl.Tensor[[T, D],                 pl.BF16],
     norm_w:    pl.Tensor[[D],                    pl.FP32],
     wq_a:      pl.Tensor[[D, Q_LORA],            pl.BF16],
     wq_b:      pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
@@ -566,6 +566,7 @@ def prefill_packed_qkv_proj_rope_core(
     rope_cos_t: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     rope_sin_t: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     # Stage -1: materialize absolute-position RoPE rows for packed tokens.
     # Unlike the shared rectangular prefill QKV kernel, HCA packed prefill uses
@@ -574,13 +575,14 @@ def prefill_packed_qkv_proj_rope_core(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_qkv_rope_rows"):
             for rope_dt in pl.range(HCA_KV_STORE_TILE):
                 rope_t = rope_t0 + rope_dt
-                rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
-                rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
-                rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                if rope_t < num_tokens:
+                    rope_pos = pl.cast(pl.read(position_ids, [rope_t]), pl.INDEX)
+                    rope_cos_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_cos[rope_pos : rope_pos + 1, 0:ROPE_DIM]
+                    rope_sin_t[rope_t : rope_t + 1, 0:ROPE_DIM] = freqs_sin[rope_pos : rope_pos + 1, 0:ROPE_DIM]
 
-    x_flat = pl.reshape(x, [T, D])
+    x_flat = x
 
-    # Stage 0+: process this [B, S] QKV invocation in token chunks. The
+    # Stage 0+: process this token-major QKV invocation in token chunks. The
     # internal chunk keeps the largest local tensors small enough for the QKV
     # projection, quantization, and RoPE scopes.
     for chunk_idx in pl.range(QKV_PREFILL_QKV_CHUNKS):

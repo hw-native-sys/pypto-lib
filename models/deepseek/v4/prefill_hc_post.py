@@ -31,16 +31,16 @@ assert T % HC_POST_TOKEN_TILE == 0, "T must be divisible by HC_POST_TOKEN_TILE"
 
 
 @pl.jit.inline
-def prefill_hc_post(
-    x:               pl.Tensor[[B, S, D],             pl.BF16],
-    residual:        pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
-    post:            pl.Tensor[[B, S, HC_MULT],       pl.FP32],
-    comb:            pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
-    y:               pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
+def prefill_hc_post_packed(
+    x:        pl.Tensor[[T, D], pl.BF16],
+    residual: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    post:     pl.Tensor[[T, HC_MULT], pl.FP32],
+    comb:     pl.Tensor[[T, HC_MULT, HC_MULT], pl.FP32],
+    y:        pl.Tensor[[T, HC_MULT, D], pl.BF16],
 ):
-    x_flat = pl.reshape(x, [T, D])
+    x_flat = x
     residual_flat = pl.reshape(residual, [T, HC_DIM])
-    post_t = pl.reshape(post, [T, HC_MULT])
+    post_t = post
     comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     y_flat = pl.reshape(y, [T, HC_DIM])
 
@@ -88,8 +88,36 @@ def prefill_hc_post(
                 t:t + 1,
                 out_h * D + d0:out_h * D + d0 + D_CHUNK,
             ] = pl.cast(y_row, target_type=pl.BF16, mode="rint")
-    y = pl.reshape(y_flat, [B, S, HC_MULT, D])
+    y = pl.reshape(y_flat, [T, HC_MULT, D])
     return y
+
+
+@pl.jit.inline
+def prefill_hc_post(
+    x:               pl.Tensor[[B, S, D],             pl.BF16],
+    residual:        pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
+    post:            pl.Tensor[[B, S, HC_MULT],       pl.FP32],
+    comb:            pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
+    y:               pl.Tensor[[B, S, HC_MULT, D],    pl.BF16],
+):
+    x_packed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_packed = pl.reshape(x, [T, D])
+    residual_packed = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    residual_packed = pl.reshape(residual, [T, HC_MULT, D])
+    post_packed = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    post_packed = pl.reshape(post, [T, HC_MULT])
+    comb_packed = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
+    comb_packed = pl.reshape(comb, [T, HC_MULT, HC_MULT])
+    y_packed = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    y_packed = pl.reshape(y, [T, HC_MULT, D])
+    y_packed = prefill_hc_post_packed(
+        x_packed,
+        residual_packed,
+        post_packed,
+        comb_packed,
+        y_packed,
+    )
+    return pl.reshape(y_packed, [B, S, HC_MULT, D])
 
 
 @pl.jit
