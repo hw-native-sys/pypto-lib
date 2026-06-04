@@ -64,7 +64,12 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
-from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
+from config import (  # shared model/serving config
+    BLOCK_TABLE_FLAT_DYN,  # flat [user_batch * max_blocks_per_seq] block table dim
+    KV_CACHE_ROWS_DYN,     # runtime-dynamic paged KV pool row count
+    USER_BATCH_DYN,        # runtime-dynamic user batch
+    VOCAB,                 # vocab size for the fused decode_fwd LM head / logits
+)
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -93,7 +98,6 @@ HALF_DIM = HEAD_DIM // 2  # 64 (RoPE rotates lo/hi halves)
 ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
 HIDDEN_INV = 1.0 / HIDDEN
 HEAD_DIM_INV = 1.0 / HEAD_DIM  # per-head QK-norm RMSNorm denominator
-CACHE_ROWS = BATCH * NUM_KV_HEADS * MAX_SEQ  # k_cache / v_cache row count
 
 # Attention head grouping. Q_HEAD_BATCH = Q_PER_KV (one attn lane per KV head).
 Q_HEAD_BATCH = Q_PER_KV  # 5: Q heads bundled per attention task
@@ -139,14 +143,23 @@ QKV_OK = 4  # split-K slices (atomic-add)
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
-# ── Scope 2 · grouped-query attention (fused) ──
-# SEQ_TILE = seq length per KV block. 256 compiles after the AutoTileMatmulL0 fix
-# (#1595): the pass now tiles the PV (score·V) matmul like QK, so V's L0B right
-# buffer reuses QK's freed buffer instead of co-residing — peak L0B = max(QK, PV)
-# rather than the sum. (Pre-fix, 256 hit "Right buffer usage 131072 exceeds
-# platform limit 65536" at AllocateMemoryAddr; 128 was the cap.)
-SEQ_TILE = 256
-MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # 16
+# ── Scope 2 · grouped-query attention (fused, PAGED) ──
+# SEQ_TILE = seq length per KV block. PINNED to the serving paged page_size (128):
+# decode now reads KV from the PAGED pool via block_table, so one logical block
+# must map to exactly one physical page — i.e. SEQ_TILE == page_size — or a block
+# would straddle two pages whose physical ids are unrelated. prefill_fwd uses the
+# same 128 page; 128 is also the known-good L0B double-buffer cap (256 only became
+# legal after the AutoTileMatmulL0 fix #1595, and is not needed once tiling tracks
+# the page size). BLOCK_SIZE is an alias used by the paged cache-row arithmetic.
+SEQ_TILE = 128
+BLOCK_SIZE = SEQ_TILE  # paged page size (== serving runtime.page_size)
+MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # logical blocks per seq (32 @ 4096)
+# Worst-case physical page count for the standalone golden/smoke pool (one band
+# per (batch, block)); the kernel itself reads the pool size from k_cache's dynamic
+# dim, so this only sizes the test fixtures.
+MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
+NUM_PAGES = BATCH * MAX_BLOCKS_PER_SEQ
+CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE  # paged k_cache / v_cache rows (one layer)
 
 # ── Scope 2 · KV-block split (flash-decoding) for ragged load balance ──
 # Each fa_fused lane (a Q-group pair) is split into contiguous KV partitions of
@@ -264,6 +277,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -276,12 +291,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-    # Per-layer offsets into the STACKED weights / KV cache. For the single-layer
-    # entry (qwen3_decode_mpmd) layer_idx==0 so every base is 0 and single-layer
-    # weight tensors work unchanged; decode_fwd passes the running loop index.
+    # Per-layer offsets into the STACKED weights / PAGED KV cache. For the
+    # single-layer entry (qwen3_decode_mpmd) layer_idx==0 so every base is 0 and
+    # single-layer tensors work unchanged; decode_fwd passes the running loop index.
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
-    layer_cache_base = layer_idx * (BATCH * NUM_KV_HEADS * MAX_SEQ)
+    # Paged KV: rows are runtime-dynamic (the paged pool sizes them). Derive the
+    # per-layer stride and the block-table row stride from the tensor dims, exactly
+    # as prefill_fwd does, so decode reads the SAME pool prefill wrote.
+    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
+    layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
+    layer_cache_base = layer_idx * layer_cache_rows
+    user_batch = pl.tensor.dim(seq_lens, 0)
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
@@ -508,7 +530,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # per-row scalar) here, instead of normalizing before the projection.
         # Read on-device so it auto-deps on the rms_recip producer.
         inv_rms_b = pl.read(inv_rms_states, [b, 0])
-        pos = ctx_len - 1
+        pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
+        # Paged write target for this row's current token: slot_mapping[b] decomposes
+        # into (physical page, in-page offset). Same scheme prefill_fwd uses.
+        wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+        wr_slot_block = wr_slot // BLOCK_SIZE
+        wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
         cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
         cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
         sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
@@ -527,7 +554,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             k_hi = k_full[:, HALF_DIM:HEAD_DIM]
             rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
             rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-            cache_row = layer_cache_base + b * NUM_KV_HEADS * MAX_SEQ + ki * MAX_SEQ + pos
+            cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
             k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
             k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
             v_row_bf16 = pl.cast(
@@ -627,9 +654,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
             fa_ctx_len = pl.read(seq_lens, [fa_b])
             # Table holds only real blocks → exactly one block per entry, at fa_p.
-            sb = fa_p  # global KV block index (no inner loop — old p_blocks was 1)
+            sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
             s0 = sb * SEQ_TILE
             valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
+            # Paged read: map logical block sb -> physical page via this request's
+            # block_table row. SEQ_TILE == page_size, so one page is exactly one
+            # contiguous SEQ_TILE-row slice of the pool (shared with the kvh below).
+            fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
 
             # Declarative software pipeline over the per-head gp loop: instead of
             # manually unrolling and reordering (QK0,QK1 -> softmax0,softmax1 ->
@@ -641,7 +672,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                 q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
                 g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-                cache_row = layer_cache_base + fa_b * NUM_KV_HEADS * MAX_SEQ + kvh * MAX_SEQ + s0
+                cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
 
                 # QK matmul (cube) -> C2V boundary move (first vec consumer).
                 k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
@@ -974,6 +1005,8 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — single-layer entry (external API unc
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -987,7 +1020,7 @@ def qwen3_decode_mpmd(  # noqa: PLR0913 — single-layer entry (external API unc
 ):
     res = _decode_layer(
         hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-        seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+        seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
         post_rms_weight, out, 0,
     )
     return res
@@ -1003,6 +1036,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -1041,7 +1076,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
         next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, layer_idx,
         )
     out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
@@ -1061,6 +1096,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -1091,7 +1128,7 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, i,
         )
     for ob0 in pl.parallel(0, BATCH, BATCH):
@@ -1117,6 +1154,8 @@ INPUT_NAMES = (
     "q_norm_weight",
     "k_norm_weight",
     "seq_lens",
+    "block_table",
+    "slot_mapping",
     "rope_cos",
     "rope_sin",
     "k_cache",
@@ -1133,10 +1172,26 @@ def load_inputs(data_in_dir: Path) -> list[torch.Tensor]:
     return [torch.load(data_in_dir / f"{name}.pt", weights_only=True) for name in INPUT_NAMES]
 
 
+def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Identity paging for the standalone harness: batch b's logical blocks map to
+    physical pages [b*MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
+    token's (pos=seq_len-1) physical row. Mirrors the serving runner's layout."""
+    block_table = torch.arange(BATCH * MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    slot_mapping = torch.empty(BATCH, dtype=torch.int32)
+    for b in range(BATCH):
+        pos = int(seq_lens[b].item()) - 1
+        logical_block = pos // BLOCK_SIZE
+        phys_page = b * MAX_BLOCKS_PER_SEQ + logical_block
+        slot_mapping[b] = phys_page * BLOCK_SIZE + (pos % BLOCK_SIZE)
+    return block_table, slot_mapping
+
+
 def _smoke_inputs() -> list[torch.Tensor]:
     def randn(shape, dtype):
         return torch.empty(shape, dtype=dtype).normal_()
 
+    seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
+    block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
     return [
         randn([BATCH, HIDDEN], torch.bfloat16),
         randn([1, HIDDEN], torch.float32),
@@ -1145,7 +1200,9 @@ def _smoke_inputs() -> list[torch.Tensor]:
         randn([HIDDEN, KV_HIDDEN], torch.bfloat16),
         torch.ones([1, HEAD_DIM], dtype=torch.float32),  # q_norm_weight
         torch.ones([1, HEAD_DIM], dtype=torch.float32),  # k_norm_weight
-        torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32),
+        seq_lens,
+        block_table,
+        slot_mapping,
         randn([MAX_SEQ, HEAD_DIM], torch.float32),
         randn([MAX_SEQ, HEAD_DIM], torch.float32),
         randn([CACHE_ROWS, HEAD_DIM], torch.bfloat16),
@@ -1435,13 +1492,15 @@ if __name__ == "__main__":
         _FWD_NLAYERS = N
         def stack0(t, reps):  # replicate along dim 0
             return torch.cat([t] * reps, dim=0).contiguous()
-        hs, irw, wq_, wk_, wv_, qn, kn, sl, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
+        hs, irw, wq_, wk_, wv_, qn, kn, sl, bt, sm, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
         torch.manual_seed(1234)
         final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
         lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
+        # block_table / slot_mapping are shared across layers (NOT per-layer stacked);
+        # the paged pool kc/vc IS stacked N times (one paged pool per layer).
         stacked = [
             hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
-            stack0(qn, N), stack0(kn, N), sl, rc, rs, stack0(kc, N), stack0(vc, N),
+            stack0(qn, N), stack0(kn, N), sl, bt, sm, rc, rs, stack0(kc, N), stack0(vc, N),
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
         ]
