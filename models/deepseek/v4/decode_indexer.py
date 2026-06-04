@@ -46,7 +46,6 @@ IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 IDX_CACHE_MAX_BLOCKS = 64
 IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 SCORE_LEN = IDX_KV_LEN
-START_POS = 254
 
 # tiling
 CACHE_TILE = 32
@@ -443,7 +442,7 @@ def golden_indexer(tensors):
     tensors["topk_idxs"][:] = topk_idxs.view(B, S, SCORE_LEN)
 
 
-def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
 
@@ -488,11 +487,32 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
                 tbl[b, j] = b * IDX_CACHE_MAX_BLOCKS + j
         return tbl
     def init_start_pos():
-        vals = torch.full((B,), start_pos, dtype=torch.int32)
-        if hetero_start_pos:
-            pattern = torch.tensor([COMPRESS_RATIO * 2 - 1, COMPRESS_RATIO - 1, COMPRESS_RATIO - S, 0], dtype=torch.int32)
-            for b in range(B):
-                vals[b] = pattern[b % int(pattern.numel())]
+        if start_pos is not None:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        # Default per-batch pattern covers indexer score/topk and inner compressor branches:
+        #   0             : no valid compressed cache
+        #   1             : no-compress, mid-window, no valid compressed cache
+        #   RATIO-S       : compress, boundary on 2nd token with one cache entry
+        #   RATIO-1       : compress, boundary on 1st token with one cache entry
+        #   2*RATIO-S     : compress aligned in the 2nd window with previous-window overlap
+        #   2*RATIO-1     : compress crossing in the 2nd window with previous-window overlap
+        #   STATE_BLK*32-1: compress crossing inner state logical block 31->32
+        #   RATIO*CACHE_TILE-S: score over exactly one cache tile
+        #   RATIO*(CACHE_TILE*2)-S: score over two cache tiles
+        pattern = torch.tensor([
+            0,
+            1,
+            COMPRESS_RATIO - S,
+            COMPRESS_RATIO - 1,
+            COMPRESS_RATIO * 2 - S,
+            COMPRESS_RATIO * 2 - 1,
+            INNER_STATE_BLOCK_SIZE * 32 - 1,
+            COMPRESS_RATIO * CACHE_TILE - S,
+            COMPRESS_RATIO * (CACHE_TILE * 2) - S,
+        ], dtype=torch.int32)
+        vals = torch.empty((B,), dtype=torch.int32)
+        for b in range(B):
+            vals[b] = pattern[b % int(pattern.numel())]
         return vals
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
@@ -537,8 +557,9 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--start-pos", type=int, default=START_POS)
-    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="If set, use this single start_pos for all batches; "
+                             "otherwise use the default per-batch coverage pattern.")
     args = parser.parse_args()
 
     # topk_pair_compare expects a tensor whose [..., i] entry is the score paired
@@ -564,7 +585,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=indexer_test,
-        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_indexer,
         runtime_dir=args.runtime_dir,
         runtime_cfg=dict(
