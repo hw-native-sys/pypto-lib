@@ -208,12 +208,6 @@ def hc_pre(
     return x_mixed
 
 
-# @pl.inline alias for callers inside @pl.program / @pl.function(type=InCore)
-# methods (e.g. moe_ep.py). The same body, parsed against this module's
-# globals so constants like T / D / M / HC_MULT resolve correctly.
-hc_pre_inline = pl.inline(hc_pre._func)
-
-
 @pl.jit
 def hc_pre_test(
     x: pl.Tensor[[T, HC_MULT, D], pl.BF16],

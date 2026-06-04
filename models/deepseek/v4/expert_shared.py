@@ -133,12 +133,6 @@ def expert_shared(
     return sh
 
 
-# @pl.inline alias for @pl.program / @pl.function(type=InCore) callers
-# (e.g. moe_ep.py). Reuses expert_shared's raw body parsed against this
-# module's globals.
-expert_shared_inline = pl.inline(expert_shared._func)
-
-
 @pl.jit
 def expert_shared_test(
     x_local_i8: pl.Tensor[[T, D], pl.INT8],
