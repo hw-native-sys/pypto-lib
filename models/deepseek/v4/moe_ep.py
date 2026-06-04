@@ -7,122 +7,59 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
-"""DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer).
-
-Mirrors moe.py but assembles the 7 stages with explicit cross-rank
-dispatch/combine over an HCCL window scratch, following the
-``test_l3_ep_dispatch_combine`` reference protocol. Authored entirely in the
-``@pl.jit`` family (pypto #1638 + #1645): the chip-level ``moe_ep`` is a
-``@pl.jit`` orchestration, ``host_orch`` is the ``@pl.jit.host`` per-rank
-driver, and the compute kernels (hc_pre / gate / expert_shared /
-expert_routed / hc_post) are auto-discovered ``@pl.jit.inline`` deps.
-Cross-rank dispatch/combine live in ``dispatch.py`` / ``combine.py`` (next to
-the single-card kernels) as ``@pl.jit.incore`` deps.
-
-Demo sizing (set in the module preamble below):
-  N_RANKS = 2, DEMO preset, EP_WORLD_SIZE = 2, EP_ROUTING_GLOBAL = True
-  T = 128, D = 4096, N_LOCAL = 4, RECV_MAX = 256, TOPK = 2,
-  N_EXPERTS_GLOBAL = 8, MOE_INTER = 4096
-"""
+"""DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer): FLASH preset
+with n_routed_experts shrunk 256 -> 32 so each rank keeps EP=16's 16-expert load."""
 
 
-# === Module preamble: override config BEFORE importing sub-kernels ==========
-# Sub-kernels (hc_pre / gate / expert_routed / ...) bind preset constants at
-# module-import time via ``from config import FLASH as M``. By the time those
-# modules execute their first line, the overrides below must already be in
-# place — otherwise they'd capture FLASH and EP_WORLD_SIZE=16 instead.
+# Override config before importing the sub-kernels — they bake EP_WORLD_SIZE /
+# EP_ROUTING_GLOBAL / n_routed_experts into their tensor shapes at import time.
 import dataclasses
 
 import config
 
-# Use DEMO sizing instead of FLASH:
-#   FLASH's n_routed_experts=256 combined with EP_ROUTING_GLOBAL=True makes
-#   gate.py's matmul allocate a single gate_w[:, 0:GATE_D_CHUNK=512] slice of
-#   256 × 512 × 4 = 512 KB, which saturates the cube Mat buffer once the LHS
-#   x slice is added. DEMO's n_routed_experts=16 keeps the slices comfortable.
-#   gate.py does not chunk along the N_EXPERTS dim today; supporting FLASH-EP
-#   would require that change.
-#
-# Override num_hash_layers 0 -> 1:
-#   DEMO ships with num_hash_layers=0. gate.py picks the hash routing branch
-#   when ``layer_id < N_HASH_LAYERS``, so with num_hash_layers=0 every
-#   non-negative layer_id (including the CLI default of 0) falls into the
-#   ELSE branch — the sort routing path. That path has an independent
-#   precision regression (single-card ``python moe.py --layer-id 3`` reproduces
-#   the same x_next mismatch, ratio_reldiff ≈ 7%), unrelated to the EP
-#   changes. Bumping num_hash_layers to 1 makes layer_id=0 satisfy 0 < 1 and
-#   pick hash, so moe_ep runs the validated route end-to-end. Pass
-#   ``--layer-id 1`` (or any layer_id >= num_hash_layers) to exercise the sort
-#   path explicitly once that regression is investigated.
-#
-# dataclasses.replace creates a fresh DeepSeekV4Config copy, so the DEMO
-# preset in config.py stays untouched for any other importer.
-config.FLASH = dataclasses.replace(config.DEMO, num_hash_layers=1)
 config.EP_WORLD_SIZE = 2
 config.EP_ROUTING_GLOBAL = True
-config.RECV_MAX = (
-    config.DECODE_BATCH * config.DECODE_SEQ * config.FLASH.num_experts_per_tok
-    // (config.FLASH.n_routed_experts // config.EP_WORLD_SIZE)
-) * config.RECV_SAFETY
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * 2)  # 256 -> 32
 
-# Now safe to import the compute sub-kernels. These are the ``@pl.jit.inline``
-# JITFunction objects (not the ``pl.inline`` aliases): the ``@pl.jit`` /
-# ``@pl.jit.host`` specializer auto-discovers them as deps and emits each as its
-# own ``@pl.function(Inline)`` in the generated program, so back-to-back inline
-# kernels that share a local var (e.g. hc_pre + gate both use ``sq_sum``) no
-# longer collide in one InCore scope — the per-kernel wrapper steps the old
-# ``@pl.program`` form needed are gone.
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import expert_routed
-
-# Cross-rank dispatch / combine — @pl.jit.incore deps living alongside the
-# single-card kernels in dispatch.py / combine.py (only imported here).
 from dispatch import dispatch_ep
 from combine import combine_ep
 
 
-# === Demo / EP constants ====================================================
-M = config.FLASH  # alias (now DEMO after the override above)
-N_RANKS = config.EP_WORLD_SIZE
-B = config.DECODE_BATCH
-S = config.DECODE_SEQ
+B = DECODE_BATCH
+S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
+
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 MOE_INTER = M.moe_intermediate_size
+
+N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
-RECV_MAX = config.RECV_MAX
 N_ROUTES = T * TOPK
 
 # Padding widths required by tile vector ops (32 B minimum tile).
-W_PAD = 8  # FP32 weight/scale tile width
+W_PAD = 8   # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
 
-# Single-program sanity asserts catch preset mismatches early.
 assert N_RANKS == 2, "moe_ep demo is wired for 2 ranks"
-assert TOPK == 2, "moe_ep demo assumes TOPK == 2 for combine reduce"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 
 
-# === Kernels =================================================================
-# Two JIT functions only: the chip-level ``moe_ep`` orchestration and the
-# HOST-level ``host_orch``. The 5 compute sub-kernels (hc_pre / gate /
-# expert_shared / expert_routed / hc_post) are imported ``@pl.jit.inline`` deps;
-# dispatch_ep / combine_ep are imported ``@pl.jit.incore`` deps. The specializer
-# (#1638 DistributedTensor params + #1645 @pl.jit.host) discovers all of them
-# from this module's globals and folds them into one ``@pl.program``.
 @pl.jit
 def moe_ep(
     # model inputs
