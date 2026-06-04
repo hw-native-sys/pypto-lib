@@ -52,6 +52,7 @@ def dispatch(
     recv_scale_dq:     pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
     recv_weights:      pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32],
     recv_token:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
+    recv_route:        pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1],           pl.INT32],
 ):
     # recv_x still uses a flat row view because its destination row is
@@ -64,6 +65,7 @@ def dispatch(
         #   - recv_scale_dq = 0 -> dequant of any recv_x tail row yields 0
         #   - recv_weights  = 0 -> combine's weighted reduction skips tail rows
         #   - recv_token    = 0 -> safe scatter target (combine ignores via count)
+        #   - recv_route    = 0 -> safe route slot (combine ignores via count)
         # The recv_x INT8 tail is left uninitialized; pairing it with scale_dq=0
         # is sufficient to neutralize its contribution after dequant.
         for e in pl.range(N_LOCAL_EXPERTS):
@@ -72,6 +74,7 @@ def dispatch(
                 pl.write(recv_scale_dq, [e, s], 0.0)
                 pl.write(recv_weights, [e, s], 0.0)
                 pl.write(recv_token, [e, s], pl.cast(0, pl.INT32))
+                pl.write(recv_route, [e, s], pl.cast(0, pl.INT32))
 
         for t in pl.range(T):
             for k in pl.range(TOPK):
@@ -85,6 +88,7 @@ def dispatch(
                 pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale, [t, 0]))
                 pl.write(recv_weights, [e, slot], pl.read(weights, [t, k]))
                 pl.write(recv_token, [e, slot], pl.cast(t, pl.INT32))
+                pl.write(recv_route, [e, slot], pl.cast(k, pl.INT32))
                 pl.write(recv_expert_count, [e, 0], pl.cast(slot_i32 + 1, pl.INT32))
 
 
@@ -320,13 +324,14 @@ def dispatch_test(
     recv_scale_dq:     pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32]],
     recv_weights:      pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.FP32]],
     recv_token:        pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32]],
+    recv_route:        pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32]],
     recv_expert_count: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32]],
 ):
     dispatch(
         x_norm_i8, x_norm_scale, indices, weights,
-        recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
+        recv_x, recv_scale_dq, recv_weights, recv_token, recv_route, recv_expert_count,
     )
-    return recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count
+    return recv_x, recv_scale_dq, recv_weights, recv_token, recv_route, recv_expert_count
 
 
 def golden_dispatch(tensors):
@@ -342,6 +347,7 @@ def golden_dispatch(tensors):
     recv_scale_dq = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_weights  = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_token    = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
+    recv_route    = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
     cursor = [0] * N_LOCAL_EXPERTS
     for t in range(T):
         for k in range(TOPK):
@@ -353,6 +359,7 @@ def golden_dispatch(tensors):
             recv_scale_dq[e, s]  = float(x_norm_scale[t, 0].item())
             recv_weights[e, s]   = float(weights[t, k].item())
             recv_token[e, s]     = t
+            recv_route[e, s]     = k
             cursor[e] = s + 1
 
     recv_count = torch.zeros(N_LOCAL_EXPERTS, 1, dtype=torch.int32)
@@ -363,6 +370,7 @@ def golden_dispatch(tensors):
     tensors["recv_scale_dq"][:]     = recv_scale_dq
     tensors["recv_weights"][:]      = recv_weights
     tensors["recv_token"][:]        = recv_token
+    tensors["recv_route"][:]        = recv_route
     tensors["recv_expert_count"][:] = recv_count
 
 
@@ -430,6 +438,7 @@ def build_tensor_specs():
         TensorSpec("recv_scale_dq",     [N_LOCAL_EXPERTS, RECV_MAX],    torch.float32,  is_output=True),
         TensorSpec("recv_weights",      [N_LOCAL_EXPERTS, RECV_MAX],    torch.float32,  is_output=True),
         TensorSpec("recv_token",        [N_LOCAL_EXPERTS, RECV_MAX],    torch.int32,    is_output=True),
+        TensorSpec("recv_route",        [N_LOCAL_EXPERTS, RECV_MAX],    torch.int32,    is_output=True),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1],           torch.int32,    is_output=True),
     ]
 
@@ -463,6 +472,7 @@ if __name__ == "__main__":
             "recv_scale_dq": _valid_rows_compare(),
             "recv_weights":  _valid_rows_compare(),
             "recv_token":    _valid_rows_compare(),
+            "recv_route":    _valid_rows_compare(),
         },
     )
     if not result.passed:

@@ -109,10 +109,11 @@ def moe(
     recv_scale_dq = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_weights = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32)
     recv_token = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
+    recv_route = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32)
     recv_expert_count = pl.create_tensor([N_LOCAL_EXPERTS, 1], dtype=pl.INT32)
     dispatch(
         x_norm_i8, x_norm_scale, indices, weights,
-        recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
+        recv_x, recv_scale_dq, recv_weights, recv_token, recv_route, recv_expert_count,
     )
 
     recv_y = pl.create_tensor([N_LOCAL_EXPERTS, RECV_MAX, D], dtype=pl.BF16)
@@ -124,7 +125,7 @@ def moe(
     )
 
     ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
+    combine(recv_y, recv_token, recv_route, recv_expert_count, sh, ffn_out)
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
@@ -233,6 +234,7 @@ def golden_moe(tensors):
     recv_scale_dq = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
     recv_token = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
+    recv_route = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
     recv_expert_count_actual = torch.zeros(N_LOCAL_EXPERTS, 1, dtype=torch.int32)
     golden_dispatch({
         "x_norm_i8":         x_norm_i8,
@@ -243,6 +245,7 @@ def golden_moe(tensors):
         "recv_scale_dq":     recv_scale_dq,
         "recv_weights":      recv_weights,
         "recv_token":        recv_token,
+        "recv_route":        recv_route,
         "recv_expert_count": recv_expert_count_actual,
     })
 
@@ -265,6 +268,7 @@ def golden_moe(tensors):
     golden_combine({
         "recv_y":            recv_y,
         "recv_token":        recv_token,
+        "recv_route":        recv_route,
         "recv_expert_count": recv_expert_count_actual,
         "sh":                sh,
         "ffn_out":           ffn_out,
