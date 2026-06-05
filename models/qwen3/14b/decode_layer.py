@@ -1269,6 +1269,10 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
     else:
         seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), generator=g, dtype=torch.int32)
 
+    # Paged block_table / slot_mapping (identity paging) for the PAGED KV pool the
+    # kernel reads — k_cache/v_cache below are sized as the paged pool (CACHE_ROWS).
+    block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
+
     # Proper NeoX half-split RoPE tables (cols [0:64] and [64:128] duplicated).
     posv = torch.arange(MAX_SEQ).float().unsqueeze(1)
     inv_freq = 1.0 / (1.0e4 ** (torch.arange(0, HALF_DIM).float() / HALF_DIM))
@@ -1285,6 +1289,8 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
         "q_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
         "k_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
         "seq_lens": seq_lens,
+        "block_table": block_table,
+        "slot_mapping": slot_mapping,
         "rope_cos": rope_cos,
         "rope_sin": rope_sin,
         "k_cache": rn([CACHE_ROWS, HEAD_DIM], 0.01).to(torch.bfloat16),
@@ -1324,6 +1330,7 @@ def golden_decode_layer(values: dict) -> None:
     v_heads = (v_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
 
     seq_lens = values["seq_lens"]
+    block_table = values["block_table"]
     rope_cos = values["rope_cos"].float()
     rope_sin = values["rope_sin"].float()
     k_cache = values["k_cache"].float()
@@ -1337,11 +1344,21 @@ def golden_decode_layer(values: dict) -> None:
         q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))             # [40,128] current Q (bf16)
         k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))           # [8,128] current K (bf16)
         v_cur = _bf16(v_heads[b])                                # [8,128]
+        n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
         for kvh in range(NUM_KV_HEADS):
-            base = (b * NUM_KV_HEADS + kvh) * MAX_SEQ
-            k_lane = k_cache[base : base + slen].clone()         # past from cache; current at pos
-            v_lane = v_cache[base : base + slen].clone()
-            k_lane[p] = k_cur[kvh]
+            # Gather this (b, kvh) lane's past KV from the PAGED pool exactly as the
+            # kernel does: logical block sb -> physical page block_table[b*MBPS + sb],
+            # whose (page, kvh) tile starts at (pbid*NUM_KV_HEADS + kvh)*BLOCK_SIZE.
+            k_lane = torch.empty(slen, HEAD_DIM)
+            v_lane = torch.empty(slen, HEAD_DIM)
+            for sb in range(n_blocks):
+                pbid = int(block_table[b * MAX_BLOCKS_PER_SEQ + sb].item())
+                row = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+                lo = sb * BLOCK_SIZE
+                blk = min(BLOCK_SIZE, slen - lo)
+                k_lane[lo : lo + blk] = k_cache[row : row + blk]
+                v_lane[lo : lo + blk] = v_cache[row : row + blk]
+            k_lane[p] = k_cur[kvh]                               # current token (kernel writes it first)
             v_lane[p] = v_cur[kvh]
             for j in range(Q_PER_KV):
                 hq = kvh * Q_PER_KV + j
