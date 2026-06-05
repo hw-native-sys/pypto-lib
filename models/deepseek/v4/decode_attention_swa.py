@@ -54,12 +54,11 @@ TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
 SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
-SWA_OVERLAY_BASE = SPARSE_IDX_TOPK - S
-START_POS = 127      # full-window decode fixture; SWA has no compression constraint
 
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
+CACHE_COPY_TILE = 16
 
 
 @pl.jit.inline
@@ -90,6 +89,7 @@ def attention_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    kv_cache_out: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -140,24 +140,26 @@ def attention_swa(
         qr_scale,
     )
 
+    kv_cache_in_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
+    kv_cache_out_flat = pl.reshape(kv_cache_out, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
+    for copy_block in pl.spmd((B * ORI_MAX_BLOCKS * BLOCK_SIZE) // CACHE_COPY_TILE, name_hint="swa_cache_copy"):
+        copy_row0 = copy_block * CACHE_COPY_TILE
+        kv_cache_out_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM] = kv_cache_in_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM]
+    for write_t in pl.spmd(T, name_hint="swa_cache_writeback"):
+        write_b = write_t // S
+        write_s = write_t - write_b * S
+        write_start_b = pl.read(start_pos, [write_b])
+        write_slot = (write_start_b + write_s) % WIN
+        write_blk = pl.cast(pl.read(block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
+        write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
+        kv_cache_out_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+
+    sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     cmp_kv_dummy = pl.create_tensor([B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    cmp_kv_dummy_flat = pl.reshape(cmp_kv_dummy, [B * SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_kv"):
-        for cb in pl.range(B):
-            for cj in pl.range(SPARSE_CMP_MAX_BLOCKS):
-                pl.write(cmp_block_table_dummy, [cb, cj], pl.cast(cb * SPARSE_CMP_MAX_BLOCKS + cj, pl.INT32))
-            for os in pl.range(S):
-                overlay_slot = SWA_OVERLAY_BASE + os
-                overlay_blk = pl.cast(pl.read(cmp_block_table_dummy, [cb, overlay_slot // BLOCK_SIZE]), pl.INDEX)
-                overlay_row = overlay_blk * BLOCK_SIZE + overlay_slot % BLOCK_SIZE
-                overlay_t = cb * S + os
-                cmp_kv_dummy_flat[overlay_row : overlay_row + 1, 0 : HEAD_DIM] = kv[overlay_t : overlay_t + 1, 0 : HEAD_DIM]
-
-    cmp_kv_dummy = pl.reshape(cmp_kv_dummy_flat, [B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_topk"):
         for topk_b in pl.range(B):
+            pl.write(cmp_block_table_dummy, [topk_b, 0], pl.cast(topk_b * SPARSE_CMP_MAX_BLOCKS, pl.INT32))
             topk_start_b = pl.read(start_pos, [topk_b])
             for topk_s in pl.range(S):
                 topk_t = topk_b * S + topk_s
@@ -166,21 +168,21 @@ def attention_swa(
                     topk_win_start = (topk_abs_pos % WIN) + 1
                     for topk_k in pl.range(WIN):
                         topk_val = (topk_win_start + topk_k) % WIN
-                        if topk_val == topk_start_b % WIN:
-                            pl.write(sparse_topk, [topk_t, topk_k], pl.cast(WIN + SWA_OVERLAY_BASE, pl.INT32))
-                        elif topk_s >= 1 and topk_val == (topk_start_b + 1) % WIN:
-                            pl.write(sparse_topk, [topk_t, topk_k], pl.cast(WIN + SWA_OVERLAY_BASE + 1, pl.INT32))
-                        else:
-                            pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_val, pl.INT32))
+                        topk_out = topk_val
+                        for topk_os in pl.range(S):
+                            if topk_os <= topk_s:
+                                if topk_val == (topk_start_b + topk_os) % WIN:
+                                    topk_out = WIN + topk_os
+                        pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                 else:
                     for topk_k in pl.range(WIN):
                         if topk_k <= topk_abs_pos:
-                            if topk_k == topk_start_b % WIN:
-                                pl.write(sparse_topk, [topk_t, topk_k], pl.cast(WIN + SWA_OVERLAY_BASE, pl.INT32))
-                            elif topk_s >= 1 and topk_k == (topk_start_b + 1) % WIN:
-                                pl.write(sparse_topk, [topk_t, topk_k], pl.cast(WIN + SWA_OVERLAY_BASE + 1, pl.INT32))
-                            else:
-                                pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_k, pl.INT32))
+                            topk_out = topk_k
+                            for topk_os in pl.range(S):
+                                if topk_os <= topk_s:
+                                    if topk_k == (topk_start_b + topk_os) % WIN:
+                                        topk_out = WIN + topk_os
+                            pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                         else:
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
                 for topk_pad in pl.range(SPARSE_IDX_TOPK):
@@ -191,6 +193,7 @@ def attention_swa(
         q,
         kv_cache,
         block_table,
+        kv,
         cmp_kv_dummy,
         cmp_block_table_dummy,
         sparse_topk,
@@ -242,6 +245,7 @@ def attention_swa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    kv_cache_out: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_swa(
@@ -254,6 +258,7 @@ def attention_swa_test(
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_out,
+        kv_cache_out,
         start_pos,
     )
     return x_out
@@ -332,12 +337,7 @@ def golden_attention_swa(tensors):
     cmp_kv_dummy = torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
     for b in range(B):
-        for j in range(SPARSE_CMP_MAX_BLOCKS):
-            cmp_block_table_dummy[b, j] = b * SPARSE_CMP_MAX_BLOCKS + j
-        for s in range(S):
-            overlay_slot = SWA_OVERLAY_BASE + s
-            blk_id = int(cmp_block_table_dummy[b, overlay_slot // BLOCK_SIZE].item())
-            cmp_kv_dummy[blk_id, overlay_slot % BLOCK_SIZE, 0] = kv[b * S + s]
+        cmp_block_table_dummy[b, 0] = b * SPARSE_CMP_MAX_BLOCKS
 
     sparse_topk_all = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     for t in range(T):
@@ -353,13 +353,14 @@ def golden_attention_swa(tensors):
             vals = list(range(abs_pos + 1))
         for k, raw in enumerate(vals):
             if raw in overlay_slots:
-                sparse_topk_all[t, k] = WIN + SWA_OVERLAY_BASE + overlay_slots[raw]
+                sparse_topk_all[t, k] = WIN + overlay_slots[raw]
             else:
                 sparse_topk_all[t, k] = raw
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": block_table[:, :ORI_MAX_BLOCKS],
+        "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv_dummy,
         "cmp_block_table": cmp_block_table_dummy,
         "cmp_sparse_indices": sparse_topk_all,
@@ -372,6 +373,16 @@ def golden_attention_swa(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
+
+    kv_cache_out = kv_cache.clone()
+    for t in range(T):
+        b = t // S
+        s = t % S
+        start_pos_b = int(start_pos_t[b].item())
+        write_slot = (start_pos_b + s) % WIN
+        write_blk = int(block_table[b, write_slot // BLOCK_SIZE].item())
+        kv_cache_out[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
+    tensors["kv_cache_out"][:] = kv_cache_out
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -495,13 +506,14 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("kv_cache_out", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_reldiff, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -528,6 +540,7 @@ if __name__ == "__main__":
             # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
             # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
             "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
+            "kv_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:

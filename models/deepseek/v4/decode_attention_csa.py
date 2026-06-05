@@ -289,7 +289,7 @@ def attention_csa(
         idx_score_unused,
         idx_topk_full,
         cmp_start_pos,
-        WIN,
+        WIN + S,
     )
 
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
@@ -306,10 +306,12 @@ def attention_csa(
             cmp_sparse_indices[t_idx : t_idx + 1, WIN : WIN + IDX_TOPK] = cmp_topk
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    mtp_kv_overlay_dummy = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     attn_out = sparse_attn(
         q,
         kv_cache,
         ori_block_table,
+        mtp_kv_overlay_dummy,
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
@@ -536,7 +538,7 @@ def golden_attention_csa(tensors):
         "score": idx_score,
         "topk_idxs": idx_topk_full,
         "start_pos": cmp_start_pos,
-        "offset": torch.tensor(WIN, dtype=torch.int32),
+        "offset": torch.tensor(WIN + S, dtype=torch.int32),
     })
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -548,6 +550,7 @@ def golden_attention_csa(tensors):
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": ori_block_table,
+        "mtp_kv_overlay": torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16),
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
