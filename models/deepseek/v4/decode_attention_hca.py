@@ -27,7 +27,8 @@ from config import (
 )
 from hc_pre import hc_pre
 from hc_post import hc_post
-from decode_qkv_proj_rope import attn_norm, qkv_proj_rope
+from decode_qkv_proj_rope import qkv_proj_rope
+from decode_rmsnorm import attn_norm
 from decode_compressor_ratio128 import compressor_ratio128
 from decode_sparse_attn import sparse_attn
 
@@ -308,7 +309,8 @@ def golden_attention_hca(tensors):
     import torch
 
     from hc_pre import golden_hc_pre
-    from decode_qkv_proj_rope import golden_attn_norm, golden_qkv_proj_rope
+    from decode_qkv_proj_rope import golden_qkv_proj_rope
+    from decode_rmsnorm import golden_attn_norm
     from decode_compressor_ratio128 import golden_compressor
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
@@ -360,7 +362,7 @@ def golden_attention_hca(tensors):
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
-        "x": x_normed.reshape(B, S, D),
+        "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],

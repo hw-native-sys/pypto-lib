@@ -19,6 +19,7 @@ from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFIL
 from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_packed
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre_packed
 from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
+from prefill_rmsnorm import prefill_packed_attn_norm
 from prefill_sparse_attn import (
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
     ORI_BLOCK_NUM as SPARSE_ORI_BLOCK_NUM,
@@ -161,9 +162,10 @@ def prefill_attention_swa(
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed = prefill_packed_attn_norm(x_mixed, attn_norm_w, x_normed)
     q, kv, qr, qr_scale = prefill_packed_qkv_proj_rope_core(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,

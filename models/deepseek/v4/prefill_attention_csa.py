@@ -28,7 +28,8 @@ from prefill_compressor_ratio4 import prefill_compressor_ratio4
 from prefill_hc_post import prefill_hc_post
 from prefill_hc_pre import prefill_hc_pre
 from prefill_indexer import prefill_indexer
-from prefill_qkv_proj_rope import prefill_attn_norm, prefill_qkv_proj_rope_core
+from prefill_qkv_proj_rope import prefill_qkv_proj_rope_core
+from prefill_rmsnorm import prefill_attn_norm
 from prefill_sparse_attn import prefill_sparse_attn
 
 B = PREFILL_BATCH
@@ -400,7 +401,8 @@ def golden_prefill_attention_csa(tensors):
     from prefill_hc_post import golden_prefill_hc_post
     from prefill_hc_pre import golden_prefill_hc_pre
     from prefill_indexer import golden_prefill_indexer
-    from prefill_qkv_proj_rope import golden_prefill_attn_norm, golden_prefill_qkv_proj_rope
+    from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope
+    from prefill_rmsnorm import golden_prefill_attn_norm
     from prefill_sparse_attn import golden_prefill_sparse_attn
 
     start_pos = int(tensors["start_pos"])
