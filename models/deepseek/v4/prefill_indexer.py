@@ -32,6 +32,7 @@ Q_CHUCK = 128
 HEAD_ROWS = IDX_N_HEADS * 2
 HEAD_DIM_CHUCK = 32
 TOPK_TILE = 16
+assert T % TOPK_TILE == 0
 
 @pl.jit.inline
 def prefill_indexer(

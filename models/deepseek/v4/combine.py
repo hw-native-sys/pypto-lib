@@ -32,6 +32,7 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 N_RANKS = EP_WORLD_SIZE
 N_LOCAL = N_LOCAL_EXPERTS  # all-rank naming used by the EP kernel
 N_ROUTES = T * TOPK
+assert T % 4 == 0
 
 
 @pl.jit.inline
