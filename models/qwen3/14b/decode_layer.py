@@ -64,12 +64,7 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
-from config import (  # shared model/serving config
-    BLOCK_TABLE_FLAT_DYN,  # flat [user_batch * max_blocks_per_seq] block table dim
-    KV_CACHE_ROWS_DYN,     # runtime-dynamic paged KV pool row count
-    USER_BATCH_DYN,        # runtime-dynamic user batch
-    VOCAB,                 # vocab size for the fused decode_fwd LM head / logits
-)
+from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
