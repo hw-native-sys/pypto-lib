@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 MoE packed combine -- decode, single-card EP.
 
-    recv_y / recv_token / recv_route / recv_expert_count + sh -> ffn_out
+    recv_y / recv_token / recv_weights / recv_expert_count + sh -> ffn_out
 """
 
 
@@ -32,14 +32,12 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 N_RANKS = EP_WORLD_SIZE
 N_LOCAL = N_LOCAL_EXPERTS  # all-rank naming used by the EP kernel
 N_ROUTES = T * TOPK
-assert T % 4 == 0
 
 
 @pl.jit.inline
 def combine(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
@@ -47,29 +45,32 @@ def combine(
     # recv_y already has the per-row routing weight applied by expert_routed,
     # so combine is a pure scatter + dense reduce (sum, no second mul).
 
-    # [T, TOPK, D] scratch indexed by the original route slot k. Dispatch
-    # records k in recv_route, so every valid route writes a unique row here.
-    routed_y_buf = pl.create_tensor([T, TOPK, D], dtype=pl.BF16)
+    # [T, N_LOCAL_EXPERTS, D] scratch indexed by (token, expert). Padding
+    # (t, e) slots stay zero and contribute nothing to the dense reduce.
+    routed_y_buf = pl.create_tensor([T, N_LOCAL_EXPERTS, D], dtype=pl.BF16)
     # Flat 2D view for slice ops: ptoas tensor.slice rejects 3D bases.
-    routed_y_buf_flat = pl.reshape(routed_y_buf, [T * TOPK, D])
+    routed_y_buf_flat = pl.reshape(routed_y_buf, [T * N_LOCAL_EXPERTS, D])
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
-    for e in pl.spmd(N_LOCAL_EXPERTS, name_hint="combine_scatter"):
-        n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
-        for s in pl.range(n_rows):
-            i = e * RECV_MAX + s
-            t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
-            k = pl.cast(pl.read(recv_route, [e, s]), pl.INDEX)
-            dst = t * TOPK + k
-            routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_scatter"):
+        for r0 in pl.range(T):
+            routed_y_buf[r0, :, :] = pl.full([N_LOCAL_EXPERTS, D], dtype=pl.BF16, value=0.0)
+
+        for e in pl.range(N_LOCAL_EXPERTS):
+            n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
+            for s in pl.range(n_rows):
+                i = e * RECV_MAX + s
+                t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
+                dst = t * N_LOCAL_EXPERTS + e
+                routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
 
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
             t = tb * 4 + tt
-            base = t * TOPK
+            base = t * N_LOCAL_EXPERTS
             acc = pl.cast(sh[t:t+1, :], target_type=pl.FP32)
-            for k in pl.pipeline(TOPK, stage=2):
-                src = base + k
+            for e in pl.pipeline(N_LOCAL_EXPERTS, stage=2):
+                src = base + e
                 row_fp32 = pl.cast(routed_y_buf_flat[src:src+1, :], target_type=pl.FP32)
                 acc = pl.add(acc, row_fp32)
             ffn_out[t:t+1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
@@ -152,12 +153,11 @@ def combine_ep(
 def combine_test(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
-    recv_route: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    combine(recv_y, recv_token, recv_route, recv_expert_count, sh, ffn_out)
+    combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
     return ffn_out
 
 
@@ -166,22 +166,20 @@ def golden_combine(tensors):
 
     recv_y = tensors["recv_y"]
     recv_token = tensors["recv_token"]
-    recv_route = tensors["recv_route"]
     recv_expert_count = tensors["recv_expert_count"]
     sh = tensors["sh"]
 
     # recv_y already carries the per-row routing weight applied by
     # expert_routed; combine just scatters by token and sums.
-    routed_y_buf = torch.zeros(T, TOPK, D, dtype=torch.bfloat16)
+    routed_y_buf = torch.zeros(T, N_LOCAL_EXPERTS, D, dtype=torch.bfloat16)
     for e in range(N_LOCAL_EXPERTS):
         for s in range(int(recv_expert_count[e, 0].item())):
             t = int(recv_token[e, s].item())
-            k = int(recv_route[e, s].item())
-            routed_y_buf[t, k, :] = recv_y[e, s, :]
+            routed_y_buf[t, e, :] = recv_y[e, s, :]
 
     ffn_out = sh.float()
-    for k in range(TOPK):
-        ffn_out = ffn_out + routed_y_buf[:, k, :].float()
+    for e in range(N_LOCAL_EXPERTS):
+        ffn_out = ffn_out + routed_y_buf[:, e, :].float()
     tensors["ffn_out"][:] = ffn_out.to(torch.bfloat16)
 
 
@@ -189,10 +187,10 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    # Simulate dispatch routing: each of T tokens routes to topk local experts.
-    # counts[e] = #tokens routed to e (sum = T*topk before
+    # Simulate dispatch routing: each of T tokens routes to topk distinct
+    # local experts. counts[e] = #tokens routed to e (sum = T*topk before
     # RECV_MAX clamp); recv_token[e, :counts[e]] is the matching token list
-    # and recv_route[e, :counts[e]] is the matching topk slot.
+    # with no per-expert duplicates. Mirrors expert_routed.build_tensor_specs.
     topk = min(M.num_experts_per_tok, N_LOCAL_EXPERTS)
     gen = torch.Generator().manual_seed(0)
     routing = torch.stack(
@@ -221,18 +219,6 @@ def build_tensor_specs():
                 )
         return recv_token
 
-    def init_recv_route():
-        recv_route = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.int32)
-        for e in range(N_LOCAL_EXPERTS):
-            n = int(counts[e].item())
-            if n > 0:
-                routes = []
-                for t in per_expert_tokens[e][:n]:
-                    matches = torch.nonzero(routing[t] == e, as_tuple=False)
-                    routes.append(int(matches[0, 0].item()))
-                recv_route[e, :n] = torch.tensor(routes, dtype=torch.int32)
-        return recv_route
-
     def init_recv_expert_count():
         return counts.reshape(N_LOCAL_EXPERTS, 1)
 
@@ -242,7 +228,6 @@ def build_tensor_specs():
     return [
         TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, init_value=init_recv_y),
         TensorSpec("recv_token", [N_LOCAL_EXPERTS, RECV_MAX], torch.int32, init_value=init_recv_token),
-        TensorSpec("recv_route", [N_LOCAL_EXPERTS, RECV_MAX], torch.int32, init_value=init_recv_route),
         TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
         TensorSpec("sh", [T, D], torch.bfloat16, init_value=init_sh),
         TensorSpec("ffn_out", [T, D], torch.bfloat16, is_output=True),
