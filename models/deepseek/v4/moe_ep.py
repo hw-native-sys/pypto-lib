@@ -19,7 +19,7 @@ import config
 
 config.EP_WORLD_SIZE = 2
 config.EP_ROUTING_GLOBAL = True
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * 2)  # 256 -> 32
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * 2)  # 256 -> 64
 
 import pypto.language as pl
 import pypto.language.distributed as pld
