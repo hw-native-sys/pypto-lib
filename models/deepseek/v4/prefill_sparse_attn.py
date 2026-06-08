@@ -65,7 +65,10 @@ ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 # cube-friendly 64-column attention blocks without out-of-bounds slices.
 GATHER_TOKEN_TILE = 4
 ATTN_TOKEN_TILE = 32
-ROPE_TOKEN_TILE = 8
+# Keep inverse-RoPE token tiles small enough to expose per-output-group AIV
+# parallelism; larger tiles reduce task count but leave longer RoPE work on
+# the critical path.
+ROPE_TOKEN_TILE = 4
 ROPE_PACK_TOKEN_TILE = 16
 MATMUL_ROW_PAD = 16
 PV_HEAD_TILE = 16
@@ -608,12 +611,16 @@ SPARSE_PREFILL_SPARSE_PAD = PREFILL_SPARSE_PAD
 SPARSE_PROJ_TOKEN_TILE = PROJ_TOKEN_TILE
 SPARSE_PV_HEAD_TILE = PV_HEAD_TILE
 SPARSE_QUANT_CHUNK = QUANT_CHUNK
+SPARSE_QUANT_K_TILE = O_GROUPS * O_LORA // 2
+SPARSE_QUANT_K_BLOCKS = (O_GROUPS * O_LORA) // SPARSE_QUANT_K_TILE
+SPARSE_QUANT_SPMD_BLOCKS = (T // QUANT_TOKEN_TILE) * SPARSE_QUANT_K_BLOCKS
 SPARSE_QUANT_TOKEN_TILE = QUANT_TOKEN_TILE
 SPARSE_ROPE_CHUNK = ROPE_CHUNK
 SPARSE_ROPE_INTERLEAVE_CHUNK = ROPE_INTERLEAVE_CHUNK
 SPARSE_ROPE_PACK_SPMD_BLOCKS = ROPE_PACK_SPMD_BLOCKS
 SPARSE_ROPE_PACK_TOKEN_TILE = ROPE_PACK_TOKEN_TILE
 SPARSE_ROPE_TOKEN_TILE = ROPE_TOKEN_TILE
+SPARSE_ROPE_APPLY_SPMD_BLOCKS = ((T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE_TOKEN_TILE) * O_GROUPS
 SPARSE_TOPK = TOPK
 
 @pl.jit.inline
@@ -913,11 +920,18 @@ def prefill_hca_packed_sparse_attn(
                                 )
 
     # Stage 3: inverse RoPE on the rope slice of the attention output.
-    for rope_apply_t0 in pl.parallel(0, T, SPARSE_ROPE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_rope_apply_assemble_tile"):
-            for rope_apply_dt in pl.range(SPARSE_ROPE_TOKEN_TILE):
-                rope_apply_t = rope_apply_t0 + rope_apply_dt
-                rope_apply_head_row = rope_apply_t * H
+    # Split by token tile and output group so the long vector RoPE task fans
+    # out across all AIV lanes instead of processing all heads in one task.
+    for rope_apply_block in pl.spmd(SPARSE_ROPE_APPLY_SPMD_BLOCKS, name_hint="prefill_hca_rope_apply_assemble_group"):
+        rope_apply_token_block = rope_apply_block // O_GROUPS
+        rope_apply_g = rope_apply_block - rope_apply_token_block * O_GROUPS
+        rope_apply_t0 = rope_apply_token_block * SPARSE_ROPE_TOKEN_TILE
+        rope_apply_h0 = rope_apply_g * HEADS_PER_GROUP
+
+        for rope_apply_dt in pl.range(SPARSE_ROPE_TOKEN_TILE):
+            rope_apply_t = rope_apply_t0 + rope_apply_dt
+            if rope_apply_t < T:
+                rope_apply_head_row = rope_apply_t * H + rope_apply_h0
 
                 for rope_asm_r0 in pl.range(0, ROPE_HALF, SPARSE_ROPE_CHUNK):
                     cos_chunk = pl.cast(
@@ -929,7 +943,7 @@ def prefill_hca_packed_sparse_attn(
                         target_type=pl.FP32,
                     )
                     rope_tile = attn_rope_stage[
-                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_apply_head_row : rope_apply_head_row + HEADS_PER_GROUP,
                         2 * rope_asm_r0 : 2 * rope_asm_r0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
                     ]
                     rope_tile_fp32 = pl.cast(rope_tile, target_type=pl.FP32)
@@ -945,7 +959,7 @@ def prefill_hca_packed_sparse_attn(
                     )
                     rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
                     rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
-                    rope_interleave = pl.full([H, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=0.0)
+                    rope_interleave = pl.full([HEADS_PER_GROUP, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=0.0)
                     rope_interleave = pl.tensor.scatter(
                         pl.cast(rope_rot_even_chunk, target_type=pl.FP32),
                         mask_pattern=pl.tile.MaskPattern.P0101,
@@ -1028,27 +1042,37 @@ def prefill_hca_packed_sparse_attn(
                         proj_t0:proj_t0 + SPARSE_PROJ_TOKEN_TILE,
                     ] = acc_a_amax
 
-    # Stage 6: per-row symmetric INT8 activation quantization.
-    for quant_t0 in pl.parallel(0, T, SPARSE_QUANT_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_b_quant_tile"):
-            or_amax = pl.full([1, SPARSE_QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for ab in pl.range(0, A_AMAX_BLOCKS, 1):
-                or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE]
-                or_amax = pl.maximum(or_amax, or_a_part)
-            or_sq_row = pl.div(pl.full([1, SPARSE_QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
-            or_scale_dq = pl.reshape(pl.recip(or_sq_row), [SPARSE_QUANT_TOKEN_TILE, 1])
-            o_r_scale_dq[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, 0:1] = or_scale_dq
-            or_sq_col = pl.reshape(or_sq_row, [SPARSE_QUANT_TOKEN_TILE, 1])
-            for k1 in pl.range(0, O_GROUPS * O_LORA, SPARSE_QUANT_CHUNK):
-                or_q_f32 = pl.cast(o_r[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK], target_type=pl.FP32)
-                or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
-                or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
-                or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
-                o_r_i8[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK] = pl.cast(
-                    or_q_half,
-                    target_type=pl.INT8,
-                    mode="trunc",
-                )
+    # Stage 6: per-row symmetric INT8 activation quantization. Split the
+    # output-rank dimension into two SPMD blocks, matching the decode path, so
+    # quantization does not serialize the full O_GROUPS * O_LORA width in one
+    # task.
+    for quant_block in pl.spmd(SPARSE_QUANT_SPMD_BLOCKS, name_hint="prefill_hca_stage_b_quant_k_tile"):
+        quant_t_block = quant_block // SPARSE_QUANT_K_BLOCKS
+        quant_k_block = quant_block - quant_t_block * SPARSE_QUANT_K_BLOCKS
+        quant_t0 = quant_t_block * SPARSE_QUANT_TOKEN_TILE
+        quant_k0 = quant_k_block * SPARSE_QUANT_K_TILE
+
+        or_amax = pl.full([1, SPARSE_QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for ab in pl.range(0, A_AMAX_BLOCKS, 1):
+            or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE]
+            or_amax = pl.maximum(or_amax, or_a_part)
+        or_sq_row = pl.div(pl.full([1, SPARSE_QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
+        or_scale_dq = pl.reshape(pl.recip(or_sq_row), [SPARSE_QUANT_TOKEN_TILE, 1])
+        o_r_scale_dq[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, 0:1] = or_scale_dq
+        or_sq_col = pl.reshape(or_sq_row, [SPARSE_QUANT_TOKEN_TILE, 1])
+        for k1 in pl.range(quant_k0, quant_k0 + SPARSE_QUANT_K_TILE, SPARSE_QUANT_CHUNK):
+            or_q_f32 = pl.cast(
+                o_r[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK],
+                target_type=pl.FP32,
+            )
+            or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
+            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
+            or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
+            o_r_i8[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK] = pl.cast(
+                or_q_half,
+                target_type=pl.INT8,
+                mode="trunc",
+            )
 
     # Stage 7: INT8 output projection and dequantization.
     for nb in pl.parallel(0, B_N_BLOCKS, 1):

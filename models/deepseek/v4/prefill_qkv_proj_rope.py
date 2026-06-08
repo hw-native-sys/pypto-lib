@@ -464,7 +464,9 @@ def prefill_qkv_proj_rope_core(
 # original [B, S] contract; this variant consumes token-major position_ids.
 MAX_TOKENS = T
 QKV_HEAD_CHUNK = HEAD_CHUNK
-QKV_HEAD_GROUP = HEAD_GROUP
+# Keep packed prefill q-RoPE reassemble/write on enough lanes while avoiding
+# the scheduler overhead from per-head tasks.
+QKV_HEAD_GROUP = 2
 QKV_Q_PROJ_OUT_CHUNK = Q_PROJ_OUT_CHUNK
 QKV_Q_PROJ_CHUNK = Q_PROJ_CHUNK
 QKV_Q_PROJ_GROUP = Q_PROJ_GROUP
@@ -756,11 +758,10 @@ def prefill_packed_qkv_proj_rope_core(
                 ] = col_dequant
 
         q_flat = pl.reshape(q, [T, H * HEAD_DIM])
-        q_rope_pair_stage = pl.create_tensor([H * QKV_PREFILL_QKV_TOKEN_CHUNK, ROPE_DIM], dtype=pl.BF16)
-        # Stage 5.1: per-head RMSNorm for q_proj output. The noPE portion can
-        # be written directly to q; the RoPE portion keeps the per-head inverse
-        # RMS for the next rotation stage.
-        for hg_idx in pl.spmd(H // QKV_Q_HEAD_RMS_GROUP, name_hint="prefill_q_head_rms_nope"):
+        # Stage 5.1: per-head RMSNorm for q_proj output. The noPE portion and
+        # RoPE tail are both written directly to q_flat, mirroring decode's
+        # fused q_head_rope path and avoiding a separate RoPE pair stage.
+        for hg_idx in pl.spmd(H // QKV_Q_HEAD_RMS_GROUP, name_hint="prefill_q_head_rms_rope_fused"):
             hg = hg_idx * QKV_Q_HEAD_RMS_GROUP
             rope_cos_fp32 = pl.cast(rope_cos_tile[:, :ROPE_HALF], target_type=pl.FP32)
             rope_sin_fp32 = pl.cast(rope_sin_tile[:, :ROPE_HALF], target_type=pl.FP32)
@@ -790,7 +791,6 @@ def prefill_packed_qkv_proj_rope_core(
                         h0 + n0 : h0 + n0 + QKV_HEAD_CHUNK,
                     ] = pl.cast(q_normed, target_type=pl.BF16, mode="rint")
 
-                # Apply partial RoPE while the per-head inverse RMS is still local.
                 q_rope = q_proj_fp32[
                     :,
                     h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM,
@@ -800,42 +800,20 @@ def prefill_packed_qkv_proj_rope_core(
                 q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
                 q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
                 q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
-                q_rope_pair_stage[
-                    h * QKV_PREFILL_QKV_TOKEN_CHUNK : h * QKV_PREFILL_QKV_TOKEN_CHUNK + QKV_PREFILL_QKV_TOKEN_CHUNK,
-                    :ROPE_HALF,
-                ] = pl.cast(q_rot_even, target_type=pl.BF16, mode="rint")
-                q_rope_pair_stage[
-                    h * QKV_PREFILL_QKV_TOKEN_CHUNK : h * QKV_PREFILL_QKV_TOKEN_CHUNK + QKV_PREFILL_QKV_TOKEN_CHUNK,
-                    ROPE_HALF : ROPE_DIM,
-                ] = pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint")
-
-        # Stage 5.2: scatter q RoPE even/odd pairs into the interleaved head
-        # layout and write the RoPE tail back into q_flat.
-        for hg_idx in pl.spmd(H // QKV_HEAD_GROUP, name_hint="prefill_q_rope_scatter"):
-            hg = hg_idx * QKV_HEAD_GROUP
-            for h_inner in pl.pipeline(QKV_HEAD_GROUP, stage=2):
-                even_chunk = q_rope_pair_stage[
-                    (hg + h_inner) * QKV_PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * QKV_PREFILL_QKV_TOKEN_CHUNK + QKV_PREFILL_QKV_TOKEN_CHUNK,
-                    :ROPE_HALF,
-                ]
-                odd_chunk = q_rope_pair_stage[
-                    (hg + h_inner) * QKV_PREFILL_QKV_TOKEN_CHUNK : (hg + h_inner) * QKV_PREFILL_QKV_TOKEN_CHUNK + QKV_PREFILL_QKV_TOKEN_CHUNK,
-                    ROPE_HALF : ROPE_DIM,
-                ]
                 q_rope_buf = pl.full([QKV_PREFILL_QKV_TOKEN_CHUNK, ROPE_DIM], dtype=pl.FP32, value=0.0)
                 q_rope_buf = pl.tensor.scatter(
-                    pl.cast(even_chunk, target_type=pl.FP32),
+                    pl.cast(pl.cast(q_rot_even, target_type=pl.BF16, mode="rint"), target_type=pl.FP32),
                     mask_pattern=pl.tile.MaskPattern.P0101,
                     dst=q_rope_buf,
                 )
                 q_rope_buf = pl.tensor.scatter(
-                    pl.cast(odd_chunk, target_type=pl.FP32),
+                    pl.cast(pl.cast(q_rot_odd, target_type=pl.BF16, mode="rint"), target_type=pl.FP32),
                     mask_pattern=pl.tile.MaskPattern.P1010,
                     dst=q_rope_buf,
                 )
                 q_flat[
                     t0 : t0 + QKV_PREFILL_QKV_TOKEN_CHUNK,
-                    (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
+                    h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM,
                 ] = pl.cast(q_rope_buf, target_type=pl.BF16, mode="rint")
 
         q = pl.reshape(q_flat, [T, H, HEAD_DIM])
