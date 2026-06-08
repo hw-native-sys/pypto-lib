@@ -7,15 +7,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
-"""DeepSeek-V4 LM head projection with TP vocab all-gather.
+"""DeepSeek-V4 LM head projection with DP-owned hidden and TP vocab shards.
 
 The input hidden states are expected to have already passed the final RMSNorm,
 matching cann-recipes' ``DeepseekV3Model.forward`` + ``forward_lm_head`` split.
 
-Each TP rank owns one contiguous vocabulary shard of ``lm_head_weight`` and
-computes local logits for that shard. The distributed program then publishes
-every shard to every TP rank through an HCCL window so each rank's output
-contains full-vocabulary logits.
+After attention DP and MoE EP, each rank owns a different set of hidden rows.
+For LM head TP, every TP rank owns one contiguous vocabulary shard of
+``lm_head_weight``. Each owner rank first publishes its hidden rows to all TP
+ranks. Every TP rank computes its local vocabulary shard for every owner, then
+routes that shard back to the owner so the owner has full-vocabulary logits for
+token selection.
 """
 
 import pypto.language as pl
@@ -35,30 +37,33 @@ D = M.hidden_size  # 4096 hidden size.
 VOCAB = M.vocab_size  # 129280 vocabulary size.
 
 LM_HEAD_K_CHUNK = 128  # K tile width; D / 128 = 32 matmul accumulation blocks.
-VOCAB_CHUNK = 160  # Vocab tile width; with TP=2, VOCAB_PER_TP / 160 = 404 blocks.
+HIDDEN_COMM_CHUNK = 512  # Hidden publish tile width; D / 512 = 8 copy blocks.
+VOCAB_CHUNK = 512  # Main vocab tile width; tail is handled separately.
 T_TILE = 16  # Token tile height; T / 16 = 8 token blocks.
 
 assert D % LM_HEAD_K_CHUNK == 0
+assert D % HIDDEN_COMM_CHUNK == 0
 assert T % T_TILE == 0
-assert VOCAB % VOCAB_CHUNK == 0
 assert VOCAB % TP_SIZE == 0
 assert TP_SIZE <= LM_HEAD_TP_SIZE
 
 K_BLOCKS = D // LM_HEAD_K_CHUNK  # 32.
+HIDDEN_COMM_BLOCKS = D // HIDDEN_COMM_CHUNK  # 8.
 VOCAB_PER_TP = VOCAB // TP_SIZE  # 64640 when TP_SIZE=2.
-VOCAB_BLOCKS_PER_TP = VOCAB_PER_TP // VOCAB_CHUNK  # 404 blocks per TP shard.
-
-assert VOCAB_PER_TP % VOCAB_CHUNK == 0
+VOCAB_FULL_BLOCKS_PER_TP = VOCAB_PER_TP // VOCAB_CHUNK  # 126 when TP_SIZE=2.
+VOCAB_TAIL = VOCAB_PER_TP % VOCAB_CHUNK  # 128 when TP_SIZE=2.
+VOCAB_BLOCKS_PER_TP = VOCAB_FULL_BLOCKS_PER_TP + (1 if VOCAB_TAIL != 0 else 0)
+VOCAB_PADDED_PER_TP = VOCAB_BLOCKS_PER_TP * VOCAB_CHUNK  # Weight scratch shape.
 
 
 @pl.jit.inline
 def lm_head(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logits_shard: pl.Out[pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]],
-) -> pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]:
+    lm_head_weight: pl.Tensor[[VOCAB_PADDED_PER_TP, D], pl.BF16],
+    logits_shard: pl.Out[pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32]],
+) -> pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32]:
     for t0 in pl.parallel(0, T, T_TILE):
-        for ob in pl.parallel(VOCAB_BLOCKS_PER_TP):
+        for ob in pl.parallel(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
                 hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, 0])
@@ -74,39 +79,54 @@ def lm_head(
                     )
                     acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
                 logits_shard = pl.assemble(logits_shard, acc, [t0, o0])
+
+        if VOCAB_TAIL != 0:
+            tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_tail"):
+                hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, 0])
+                weight_chunk = pl.slice(
+                    lm_head_weight, [VOCAB_TAIL, LM_HEAD_K_CHUNK], [tail_o0, 0]
+                )
+                acc = pl.matmul(hidden_chunk, weight_chunk, b_trans=True, out_dtype=pl.FP32)
+                for kb in pl.range(1, K_BLOCKS):
+                    k0 = kb * LM_HEAD_K_CHUNK
+                    hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, k0])
+                    weight_chunk = pl.slice(
+                        lm_head_weight,
+                        [VOCAB_TAIL, LM_HEAD_K_CHUNK],
+                        [tail_o0, k0],
+                    )
+                    acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
+                logits_shard = pl.assemble(logits_shard, acc, [t0, tail_o0])
     return logits_shard
 
 
 @pl.jit.incore
-def gather_step(
-    logits_shard: pl.Tensor[[T, VOCAB_PER_TP], pl.FP32],
-    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
-    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
-    gather_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+def publish_hidden_step(
+    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, VOCAB], pl.FP32]:
-    # Publish this rank's contiguous vocab shard into every peer's full
-    # logits window. The local rank writes its own shard directly to
-    # the host-backed output below; routing it through the comm window
-    # would add a large self-remote path that is unnecessary here.
-    vocab_base = my_rank * VOCAB_PER_TP
+):
+    row_base = my_rank * T
+
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
             for t0 in pl.range(0, T, T_TILE):
-                for ob in pl.range(VOCAB_BLOCKS_PER_TP):
-                    o0 = ob * VOCAB_CHUNK
-                    tile = pl.load(logits_shard, [t0, o0], [T_TILE, VOCAB_CHUNK])
+                for kb in pl.range(HIDDEN_COMM_BLOCKS):
+                    k0 = kb * HIDDEN_COMM_CHUNK
+                    tile = pl.load(hidden_states, [t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
                     pld.tile.remote_store(
                         tile,
-                        target=logits_window,
+                        target=hidden_window,
                         peer=peer,
-                        offsets=[t0, vocab_base + o0],
+                        offsets=[row_base + t0, k0],
                     )
 
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
             pld.system.notify(
-                target=gather_done,
+                target=hidden_done,
                 peer=peer,
                 offsets=[my_rank, 0],
                 value=1,
@@ -116,7 +136,89 @@ def gather_step(
     for src in pl.range(TP_SIZE):
         if src != my_rank:
             pld.system.wait(
-                signal=gather_done,
+                signal=hidden_done,
+                offsets=[src, 0],
+                expected=1,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+
+@pl.jit.incore
+def load_owner_hidden_step(
+    owner_hidden: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    owner_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, D], pl.BF16]:
+    row_base = owner_rank * T
+
+    for t0 in pl.range(0, T, T_TILE):
+        for kb in pl.range(HIDDEN_COMM_BLOCKS):
+            k0 = kb * HIDDEN_COMM_CHUNK
+            tile = pl.load(hidden_window, [row_base + t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
+            pl.store(tile, [t0, k0], owner_hidden)
+    return owner_hidden
+
+
+@pl.jit.incore
+def route_logits_shard_step(
+    logits_shard: pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
+    owner_rank: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, VOCAB], pl.FP32]:
+    vocab_base = my_rank * VOCAB_PER_TP
+
+    for t0 in pl.range(0, T, T_TILE):
+        for ob in pl.range(VOCAB_FULL_BLOCKS_PER_TP):
+            o0 = ob * VOCAB_CHUNK
+            tile = pl.load(logits_shard, [t0, o0], [T_TILE, VOCAB_CHUNK])
+            if owner_rank == my_rank:
+                pl.store(tile, [t0, vocab_base + o0], logits)
+            else:
+                pld.tile.remote_store(
+                    tile,
+                    target=logits_window,
+                    peer=owner_rank,
+                    offsets=[t0, vocab_base + o0],
+                )
+
+        if VOCAB_TAIL != 0:
+            tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+            tile = pl.load(logits_shard, [t0, tail_o0], [T_TILE, VOCAB_TAIL])
+            if owner_rank == my_rank:
+                pl.store(tile, [t0, vocab_base + tail_o0], logits)
+            else:
+                pld.tile.remote_store(
+                    tile,
+                    target=logits_window,
+                    peer=owner_rank,
+                    offsets=[t0, vocab_base + tail_o0],
+                )
+    return logits
+
+
+@pl.jit.incore
+def finish_logits_step(
+    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, VOCAB], pl.FP32]:
+    for peer in pl.range(TP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=logits_done,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=1,
+                op=pld.NotifyOp.Set,
+            )
+
+    for src in pl.range(TP_SIZE):
+        if src != my_rank:
+            pld.system.wait(
+                signal=logits_done,
                 offsets=[src, 0],
                 expected=1,
                 cmp=pld.WaitCmp.Ge,
@@ -124,62 +226,86 @@ def gather_step(
 
     for t0 in pl.range(0, T, T_TILE):
         for src in pl.range(TP_SIZE):
-            src_vocab_base = src * VOCAB_PER_TP
-            for ob in pl.range(VOCAB_BLOCKS_PER_TP):
-                o0 = ob * VOCAB_CHUNK
-                # Store inside each branch: a tile assigned in both arms of an
-                # if/else can't be phi-merged ("used outside its defining
-                # scope"), so write it within the arm that loaded it.
-                if src == my_rank:
-                    tile = pl.load(logits_shard, [t0, o0], [T_TILE, VOCAB_CHUNK])
-                    pl.store(tile, [t0, src_vocab_base + o0], logits)
-                else:
+            if src != my_rank:
+                src_vocab_base = src * VOCAB_PER_TP
+                for ob in pl.range(VOCAB_FULL_BLOCKS_PER_TP):
+                    o0 = ob * VOCAB_CHUNK
                     tile = pl.load(
                         logits_window,
                         [t0, src_vocab_base + o0],
                         [T_TILE, VOCAB_CHUNK],
                     )
                     pl.store(tile, [t0, src_vocab_base + o0], logits)
+
+                if VOCAB_TAIL != 0:
+                    tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+                    tile = pl.load(
+                        logits_window,
+                        [t0, src_vocab_base + tail_o0],
+                        [T_TILE, VOCAB_TAIL],
+                    )
+                    pl.store(tile, [t0, src_vocab_base + tail_o0], logits)
     return logits
 
 
 @pl.jit
 def lm_head_tp(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PADDED_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
-    gather_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     # scalars trailing — runtime TaskArgs requires all tensor args before any
     # scalar args (#1603-adjacent constraint).
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, VOCAB], pl.FP32]:
-    logits_shard = pl.create_tensor([T, VOCAB_PER_TP], dtype=pl.FP32)
-    logits_shard = lm_head(hidden_states, lm_head_weight, logits_shard)
-    # gather_step is an InCore dep (a separate IR function): capture its
-    # post-call return rather than reusing the pre-call ``logits`` handle.
-    logits = gather_step(logits_shard, logits, logits_window, gather_done, my_rank)
+    publish_hidden_step(hidden_states, hidden_window, hidden_done, my_rank)
+
+    for owner_rank in pl.range(TP_SIZE):
+        logits_shard = pl.create_tensor([T, VOCAB_PADDED_PER_TP], dtype=pl.FP32)
+        if owner_rank == my_rank:
+            logits_shard = lm_head(hidden_states, lm_head_weight, logits_shard)
+            logits = route_logits_shard_step(
+                logits_shard, logits, logits_window, owner_rank, my_rank
+            )
+        else:
+            owner_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
+            owner_hidden = load_owner_hidden_step(owner_hidden, hidden_window, owner_rank)
+            logits_shard = lm_head(owner_hidden, lm_head_weight, logits_shard)
+            logits = route_logits_shard_step(
+                logits_shard, logits, logits_window, owner_rank, my_rank
+            )
+
+    logits = finish_logits_step(logits, logits_window, logits_done, my_rank)
     return logits
 
 
 @pl.jit.host
 def host_orch(
     hidden_states: pl.Tensor[[TP_SIZE, T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PADDED_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[TP_SIZE, T, VOCAB], pl.FP32]],
 ):
+    hidden_window_buf = pld.alloc_window_buffer(TP_SIZE * T * D * 2)
+    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
     logits_window_buf = pld.alloc_window_buffer(T * VOCAB * 4)
-    gather_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
 
     for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(hidden_window_buf, [TP_SIZE * T, D], dtype=pl.BF16)
+        hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [T, VOCAB], dtype=pl.FP32)
-        gather_done = pld.window(gather_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         lm_head_tp(
             hidden_states[r],
             lm_head_weight[r],
             logits[r],
+            hidden_window,
+            hidden_done,
             logits_window,
-            gather_done,
+            logits_done,
             r,
             device=r,
         )
@@ -190,10 +316,13 @@ def golden_lm_head(tensors):
 
     hidden = tensors["hidden_states"].float()
     weight = tensors["lm_head_weight"].float()
-    shard_logits = []
-    for r in range(weight.shape[0]):
-        shard_logits.append(torch.matmul(hidden[r], weight[r].t()))
-    full_logits = [torch.cat(shard_logits, dim=-1) for _ in range(weight.shape[0])]
+    full_logits = []
+    for owner_rank in range(hidden.shape[0]):
+        shard_logits = []
+        for tp_rank in range(weight.shape[0]):
+            shard_weight = weight[tp_rank, :VOCAB_PER_TP]
+            shard_logits.append(torch.matmul(hidden[owner_rank], shard_weight.t()))
+        full_logits.append(torch.cat(shard_logits, dim=-1))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
 
 
@@ -202,19 +331,21 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_hidden_states():
-        # Hidden states are replicated across TP ranks (TP splits the vocab,
-        # not the tokens).
-        x = torch.randn(T, D) * 0.1
-        return x.unsqueeze(0).expand(TP_SIZE, -1, -1).contiguous()
+        # Each source rank owns different post-DP/post-EP token rows.
+        return torch.randn(TP_SIZE, T, D) * 0.1
 
     def init_lm_head_weight():
-        return (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        weight = torch.zeros(TP_SIZE, VOCAB_PADDED_PER_TP, D, dtype=torch.bfloat16)
+        weight[:, :VOCAB_PER_TP] = (
+            torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5
+        ).to(torch.bfloat16)
+        return weight
 
     return [
         TensorSpec("hidden_states", [TP_SIZE, T, D], torch.bfloat16, init_value=init_hidden_states),
         TensorSpec(
             "lm_head_weight",
-            [TP_SIZE, VOCAB_PER_TP, D],
+            [TP_SIZE, VOCAB_PADDED_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
         ),
