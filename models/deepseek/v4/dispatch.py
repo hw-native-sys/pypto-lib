@@ -32,15 +32,6 @@ TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
-# EP (cross-rank) layout — used only by dispatch_ep below, which moe_ep.py
-# imports after overriding config to the 2-rank DEMO preset. In the single-card
-# moe.py process these bind to the default config and dispatch_ep is defined but
-# never called/compiled (lazy JIT), so the values are harmless there.
-N_RANKS = EP_WORLD_SIZE
-N_LOCAL = N_LOCAL_EXPERTS  # all-rank naming used by the EP kernel
-W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
-IDX_PAD = 8  # INT32 r_route tile pad
-
 
 @pl.jit.inline
 def dispatch(
@@ -88,65 +79,65 @@ def dispatch(
                 pl.write(recv_expert_count, [e, 0], pl.cast(slot_i32 + 1, pl.INT32))
 
 
+W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
+IDX_PAD = 8  # INT32 r_route tile pad
+
+
 @pl.jit.inline
 def dispatch_ep(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
-    recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
-    recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
-    recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
-    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
-    recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
-    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
-    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_x_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
+    recv_scale_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_w_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_r_route_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
+    recv_count_out: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
+    pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    count_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
     # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on a2a3 (see
     # x_tile cast in payload_push below). ``recv_x_out`` stays INT8 — the narrow
     # cast happens in stage_out.
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.FP16],
-    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP16],
+    recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
+    recv_w: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
+    recv_r_route: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, IDX_PAD], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    # Flat 2-D view of the 3-D recv_x_out for the stage_out row stores (a
-    # tensor-level reshape kept outside the InCore scope so it stays a tensor
-    # view, not a tile).
-    recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
+    # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
+    # so it stays a tensor view, not a tile.
+    recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
-    # The whole route + push + stage-out runs in one pl.at(CORE_GROUP) (=
-    # ScopeStmt(InCore)) so that, once this kernel is inlined into moe_ep, the
-    # scalar histogram / prefix-sum arrays, the cross-rank notify/wait barriers,
-    # and the per-(t,k) remote_store all execute atomically as a single task —
-    # the same guarantee the former @pl.jit.incore function gave.
+    # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
+    # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_ep"):
         # ---------- histogram: scalar histogram on indices ----------
-        send_counts = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                send_counts[d * N_LOCAL + e] = 0
+        send_counts = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
+        for d in pl.range(EP_WORLD_SIZE):
+            for e in pl.range(N_LOCAL_EXPERTS):
+                send_counts[d * N_LOCAL_EXPERTS + e] = 0
 
         for t in pl.range(T):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
-                d = eid // N_LOCAL
-                e = eid - d * N_LOCAL
-                cur = send_counts[d * N_LOCAL + e]
-                send_counts[d * N_LOCAL + e] = cur + 1
+                d = eid // N_LOCAL_EXPERTS
+                e = eid - d * N_LOCAL_EXPERTS
+                cur = send_counts[d * N_LOCAL_EXPERTS + e]
+                send_counts[d * N_LOCAL_EXPERTS + e] = cur + 1
 
         # ---------- publish: TNOTIFY(AtomicAdd) ----------
-        for peer in pl.range(N_RANKS):
-            for d in pl.range(N_RANKS):
-                for e in pl.range(N_LOCAL):
-                    v = send_counts[d * N_LOCAL + e]
+        for peer in pl.range(EP_WORLD_SIZE):
+            for d in pl.range(EP_WORLD_SIZE):
+                for e in pl.range(N_LOCAL_EXPERTS):
+                    v = send_counts[d * N_LOCAL_EXPERTS + e]
                     if v != 0:
                         # Single-writer cell (each (src, d, e) is touched by
                         # exactly src=my_rank), so Set is sufficient.
                         pld.system.notify(
                             target=pub_counts,
                             peer=peer,
-                            offsets=[my_rank * N_RANKS + d, e],
+                            offsets=[my_rank * EP_WORLD_SIZE + d, e],
                             value=v,
                             op=pld.NotifyOp.Set,
                         )
@@ -154,7 +145,7 @@ def dispatch_ep(
         # ---------- count_done barrier ----------
         # First notify on this per-src cell; Set since only my_rank writes
         # offsets=[my_rank, 0] on each peer.
-        for peer in pl.range(N_RANKS):
+        for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
                     target=count_done,
@@ -163,7 +154,7 @@ def dispatch_ep(
                     value=1,
                     op=pld.NotifyOp.Set,
                 )
-        for src in pl.range(N_RANKS):
+        for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.wait(
                     signal=count_done,
@@ -173,26 +164,26 @@ def dispatch_ep(
                 )
 
         # ---------- prefix_sum: my slot offset + total recv_count ----------
-        my_slot_at_dst = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
+        my_slot_at_dst = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
+        for d in pl.range(EP_WORLD_SIZE):
+            for e in pl.range(N_LOCAL_EXPERTS):
                 acc = pl.const(0, pl.INT32)
-                for s in pl.range(N_RANKS):
+                for s in pl.range(EP_WORLD_SIZE):
                     if s < my_rank:
-                        acc = acc + pl.read(pub_counts, [s * N_RANKS + d, e])
-                my_slot_at_dst[d * N_LOCAL + e] = acc
+                        acc = acc + pl.read(pub_counts, [s * EP_WORLD_SIZE + d, e])
+                my_slot_at_dst[d * N_LOCAL_EXPERTS + e] = acc
 
-        for e in pl.range(N_LOCAL):
+        for e in pl.range(N_LOCAL_EXPERTS):
             acc = pl.const(0, pl.INT32)
-            for s in pl.range(N_RANKS):
-                acc = acc + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+            for s in pl.range(EP_WORLD_SIZE):
+                acc = acc + pl.read(pub_counts, [s * EP_WORLD_SIZE + my_rank, e])
             pl.write(recv_count_out, [e, 0], acc)
 
         # ---------- payload_push: 4 channels per (t, k) ----------
-        cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
-        for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                cursor[d * N_LOCAL + e] = 0
+        cursor = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
+        for d in pl.range(EP_WORLD_SIZE):
+            for e in pl.range(N_LOCAL_EXPERTS):
+                cursor[d * N_LOCAL_EXPERTS + e] = 0
 
         # Allocate the three pad tiles once, zero-initialised. Columns 1..PAD-1 stay
         # 0 across every push so the stage_out row_sum at the receiver recovers
@@ -210,9 +201,9 @@ def dispatch_ep(
         for t in pl.range(T):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
-                dst = eid // N_LOCAL
-                loc_e = eid - dst * N_LOCAL
-                bucket = dst * N_LOCAL + loc_e
+                dst = eid // N_LOCAL_EXPERTS
+                loc_e = eid - dst * N_LOCAL_EXPERTS
+                bucket = dst * N_LOCAL_EXPERTS + loc_e
                 cur_val = cursor[bucket]
                 slot_off = my_slot_at_dst[bucket]
                 slot = slot_off + cur_val
@@ -247,7 +238,7 @@ def dispatch_ep(
         # ---------- data_done barrier ----------
         # Reuse count_done signal cells: count phase bumps to 1, data phase bumps to
         # 2 (per-src cumulative count via AtomicAdd). Avoids a separate window.
-        for peer in pl.range(N_RANKS):
+        for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
                     target=count_done,
@@ -256,7 +247,7 @@ def dispatch_ep(
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
-        for src in pl.range(N_RANKS):
+        for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.wait(
                     signal=count_done,
@@ -265,32 +256,22 @@ def dispatch_ep(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-        # ---------- stage_out: window → host-backed ----------
-        # Same InCore scope, after the data_done barrier: stage_out reads the
-        # recv_x / recv_scale / recv_w / recv_r_route windows that the push above
-        # filled, exactly as the former @pl.jit.incore kernel did (one kernel).
-        # recv_x: per-row [1, D] FP16 → narrow back to INT8 host tensor, stored
-        # through recv_x_out_flat (row e*RECV_MAX+slot); the 3-D
-        # [N_LOCAL, RECV_MAX, D] view is what expert_routed consumes downstream.
-        for e in pl.range(N_LOCAL):
+        # stage_out: copy the windows the push filled into the host outputs.
+        # recv_x: FP16 window -> INT8, stored through the flat view (cast needs a
+        # tile, so pl.load/pl.store here).
+        for e in pl.range(N_LOCAL_EXPERTS):
             for slot in pl.range(RECV_MAX):
                 row = e * RECV_MAX + slot
                 stage_x_fp16 = pl.load(recv_x, [row, 0], [1, D])
                 stage_x_i8 = pl.cast(stage_x_fp16, target_type=pl.INT8)
                 pl.store(stage_x_i8, [row, 0], recv_x_out_flat)
 
-        # recv_scale / recv_w / recv_r_route: scalar copy of column 0 from each
-        # W_PAD-padded window row. A scalar pl.write (not a tile pl.store) keeps
-        # these as write-only OUTPUTS of the inlined task. WORKAROUND for
-        # pypto#1693: the tile-store form made recv_scale_out / recv_w_out
-        # add_inout, and the orchestration cross-assigned their post-write SSA
-        # aliases to the wrong source tensors (recv_scale_out -> recv_x FP16
-        # window, recv_w_out -> recv_count_out), so expert_routed dequant read
-        # garbage -> NaN/507018. Scalar pl.write keeps them add_output and
-        # sidesteps the bug (same as recv_r_route always did). The assemble-style
-        # slice-assign alternative is blocked by pypto#1694 (window slice inside
-        # an InCore scope).
-        for e in pl.range(N_LOCAL):
+        # recv_scale / recv_w / recv_r_route: scalar copy of window column 0.
+        # WORKAROUND pypto#1693: writing these via tile pl.store made them
+        # add_inout and the orchestration scrambled their post-write SSA aliases;
+        # scalar pl.write keeps them add_output. The slice-assign alternative is
+        # blocked by pypto#1694 (window slice inside an InCore scope).
+        for e in pl.range(N_LOCAL_EXPERTS):
             for slot in pl.range(RECV_MAX):
                 row = e * RECV_MAX + slot
                 pl.write(recv_scale_out, [e, slot], pl.read(recv_scale, [row, 0]))

@@ -95,8 +95,7 @@ def moe_ep(
     recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    # scalars trailing — runtime TaskArgs requires all tensor args before any
-    # scalar args (#1603-adjacent constraint).
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:

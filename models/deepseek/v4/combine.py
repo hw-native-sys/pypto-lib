@@ -26,13 +26,6 @@ D = M.hidden_size
 TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
-# EP (cross-rank) layout — used only by combine_ep below, which moe_ep.py
-# imports after overriding config to the 2-rank DEMO preset (harmless/uncompiled
-# in the single-card moe.py process).
-N_RANKS = EP_WORLD_SIZE
-N_LOCAL = N_LOCAL_EXPERTS  # all-rank naming used by the EP kernel
-N_ROUTES = T * TOPK
-
 
 @pl.jit.inline
 def combine(
@@ -79,33 +72,28 @@ def combine(
 
 @pl.jit.inline
 def combine_ep(
-    recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
-    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
+    recv_r_route_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
-    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    # ---------- push + barrier: one InCore scope ----------
-    # Push recv_y rows to each peer's routed_y_buf, then the cross-rank barrier.
-    # Both stay in a single pl.at(CORE_GROUP) (= ScopeStmt(InCore)) so the
-    # remote_store + notify/wait run atomically as one task, matching the former
-    # @pl.jit.incore semantics now that this kernel is inlined into moe_ep.
+    # Push recv_y rows to each peer's routed_y_buf, then a cross-rank barrier, in
+    # one pl.at(CORE_GROUP) so remote_store + notify/wait stay one atomic task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
-        # For each dst rank and each local expert e on MY rank, the n rows I sent
-        # to dst's expert e originally landed at slots [src_off, src_off + n) on
-        # dst (src_off = Σ_{s<dst} counts). Per-row pl.load uses 3D indexing on
-        # recv_y directly — DON'T reshape recv_y to 2D first, that would tile.load
-        # the full [N_LOCAL, RECV_MAX, D] tensor into Vec (≫ 192 KB).
-        for dst in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                n = pl.cast(pl.read(pub_counts, [dst * N_RANKS + my_rank, e]), pl.INDEX)
+        # Each (dst, e) block of n rows landed at slots [src_off, src_off+n) on
+        # dst. Per-row 3D pl.load on recv_y (don't reshape to 2D — that loads the
+        # whole [N_LOCAL_EXPERTS, RECV_MAX, D] into Vec).
+        for dst in pl.range(EP_WORLD_SIZE):
+            for e in pl.range(N_LOCAL_EXPERTS):
+                n = pl.cast(pl.read(pub_counts, [dst * EP_WORLD_SIZE + my_rank, e]), pl.INDEX)
                 src_off = pl.const(0, pl.INT32)
-                for s in pl.range(N_RANKS):
+                for s in pl.range(EP_WORLD_SIZE):
                     if s < dst:
-                        src_off = src_off + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+                        src_off = src_off + pl.read(pub_counts, [s * EP_WORLD_SIZE + my_rank, e])
                 src_off_idx = pl.cast(src_off, pl.INDEX)
                 for row in pl.range(n):
                     slot = src_off_idx + row
@@ -117,7 +105,7 @@ def combine_ep(
                     )
 
         # combine_done barrier — single-writer per-src cell (Set, not Add).
-        for peer in pl.range(N_RANKS):
+        for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
                     target=combine_done,
@@ -126,7 +114,7 @@ def combine_ep(
                     value=1,
                     op=pld.NotifyOp.Set,
                 )
-        for src in pl.range(N_RANKS):
+        for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:
                 pld.system.wait(
                     signal=combine_done,
@@ -135,13 +123,10 @@ def combine_ep(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # ---------- reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k] ----------
-    # A separate parallel pl.spmd scope: pypto#1670 now classifies the
-    # remote_store target above as a window write, so the orchestration orders
-    # this routed_y_buf reader after the push scope (no longer needs to share the
-    # push's InCore block, the old @pl.jit.incore constraint). The window is read
-    # with pl.load — #1672 makes slice/slice-assign accept a DistributedTensor,
-    # but the per-token compute (cast/add) still needs the data in a tile.
+    # reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k]. Separate pl.spmd
+    # scope (ordered after the push via the window write->read dep). routed_y_buf
+    # must be pl.load-ed, which forces the whole reduce tile-level: cast/add can't
+    # run on a window slice, nor be assembled to a local tensor in-scope (pypto#1694).
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
             t = tb * 4 + tt
