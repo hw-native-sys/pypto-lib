@@ -89,7 +89,7 @@ def hc_head(
             mixes = pl.assemble(mixes, scaled, [t0, 0])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_pre"):
-        scale = pl.tensor.read(hc_head_scale, [0])
+        scale = pl.read(hc_head_scale, [0])
         base = pl.reshape(pl.slice(hc_head_base, [HC_PAD], [0], valid_shape=[HC_MULT]), [1, HC_PAD])
         logits = pl.add(
             pl.mul(pl.slice(mixes, [T, HC_PAD], [0, 0]), scale),

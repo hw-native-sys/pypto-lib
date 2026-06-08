@@ -121,7 +121,7 @@ def expert_routed(
                     silu = pl.mul(gate_2d, sigmoid)
                     gated = pl.mul(silu, up_2d)
                     # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
-                    gated_valid = pl.tensor.set_validshape(gated, valid_rows, INTER_TILE)
+                    gated_valid = pl.set_validshape(gated, valid_rows, INTER_TILE)
                     gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
                     h_tile_fp32[:, n0 : n0 + INTER_TILE] = gated_masked
 

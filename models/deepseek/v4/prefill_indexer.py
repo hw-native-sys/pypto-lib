@@ -285,13 +285,13 @@ def prefill_indexer(
             if visible_len > 0:
                 offset_i32 = pl.cast(offset, target_type=pl.INT32)
                 score_row = score_flat[t : t + 1, :]
-                idx_init = pl.tensor.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
-                sorted_score_tile = pl.tensor.sort32(score_row, idx_init)
-                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=64)
-                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=256)
-                sorted_score_tile = pl.tensor.mrgsort(sorted_score_tile, block_len=1024)
+                idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+                sorted_score_tile = pl.sort32(score_row, idx_init)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=64)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=256)
+                sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=1024)
                 topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
-                topk_idxs_tile = pl.tensor.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+                topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 valid_topk = pl.min(IDX_TOPK, visible_len)
                 topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
                 topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)

@@ -933,8 +933,8 @@ def prefill_hca_packed_sparse_attn(
                         2 * rope_asm_r0 : 2 * rope_asm_r0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
                     ]
                     rope_tile_fp32 = pl.cast(rope_tile, target_type=pl.FP32)
-                    rope_apply_even_chunk = pl.tensor.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                    rope_apply_odd_chunk = pl.tensor.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+                    rope_apply_even_chunk = pl.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+                    rope_apply_odd_chunk = pl.gather(rope_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
                     rope_even_acc = pl.add(
                         pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
                         pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),

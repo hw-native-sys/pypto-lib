@@ -251,8 +251,8 @@ def qkv_proj_rope(
         )
         kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
         kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
-        kv_rope_even = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
-        kv_rope_odd = pl.tensor.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
+        kv_rope_even = pl.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P0101)
+        kv_rope_odd = pl.gather(kv_rope_norm_chunk, mask_pattern=pl.tile.MaskPattern.P1010)
         kv_rope_cos_chunk = pl.cast(rope_cos[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
         kv_rope_sin_chunk = pl.cast(rope_sin[tg : tg + KV_ROPE_T_TILE, :ROPE_HALF], target_type=pl.FP32)
         kv_rot_even = pl.sub(pl.mul(kv_rope_even, kv_rope_cos_chunk), pl.mul(kv_rope_odd, kv_rope_sin_chunk))

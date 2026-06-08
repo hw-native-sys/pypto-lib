@@ -95,8 +95,7 @@ def moe_ep(
     recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    # scalars trailing — runtime TaskArgs requires all tensor args before any
-    # scalar args (#1603-adjacent constraint).
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
@@ -137,14 +136,10 @@ def moe_ep(
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    # Capture the incore returns: an InCore dep is a separate IR function, so
-    # InOutUseDiscipline requires downstream reads to use the post-call SSA
-    # values, not the pre-call create_tensor handles. (The specializer infers
-    # each return's meta from the bound pl.Out arg.)
-    (
-        recv_x_out, recv_scale_out, recv_w_out,
-        recv_r_route_out, recv_count_out,
-    ) = dispatch_ep(
+    # dispatch_ep is inlined: it writes the recv_*_out tensors in place, so the
+    # downstream reads use the create_tensor handles directly (no post-call SSA
+    # rebind, which only the old @pl.jit.incore separate-function form needed).
+    dispatch_ep(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
         pub_counts, count_done,
@@ -161,7 +156,7 @@ def moe_ep(
     )
 
     ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    ffn_out = combine_ep(
+    combine_ep(
         recv_y, recv_r_route_out, sh,
         ffn_out,
         pub_counts, routed_y_buf, combine_done,
