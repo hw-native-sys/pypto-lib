@@ -53,8 +53,9 @@ def combine(
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_scatter"):
-        for r0 in pl.range(T):
-            routed_y_buf[r0, :, :] = pl.full([N_LOCAL_EXPERTS, D], dtype=pl.BF16, value=0.0)
+        for rb in pl.range(T * N_LOCAL_EXPERTS // 16):
+            r0 = rb * 16
+            routed_y_buf_flat[r0:r0 + 16, :] = pl.full([16, D], dtype=pl.BF16, value=0.0)
 
         for e in pl.range(N_LOCAL_EXPERTS):
             n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)

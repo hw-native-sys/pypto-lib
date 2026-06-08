@@ -257,7 +257,7 @@ INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
 # EP communication constants
-EP_WORLD_SIZE = 16  # deployment EP world size (demo overrides to 1)
+EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
 EP_RANK = 0
 RECV_SAFETY = 4
 RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
