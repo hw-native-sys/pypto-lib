@@ -16,7 +16,7 @@ position_ids, slot mappings, and window-ring sparse indices.
 import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_packed
+from hc_post import golden_hc_post, hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre_packed
 from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
 from prefill_rmsnorm import prefill_packed_attn_norm
@@ -207,11 +207,13 @@ def prefill_attention_swa(
         attn_out,
     )
 
-    x_out = prefill_hc_post_packed(
+    comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
+    x_out = hc_post(
         attn_out,
         x_hc,
         post,
-        comb,
+        comb_t,
         x_out,
     )
     return kv_cache, x_out
@@ -420,15 +422,15 @@ def golden_prefill_attention_swa(tensors):
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     _golden_swa_packed_sparse_attn(tensors, q, kv_cache, cmp_kv, rope_cos_t, rope_sin_t, attn_out)
 
-    y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
-    golden_prefill_hc_post({
-        "x": attn_out.view(B, S, D),
-        "residual": x_hc_rect,
-        "post": post,
-        "comb": comb,
+    y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
+    golden_hc_post({
+        "x": attn_out.view(T, D),
+        "residual": x_hc_rect.view(T, HC_MULT, D),
+        "post": post.view(T, HC_MULT),
+        "comb": comb.view(T, HC_MULT, HC_MULT),
         "y": y,
     })
-    tensors["x_out"][:] = y.view(MAX_TOKENS, HC_MULT, D)
+    tensors["x_out"][:] = y
 
 
 def build_tensor_specs(

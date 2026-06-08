@@ -25,7 +25,7 @@ from config import (
 
 from decode_attention_csa import *  # noqa: F401,F403
 from prefill_compressor_ratio4 import prefill_compressor_ratio4
-from prefill_hc_post import prefill_hc_post
+from hc_post import hc_post
 from prefill_hc_pre import prefill_hc_pre
 from prefill_indexer import prefill_indexer
 from prefill_qkv_proj_rope import prefill_qkv_proj_rope_core
@@ -287,15 +287,22 @@ def prefill_attention_csa(
         attn_out,
     )
 
-    attn_out_3d = pl.create_tensor([B, S, D], dtype=pl.BF16)
-    attn_out_3d = pl.reshape(attn_out, [B, S, D])
-    x_out = prefill_hc_post(
-        attn_out_3d,
-        x_hc,
-        post_t,
-        comb_t,
-        x_out,
+    x_hc_flat = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_hc_flat = pl.reshape(x_hc, [T, HC_MULT, D])
+    post_t_flat = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    post_t_flat = pl.reshape(post_t, [T, HC_MULT])
+    comb_t_flat = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    comb_t_flat = pl.reshape(comb_t, [T, HC_MULT * HC_MULT])
+    x_out_flat = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_out_flat = pl.reshape(x_out, [T, HC_MULT, D])
+    x_out_flat = hc_post(
+        attn_out,
+        x_hc_flat,
+        post_t_flat,
+        comb_t_flat,
+        x_out_flat,
     )
+    x_out = pl.reshape(x_out_flat, [B, S, HC_MULT, D])
     return x_out
 
 
@@ -398,7 +405,7 @@ def golden_prefill_attention_csa(tensors):
     import torch
 
     from prefill_compressor_ratio4 import golden_prefill_compressor_ratio4
-    from prefill_hc_post import golden_prefill_hc_post
+    from hc_post import golden_hc_post
     from prefill_hc_pre import golden_prefill_hc_pre
     from prefill_indexer import golden_prefill_indexer
     from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope
@@ -536,12 +543,12 @@ def golden_prefill_attention_csa(tensors):
     })
 
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16, device=kv.device)
-    golden_prefill_hc_post({
-        "x": attn_out.view(B, S, D),
-        "residual": tensors["x_hc"],
-        "post": post_t,
-        "comb": comb_t,
-        "y": y,
+    golden_hc_post({
+        "x": attn_out.view(T, D),
+        "residual": tensors["x_hc"].view(T, HC_MULT, D),
+        "post": post_t.view(T, HC_MULT),
+        "comb": comb_t.view(T, HC_MULT * HC_MULT),
+        "y": y.view(T, HC_MULT, D),
     })
     tensors["x_out"][:] = y
 
