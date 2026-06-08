@@ -6,8 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 single-token decode attn_norm fused + Q/KV LoRA + RoPE: produces (q, kv, qr) for the
-attention body, with attn_norm fused at the front to save one GM round-trip."""
+"""DeepSeek-V4 single-token decode Q/KV LoRA + RoPE for attention-normalized input."""
 
 
 import pypto.language as pl
@@ -43,33 +42,6 @@ QPROJ_T_TILE = 16
 KV_RMS_T_TILE = 16
 Q_ROPE_T_TILE = 32
 KV_ROPE_T_TILE = 32
-
-
-@pl.jit.inline
-def attn_norm(
-    x: pl.Tensor[[T, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.FP32],
-    x_normed: pl.Tensor[[T, D], pl.BF16],
-):
-    for tg_idx in pl.spmd(T // T_TILE, name_hint="attn_norm"):
-        tg = tg_idx * T_TILE
-        x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_db in pl.pipeline(D // D_TILE, stage=2):
-            rms_d0 = rms_db * D_TILE
-            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
-            x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
-        x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
-        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // D_TILE, stage=2):
-            apply_d0 = apply_db * D_TILE
-            apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
-            norm_w_chunk = pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE])
-            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
-                x_normed_chunk, target_type=pl.BF16, mode="rint"
-            )
-
-    return x_normed
 
 
 @pl.jit.inline
@@ -299,7 +271,6 @@ def qkv_proj_rope(
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.FP32],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -313,10 +284,8 @@ def qkv_proj_rope_test(
     qr: pl.Out[pl.Tensor[[T, Q_LORA], pl.INT8]],
     qr_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
 ):
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = attn_norm(x, norm_w, x_normed)
     q = qkv_proj_rope(
-        x_normed,
+        x,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -333,22 +302,11 @@ def qkv_proj_rope_test(
     return q
 
 
-def golden_attn_norm(x, norm_w):
-    import torch
-
-    x = x.float()
-    norm_w = norm_w.float()
-    inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
-    return (x * inv * norm_w).to(torch.bfloat16)
-
-
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
 
     x = tensors["x"].float()
-    if "norm_w" in tensors:
-        x = golden_attn_norm(x, tensors["norm_w"]).float()
     wq_a = tensors["wq_a"].float()
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
@@ -434,8 +392,6 @@ def build_tensor_specs():
 
     def init_x():
         return (torch.randn(T, D) - 0.5)
-    def init_norm_w():
-        return torch.ones(D)
     def init_wq_a():
         return (torch.randn(D, Q_LORA) - 0.5) / (D ** 0.5)
     def init_wq_b():
@@ -457,7 +413,6 @@ def build_tensor_specs():
 
     return [
         TensorSpec("x",         [T, D],                 torch.bfloat16, init_value=init_x),
-        TensorSpec("norm_w",    [D],                    torch.float32,  init_value=init_norm_w),
         TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),

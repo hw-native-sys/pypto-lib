@@ -21,6 +21,7 @@ from prefill_hc_post import golden_prefill_hc_post, prefill_hc_post_packed
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre_packed
 from prefill_compressor_ratio128 import prefill_compressor_ratio128_packed
 from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
+from prefill_rmsnorm import golden_prefill_attn_norm, prefill_packed_attn_norm
 from prefill_sparse_attn import (
     CMP_BLOCK_NUM as SPARSE_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
@@ -159,6 +160,9 @@ def prefill_attention_hca(
         comb,
     )
 
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed = prefill_packed_attn_norm(x_mixed, attn_norm_w, x_normed)
+
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -166,8 +170,7 @@ def prefill_attention_hca(
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     q, kv, qr, qr_scale = prefill_packed_qkv_proj_rope_core(
-        x_mixed,
-        attn_norm_w,
+        x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
@@ -188,7 +191,7 @@ def prefill_attention_hca(
 
     kv_cache = _prefill_hca_write_prompt_kv(kv, kv_cache, ori_slot_mapping, num_tokens)
     cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio128_packed(
-        x_mixed,
+        x_normed,
         cmp_kv_state,
         cmp_score_state,
         cmp_wkv,
@@ -344,11 +347,10 @@ def _golden_hca_packed_sparse_attn(tensors, q, ori_kv, cmp_kv, rope_cos_t, rope_
     attn_out[:] = out.to(torch.bfloat16)
 
 
-def _golden_hca_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale):
+def _golden_hca_packed_qkv_proj_rope(tensors, x_normed, q, kv, qr, qr_scale):
     import torch
 
-    x = x_mixed.float()
-    norm_w = tensors["attn_norm_w"].float()
+    x = x_normed.float()
     wq_a = tensors["wq_a"].float()
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float().view(-1)
@@ -390,7 +392,7 @@ def _golden_hca_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale):
         y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
         return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
 
-    token_x = rms_norm(x.reshape(T, D), norm_w)
+    token_x = x.reshape(T, D)
     qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)
     qr_i8, qr_scale_out = int8_quant_per_row(qr_out.to(torch.bfloat16).float())
     q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
@@ -434,7 +436,8 @@ def golden_prefill_attention_hca(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    _golden_hca_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale)
+    x_normed = golden_prefill_attn_norm(x_mixed, tensors["attn_norm_w"])
+    _golden_hca_packed_qkv_proj_rope(tensors, x_normed, q, kv, qr, qr_scale)
 
     ori_kv = tensors["kv_cache"]
     ori_kv_flat = ori_kv.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -445,8 +448,8 @@ def golden_prefill_attention_hca(tensors):
 
     cmp_kv = tensors["cmp_kv"]
     num_cmp_writes = int(tensors["num_cmp_writes"])
-    kv_proj = x_mixed.float() @ tensors["cmp_wkv"].float()
-    score_proj = x_mixed.float() @ tensors["cmp_wgate"].float()
+    kv_proj = x_normed.float() @ tensors["cmp_wkv"].float()
+    score_proj = x_normed.float() @ tensors["cmp_wgate"].float()
     kv_state = tensors["cmp_kv_state"]
     score_state = tensors["cmp_score_state"]
     for t in range(num_tokens):
