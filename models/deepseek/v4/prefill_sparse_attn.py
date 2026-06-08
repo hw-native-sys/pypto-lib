@@ -65,10 +65,7 @@ ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 # cube-friendly 64-column attention blocks without out-of-bounds slices.
 GATHER_TOKEN_TILE = 4
 ATTN_TOKEN_TILE = 32
-# Keep inverse-RoPE token tiles small enough to expose per-output-group AIV
-# parallelism; larger tiles reduce task count but leave longer RoPE work on
-# the critical path.
-ROPE_TOKEN_TILE = 4
+ROPE_TOKEN_TILE = 8
 ROPE_PACK_TOKEN_TILE = 16
 MATMUL_ROW_PAD = 16
 PV_HEAD_TILE = 16
@@ -88,6 +85,9 @@ B_N_CHUNK = 128 if T >= 128 else 256
 QUANT_CHUNK = 128 if T >= 128 else (128 if T >= 64 else 256)
 QUANT_TOKEN_TILE = 32
 PROJ_TOKEN_TILE = 128 if T >= 128 else T
+assert T % QUANT_TOKEN_TILE == 0, "T must be divisible by QUANT_TOKEN_TILE for full-row quantization coverage"
+assert T % PROJ_TOKEN_TILE == 0, "T must be divisible by PROJ_TOKEN_TILE for projection tiling"
+assert (O_GROUPS * O_LORA) % 2 == 0, "2-way quant K split requires an even O_GROUPS * O_LORA width"
 
 
 @pl.jit.inline
@@ -619,7 +619,10 @@ SPARSE_ROPE_CHUNK = ROPE_CHUNK
 SPARSE_ROPE_INTERLEAVE_CHUNK = ROPE_INTERLEAVE_CHUNK
 SPARSE_ROPE_PACK_SPMD_BLOCKS = ROPE_PACK_SPMD_BLOCKS
 SPARSE_ROPE_PACK_TOKEN_TILE = ROPE_PACK_TOKEN_TILE
-SPARSE_ROPE_TOKEN_TILE = ROPE_TOKEN_TILE
+# Keep packed inverse-RoPE token tiles small enough to expose per-output-group
+# AIV parallelism; larger tiles reduce task count but leave longer RoPE work on
+# the critical path.
+SPARSE_ROPE_TOKEN_TILE = 4
 SPARSE_ROPE_APPLY_SPMD_BLOCKS = ((T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE_TOKEN_TILE) * O_GROUPS
 SPARSE_TOPK = TOPK
 
@@ -1058,7 +1061,8 @@ def prefill_hca_packed_sparse_attn(
             or_amax = pl.maximum(or_amax, or_a_part)
         or_sq_row = pl.div(pl.full([1, SPARSE_QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
         or_scale_dq = pl.reshape(pl.recip(or_sq_row), [SPARSE_QUANT_TOKEN_TILE, 1])
-        o_r_scale_dq[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, 0:1] = or_scale_dq
+        if quant_k_block == 0:
+            o_r_scale_dq[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, 0:1] = or_scale_dq
         or_sq_col = pl.reshape(or_sq_row, [SPARSE_QUANT_TOKEN_TILE, 1])
         for k1 in pl.range(quant_k0, quant_k0 + SPARSE_QUANT_K_TILE, SPARSE_QUANT_CHUNK):
             or_q_f32 = pl.cast(

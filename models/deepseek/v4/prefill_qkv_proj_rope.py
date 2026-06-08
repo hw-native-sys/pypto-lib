@@ -464,9 +464,6 @@ def prefill_qkv_proj_rope_core(
 # original [B, S] contract; this variant consumes token-major position_ids.
 MAX_TOKENS = T
 QKV_HEAD_CHUNK = HEAD_CHUNK
-# Keep packed prefill q-RoPE reassemble/write on enough lanes while avoiding
-# the scheduler overhead from per-head tasks.
-QKV_HEAD_GROUP = 2
 QKV_Q_PROJ_OUT_CHUNK = Q_PROJ_OUT_CHUNK
 QKV_Q_PROJ_CHUNK = Q_PROJ_CHUNK
 QKV_Q_PROJ_GROUP = Q_PROJ_GROUP
