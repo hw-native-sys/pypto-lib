@@ -84,7 +84,9 @@ B_K_CHUNK = 128
 B_N_CHUNK = 128 if T >= 128 else 256
 QUANT_CHUNK = 128 if T >= 128 else (128 if T >= 64 else 256)
 QUANT_TOKEN_TILE = 32
-PROJ_TOKEN_TILE = 128 if T >= 128 else T
+# Keep the standalone sparse-attn simulator kernels below the scheduler
+# no-progress timeout; the packed HCA path below keeps its own 128-token tile.
+PROJ_TOKEN_TILE = 64 if T >= 128 else T
 assert T % QUANT_TOKEN_TILE == 0, "T must be divisible by QUANT_TOKEN_TILE for full-row quantization coverage"
 assert T % PROJ_TOKEN_TILE == 0, "T must be divisible by PROJ_TOKEN_TILE for projection tiling"
 assert (O_GROUPS * O_LORA) % 2 == 0, "2-way quant K split requires an even O_GROUPS * O_LORA width"
@@ -608,7 +610,7 @@ SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
 SPARSE_PREFILL_ATTN_BLOCKS = PREFILL_ATTN_BLOCKS
 SPARSE_PREFILL_ATTN_TILE = PREFILL_ATTN_TILE
 SPARSE_PREFILL_SPARSE_PAD = PREFILL_SPARSE_PAD
-SPARSE_PROJ_TOKEN_TILE = PROJ_TOKEN_TILE
+SPARSE_PROJ_TOKEN_TILE = 128 if T >= 128 else T
 SPARSE_PV_HEAD_TILE = PV_HEAD_TILE
 SPARSE_QUANT_CHUNK = QUANT_CHUNK
 SPARSE_QUANT_K_TILE = O_GROUPS * O_LORA // 2
