@@ -161,7 +161,7 @@ def moe_ep(
     )
 
     ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    ffn_out = combine_ep(
+    combine_ep(
         recv_y, recv_r_route_out, sh,
         ffn_out,
         pub_counts, routed_y_buf, combine_done,
