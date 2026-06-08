@@ -148,12 +148,50 @@ often false timeouts — run the suspect test serially before deep-diving.
 
 ## 5. Localize a precision mismatch with dump-tensor
 
-`enable_dump_tensor=True` (CLI `--dump-tensor`) writes
+`enable_dump_tensor` writes
 `dfx_outputs/tensor_dump/{tensor_dump.json,tensor_dump.bin}` — the
-intermediate tensor values captured at kernel boundaries. Use it to turn a
-"the whole kernel is wrong" mismatch into "this one op is wrong":
+intermediate tensor values captured at kernel-task boundaries. Use it to turn a
+"the whole kernel is wrong" mismatch into "this one op is wrong".
 
-1. Reproduce on fixed data (§2) with `--dump-tensor`.
+**Dump levels** (`runtime_cfg["enable_dump_tensor"]`): `0` off · `1` partial —
+only tensors you mark · `2` full — every task's inputs/outputs (heavy; can
+saturate the host collector / trip AICPU timeouts on large workloads).
+
+**The usual flow — tag the tensor, dump at level 1.** Mark the tensor of
+interest with `pl.dump_tag(t)` right where it's produced, then run with level
+`1`:
+
+```python
+h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
+pl.dump_tag(h_tile_i8)          # capture this one tensor under partial dump
+```
+
+```python
+run_jit(..., runtime_cfg=dict(platform=..., enable_dump_tensor=1))
+```
+
+`pl.dump_tag` works on plain function args and on internal
+`pl.create_tensor` GM tensors (incl. inside `@pl.jit.inline`); it returns the
+tensor unchanged and is a no-op when dump is off. Equivalent per-scope form:
+`pl.at(..., dumps=[t])` / `pl.submit(..., dumps=[t])`. Prefer level `1` + tags
+over level `2` — it keeps the dump small and avoids the full-dump timeouts.
+
+Inspect the result with the viewer — with no filters it lists every captured
+tensor (task_id / stage / role / dtype / shape); add filters (`--task`,
+`--stage before|after`, `--role`, `--arg`, `-i N`) + `--export` to decode the
+chosen tensors to `tensor_dump/txt/` for element-wise comparison against torch:
+
+```bash
+python -m simpler_setup.tools.dump_viewer <build_output/.../dfx_outputs/tensor_dump>
+```
+
+Pass the dump dir **explicitly** — with no argument the viewer looks under
+`./outputs/*/tensor_dump`, but `run_jit` writes to
+`build_output/<...>/dfx_outputs/tensor_dump`.
+
+To localize a precision bug:
+
+1. Reproduce on fixed data (§2) with the suspect tensors tagged, level `1`.
 2. Compute the matching torch intermediates stage by stage.
 3. Walk the dumped tensors in dependency order and find the **first** one
    that diverges from its torch reference — the producing kernel is the
