@@ -10,8 +10,13 @@
 
     C[m, n] = A[m, k] @ B[k, n]
 
-M and N are parallelised via pl.parallel; K is tiled and reduced using
-pl.matmul (first K-tile) + pl.matmul_acc (remaining K-tiles).
+Authored in the ``@pl.jit`` form (see docs/pypto-coding-style.md §1):
+``gemm`` is a reusable ``@pl.jit.inline`` sub-kernel called by the thin
+``@pl.jit`` entry. ``pl.parallel`` tiles the M and N output dimensions
+across core-groups; inside each ``pl.at`` scope ``pl.pipeline(stage=2)``
+software-pipelines the K reduction — the canonical matmul-reduction shape
+(see examples/advanced/multi_proj.py): ``pl.matmul`` seeds the FP32
+accumulator on the first K-tile, ``pl.matmul_acc`` adds the rest.
 
 Input and output matrices are FP32.
 """
@@ -26,65 +31,53 @@ K = 256         # total cols of A / rows of B
 M_TILE = 64     # tile size along M dimension
 N_TILE = 64     # tile size along N dimension
 K_TILE = 64     # tile size along K dimension (reduction)
-M_CHUNK = 2     # M-tiles grouped per incore chunk
-N_CHUNK = 2     # N-tiles grouped per incore chunk
+
+K_BLOCKS = K // K_TILE
 
 
-def build_gemm_program(
-    m: int = M,
-    n: int = N,
-    k: int = K,
-    m_tile: int = M_TILE,
-    n_tile: int = N_TILE,
-    k_tile: int = K_TILE,
-    m_chunk: int = M_CHUNK,
-    n_chunk: int = N_CHUNK,
+@pl.jit.inline
+def gemm(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
 ):
-    k_blocks = k // k_tile
+    for mb in pl.parallel(0, M, M_TILE):
+        for nb in pl.parallel(0, N, N_TILE):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm"):
+                acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                for kb in pl.pipeline(0, K_BLOCKS, stage=2):
+                    k0 = kb * K_TILE
+                    tile_a = a[mb : mb + M_TILE, k0 : k0 + K_TILE]
+                    tile_b = b[k0 : k0 + K_TILE, nb : nb + N_TILE]
+                    if k0 == 0:
+                        # First K-tile seeds the accumulator
+                        acc = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)
+                    else:
+                        # Remaining K-tiles accumulate in place
+                        acc = pl.matmul_acc(acc, tile_a, tile_b)
+                c[mb : mb + M_TILE, nb : nb + N_TILE] = acc
 
-    @pl.program
-    class GemmProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def gemm(
-            self,
-            a: pl.Tensor[[m, k], pl.FP32],
-            b: pl.Tensor[[k, n], pl.FP32],
-            c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
-        ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
-                    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        # First K-tile: initialize accumulator via matmul
-                        tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
-                        tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
-                        acc = pl.matmul(tile_a, tile_b)
-
-                        # Remaining K-tiles: accumulate via matmul_acc
-                        for kb in pl.range(1, k_blocks):
-                            k0 = kb * k_tile
-                            tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
-                            tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
-                            acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
-
-                        c = pl.assemble(c, acc, [mb, nb])
-
-            return c
-
-    return GemmProgram
+    return c
 
 
-def build_tensor_specs(
-    m: int = M,
-    n: int = N,
-    k: int = K,
+@pl.jit
+def gemm_kernel(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
 ):
+    c = gemm(a, b, c)
+    return c
+
+
+def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
     return [
-        TensorSpec("a", [m, k], torch.float32, init_value=torch.randn),
-        TensorSpec("b", [k, n], torch.float32, init_value=torch.randn),
-        TensorSpec("c", [m, n], torch.float32, is_output=True),
+        TensorSpec("a", [M, K], torch.float32, init_value=torch.randn),
+        TensorSpec("b", [K, N], torch.float32, init_value=torch.randn),
+        TensorSpec("c", [M, N], torch.float32, is_output=True),
     ]
 
 
@@ -94,7 +87,7 @@ def golden_gemm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -103,11 +96,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_gemm_program(),
+    result = run_jit(
+        fn=gemm_kernel,
         specs=build_tensor_specs(),
         golden_fn=golden_gemm,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

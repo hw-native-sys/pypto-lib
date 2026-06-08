@@ -10,87 +10,80 @@
 
     output[r, c] = x[r, c] / sqrt(mean(x[r, :]^2) + eps) * gamma[c]
 
-Rows are parallelised via pl.parallel (batch dimension).
-The hidden dimension is chunked with pl.range to accumulate the
-squared-sum reduction, then a second pass normalises and applies gamma.
+Authored in the ``@pl.jit`` form (see docs/pypto-coding-style.md §1):
+``rms_norm`` is a reusable ``@pl.jit.inline`` sub-kernel that the thin
+``@pl.jit`` entry calls. Inside, ``pl.spmd`` dispatches one row-tile per
+core and ``pl.pipeline(stage=2)`` software-pipelines the two passes over
+the hidden dimension — the standard column-chunking pattern used in
+production LLM kernels (see models/deepseek/v4/decode_rmsnorm.py) where
+the hidden dimension exceeds on-chip buffer capacity.
 
-This two-pass column-chunking pattern is the standard approach used
-in production LLM kernels (see qwen3/deepseek examples) where the
-hidden dimension exceeds on-chip buffer capacity.
-
-Input and output are FP32; gamma is a [1, hidden] weight vector.
+Input and output are FP32; gamma is a [hidden] weight vector (the 1-D
+per-channel form used by production norm kernels).
 """
 import pypto.language as pl
 
 ROWS = 512              # batch / sequence length
 HIDDEN = 512            # hidden dimension (normalised axis)
-ROW_CHUNK = 64          # rows per parallel tile
-HIDDEN_CHUNK = 64       # columns per sequential chunk
+ROW_CHUNK = 64          # rows per SPMD tile
+HIDDEN_CHUNK = 128      # columns per pipelined chunk (512B fp32 = L2 line)
 EPS = 1e-6
 
+ROW_TILES = ROWS // ROW_CHUNK
+HIDDEN_BLOCKS = HIDDEN // HIDDEN_CHUNK
 
-def build_rms_norm_program(
-    rows: int = ROWS,
-    hidden: int = HIDDEN,
-    row_chunk: int = ROW_CHUNK,
-    hidden_chunk: int = HIDDEN_CHUNK,
-    eps: float = EPS,
+
+@pl.jit.inline
+def rms_norm(
+    x: pl.Tensor[[ROWS, HIDDEN], pl.FP32],
+    gamma: pl.Tensor[[HIDDEN], pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, HIDDEN], pl.FP32]],
 ):
-    hidden_blocks = hidden // hidden_chunk
-    hidden_inv = 1.0 / hidden
+    for rb in pl.spmd(ROW_TILES, name_hint="rms_norm"):
+        r = rb * ROW_CHUNK
 
-    @pl.program
-    class RMSNormProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def rms_norm(
-            self,
-            x: pl.Tensor[[rows, hidden], pl.FP32],
-            gamma: pl.Tensor[[1, hidden], pl.FP32],
-            y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
-        ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    # Pass 1: accumulate sum(x^2) across hidden chunks
-                    # row_sum produces [row_chunk, 1] col_major; scalar ops
-                    # need row_major, so accumulate in [1, row_chunk] shape.
-                    sq_sum = pl.create_tensor([1, row_chunk], dtype=pl.FP32)
-                    sq_sum = pl.mul(sq_sum, 0.0)
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        rs = pl.row_sum(pl.mul(x_chunk, x_chunk))
-                        sq_sum = pl.add(sq_sum, pl.reshape(rs, [1, row_chunk]))
+        # Pass 1: accumulate sum(x^2) across hidden chunks. row_sum yields
+        # [ROW_CHUNK, 1] col_major; scalar ops need row_major, so carry the
+        # reduction in [1, ROW_CHUNK] shape.
+        sq_sum = pl.full([1, ROW_CHUNK], dtype=pl.FP32, value=0.0)
+        for hb in pl.pipeline(HIDDEN_BLOCKS, stage=2):
+            h0 = hb * HIDDEN_CHUNK
+            x_chunk = x[r : r + ROW_CHUNK, h0 : h0 + HIDDEN_CHUNK]
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, ROW_CHUNK]))
 
-                    # inv_rms = 1 / sqrt(mean(x^2) + eps)
-                    inv_rms_T = pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), eps))
-                    inv_rms = pl.reshape(inv_rms_T, [row_chunk, 1])
+        # inv_rms = 1 / sqrt(mean(x^2) + eps)
+        inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / HIDDEN), EPS))), [ROW_CHUNK, 1])
 
-                    # Pass 2: normalise and apply gamma weight
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        gamma_chunk = pl.slice(gamma, [1, hidden_chunk], [0, h0])
-                        normed = pl.col_expand_mul(
-                            pl.row_expand_mul(x_chunk, inv_rms), gamma_chunk
-                        )
-                        y = pl.assemble(y, normed, [r, h0])
+        # Pass 2: normalise and apply gamma weight
+        for hb in pl.pipeline(HIDDEN_BLOCKS, stage=2):
+            h0 = hb * HIDDEN_CHUNK
+            x_chunk = x[r : r + ROW_CHUNK, h0 : h0 + HIDDEN_CHUNK]
+            gamma_chunk = pl.reshape(gamma[h0 : h0 + HIDDEN_CHUNK], [1, HIDDEN_CHUNK])
+            y[r : r + ROW_CHUNK, h0 : h0 + HIDDEN_CHUNK] = pl.col_expand_mul(
+                pl.row_expand_mul(x_chunk, inv_rms), gamma_chunk
+            )
 
-            return y
-
-    return RMSNormProgram
+    return y
 
 
-def build_tensor_specs(
-    rows: int = ROWS,
-    hidden: int = HIDDEN,
+@pl.jit
+def rms_norm_kernel(
+    x: pl.Tensor[[ROWS, HIDDEN], pl.FP32],
+    gamma: pl.Tensor[[HIDDEN], pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, HIDDEN], pl.FP32]],
 ):
+    y = rms_norm(x, gamma, y)
+    return y
+
+
+def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
     return [
-        TensorSpec("x", [rows, hidden], torch.float32, init_value=torch.randn),
-        TensorSpec("gamma", [1, hidden], torch.float32, init_value=torch.randn),
-        TensorSpec("y", [rows, hidden], torch.float32, is_output=True),
+        TensorSpec("x", [ROWS, HIDDEN], torch.float32, init_value=torch.randn),
+        TensorSpec("gamma", [HIDDEN], torch.float32, init_value=torch.randn),
+        TensorSpec("y", [ROWS, HIDDEN], torch.float32, is_output=True),
     ]
 
 
@@ -105,7 +98,7 @@ def golden_rms_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -114,11 +107,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_rms_norm_program(),
+    result = run_jit(
+        fn=rms_norm_kernel,
         specs=build_tensor_specs(),
         golden_fn=golden_rms_norm,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
