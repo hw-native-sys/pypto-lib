@@ -30,6 +30,7 @@ S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
+SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
 T_TILE = 32
@@ -84,6 +85,9 @@ def expert_shared(
             sh_up = pl.cast(sh_up_acc, target_type=pl.FP32, mode="none")
             sh_gate = pl.col_expand_mul(pl.row_expand_mul(sh_gate, x_local_scale_dq_tile), sw1_scale_chunk)
             sh_up = pl.col_expand_mul(pl.row_expand_mul(sh_up, x_local_scale_dq_tile), sw3_scale_chunk)
+            if SWIGLU_LIMIT > 0.0:
+                sh_gate = pl.minimum(sh_gate, SWIGLU_LIMIT)
+                sh_up = pl.maximum(pl.minimum(sh_up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
             sh_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(sh_gate)), 1.0))
             sh_silu = pl.mul(sh_gate, sh_sigmoid)
             sh_gated = pl.mul(sh_silu, sh_up)
@@ -200,6 +204,9 @@ def golden_expert_shared(tensors):
 
     sh_gate = x_local @ sw1.T
     sh_up = x_local @ sw3.T
+    if SWIGLU_LIMIT > 0:
+        sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
+        sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
     sh_h_i8, sh_h_sd = _int8_quant_per_row(sh_h)
     sh_h = sh_h_i8.float() * sh_h_sd
