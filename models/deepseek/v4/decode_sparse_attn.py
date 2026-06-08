@@ -231,8 +231,8 @@ def sparse_attn(
             for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
                 # gather_mask requires FP/INT (not BF16): cast BF16 tile to FP32 first.
                 r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, 2 * r_r0 : 2 * r_r0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
-                r_even = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-                r_odd = pl.tensor.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+                r_even = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
+                r_odd = pl.gather(r_tile_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
 
                 r_cos = pl.cast(freqs_cos[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
                 r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)

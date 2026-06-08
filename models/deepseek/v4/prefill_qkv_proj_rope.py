@@ -291,8 +291,8 @@ def prefill_qkv_proj_rope_core(
                 [1, ROPE_DIM],
             )
             kv_rope_norm = pl.col_expand_mul(pl.row_expand_mul(kv_rope, kv_inv_rms_t), gamma_rope)
-            kv_even = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-            kv_odd = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+            kv_even = pl.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+            kv_odd = pl.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
             cos = pl.cast(rope_cos_tile[:, :ROPE_HALF], target_type=pl.FP32)
             sin = pl.cast(rope_sin_tile[:, :ROPE_HALF], target_type=pl.FP32)
             kv_rot_even = pl.sub(pl.mul(kv_even, cos), pl.mul(kv_odd, sin))
@@ -414,8 +414,8 @@ def prefill_qkv_proj_rope_core(
                     (hg + h_inner) * HEAD_DIM + NOPE_DIM : (hg + h_inner) * HEAD_DIM + NOPE_DIM + ROPE_DIM,
                 ]
                 q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
-                q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_even = pl.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_odd = pl.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
                 q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
                 q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
                 q_rope_pair_stage[
@@ -685,8 +685,8 @@ def prefill_packed_qkv_proj_rope_core(
                 [1, ROPE_DIM],
             )
             kv_rope_norm = pl.col_expand_mul(pl.row_expand_mul(kv_rope, kv_inv_rms_t), gamma_rope)
-            kv_even = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-            kv_odd = pl.tensor.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+            kv_even = pl.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+            kv_odd = pl.gather(kv_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
             cos = pl.cast(rope_cos_tile[:, :ROPE_HALF], target_type=pl.FP32)
             sin = pl.cast(rope_sin_tile[:, :ROPE_HALF], target_type=pl.FP32)
             kv_rot_even = pl.sub(pl.mul(kv_even, cos), pl.mul(kv_odd, sin))
@@ -796,8 +796,8 @@ def prefill_packed_qkv_proj_rope_core(
                     h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM,
                 ]
                 q_rope_norm = pl.row_expand_mul(q_rope, q_head_inv_rms_t)
-                q_even = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
-                q_odd = pl.tensor.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
+                q_even = pl.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P0101)
+                q_odd = pl.gather(q_rope_norm, mask_pattern=pl.tile.MaskPattern.P1010)
                 q_rot_even = pl.sub(pl.mul(q_even, rope_cos_fp32), pl.mul(q_odd, rope_sin_fp32))
                 q_rot_odd = pl.add(pl.mul(q_even, rope_sin_fp32), pl.mul(q_odd, rope_cos_fp32))
                 q_rope_pair_stage[

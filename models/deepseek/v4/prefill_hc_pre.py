@@ -125,9 +125,9 @@ def prefill_hc_pre_packed(
     comb_logits = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     for split_t0 in pl.parallel(0, T, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hc_split"):
-            scale0 = pl.tensor.read(hc_scale, [0])
-            scale1 = pl.tensor.read(hc_scale, [1])
-            scale2 = pl.tensor.read(hc_scale, [2])
+            scale0 = pl.read(hc_scale, [0])
+            scale1 = pl.read(hc_scale, [1])
+            scale2 = pl.read(hc_scale, [2])
 
             ones_hc = pl.full([T_TILE, HC_PAD], dtype=pl.FP32, value=1.0)
             pre_base = pl.reshape(pl.slice(hc_base, [HC_PAD], [0]), [1, HC_PAD])
