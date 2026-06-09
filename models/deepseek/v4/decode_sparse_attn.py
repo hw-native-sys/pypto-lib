@@ -108,6 +108,10 @@ def sparse_attn(
         g_b = g_t // S
         g_kv_base = g_t * PADDED_TOPK
         zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
+        # gets a WAR edge against this read (pypto-lib#481).
+        g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
+        ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
 
         for g_kk in pl.range(PADDED_TOPK):
             g_dst_row = g_kv_base + g_kk
