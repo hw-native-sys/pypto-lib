@@ -48,7 +48,9 @@ ROPE_TOKEN_TILE = 1
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
-ATTN_K_TILE = 32
+# Largest sparse-K tile that fits the cube Mat buffer and divides TOPK with no
+# padding (WIN and IDX_TOPK are multiples of 128).
+ATTN_K_TILE = 128
 SPARSE_BLOCKS = (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 ROPE_TILE = 16
@@ -104,22 +106,20 @@ def sparse_attn(
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
-    sparse_valid = pl.create_tensor([T, PADDED_TOPK], dtype=pl.INT32)
+    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
 
-    # Vectorized valid mask in its OWN scope: a slot is valid iff its raw index
-    # is >= 0, i.e. clamp(idx + 1, 0, 1) (any negative -> 0). Token-tiled inside
-    # one pl.at. Kept separate from the sparse_kv gather so each scope has a
-    # single tile-store output tensor -- writing both sparse_kv and sparse_valid
-    # as tile-stores in one inlined scope makes orchestration cross-assign SSA
-    # aliases (silent NaN).
+    # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
+    # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
+    # Own scope from the gather: one tile-store output per inlined scope (two
+    # cross-assign SSA -> NaN).
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="build_valid"):
         for v_t0 in pl.range(0, T, VALID_TOKEN_TILE):
             v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
             v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
-            sparse_valid[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.cast(v_valid_f, target_type=pl.INT32)
+            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
             if PADDED_TOPK > TOPK:
-                sparse_valid[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                    [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.INT32, value=0)
+                sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
+                    [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
     for g_t in pl.spmd(T, name_hint="gather_kv"):
         g_b = g_t // S
@@ -130,31 +130,45 @@ def sparse_attn(
         g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
         ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
 
-        for g_kk in pl.range(PADDED_TOPK):
-            g_dst_row = g_kv_base + g_kk
-            if g_kk >= TOPK:
+        # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
+        # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
+        # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
+        g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
+        g_overlay_base = g_b * S
+
+        # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
+        for g_w in pl.range(WIN):
+            g_dst_row = g_kv_base + g_w
+            g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
+            if g_raw < 0:
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
+            elif g_raw < WIN:
+                g_src_row = g_ori_base + g_raw
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+            else:
+                g_overlay_row = g_overlay_base + (g_raw - WIN)
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
+
+        # Compressed slots [WIN, TOPK): paged compressed cache; -1 is padding.
+        for g_c in pl.range(WIN, TOPK):
+            g_dst_row = g_kv_base + g_c
+            g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+            if g_raw < 0:
                 sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
             else:
-                g_raw = pl.read(cmp_sparse_indices, [g_t, g_kk])
-                if g_raw < 0:
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
-                elif g_raw < WIN:
-                    g_ori_blk = pl.cast(pl.read(ori_block_table, [g_b, g_raw // BLOCK_SIZE]), pl.INDEX)
-                    g_src_row = g_ori_blk * BLOCK_SIZE + g_raw % BLOCK_SIZE
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                elif g_raw < WIN + S:
-                    g_overlay_s = g_raw - WIN
-                    g_overlay_row = g_b * S + g_overlay_s
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-                else:
-                    g_slot = g_raw - (WIN + S)
-                    g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                    g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                g_slot = g_raw - (WIN + S)
+                g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
 
-    # Sparse-K attention: qk_pv writes per-tile (mi, li, oi) into GM scratch,
-    # merge_norm reads them back. ATTN_K_TILE keeps K and V right-buffer
-    # copies together under the 64KB L1B limit.
+        # Padding tail [TOPK, PADDED_TOPK): always zero (empty when TOPK aligns).
+        for g_p in pl.range(TOPK, PADDED_TOPK):
+            g_dst_row = g_kv_base + g_p
+            sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
+
+    # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
+    # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
+    # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -176,16 +190,12 @@ def sparse_attn(
                 qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
                 qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                qk_valid_row = pl.cast(sparse_valid[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE], target_type=pl.FP32)
-                qk_valid = pl.col_expand(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_valid_row)
-                qk_invalid = pl.sub(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=1.0), qk_valid)
-                qk_scores = pl.add(
-                    pl.mul(qk_scaled, qk_valid),
-                    pl.mul(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=NEG_INF), qk_invalid),
-                )
+                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+                qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
                 qk_mi = pl.row_max(qk_scores)
-                qk_exp_raw = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                qk_exp = pl.mul(qk_exp_raw, qk_valid)
+                # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
+                # blocks die in the merge alpha/beta -- no mask multiply needed.
+                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
                 qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
