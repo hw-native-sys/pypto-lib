@@ -43,6 +43,7 @@ CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
+VALID_TOKEN_TILE = 16
 ROPE_TOKEN_TILE = 1
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
@@ -104,6 +105,22 @@ def sparse_attn(
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
     sparse_valid = pl.create_tensor([T, PADDED_TOPK], dtype=pl.INT32)
+
+    # Vectorized valid mask in its OWN scope: a slot is valid iff its raw index
+    # is >= 0, i.e. clamp(idx + 1, 0, 1) (any negative -> 0). Token-tiled inside
+    # one pl.at. Kept separate from the sparse_kv gather so each scope has a
+    # single tile-store output tensor -- writing both sparse_kv and sparse_valid
+    # as tile-stores in one inlined scope makes orchestration cross-assign SSA
+    # aliases (silent NaN).
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="build_valid"):
+        for v_t0 in pl.range(0, T, VALID_TOKEN_TILE):
+            v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
+            v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
+            sparse_valid[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.cast(v_valid_f, target_type=pl.INT32)
+            if PADDED_TOPK > TOPK:
+                sparse_valid[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
+                    [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.INT32, value=0)
+
     for g_t in pl.spmd(T, name_hint="gather_kv"):
         g_b = g_t // S
         g_kv_base = g_t * PADDED_TOPK
@@ -117,28 +134,23 @@ def sparse_attn(
             g_dst_row = g_kv_base + g_kk
             if g_kk >= TOPK:
                 sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
-                pl.write(sparse_valid, [g_t, g_kk], pl.cast(0, pl.INT32))
             else:
                 g_raw = pl.read(cmp_sparse_indices, [g_t, g_kk])
                 if g_raw < 0:
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
-                    pl.write(sparse_valid, [g_t, g_kk], pl.cast(0, pl.INT32))
                 elif g_raw < WIN:
                     g_ori_blk = pl.cast(pl.read(ori_block_table, [g_b, g_raw // BLOCK_SIZE]), pl.INDEX)
                     g_src_row = g_ori_blk * BLOCK_SIZE + g_raw % BLOCK_SIZE
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                    pl.write(sparse_valid, [g_t, g_kk], pl.cast(1, pl.INT32))
                 elif g_raw < WIN + S:
                     g_overlay_s = g_raw - WIN
                     g_overlay_row = g_b * S + g_overlay_s
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-                    pl.write(sparse_valid, [g_t, g_kk], pl.cast(1, pl.INT32))
                 else:
                     g_slot = g_raw - (WIN + S)
                     g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
                     g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                    pl.write(sparse_valid, [g_t, g_kk], pl.cast(1, pl.INT32))
 
     # Sparse-K attention: qk_pv writes per-tile (mi, li, oi) into GM scratch,
     # merge_norm reads them back. ATTN_K_TILE keeps K and V right-buffer
@@ -695,6 +707,7 @@ if __name__ == "__main__":
                         help="Use -1-padded window slots with valid compressed raw indices.")
     parser.add_argument("--overlay-replacement-fixture", action="store_true", default=False,
                         help="Place a compressed raw index inside the window prefix order.")
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
@@ -709,6 +722,7 @@ if __name__ == "__main__":
             args.overlay_replacement_fixture,
         ),
         golden_fn=golden_sparse_attn,
+        golden_data=args.golden_data,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
