@@ -117,11 +117,6 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-# Keep the default fixture on a full-window compression step so sparse_attn
-# exercises both the window and compressed paths. The --start-pos fixture option
-# covers post-window no-compression/aligned/boundary positions.
-START_POS = 126
-
 @pl.jit.inline
 def attention_csa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -575,7 +570,7 @@ def golden_attention_csa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = False):
+def build_tensor_specs(start_pos=None):
     import torch
     from golden import TensorSpec
     from hc_pre import golden_hc_pre
@@ -737,17 +732,31 @@ def build_tensor_specs(start_pos: int = START_POS, hetero_start_pos: bool = Fals
     def init_attn_sink():
         return torch.zeros(H)
 
-    def init_cmp_sparse_indices():
-        return torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-
     def init_start_pos():
-        if not hetero_start_pos:
+        if start_pos is not None:
             return torch.full((B,), start_pos, dtype=torch.int32)
-        # Keep row 0 at the maximum position because the current indexer score
-        # loop bounds are derived from row 0. Alternating with start_pos - 1
-        # covers mixed compression/no-compression rows without relying on the
-        # unrelated very-short-context sparse_attn fixture path.
-        pattern = torch.tensor([start_pos, max(start_pos - 1, 0)], dtype=torch.int32)
+        # Default per-batch pattern mirrors the HCA fixture style while keeping
+        # CSA's separate ratio-4 compressor and sliding-window boundaries covered:
+        #   10        : short-context compressed cache with multiple valid entries
+        #   RATIO-S   : compress, boundary on 2nd token with one cache entry
+        #   RATIO-1   : compress, boundary on 1st token with one cache entry
+        #   RATIO     : no new boundary on 1st token; 2nd token advances the next window
+        #   2*RATIO-S : compress aligned in the 2nd window with previous-window overlap
+        #   3*RATIO-1 : compress crossing in the 3rd window with previous-window overlap
+        #   WIN-S     : final token reaches the sliding-window boundary
+        #   WIN-1     : 1st token reaches the sliding-window boundary; 2nd spills past it
+        #   WIN       : post-window ring-cache path with valid compressed tail
+        pattern = torch.tensor([
+            10,
+            COMPRESS_RATIO - S,
+            COMPRESS_RATIO - 1,
+            COMPRESS_RATIO,
+            COMPRESS_RATIO * 2 - S,
+            COMPRESS_RATIO * 3 - 1,
+            WIN - S,
+            WIN - 1,
+            WIN,
+        ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
 
     def init_seqused_kv():
@@ -848,17 +857,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Decode start position for no-compression/aligned/crossing coverage.")
-    parser.add_argument("--hetero-start-pos", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use per-row start_pos values in the standalone fixture.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="If set, use this single start_pos for all batches; "
+                             "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
-    max_error_ratio = 0.01 if args.hetero_start_pos else 0.005
+    max_error_ratio = 0.01 if args.start_pos is None else 0.005
 
     result = run_jit(
         fn=attention_csa_test,
-        specs=build_tensor_specs(args.start_pos, args.hetero_start_pos),
+        specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_csa,
         runtime_cfg=dict(
             platform=args.platform,
