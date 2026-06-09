@@ -167,9 +167,9 @@ top opaque function. For each entry, allocate a torch tensor:
 - Scalars become 0-D tensors carrying the spec value.
 
 The input snapshot is written to `data/in/<name>.pt` so the same inputs can
-be replayed later. If `golden_data=<dir>` is passed instead, the harness
-loads `<dir>/in/*.pt` rather than generating fresh data — useful for
-deterministic regression checks.
+be replayed later (skipped when `save_data=False`). If `golden_data=<dir>` is
+passed instead, the harness loads `<dir>/in/*.pt` rather than generating fresh
+data — useful for deterministic regression checks.
 
 ### 3. Compute golden
 
@@ -179,7 +179,8 @@ a later runtime crash still leaves a usable `data/out/`.
 
 If `golden_fn` is provided, `run` builds a `scratch` dict with cloned
 inputs and zero-init outputs, calls `golden_fn(scratch)` (which fills the
-output entries in place), and writes the result to `data/out/<name>.pt`.
+output entries in place), and writes the result to `data/out/<name>.pt`
+(skipped when `save_data=False`).
 
 If `golden_data=<dir>` is set, the harness loads `<dir>/out/*.pt` instead
 of recomputing — `golden_data` always wins over `golden_fn`.
@@ -269,6 +270,7 @@ failure (compile error, runtime crash, validation mismatch) it returns
 | `compile_only=True` | Stops after the compile phase. Useful in CI smoke tests that just check the program lowers cleanly. |
 | `runtime_dir="<path>"` (kwarg to `run`) | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
 | `golden_data="<path>"` (kwarg to `run`) | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
+| `save_data=False` (kwarg to `run`; default `True`) | Skips writing the `data/in/` + `data/out/` snapshot. Validation still runs against the in-memory golden. Use for large fixtures (full-model weights / KV cache) where the snapshot is huge and replay is not needed — full-model kernels like `models/qwen3/14b/{prefill_fwd,decode_layer}.py` expose it as `--save-data` (off by default). |
 
 For diagnosing compile errors, runtime hangs, and precision mismatches, see
 [debugging.md](debugging.md).

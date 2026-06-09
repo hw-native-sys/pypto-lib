@@ -232,13 +232,17 @@ def _prepare_inputs(
     scalar_specs: list[ScalarSpec],
     data_dir: Path | None,
     work_dir: Path,
+    save_data: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
     With *data_dir* set, load tensors and scalars from ``{data_dir}/in/`` and
     leave ``input_snapshot`` empty (golden will be loaded from cache, no need
-    to clone inputs for ``golden_fn``). Otherwise generate from *specs* and
-    persist into ``{work_dir}/data/in/``.
+    to clone inputs for ``golden_fn``). Otherwise generate from *specs* and,
+    when *save_data* is True, persist into ``{work_dir}/data/in/``. Set
+    *save_data* False to skip the on-disk ``.pt`` snapshot (validation still
+    works via the in-memory ``input_snapshot``); useful when inputs are large
+    (e.g. full-model weights) and golden replay is not needed.
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
@@ -250,9 +254,10 @@ def _prepare_inputs(
             for spec in tensor_specs
             if not spec.is_output or spec.init_value is not None
         }
-        in_dir = work_dir / "data" / "in"
-        _save_tensors(in_dir, input_snapshot)
-        _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
+        if save_data:
+            in_dir = work_dir / "data" / "in"
+            _save_tensors(in_dir, input_snapshot)
+            _save_tensors(in_dir, {s.name: s.value for s in scalar_specs})
         return tensors, scalar_specs_eff, input_snapshot
 
     required: list[tuple[str, str]] = []
@@ -356,12 +361,14 @@ def _compute_golden(
     work_dir: Path,
     data_dir: Path | None,
     golden_fn: Callable | None,
+    save_data: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Produce golden output tensors for validation.
 
     With *data_dir* set, load from ``{data_dir}/out/``. Otherwise call
     *golden_fn* on a scratch dict (inputs cloned from *input_snapshot*,
-    outputs zero-init) and persist results into ``{work_dir}/data/out/``.
+    outputs zero-init) and, when *save_data* is True, persist results into
+    ``{work_dir}/data/out/``.
     """
     with _Stage("compute golden"):
         if data_dir is not None:
@@ -379,7 +386,8 @@ def _compute_golden(
                 scratch[spec.name] = input_snapshot[spec.name].clone()
         golden_fn(scratch)
         golden_outputs = {spec.name: scratch[spec.name] for spec in tensor_specs if spec.is_output}
-        _save_tensors(work_dir / "data" / "out", golden_outputs)
+        if save_data:
+            _save_tensors(work_dir / "data" / "out", golden_outputs)
         return golden_outputs
 
 
@@ -413,6 +421,7 @@ def run(
     compare_fn: dict[str, Callable] | None = None,
     compile_only: bool = False,
     runtime_dir: str | None = None,
+    save_data: bool = True,
 ) -> RunResult:
     """Compile *program*, run on device, and validate against golden.
 
@@ -441,6 +450,12 @@ def run(
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
             rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
+        save_data: When True (default), persist generated inputs to
+            ``{work_dir}/data/in/`` and golden outputs to
+            ``{work_dir}/data/out/`` for later replay via *golden_data*. Set
+            False to skip the on-disk ``.pt`` snapshot when inputs are large
+            (e.g. full-model weights) and replay is not needed; validation
+            still runs against the in-memory golden.
 
     Returns:
         :class:`RunResult`.
@@ -500,7 +515,7 @@ def run(
     try:
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
-                specs, tensor_specs, scalar_specs, data_dir, work_dir,
+                specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -510,7 +525,7 @@ def run(
     if golden_fn is not None or golden_data is not None:
         golden_outputs = _compute_golden(
             specs, tensor_specs, scalar_specs_eff, input_snapshot,
-            work_dir, data_dir, golden_fn,
+            work_dir, data_dir, golden_fn, save_data,
         )
 
     # Runtime
@@ -547,6 +562,7 @@ def run_jit(
     compare_fn: dict[str, Callable] | None = None,
     compile_only: bool = False,
     runtime_dir: str | None = None,
+    save_data: bool = True,
 ) -> RunResult:
     """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
 
@@ -578,6 +594,12 @@ def run_jit(
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
             rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
+        save_data: When True (default), persist generated inputs to
+            ``{work_dir}/data/in/`` and golden outputs to
+            ``{work_dir}/data/out/`` for later replay via *golden_data*. Set
+            False to skip the on-disk ``.pt`` snapshot when inputs are large
+            (e.g. full-model weights) and replay is not needed; validation
+            still runs against the in-memory golden.
 
     Returns:
         :class:`RunResult`.
@@ -641,7 +663,7 @@ def run_jit(
     try:
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
-                specs, tensor_specs, scalar_specs, data_dir, work_dir,
+                specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -651,7 +673,7 @@ def run_jit(
     if golden_fn is not None or golden_data is not None:
         golden_outputs = _compute_golden(
             specs, tensor_specs, scalar_specs_eff, input_snapshot,
-            work_dir, data_dir, golden_fn,
+            work_dir, data_dir, golden_fn, save_data,
         )
 
     # Runtime

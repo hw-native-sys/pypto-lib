@@ -1120,6 +1120,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-size", type=int, default=0,
                         help="current chunk size for synthetic chunked-prefill tests; 0 means full prompt")
     parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs + golden for replay (off: large fixtures)")
     args = parser.parse_args()
 
     result = run_jit(
@@ -1140,6 +1142,7 @@ if __name__ == "__main__":
         ),
         rtol=5e-3,
         atol=5e-3,
+        save_data=args.save_data,
     )
     if not result.passed:
         if result.error:

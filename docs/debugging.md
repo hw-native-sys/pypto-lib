@@ -57,7 +57,9 @@ mechanisms below.
 ## 2. Replay failing data with `golden_data`
 
 Every run snapshots its inputs to `data/in/<name>.pt` and its golden
-outputs to `data/out/<name>.pt` inside the build directory. To reproduce a
+outputs to `data/out/<name>.pt` inside the build directory (unless the run
+used `save_data=False` — e.g. the `--save-data`-off full-model kernels — in
+which case nothing was saved and there is nothing to replay). To reproduce a
 failure on the **exact same tensors** instead of re-rolling random data,
 point a re-run at that directory:
 

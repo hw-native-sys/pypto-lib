@@ -357,6 +357,40 @@ class TestGoldenFnPath:
         assert "does not match golden" in (r.error or "")
 
 
+class TestSaveData:
+    """``save_data=False`` skips the ``data/`` snapshot but still validates."""
+
+    def test_save_data_false_skips_persist_but_validates(
+        self, three_kinds_specs, tmp_path,
+    ):
+        """With save_data=False: validation runs against the in-memory golden,
+        but no data/in/ or data/out/ files are written."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        def golden_fn(tensors):
+            tensors["y"][:] = tensors["x"] + 1
+            tensors["state"][:] = tensors["state"] + 100
+
+        def fake_execute(_work_dir, tensors, **_kwargs):
+            tensors[1][:] = tensors[0] + 1
+            tensors[2][:] = tensors[2] + 100
+
+        fake = _FakeCompiled(compiled_dir)
+        with patch("pypto.ir.compile", return_value=fake), \
+             patch("pypto.runtime.execute_compiled", side_effect=fake_execute):
+            r = run(
+                program=object(),
+                specs=three_kinds_specs,
+                golden_fn=golden_fn,
+                save_data=False,
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        # Nothing persisted under the compiled output directory.
+        assert not (compiled_dir / "data").exists()
+
+
 class TestNoValidation:
     """Neither ``golden_fn`` nor ``golden_data`` — validation is skipped."""
 

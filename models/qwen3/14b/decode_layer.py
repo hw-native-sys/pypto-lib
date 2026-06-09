@@ -1432,6 +1432,8 @@ if __name__ == "__main__":
                              "-> logits) against a host chain reference, instead of the default "
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="persist inputs + golden for replay (off: large fixtures)")
     args = parser.parse_args()
 
     set_backend_type(_backend_type(args.platform))
@@ -1474,6 +1476,7 @@ if __name__ == "__main__":
             rtol=3e-3,
             atol=3e-3,
             compare_fn={"out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
+            save_data=args.save_data,
         )
         if not result.passed:
             if result.error:
