@@ -26,7 +26,12 @@ HC_DIM = M.hc_dim
 # Tiling config
 D_CHUNK = 512
 D_STEPS = D // D_CHUNK          # number of D-chunks per hidden dim
-TILE = HC_MULT * D_STEPS        # blocks per token (out_h × d_steps)
+
+# Keep T dynamic while packing 16 tokens per task; current decode/prefill T values are 16-aligned.
+HC_POST_TOKEN_TILE = 16
+HC_POST_LOCAL_BLOCKS = HC_MULT * D_STEPS
+assert (DECODE_BATCH * DECODE_SEQ) % HC_POST_TOKEN_TILE == 0
+assert (PREFILL_BATCH * PREFILL_SEQ) % HC_POST_TOKEN_TILE == 0
 
 
 @pl.jit.inline
@@ -42,26 +47,34 @@ def hc_post(
     residual_flat = pl.reshape(residual, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, HC_DIM])
 
-    for block in pl.spmd(t_dim * TILE, name_hint="hc_post"):
-        t = block // TILE
-        local = block % TILE          # block index within this token
-        out_h = local // D_STEPS      # which output HC head
+    token_blocks = t_dim // HC_POST_TOKEN_TILE
+
+    for block in pl.spmd(token_blocks * HC_POST_LOCAL_BLOCKS, name_hint="hc_post"):
+        token_block = block // HC_POST_LOCAL_BLOCKS
+        local = block % HC_POST_LOCAL_BLOCKS
+        out_h = local // D_STEPS
         d0 = (local % D_STEPS) * D_CHUNK
-        y_d = out_h * D + d0
-        x_chunk = pl.cast(x[t : t + 1, d0 : d0 + D_CHUNK], target_type=pl.FP32)
-        post_w = pl.read(post, [t, out_h])
-        y_row = pl.mul(x_chunk, post_w)
-        for in_h in pl.range(HC_MULT):
-            comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
-            res_d = in_h * D + d0
-            res_chunk = pl.cast(
-                residual_flat[t : t + 1, res_d : res_d + D_CHUNK],
-                target_type=pl.FP32,
+        t0 = token_block * HC_POST_TOKEN_TILE
+        for dt in pl.range(HC_POST_TOKEN_TILE):
+            t = t0 + dt
+            post_w = pl.read(post, [t, out_h])
+            y_row = pl.mul(
+                pl.cast(x[t : t + 1, d0 : d0 + D_CHUNK], target_type=pl.FP32),
+                post_w,
             )
-            y_row = pl.add(y_row, pl.mul(res_chunk, comb_w))
-        y_flat[t : t + 1, y_d : y_d + D_CHUNK] = pl.cast(
-            y_row, target_type=pl.BF16, mode="rint"
-        )
+            for in_h in pl.range(HC_MULT):
+                comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
+                res_d = in_h * D + d0
+                res_chunk = pl.cast(
+                    residual_flat[t : t + 1, res_d : res_d + D_CHUNK],
+                    target_type=pl.FP32,
+                )
+                y_row = pl.add(y_row, pl.mul(res_chunk, comb_w))
+            y_flat[t : t + 1, out_h * D + d0 : out_h * D + d0 + D_CHUNK] = pl.cast(
+                y_row,
+                target_type=pl.BF16,
+                mode="rint",
+            )
     # Data is already written through the y_flat view; skip the reshape-back
     # to avoid a static-vs-dynamic type mismatch when inlined into callers
     # with concrete shapes (e.g. moe_ep.py).
@@ -84,6 +97,7 @@ def hc_post_test(
 
     y = hc_post(x, residual, post, comb, y)
     return y
+
 
 def golden_hc_post(tensors):
     """Torch reference, direct port of model.py Block.hc_post 684-687."""
@@ -148,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
 
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
@@ -166,6 +181,7 @@ if __name__ == "__main__":
             ),
             rtol=1e-3,
             atol=1e-3,
+            compile_only=args.compile_only,
         )
         if not result.passed:
             if result.error:
