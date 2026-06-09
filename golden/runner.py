@@ -535,46 +535,6 @@ def run(
     return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
 
-def _jit_compile_only(
-    fn: Any, jit_args: list[Any], platform: str | None, **compile_kwargs: Any,
-) -> tuple[Path, Any]:
-    """Compile a ``@pl.jit`` function without executing on device.
-
-    Replays :meth:`JITFunction.__call__`'s prelude (bind args → cache key →
-    ``_compile``) and stops there, populating the L1 cache. Private-API
-    surgery — pypto exposes no platform-aware compile-only entry. Extra
-    *compile_kwargs* forward to ``fn._compile``, so unsupported keys raise
-    ``TypeError`` there rather than being silently dropped.
-
-    Returns ``(output_dir, compiled)``; *compiled* is the cached
-    ``CompiledProgram`` (a ``DistributedCompiledProgram`` for an L3 host
-    orchestrator compiled with ``distributed_config``), so the caller can
-    pick the right dispatch path.
-    """
-    import pypto.language as pl_mod
-    from pypto.jit.cache import make_cache_key
-
-    param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = (
-        fn._bind_args(tuple(jit_args), {})
-    )
-    key = make_cache_key(
-        source_hash=fn._get_source_hash(),
-        param_names=param_names,
-        tensor_shapes={n: m.shape for n, m in tensor_meta.items()},
-        tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
-        dynamic_dims=dynamic_dims,
-        scalar_values=scalar_values,
-        platform=platform,
-    )
-    if key not in fn._cache:
-        fn._cache[key] = fn._compile(
-            tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl_mod,
-            platform=platform, **compile_kwargs,
-        )
-    compiled = fn._cache[key]
-    return Path(compiled.output_dir), compiled
-
-
 def run_jit(
     fn: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -600,9 +560,11 @@ def run_jit(
         golden_data: Directory with ``in/{name}.pt`` and ``out/{name}.pt``;
             loads inputs and expected outputs (read-only). Takes precedence
             over *golden_fn*.
-        compile_cfg: Kwargs forwarded to ``fn._compile``. The JIT path only
-            honors ``platform`` (typically supplied via *runtime_cfg*), so
-            other keys raise there.
+        compile_cfg: Compile-side ``RunConfig`` fields (``dump_passes`` /
+            ``distributed_config`` / ``compile_profiling`` / ...) carried into
+            ``JITFunction.compile``; ``platform`` is supplied separately
+            (typically via *runtime_cfg*). Unknown keys raise when the
+            ``RunConfig`` is built.
         runtime_cfg: Kwargs forwarded to
             :func:`pypto.runtime.execute_compiled` (``platform``, ``device_id``,
             ``enable_l2_swimlane``, ...). Unknown keys raise there, except
@@ -651,18 +613,25 @@ def run_jit(
             return _fail(str(e))
     else:
         with _Stage("compile"):
-            # Dummy args just satisfy _bind_args's tensor-meta extraction; real
-            # tensors with the same shape/dtype hit the same cache key later.
+            from pypto.runtime import RunConfig
+
+            # Dummy args only carry shape/dtype (and scalar values) into the
+            # specialization key; real tensors of the same shape hit the same
+            # JIT cache entry at dispatch.
             dummy_args = [
                 spec.value.item() if isinstance(spec, ScalarSpec)
                 else torch.empty(spec.shape, dtype=spec.dtype)
                 for spec in specs
             ]
-            work_dir, compiled = _jit_compile_only(
-                fn, dummy_args,
-                platform=runtime_cfg.get("platform"),
-                **compile_cfg,
-            )
+            cfg = dict(compile_cfg)
+            platform = runtime_cfg.get("platform")
+            if platform is not None:
+                cfg["platform"] = platform
+            # Public compile-only entry: same specialize → cache → ir.compile
+            # pipeline as __call__, minus on-device dispatch. Returns a
+            # DistributedCompiledProgram for an L3 host orchestrator.
+            compiled = fn.compile(*dummy_args, config=RunConfig(**cfg))
+            work_dir = Path(compiled.output_dir)
         if compile_only:
             total = time.time() - start
             print(f"[RUN] PASS ({total:.2f}s)", flush=True)
