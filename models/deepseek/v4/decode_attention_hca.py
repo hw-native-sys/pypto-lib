@@ -77,7 +77,6 @@ HCA_TOPK_LIMIT = min(CMP_TOPK, SPARSE_IDX_TOPK)
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-CACHE_COPY_TILE = 16
 
 
 @pl.jit.inline
@@ -118,7 +117,6 @@ def attention_hca(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    kv_cache_out: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
@@ -179,20 +177,6 @@ def attention_hca(
         qr,
         qr_scale,
     )
-
-    kv_cache_in_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    kv_cache_out_flat = pl.reshape(kv_cache_out, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for copy_block in pl.spmd((ORI_BLOCK_NUM * BLOCK_SIZE) // CACHE_COPY_TILE, name_hint="hca_cache_copy"):
-        copy_row0 = copy_block * CACHE_COPY_TILE
-        kv_cache_out_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM] = kv_cache_in_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM]
-    for write_t in pl.spmd(T, name_hint="hca_cache_writeback"):
-        write_b = write_t // S
-        write_s = write_t - write_b * S
-        write_start_b = pl.read(start_pos, [write_b])
-        write_slot = (write_start_b + write_s) % WIN
-        write_blk = pl.cast(pl.read(ori_block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
-        write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
-        kv_cache_out_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
     x_normed_bsd = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed_bsd = pl.reshape(x_normed, [B, S, D])
@@ -269,6 +253,23 @@ def attention_hca(
         attn_out,
     )
 
+    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
+    # history (the current token reaches attention via the `kv` overlay).
+    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cache_writeback"):
+        # No-op self-copy: marks kv_cache add_inout so the runtime orders this
+        # write after the gather's read (WAR); see pypto-lib#481.
+        kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
+        kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
+        for write_t in pl.range(T):
+            write_b = write_t // S
+            write_s = write_t - write_b * S
+            write_start_b = pl.read(start_pos, [write_b])
+            write_slot = (write_start_b + write_s) % WIN
+            write_blk = pl.cast(pl.read(ori_block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
+            write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
+            kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+
     x_out = hc_post(
         attn_out,
         x_hc,
@@ -310,7 +311,6 @@ def attention_hca_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    kv_cache_out: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_hca(
@@ -324,7 +324,6 @@ def attention_hca_test(
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        kv_cache_out,
         start_pos,
     )
     return x_out
@@ -470,15 +469,14 @@ def golden_attention_hca(tensors):
         "attn_out": attn_out,
     })
 
-    kv_cache_out = kv_cache.clone()
+    # In-place sliding-window KV-cache update (validated as an inout tensor).
     for t in range(T):
         b = t // S
         s = t % S
         start_pos_b = int(start_pos_t[b].item())
         write_slot = (start_pos_b + s) % WIN
         write_blk = int(ori_block_table[b, write_slot // BLOCK_SIZE].item())
-        kv_cache_out[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
-    tensors["kv_cache_out"][:] = kv_cache_out
+        kv_cache[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
 
     # ===== Block.hc_post =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -633,7 +631,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
@@ -643,7 +641,6 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
-        TensorSpec("kv_cache_out", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
@@ -676,7 +673,7 @@ if __name__ == "__main__":
             # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
             # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
             "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
-            "kv_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
         rtol=1e-2,
     )

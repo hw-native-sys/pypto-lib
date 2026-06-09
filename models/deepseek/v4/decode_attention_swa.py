@@ -58,7 +58,6 @@ SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA b
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-CACHE_COPY_TILE = 16
 
 
 @pl.jit.inline
@@ -89,7 +88,6 @@ def attention_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    kv_cache_out: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -139,20 +137,6 @@ def attention_swa(
         qr,
         qr_scale,
     )
-
-    kv_cache_in_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    kv_cache_out_flat = pl.reshape(kv_cache_out, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    for copy_block in pl.spmd((B * ORI_MAX_BLOCKS * BLOCK_SIZE) // CACHE_COPY_TILE, name_hint="swa_cache_copy"):
-        copy_row0 = copy_block * CACHE_COPY_TILE
-        kv_cache_out_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM] = kv_cache_in_flat[copy_row0 : copy_row0 + CACHE_COPY_TILE, 0 : HEAD_DIM]
-    for write_t in pl.spmd(T, name_hint="swa_cache_writeback"):
-        write_b = write_t // S
-        write_s = write_t - write_b * S
-        write_start_b = pl.read(start_pos, [write_b])
-        write_slot = (write_start_b + write_s) % WIN
-        write_blk = pl.cast(pl.read(block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
-        write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
-        kv_cache_out_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
     sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     cmp_kv_dummy = pl.create_tensor([B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
@@ -207,6 +191,23 @@ def attention_swa(
         attn_out,
     )
 
+    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
+    # history (the current token reaches attention via the `kv` overlay).
+    kv_cache_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_writeback"):
+        # No-op self-copy: marks kv_cache add_inout so the runtime orders this
+        # write after the gather's read (WAR); see pypto-lib#481.
+        kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
+        kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
+        for write_t in pl.range(T):
+            write_b = write_t // S
+            write_s = write_t - write_b * S
+            write_start_b = pl.read(start_pos, [write_b])
+            write_slot = (write_start_b + write_s) % WIN
+            write_blk = pl.cast(pl.read(block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
+            write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
+            kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+
     x_out = hc_post(
         attn_out,
         x_hc,
@@ -245,7 +246,6 @@ def attention_swa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    kv_cache_out: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_swa(
@@ -258,7 +258,6 @@ def attention_swa_test(
         attn_sink, seqused_kv,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        kv_cache_out,
         start_pos,
     )
     return x_out
@@ -374,15 +373,14 @@ def golden_attention_swa(tensors):
         "attn_out": attn_out,
     })
 
-    kv_cache_out = kv_cache.clone()
+    # In-place sliding-window KV-cache update (validated as an inout tensor).
     for t in range(T):
         b = t // S
         s = t % S
         start_pos_b = int(start_pos_t[b].item())
         write_slot = (start_pos_b + s) % WIN
         write_blk = int(block_table[b, write_slot // BLOCK_SIZE].item())
-        kv_cache_out[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
-    tensors["kv_cache_out"][:] = kv_cache_out
+        kv_cache[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -498,7 +496,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("gamma_ckv", [HEAD_DIM], torch.bfloat16, init_value=init_gamma_ckv),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache),
+        TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
@@ -506,7 +504,6 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
-        TensorSpec("kv_cache_out", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
@@ -523,12 +520,16 @@ if __name__ == "__main__":
                         help="If set, use this single start_pos for all batches; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_swa_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_swa,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
@@ -540,7 +541,7 @@ if __name__ == "__main__":
             # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
             # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
             "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
-            "kv_cache_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:
