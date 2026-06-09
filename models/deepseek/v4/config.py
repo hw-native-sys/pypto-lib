@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 configuration"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Optional, Tuple
 
 
@@ -141,6 +141,11 @@ DEMO = DeepSeekV4Config(
     scale_dtype="fp8",
     max_batch_size=4,
 )
+
+# EP MoE demo (moe_ep.py): DEMO with num_hash_layers=1 so layer_id=0 uses hash routing.
+# DEMO ships num_hash_layers=0, which forces sort routing for layer_id=0; that path has an
+# independent precision regression (single-card ``python moe.py --layer-id 3``).
+DEMO_EP = replace(DEMO, num_hash_layers=1)
 
 FLASH = DeepSeekV4Config(
     name="flash",
