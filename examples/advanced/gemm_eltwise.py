@@ -6,121 +6,45 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""GEMM + Elementwise — matrix multiplication fused with elementwise addition.
+"""GEMM + Elementwise — matmul fused with a residual add in one InCore scope.
 
     output = matmul(attn_out, wo) + hidden_states
 
-Stage 0 (matmul: attn_out x wo) and Stage 1 (residual add) can be:
-  - Fused: single pl.at block with auto_chunk (mix mode)
-  - Split: separate pl.at blocks for each stage (split mode)
-
-Input and hidden_states are BF16; wo is BF16; output is FP32.
+Each N tile runs a tiled K-reduction matmul then adds the residual inside a
+single pl.at block, keeping the matmul output on chip. Inputs BF16; output FP32.
 """
 import pypto.language as pl
 
-# ---------------------------------------------------------------------------
-# GEMM + Elementwise parameters — edit these to change problem size and tiling
-# ---------------------------------------------------------------------------
 BATCH = 16
 HIDDEN = 8192
-K_CHUNK = 128        # K dimension tile size for matmul
-N_CHUNK = 64         # N dimension tile size for matmul output
-BATCH_TILE = 16      # Batch dimension tile size
+K_TILE = 128         # K dimension tile size for matmul
+N_TILE = 64          # N dimension tile size for matmul output
 
 
-def build_gemm_eltwise_mix_program(
-    batch: int = BATCH,
-    hidden: int = HIDDEN,
-    k_chunk: int = K_CHUNK,
-    n_chunk: int = N_CHUNK,
-    batch_tile: int = BATCH_TILE,
-    chunk: int = 4,
+@pl.jit
+def gemm_eltwise(
+    attn_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    wo: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
+    resid: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.FP32]],
 ):
-    """Build fused matmul + elementwise program with auto_chunk."""
-    k_blocks = hidden // k_chunk
-    n_blocks = hidden // n_chunk
+    for n0 in pl.parallel(0, HIDDEN, N_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm_eltwise_tile"):
+            # tiled K-reduction matmul: attn_out @ wo[:, n-tile]
+            acc = pl.create_tensor([BATCH, N_TILE], dtype=pl.FP32)
+            for kb in pl.range(HIDDEN // K_TILE):
+                k0 = kb * K_TILE
+                tile_a = attn_out[:, k0 : k0 + K_TILE]
+                tile_w = wo[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
+                if kb == 0:
+                    acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
+                else:
+                    acc = pl.matmul_acc(acc, tile_a, tile_w)
 
-    @pl.program
-    class GemmEltwiseMixProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def gemm_eltwise(
-            self,
-            attn_out: pl.Tensor[[batch, hidden], pl.BF16],
-            hidden_states: pl.Tensor[[batch, hidden], pl.BF16],
-            wo: pl.Tensor[[hidden, hidden], pl.BF16],
-            resid: pl.Out[pl.Tensor[[batch, hidden], pl.FP32]],
-        ) -> pl.Tensor[[batch, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
-                for nb in pl.parallel(0, n_blocks, chunk=chunk):
-                    n0 = nb * n_chunk
-                    # First K-tile: initialize accumulator via matmul
-                    a_chunk_0 = pl.slice(attn_out, [batch_tile, k_chunk], [0, 0])
-                    w_chunk_0 = pl.slice(wo, [k_chunk, n_chunk], [0, n0])
-                    acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-
-                    # Remaining K-tiles: accumulate via matmul_acc
-                    for kb in pl.range(1, k_blocks):
-                        k0 = kb * k_chunk
-                        a_chunk = pl.slice(attn_out, [batch_tile, k_chunk], [0, k0])
-                        w_chunk = pl.slice(wo, [k_chunk, n_chunk], [k0, n0])
-                        acc = pl.matmul_acc(acc, a_chunk, w_chunk)
-
-                    # Elementwise residual addition
-                    hidden_chunk = pl.slice(hidden_states, [batch_tile, n_chunk], [0, n0])
-                    hidden_chunk_f32 = pl.cast(hidden_chunk, target_type=pl.FP32)
-                    resid_sum = pl.add(acc, hidden_chunk_f32)
-                    resid = pl.assemble(resid, resid_sum, [0, n0])
-
-            return resid
-
-    return GemmEltwiseMixProgram
-
-
-def build_gemm_eltwise_split_program(
-    batch: int = BATCH,
-    hidden: int = HIDDEN,
-    k_chunk: int = K_CHUNK,
-    n_chunk: int = N_CHUNK,
-    batch_tile: int = BATCH_TILE,
-):
-    """Build unfused matmul + elementwise program with separate pl.at blocks."""
-    k_blocks = hidden // k_chunk
-    n_blocks = hidden // n_chunk
-
-    @pl.program
-    class GemmEltwiseSplitProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def gemm_eltwise(
-            self,
-            attn_out: pl.Tensor[[batch, hidden], pl.BF16],
-            hidden_states: pl.Tensor[[batch, hidden], pl.BF16],
-            wo: pl.Tensor[[hidden, hidden], pl.BF16],
-            resid: pl.Out[pl.Tensor[[batch, hidden], pl.FP32]],
-        ) -> pl.Tensor[[batch, hidden], pl.FP32]:
-            for nb in pl.range(n_blocks):
-                n0 = nb * n_chunk
-
-                # Stage 0: matmul
-                with pl.at(level=pl.Level.CORE_GROUP):
-                    a_chunk_0 = pl.slice(attn_out, [batch_tile, k_chunk], [0, 0])
-                    w_chunk_0 = pl.slice(wo, [k_chunk, n_chunk], [0, n0])
-                    acc = pl.matmul(a_chunk_0, w_chunk_0, out_dtype=pl.FP32)
-                    for kb in pl.range(1, k_blocks):
-                        k0 = kb * k_chunk
-                        a_chunk = pl.slice(attn_out, [batch_tile, k_chunk], [0, k0])
-                        w_chunk = pl.slice(wo, [k_chunk, n_chunk], [k0, n0])
-                        acc = pl.matmul_acc(acc, a_chunk, w_chunk)
-
-                # Stage 1: elementwise residual addition
-                with pl.at(level=pl.Level.CORE_GROUP):
-                    hidden_chunk = pl.slice(hidden_states, [batch_tile, n_chunk], [0, n0])
-                    hidden_chunk_f32 = pl.cast(hidden_chunk, target_type=pl.FP32)
-                    resid_sum = pl.add(acc, hidden_chunk_f32)
-                resid = pl.assemble(resid, resid_sum, [0, n0])
-
-            return resid
-
-    return GemmEltwiseSplitProgram
+            # fuse the residual add while the matmul output is still on chip
+            hidden_tile = pl.cast(hidden_states[:, n0 : n0 + N_TILE], target_type=pl.FP32)
+            resid[:, n0 : n0 + N_TILE] = pl.add(acc, hidden_tile)
+    return resid
 
 
 def build_tensor_specs(
@@ -147,29 +71,19 @@ def golden_gemm_eltwise(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--chunk", type=int, default=4,
-                        help="Chunk size for parallel loop (smaller = more parallel tasks)")
-    parser.add_argument("--mix", action="store_true",
-                        help="Use fused mix version (default: split version)")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    if args.mix:
-        program = build_gemm_eltwise_mix_program(chunk=args.chunk)
-    else:
-        program = build_gemm_eltwise_split_program()
-
-    result = run(
-        program=program,
+    result = run_jit(
+        fn=gemm_eltwise,
         specs=build_tensor_specs(),
         golden_fn=golden_gemm_eltwise,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

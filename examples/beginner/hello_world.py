@@ -6,47 +6,34 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Hello World — the simplest PyPTO-Lib example.
+"""Hello World — add a scalar to every element of a matrix.
 
-Demonstrates the simplest use of auto_incore with a single parallel loop and a
-scalar runtime parameter: a large matrix is split into row chunks, and each
-chunk adds the same scalar ``a`` elementwise.
+    output[r, c] = input[r, c] + a
 
-    output[r, c] = input[r, c] + a     for all (r, c)
-
-The parallel loop with chunk= lets the compiler split the iteration space
-into (chunk_loop, in_chunk_loop) and place the incore boundary automatically.
+pl.parallel distributes the row tiles across core-groups; an inner pl.range
+walks the column tiles so each pl.at InCore scope works on one
+[ROW_TILE, COL_TILE] block: load it, add the scalar, store it.
 """
 import pypto.language as pl
 
 ROWS = 1024
 COLS = 512
-ROW_CHUNK = 128
+ROW_TILE = 128
+COL_TILE = 256
 
 
-def build_hello_world_program(
-    rows: int = ROWS,
-    cols: int = COLS,
-    row_chunk: int = ROW_CHUNK,
+@pl.jit
+def hello_world(
+    x: pl.Tensor[[ROWS, COLS], pl.FP32],
+    a: pl.Scalar[pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
 ):
-    @pl.program
-    class HelloWorldProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def add_scalar(
-            self,
-            x: pl.Tensor[[rows, cols], pl.FP32],
-            a: pl.Scalar[pl.FP32],
-            y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
-        ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for r in pl.parallel(0, rows, 1, chunk=row_chunk):
-                    tile_x = pl.slice(x, [1, cols], [r, 0])
-                    tile_y = pl.add(tile_x, a)
-                    y = pl.assemble(y, tile_y, [r, 0])
-
-            return y
-
-    return HelloWorldProgram
+    for r in pl.parallel(0, ROWS, ROW_TILE):
+        for c in pl.range(0, COLS, COL_TILE):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="add_scalar"):
+                tile_x = x[r : r + ROW_TILE, c : c + COL_TILE]
+                y[r : r + ROW_TILE, c : c + COL_TILE] = pl.add(tile_x, a)
+    return y
 
 
 def build_specs(
@@ -70,7 +57,7 @@ def golden_hello_world(values):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -79,11 +66,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_hello_world_program(),
+    result = run_jit(
+        fn=hello_world,
         specs=build_specs(),
         golden_fn=golden_hello_world,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

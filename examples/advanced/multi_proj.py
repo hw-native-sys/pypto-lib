@@ -8,35 +8,36 @@
 # -----------------------------------------------------------------------------------------------------------
 """Multi-call projection: ``qkv_proj`` calls a shared ``proj`` three times for Q/K/V.
 
-``proj`` parallelises over the N dimension and pipelines the K reduction.
+``proj`` parallelises over the N dimension and reduces K with a create_tensor
+accumulator. The shared @pl.jit.inline body is inlined into each call site.
 """
 
 import pypto.language as pl
 
 BATCH = 16
 HIDDEN = 8192
-N_OUT_CHUNK = 256       # N tile per parallel core-group
-K_PROJ_CHUNK = 128      # K reduction tile inside each scope
+N_TILE = 256        # N tile per core-group
+K_TILE = 128        # K reduction tile inside each scope
 
 
 @pl.jit.inline
 def proj(
     x: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     w: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
-    y: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.FP32]],
+    y: pl.Tensor[[BATCH, HIDDEN], pl.FP32],
 ):
-    for n0 in pl.parallel(0, HIDDEN, N_OUT_CHUNK):
+    for n0 in pl.parallel(0, HIDDEN, N_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj"):
-            acc = pl.create_tensor([BATCH, N_OUT_CHUNK], dtype=pl.FP32)
-            for kb in pl.pipeline(0, HIDDEN // K_PROJ_CHUNK, stage=2):
-                k0 = kb * K_PROJ_CHUNK
-                tile_x = x[:, k0 : k0 + K_PROJ_CHUNK]
-                tile_w = w[k0 : k0 + K_PROJ_CHUNK, n0 : n0 + N_OUT_CHUNK]
-                if k0 == 0:
+            acc = pl.create_tensor([BATCH, N_TILE], dtype=pl.FP32)
+            for kb in pl.range(HIDDEN // K_TILE):
+                k0 = kb * K_TILE
+                tile_x = x[:, k0 : k0 + K_TILE]
+                tile_w = w[k0 : k0 + K_TILE, n0 : n0 + N_TILE]
+                if kb == 0:
                     acc = pl.matmul(tile_x, tile_w, out_dtype=pl.FP32)
                 else:
                     acc = pl.matmul_acc(acc, tile_x, tile_w)
-            y = pl.assemble(y, acc, [0, n0])
+            y[:, n0 : n0 + N_TILE] = acc
     return y
 
 

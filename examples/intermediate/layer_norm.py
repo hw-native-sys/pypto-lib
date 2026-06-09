@@ -10,69 +10,50 @@
 
     output[r, c] = (x[r, c] - mean(x[r, :])) / sqrt(var(x[r, :]) + eps) * gamma[c] + beta[c]
 
-Rows are parallelised via pl.parallel (batch dimension).
-The hidden dimension is loaded in full per tile (no column chunking),
-keeping the kernel simple and single-pass friendly.
-
-Input and output are FP32; gamma and beta are [1, hidden] weight vectors.
+Rows are tiled across core-groups via pl.parallel; the hidden dimension fits in
+one tile (no column chunking). FP32 in/out; gamma and beta are [1, hidden].
 """
 import pypto.language as pl
 
 ROWS = 512              # batch / sequence length
 HIDDEN = 256            # hidden dimension (normalised axis, fits in one tile)
-ROW_CHUNK = 32          # rows per parallel tile
+ROW_TILE = 32           # rows per core-group
 EPS = 1e-5
 
 
-def build_layer_norm_program(
-    rows: int = ROWS,
-    hidden: int = HIDDEN,
-    row_chunk: int = ROW_CHUNK,
-    eps: float = EPS,
+@pl.jit
+def layer_norm(
+    x: pl.Tensor[[ROWS, HIDDEN], pl.FP32],
+    gamma: pl.Tensor[[1, HIDDEN], pl.FP32],
+    beta: pl.Tensor[[1, HIDDEN], pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, HIDDEN], pl.FP32]],
 ):
-    hidden_inv = 1.0 / hidden
+    for r in pl.parallel(0, ROWS, ROW_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="layer_norm_rows"):
+            tile_x = x[r : r + ROW_TILE, :]
 
-    @pl.program
-    class LayerNormProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def layer_norm(
-            self,
-            x: pl.Tensor[[rows, hidden], pl.FP32],
-            gamma: pl.Tensor[[1, hidden], pl.FP32],
-            beta: pl.Tensor[[1, hidden], pl.FP32],
-            y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
-        ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    tile_x = pl.slice(x, [row_chunk, hidden], [r, 0])
-                    gamma_tile = pl.slice(gamma, [1, hidden], [0, 0])
-                    beta_tile = pl.slice(beta, [1, hidden], [0, 0])
+            # row mean (pre-scale before row_sum to keep it row-major)
+            scaled_x = pl.mul(tile_x, 1.0 / HIDDEN)
+            mean = pl.row_sum(scaled_x)
+            centred = pl.row_expand_sub(tile_x, mean)
 
-                    # Step 1: row mean — pre-scale before row_sum, no reshape
-                    mean = pl.row_sum(pl.mul(tile_x, hidden_inv))
+            # row variance + eps, then standard deviation
+            sq = pl.mul(centred, centred)
+            sq = pl.add(sq, EPS)
+            sq = pl.mul(sq, 1.0 / HIDDEN)
+            var_eps = pl.row_sum(sq)
+            var_eps = pl.reshape(var_eps, [1, ROW_TILE])
+            std = pl.sqrt(var_eps)
+            std = pl.reshape(std, [ROW_TILE, 1])
+            normed = pl.row_expand_div(centred, std)
 
-                    # Step 2: row variance + eps — pre-scale and pre-add
-                    centred = pl.row_expand_sub(tile_x, mean)
-                    var_eps = pl.row_sum(
-                        pl.mul(pl.add(pl.mul(centred, centred), eps), hidden_inv)
-                    )
-
-                    # Step 3: normalise — single reshape pair for sqrt
-                    std = pl.reshape(
-                        pl.sqrt(pl.reshape(var_eps, [1, row_chunk])),
-                        [row_chunk, 1],
-                    )
-                    normed = pl.row_expand_div(centred, std)
-
-                    # Step 4: apply gamma scale and beta offset
-                    scaled = pl.col_expand_mul(normed, gamma_tile)
-                    ones = pl.add(pl.sub(tile_x, tile_x), 1.0)
-                    result = pl.add(scaled, pl.col_expand_mul(ones, beta_tile))
-                    y = pl.assemble(y, result, [r, 0])
-
-            return y
-
-    return LayerNormProgram
+            # apply gamma scale and beta offset
+            scaled = pl.col_expand_mul(normed, gamma[:, :])
+            ones = pl.sub(tile_x, tile_x)
+            ones = pl.add(ones, 1.0)
+            offset = pl.col_expand_mul(ones, beta[:, :])
+            y[r : r + ROW_TILE, :] = pl.add(scaled, offset)
+    return y
 
 
 def build_tensor_specs(
@@ -103,7 +84,7 @@ def golden_layer_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -112,11 +93,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_layer_norm_program(),
+    result = run_jit(
+        fn=layer_norm,
         specs=build_tensor_specs(),
         golden_fn=golden_layer_norm,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

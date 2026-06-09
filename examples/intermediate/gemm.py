@@ -6,71 +6,43 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""GEMM — tiled matrix multiplication with M/N/K blocking.
+"""GEMM — tiled matrix multiply with M/N/K blocking.
 
     C[m, n] = A[m, k] @ B[k, n]
 
-M and N are parallelised via pl.parallel; K is tiled and reduced using
-pl.matmul (first K-tile) + pl.matmul_acc (remaining K-tiles).
-
-Input and output matrices are FP32.
+M and N are tiled across core-groups via nested pl.parallel; K is reduced with
+pl.matmul on the first K-tile then pl.matmul_acc over the rest. FP32 in/out.
 """
 import pypto.language as pl
 
-# ---------------------------------------------------------------------------
-# GEMM parameters — edit these to change problem size and tiling
-# ---------------------------------------------------------------------------
 M = 256         # total rows of A / C
 N = 256         # total cols of B / C
 K = 256         # total cols of A / rows of B
 M_TILE = 64     # tile size along M dimension
 N_TILE = 64     # tile size along N dimension
 K_TILE = 64     # tile size along K dimension (reduction)
-M_CHUNK = 2     # M-tiles grouped per incore chunk
-N_CHUNK = 2     # N-tiles grouped per incore chunk
 
 
-def build_gemm_program(
-    m: int = M,
-    n: int = N,
-    k: int = K,
-    m_tile: int = M_TILE,
-    n_tile: int = N_TILE,
-    k_tile: int = K_TILE,
-    m_chunk: int = M_CHUNK,
-    n_chunk: int = N_CHUNK,
+@pl.jit
+def gemm(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
 ):
-    k_blocks = k // k_tile
-
-    @pl.program
-    class GemmProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def gemm(
-            self,
-            a: pl.Tensor[[m, k], pl.FP32],
-            b: pl.Tensor[[k, n], pl.FP32],
-            c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
-        ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
-                    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        # First K-tile: initialize accumulator via matmul
-                        tile_a = pl.slice(a, [m_tile, k_tile], [mb, 0])
-                        tile_b = pl.slice(b, [k_tile, n_tile], [0, nb])
+    for mb in pl.parallel(0, M, M_TILE):
+        for nb in pl.parallel(0, N, N_TILE):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="gemm_tile"):
+                acc = pl.create_tensor([M_TILE, N_TILE], dtype=pl.FP32)
+                for kb in pl.range(K // K_TILE):
+                    k0 = kb * K_TILE
+                    tile_a = a[mb : mb + M_TILE, k0 : k0 + K_TILE]
+                    tile_b = b[k0 : k0 + K_TILE, nb : nb + N_TILE]
+                    if kb == 0:
                         acc = pl.matmul(tile_a, tile_b)
-
-                        # Remaining K-tiles: accumulate via matmul_acc
-                        for kb in pl.range(1, k_blocks):
-                            k0 = kb * k_tile
-                            tile_a_i = pl.slice(a, [m_tile, k_tile], [mb, k0])
-                            tile_b_i = pl.slice(b, [k_tile, n_tile], [k0, nb])
-                            acc = pl.matmul_acc(acc, tile_a_i, tile_b_i)
-
-                        c = pl.assemble(c, acc, [mb, nb])
-
-            return c
-
-    return GemmProgram
+                    else:
+                        acc = pl.matmul_acc(acc, tile_a, tile_b)
+                c[mb : mb + M_TILE, nb : nb + N_TILE] = acc
+    return c
 
 
 def build_tensor_specs(
@@ -94,7 +66,7 @@ def golden_gemm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -103,11 +75,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_gemm_program(),
+    result = run_jit(
+        fn=gemm,
         specs=build_tensor_specs(),
         golden_fn=golden_gemm,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

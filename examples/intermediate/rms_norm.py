@@ -6,78 +6,56 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""RMSNorm — Root Mean Square layer normalization with row + column tiling.
+"""RMSNorm — root-mean-square normalization with row + column tiling.
 
     output[r, c] = x[r, c] / sqrt(mean(x[r, :]^2) + eps) * gamma[c]
 
-Rows are parallelised via pl.parallel (batch dimension).
-The hidden dimension is chunked with pl.range to accumulate the
-squared-sum reduction, then a second pass normalises and applies gamma.
-
-This two-pass column-chunking pattern is the standard approach used
-in production LLM kernels (see qwen3/deepseek examples) where the
-hidden dimension exceeds on-chip buffer capacity.
-
-Input and output are FP32; gamma is a [1, hidden] weight vector.
+Rows are tiled across core-groups via pl.parallel. The hidden dimension is
+chunked with pl.range: one pass accumulates sum(x^2), a second normalises and
+applies gamma. FP32 in/out; gamma is a [1, hidden] weight vector.
 """
 import pypto.language as pl
 
 ROWS = 512              # batch / sequence length
 HIDDEN = 512            # hidden dimension (normalised axis)
-ROW_CHUNK = 64          # rows per parallel tile
-HIDDEN_CHUNK = 64       # columns per sequential chunk
+ROW_TILE = 64           # rows per core-group
+HIDDEN_TILE = 64        # columns per sequential chunk
 EPS = 1e-6
 
 
-def build_rms_norm_program(
-    rows: int = ROWS,
-    hidden: int = HIDDEN,
-    row_chunk: int = ROW_CHUNK,
-    hidden_chunk: int = HIDDEN_CHUNK,
-    eps: float = EPS,
+@pl.jit
+def rms_norm(
+    x: pl.Tensor[[ROWS, HIDDEN], pl.FP32],
+    gamma: pl.Tensor[[1, HIDDEN], pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, HIDDEN], pl.FP32]],
 ):
-    hidden_blocks = hidden // hidden_chunk
-    hidden_inv = 1.0 / hidden
+    for r in pl.parallel(0, ROWS, ROW_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms_norm_rows"):
+            # accumulate sum(x^2) across hidden chunks; keep it [1, ROW_TILE]
+            # so the scalar rsqrt below stays row-major
+            sq_sum = pl.full([1, ROW_TILE], dtype=pl.FP32, value=0.0)
+            for hb in pl.range(HIDDEN // HIDDEN_TILE):
+                h0 = hb * HIDDEN_TILE
+                x_tile = x[r : r + ROW_TILE, h0 : h0 + HIDDEN_TILE]
+                sq = pl.mul(x_tile, x_tile)
+                sq_row = pl.row_sum(sq)
+                sq_row = pl.reshape(sq_row, [1, ROW_TILE])
+                sq_sum = pl.add(sq_sum, sq_row)
 
-    @pl.program
-    class RMSNormProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def rms_norm(
-            self,
-            x: pl.Tensor[[rows, hidden], pl.FP32],
-            gamma: pl.Tensor[[1, hidden], pl.FP32],
-            y: pl.Out[pl.Tensor[[rows, hidden], pl.FP32]],
-        ) -> pl.Tensor[[rows, hidden], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    # Pass 1: accumulate sum(x^2) across hidden chunks
-                    # row_sum produces [row_chunk, 1] col_major; scalar ops
-                    # need row_major, so accumulate in [1, row_chunk] shape.
-                    sq_sum = pl.create_tensor([1, row_chunk], dtype=pl.FP32)
-                    sq_sum = pl.mul(sq_sum, 0.0)
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        rs = pl.row_sum(pl.mul(x_chunk, x_chunk))
-                        sq_sum = pl.add(sq_sum, pl.reshape(rs, [1, row_chunk]))
+            mean_sq = pl.mul(sq_sum, 1.0 / HIDDEN)
+            mean_sq = pl.add(mean_sq, EPS)
+            inv_rms = pl.rsqrt(mean_sq)
+            inv_rms = pl.reshape(inv_rms, [ROW_TILE, 1])
 
-                    # inv_rms = 1 / sqrt(mean(x^2) + eps)
-                    inv_rms_T = pl.rsqrt(pl.add(pl.mul(sq_sum, hidden_inv), eps))
-                    inv_rms = pl.reshape(inv_rms_T, [row_chunk, 1])
-
-                    # Pass 2: normalise and apply gamma weight
-                    for hb in pl.range(hidden_blocks):
-                        h0 = hb * hidden_chunk
-                        x_chunk = pl.slice(x, [row_chunk, hidden_chunk], [r, h0])
-                        gamma_chunk = pl.slice(gamma, [1, hidden_chunk], [0, h0])
-                        normed = pl.col_expand_mul(
-                            pl.row_expand_mul(x_chunk, inv_rms), gamma_chunk
-                        )
-                        y = pl.assemble(y, normed, [r, h0])
-
-            return y
-
-    return RMSNormProgram
+            # normalise each chunk and apply the gamma weight
+            for hb in pl.range(HIDDEN // HIDDEN_TILE):
+                h0 = hb * HIDDEN_TILE
+                x_tile = x[r : r + ROW_TILE, h0 : h0 + HIDDEN_TILE]
+                gamma_tile = gamma[:, h0 : h0 + HIDDEN_TILE]
+                normed = pl.row_expand_mul(x_tile, inv_rms)
+                normed = pl.col_expand_mul(normed, gamma_tile)
+                y[r : r + ROW_TILE, h0 : h0 + HIDDEN_TILE] = normed
+    return y
 
 
 def build_tensor_specs(
@@ -105,7 +83,7 @@ def golden_rms_norm(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -114,11 +92,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_rms_norm_program(),
+    result = run_jit(
+        fn=rms_norm,
         specs=build_tensor_specs(),
         golden_fn=golden_rms_norm,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

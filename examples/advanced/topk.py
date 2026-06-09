@@ -12,8 +12,8 @@
 ``mrgsort`` 4-way-merges them until the whole row is sorted (runs of
 64 -> 256 positions for N=512). The leading ``2*K`` pairs are split with a
 mask ``gather``: ``P0101`` lifts the value lanes, ``P1010`` the index lanes.
-Both primitives need a single row, so the ``pl.spmd`` block loops rows with
-``pl.range``.
+Both primitives need a single row, so each core-group's pl.at scope loops its
+row tile with ``pl.range``.
 """
 
 import pypto.language as pl
@@ -30,20 +30,18 @@ def topk(
     topk_vals: pl.Out[pl.Tensor[[ROWS, K], pl.FP32]],
     topk_idx: pl.Out[pl.Tensor[[ROWS, K], pl.INT32]],
 ):
-    for blk in pl.spmd(ROWS // ROW_TILE, name_hint="topk_block"):
-        r0 = blk * ROW_TILE
-        idx_init = pl.arange(0, [1, N], dtype=pl.UINT32)
-        for ri in pl.range(ROW_TILE):
-            r = r0 + ri
-            score_row = scores[r : r + 1, :]
-            s = pl.sort32(score_row, idx_init)                      # [1, 2N], 32-runs sorted
-            s = pl.mrgsort(s, block_len=64)                         # 4-way merge -> 256-pos runs
-            s = pl.mrgsort(s, block_len=256)                        # 4-way merge -> whole row, descending
-            pairs = s[:, 0 : 2 * K]                                 # K largest (value, index) pairs
-            topk_vals[r : r + 1, :] = pl.gather(pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-            topk_idx[r : r + 1, :] = pl.gather(
-                pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32
-            )
+    for r0 in pl.parallel(0, ROWS, ROW_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_block"):
+            idx_init = pl.arange(0, [1, N], dtype=pl.UINT32)
+            for ri in pl.range(ROW_TILE):
+                r = r0 + ri
+                score_row = scores[r : r + 1, :]
+                s = pl.sort32(score_row, idx_init)                  # [1, 2N], 32-runs sorted
+                s = pl.mrgsort(s, block_len=64)                     # 4-way merge -> 256-pos runs
+                s = pl.mrgsort(s, block_len=256)                    # 4-way merge -> whole row, descending
+                pairs = s[:, 0 : 2 * K]                             # K largest (value, index) pairs
+                topk_vals[r : r + 1, :] = pl.gather(pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                topk_idx[r : r + 1, :] = pl.gather(pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
     return topk_vals, topk_idx
 
 

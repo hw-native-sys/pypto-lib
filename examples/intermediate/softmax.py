@@ -6,60 +6,36 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Softmax — row-wise numerically stable softmax with row-chunk tiling.
+"""Softmax — numerically stable row-wise softmax with row tiling.
 
     output[r, c] = exp(x[r, c] - max_row(x)) / sum_row(exp(x[r, c] - max_row(x)))
 
-The matrix is split into row chunks via pl.parallel so softmax is computed
-independently on each chunk.  Each chunk's rows are self-contained because
-softmax normalises across the column (hidden) dimension only.
-
-Input and output are FP32.
+Rows are tiled across core-groups via pl.parallel; each tile is normalised
+independently along the column axis. FP32 in/out.
 """
 import pypto.language as pl
 
 ROWS = 512
 COLS = 256
-ROW_CHUNK = 64          # rows per incore tile
+ROW_TILE = 64           # rows per core-group
 
 
-def build_softmax_program(
-    rows: int = ROWS,
-    cols: int = COLS,
-    row_chunk: int = ROW_CHUNK,
+@pl.jit
+def softmax(
+    x: pl.Tensor[[ROWS, COLS], pl.FP32],
+    y: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
 ):
-    @pl.program
-    class SoftmaxProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def softmax(
-            self,
-            x: pl.Tensor[[rows, cols], pl.FP32],
-            y: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
-        ) -> pl.Tensor[[rows, cols], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for r in pl.parallel(0, rows, row_chunk, chunk=1):
-                    tile_x = pl.slice(x, [row_chunk, cols], [r, 0])
-
-                    # Step 1: row-wise max for numerical stability
-                    row_max = pl.row_max(tile_x)
-
-                    # Step 2: subtract row max: x - max(x)
-                    shifted = pl.row_expand_sub(tile_x, row_max)
-
-                    # Step 3: exp(x - max(x))
-                    exp_shifted = pl.exp(shifted)
-
-                    # Step 4: row-wise sum of exp values
-                    row_sum = pl.row_sum(exp_shifted)
-
-                    # Step 5: divide each row by its sum
-                    result = pl.row_expand_div(exp_shifted, row_sum)
-
-                    y = pl.assemble(y, result, [r, 0])
-
-            return y
-
-    return SoftmaxProgram
+    for r in pl.parallel(0, ROWS, ROW_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="softmax_rows"):
+            tile_x = x[r : r + ROW_TILE, :]
+            # subtract the row max for numerical stability, then exponentiate
+            row_max = pl.row_max(tile_x)
+            shifted = pl.row_expand_sub(tile_x, row_max)
+            exp_shifted = pl.exp(shifted)
+            # divide each row by the sum of its exponentials
+            denom = pl.row_sum(exp_shifted)
+            y[r : r + ROW_TILE, :] = pl.row_expand_div(exp_shifted, denom)
+    return y
 
 
 def build_tensor_specs(
@@ -83,7 +59,7 @@ def golden_softmax(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -92,11 +68,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_softmax_program(),
+    result = run_jit(
+        fn=softmax,
         specs=build_tensor_specs(),
         golden_fn=golden_softmax,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

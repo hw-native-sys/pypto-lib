@@ -6,84 +6,53 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""RoPE — Rotary Position Embedding with half-vector rotation.
+"""RoPE — rotary position embedding via half-vector rotation.
 
     y_lo = x_lo * cos_lo - x_hi * sin_lo
     y_hi = x_hi * cos_hi + x_lo * sin_hi
-    y    = concat(y_lo, y_hi)
 
-The input vector is split into two halves along the head dimension.
-Each half is multiplied by the corresponding cos/sin values and combined
-via subtraction/addition to produce the rotated output.
-
-x is laid out as [BATCH * NUM_HEADS, HEAD_DIM]; each group of NUM_HEADS
-rows belongs to one batch item.  cos and sin are [1, HEAD_DIM] (a single
-position's embedding broadcast across all heads via col_expand_mul) —
-matching the decode pattern in Qwen3.
-
-The outer loop parallelises over the batch dimension (BATCH=16).
-Each iteration processes NUM_HEADS=8 rows of HEAD_DIM=128, giving
-half-vector operands of [8, 64] FP32 = 2 KB = TILELET MAX.
-
-Structure matches Qwen3 decode tilelet (Scope 2):
-  auto_incore → parallel(BATCH) → cos/sin split → rotate → store.
-
-Input and output are FP32; cos and sin are FP32.
+x is laid out as [BATCH * NUM_HEADS, HEAD_DIM]; cos and sin are [1, HEAD_DIM]
+broadcast across heads via col_expand_mul. pl.parallel tiles the batch; each
+item rotates its NUM_HEADS rows. FP32 throughout.
 """
 import pypto.language as pl
 
-BATCH = 16          # batch size (= Qwen3 BATCH)
-NUM_HEADS = 8       # heads per batch item (= Qwen3 NUM_KV_HEADS)
-HEAD_DIM = 128      # dimension per head (= Qwen3 HEAD_DIM)
-BATCH_CHUNK = 4     # parallel chunk size for batch loop
+BATCH = 16          # batch size
+NUM_HEADS = 8       # heads per batch item
+HEAD_DIM = 128      # dimension per head
+
+TOTAL_ROWS = BATCH * NUM_HEADS
+HALF_DIM = HEAD_DIM // 2
 
 
-def build_rope_program(
-    batch: int = BATCH,
-    num_heads: int = NUM_HEADS,
-    head_dim: int = HEAD_DIM,
-    batch_chunk: int = BATCH_CHUNK,
+@pl.jit
+def rope(
+    x: pl.Tensor[[TOTAL_ROWS, HEAD_DIM], pl.FP32],
+    cos: pl.Tensor[[1, HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[1, HEAD_DIM], pl.FP32],
+    y: pl.Out[pl.Tensor[[TOTAL_ROWS, HEAD_DIM], pl.FP32]],
 ):
-    total_rows = batch * num_heads
-    half_dim = head_dim // 2
+    for b in pl.parallel(0, BATCH, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_rotate"):
+            cos_lo = cos[:, 0:HALF_DIM]
+            cos_hi = cos[:, HALF_DIM:HEAD_DIM]
+            sin_lo = sin[:, 0:HALF_DIM]
+            sin_hi = sin[:, HALF_DIM:HEAD_DIM]
 
-    @pl.program
-    class RoPEProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def rope(
-            self,
-            x: pl.Tensor[[total_rows, head_dim], pl.FP32],
-            cos: pl.Tensor[[1, head_dim], pl.FP32],
-            sin: pl.Tensor[[1, head_dim], pl.FP32],
-            y: pl.Out[pl.Tensor[[total_rows, head_dim], pl.FP32]],
-        ) -> pl.Tensor[[total_rows, head_dim], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for b in pl.parallel(0, batch, 1, chunk=batch_chunk):
-                    # Slice cos/sin lo/hi halves directly from tensor
-                    # so each becomes a separate tile.load (no textract).
-                    cos_lo = pl.slice(cos, [1, half_dim], [0, 0])
-                    cos_hi = pl.slice(cos, [1, half_dim], [0, half_dim])
-                    sin_lo = pl.slice(sin, [1, half_dim], [0, 0])
-                    sin_hi = pl.slice(sin, [1, half_dim], [0, half_dim])
+            base = b * NUM_HEADS
+            x_lo = x[base : base + NUM_HEADS, 0:HALF_DIM]
+            x_hi = x[base : base + NUM_HEADS, HALF_DIM:HEAD_DIM]
 
-                    base = b * num_heads
-                    x_lo = pl.slice(x, [num_heads, half_dim], [base, 0])
-                    x_hi = pl.slice(x, [num_heads, half_dim], [base, half_dim])
+            # lower half: x_lo * cos_lo - x_hi * sin_lo
+            lo_cos = pl.col_expand_mul(x_lo, cos_lo)
+            lo_sin = pl.col_expand_mul(x_hi, sin_lo)
+            y[base : base + NUM_HEADS, 0:HALF_DIM] = pl.sub(lo_cos, lo_sin)
 
-                    rot_lo = pl.sub(
-                        pl.col_expand_mul(x_lo, cos_lo),
-                        pl.col_expand_mul(x_hi, sin_lo),
-                    )
-                    rot_hi = pl.add(
-                        pl.col_expand_mul(x_hi, cos_hi),
-                        pl.col_expand_mul(x_lo, sin_hi),
-                    )
-                    y = pl.assemble(y, rot_lo, [base, 0])
-                    y = pl.assemble(y, rot_hi, [base, half_dim])
-
-            return y
-
-    return RoPEProgram
+            # upper half: x_hi * cos_hi + x_lo * sin_hi
+            hi_cos = pl.col_expand_mul(x_hi, cos_hi)
+            hi_sin = pl.col_expand_mul(x_lo, sin_hi)
+            y[base : base + NUM_HEADS, HALF_DIM:HEAD_DIM] = pl.add(hi_cos, hi_sin)
+    return y
 
 
 def build_tensor_specs(
@@ -123,7 +92,7 @@ def golden_rope(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -132,11 +101,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_rope_program(),
+    result = run_jit(
+        fn=rope,
         specs=build_tensor_specs(),
         golden_fn=golden_rope,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

@@ -6,57 +6,35 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Matmul — tiled matrix multiplication with M/N blocking (no K tiling).
+"""Matmul — tiled matrix multiply with M/N blocking (no K tiling).
 
     C[m, n] = A[m, k] @ B[k, n]
 
-M and N are parallelised via pl.parallel; K is consumed in a single matmul.
-
-Input and output matrices are FP32.
+M and N are tiled across core-groups via nested pl.parallel; K is consumed in
+a single matmul. FP32 in/out.
 """
 import pypto.language as pl
 
-# ---------------------------------------------------------------------------
-# Matmul parameters — edit these to change problem size and tiling
-# ---------------------------------------------------------------------------
 M = 256         # total rows of A / C
 N = 256         # total cols of B / C
 K = 256         # total cols of A / rows of B
 M_TILE = 64     # tile size along M dimension
 N_TILE = 64     # tile size along N dimension
-M_CHUNK = 2     # M-tiles grouped per incore chunk
-N_CHUNK = 2     # N-tiles grouped per incore chunk
 
 
-def build_matmul_program(
-    m: int = M,
-    n: int = N,
-    k: int = K,
-    m_tile: int = M_TILE,
-    n_tile: int = N_TILE,
-    m_chunk: int = M_CHUNK,
-    n_chunk: int = N_CHUNK,
+@pl.jit
+def matmul(
+    a: pl.Tensor[[M, K], pl.FP32],
+    b: pl.Tensor[[K, N], pl.FP32],
+    c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
 ):
-    @pl.program
-    class MatmulProgram:
-        @pl.function(type=pl.FunctionType.Opaque)
-        def matmul(
-            self,
-            a: pl.Tensor[[m, k], pl.FP32],
-            b: pl.Tensor[[k, n], pl.FP32],
-            c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
-        ) -> pl.Tensor[[m, n], pl.FP32]:
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                for mb in pl.parallel(0, m, m_tile, chunk=m_chunk):
-                    for nb in pl.parallel(0, n, n_tile, chunk=n_chunk):
-                        tile_a = pl.slice(a, [m_tile, k], [mb, 0])
-                        tile_b = pl.slice(b, [k, n_tile], [0, nb])
-                        tile_c = pl.matmul(tile_a, tile_b)
-                        c = pl.assemble(c, tile_c, [mb, nb])
-
-            return c
-
-    return MatmulProgram
+    for mb in pl.parallel(0, M, M_TILE):
+        for nb in pl.parallel(0, N, N_TILE):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="matmul_tile"):
+                tile_a = a[mb : mb + M_TILE, :]
+                tile_b = b[:, nb : nb + N_TILE]
+                c[mb : mb + M_TILE, nb : nb + N_TILE] = pl.matmul(tile_a, tile_b)
+    return c
 
 
 def build_tensor_specs(
@@ -80,7 +58,7 @@ def golden_matmul(tensors):
 
 if __name__ == "__main__":
     import argparse
-    from golden import run
+    from golden import run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -89,11 +67,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run(
-        program=build_matmul_program(),
+    result = run_jit(
+        fn=matmul,
         specs=build_tensor_specs(),
         golden_fn=golden_matmul,
-        compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
