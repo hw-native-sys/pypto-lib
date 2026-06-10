@@ -132,9 +132,7 @@ def combine_ep(
                 )
 
     # reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k]. Separate pl.spmd
-    # scope (ordered after the push via the window write->read dep). routed_y_buf
-    # must be pl.load-ed, which forces the whole reduce tile-level: cast/add can't
-    # run on a window slice, nor be assembled to a local tensor in-scope (pypto#1694).
+    # scope (ordered after the push via the window write->read dep).
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
             t = tb * 4 + tt

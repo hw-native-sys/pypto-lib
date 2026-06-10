@@ -101,6 +101,7 @@ def dispatch(
 
 W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
 IDX_PAD = 8  # INT32 r_route tile pad
+X_STAGE_ROWS = 8  # recv_x widen/stage chunk rows (8 x D FP16 = 64KB UB tile)
 
 
 @pl.jit.inline
@@ -116,9 +117,10 @@ def dispatch_ep(
     recv_count_out: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     count_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
-    # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on a2a3 (see
-    # x_tile cast in payload_push below). ``recv_x_out`` stays INT8 — the narrow
-    # cast happens in stage_out.
+    # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on a2a3 (INT8
+    # cross-rank push lands stale on the peer; b16 is fine, and FP16 <-> INT8 is
+    # a lossless round-trip). ``recv_x_out`` stays INT8 — the narrow cast
+    # happens in stage_out.
     recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP16],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_w: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
@@ -128,6 +130,10 @@ def dispatch_ep(
     # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
     # so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    # FP16 widen scratch for the b8 SDMA workaround; allocated outside the
+    # InCore scope (InCore cannot create GM tensors) and written in full by the
+    # widen loop before any read, pinning it against MemoryReuse.
+    x_fp16 = pl.create_tensor([T, D], dtype=pl.FP16)
 
     # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
@@ -200,6 +206,14 @@ def dispatch_ep(
             pl.write(recv_count_out, [e, 0], acc)
 
         # ---------- payload_push: 4 channels per (t, k) ----------
+        # Widen x INT8 -> FP16 once per token (b8 SDMA workaround, see recv_x
+        # above) into the x_fp16 GM scratch; the per-route x push is then a
+        # GM-to-peer-GM TPUT with no per-route UB staging.
+        for cb in pl.range(T // X_STAGE_ROWS):
+            c0 = cb * X_STAGE_ROWS
+            wide_i8 = pl.load(x_norm_i8, [c0, 0], [X_STAGE_ROWS, D])
+            pl.store(pl.cast(wide_i8, target_type=pl.FP16), [c0, 0], x_fp16)
+
         cursor = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
@@ -231,18 +245,14 @@ def dispatch_ep(
                 cursor[bucket] = cur_val + 1
                 r_route = pl.cast(t * TOPK + k, pl.INT32)
 
-                # Widen INT8 → FP16 before the cross-rank push: the b8 SDMA burst
-                # path (``copy_ubuf_to_gm_align_b8``) is broken on a2a3 — recv data
-                # lands stale on the peer. b16 is fine, and FP16 is the only floating
-                # dtype that the a2a3 ``TCVT`` table reaches from INT8 directly (see
-                # ``TCvt.hpp``: ``I8 -> FP16`` is listed as a direct path; INT8 →
-                # BF16 / INT8 → INT32 are not). FP16's 10-bit mantissa exactly
-                # represents every INT8 value in [-128, 127], so the round-trip is
-                # lossless. INT8 is recovered via the symmetric FP16 → INT8 cast in
-                # stage_out below (also a documented direct path).
-                x_tile_i8 = pl.load(x_norm_i8, [t, 0], [1, D])
-                x_tile = pl.cast(x_tile_i8, target_type=pl.FP16)
-                pld.tile.remote_store(x_tile, target=recv_x, peer=dst, offsets=[row, 0])
+                pld.tensor.put(
+                    dst=recv_x,
+                    peer=dst,
+                    src=x_fp16,
+                    dst_offsets=[row, 0],
+                    src_offsets=[t, 0],
+                    shape=[1, D],
+                )
 
                 s_val = pl.read(x_norm_scale, [t, 0])
                 pl.tile.write(scale_tile, [0, 0], s_val)
@@ -277,22 +287,23 @@ def dispatch_ep(
                 )
 
         # stage_out: copy the windows the push filled into the host outputs.
-        # recv_x: FP16 window -> INT8, stored through the flat view (cast needs a
-        # tile, so pl.load/pl.store here).
-        for e in pl.range(N_LOCAL_EXPERTS):
-            for slot in pl.range(RECV_MAX):
-                row = e * RECV_MAX + slot
-                stage_x_fp16 = pl.load(recv_x, [row, 0], [1, D])
-                stage_x_i8 = pl.cast(stage_x_fp16, target_type=pl.INT8)
-                pl.store(stage_x_i8, [row, 0], recv_x_out_flat)
+        # recv_x: FP16 window -> INT8 in X_STAGE_ROWS-row chunks through the
+        # flat view (per-row copies cost ~16x more MTE transfers).
+        for xb in pl.range(N_LOCAL_EXPERTS * RECV_MAX // X_STAGE_ROWS):
+            row = xb * X_STAGE_ROWS
+            stage_x_fp16 = pl.load(recv_x, [row, 0], [X_STAGE_ROWS, D])
+            stage_x_i8 = pl.cast(stage_x_fp16, target_type=pl.INT8)
+            pl.store(stage_x_i8, [row, 0], recv_x_out_flat)
 
-        # recv_scale / recv_w / recv_r_route: scalar copy of window column 0.
+        # recv_scale / recv_w / recv_r_route: scalar copy of window column 0,
+        # bounded to the valid rows (downstream consumers are count-bounded, so
+        # tail slots carry no contract).
         # WORKAROUND pypto#1693: writing these via tile pl.store made them
         # add_inout and the orchestration scrambled their post-write SSA aliases;
-        # scalar pl.write keeps them add_output. The slice-assign alternative is
-        # blocked by pypto#1694 (window slice inside an InCore scope).
+        # scalar pl.write keeps them add_output.
         for e in pl.range(N_LOCAL_EXPERTS):
-            for slot in pl.range(RECV_MAX):
+            n_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
+            for slot in pl.range(n_rows):
                 row = e * RECV_MAX + slot
                 pl.write(recv_scale_out, [e, slot], pl.read(recv_scale, [row, 0]))
                 pl.write(recv_w_out, [e, slot], pl.read(recv_w, [row, 0]))
