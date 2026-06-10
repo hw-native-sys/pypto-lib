@@ -36,7 +36,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 4
+DEFAULT_COMPRESS_RATIO = 128
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
@@ -47,14 +47,6 @@ VALID_TOKEN_TILE = 16
 GATHER_FILL_TILE = 128
 ROPE_OUT_TOK_TILE = 64
 H_TILE = 16
-# qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
-# per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
-# head-tiles (2x reuse at 32) instead of per H_TILE head-tile, then slices the
-# [QK_M_TILE, ...] result back into H_TILE-row stores so the sparse_blk_* layout
-# and merge_norm stay unchanged. 32 keeps the [32,128] softmax inside the 192KB
-# Vec budget without a cross-core split. 64 is infeasible without further work
-# (its [64,128] softmax and co-resident QK+PV L0C accumulators overflow Vec/L0C).
-QK_M_TILE = 32
 ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
@@ -72,8 +64,6 @@ NEG_INF = -1.0e20
 assert T % VALID_TOKEN_TILE == 0
 assert T % 2 == 0
 assert H % 4 == 0
-assert QK_M_TILE % H_TILE == 0
-assert H % QK_M_TILE == 0
 assert T % QUANT_TOKEN_TILE == 0
 assert H % O_GROUPS == 0
 assert (O_GROUPS * O_LORA) % B_K_TILE == 0
@@ -91,10 +81,8 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-# CSA/full sparse-K width. SWA and HCA use explicit sibling modules so a
-# combined decode layer can import all three variants in one Python process
-# without relying on import-time config mutation and module-cache order.
-TOPK = TOPK_FULL
+# HCA sparse-K width: window plus the deterministic ratio-128 compressed tail.
+TOPK = WIN + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
@@ -105,7 +93,7 @@ assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
 
 
 @pl.jit.inline
-def sparse_attn(
+def sparse_attn_hca(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -215,20 +203,13 @@ def sparse_attn(
             qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
 
-            # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
-            # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
-            # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
-            # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
-            # stores at the SAME offsets as the per-head-tile path
-            # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
-            # sparse_blk_* layout and merge_norm are bit-identical.
-            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                qk_h0 = qk_hb * QK_M_TILE
+            for qk_h_idx in pl.range((H // H_TILE)):
+                qk_h0 = qk_h_idx * H_TILE
                 qk_head_row = qk_t * H + qk_h0
-                qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
+                qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
                 qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
+                qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
                 qk_mi = pl.row_max(qk_scores)
                 # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
                 # blocks die in the merge alpha/beta -- no mask multiply needed.
@@ -236,14 +217,11 @@ def sparse_attn(
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                    qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                    qk_r0 = qk_sub * H_TILE
-                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+                qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
+                qk_row = qk_blk_base + qk_sb * H_TILE
+                sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
+                sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
+                sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi
 
     # Online-softmax merge across sparse-K tiles, then sink-norm.
     for m_t in pl.spmd(T, name_hint="merge_norm"):
@@ -448,7 +426,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    attn_out = sparse_attn(
+    attn_out = sparse_attn_hca(
         q,
         ori_kv,
         ori_block_table,
@@ -615,7 +593,7 @@ def build_tensor_specs(
     import torch
     from golden import TensorSpec
 
-    cmp_valid = get_standalone_cmp_valid(compress_ratio)
+    cmp_valid = min(get_standalone_cmp_valid(compress_ratio), TOPK - WIN)
 
     def seeded_uniform(shape, seed):
         """Create a deterministic centered uniform tensor for repeatable tests."""

@@ -17,14 +17,12 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
-import config
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import attn_norm
-# NOTE: `sparse_attn` is imported lower down, AFTER config.SPARSE_TOPK_EFF is set,
-# so decode_sparse_attn bakes SWA's pruned sparse-K width at its import (issue #507).
+from decode_sparse_attn_swa import sparse_attn_swa
 
 
 # model config
@@ -60,15 +58,6 @@ SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA b
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-
-# Specialize sparse_attn to SWA's window-only sparse-K width (issue #507): WIN
-# (2 blocks after the min-2 floor) instead of the full WIN+IDX_TOPK (5 blocks),
-# pruning the padding compressed blocks. Publish it to config BEFORE importing
-# sparse_attn (same convention as moe_ep flipping EP_ROUTING_GLOBAL), so the kernel
-# and its torch golden bake this width at import.
-config.SPARSE_TOPK_EFF = WIN
-from decode_sparse_attn import sparse_attn  # noqa: E402  (must follow the config set above)
-
 
 @pl.jit.inline
 def attention_swa(
@@ -187,7 +176,7 @@ def attention_swa(
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn(
+    sparse_attn_swa(
         q,
         kv_cache,
         block_table,
@@ -284,7 +273,7 @@ def golden_attention_swa(tensors):
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
     from rmsnorm import golden_attn_norm
-    from decode_sparse_attn import golden_sparse_attn
+    from decode_sparse_attn_swa import golden_sparse_attn
     from hc_post import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
