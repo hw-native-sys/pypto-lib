@@ -91,13 +91,13 @@ COFF = 1 + int(OVERLAP)
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-MAIN_STATE_MAX_BLOCKS = 64
+MAIN_STATE_MAX_BLOCKS = 65
 MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
 MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_MAX_BLOCKS = 64
+INNER_STATE_MAX_BLOCKS = 65
 INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
@@ -107,6 +107,9 @@ IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 SPARSE_TOPK = WIN + IDX_TOPK
+CSA_TOPK_TOKEN_TILE = 8
+CSA_TOPK_BLOCKS = (T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
+WRITEBACK_GUARD_TILE = 16
 
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -227,19 +230,6 @@ def attention_csa(
         qr_scale,
     )
 
-    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    ori_block_table_flat = pl.reshape(ori_block_table, [B * ORI_MAX_BLOCKS])
-    # Per-batch per-token KV scatter: token s of batch b -> slot (start_pos + s) % WIN.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_scatter_ori"):
-        for b in pl.range(B):
-            start_pos_b = pl.read(start_pos, [b])
-            for s_idx in pl.range(S):
-                ori_slot = (start_pos_b + s_idx) % WIN
-                blk_id = pl.cast(pl.read(ori_block_table_flat, [b * ORI_MAX_BLOCKS + ori_slot // BLOCK_SIZE]), pl.INDEX)
-                dst_row = blk_id * BLOCK_SIZE + ori_slot % BLOCK_SIZE
-                kv_cache_flat[dst_row : dst_row + 1, 0 : HEAD_DIM] = kv[b * S + s_idx : b * S + s_idx + 1, 0 : HEAD_DIM]
-    kv_cache = pl.reshape(kv_cache_flat, [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-
     x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
@@ -291,22 +281,56 @@ def attention_csa(
     # fixed metadata while the CSA path still composes indexer at runtime.
     cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_sparse_idx"):
-        for t_idx in pl.range(T):
-            window_row = pl.arange(0, [1, WIN], dtype=pl.INT32)
-            invalid_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
-            cmp_sparse_indices[t_idx : t_idx + 1, 0 : SPARSE_TOPK] = invalid_row
-            cmp_sparse_indices[t_idx : t_idx + 1, 0 : WIN] = window_row
-            cmp_topk = idx_topk_flat[t_idx : t_idx + 1, 0 : IDX_TOPK]
-            cmp_sparse_indices[t_idx : t_idx + 1, WIN : WIN + IDX_TOPK] = cmp_topk
+    for topk_block in pl.spmd(CSA_TOPK_BLOCKS, name_hint="csa_sparse_idx_tile"):
+        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+            t_idx = topk_t0 + topk_dt
+            if t_idx < T:
+                topk_b = t_idx // S
+                topk_s = t_idx - topk_b * S
+                topk_start_b = pl.read(start_pos, [topk_b])
+                topk_abs_pos = topk_start_b + topk_s
+
+                if topk_abs_pos >= WIN - 1:
+                    topk_win_start = (topk_abs_pos % WIN) + 1
+                    for topk_k in pl.range(WIN):
+                        topk_val = (topk_win_start + topk_k) % WIN
+                        topk_out = topk_val
+                        for topk_os in pl.range(S):
+                            if topk_os <= topk_s:
+                                if topk_val == (topk_start_b + topk_os) % WIN:
+                                    topk_out = WIN + topk_os
+                        pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
+                else:
+                    for topk_k in pl.range(WIN):
+                        if topk_k <= topk_abs_pos:
+                            topk_out = topk_k
+                            for topk_os in pl.range(S):
+                                if topk_os <= topk_s:
+                                    if topk_k == (topk_start_b + topk_os) % WIN:
+                                        topk_out = WIN + topk_os
+                            pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
+                        else:
+                            pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
+
+                topk_cmp_valid = (topk_abs_pos + 1) // COMPRESS_RATIO
+                for topk_ck in pl.range(IDX_TOPK):
+                    cmp_raw = pl.read(idx_topk_flat, [t_idx, topk_ck])
+                    if cmp_raw >= WIN + S:
+                        cmp_slot = cmp_raw - (WIN + S)
+                        if cmp_slot < topk_cmp_valid:
+                            pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(cmp_raw, pl.INT32))
+                        else:
+                            pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
+                    else:
+                        pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    mtp_kv_overlay_dummy = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     attn_out = sparse_attn(
         q,
         kv_cache,
         ori_block_table,
-        mtp_kv_overlay_dummy,
+        kv,
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
@@ -319,6 +343,25 @@ def attention_csa(
         wo_b_scale,
         attn_out,
     )
+
+    # Commit current MTP tokens only after sparse_attn has gathered the old cache
+    # plus the explicit overlay, matching the SWA/HCA MTP contract.
+    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cache_writeback"):
+        kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
+        kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
+        for write_t in pl.range(T):
+            write_b = write_t // S
+            write_s = write_t - write_b * S
+            write_start_b = pl.read(start_pos, [write_b])
+            write_slot = (write_start_b + write_s) % WIN
+            write_blk = pl.cast(pl.read(ori_block_table, [write_b, 0]), pl.INDEX)
+            write_row = write_blk * BLOCK_SIZE + write_slot
+            write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+            write_zero = pl.mul(write_guard, 0.0)
+            write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+            kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(pl.add(write_kv_head, write_zero), target_type=pl.BF16)
+            kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     x_out = hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
@@ -481,16 +524,6 @@ def golden_attention_csa(tensors):
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 
-    # Per-batch per-token ori_kv scatter: token s of batch b -> slot (start_pos + s) % WIN.
-    for t in range(T):
-        b = t // S
-        s = t % S
-        start_pos_b = int(start_pos_t[b].item())
-        ori_slot = (start_pos_b + s) % WIN
-        blk_id = int(ori_block_table[b, ori_slot // BLOCK_SIZE].item())
-        intra = ori_slot % BLOCK_SIZE
-        kv_cache[blk_id, intra, 0] = kv[t]
-
     cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     golden_compressor({
         "x": x_normed.reshape(B, S, D),
@@ -537,15 +570,39 @@ def golden_attention_csa(tensors):
     })
 
     sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-    sparse_topk[:, :WIN] = torch.arange(WIN, dtype=torch.int32)
-    sparse_topk[:, WIN:WIN + IDX_TOPK] = idx_topk_full.view(T, INDEXER_SCORE_LEN)[:, :IDX_TOPK]
+    for t in range(T):
+        b = t // S
+        s = t % S
+        start_pos_b = int(start_pos_t[b].item())
+        abs_pos = start_pos_b + s
+        overlay_slots = {(start_pos_b + os) % WIN: os for os in range(s + 1)}
+        if abs_pos >= WIN - 1:
+            win_start = (abs_pos % WIN) + 1
+            vals = ((torch.arange(WIN, dtype=torch.int32) + win_start) % WIN).tolist()
+        else:
+            vals = list(range(abs_pos + 1))
+        for k, raw in enumerate(vals):
+            if raw in overlay_slots:
+                sparse_topk[t, k] = WIN + overlay_slots[raw]
+            else:
+                sparse_topk[t, k] = raw
+    idx_topk_flat = idx_topk_full.view(T, INDEXER_SCORE_LEN)
+    for t in range(T):
+        b = t // S
+        s = t % S
+        abs_pos = int(start_pos_t[b].item()) + s
+        cmp_valid = (abs_pos + 1) // COMPRESS_RATIO
+        for ck, raw_t in enumerate(idx_topk_flat[t, :IDX_TOPK].tolist()):
+            raw = int(raw_t)
+            if raw >= WIN + S and raw - (WIN + S) < cmp_valid:
+                sparse_topk[t, WIN + ck] = raw
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "ori_block_table": ori_block_table,
-        "mtp_kv_overlay": torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16),
+        "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
@@ -558,6 +615,17 @@ def golden_attention_csa(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
+
+    kv_cache_out = kv_cache.clone()
+    for t in range(T):
+        b = t // S
+        s = t % S
+        start_pos_b = int(start_pos_t[b].item())
+        ori_slot = (start_pos_b + s) % WIN
+        blk_id = int(ori_block_table[b, ori_slot // BLOCK_SIZE].item())
+        intra = ori_slot % BLOCK_SIZE
+        kv_cache_out[blk_id, intra, 0] = kv[t]
+    tensors["kv_cache"][:] = kv_cache_out
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
@@ -651,6 +719,15 @@ def build_tensor_specs(start_pos=None):
     def init_compress_state():
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
         state[:, :, MAIN_OUT_DIM:] = float("-inf")
+        starts = init_start_pos().to(torch.int64)
+        gen = torch.Generator()
+        gen.manual_seed(101)
+        hist = torch.randn(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM, generator=gen) * 0.05
+        for b in range(B):
+            for abs_pos in range(int(starts[b].item())):
+                blk = b * MAIN_STATE_MAX_BLOCKS + abs_pos // MAIN_STATE_BLOCK_SIZE
+                intra = abs_pos % MAIN_STATE_BLOCK_SIZE
+                state[blk, intra] = hist[blk, intra]
         return state
 
     def init_compress_state_block_table():
@@ -690,6 +767,15 @@ def build_tensor_specs(start_pos=None):
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
         state[:, :, INNER_OUT_DIM:] = float("-inf")
+        starts = init_start_pos().to(torch.int64)
+        gen = torch.Generator()
+        gen.manual_seed(102)
+        hist = torch.randn(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM, generator=gen) * 0.05
+        for b in range(B):
+            for abs_pos in range(int(starts[b].item())):
+                blk = b * INNER_STATE_MAX_BLOCKS + abs_pos // INNER_STATE_BLOCK_SIZE
+                intra = abs_pos % INNER_STATE_BLOCK_SIZE
+                state[blk, intra] = hist[blk, intra]
         return state
 
     def init_inner_compress_state_block_table():
@@ -730,7 +816,7 @@ def build_tensor_specs(start_pos=None):
         return tbl
 
     def init_attn_sink():
-        return torch.zeros(H)
+        return torch.ones(H) * 4.0
 
     def init_start_pos():
         if start_pos is not None:
