@@ -209,28 +209,22 @@ def dispatch_ep(
         # Widen x INT8 -> FP16 once per token (b8 SDMA workaround, see recv_x
         # above) into the x_fp16 GM scratch; the per-route x push is then a
         # GM-to-peer-GM TPUT with no per-route UB staging.
-        for cb in pl.range(T // X_STAGE_ROWS):
-            c0 = cb * X_STAGE_ROWS
-            wide_i8 = pl.load(x_norm_i8, [c0, 0], [X_STAGE_ROWS, D])
-            pl.store(pl.cast(wide_i8, target_type=pl.FP16), [c0, 0], x_fp16)
+        for c0 in pl.range(0, T, X_STAGE_ROWS):
+            x_wide = pl.cast(x_norm_i8[c0:c0 + X_STAGE_ROWS, :], target_type=pl.FP16)
+            x_fp16[c0:c0 + X_STAGE_ROWS, :] = x_wide
 
         cursor = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 cursor[d * N_LOCAL_EXPERTS + e] = 0
 
-        # Allocate the three pad tiles once, zero-initialised. Columns 1..PAD-1 stay
-        # 0 across every push so the stage_out row_sum at the receiver recovers
-        # column 0 exactly. The loop body only overwrites column 0.
-        scale_tile: pl.Tile[[1, W_PAD], pl.FP32] = pl.tile.full(
-            [1, W_PAD], dtype=pl.FP32, value=0.0
-        )
-        w_tile: pl.Tile[[1, W_PAD], pl.FP32] = pl.tile.full(
-            [1, W_PAD], dtype=pl.FP32, value=0.0
-        )
-        idx_tile: pl.Tile[[1, IDX_PAD], pl.INT32] = pl.tile.full(
-            [1, IDX_PAD], dtype=pl.INT32, value=0
-        )
+        # Pad tiles for the scalar channels — a TPUT needs a 32B-aligned (>=8
+        # FP32 col) transfer, so the 1-element scale/w/r_route channels keep the
+        # tile.write + remote_store form. Columns 1..PAD-1 stay 0; only column 0
+        # is overwritten per push and read by stage_out.
+        scale_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
+        w_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
+        idx_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
 
         for t in pl.range(T):
             for k in pl.range(TOPK):
@@ -289,11 +283,9 @@ def dispatch_ep(
         # stage_out: copy the windows the push filled into the host outputs.
         # recv_x: FP16 window -> INT8 in X_STAGE_ROWS-row chunks through the
         # flat view (per-row copies cost ~16x more MTE transfers).
-        for xb in pl.range(N_LOCAL_EXPERTS * RECV_MAX // X_STAGE_ROWS):
-            row = xb * X_STAGE_ROWS
-            stage_x_fp16 = pl.load(recv_x, [row, 0], [X_STAGE_ROWS, D])
-            stage_x_i8 = pl.cast(stage_x_fp16, target_type=pl.INT8)
-            pl.store(stage_x_i8, [row, 0], recv_x_out_flat)
+        for row in pl.range(0, N_LOCAL_EXPERTS * RECV_MAX, X_STAGE_ROWS):
+            stage_x_i8 = pl.cast(recv_x[row:row + X_STAGE_ROWS, :], target_type=pl.INT8)
+            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = stage_x_i8
 
         # recv_scale / recv_w / recv_r_route: scalar copy of window column 0,
         # bounded to the valid rows (downstream consumers are count-bounded, so

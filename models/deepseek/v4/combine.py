@@ -93,9 +93,9 @@ def combine_ep(
     # one pl.at(CORE_GROUP) so remote_store + notify/wait stay one atomic task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
         # Each (dst, e) block of n rows landed at slots [src_off, src_off+n) on
-        # dst. Per-row 3D pl.load on recv_y: remote_store needs a UB tile src
-        # (a slice view is rejected), and reshaping the whole tensor to 2D
-        # would load all of [N_LOCAL_EXPERTS, RECV_MAX, D] into Vec.
+        # dst. Keep the per-row pl.load + remote_store form: with pld.tensor.put
+        # the orchestration marks the routed_y_buf dst window add_input, so
+        # combine_reduce gets no RAW edge and reads it stale (pypto#1732).
         for dst in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 n = pl.cast(pl.read(pub_counts, [dst * EP_WORLD_SIZE + my_rank, e]), pl.INDEX)
