@@ -168,7 +168,7 @@ def moe_ep(
 
 
 @pl.jit.host
-def host_orch(
+def l3_moe_ep(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -636,7 +636,7 @@ if __name__ == "__main__":
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
     result = run_jit(
-        fn=host_orch,
+        fn=l3_moe_ep,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_ep,
         compile_only=args.compile_only,
