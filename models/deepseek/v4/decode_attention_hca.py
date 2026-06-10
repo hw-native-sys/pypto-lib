@@ -16,7 +16,6 @@ Companion files: attention_swa.py (ratio=0)
 
 import pypto.language as pl
 
-import config
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -31,8 +30,7 @@ from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import attn_norm
 from decode_compressor_ratio128 import compressor_ratio128
-# NOTE: `sparse_attn` is imported lower down, AFTER config.SPARSE_TOPK_EFF is set,
-# so decode_sparse_attn bakes HCA's pruned sparse-K width at its import (issue #507).
+from decode_sparse_attn_hca import sparse_attn_hca
 
 
 # model config
@@ -77,14 +75,7 @@ SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (stat
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 HCA_TOPK_LIMIT = min(CMP_TOPK, SPARSE_IDX_TOPK)
 
-# Specialize sparse_attn to HCA's window+compressed sparse-K width (issue #507):
-# WIN + HCA_TOPK_LIMIT (2 blocks after the min-2 floor) instead of the full
-# WIN+IDX_TOPK (5 blocks), pruning the padding compressed blocks. Publish it to
-# config BEFORE importing sparse_attn (same convention as moe_ep flipping
-# EP_ROUTING_GLOBAL), so the kernel and its torch golden bake this width at import.
 HCA_SPARSE_TOPK = WIN + HCA_TOPK_LIMIT
-config.SPARSE_TOPK_EFF = HCA_SPARSE_TOPK
-from decode_sparse_attn import sparse_attn  # noqa: E402  (must follow the config set above)
 
 # tiling
 SPARSE_ROPE_TILE = 16
@@ -262,7 +253,7 @@ def attention_hca(
                     else:
                         pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(-1, pl.INT32))
 
-    sparse_attn(
+    sparse_attn_hca(
         q,
         kv_cache,
         ori_block_table,
@@ -365,7 +356,7 @@ def golden_attention_hca(tensors):
     from qkv_proj_rope import golden_qkv_proj_rope
     from rmsnorm import golden_attn_norm
     from decode_compressor_ratio128 import golden_compressor
-    from decode_sparse_attn import golden_sparse_attn
+    from decode_sparse_attn_hca import golden_sparse_attn
     from hc_post import golden_hc_post
 
     # ---- Block.hc_pre ----

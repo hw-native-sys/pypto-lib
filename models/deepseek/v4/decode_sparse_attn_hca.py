@@ -36,7 +36,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 4
+DEFAULT_COMPRESS_RATIO = 128
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
@@ -91,10 +91,8 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-# CSA/full sparse-K width. SWA and HCA use explicit sibling modules so a
-# combined decode layer can import all three variants in one Python process
-# without relying on import-time config mutation and module-cache order.
-TOPK = TOPK_FULL
+# HCA sparse-K width: window plus the deterministic ratio-128 compressed tail.
+TOPK = WIN + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
@@ -105,7 +103,7 @@ assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
 
 
 @pl.jit.inline
-def sparse_attn(
+def sparse_attn_hca(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
@@ -457,7 +455,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    attn_out = sparse_attn(
+    attn_out = sparse_attn_hca(
         q,
         ori_kv,
         ori_block_table,
@@ -624,7 +622,7 @@ def build_tensor_specs(
     import torch
     from golden import TensorSpec
 
-    cmp_valid = get_standalone_cmp_valid(compress_ratio)
+    cmp_valid = min(get_standalone_cmp_valid(compress_ratio), TOPK - WIN)
 
     def seeded_uniform(shape, seed):
         """Create a deterministic centered uniform tensor for repeatable tests."""
