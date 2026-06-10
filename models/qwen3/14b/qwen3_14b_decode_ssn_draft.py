@@ -6,14 +6,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3-14B single-layer decode forward, in a serial tile-DSL style.
+"""Qwen3-14B single-layer decode forward, serial tile-DSL style, 4D-blocked.
+
+All tensors -- kernel parameters and internal bridges alike -- use the 4D
+pre-blocked layout of qwen3_32b_decode_4d.py:
+  - activations / output:  [COL_BLOCKS, 1, BATCH, CHUNK]
+  - weights:               [K_BLOCKS, N_BLOCKS, MM_K, MM_N] (one 4 KB tile per block)
+  - rms / norm weights:    [K_BLOCKS, 1, 1, CHUNK]
+  - rope tables:           [MAX_SEQ, 1, 1, HEAD_DIM]
+  - paged KV caches:       [MAX_BLOCKS_PER_SEQ, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM]
+  - scalar tables:         [BATCH, ..., 1, 1]
+Tensors stay 4D end to end: every access loads one [1, 1, rows, cols] block
+(dims 2/3 untouched) and pl.tile.reshape's it to a 2D tile; stores reshape
+the 2D tile back to a 4D block. Internal bridges are declared right before
+the loop that first writes them.
 
 Style rules:
   1. One plain function; control flow is only pl.range and if/else
      (no jit / program / at / spmd / parallel / pipeline).
-  2. Compute is tile-level (pl.tile.*); the only tensor-level ops are
-     pl.tensor.reshape (views) and pl.tensor.read (host scalars for
-     loop bounds / paged addressing).
+  2. Compute is tile-level (pl.tile.*); the only tensor-level op is
+     pl.tensor.read (host scalars for loop bounds / paged addressing).
   3. Every tile's static shape is 4 KB (FP32 1024 / BF16 2048 elems);
      a tile whose live region is smaller declares it via set_validshape.
   4. SSA names: only set_validshape may reuse a tile name; full 4 KB
@@ -45,7 +57,8 @@ VEC_BF16 = 128  # [BATCH, 128] BF16 = 4 KB (full BF16 column tile)
 VEC_W = 64      # [BATCH, 64]  FP32 = 4 KB (one half of a BF16 tile)
 MM_N = 64       # [BATCH, 64]  FP32 = 4 KB (matmul accumulator)
 MM_K = 32       # [32, 64] BF16 = 4 KB weight tile is the binding operand
-HN_ROWS = 8     # [8, 128] FP32 = 4 KB (per-head RMSNorm tile)
+
+HALVES_PER_HEAD = 2  # VEC_W blocks per HEAD_DIM head
 
 # --- Scope 2 (RoPE + paged-cache + flash attention) ------------------------
 HALF_DIM = HEAD_DIM // 2                  # 64
@@ -69,56 +82,36 @@ SV_SSTEPS = ATT_SEQ // SV_SEQ   # 2
 
 @pl.kernel
 def qwen3_14b_decode(
-    current_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-    input_rms_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
-    wq: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
-    wk: pl.Tensor[[HIDDEN, KV_HIDDEN], pl.BF16],
-    wv: pl.Tensor[[HIDDEN, KV_HIDDEN], pl.BF16],
-    q_norm_weight: pl.Tensor[[1, HEAD_DIM], pl.FP32],
-    k_norm_weight: pl.Tensor[[1, HEAD_DIM], pl.FP32],
-    seq_lens: pl.Tensor[[BATCH], pl.INT32],
-    block_table: pl.Tensor[[BATCH * MAX_BLOCKS_PER_SEQ], pl.INT32],
-    slot_mapping: pl.Tensor[[BATCH], pl.INT32],
-    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
-    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
-    k_cache: pl.Tensor[[NUM_KV_HEADS * MAX_BLOCKS_PER_SEQ * BLOCK_SIZE, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[NUM_KV_HEADS * MAX_BLOCKS_PER_SEQ * BLOCK_SIZE, HEAD_DIM], pl.BF16],
-    wo: pl.Tensor[[HIDDEN, HIDDEN], pl.BF16],
-    post_rms_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
-    w_gate: pl.Tensor[[HIDDEN, INTERMEDIATE], pl.BF16],
-    w_up: pl.Tensor[[HIDDEN, INTERMEDIATE], pl.BF16],
-    w_down: pl.Tensor[[INTERMEDIATE, HIDDEN], pl.BF16],
-    next_hidden: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+    current_hidden: pl.Tensor[[HIDDEN // VEC_BF16, 1, BATCH, VEC_BF16], pl.BF16],
+    input_rms_weight: pl.Tensor[[HIDDEN // VEC_BF16, 1, 1, VEC_BF16], pl.FP32],
+    wq: pl.Tensor[[HIDDEN // MM_K, HIDDEN // MM_N, MM_K, MM_N], pl.BF16],
+    wk: pl.Tensor[[HIDDEN // MM_K, KV_HIDDEN // MM_N, MM_K, MM_N], pl.BF16],
+    wv: pl.Tensor[[HIDDEN // MM_K, KV_HIDDEN // MM_N, MM_K, MM_N], pl.BF16],
+    q_norm_weight: pl.Tensor[[1, 1, 1, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[1, 1, 1, HEAD_DIM], pl.FP32],
+    seq_lens: pl.Tensor[[BATCH, 1, 1, 1], pl.INT32],
+    block_table: pl.Tensor[[BATCH, MAX_BLOCKS_PER_SEQ, 1, 1], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH, 1, 1, 1], pl.INT32],
+    rope_cos: pl.Tensor[[MAX_SEQ, 1, 1, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[MAX_SEQ, 1, 1, HEAD_DIM], pl.FP32],
+    k_cache: pl.Tensor[[MAX_BLOCKS_PER_SEQ, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[MAX_BLOCKS_PER_SEQ, NUM_KV_HEADS, BLOCK_SIZE, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[HIDDEN // MM_K, HIDDEN // MM_N, MM_K, MM_N], pl.BF16],
+    post_rms_weight: pl.Tensor[[HIDDEN // VEC_BF16, 1, 1, VEC_BF16], pl.FP32],
+    w_gate: pl.Tensor[[HIDDEN // MM_K, INTERMEDIATE // MM_N, MM_K, MM_N], pl.BF16],
+    w_up: pl.Tensor[[HIDDEN // MM_K, INTERMEDIATE // MM_N, MM_K, MM_N], pl.BF16],
+    w_down: pl.Tensor[[INTERMEDIATE // MM_K, HIDDEN // MM_N, MM_K, MM_N], pl.BF16],
+    next_hidden: pl.Out[pl.Tensor[[HIDDEN // MM_N, 1, BATCH, MM_N], pl.BF16]],
 ):
-    # Bridge buffer carrying the RMSNorm result into the Q/K/V matmuls.
-    normed_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    # Raw (pre per-head-norm) Q/K projections.
-    q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-    # Per-head-normed Q/K and raw V -- internal bridges into scope 2.
-    q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-    v_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-    # RoPE'd + padded Q, grouped [B, TOTAL_Q_GROUPS, Q_HEAD_PAD] rows of HEAD_DIM.
-    all_q_padded = pl.create_tensor(
-        [BATCH * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM], dtype=pl.BF16,
-    )
-    # Attention output -> scope 3 input.
-    attn_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    # Scope 3 bridges: residual1 (FP32), post-RMSNorm, MLP intermediate.
-    resid1 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    post_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    mlp = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
-
     # =====================================================================
     # 1. Input RMSNorm:  normed_all = (x / rms(x)) * gamma
     # =====================================================================
-    # sum of squares over HIDDEN (BF16 load -> two FP32 halves -> square)
+    # sum of squares over HIDDEN (BF16 block load -> two FP32 halves -> square)
     sumsq = pl.tile.full([BATCH, VEC_W], value=0.0, dtype=pl.FP32)
     sumsq = pl.tile.set_validshape(sumsq, [BATCH, 1])
     for kb in pl.range(HIDDEN // VEC_BF16):
-        k0 = kb * VEC_BF16
-        x_bf16 = pl.tile.load(current_hidden, [BATCH, VEC_BF16], [0, k0])
+        x_blk = pl.tile.load(current_hidden, [1, 1, BATCH, VEC_BF16], [kb, 0, 0, 0])
+        x_bf16 = pl.tile.reshape(x_blk, [BATCH, VEC_BF16])
         for h in pl.range(2):
             h0 = h * VEC_W
             x_half = pl.tile.slice(x_bf16, [BATCH, VEC_W], [0, h0])
@@ -139,135 +132,182 @@ def qwen3_14b_decode(
     inv_rms = pl.tile.recip(rms)
     inv_rms = pl.tile.set_validshape(inv_rms, [BATCH, 1])
 
-    # normalize + scale by gamma -> BF16 bridge buffer
+    # normalize + scale by gamma -> BF16 bridge buffer (VEC_W column blocks)
+    normed_all = pl.create_tensor([HIDDEN // VEC_W, 1, BATCH, VEC_W], dtype=pl.BF16)
     for kb in pl.range(HIDDEN // VEC_BF16):
-        k0 = kb * VEC_BF16
-        x_bf16 = pl.tile.load(current_hidden, [BATCH, VEC_BF16], [0, k0])
+        x_blk = pl.tile.load(current_hidden, [1, 1, BATCH, VEC_BF16], [kb, 0, 0, 0])
+        x_bf16 = pl.tile.reshape(x_blk, [BATCH, VEC_BF16])
         for h in pl.range(2):
             h0 = h * VEC_W
             x_half = pl.tile.slice(x_bf16, [BATCH, VEC_W], [0, h0])
             x_half = pl.tile.set_validshape(x_half, [BATCH, VEC_W])
             x = pl.tile.cast(x_half, dtype=pl.FP32)
-            gamma = pl.tile.load(input_rms_weight, [1, VEC_W], [0, k0 + h0])
+            gamma_blk = pl.tile.load(input_rms_weight, [1, 1, 1, VEC_W], [kb, 0, 0, h0])
+            gamma = pl.tile.reshape(gamma_blk, [1, VEC_W])
             gamma = pl.tile.set_validshape(gamma, [1, VEC_W])
             x_scaled = pl.tile.row_expand_mul(x, inv_rms)
             normed = pl.tile.col_expand_mul(x_scaled, gamma)
             normed_bf16 = pl.tile.cast(normed, dtype=pl.BF16)
             normed_bf16 = pl.tile.set_validshape(normed_bf16, [BATCH, VEC_W])
-            pl.tile.store(normed_all, normed_bf16, [0, k0 + h0])
+            normed_blk = pl.tile.reshape(normed_bf16, [1, 1, BATCH, VEC_W])
+            pl.tile.store(normed_all, normed_blk, [kb * 2 + h, 0, 0, 0])
 
     # =====================================================================
     # 2. Q / K / V projection:  proj = normed_all @ W
     #    (peeled-first matmul + matmul_acc over the K tiles, per output tile)
+    #    An MM_K activation chunk kb sits in VEC_W block kb // 2, half kb % 2.
     # =====================================================================
     # --- Q projection: [BATCH, HIDDEN] @ [HIDDEN, HIDDEN] ---
+    q_proj = pl.create_tensor([HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
     for nb in pl.range(HIDDEN // MM_N):
-        n0 = nb * MM_N
-        a0 = pl.tile.load(normed_all, [BATCH, MM_K], [0, 0])
+        a0_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        a0 = pl.tile.reshape(a0_blk, [BATCH, MM_K])
         a0 = pl.tile.set_validshape(a0, [BATCH, MM_K])
-        w0 = pl.tile.load(wq, [MM_K, MM_N], [0, n0])
+        w0_blk = pl.tile.load(wq, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        w0 = pl.tile.reshape(w0_blk, [MM_K, MM_N])
         acc = pl.tile.matmul(a0, w0, out_dtype=pl.FP32)
         for kb in pl.range(1, HIDDEN // MM_K):
-            k0 = kb * MM_K
-            a = pl.tile.load(normed_all, [BATCH, MM_K], [0, k0])
+            a_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            a = pl.tile.reshape(a_blk, [BATCH, MM_K])
             a = pl.tile.set_validshape(a, [BATCH, MM_K])
-            w = pl.tile.load(wq, [MM_K, MM_N], [k0, n0])
+            w_blk = pl.tile.load(wq, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            w = pl.tile.reshape(w_blk, [MM_K, MM_N])
             acc = pl.tile.matmul_acc(acc, a, w)
-        pl.tile.store(q_proj, acc, [0, n0])
+        acc_blk = pl.tile.reshape(acc, [1, 1, BATCH, MM_N])
+        pl.tile.store(q_proj, acc_blk, [nb, 0, 0, 0])
 
     # --- K projection: [BATCH, HIDDEN] @ [HIDDEN, KV_HIDDEN] ---
+    k_proj = pl.create_tensor([KV_HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
     for nb in pl.range(KV_HIDDEN // MM_N):
-        n0 = nb * MM_N
-        a0 = pl.tile.load(normed_all, [BATCH, MM_K], [0, 0])
+        a0_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        a0 = pl.tile.reshape(a0_blk, [BATCH, MM_K])
         a0 = pl.tile.set_validshape(a0, [BATCH, MM_K])
-        w0 = pl.tile.load(wk, [MM_K, MM_N], [0, n0])
+        w0_blk = pl.tile.load(wk, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        w0 = pl.tile.reshape(w0_blk, [MM_K, MM_N])
         acc = pl.tile.matmul(a0, w0, out_dtype=pl.FP32)
         for kb in pl.range(1, HIDDEN // MM_K):
-            k0 = kb * MM_K
-            a = pl.tile.load(normed_all, [BATCH, MM_K], [0, k0])
+            a_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            a = pl.tile.reshape(a_blk, [BATCH, MM_K])
             a = pl.tile.set_validshape(a, [BATCH, MM_K])
-            w = pl.tile.load(wk, [MM_K, MM_N], [k0, n0])
+            w_blk = pl.tile.load(wk, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            w = pl.tile.reshape(w_blk, [MM_K, MM_N])
             acc = pl.tile.matmul_acc(acc, a, w)
-        pl.tile.store(k_proj, acc, [0, n0])
+        acc_blk = pl.tile.reshape(acc, [1, 1, BATCH, MM_N])
+        pl.tile.store(k_proj, acc_blk, [nb, 0, 0, 0])
 
     # --- V projection: [BATCH, HIDDEN] @ [HIDDEN, KV_HIDDEN] ---
+    v_proj = pl.create_tensor([KV_HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
     for nb in pl.range(KV_HIDDEN // MM_N):
-        n0 = nb * MM_N
-        a0 = pl.tile.load(normed_all, [BATCH, MM_K], [0, 0])
+        a0_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        a0 = pl.tile.reshape(a0_blk, [BATCH, MM_K])
         a0 = pl.tile.set_validshape(a0, [BATCH, MM_K])
-        w0 = pl.tile.load(wv, [MM_K, MM_N], [0, n0])
+        w0_blk = pl.tile.load(wv, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        w0 = pl.tile.reshape(w0_blk, [MM_K, MM_N])
         acc = pl.tile.matmul(a0, w0, out_dtype=pl.FP32)
         for kb in pl.range(1, HIDDEN // MM_K):
-            k0 = kb * MM_K
-            a = pl.tile.load(normed_all, [BATCH, MM_K], [0, k0])
+            a_blk = pl.tile.load(normed_all, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            a = pl.tile.reshape(a_blk, [BATCH, MM_K])
             a = pl.tile.set_validshape(a, [BATCH, MM_K])
-            w = pl.tile.load(wv, [MM_K, MM_N], [k0, n0])
+            w_blk = pl.tile.load(wv, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            w = pl.tile.reshape(w_blk, [MM_K, MM_N])
             acc = pl.tile.matmul_acc(acc, a, w)
-        pl.tile.store(v_proj, acc, [0, n0])
+        acc_blk = pl.tile.reshape(acc, [1, 1, BATCH, MM_N])
+        pl.tile.store(v_proj, acc_blk, [nb, 0, 0, 0])
 
     # =====================================================================
-    # 3. Per-head q_norm / k_norm: reshape (batch, head) -> rows of HEAD_DIM,
-    #    then a plain row-wise RMSNorm over each HEAD_DIM row.
+    # 3. Per-head q_norm / k_norm. A head's HEAD_DIM spans two consecutive
+    #    MM_N blocks (lo/hi halves, batch rows): row-wise RMSNorm per head.
     # =====================================================================
-    q_rows = BATCH * NUM_HEADS          # 16 * 40  = 640
-    k_rows = BATCH * NUM_KV_HEADS       # 16 * 8   = 128
-    q_proj_heads = pl.tensor.reshape(q_proj, [q_rows, HEAD_DIM])
-    q_norm_heads = pl.tensor.reshape(q_proj_norm, [q_rows, HEAD_DIM])
-    k_proj_heads = pl.tensor.reshape(k_proj, [k_rows, HEAD_DIM])
-    k_norm_heads = pl.tensor.reshape(k_proj_norm, [k_rows, HEAD_DIM])
-
-    for rb in pl.range(q_rows // HN_ROWS):
-        r0 = rb * HN_ROWS
-        x = pl.tile.load(q_proj_heads, [HN_ROWS, HEAD_DIM], [r0, 0])
-        sq = pl.tile.mul(x, x)
-        sumsq = pl.tile.row_sum(sq)
-        sumsq = pl.tile.set_validshape(sumsq, [HN_ROWS, 1])
+    q_proj_norm = pl.create_tensor([HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
+    for hq in pl.range(NUM_HEADS):
+        b_lo = hq * HALVES_PER_HEAD
+        x_lo_blk = pl.tile.load(q_proj, [1, 1, BATCH, VEC_W], [b_lo, 0, 0, 0])
+        x_lo = pl.tile.reshape(x_lo_blk, [BATCH, VEC_W])
+        x_hi_blk = pl.tile.load(q_proj, [1, 1, BATCH, VEC_W], [b_lo + 1, 0, 0, 0])
+        x_hi = pl.tile.reshape(x_hi_blk, [BATCH, VEC_W])
+        sq_lo = pl.tile.mul(x_lo, x_lo)
+        sumsq = pl.tile.row_sum(sq_lo)
+        sumsq = pl.tile.set_validshape(sumsq, [BATCH, 1])
+        sq_hi = pl.tile.mul(x_hi, x_hi)
+        part = pl.tile.row_sum(sq_hi)
+        part = pl.tile.set_validshape(part, [BATCH, 1])
+        sumsq_acc = pl.tile.add(sumsq, part)
+        sumsq = pl.tile.set_validshape(sumsq_acc, [BATCH, 1])
         mean_sq = pl.tile.mul(sumsq, HEAD_DIM_INV)
-        mean_sq = pl.tile.set_validshape(mean_sq, [HN_ROWS, 1])
+        mean_sq = pl.tile.set_validshape(mean_sq, [BATCH, 1])
         variance = pl.tile.add(mean_sq, EPS)
-        variance = pl.tile.set_validshape(variance, [HN_ROWS, 1])
+        variance = pl.tile.set_validshape(variance, [BATCH, 1])
         inv_rms = pl.tile.rsqrt(variance)
-        inv_rms = pl.tile.set_validshape(inv_rms, [HN_ROWS, 1])
-        gamma = pl.tile.load(q_norm_weight, [1, HEAD_DIM], [0, 0])
-        gamma = pl.tile.set_validshape(gamma, [1, HEAD_DIM])
-        x_scaled = pl.tile.row_expand_mul(x, inv_rms)
-        normed = pl.tile.col_expand_mul(x_scaled, gamma)
-        pl.tile.store(q_norm_heads, normed, [r0, 0])
+        inv_rms = pl.tile.set_validshape(inv_rms, [BATCH, 1])
+        g_lo_blk = pl.tile.load(q_norm_weight, [1, 1, 1, HALF_DIM], [0, 0, 0, 0])
+        g_lo = pl.tile.reshape(g_lo_blk, [1, HALF_DIM])
+        g_lo = pl.tile.set_validshape(g_lo, [1, HALF_DIM])
+        g_hi_blk = pl.tile.load(q_norm_weight, [1, 1, 1, HALF_DIM], [0, 0, 0, HALF_DIM])
+        g_hi = pl.tile.reshape(g_hi_blk, [1, HALF_DIM])
+        g_hi = pl.tile.set_validshape(g_hi, [1, HALF_DIM])
+        x_lo_scaled = pl.tile.row_expand_mul(x_lo, inv_rms)
+        n_lo = pl.tile.col_expand_mul(x_lo_scaled, g_lo)
+        x_hi_scaled = pl.tile.row_expand_mul(x_hi, inv_rms)
+        n_hi = pl.tile.col_expand_mul(x_hi_scaled, g_hi)
+        n_lo_blk = pl.tile.reshape(n_lo, [1, 1, BATCH, VEC_W])
+        n_hi_blk = pl.tile.reshape(n_hi, [1, 1, BATCH, VEC_W])
+        pl.tile.store(q_proj_norm, n_lo_blk, [b_lo, 0, 0, 0])
+        pl.tile.store(q_proj_norm, n_hi_blk, [b_lo + 1, 0, 0, 0])
 
-    for rb in pl.range(k_rows // HN_ROWS):
-        r0 = rb * HN_ROWS
-        x = pl.tile.load(k_proj_heads, [HN_ROWS, HEAD_DIM], [r0, 0])
-        sq = pl.tile.mul(x, x)
-        sumsq = pl.tile.row_sum(sq)
-        sumsq = pl.tile.set_validshape(sumsq, [HN_ROWS, 1])
+    k_proj_norm = pl.create_tensor([KV_HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
+    for hk in pl.range(NUM_KV_HEADS):
+        b_lo = hk * HALVES_PER_HEAD
+        x_lo_blk = pl.tile.load(k_proj, [1, 1, BATCH, VEC_W], [b_lo, 0, 0, 0])
+        x_lo = pl.tile.reshape(x_lo_blk, [BATCH, VEC_W])
+        x_hi_blk = pl.tile.load(k_proj, [1, 1, BATCH, VEC_W], [b_lo + 1, 0, 0, 0])
+        x_hi = pl.tile.reshape(x_hi_blk, [BATCH, VEC_W])
+        sq_lo = pl.tile.mul(x_lo, x_lo)
+        sumsq = pl.tile.row_sum(sq_lo)
+        sumsq = pl.tile.set_validshape(sumsq, [BATCH, 1])
+        sq_hi = pl.tile.mul(x_hi, x_hi)
+        part = pl.tile.row_sum(sq_hi)
+        part = pl.tile.set_validshape(part, [BATCH, 1])
+        sumsq_acc = pl.tile.add(sumsq, part)
+        sumsq = pl.tile.set_validshape(sumsq_acc, [BATCH, 1])
         mean_sq = pl.tile.mul(sumsq, HEAD_DIM_INV)
-        mean_sq = pl.tile.set_validshape(mean_sq, [HN_ROWS, 1])
+        mean_sq = pl.tile.set_validshape(mean_sq, [BATCH, 1])
         variance = pl.tile.add(mean_sq, EPS)
-        variance = pl.tile.set_validshape(variance, [HN_ROWS, 1])
+        variance = pl.tile.set_validshape(variance, [BATCH, 1])
         inv_rms = pl.tile.rsqrt(variance)
-        inv_rms = pl.tile.set_validshape(inv_rms, [HN_ROWS, 1])
-        gamma = pl.tile.load(k_norm_weight, [1, HEAD_DIM], [0, 0])
-        gamma = pl.tile.set_validshape(gamma, [1, HEAD_DIM])
-        x_scaled = pl.tile.row_expand_mul(x, inv_rms)
-        normed = pl.tile.col_expand_mul(x_scaled, gamma)
-        pl.tile.store(k_norm_heads, normed, [r0, 0])
+        inv_rms = pl.tile.set_validshape(inv_rms, [BATCH, 1])
+        g_lo_blk = pl.tile.load(k_norm_weight, [1, 1, 1, HALF_DIM], [0, 0, 0, 0])
+        g_lo = pl.tile.reshape(g_lo_blk, [1, HALF_DIM])
+        g_lo = pl.tile.set_validshape(g_lo, [1, HALF_DIM])
+        g_hi_blk = pl.tile.load(k_norm_weight, [1, 1, 1, HALF_DIM], [0, 0, 0, HALF_DIM])
+        g_hi = pl.tile.reshape(g_hi_blk, [1, HALF_DIM])
+        g_hi = pl.tile.set_validshape(g_hi, [1, HALF_DIM])
+        x_lo_scaled = pl.tile.row_expand_mul(x_lo, inv_rms)
+        n_lo = pl.tile.col_expand_mul(x_lo_scaled, g_lo)
+        x_hi_scaled = pl.tile.row_expand_mul(x_hi, inv_rms)
+        n_hi = pl.tile.col_expand_mul(x_hi_scaled, g_hi)
+        n_lo_blk = pl.tile.reshape(n_lo, [1, 1, BATCH, VEC_W])
+        n_hi_blk = pl.tile.reshape(n_hi, [1, 1, BATCH, VEC_W])
+        pl.tile.store(k_proj_norm, n_lo_blk, [b_lo, 0, 0, 0])
+        pl.tile.store(k_proj_norm, n_hi_blk, [b_lo + 1, 0, 0, 0])
 
     # =====================================================================
     # 2a. RoPE + paged KV-cache write. Per batch row, per KV head: rotate-half
     #     K -> k_cache, copy V -> v_cache, rotate the Q_HEAD_BATCH Q heads and
     #     zero-pad to Q_HEAD_PAD rows -> all_q_padded.
     # =====================================================================
-    q_norm_heads_r = pl.tensor.reshape(q_proj_norm, [BATCH * NUM_HEADS, HEAD_DIM])
+    all_q_padded = pl.create_tensor([BATCH * TOTAL_Q_GROUPS, 1, Q_HEAD_PAD, HEAD_DIM], dtype=pl.BF16)
     for b in pl.range(BATCH):
-        ctx_len = pl.tensor.read(seq_lens, [b])
+        ctx_len = pl.tensor.read(seq_lens, [b, 0, 0, 0])
         pos = ctx_len - 1
-        slot = pl.tensor.read(slot_mapping, [b])
+        slot = pl.tensor.read(slot_mapping, [b, 0, 0, 0])
         slot_block = slot // BLOCK_SIZE
         slot_offset = slot - slot_block * BLOCK_SIZE
 
-        cos_row = pl.tile.load(rope_cos, [1, HEAD_DIM], [pos, 0])
+        cos_blk = pl.tile.load(rope_cos, [1, 1, 1, HEAD_DIM], [pos, 0, 0, 0])
+        cos_row = pl.tile.reshape(cos_blk, [1, HEAD_DIM])
         cos_row = pl.tile.set_validshape(cos_row, [1, HEAD_DIM])
-        sin_row = pl.tile.load(rope_sin, [1, HEAD_DIM], [pos, 0])
+        sin_blk = pl.tile.load(rope_sin, [1, 1, 1, HEAD_DIM], [pos, 0, 0, 0])
+        sin_row = pl.tile.reshape(sin_blk, [1, HEAD_DIM])
         sin_row = pl.tile.set_validshape(sin_row, [1, HEAD_DIM])
         cos_lo = pl.tile.slice(cos_row, [1, HALF_DIM], [0, 0])
         cos_lo = pl.tile.set_validshape(cos_lo, [1, HALF_DIM])
@@ -279,13 +319,14 @@ def qwen3_14b_decode(
         sin_hi = pl.tile.set_validshape(sin_hi, [1, HALF_DIM])
 
         for ki in pl.range(NUM_KV_HEADS):
-            kv_col = ki * HEAD_DIM
-            cache_row = (slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + slot_offset
+            kv_blo = ki * HALVES_PER_HEAD
 
             # K head RoPE -> k_cache (rotate-half).
-            k_lo = pl.tile.load(k_proj_norm, [1, HALF_DIM], [b, kv_col])
+            k_lo_blk = pl.tile.load(k_proj_norm, [1, 1, 1, HALF_DIM], [kv_blo, 0, b, 0])
+            k_lo = pl.tile.reshape(k_lo_blk, [1, HALF_DIM])
             k_lo = pl.tile.set_validshape(k_lo, [1, HALF_DIM])
-            k_hi = pl.tile.load(k_proj_norm, [1, HALF_DIM], [b, kv_col + HALF_DIM])
+            k_hi_blk = pl.tile.load(k_proj_norm, [1, 1, 1, HALF_DIM], [kv_blo + 1, 0, b, 0])
+            k_hi = pl.tile.reshape(k_hi_blk, [1, HALF_DIM])
             k_hi = pl.tile.set_validshape(k_hi, [1, HALF_DIM])
             klo_cos = pl.tile.col_expand_mul(k_lo, cos_lo)
             klo_cos = pl.tile.set_validshape(klo_cos, [1, HALF_DIM])
@@ -303,44 +344,58 @@ def qwen3_14b_decode(
             k_rot_lo_bf16 = pl.tile.set_validshape(k_rot_lo_bf16, [1, HALF_DIM])
             k_rot_hi_bf16 = pl.tile.cast(k_rot_hi, dtype=pl.BF16)
             k_rot_hi_bf16 = pl.tile.set_validshape(k_rot_hi_bf16, [1, HALF_DIM])
-            pl.tile.store(k_cache, k_rot_lo_bf16, [cache_row, 0])
-            pl.tile.store(k_cache, k_rot_hi_bf16, [cache_row, HALF_DIM])
+            k_rot_lo_blk = pl.tile.reshape(k_rot_lo_bf16, [1, 1, 1, HALF_DIM])
+            k_rot_hi_blk = pl.tile.reshape(k_rot_hi_bf16, [1, 1, 1, HALF_DIM])
+            pl.tile.store(k_cache, k_rot_lo_blk, [slot_block, ki, slot_offset, 0])
+            pl.tile.store(k_cache, k_rot_hi_blk, [slot_block, ki, slot_offset, HALF_DIM])
 
-            # V head copy -> v_cache.
-            v_head = pl.tile.load(v_proj, [1, HEAD_DIM], [b, kv_col])
-            v_head = pl.tile.set_validshape(v_head, [1, HEAD_DIM])
-            v_head_bf16 = pl.tile.cast(v_head, dtype=pl.BF16)
-            v_head_bf16 = pl.tile.set_validshape(v_head_bf16, [1, HEAD_DIM])
-            pl.tile.store(v_cache, v_head_bf16, [cache_row, 0])
+            # V head copy -> v_cache (lo/hi MM_N blocks).
+            v_lo_blk = pl.tile.load(v_proj, [1, 1, 1, HALF_DIM], [kv_blo, 0, b, 0])
+            v_lo = pl.tile.reshape(v_lo_blk, [1, HALF_DIM])
+            v_lo = pl.tile.set_validshape(v_lo, [1, HALF_DIM])
+            v_lo_bf16 = pl.tile.cast(v_lo, dtype=pl.BF16)
+            v_lo_bf16 = pl.tile.set_validshape(v_lo_bf16, [1, HALF_DIM])
+            v_lo_out = pl.tile.reshape(v_lo_bf16, [1, 1, 1, HALF_DIM])
+            pl.tile.store(v_cache, v_lo_out, [slot_block, ki, slot_offset, 0])
+            v_hi_blk = pl.tile.load(v_proj, [1, 1, 1, HALF_DIM], [kv_blo + 1, 0, b, 0])
+            v_hi = pl.tile.reshape(v_hi_blk, [1, HALF_DIM])
+            v_hi = pl.tile.set_validshape(v_hi, [1, HALF_DIM])
+            v_hi_bf16 = pl.tile.cast(v_hi, dtype=pl.BF16)
+            v_hi_bf16 = pl.tile.set_validshape(v_hi_bf16, [1, HALF_DIM])
+            v_hi_out = pl.tile.reshape(v_hi_bf16, [1, 1, 1, HALF_DIM])
+            pl.tile.store(v_cache, v_hi_out, [slot_block, ki, slot_offset, HALF_DIM])
 
-            # Q heads RoPE (Q_HEAD_BATCH rows) + zero pad -> all_q_padded.
+            # Q heads RoPE (one row per head) + zero pad -> all_q_padded.
             q_base = ki * Q_PER_KV
-            qp_row = b * TOTAL_Q_GROUPS * Q_HEAD_PAD + ki * Q_HEAD_PAD
-            q_block = pl.tile.load(
-                q_norm_heads_r, [Q_HEAD_BATCH, HEAD_DIM], [b * NUM_HEADS + q_base, 0],
-            )
-            q_block = pl.tile.set_validshape(q_block, [Q_HEAD_BATCH, HEAD_DIM])
-            q_lo = pl.tile.slice(q_block, [Q_HEAD_BATCH, HALF_DIM], [0, 0])
-            q_lo = pl.tile.set_validshape(q_lo, [Q_HEAD_BATCH, HALF_DIM])
-            q_hi = pl.tile.slice(q_block, [Q_HEAD_BATCH, HALF_DIM], [0, HALF_DIM])
-            q_hi = pl.tile.set_validshape(q_hi, [Q_HEAD_BATCH, HALF_DIM])
-            qlo_cos = pl.tile.col_expand_mul(q_lo, cos_lo)
-            qhi_sin = pl.tile.col_expand_mul(q_hi, sin_lo)
-            q_rot_lo = pl.tile.sub(qlo_cos, qhi_sin)
-            q_rot_lo = pl.tile.set_validshape(q_rot_lo, [Q_HEAD_BATCH, HALF_DIM])
-            qhi_cos = pl.tile.col_expand_mul(q_hi, cos_hi)
-            qlo_sin = pl.tile.col_expand_mul(q_lo, sin_hi)
-            q_rot_hi = pl.tile.add(qhi_cos, qlo_sin)
-            q_rot_hi = pl.tile.set_validshape(q_rot_hi, [Q_HEAD_BATCH, HALF_DIM])
-            q_rot_lo_bf16 = pl.tile.cast(q_rot_lo, dtype=pl.BF16)
-            q_rot_lo_bf16 = pl.tile.set_validshape(q_rot_lo_bf16, [Q_HEAD_BATCH, HALF_DIM])
-            q_rot_hi_bf16 = pl.tile.cast(q_rot_hi, dtype=pl.BF16)
-            q_rot_hi_bf16 = pl.tile.set_validshape(q_rot_hi_bf16, [Q_HEAD_BATCH, HALF_DIM])
-            pl.tile.store(all_q_padded, q_rot_lo_bf16, [qp_row, 0])
-            pl.tile.store(all_q_padded, q_rot_hi_bf16, [qp_row, HALF_DIM])
+            pad_idx = b * TOTAL_Q_GROUPS + ki
+            for qi in pl.range(Q_HEAD_BATCH):
+                q_blo = (q_base + qi) * HALVES_PER_HEAD
+                q_lo_blk = pl.tile.load(q_proj_norm, [1, 1, 1, HALF_DIM], [q_blo, 0, b, 0])
+                q_lo = pl.tile.reshape(q_lo_blk, [1, HALF_DIM])
+                q_lo = pl.tile.set_validshape(q_lo, [1, HALF_DIM])
+                q_hi_blk = pl.tile.load(q_proj_norm, [1, 1, 1, HALF_DIM], [q_blo + 1, 0, b, 0])
+                q_hi = pl.tile.reshape(q_hi_blk, [1, HALF_DIM])
+                q_hi = pl.tile.set_validshape(q_hi, [1, HALF_DIM])
+                qlo_cos = pl.tile.col_expand_mul(q_lo, cos_lo)
+                qhi_sin = pl.tile.col_expand_mul(q_hi, sin_lo)
+                q_rot_lo = pl.tile.sub(qlo_cos, qhi_sin)
+                q_rot_lo = pl.tile.set_validshape(q_rot_lo, [1, HALF_DIM])
+                qhi_cos = pl.tile.col_expand_mul(q_hi, cos_hi)
+                qlo_sin = pl.tile.col_expand_mul(q_lo, sin_hi)
+                q_rot_hi = pl.tile.add(qhi_cos, qlo_sin)
+                q_rot_hi = pl.tile.set_validshape(q_rot_hi, [1, HALF_DIM])
+                q_rot_lo_bf16 = pl.tile.cast(q_rot_lo, dtype=pl.BF16)
+                q_rot_lo_bf16 = pl.tile.set_validshape(q_rot_lo_bf16, [1, HALF_DIM])
+                q_rot_hi_bf16 = pl.tile.cast(q_rot_hi, dtype=pl.BF16)
+                q_rot_hi_bf16 = pl.tile.set_validshape(q_rot_hi_bf16, [1, HALF_DIM])
+                q_rot_lo_blk = pl.tile.reshape(q_rot_lo_bf16, [1, 1, 1, HALF_DIM])
+                q_rot_hi_blk = pl.tile.reshape(q_rot_hi_bf16, [1, 1, 1, HALF_DIM])
+                pl.tile.store(all_q_padded, q_rot_lo_blk, [pad_idx, 0, qi, 0])
+                pl.tile.store(all_q_padded, q_rot_hi_blk, [pad_idx, 0, qi, HALF_DIM])
             zpad = pl.tile.full([Q_HEAD_PAD, HEAD_DIM], value=0.0, dtype=pl.BF16)
             zpad = pl.tile.set_validshape(zpad, [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM])
-            pl.tile.store(all_q_padded, zpad, [qp_row + Q_HEAD_BATCH, 0])
+            zpad_blk = pl.tile.reshape(zpad, [1, 1, Q_HEAD_PAD, HEAD_DIM])
+            pl.tile.store(all_q_padded, zpad_blk, [pad_idx, 0, Q_HEAD_BATCH, 0])
 
     # =====================================================================
     # 2b. Flash attention, online softmax. Per batch row, per KV head: stream
@@ -348,18 +403,18 @@ def qwen3_14b_decode(
     #     (QK over head-dim, SV over seq) and the HEAD_DIM output split lo/hi
     #     so every tile stays 4 KB.
     # =====================================================================
-    # head-as-row view: a KV group's Q_HEAD_BATCH heads are contiguous rows.
-    attn_heads = pl.tensor.reshape(attn_out, [BATCH * NUM_HEADS, HEAD_DIM])
+    # attn_out blocks mirror q_proj: head h's lo/hi halves at 2h / 2h + 1.
+    attn_out = pl.create_tensor([HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.BF16)
     for b in pl.range(BATCH):
-        ctx_len = pl.tensor.read(seq_lens, [b])
-        bt_base = b * MAX_BLOCKS_PER_SEQ
+        ctx_len = pl.tensor.read(seq_lens, [b, 0, 0, 0])
         n_steps = (ctx_len + ATT_SEQ - 1) // ATT_SEQ
 
         for gi in pl.range(TOTAL_Q_GROUPS):
             kvh = gi
             q_base = kvh * Q_HEAD_BATCH
-            qp_row = b * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-            q_padded = pl.tile.load(all_q_padded, [Q_HEAD_PAD, HEAD_DIM], [qp_row, 0])
+            pad_idx = b * TOTAL_Q_GROUPS + gi
+            q_pad_blk = pl.tile.load(all_q_padded, [1, 1, Q_HEAD_PAD, HEAD_DIM], [pad_idx, 0, 0, 0])
+            q_padded = pl.tile.reshape(q_pad_blk, [Q_HEAD_PAD, HEAD_DIM])
 
             # online accumulators seeded with sentinels mi=-inf, li=0, oi=0
             mi = pl.tile.full([Q_HEAD_PAD, VEC_W], value=NEG_INF, dtype=pl.FP32)
@@ -373,20 +428,22 @@ def qwen3_14b_decode(
                 g0 = st * ATT_SEQ
                 sb = g0 // BLOCK_SIZE
                 in_block = g0 - sb * BLOCK_SIZE
-                pbid = pl.cast(pl.tensor.read(block_table, [bt_base + sb]), pl.INDEX)
-                kv_row0 = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE + in_block
+                pbid_i32 = pl.tensor.read(block_table, [b, sb, 0, 0])
+                pbid = pl.cast(pbid_i32, pl.INDEX)
                 valid_seq = pl.min(ATT_SEQ, ctx_len - g0)
 
                 # --- QK matmul: scores[Q_HEAD_PAD, ATT_SEQ] over head-dim chunks ---
                 q_sub0 = pl.tile.slice(q_padded, [Q_HEAD_PAD, QK_KD], [0, 0])
                 q_sub0 = pl.tile.set_validshape(q_sub0, [Q_HEAD_PAD, QK_KD])
-                k_sub0 = pl.tile.load(k_cache, [ATT_SEQ, QK_KD], [kv_row0, 0])
+                k_sub0_blk = pl.tile.load(k_cache, [1, 1, ATT_SEQ, QK_KD], [pbid, kvh, in_block, 0])
+                k_sub0 = pl.tile.reshape(k_sub0_blk, [ATT_SEQ, QK_KD])
                 scores = pl.tile.matmul(q_sub0, k_sub0, b_trans=True, out_dtype=pl.FP32)
                 for kd in pl.range(1, QK_KSTEPS):
                     kd0 = kd * QK_KD
                     q_sub = pl.tile.slice(q_padded, [Q_HEAD_PAD, QK_KD], [0, kd0])
                     q_sub = pl.tile.set_validshape(q_sub, [Q_HEAD_PAD, QK_KD])
-                    k_sub = pl.tile.load(k_cache, [ATT_SEQ, QK_KD], [kv_row0, kd0])
+                    k_sub_blk = pl.tile.load(k_cache, [1, 1, ATT_SEQ, QK_KD], [pbid, kvh, in_block, kd0])
+                    k_sub = pl.tile.reshape(k_sub_blk, [ATT_SEQ, QK_KD])
                     scores = pl.tile.matmul_acc(scores, q_sub, k_sub)
 
                 # --- tail-masked softmax (vec) ---
@@ -406,14 +463,19 @@ def qwen3_14b_decode(
                 # --- SV matmul: oi halves over the SV_SSTEPS == 2 seq chunks ---
                 exp_sub0 = pl.tile.slice(exp_bf16, [Q_HEAD_PAD, SV_SEQ], [0, 0])
                 exp_sub0 = pl.tile.set_validshape(exp_sub0, [Q_HEAD_PAD, SV_SEQ])
-                v_lo0 = pl.tile.load(v_cache, [SV_SEQ, HALF_DIM], [kv_row0, 0])
-                v_hi0 = pl.tile.load(v_cache, [SV_SEQ, HALF_DIM], [kv_row0, HALF_DIM])
+                v_lo0_blk = pl.tile.load(v_cache, [1, 1, SV_SEQ, HALF_DIM], [pbid, kvh, in_block, 0])
+                v_lo0 = pl.tile.reshape(v_lo0_blk, [SV_SEQ, HALF_DIM])
+                v_hi0_blk = pl.tile.load(v_cache, [1, 1, SV_SEQ, HALF_DIM], [pbid, kvh, in_block, HALF_DIM])
+                v_hi0 = pl.tile.reshape(v_hi0_blk, [SV_SEQ, HALF_DIM])
                 oi_lo_tmp = pl.tile.matmul(exp_sub0, v_lo0, out_dtype=pl.FP32)
                 oi_hi_tmp = pl.tile.matmul(exp_sub0, v_hi0, out_dtype=pl.FP32)
                 exp_sub1 = pl.tile.slice(exp_bf16, [Q_HEAD_PAD, SV_SEQ], [0, SV_SEQ])
                 exp_sub1 = pl.tile.set_validshape(exp_sub1, [Q_HEAD_PAD, SV_SEQ])
-                v_lo1 = pl.tile.load(v_cache, [SV_SEQ, HALF_DIM], [kv_row0 + SV_SEQ, 0])
-                v_hi1 = pl.tile.load(v_cache, [SV_SEQ, HALF_DIM], [kv_row0 + SV_SEQ, HALF_DIM])
+                in_block1 = in_block + SV_SEQ
+                v_lo1_blk = pl.tile.load(v_cache, [1, 1, SV_SEQ, HALF_DIM], [pbid, kvh, in_block1, 0])
+                v_lo1 = pl.tile.reshape(v_lo1_blk, [SV_SEQ, HALF_DIM])
+                v_hi1_blk = pl.tile.load(v_cache, [1, 1, SV_SEQ, HALF_DIM], [pbid, kvh, in_block1, HALF_DIM])
+                v_hi1 = pl.tile.reshape(v_hi1_blk, [SV_SEQ, HALF_DIM])
                 oi_lo_tmp = pl.tile.matmul_acc(oi_lo_tmp, exp_sub1, v_lo1)
                 oi_hi_tmp = pl.tile.matmul_acc(oi_hi_tmp, exp_sub1, v_hi1)
 
@@ -442,49 +504,60 @@ def qwen3_14b_decode(
                 oi_hi = pl.tile.add(oi_hi_a, oi_hi_b)
                 mi = mi_new
 
-            # ctx = oi / li, trim Q_HEAD_PAD -> Q_HEAD_BATCH, store lo/hi blocks
+            # ctx = oi / li, trim Q_HEAD_PAD -> Q_HEAD_BATCH rows; per head row
+            # qi, the lo/hi halves land in attn_out blocks 2(q_base+qi) / +1.
             ctx_lo = pl.tile.row_expand_div(oi_lo, li)
             ctx_hi = pl.tile.row_expand_div(oi_hi, li)
-            head_row0 = b * NUM_HEADS + q_base
-            lo5 = pl.tile.slice(ctx_lo, [Q_HEAD_BATCH, HALF_DIM], [0, 0])
-            lo5 = pl.tile.set_validshape(lo5, [Q_HEAD_BATCH, HALF_DIM])
-            lo5_bf16 = pl.tile.cast(lo5, dtype=pl.BF16)
-            lo5_bf16 = pl.tile.set_validshape(lo5_bf16, [Q_HEAD_BATCH, HALF_DIM])
-            pl.tile.store(attn_heads, lo5_bf16, [head_row0, 0])
-            hi5 = pl.tile.slice(ctx_hi, [Q_HEAD_BATCH, HALF_DIM], [0, 0])
-            hi5 = pl.tile.set_validshape(hi5, [Q_HEAD_BATCH, HALF_DIM])
-            hi5_bf16 = pl.tile.cast(hi5, dtype=pl.BF16)
-            hi5_bf16 = pl.tile.set_validshape(hi5_bf16, [Q_HEAD_BATCH, HALF_DIM])
-            pl.tile.store(attn_heads, hi5_bf16, [head_row0, HALF_DIM])
+            for qi in pl.range(Q_HEAD_BATCH):
+                h_blo = (q_base + qi) * HALVES_PER_HEAD
+                lo1 = pl.tile.slice(ctx_lo, [1, HALF_DIM], [qi, 0])
+                lo1 = pl.tile.set_validshape(lo1, [1, HALF_DIM])
+                lo1_bf16 = pl.tile.cast(lo1, dtype=pl.BF16)
+                lo1_bf16 = pl.tile.set_validshape(lo1_bf16, [1, HALF_DIM])
+                lo1_blk = pl.tile.reshape(lo1_bf16, [1, 1, 1, HALF_DIM])
+                pl.tile.store(attn_out, lo1_blk, [h_blo, 0, b, 0])
+                hi1 = pl.tile.slice(ctx_hi, [1, HALF_DIM], [qi, 0])
+                hi1 = pl.tile.set_validshape(hi1, [1, HALF_DIM])
+                hi1_bf16 = pl.tile.cast(hi1, dtype=pl.BF16)
+                hi1_bf16 = pl.tile.set_validshape(hi1_bf16, [1, HALF_DIM])
+                hi1_blk = pl.tile.reshape(hi1_bf16, [1, 1, 1, HALF_DIM])
+                pl.tile.store(attn_out, hi1_blk, [h_blo + 1, 0, b, 0])
 
     # =====================================================================
     # 3. Output projection + residual -> post-RMSNorm -> MLP -> residual.
+    #    An MM_K activation chunk kb sits in MM_N block kb // 2, half kb % 2;
+    #    an MM_N residual chunk sits in hidden block nb // 2, half nb % 2.
     # =====================================================================
     # --- out-proj + residual: resid1 = attn_out @ wo + current_hidden ---
+    resid1 = pl.create_tensor([HIDDEN // MM_N, 1, BATCH, MM_N], dtype=pl.FP32)
     for nb in pl.range(HIDDEN // MM_N):
-        n0 = nb * MM_N
-        a0 = pl.tile.load(attn_out, [BATCH, MM_K], [0, 0])
+        a0_blk = pl.tile.load(attn_out, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        a0 = pl.tile.reshape(a0_blk, [BATCH, MM_K])
         a0 = pl.tile.set_validshape(a0, [BATCH, MM_K])
-        w0 = pl.tile.load(wo, [MM_K, MM_N], [0, n0])
+        w0_blk = pl.tile.load(wo, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        w0 = pl.tile.reshape(w0_blk, [MM_K, MM_N])
         acc = pl.tile.matmul(a0, w0, out_dtype=pl.FP32)
         for kb in pl.range(1, HIDDEN // MM_K):
-            k0 = kb * MM_K
-            a = pl.tile.load(attn_out, [BATCH, MM_K], [0, k0])
+            a_blk = pl.tile.load(attn_out, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            a = pl.tile.reshape(a_blk, [BATCH, MM_K])
             a = pl.tile.set_validshape(a, [BATCH, MM_K])
-            w = pl.tile.load(wo, [MM_K, MM_N], [k0, n0])
+            w_blk = pl.tile.load(wo, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            w = pl.tile.reshape(w_blk, [MM_K, MM_N])
             acc = pl.tile.matmul_acc(acc, a, w)
-        resid_bf16 = pl.tile.load(current_hidden, [BATCH, MM_N], [0, n0])
+        resid_blk = pl.tile.load(current_hidden, [1, 1, BATCH, MM_N], [nb // 2, 0, 0, (nb % 2) * MM_N])
+        resid_bf16 = pl.tile.reshape(resid_blk, [BATCH, MM_N])
         resid_bf16 = pl.tile.set_validshape(resid_bf16, [BATCH, MM_N])
         resid = pl.tile.cast(resid_bf16, dtype=pl.FP32)
         out_sum = pl.tile.add(acc, resid)
-        pl.tile.store(resid1, out_sum, [0, n0])
+        out_blk = pl.tile.reshape(out_sum, [1, 1, BATCH, MM_N])
+        pl.tile.store(resid1, out_blk, [nb, 0, 0, 0])
 
     # --- post-attention RMSNorm: post_norm = (resid1 / rms) * post_gamma ---
     sumsq = pl.tile.full([BATCH, VEC_W], value=0.0, dtype=pl.FP32)
     sumsq = pl.tile.set_validshape(sumsq, [BATCH, 1])
-    for kb in pl.range(HIDDEN // VEC_W):
-        k0 = kb * VEC_W
-        x = pl.tile.load(resid1, [BATCH, VEC_W], [0, k0])
+    for kb in pl.range(HIDDEN // MM_N):
+        x_blk = pl.tile.load(resid1, [1, 1, BATCH, VEC_W], [kb, 0, 0, 0])
+        x = pl.tile.reshape(x_blk, [BATCH, VEC_W])
         sq = pl.tile.mul(x, x)
         part = pl.tile.row_sum(sq)
         part = pl.tile.set_validshape(part, [BATCH, 1])
@@ -500,33 +573,42 @@ def qwen3_14b_decode(
     inv_rms = pl.tile.recip(rms)
     inv_rms = pl.tile.set_validshape(inv_rms, [BATCH, 1])
 
-    for kb in pl.range(HIDDEN // VEC_W):
-        k0 = kb * VEC_W
-        x = pl.tile.load(resid1, [BATCH, VEC_W], [0, k0])
-        gamma = pl.tile.load(post_rms_weight, [1, VEC_W], [0, k0])
+    # post_gamma block kb // 2 holds the two VEC_W halves of each VEC_BF16 chunk
+    post_norm = pl.create_tensor([HIDDEN // MM_N, 1, BATCH, VEC_W], dtype=pl.BF16)
+    for kb in pl.range(HIDDEN // MM_N):
+        x_blk = pl.tile.load(resid1, [1, 1, BATCH, VEC_W], [kb, 0, 0, 0])
+        x = pl.tile.reshape(x_blk, [BATCH, VEC_W])
+        gamma_blk = pl.tile.load(post_rms_weight, [1, 1, 1, VEC_W], [kb // 2, 0, 0, (kb % 2) * VEC_W])
+        gamma = pl.tile.reshape(gamma_blk, [1, VEC_W])
         gamma = pl.tile.set_validshape(gamma, [1, VEC_W])
         x_scaled = pl.tile.row_expand_mul(x, inv_rms)
         normed = pl.tile.col_expand_mul(x_scaled, gamma)
         normed_bf16 = pl.tile.cast(normed, dtype=pl.BF16)
         normed_bf16 = pl.tile.set_validshape(normed_bf16, [BATCH, VEC_W])
-        pl.tile.store(post_norm, normed_bf16, [0, k0])
+        normed_blk = pl.tile.reshape(normed_bf16, [1, 1, BATCH, VEC_W])
+        pl.tile.store(post_norm, normed_blk, [kb, 0, 0, 0])
 
     # --- MLP gate/up + SiLU: mlp = (silu(post_norm @ w_gate)) * (post_norm @ w_up) ---
     # gate and up share one K-loop over the post_norm activation tiles.
+    mlp = pl.create_tensor([INTERMEDIATE // MM_N, 1, BATCH, MM_N], dtype=pl.BF16)
     for nb in pl.range(INTERMEDIATE // MM_N):
-        n0 = nb * MM_N
-        p0 = pl.tile.load(post_norm, [BATCH, MM_K], [0, 0])
+        p0_blk = pl.tile.load(post_norm, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        p0 = pl.tile.reshape(p0_blk, [BATCH, MM_K])
         p0 = pl.tile.set_validshape(p0, [BATCH, MM_K])
-        wg0 = pl.tile.load(w_gate, [MM_K, MM_N], [0, n0])
-        wu0 = pl.tile.load(w_up, [MM_K, MM_N], [0, n0])
+        wg0_blk = pl.tile.load(w_gate, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        wg0 = pl.tile.reshape(wg0_blk, [MM_K, MM_N])
+        wu0_blk = pl.tile.load(w_up, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        wu0 = pl.tile.reshape(wu0_blk, [MM_K, MM_N])
         gate_acc = pl.tile.matmul(p0, wg0, out_dtype=pl.FP32)
         up_acc = pl.tile.matmul(p0, wu0, out_dtype=pl.FP32)
         for kb in pl.range(1, HIDDEN // MM_K):
-            k0 = kb * MM_K
-            p = pl.tile.load(post_norm, [BATCH, MM_K], [0, k0])
+            p_blk = pl.tile.load(post_norm, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            p = pl.tile.reshape(p_blk, [BATCH, MM_K])
             p = pl.tile.set_validshape(p, [BATCH, MM_K])
-            wg = pl.tile.load(w_gate, [MM_K, MM_N], [k0, n0])
-            wu = pl.tile.load(w_up, [MM_K, MM_N], [k0, n0])
+            wg_blk = pl.tile.load(w_gate, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            wg = pl.tile.reshape(wg_blk, [MM_K, MM_N])
+            wu_blk = pl.tile.load(w_up, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            wu = pl.tile.reshape(wu_blk, [MM_K, MM_N])
             gate_acc = pl.tile.matmul_acc(gate_acc, p, wg)
             up_acc = pl.tile.matmul_acc(up_acc, p, wu)
         # SiLU(gate) * up = (gate * sigmoid(gate)) * up
@@ -538,23 +620,28 @@ def qwen3_14b_decode(
         mlp_chunk = pl.tile.mul(gate_sig, up_acc)
         mlp_bf16 = pl.tile.cast(mlp_chunk, dtype=pl.BF16)
         mlp_bf16 = pl.tile.set_validshape(mlp_bf16, [BATCH, MM_N])
-        pl.tile.store(mlp, mlp_bf16, [0, n0])
+        mlp_blk = pl.tile.reshape(mlp_bf16, [1, 1, BATCH, MM_N])
+        pl.tile.store(mlp, mlp_blk, [nb, 0, 0, 0])
 
     # --- down-proj + residual: next_hidden = mlp @ w_down + resid1 ---
     for nb in pl.range(HIDDEN // MM_N):
-        n0 = nb * MM_N
-        m0 = pl.tile.load(mlp, [BATCH, MM_K], [0, 0])
+        m0_blk = pl.tile.load(mlp, [1, 1, BATCH, MM_K], [0, 0, 0, 0])
+        m0 = pl.tile.reshape(m0_blk, [BATCH, MM_K])
         m0 = pl.tile.set_validshape(m0, [BATCH, MM_K])
-        wd0 = pl.tile.load(w_down, [MM_K, MM_N], [0, n0])
+        wd0_blk = pl.tile.load(w_down, [1, 1, MM_K, MM_N], [0, nb, 0, 0])
+        wd0 = pl.tile.reshape(wd0_blk, [MM_K, MM_N])
         acc = pl.tile.matmul(m0, wd0, out_dtype=pl.FP32)
         for kb in pl.range(1, INTERMEDIATE // MM_K):
-            k0 = kb * MM_K
-            m = pl.tile.load(mlp, [BATCH, MM_K], [0, k0])
+            m_blk = pl.tile.load(mlp, [1, 1, BATCH, MM_K], [kb // 2, 0, 0, (kb % 2) * MM_K])
+            m = pl.tile.reshape(m_blk, [BATCH, MM_K])
             m = pl.tile.set_validshape(m, [BATCH, MM_K])
-            wd = pl.tile.load(w_down, [MM_K, MM_N], [k0, n0])
+            wd_blk = pl.tile.load(w_down, [1, 1, MM_K, MM_N], [kb, nb, 0, 0])
+            wd = pl.tile.reshape(wd_blk, [MM_K, MM_N])
             acc = pl.tile.matmul_acc(acc, m, wd)
-        resid = pl.tile.load(resid1, [BATCH, MM_N], [0, n0])
+        resid_blk = pl.tile.load(resid1, [1, 1, BATCH, MM_N], [nb, 0, 0, 0])
+        resid = pl.tile.reshape(resid_blk, [BATCH, MM_N])
         out_sum = pl.tile.add(acc, resid)
         out_bf16 = pl.tile.cast(out_sum, dtype=pl.BF16)
         out_bf16 = pl.tile.set_validshape(out_bf16, [BATCH, MM_N])
-        pl.tile.store(next_hidden, out_bf16, [0, n0])
+        out_blk = pl.tile.reshape(out_bf16, [1, 1, BATCH, MM_N])
+        pl.tile.store(next_hidden, out_blk, [nb, 0, 0, 0])
