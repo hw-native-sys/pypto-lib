@@ -599,8 +599,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # fa_fused cube/vector work instead of serializing them at the head of the
     # MLP manual_scope. Their TASK_IDs (seed_tid / gate_seed_tid / up_seed_tid)
     # cross into the manual_scope below as explicit deps — the same pattern as
-    # attn_fence's attn_done_tid. The accumulator create_tensor calls move up
-    # with them (a seed must follow its tensor's allocation).
+    # online_softmax's captured online_done_tid. The accumulator create_tensor
+    # calls move up with them (a seed must follow its tensor's allocation).
     down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
     up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
@@ -698,11 +698,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
                 all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
 
-    # online_softmax: flat top-level spmd, writes attn_out directly. Unchanged —
-    # reduces per-block partials across ALL blocks of a lane (hence across the
-    # KV partitions that produced them); auto-dep on the scratch serializes it
-    # after every contributing fa_fused partition.
-    for os_core in pl.spmd(NUM_CORES * 2, name_hint="online_softmax"):
+    # online_softmax: flat top-level spmd, writes attn_out directly. Reduces the
+    # per-block partials across ALL blocks of a lane (hence across the KV
+    # partitions that produced them); auto-dep on the scratch serializes it after
+    # every contributing fa_fused partition. Captured in the `as tid` form so the
+    # dispatch's producer TASK_ID (online_done_tid) crosses directly into the MLP
+    # manual_scope as the out_proj dep — no dummy attn_fence task needed.
+    with pl.spmd(NUM_CORES * 2, name_hint="online_softmax") as online_done_tid:
+        os_core = pl.tile.get_block_idx()
         # Grid-stride over online_softmax work items (one per (b, kvh) lane).
         for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
             os_b = os_spmd_idx // NUM_KV_HEADS
@@ -759,15 +762,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
             attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
 
-    # ── Scope 3a: attn_fence — bridges attn→out_proj across the manual_scope
-    # boundary. Reads attn_out (so it auto-deps on the attn loop writers). ──
-    attn_fence_dummy = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_fence") as attn_done_tid:
-        attn_touch_data = pl.cast(attn_out[0:BATCH, 0:K_CHUNK], target_type=pl.FP32)
-        attn_touch_sum = pl.row_sum(attn_touch_data)
-        attn_fence_dummy = pl.assemble(attn_fence_dummy, attn_touch_sum, [0, 0])
-
     # ── Scope 3b: manual_scope MLP block. ──
+    # out_proj depends on online_done_tid (the captured online_softmax dispatch
+    # TASK_ID) directly — bridging attn→out_proj across the manual_scope boundary
+    # without a dummy attn_fence task.
     with pl.manual_scope():
         silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
         down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
@@ -784,7 +782,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="out_proj",
-                    deps=[out_seed_tid, attn_done_tid],
+                    deps=[out_seed_tid, online_done_tid],
                 ) as out_tid:
                     out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
                     out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
