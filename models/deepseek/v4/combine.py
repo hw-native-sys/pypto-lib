@@ -45,18 +45,26 @@ def combine(
     routed_y_buf_flat = pl.reshape(routed_y_buf, [T * N_LOCAL_EXPERTS, D])
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_scatter"):
-        for rb in pl.range(T * N_LOCAL_EXPERTS // 16):
-            r0 = rb * 16
-            routed_y_buf_flat[r0:r0 + 16, :] = pl.full([16, D], dtype=pl.BF16, value=0.0)
+    # Token-major 2D view: row t, cols [e*D, (e+1)*D) hold routed_y_buf[t, e, :].
+    routed_y_buf_2d = pl.reshape(routed_y_buf, [T, N_LOCAL_EXPERTS * D])
 
-        for e in pl.range(N_LOCAL_EXPERTS):
-            n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
-            for s in pl.range(n_rows):
-                i = e * RECV_MAX + s
-                t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
-                dst = t * N_LOCAL_EXPERTS + e
-                routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
+    # Per-expert scatter: block e owns exactly the (t, e) cells of routed_y_buf
+    # (rows dst % N_LOCAL_EXPERTS == e in the flat view), so blocks never alias
+    # each other. Zero-init + scatter stay in the same block, preserving the
+    # zero -> overwrite ordering per cell that the duplicate-token (hash route)
+    # semantics require. ZERO_ROWS chunks keep each strided fill inside UB.
+    ZERO_ROWS = 16
+    for e in pl.spmd(N_LOCAL_EXPERTS, name_hint="combine_scatter"):
+        for z0 in pl.range(0, T, ZERO_ROWS):
+            routed_y_buf_2d[z0 : z0 + ZERO_ROWS, e * D : (e + 1) * D] = pl.full(
+                [ZERO_ROWS, D], dtype=pl.BF16, value=0.0
+            )
+        n_rows = pl.cast(pl.read(recv_expert_count, [e, 0]), pl.INDEX)
+        for s in pl.range(n_rows):
+            i = e * RECV_MAX + s
+            t = pl.cast(pl.read(recv_token, [e, s]), pl.INDEX)
+            dst = t * N_LOCAL_EXPERTS + e
+            routed_y_buf_flat[dst:dst+1, :] = recv_y_flat[i:i+1, :]
 
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):

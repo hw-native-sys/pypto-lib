@@ -362,7 +362,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="fix the torch RNG for reproducible inputs/routing "
+                             "(default: keep random behavior)")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        import torch
+        torch.manual_seed(args.seed)
 
     result = run_jit(
         fn=moe_test,

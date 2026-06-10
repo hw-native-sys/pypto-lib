@@ -49,39 +49,54 @@ def dispatch(
     # data-dependent. Small route metadata uses the natural 2-D layout.
     recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch"):
-        # Zero-init tail slots so downstream consumers (expert_routed / combine)
-        # can rely on slot >= recv_expert_count[e] being neutral:
-        #   - recv_scale_dq = 0 -> dequant of any recv_x tail row yields 0
-        #   - recv_weights  = 0 -> combine's weighted reduction skips tail rows
-        #   - recv_token    = 0 -> safe scatter target (combine ignores via count)
-        # The recv_x INT8 tail is left uninitialized; pairing it with scale_dq=0
-        # is sufficient to neutralize its contribution after dequant.
-        # Vectorized tail zero-init: one fill per buffer instead of
-        # N_LOCAL_EXPERTS * RECV_MAX scalar writes. Same neutral tails, far less
-        # scalar-store time on this serial CORE_GROUP kernel (which sits on the
-        # decode critical path between gate and expert_routed).
-        recv_scale_dq[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32, value=0.0)
-        recv_weights[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.FP32, value=0.0)
-        recv_token[:, :] = pl.full([N_LOCAL_EXPERTS, RECV_MAX], dtype=pl.INT32, value=0)
-        # recv_expert_count is [E, 1] -- a 4-byte row that fails the 32B tile
-        # alignment for a vector fill, so zero its E entries with scalar writes.
-        for e in pl.range(N_LOCAL_EXPERTS):
-            pl.write(recv_expert_count, [e, 0], pl.cast(0, pl.INT32))
+    # Per-expert parallel scatter: block e scans all (t, k) routes and packs
+    # only its own rows, so every output row/slot is owned by exactly one block
+    # (no cross-block alias). Slot order = (t, k) scan order, identical to the
+    # legacy serial scatter. Tail slots stay neutral:
+    #   - recv_scale_dq = 0 -> dequant of any recv_x tail row yields 0
+    #   - recv_weights  = 0 -> combine's weighted reduction skips tail rows
+    #   - recv_token    = 0 -> safe scatter target (combine ignores via count)
+    # The recv_x INT8 tail is left uninitialized; pairing it with scale_dq=0
+    # is sufficient to neutralize its contribution after dequant.
+    for e in pl.spmd(N_LOCAL_EXPERTS, name_hint="dispatch"):
+        recv_scale_dq[e : e + 1, :] = pl.full([1, RECV_MAX], dtype=pl.FP32, value=0.0)
+        recv_weights[e : e + 1, :] = pl.full([1, RECV_MAX], dtype=pl.FP32, value=0.0)
+        recv_token[e : e + 1, :] = pl.full([1, RECV_MAX], dtype=pl.INT32, value=0)
 
+        # Track the token index in an INT32 register: a static pl.range loop
+        # var used as a slice index or scalar value inside pl.spmd gets
+        # mis-hoisted into an undeclared host scalar by orchestration codegen.
+        slot_i32 = pl.const(0, pl.INT32)
+        tok_i32 = pl.const(0, pl.INT32)
         for t in pl.range(T):
             for k in pl.range(TOPK):
                 e_global = pl.read(indices, [t, k])
-                e = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
-                slot_i32 = pl.read(recv_expert_count, [e, 0])
-                slot = pl.cast(slot_i32, pl.INDEX)
-                dst = e * RECV_MAX + slot
+                eg = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
+                if eg == e:
+                    slot = pl.cast(slot_i32, pl.INDEX)
+                    dst = e * RECV_MAX + slot
+                    ti = pl.cast(tok_i32, pl.INDEX)
+                    recv_x_flat[dst : dst + 1, :] = x_norm_i8[ti : ti + 1, :]
+                    pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale, [ti, 0]))
+                    pl.write(recv_weights, [e, slot], pl.read(weights, [ti, k]))
+                    pl.write(recv_token, [e, slot], tok_i32)
+                    slot_i32 = slot_i32 + pl.const(1, pl.INT32)
+            tok_i32 = tok_i32 + pl.const(1, pl.INT32)
 
-                recv_x_flat = pl.assemble(recv_x_flat, pl.slice(x_norm_i8, [1, D], [t, 0]), [dst, 0])
-                pl.write(recv_scale_dq, [e, slot], pl.read(x_norm_scale, [t, 0]))
-                pl.write(recv_weights, [e, slot], pl.read(weights, [t, k]))
-                pl.write(recv_token, [e, slot], pl.cast(t, pl.INT32))
-                pl.write(recv_expert_count, [e, 0], pl.cast(slot_i32 + 1, pl.INT32))
+    # recv_expert_count is written by this single serial kernel, not by the
+    # spmd blocks: its [E, 1] INT32 column spans a single 64B cache line, and
+    # 16 cores scalar-writing one line lose updates. The histogram only needs
+    # T*TOPK index reads, so this runs concurrently with the scatter blocks
+    # (disjoint outputs) and stays off the dispatch critical path.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_count"):
+        for ce in pl.range(N_LOCAL_EXPERTS):
+            pl.write(recv_expert_count, [ce, 0], pl.cast(0, pl.INT32))
+        for t in pl.range(T):
+            for k in pl.range(TOPK):
+                e_global = pl.read(indices, [t, k])
+                eg = pl.cast(e_global - EXPERTS_START_IDX, pl.INDEX)
+                cnt = pl.read(recv_expert_count, [eg, 0])
+                pl.write(recv_expert_count, [eg, 0], cnt + pl.const(1, pl.INT32))
 
 
 W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
