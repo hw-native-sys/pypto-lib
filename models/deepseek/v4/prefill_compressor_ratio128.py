@@ -292,39 +292,43 @@ def prefill_compressor_ratio128_packed(
         kv_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = kv_acc
         score_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = score_acc
 
-    for state_t0 in pl.parallel(0, MAX_TOKENS, HCA_KV_STORE_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_update"):
-            for dt in pl.range(HCA_KV_STORE_TILE):
-                t = state_t0 + dt
-                if t < num_tokens:
-                    req = pl.cast(pl.read(token_to_request, [t]), pl.INDEX)
-                    pos = pl.read(position_ids, [t])
-                    state_slot = pl.cast(pos % COMPRESS_RATIO, pl.INDEX)
-                    state_row = req * MAIN_STATE_LEN + state_slot
-                    for ob in pl.pipeline(0, CMP_OUT_BLOCKS, stage=4):
-                        o0 = ob * CMP_OUT_CHUNK
-                        ape_row = ape[state_slot : state_slot + 1, o0 : o0 + CMP_OUT_CHUNK]
-                        score_row = pl.add(score_proj[t : t + 1, o0 : o0 + CMP_OUT_CHUNK], ape_row)
-                        kv_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = kv_proj[
-                            t : t + 1,
-                            o0 : o0 + CMP_OUT_CHUNK,
-                        ]
-                        score_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = score_row
-                else:
-                    score_proj[t : t + 1, 0:CMP_OUT_CHUNK] = score_proj[t : t + 1, 0:CMP_OUT_CHUNK]
-
     for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
         write_i = pool_idx // CMP_HEAD_BLOCKS
         hb = pool_idx - write_i * CMP_HEAD_BLOCKS
         h0 = hb * CMP_HEAD_CHUNK
+        pool_kv_tile = pl.create_tensor([MAIN_STATE_LEN, CMP_HEAD_CHUNK], dtype=pl.FP32)
+        pool_score_tile = pl.create_tensor([MAIN_STATE_LEN, CMP_HEAD_CHUNK], dtype=pl.FP32)
         if write_i < num_cmp_writes:
             write_token = pl.cast(pl.read(cmp_write_token_ids, [write_i]), pl.INDEX)
+            write_pos = pl.read(position_ids, [write_token])
             req = pl.cast(pl.read(token_to_request, [write_token]), pl.INDEX)
             state_row0 = req * MAIN_STATE_LEN
-            score_tile = score_state_flat[state_row0 : state_row0 + MAIN_STATE_LEN, h0 : h0 + CMP_HEAD_CHUNK]
-            kv_tile = kv_state_flat[state_row0 : state_row0 + MAIN_STATE_LEN, h0 : h0 + CMP_HEAD_CHUNK]
-            score_t = pl.transpose(score_tile, axis1=0, axis2=1)
-            kv_t = pl.transpose(kv_tile, axis1=0, axis2=1)
+            for pool_state_i in pl.range(MAIN_STATE_LEN):
+                pool_state_row = state_row0 + pool_state_i
+                pool_kv_tile[pool_state_i : pool_state_i + 1, 0:CMP_HEAD_CHUNK] = kv_state_flat[
+                    pool_state_row : pool_state_row + 1,
+                    h0 : h0 + CMP_HEAD_CHUNK,
+                ]
+                pool_score_tile[pool_state_i : pool_state_i + 1, 0:CMP_HEAD_CHUNK] = score_state_flat[
+                    pool_state_row : pool_state_row + 1,
+                    h0 : h0 + CMP_HEAD_CHUNK,
+                ]
+            for pool_t in pl.range(MAX_TOKENS):
+                if pool_t < num_tokens:
+                    pool_req = pl.cast(pl.read(token_to_request, [pool_t]), pl.INDEX)
+                    pool_pos = pl.read(position_ids, [pool_t])
+                    if pool_req == req:
+                        if pool_pos <= write_pos:
+                            pool_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
+                            pool_ape = ape[pool_slot : pool_slot + 1, h0 : h0 + CMP_HEAD_CHUNK]
+                            pool_score = pl.add(score_proj[pool_t : pool_t + 1, h0 : h0 + CMP_HEAD_CHUNK], pool_ape)
+                            pool_kv_tile[pool_slot : pool_slot + 1, 0:CMP_HEAD_CHUNK] = kv_proj[
+                                pool_t : pool_t + 1,
+                                h0 : h0 + CMP_HEAD_CHUNK,
+                            ]
+                            pool_score_tile[pool_slot : pool_slot + 1, 0:CMP_HEAD_CHUNK] = pool_score
+            score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
+            kv_t = pl.transpose(pool_kv_tile, axis1=0, axis2=1)
             score_max = pl.row_max(score_t)
             score_exp = pl.exp(pl.row_expand_sub(score_t, score_max))
             score_sum = pl.row_sum(score_exp)
@@ -415,6 +419,27 @@ def prefill_compressor_ratio128_packed(
                     final_i : final_i + 1,
                     0:CMP_HEAD_CHUNK,
                 ]
+
+    for state_t0 in pl.parallel(0, MAX_TOKENS, HCA_KV_STORE_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_state_update"):
+            for dt in pl.range(HCA_KV_STORE_TILE):
+                t = state_t0 + dt
+                if t < num_tokens:
+                    req = pl.cast(pl.read(token_to_request, [t]), pl.INDEX)
+                    pos = pl.read(position_ids, [t])
+                    state_slot = pl.cast(pos % COMPRESS_RATIO, pl.INDEX)
+                    state_row = req * MAIN_STATE_LEN + state_slot
+                    for ob in pl.pipeline(0, CMP_OUT_BLOCKS, stage=4):
+                        o0 = ob * CMP_OUT_CHUNK
+                        ape_row = ape[state_slot : state_slot + 1, o0 : o0 + CMP_OUT_CHUNK]
+                        score_row = pl.add(score_proj[t : t + 1, o0 : o0 + CMP_OUT_CHUNK], ape_row)
+                        kv_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = kv_proj[
+                            t : t + 1,
+                            o0 : o0 + CMP_OUT_CHUNK,
+                        ]
+                        score_state_flat[state_row : state_row + 1, o0 : o0 + CMP_OUT_CHUNK] = score_row
+                else:
+                    score_proj[t : t + 1, 0:CMP_OUT_CHUNK] = score_proj[t : t + 1, 0:CMP_OUT_CHUNK]
 
     cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv_state = pl.reshape(kv_state_flat, [MAX_REQS, MAIN_STATE_LEN, MAIN_OUT_DIM])

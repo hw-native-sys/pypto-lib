@@ -31,7 +31,7 @@ from prefill_sparse_attn import (
     SOFTMAX_SCALE,
     TOPK as SPARSE_TOPK,
     _quant_w_per_channel,
-    prefill_hca_packed_sparse_attn,
+    prefill_packed_sparse_attn_overlay,
 )
 
 
@@ -70,41 +70,67 @@ HCA_ORI_BLOCK_NUM = MAX_REQS * SPARSE_ORI_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = MAX_REQS * SPARSE_CMP_MAX_BLOCKS
 HCA_CASES = (
     "custom",
+    "basic1",
     "basic128",
     "basic96",
     "basic17",
+    "suffix64_16",
     "suffix96_17",
     "suffix96_32",
+    "suffix100_50",
+    "suffix100_128",
     "suffix128_17",
+    "suffix255_1",
+    "suffix1000_50",
     "hetero_smoke",
     "hetero_boundary",
     "hetero_mixed_cmp_pos",
+    "hetero_mixed_overlay_cmp",
+    "hetero_boundary_overlay_cmp",
+    "hetero_long_suffix_overlay_cmp",
+    "hetero_full_capacity_overlay_cmp",
+    "hetero_single_long_mix_overlay_cmp",
 )
 
 HCA_KV_STORE_TILE = 16
+HCA_WRITEBACK_DEP_COLS = 16
 
 assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
 assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
 assert SPARSE_ORI_BLOCK_NUM == B * SPARSE_ORI_MAX_BLOCKS
 assert SPARSE_CMP_BLOCK_NUM == B * SPARSE_CMP_MAX_BLOCKS
 assert PREFILL_COMPRESSED_LEN == 1
+assert HCA_WRITEBACK_DEP_COLS == 16, "16 BF16 values form a 32-byte dependency sentinel"
+assert HCA_WRITEBACK_DEP_COLS < HEAD_DIM, "writeback dependency sentinel must be narrower than a KV row"
 
 
 @pl.jit.inline
-def _prefill_hca_write_prompt_kv(
+def _prefill_hca_cache_writeback_overlay(
     kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    attn_out: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     for t0 in pl.parallel(0, MAX_TOKENS, HCA_KV_STORE_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_write_prompt_kv"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_cache_writeback_overlay"):
             for dt in pl.range(HCA_KV_STORE_TILE):
                 t = t0 + dt
                 if t < num_tokens:
-                    kv_store_row = pl.cast(pl.read(ori_slot_mapping, [t]), pl.INDEX)
-                    ori_kv_flat[kv_store_row : kv_store_row + 1, 0:HEAD_DIM] = kv[t : t + 1, 0:HEAD_DIM]
+                    dst_row = pl.cast(pl.read(ori_slot_mapping, [t]), pl.INDEX)
+                    dep = pl.cast(
+                        attn_out[t : t + 1, 0:HCA_WRITEBACK_DEP_COLS],
+                        target_type=pl.FP32,
+                    )
+                    dep = pl.mul(dep, 0.0)
+                    kv_head = pl.cast(kv[t : t + 1, 0:HCA_WRITEBACK_DEP_COLS], target_type=pl.FP32)
+                    kv_head_dep = pl.cast(pl.add(kv_head, dep), target_type=pl.BF16)
+                    ori_kv_flat[dst_row : dst_row + 1, 0:HCA_WRITEBACK_DEP_COLS] = kv_head_dep
+                    ori_kv_flat[dst_row : dst_row + 1, HCA_WRITEBACK_DEP_COLS:HEAD_DIM] = kv[
+                        t : t + 1,
+                        HCA_WRITEBACK_DEP_COLS:HEAD_DIM,
+                    ]
     return pl.reshape(ori_kv_flat, [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
 
@@ -189,7 +215,6 @@ def prefill_attention_hca(
         num_tokens,
     )
 
-    kv_cache = _prefill_hca_write_prompt_kv(kv, kv_cache, ori_slot_mapping, num_tokens)
     cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio128_packed(
         x_normed,
         cmp_kv_state,
@@ -210,10 +235,11 @@ def prefill_attention_hca(
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_hca_packed_sparse_attn(
+    attn_out = prefill_packed_sparse_attn_overlay(
         q,
         kv_cache,
         ori_block_table,
+        kv,
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
@@ -227,6 +253,7 @@ def prefill_attention_hca(
         wo_b_scale,
         attn_out,
     )
+    kv_cache = _prefill_hca_cache_writeback_overlay(kv, kv_cache, ori_slot_mapping, attn_out, num_tokens)
 
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
@@ -264,12 +291,13 @@ def _int8_quant_per_row(x):
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
-def _golden_hca_packed_sparse_attn(tensors, q, ori_kv, cmp_kv, rope_cos_t, rope_sin_t, attn_out):
+def _golden_hca_packed_sparse_attn(tensors, q, ori_kv, kv_overlay, cmp_kv, rope_cos_t, rope_sin_t, attn_out):
     import torch
 
     num_tokens = int(tensors["num_tokens"])
     q_f32 = q.float()
     ori_kv_f32 = ori_kv.float()
+    kv_overlay_f32 = kv_overlay.float()
     cmp_kv_f32 = cmp_kv.float()
     ori_block_table = tensors["ori_block_table"]
     cmp_block_table = tensors["cmp_block_table"]
@@ -288,12 +316,16 @@ def _golden_hca_packed_sparse_attn(tensors, q, ori_kv, cmp_kv, rope_cos_t, rope_
             raw = int(raw_i)
             if raw < 0:
                 continue
-            if raw < S:
+            if raw < WIN:
                 blk_id = int(ori_block_table[req, raw // BLOCK_SIZE].item())
                 intra = raw % BLOCK_SIZE
                 gathered.append(ori_kv_f32[blk_id, intra, 0])
+            elif raw < WIN + MAX_TOKENS:
+                overlay_t = raw - WIN
+                if overlay_t < num_tokens:
+                    gathered.append(kv_overlay_f32[overlay_t])
             else:
-                cmp_slot = raw - S
+                cmp_slot = raw - (WIN + MAX_TOKENS)
                 if cmp_slot >= HCA_CMP_BLOCK_NUM * BLOCK_SIZE:
                     continue
                 blk_id = int(cmp_block_table[req, cmp_slot // BLOCK_SIZE].item())
@@ -443,10 +475,6 @@ def golden_prefill_attention_hca(tensors):
 
     ori_kv = tensors["kv_cache"]
     ori_kv_flat = ori_kv.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-    for t in range(num_tokens):
-        dst_row = int(tensors["ori_slot_mapping"][t].item())
-        if dst_row >= 0:
-            ori_kv_flat[dst_row, :] = kv[t]
 
     cmp_kv = tensors["cmp_kv"]
     num_cmp_writes = int(tensors["num_cmp_writes"])
@@ -454,19 +482,26 @@ def golden_prefill_attention_hca(tensors):
     score_proj = x_normed.float() @ tensors["cmp_wgate"].float()
     kv_state = tensors["cmp_kv_state"]
     score_state = tensors["cmp_score_state"]
-    for t in range(num_tokens):
-        req = int(tensors["token_to_request"][t].item())
-        state_slot = int(tensors["position_ids"][t].item()) % COMPRESS_RATIO
-        kv_state[req, state_slot, :] = kv_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t]
-        score_state[req, state_slot, :] = (
-            score_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t] + tensors["cmp_ape"][state_slot]
-        )
     cmp_kv_flat = cmp_kv.view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
     for write_i in range(num_cmp_writes):
         token_id = int(tensors["cmp_write_token_ids"][write_i].item())
         req = int(tensors["token_to_request"][token_id].item())
         dst_row = int(tensors["cmp_slot_mapping"][write_i].item())
-        pooled = (kv_state[req] * score_state[req].softmax(dim=0)).sum(dim=0, keepdim=True)
+        write_pos = int(tensors["position_ids"][token_id].item())
+        pool_kv_state = kv_state[req].clone()
+        pool_score_state = score_state[req].clone()
+        for t in range(num_tokens):
+            if int(tensors["token_to_request"][t].item()) != req:
+                continue
+            pos = int(tensors["position_ids"][t].item())
+            if pos > write_pos:
+                continue
+            state_slot = pos % COMPRESS_RATIO
+            pool_kv_state[state_slot, :] = kv_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t]
+            pool_score_state[state_slot, :] = (
+                score_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t] + tensors["cmp_ape"][state_slot]
+            )
+        pooled = (pool_kv_state * pool_score_state.softmax(dim=0)).sum(dim=0, keepdim=True)
         pooled = pooled.to(torch.bfloat16).float()
         inv = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
         normed = (pooled * inv * tensors["cmp_norm_w"].float().view(1, HEAD_DIM)).to(torch.bfloat16)
@@ -482,12 +517,25 @@ def golden_prefill_attention_hca(tensors):
         normed[:, NOPE_DIM:] = rope_full
         cmp_kv_flat[dst_row : dst_row + 1, :] = normed
 
+    for t in range(num_tokens):
+        req = int(tensors["token_to_request"][t].item())
+        state_slot = int(tensors["position_ids"][t].item()) % COMPRESS_RATIO
+        kv_state[req, state_slot, :] = kv_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t]
+        score_state[req, state_slot, :] = (
+            score_proj.view(MAX_TOKENS, MAIN_OUT_DIM)[t] + tensors["cmp_ape"][state_slot]
+        )
+
     positions = tensors["position_ids"].to(torch.long)
     rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    _golden_hca_packed_sparse_attn(tensors, q, ori_kv, cmp_kv, rope_cos_t, rope_sin_t, attn_out)
+    _golden_hca_packed_sparse_attn(tensors, q, ori_kv, kv, cmp_kv, rope_cos_t, rope_sin_t, attn_out)
+
+    for t in range(num_tokens):
+        dst_row = int(tensors["ori_slot_mapping"][t].item())
+        if dst_row >= 0:
+            ori_kv_flat[dst_row, :] = kv[t]
 
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
@@ -523,6 +571,9 @@ def _resolve_hca_case(
     if hca_case == "custom":
         q_lens_values = [num_tokens, 0]
         context_lens_values = [start_pos, 0]
+    elif hca_case == "basic1":
+        q_lens_values = [1, 0]
+        context_lens_values = [0, 0]
     elif hca_case == "basic128":
         q_lens_values = [128, 0]
         context_lens_values = [0, 0]
@@ -532,15 +583,30 @@ def _resolve_hca_case(
     elif hca_case == "basic17":
         q_lens_values = [17, 0]
         context_lens_values = [0, 0]
+    elif hca_case == "suffix64_16":
+        q_lens_values = [16, 0]
+        context_lens_values = [64, 0]
     elif hca_case == "suffix96_17":
         q_lens_values = [17, 0]
         context_lens_values = [96, 0]
     elif hca_case == "suffix96_32":
         q_lens_values = [32, 0]
         context_lens_values = [96, 0]
+    elif hca_case == "suffix100_50":
+        q_lens_values = [50, 0]
+        context_lens_values = [100, 0]
+    elif hca_case == "suffix100_128":
+        q_lens_values = [128, 0]
+        context_lens_values = [100, 0]
     elif hca_case == "suffix128_17":
         q_lens_values = [17, 0]
         context_lens_values = [128, 0]
+    elif hca_case == "suffix255_1":
+        q_lens_values = [1, 0]
+        context_lens_values = [255, 0]
+    elif hca_case == "suffix1000_50":
+        q_lens_values = [50, 0]
+        context_lens_values = [1000, 0]
     elif hca_case == "hetero_smoke":
         q_lens_values = [32, 64]
         context_lens_values = [64, 0]
@@ -550,6 +616,21 @@ def _resolve_hca_case(
     elif hca_case == "hetero_mixed_cmp_pos":
         q_lens_values = [32, 32]
         context_lens_values = [96, 224]
+    elif hca_case == "hetero_mixed_overlay_cmp":
+        q_lens_values = [50, 16]
+        context_lens_values = [100, 64]
+    elif hca_case == "hetero_boundary_overlay_cmp":
+        q_lens_values = [50, 40]
+        context_lens_values = [100, 230]
+    elif hca_case == "hetero_long_suffix_overlay_cmp":
+        q_lens_values = [30, 20]
+        context_lens_values = [200, 500]
+    elif hca_case == "hetero_full_capacity_overlay_cmp":
+        q_lens_values = [96, 32]
+        context_lens_values = [1000, 352]
+    elif hca_case == "hetero_single_long_mix_overlay_cmp":
+        q_lens_values = [1, 127]
+        context_lens_values = [255, 385]
     else:
         raise ValueError(f"unknown --hca-case {hca_case!r}; expected one of {HCA_CASES}")
 
@@ -598,6 +679,62 @@ def build_tensor_specs(
                 pos[t] = ctx + local_s
             cursor += q_len
         return token_to_req, local_pos, pos
+
+    def validate_overlay_topk(topk_idxs, token_to_req, pos):
+        current_by_req = [dict() for _ in range(MAX_REQS)]
+        for t in range(num_tokens):
+            req = int(token_to_req[t].item())
+            current_by_req[req][int(pos[t].item())] = t
+
+        for t in range(num_tokens):
+            req = int(token_to_req[t].item())
+            abs_pos = int(pos[t].item())
+            window_valid = min(WIN, abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            seen_window_abs = set()
+            seen_cmp = set()
+
+            for raw_i in topk_idxs[t, :SPARSE_TOPK].tolist():
+                raw = int(raw_i)
+                if raw < 0:
+                    continue
+                if raw < WIN:
+                    candidates = [
+                        key_abs
+                        for key_abs in range(key_start_abs, abs_pos + 1)
+                        if key_abs % WIN == raw
+                    ]
+                    if len(candidates) != 1:
+                        raise ValueError(f"ambiguous ring raw={raw} for HCA token {t}")
+                    key_abs = candidates[0]
+                    if key_abs in current_by_req[req]:
+                        raise ValueError(f"current suffix abs_pos={key_abs} must use HCA overlay for token {t}")
+                    if key_abs in seen_window_abs:
+                        raise ValueError(f"duplicate window abs_pos={key_abs} for HCA token {t}")
+                    seen_window_abs.add(key_abs)
+                elif raw < WIN + MAX_TOKENS:
+                    overlay_t = raw - WIN
+                    if overlay_t >= num_tokens:
+                        raise ValueError(f"HCA overlay raw={raw} points past active tokens for token {t}")
+                    overlay_req = int(token_to_req[overlay_t].item())
+                    if overlay_req != req:
+                        raise ValueError(f"HCA overlay raw={raw} crosses request {overlay_req}->{req}")
+                    key_abs = int(pos[overlay_t].item())
+                    if key_abs > abs_pos:
+                        raise ValueError(f"HCA overlay raw={raw} is future key abs_pos={key_abs} for token {t}")
+                    if key_abs in seen_window_abs:
+                        raise ValueError(f"duplicate overlay abs_pos={key_abs} for HCA token {t}")
+                    seen_window_abs.add(key_abs)
+                else:
+                    cmp_slot = raw - (WIN + MAX_TOKENS)
+                    visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
+                    if cmp_slot < 0 or cmp_slot >= visible_cmp:
+                        raise ValueError(
+                            f"HCA compressed raw={raw} slot={cmp_slot} is not visible for token {t}"
+                        )
+                    if cmp_slot in seen_cmp:
+                        raise ValueError(f"duplicate compressed slot={cmp_slot} for HCA token {t}")
+                    seen_cmp.add(cmp_slot)
 
     def cmp_write_records():
         records = []
@@ -706,21 +843,30 @@ def build_tensor_specs(
         return table
     def init_cmp_sparse_indices():
         topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
-        token_to_req, local_pos, _ = token_meta()
+        token_to_req, local_pos, pos = token_meta()
+        current_by_req = [dict() for _ in range(MAX_REQS)]
+        for t in range(num_tokens):
+            req = int(token_to_req[t].item())
+            current_by_req[req][int(pos[t].item())] = t
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             position = context_lens_values[req] + int(local_pos[t].item())
             window_start = max(0, position - WIN + 1)
             cursor = 0
             for visible_pos in range(window_start, position + 1):
-                topk_idxs[t, cursor] = visible_pos % WIN
+                overlay_t = current_by_req[req].get(visible_pos)
+                if overlay_t is not None and overlay_t <= t:
+                    topk_idxs[t, cursor] = WIN + overlay_t
+                else:
+                    topk_idxs[t, cursor] = visible_pos % WIN
                 cursor += 1
             visible_cmp = (position + 1) // COMPRESS_RATIO
             for cmp_slot in range(visible_cmp):
                 if cursor >= SPARSE_TOPK:
                     break
-                topk_idxs[t, cursor] = S + cmp_slot
+                topk_idxs[t, cursor] = WIN + MAX_TOKENS + cmp_slot
                 cursor += 1
+        validate_overlay_topk(topk_idxs, token_to_req, pos)
         return topk_idxs
     def init_token_to_request():
         return token_meta()[0]

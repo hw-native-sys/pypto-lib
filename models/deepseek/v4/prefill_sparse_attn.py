@@ -629,15 +629,10 @@ SPARSE_ROPE_APPLY_SPMD_BLOCKS = ((T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE
 SPARSE_TOPK = TOPK
 
 @pl.jit.inline
-def prefill_hca_packed_sparse_attn(
+def _prefill_hca_sparse_from_gathered_kv(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -645,6 +640,7 @@ def prefill_hca_packed_sparse_attn(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    sparse_kv: pl.Tensor[[T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
 ):
     A_K_BLOCKS = O_GROUP_IN // SPARSE_A_K_CHUNK
     A_N_BLOCKS = O_LORA // SPARSE_A_N_CHUNK
@@ -653,58 +649,9 @@ def prefill_hca_packed_sparse_attn(
     B_N_BLOCKS = D // SPARSE_B_N_CHUNK
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    ori_block_table_flat = pl.reshape(ori_block_table, [MAX_REQS * SPARSE_ORI_MAX_BLOCKS])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
-
-    sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     rope_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-
-    # Stage 1: gather the per-token sparse prompt/compressed KV rows.
-    for gather_t0 in pl.parallel(0, T, HCA_GATHER_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gather_prompt_kv_tile"):
-            zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
-                gather_t = gather_t0 + gather_dt
-                if gather_t < num_tokens:
-                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
-                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
-                        gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
-                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
-                        if gather_raw >= 0:
-                            if gather_raw < S:
-                                gather_ori_slot = gather_raw
-                                gather_block_slot = gather_ori_slot // BLOCK_SIZE
-                                gather_block_pos = gather_b * SPARSE_ORI_MAX_BLOCKS + gather_block_slot
-                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
-                                gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
-                                gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
-                            else:
-                                gather_cmp_slot = gather_raw - S
-                                gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
-                                gather_cmp_block_pos = gather_b * SPARSE_CMP_MAX_BLOCKS + gather_cmp_block_slot
-                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
-                                gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
-                                gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
-                        else:
-                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
-                else:
-                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
-                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
-                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
 
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, SPARSE_ATTN_TOKEN_TILE):
@@ -1109,6 +1056,195 @@ def prefill_hca_packed_sparse_attn(
     return attn_out
 
 
+
+
+@pl.jit.inline
+def prefill_hca_packed_sparse_attn(
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    ori_block_table_flat = pl.reshape(ori_block_table, [MAX_REQS * SPARSE_ORI_MAX_BLOCKS])
+    cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
+
+    sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+
+    # Stage 1: gather the per-token sparse prompt/compressed KV rows.
+    for gather_t0 in pl.parallel(0, T, HCA_GATHER_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_gather_prompt_kv_tile"):
+            zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
+                gather_t = gather_t0 + gather_dt
+                if gather_t < num_tokens:
+                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
+                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
+                        gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
+                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
+                        if gather_raw >= 0:
+                            if gather_raw < S:
+                                gather_ori_slot = gather_raw
+                                gather_block_slot = gather_ori_slot // BLOCK_SIZE
+                                gather_block_pos = gather_b * SPARSE_ORI_MAX_BLOCKS + gather_block_slot
+                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
+                                gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
+                                gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                            else:
+                                gather_cmp_slot = gather_raw - S
+                                gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
+                                gather_cmp_block_pos = gather_b * SPARSE_CMP_MAX_BLOCKS + gather_cmp_block_slot
+                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
+                                gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
+                                gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                        else:
+                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                else:
+                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
+                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
+                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+
+    attn_out = _prefill_hca_sparse_from_gathered_kv(
+        q,
+        cmp_sparse_indices,
+        attn_sink,
+        num_tokens,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+        sparse_kv,
+    )
+    return attn_out
+
+
+@pl.jit.inline
+def prefill_packed_sparse_attn_overlay(
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    kv_overlay: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    """Unified packed sparse attention with current-suffix KV overlay.
+
+    Raw index contract for this wrapper:
+      -1                              invalid
+      [0, WIN)                        historical sliding-window ring KV
+      [WIN, WIN + MAX_TOKENS)         current suffix overlay row
+      [WIN + MAX_TOKENS, ...)         compressed KV slot
+
+    HCA uses all three sources. SWA is the two-source subset and must provide
+    dummy compressed tensors while keeping compressed raw indices unreachable.
+    """
+    ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    ori_block_table_flat = pl.reshape(ori_block_table, [MAX_REQS * SPARSE_ORI_MAX_BLOCKS])
+    cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
+
+    sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+
+    # Stage 1: gather historical ring rows, current suffix overlay rows, and compressed rows.
+    for gather_t0 in pl.parallel(0, T, HCA_GATHER_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_overlay_gather_kv_tile"):
+            zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
+                gather_t = gather_t0 + gather_dt
+                if gather_t < num_tokens:
+                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
+                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
+                        gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
+                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
+                        if gather_raw >= 0:
+                            if gather_raw < WIN:
+                                gather_ori_slot = gather_raw
+                                gather_block_slot = gather_ori_slot // BLOCK_SIZE
+                                gather_block_pos = gather_b * SPARSE_ORI_MAX_BLOCKS + gather_block_slot
+                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
+                                gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
+                                gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                            elif gather_raw < WIN + MAX_TOKENS:
+                                gather_overlay_row = pl.cast(gather_raw - WIN, pl.INDEX)
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    kv_overlay[gather_overlay_row : gather_overlay_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                            else:
+                                gather_cmp_slot = gather_raw - (WIN + MAX_TOKENS)
+                                gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
+                                gather_cmp_block_pos = gather_b * SPARSE_CMP_MAX_BLOCKS + gather_cmp_block_slot
+                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
+                                gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
+                                gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
+                                sparse_kv = pl.assemble(
+                                    sparse_kv,
+                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
+                                    [gather_dst_row, 0],
+                                )
+                        else:
+                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                else:
+                    for gather_k in pl.pipeline(0, SPARSE_PREFILL_SPARSE_PAD, stage=4):
+                        gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
+                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+
+    attn_out = _prefill_hca_sparse_from_gathered_kv(
+        q,
+        cmp_sparse_indices,
+        attn_sink,
+        num_tokens,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+        sparse_kv,
+    )
+    return attn_out
+
+
 @pl.jit
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -1405,8 +1541,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Standalone DeepSeek V4 prefill sparse-attn consumer validation. "
-            "The rectangular path uses seqused_kv; packed HCA/SWA callers use prefill_hca_packed_sparse_attn "
-            "with token_to_request and prebuilt sparse indices."
+            "The rectangular path uses seqused_kv; legacy packed paths use prefill_hca_packed_sparse_attn; "
+            "HCA/SWA overlay paths share prefill_packed_sparse_attn_overlay with token_to_request and "
+            "prebuilt sparse indices."
         )
     )
     parser.add_argument(
