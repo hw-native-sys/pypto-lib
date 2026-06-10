@@ -84,38 +84,40 @@ def rms_lm_head(
                     [b0, final_norm_k0],
                 )
 
-    # LM-head matmul: ONE pl.spmd grid-stride over the VOCAB//VOCAB_CHUNK (594)
+    # LM-head matmul: ONE pl.spmd grid-stride over the VOCAB//VOCAB_CHUNK (792)
     # output chunks across LM_HEAD_CORES persistent blocks (see LM_HEAD_CORES above
     # for why one spmd dispatch beats the old per-chunk pl.parallel fan-out). Like
     # q_proj / fa_fused / out_proj. Each block owns a DISJOINT set of vocab columns,
     # so there is no split-K / atomic-add and the output is bit-identical to the
-    # fan-out. M is not split (BATCH == BATCH_TILE == TM), so the row offset is 0.
-    lm_valid_rows = pl.min(BATCH_TILE, user_batch)
+    # fan-out. M tiles (b0) are walked serially inside each block, mirroring the
+    # final_rmsnorm loop above (BATCH == BATCH_TILE today, so it runs once).
     for lm_core in pl.spmd(LM_HEAD_CORES, name_hint="lm_head"):
-        for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
-            lm_o0 = ob * VOCAB_CHUNK
-            # matmul (cube), then trim the L0C result to the dynamic user-batch rows
-            # via set_validshape and store straight to `out` (no GM scratch + separate
-            # vector store). The valid-row trim bounds the write into the
-            # dynamic-shaped `out` [USER_BATCH_DYN, VOCAB].
-            lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [0, 0])
-            lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
-            lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
-            # Pipeline the K-accumulation (stage=2) so the next K-tile load overlaps
-            # the current matmul_acc — same idiom as q_proj / out_proj / gate_proj.
-            # The leading matmul (kb=0) stays peeled: it initializes the L0C
-            # accumulator, so it can't sit inside the pipelined accumulate loop.
-            for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
-                lm_k0 = kb * LM_HEAD_K_CHUNK
-                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [0, lm_k0])
-                lm_weight_chunk = pl.slice(
-                    lm_head_weight,
-                    [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
-                    [lm_o0, lm_k0],
-                )
-                lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
-            lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
-            out = pl.assemble(out, lm_acc_trimmed, [0, lm_o0])
+        for b0 in pl.range(0, BATCH, BATCH_TILE):
+            lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
+            for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
+                lm_o0 = ob * VOCAB_CHUNK
+                # matmul (cube), then trim the L0C result to the dynamic user-batch rows
+                # via set_validshape and store straight to `out` (no GM scratch + separate
+                # vector store). The valid-row trim bounds the write into the
+                # dynamic-shaped `out` [USER_BATCH_DYN, VOCAB].
+                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
+                lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
+                lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
+                # Pipeline the K-accumulation (stage=2) so the next K-tile load overlaps
+                # the current matmul_acc — same idiom as q_proj / out_proj / gate_proj.
+                # The leading matmul (kb=0) stays peeled: it initializes the L0C
+                # accumulator, so it can't sit inside the pipelined accumulate loop.
+                for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
+                    lm_k0 = kb * LM_HEAD_K_CHUNK
+                    lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
+                    lm_weight_chunk = pl.slice(
+                        lm_head_weight,
+                        [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
+                        [lm_o0, lm_k0],
+                    )
+                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
+                lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
+                out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
 
     return out
 
