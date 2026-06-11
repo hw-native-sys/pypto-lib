@@ -177,19 +177,27 @@ def _stale_cpps(work_dir: Path) -> list[Path]:
     though ``compile_and_assemble`` would silently rebuild it).
     """
     stale: list[Path] = []
-    for sub in ("kernels", "orchestration"):
-        root = work_dir / sub
-        if not root.is_dir():
-            continue
-        for cpp in root.rglob("*.cpp"):
-            siblings = [cpp.with_suffix(ext) for ext in (".so", ".o")]
-            existing = [p for p in siblings if p.exists()]
-            if not existing:
-                stale.append(cpp)
+    # Single-chip / L2 builds keep kernels/ + orchestration/ at the root; an L3
+    # distributed build puts one complete sub-build per rank under
+    # next_levels/{rank}/. Scan both so hand-edited L3 cpps are detected.
+    bases = [work_dir]
+    next_levels = work_dir / "next_levels"
+    if next_levels.is_dir():
+        bases += [d for d in sorted(next_levels.iterdir()) if d.is_dir()]
+    for base in bases:
+        for sub in ("kernels", "orchestration"):
+            root = base / sub
+            if not root.is_dir():
                 continue
-            cpp_mtime = cpp.stat().st_mtime
-            if any(p.stat().st_mtime < cpp_mtime for p in existing):
-                stale.append(cpp)
+            for cpp in root.rglob("*.cpp"):
+                siblings = [cpp.with_suffix(ext) for ext in (".so", ".o")]
+                existing = [p for p in siblings if p.exists()]
+                if not existing:
+                    stale.append(cpp)
+                    continue
+                cpp_mtime = cpp.stat().st_mtime
+                if any(p.stat().st_mtime < cpp_mtime for p in existing):
+                    stale.append(cpp)
     return stale
 
 
@@ -359,6 +367,35 @@ def _try_l3_dispatch(
     return True
 
 
+def _maybe_reload_l3(
+    work_dir: Path,
+    runtime_cfg: dict[str, Any],
+    compile_cfg: dict[str, Any],
+) -> Any:
+    """Reconstruct an L3 ``DistributedCompiledProgram`` from a ``runtime_dir``.
+
+    Returns ``None`` for a single-chip / L2 build (which keeps using
+    ``execute_compiled``). An L3 build is identified by the
+    ``distributed_meta.json`` sidecar written at compile time (pypto #1689);
+    :meth:`DistributedCompiledProgram.from_dir` rebuilds its metadata without
+    re-running the pypto compile, so the existing :func:`_try_l3_dispatch` path
+    can dispatch it. The run's ``platform`` and ``distributed_config`` override
+    the values persisted at compile time, so ``--runtime-dir ... -p a2a3
+    -d 2,3`` replays on the requested target / devices.
+    """
+    if not (work_dir / "distributed_meta.json").exists():
+        return None
+    try:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    except ImportError:
+        return None
+    return DistributedCompiledProgram.from_dir(
+        work_dir,
+        platform=runtime_cfg.get("platform"),
+        distributed_config=compile_cfg.get("distributed_config"),
+    )
+
+
 def _compute_golden(
     specs: list[TensorSpec | ScalarSpec],
     tensor_specs: list[TensorSpec],
@@ -497,6 +534,10 @@ def run(
             work_dir = _setup_runtime_dir(runtime_dir, compile_label="compile")
         except ValueError as e:
             return _fail(str(e))
+        # An L3 build has no live compiled object here (compile was skipped);
+        # reconstruct it from the build dir so the L3 dispatch path below runs
+        # instead of falling through to the single-chip execute_compiled.
+        compiled = _maybe_reload_l3(work_dir, runtime_cfg, compile_cfg)
     else:
         with _Stage("compile"):
             compile_kwargs = dict(compile_cfg)
@@ -639,6 +680,10 @@ def run_jit(
             work_dir = _setup_runtime_dir(runtime_dir, compile_label="JIT compile")
         except ValueError as e:
             return _fail(str(e))
+        # An L3 build has no live compiled object here (JIT compile was skipped);
+        # reconstruct it from the build dir so the L3 dispatch path below runs
+        # instead of falling through to the single-chip execute_compiled.
+        compiled = _maybe_reload_l3(work_dir, runtime_cfg, compile_cfg)
     else:
         with _Stage("compile"):
             from pypto.runtime import RunConfig

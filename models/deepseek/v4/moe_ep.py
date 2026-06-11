@@ -620,6 +620,8 @@ def build_tensor_specs(layer_id=0):
 
 if __name__ == "__main__":
     import argparse
+    import os
+
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
@@ -631,6 +633,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="dir with cached in/{name}.pt + out/{name}.pt; reuses them instead "
+                             "of regenerating inputs + recomputing golden. Defaults to "
+                             "<runtime-dir>/data on replay when present.")
     parser.add_argument("--log-level", type=str, default=None,
                         help="runtime log threshold: debug, v0..v9, info, warn, error, null")
     args = parser.parse_args()
@@ -638,10 +644,20 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
+    # On replay, reuse the data/ snapshot the first compile+run persisted under
+    # the build dir (skips the slow generate-inputs + compute-golden stages).
+    # An explicit --golden-data always wins.
+    golden_data = args.golden_data
+    if golden_data is None and args.runtime_dir is not None:
+        cand = os.path.join(args.runtime_dir, "data")
+        if os.path.isdir(cand):
+            golden_data = cand
+
     result = run_jit(
         fn=l3_moe_ep,
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_ep,
+        golden_data=golden_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(

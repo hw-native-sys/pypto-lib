@@ -24,6 +24,7 @@ from golden.runner import (
     RunResult,
     _backend_for_platform,
     _format_stale_paths,
+    _maybe_reload_l3,
     _save_tensors,
     _setup_runtime_dir,
     _stale_cpps,
@@ -509,6 +510,31 @@ class TestRuntimeDir:
         assert (prebuilt / "data" / "out" / "y.pt").is_file()
         assert (prebuilt / "data" / "out" / "state.pt").is_file()
 
+    def test_runtime_dir_l3_routes_to_l3_dispatch(self, three_kinds_specs, tmp_path):
+        """An L3 runtime_dir (distributed_meta.json present) is reconstructed via
+        _maybe_reload_l3 and dispatched through _try_l3_dispatch — not the
+        single-chip execute_compiled path."""
+        prebuilt = tmp_path / "prebuilt"
+        prebuilt.mkdir()
+        (prebuilt / "distributed_meta.json").write_text("{}")
+        fake_l3 = object()
+
+        with (
+            patch("pypto.ir.compile", side_effect=lambda *a, **k: pytest.fail("compile must not run")),
+            patch(
+                "pypto.runtime.execute_compiled",
+                side_effect=lambda *a, **k: pytest.fail("execute_compiled must not run for L3"),
+            ),
+            patch("golden.runner._maybe_reload_l3", return_value=fake_l3) as reload,
+            patch("golden.runner._try_l3_dispatch", return_value=True) as l3,
+        ):
+            r = run(program=object(), specs=three_kinds_specs, runtime_dir=str(prebuilt))
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        reload.assert_called_once()
+        l3.assert_called_once()
+        assert l3.call_args.args[0] is fake_l3  # the reconstructed program is dispatched
+
     def test_runtime_dir_missing_returns_fail(self, three_kinds_specs, tmp_path):
         missing = tmp_path / "does_not_exist"
 
@@ -944,6 +970,15 @@ class TestStaleCpps:
         cpp.write_text("// cpp")
         assert _stale_cpps(tmp_path) == [cpp]
 
+    def test_l3_next_levels_cpp_is_scanned(self, tmp_path):
+        """L3 builds keep cpps under next_levels/{rank}/ — they must be scanned
+        so a hand-edited L3 kernel cpp (no sibling .so) is flagged stale."""
+        kernels = tmp_path / "next_levels" / "rank0" / "kernels" / "aiv"
+        kernels.mkdir(parents=True)
+        cpp = kernels / "foo.cpp"
+        cpp.write_text("// cpp")
+        assert _stale_cpps(tmp_path) == [cpp]
+
     def test_so_older_than_cpp_is_stale(self, tmp_path):
         """cpp edited after .so was built → reported as stale."""
         kernels = tmp_path / "kernels" / "aiv"
@@ -1105,6 +1140,33 @@ class TestLogLevelConsumption:
                 runtime_cfg=dict(platform="a2a3sim", device_id=0),
             )
         mock_cfg.assert_not_called()
+
+
+class TestMaybeReloadL3:
+    """`_maybe_reload_l3` reconstructs an L3 program from a runtime_dir."""
+
+    def test_returns_none_without_meta(self, tmp_path):
+        """A single-chip / L2 build (no distributed_meta.json) yields None."""
+        assert _maybe_reload_l3(tmp_path, {}, {}) is None
+
+    def test_calls_from_dir_with_run_overrides(self, tmp_path):
+        """An L3 build (distributed_meta.json present) reconstructs via from_dir,
+        threading the run's platform + distributed_config as overrides."""
+        (tmp_path / "distributed_meta.json").write_text("{}")
+        sentinel = object()
+        with patch(
+            "pypto.ir.distributed_compiled_program.DistributedCompiledProgram.from_dir",
+            return_value=sentinel,
+        ) as from_dir:
+            out = _maybe_reload_l3(
+                tmp_path,
+                {"platform": "a2a3"},
+                {"distributed_config": "DC"},
+            )
+        assert out is sentinel
+        from_dir.assert_called_once()
+        assert from_dir.call_args.kwargs["platform"] == "a2a3"
+        assert from_dir.call_args.kwargs["distributed_config"] == "DC"
 
 
 if __name__ == "__main__":
