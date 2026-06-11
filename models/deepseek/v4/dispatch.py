@@ -86,7 +86,7 @@ def dispatch(
 
 W_PAD = 8  # FP32 scale/weight tile pad (32B min tile)
 IDX_PAD = 8  # INT32 r_route tile pad
-X_STAGE_ROWS = 8  # recv_x widen/stage chunk rows (8 x D FP16 = 64KB UB tile)
+X_STAGE_ROWS = 8  # recv_x stage chunk rows (8 x D INT8 = 32KB UB tile)
 
 
 @pl.jit.inline
@@ -102,11 +102,7 @@ def dispatch_ep(
     recv_count_out: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
     pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     count_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
-    # ``recv_x`` is widened to FP16 to work around a b8 SDMA bug on a2a3 (INT8
-    # cross-rank push lands stale on the peer; b16 is fine, and FP16 <-> INT8 is
-    # a lossless round-trip). ``recv_x_out`` stays INT8 — the narrow cast
-    # happens in stage_out.
-    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.FP16],
+    recv_x: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_w: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_r_route: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, IDX_PAD], pl.INT32],
@@ -115,10 +111,6 @@ def dispatch_ep(
     # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
     # so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    # FP16 widen scratch for the b8 SDMA workaround; allocated outside the
-    # InCore scope (InCore cannot create GM tensors) and written in full by the
-    # widen loop before any read, pinning it against MemoryReuse.
-    x_fp16 = pl.create_tensor([T, D], dtype=pl.FP16)
 
     # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
@@ -191,13 +183,6 @@ def dispatch_ep(
             pl.write(recv_count_out, [e, 0], acc)
 
         # ---------- payload_push: 4 channels per (t, k) ----------
-        # Widen x INT8 -> FP16 once per token (b8 SDMA workaround, see recv_x
-        # above) into the x_fp16 GM scratch; the per-route x push is then a
-        # GM-to-peer-GM TPUT with no per-route UB staging.
-        for c0 in pl.range(0, T, X_STAGE_ROWS):
-            x_wide = pl.cast(x_norm_i8[c0:c0 + X_STAGE_ROWS, :], target_type=pl.FP16)
-            x_fp16[c0:c0 + X_STAGE_ROWS, :] = x_wide
-
         cursor = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
@@ -227,7 +212,7 @@ def dispatch_ep(
                 pld.tensor.put(
                     dst=recv_x,
                     peer=dst,
-                    src=x_fp16,
+                    src=x_norm_i8,
                     dst_offsets=[row, 0],
                     src_offsets=[t, 0],
                     shape=[1, D],
@@ -266,11 +251,10 @@ def dispatch_ep(
                 )
 
         # stage_out: copy the windows the push filled into the host outputs.
-        # recv_x: FP16 window -> INT8 in X_STAGE_ROWS-row chunks through the
+        # recv_x: INT8 window copied in X_STAGE_ROWS-row chunks through the
         # flat view (per-row copies cost ~16x more MTE transfers).
         for row in pl.range(0, N_LOCAL_EXPERTS * RECV_MAX, X_STAGE_ROWS):
-            stage_x_i8 = pl.cast(recv_x[row:row + X_STAGE_ROWS, :], target_type=pl.INT8)
-            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = stage_x_i8
+            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = recv_x[row:row + X_STAGE_ROWS, :]
 
         # recv_scale / recv_w / recv_r_route: scalar copy of window column 0,
         # bounded to the valid rows (downstream consumers are count-bounded, so
