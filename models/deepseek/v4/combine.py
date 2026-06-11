@@ -82,12 +82,13 @@ def combine_ep(
     my_rank: pl.Scalar[pl.INT32],
 ):
     # Push recv_y rows to each peer's routed_y_buf, then a cross-rank barrier, in
-    # one pl.at(CORE_GROUP) so remote_store + notify/wait stay one atomic task.
+    # one pl.at(CORE_GROUP) so the TPUT + notify/wait stay one atomic task. The
+    # flat 2-D view is only a put src (GM-to-peer-GM); needs pypto#1732 (put dst
+    # window declared add_output) for the RAW edge into combine_reduce.
+    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
         # Each (dst, e) block of n rows landed at slots [src_off, src_off+n) on
-        # dst. Keep the per-row pl.load + remote_store form: with pld.tensor.put
-        # the orchestration marks the routed_y_buf dst window add_input, so
-        # combine_reduce gets no RAW edge and reads it stale (pypto#1732).
+        # dst.
         for dst in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 n = pl.cast(pl.read(pub_counts, [dst * EP_WORLD_SIZE + my_rank, e]), pl.INDEX)
@@ -98,14 +99,18 @@ def combine_ep(
                 src_off_idx = pl.cast(src_off, pl.INDEX)
                 for row in pl.range(n):
                     slot = src_off_idx + row
-                    r_route = pl.read(recv_r_route_out, [e, slot])
-                    y_tile_3d = pl.load(recv_y, [e, slot, 0], [1, 1, D])
-                    y_tile = pl.reshape(y_tile_3d, [1, D])
-                    pld.tile.remote_store(
-                        y_tile, target=routed_y_buf, peer=dst, offsets=[r_route, 0]
+                    r_route = pl.cast(pl.read(recv_r_route_out, [e, slot]), pl.INDEX)
+                    pld.tensor.put(
+                        dst=routed_y_buf,
+                        peer=dst,
+                        src=recv_y_flat,
+                        dst_offsets=[r_route, 0],
+                        src_offsets=[e * RECV_MAX + slot, 0],
+                        shape=[1, D],
                     )
 
-        # combine_done barrier — single-writer per-src cell (Set, not Add).
+        # combine_done barrier — per-src signal cells, AtomicAdd (mirrors the
+        # L3 reference protocol).
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
@@ -113,7 +118,7 @@ def combine_ep(
                     peer=peer,
                     offsets=[my_rank, 0],
                     value=1,
-                    op=pld.NotifyOp.Set,
+                    op=pld.NotifyOp.AtomicAdd,
                 )
         for src in pl.range(EP_WORLD_SIZE):
             if src != my_rank:

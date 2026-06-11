@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
 """DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer): FLASH preset
-with n_routed_experts shrunk 256 -> 32 so each rank keeps EP=16's 16-expert load."""
+with n_routed_experts shrunk 256 -> 64 so each rank keeps the 32-expert load."""
 
 
 # Override config before importing the sub-kernels — they bake EP_WORLD_SIZE /
@@ -89,6 +89,7 @@ def moe_ep(
     # windows
     pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
     count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
     recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
@@ -142,7 +143,7 @@ def moe_ep(
     dispatch_ep(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
-        pub_counts, count_done,
+        pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         my_rank,
     )
@@ -195,18 +196,18 @@ def l3_moe_ep(
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
     count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)  # INT8
+    data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)  # INT8 (b8 fixed in ptoas v0.45)
     recv_scale_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)  # FP32
     recv_w_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)  # FP32
     recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)  # INT32
-    # count_done window is reused for the data-phase barrier (AtomicAdd bumps
-    # per-src cell from 1 to 2; wait expected=2 in data phase).
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)  # BF16
     combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
     for r in pl.range(pld.world_size()):
         pub_counts = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
         count_done = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_done = pld.window(data_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
         recv_scale = pld.window(recv_scale_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
         recv_w = pld.window(recv_w_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
@@ -221,7 +222,7 @@ def l3_moe_ep(
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
             x_next[r],
-            pub_counts, count_done,
+            pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
             layer_id, r,
@@ -630,6 +631,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--log-level", type=str, default=None,
+                        help="runtime log threshold: debug, v0..v9, info, warn, error, null")
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -650,6 +653,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            log_level=args.log_level,
         ),
         rtol=1e-3,
         atol=1e-3,
