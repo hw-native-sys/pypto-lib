@@ -1484,12 +1484,18 @@ if __name__ == "__main__":
 
     # ── --validate-fwd: pre-generated stacked-fwd inputs from --data-dir. ──
     inputs = load_inputs(args.data_dir / "in")
+    # dep_gen is force-disabled here: --validate-fwd runs two on-device programs in
+    # one process (decode_fwd, then the host-ref loop's qwen3_decode_mpmd), and the
+    # dep_gen collector cannot register host buffers for the second program
+    # (`halHostRegister for dep_gen SHM failed: 8` -> `init_dep_gen failed: 8`). On
+    # this 40-layer graph dep_gen also overflows ("records dropped", no deps.json),
+    # so it provides nothing of value here regardless.
     run_cfg = RunConfig(
         platform=args.platform,
         device_id=args.device,
         backend_type=_backend_type(args.platform),
         enable_l2_swimlane=args.enable_l2_swimlane,
-        enable_dep_gen=not args.no_dep_gen,
+        enable_dep_gen=False,
         dump_passes=True,
     )
 
@@ -1519,6 +1525,14 @@ if __name__ == "__main__":
         ]
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
         decode_fwd(*stacked, logits, config=run_cfg)
+        # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
+        # second on-device program in the same process (the host-ref loop below would
+        # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
+        # so skip the reference comparison and exit cleanly.
+        if args.enable_l2_swimlane:
+            print(f"[stacked-fwd {N}L+LMhead] swimlane perf run complete "
+                  f"(host-ref argmax check skipped under --enable-l2-swimlane)")
+            raise SystemExit(0)
         # host ref: chain N -> final RMSNorm -> lm_head
         ref_hidden = inputs[0]; ref_out = None
         for _step in range(N):
