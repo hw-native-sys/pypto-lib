@@ -63,9 +63,11 @@ ROPE_INTERLEAVE_CHUNK = 2 * ROPE_CHUNK
 # Correctness-first kernel tiling. These mirror the proven decode sparse-attn
 # shapes where possible, while padding prompt-K tiles so S=16 can still use
 # cube-friendly 64-column attention blocks without out-of-bounds slices.
-GATHER_TOKEN_TILE = 4
+# Two tokens per gather/RoPE task: each kernel stays short, so the work
+# spreads over all cores instead of serializing on a few long tasks.
+GATHER_TOKEN_TILE = 2
 ATTN_TOKEN_TILE = 32
-ROPE_TOKEN_TILE = 8
+ROPE_TOKEN_TILE = 2
 ROPE_PACK_TOKEN_TILE = 16
 MATMUL_ROW_PAD = 16
 PV_HEAD_TILE = 16
@@ -84,9 +86,10 @@ B_K_CHUNK = 128
 B_N_CHUNK = 128 if T >= 128 else 256
 QUANT_CHUNK = 128 if T >= 128 else (128 if T >= 64 else 256)
 QUANT_TOKEN_TILE = 32
-# Keep the standalone sparse-attn simulator kernels below the scheduler
-# no-progress timeout; the packed HCA path below keeps its own 128-token tile.
-PROJ_TOKEN_TILE = 64 if T >= 128 else T
+# 128-token projection tiles fill the cube fully and stay under the a2a3sim
+# scheduler no-progress timeout (CI a2a3sim validated); the packed HCA path
+# below keeps its own 128-token tile.
+PROJ_TOKEN_TILE = 128 if T >= 128 else T
 assert T % QUANT_TOKEN_TILE == 0, "T must be divisible by QUANT_TOKEN_TILE for full-row quantization coverage"
 assert T % PROJ_TOKEN_TILE == 0, "T must be divisible by PROJ_TOKEN_TILE for projection tiling"
 assert (O_GROUPS * O_LORA) % 2 == 0, "2-way quant K split requires an even O_GROUPS * O_LORA width"
@@ -125,8 +128,11 @@ def prefill_sparse_attn(
 
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
-    even_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
-    odd_select_stage = pl.create_tensor([ROPE_INTERLEAVE_CHUNK, ROPE_CHUNK], dtype=pl.BF16)
+    # Full-width selectors: block-diagonal stack of the two interleave-chunk
+    # selectors, so each token needs one selector matmul per parity instead of
+    # one per ROPE_CHUNK.
+    even_select_stage = pl.create_tensor([ROPE_DIM, HALF_ROPE], dtype=pl.BF16)
+    odd_select_stage = pl.create_tensor([ROPE_DIM, HALF_ROPE], dtype=pl.BF16)
     rope_even_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     rope_odd_interleave_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -141,7 +147,7 @@ def prefill_sparse_attn(
                 gather_s = gather_t - gather_b * S
                 gather_seq_len = pl.read(seqused_kv, [gather_b])
                 if gather_s < gather_seq_len:
-                    for gather_k in pl.range(PREFILL_SPARSE_PAD):
+                    for gather_k in pl.pipeline(0, PREFILL_SPARSE_PAD, stage=4):
                         gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
                         gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
                         if gather_raw >= 0:
@@ -172,9 +178,28 @@ def prefill_sparse_attn(
                         else:
                             sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
                 else:
-                    for gather_k in pl.range(PREFILL_SPARSE_PAD):
+                    for gather_k in pl.pipeline(0, PREFILL_SPARSE_PAD, stage=4):
                         gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
                         sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+
+    # Per-(token, slot) additive bias built once with vector ops: 0 for valid
+    # slots, NEG_INF for -1 padding. The QK stage adds the bias row instead of
+    # scanning PREFILL_ATTN_TILE indices per head tile; padded lanes exp to 0,
+    # matching the previous set_validshape + fillpad(min) numerics.
+    sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+    for bias_t0 in pl.parallel(0, T, QUANT_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_attn_pad_bias"):
+            for bias_sb in pl.range(PREFILL_ATTN_BLOCKS):
+                bias_start = bias_sb * PREFILL_ATTN_TILE
+                bias_idx = pl.cast(
+                    cmp_sparse_indices[bias_t0 : bias_t0 + QUANT_TOKEN_TILE, bias_start : bias_start + PREFILL_ATTN_TILE],
+                    target_type=pl.FP32,
+                )
+                bias_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
+                sparse_bias[bias_t0 : bias_t0 + QUANT_TOKEN_TILE, bias_start : bias_start + PREFILL_ATTN_TILE] = pl.mul(
+                    pl.sub(bias_flag, 1.0),
+                    3.0e38,
+                )
 
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, ATTN_TOKEN_TILE):
@@ -207,12 +232,8 @@ def prefill_sparse_attn(
 
                         for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
                             qk_tile_start = qk_sb * PREFILL_ATTN_TILE
-                            qk_tile_valid = 0
-                            for qk_valid_i in pl.range(PREFILL_ATTN_TILE):
-                                qk_valid_raw = pl.read(cmp_sparse_indices, [qk_t, qk_tile_start + qk_valid_i])
-                                if qk_valid_raw >= 0:
-                                    qk_tile_valid = qk_valid_i + 1
-                            if qk_tile_valid > 0:
+                            qk_tile_valid_raw = pl.read(cmp_sparse_indices, [qk_t, qk_tile_start])
+                            if qk_tile_valid_raw >= 0:
                                 qk_kv_tile = sparse_kv[
                                     qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + PREFILL_ATTN_TILE,
                                     0 : HEAD_DIM,
@@ -222,12 +243,14 @@ def prefill_sparse_attn(
                                     qk_dt * MATMUL_ROW_PAD * PREFILL_ATTN_BLOCKS + qk_sb * MATMUL_ROW_PAD
                                 )
                                 qk_scaled_scores = pl.mul(qk_raw_scores, SOFTMAX_SCALE)
-                                softmax_scores_valid = pl.set_validshape(
+                                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_tile_start : qk_tile_start + PREFILL_ATTN_TILE]
+                                softmax_scores = pl.add(
                                     qk_scaled_scores,
-                                    MATMUL_ROW_PAD,
-                                    qk_tile_valid,
+                                    pl.col_expand(
+                                        pl.full([MATMUL_ROW_PAD, PREFILL_ATTN_TILE], dtype=pl.FP32, value=0.0),
+                                        qk_bias_row,
+                                    ),
                                 )
-                                softmax_scores = pl.fillpad(softmax_scores_valid, pad_value=pl.PadValue.min)
                                 softmax_mi = pl.row_max(softmax_scores)
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
                                 softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16)
@@ -404,69 +427,77 @@ def prefill_sparse_attn(
                                 )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_selector_copy"):
-        even_select_stage[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK] = even_select_local[
-            0:ROPE_INTERLEAVE_CHUNK,
-            0:ROPE_CHUNK,
-        ]
-        odd_select_stage[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK] = odd_select_local[
-            0:ROPE_INTERLEAVE_CHUNK,
-            0:ROPE_CHUNK,
-        ]
+        sel_zero = pl.full([ROPE_DIM, HALF_ROPE], dtype=pl.BF16, value=0.0)
+        even_select_stage[0:ROPE_DIM, 0:HALF_ROPE] = sel_zero
+        odd_select_stage[0:ROPE_DIM, 0:HALF_ROPE] = sel_zero
+        for sel_chunk in pl.range(HALF_ROPE // ROPE_CHUNK):
+            sel_r0 = sel_chunk * ROPE_INTERLEAVE_CHUNK
+            sel_c0 = sel_chunk * ROPE_CHUNK
+            even_select_stage = pl.assemble(
+                even_select_stage,
+                even_select_local[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK],
+                [sel_r0, sel_c0],
+            )
+            odd_select_stage = pl.assemble(
+                odd_select_stage,
+                odd_select_local[0:ROPE_INTERLEAVE_CHUNK, 0:ROPE_CHUNK],
+                [sel_r0, sel_c0],
+            )
 
-    # Stage 3: inverse RoPE on the rope slice of the attention output.
+    # Stage 3: inverse RoPE on the rope slice of the attention output, on the
+    # full ROPE_DIM width per token (one selector matmul per parity).
     for rope_apply_t0 in pl.parallel(0, T, ROPE_TOKEN_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_rope_apply_assemble_tile"):
             for rope_apply_dt in pl.range(ROPE_TOKEN_TILE):
                 rope_apply_t = rope_apply_t0 + rope_apply_dt
                 rope_apply_head_row = rope_apply_t * H
 
-                for rope_asm_r0 in pl.range(0, HALF_ROPE, ROPE_CHUNK):
-                    cos_chunk = pl.cast(
-                        freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
-                        target_type=pl.FP32,
-                    )
-                    sin_chunk = pl.cast(
-                        freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + ROPE_CHUNK],
-                        target_type=pl.FP32,
-                    )
-                    rope_tile = attn_rope_stage[
-                        rope_apply_head_row : rope_apply_head_row + H,
-                        2 * rope_asm_r0 : 2 * rope_asm_r0 + ROPE_INTERLEAVE_CHUNK,
-                    ]
-                    rope_apply_even_chunk = pl.matmul(rope_tile, even_select_stage, out_dtype=pl.FP32)
-                    rope_apply_odd_chunk = pl.matmul(rope_tile, odd_select_stage, out_dtype=pl.FP32)
-                    rope_even_acc = pl.add(
-                        pl.col_expand_mul(rope_apply_even_chunk, cos_chunk),
-                        pl.col_expand_mul(rope_apply_odd_chunk, sin_chunk),
-                    )
-                    rope_odd_acc = pl.sub(
-                        pl.col_expand_mul(rope_apply_odd_chunk, cos_chunk),
-                        pl.col_expand_mul(rope_apply_even_chunk, sin_chunk),
-                    )
-                    rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
-                    rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
-                    rope_even_interleave = pl.matmul(
-                        rope_rot_even_chunk,
-                        even_select_local,
-                        b_trans=True,
-                        out_dtype=pl.FP32,
-                    )
-                    rope_odd_interleave = pl.matmul(
-                        rope_rot_odd_chunk,
-                        odd_select_local,
-                        b_trans=True,
-                        out_dtype=pl.FP32,
-                    )
-                    rope_even_interleave_buf = pl.assemble(
-                        rope_even_interleave_buf,
-                        rope_even_interleave,
-                        [rope_apply_head_row, 2 * rope_asm_r0],
-                    )
-                    rope_odd_interleave_buf = pl.assemble(
-                        rope_odd_interleave_buf,
-                        rope_odd_interleave,
-                        [rope_apply_head_row, 2 * rope_asm_r0],
-                    )
+                cos_half = pl.cast(
+                    freqs_cos[rope_apply_t : rope_apply_t + 1, 0:HALF_ROPE],
+                    target_type=pl.FP32,
+                )
+                sin_half = pl.cast(
+                    freqs_sin[rope_apply_t : rope_apply_t + 1, 0:HALF_ROPE],
+                    target_type=pl.FP32,
+                )
+                rope_tile = attn_rope_stage[
+                    rope_apply_head_row : rope_apply_head_row + H,
+                    0:ROPE_DIM,
+                ]
+                rope_apply_even_chunk = pl.matmul(rope_tile, even_select_stage, out_dtype=pl.FP32)
+                rope_apply_odd_chunk = pl.matmul(rope_tile, odd_select_stage, out_dtype=pl.FP32)
+                rope_even_acc = pl.add(
+                    pl.col_expand_mul(rope_apply_even_chunk, cos_half),
+                    pl.col_expand_mul(rope_apply_odd_chunk, sin_half),
+                )
+                rope_odd_acc = pl.sub(
+                    pl.col_expand_mul(rope_apply_odd_chunk, cos_half),
+                    pl.col_expand_mul(rope_apply_even_chunk, sin_half),
+                )
+                rope_rot_even_chunk = pl.cast(rope_even_acc, target_type=pl.BF16, mode="rint")
+                rope_rot_odd_chunk = pl.cast(rope_odd_acc, target_type=pl.BF16, mode="rint")
+                rope_even_interleave = pl.matmul(
+                    rope_rot_even_chunk,
+                    even_select_stage,
+                    b_trans=True,
+                    out_dtype=pl.FP32,
+                )
+                rope_odd_interleave = pl.matmul(
+                    rope_rot_odd_chunk,
+                    odd_select_stage,
+                    b_trans=True,
+                    out_dtype=pl.FP32,
+                )
+                rope_even_interleave_buf = pl.assemble(
+                    rope_even_interleave_buf,
+                    rope_even_interleave,
+                    [rope_apply_head_row, 0],
+                )
+                rope_odd_interleave_buf = pl.assemble(
+                    rope_odd_interleave_buf,
+                    rope_odd_interleave,
+                    [rope_apply_head_row, 0],
+                )
 
     for rope_pack_block in pl.spmd(ROPE_PACK_SPMD_BLOCKS, name_hint="prefill_rope_pack_group_spmd"):
         rope_pack_token_block = rope_pack_block // O_GROUPS
