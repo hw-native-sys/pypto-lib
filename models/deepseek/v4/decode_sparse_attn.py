@@ -44,7 +44,11 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 VALID_TOKEN_TILE = 16
-ROPE_TOKEN_TILE = 1
+# gather_kv bulk zero-fill width (rows per wide MTE store). Divides PADDED_TOPK
+# (a multiple of ATTN_K_TILE); 128 rows x HEAD_DIM bf16 = 128 KB UB (well under
+# the 192 KB Vec budget).
+GATHER_FILL_TILE = 128
+ROPE_TOKEN_TILE = 2
 ROPE_PACK_TOKEN_TILE = 32
 ROPE_PACK_GROUP_TILE = 1
 H_TILE = 16
@@ -59,9 +63,9 @@ A_T_TILE = 16
 A_K_TILE = 128
 A_N_TILE = 128
 B_T_TILE = 16
-B_K_TILE = 128
+B_K_TILE = 256
 B_N_TILE = 128
-QUANT_TILE = 32
+QUANT_TILE = 512
 QUANT_TOKEN_TILE = 8
 QUANT_K_TILE = O_GROUPS * O_LORA // 2
 NEG_INF = -1.0e20
@@ -110,25 +114,37 @@ def sparse_attn(
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    # Own scope from the gather: one tile-store output per inlined scope (two
-    # cross-assign SSA -> NaN).
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="build_valid"):
-        for v_t0 in pl.range(0, T, VALID_TOKEN_TILE):
-            v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
-            v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
-            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
-            if PADDED_TOPK > TOPK:
-                sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                    [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+    # pl.spmd fans the independent token-bands across cores from one AICPU
+    # dispatch (each band writes a disjoint sparse_bias row range -> its own
+    # outlined scope, satisfying the one-tile-store-output rule).
+    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
+        v_t0 = v_blk * VALID_TOKEN_TILE
+        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
+        v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
+        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
+        if PADDED_TOPK > TOPK:
+            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
+                [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
     for g_t in pl.spmd(T, name_hint="gather_kv"):
         g_b = g_t // S
         g_kv_base = g_t * PADDED_TOPK
-        zero_kv_row = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
         # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
         # gets a WAR edge against this read (pypto-lib#481).
         g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
         ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
+
+        # Bulk-zero the token's whole packed-KV region in GATHER_FILL_TILE-row
+        # tiles up front, so invalid (-1) slots and the padding tail default to
+        # zero via a few wide, high-UB-utilization MTE stores instead of one
+        # [1, HEAD_DIM] dup-store per invalid slot (Vec was ~1% — almost pure
+        # MTE). The valid slots below then overwrite their rows. Keeping the
+        # NEG_INF softmax bias (build_valid) plus finite (zero) invalid KV rows
+        # is what lets qk_pv skip a per-block mask multiply.
+        zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+        for g_f in pl.range(0, PADDED_TOPK, GATHER_FILL_TILE):
+            g_fill_row = g_kv_base + g_f
+            sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
 
         # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
         # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
@@ -137,34 +153,29 @@ def sparse_attn(
         g_overlay_base = g_b * S
 
         # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        for g_w in pl.range(WIN):
-            g_dst_row = g_kv_base + g_w
+        # Invalid (raw < 0) slots keep the bulk-zero fill (no per-slot store).
+        # pl.pipeline ping-pongs the per-row MTE staging so block k+1's load
+        # overlaps block k's store (matches prefill_sparse_attn's gather).
+        for g_w in pl.pipeline(WIN, stage=4):
             g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
-            if g_raw < 0:
-                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
-            elif g_raw < WIN:
-                g_src_row = g_ori_base + g_raw
-                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-            else:
-                g_overlay_row = g_overlay_base + (g_raw - WIN)
-                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
+            if g_raw >= 0:
+                g_dst_row = g_kv_base + g_w
+                if g_raw < WIN:
+                    g_src_row = g_ori_base + g_raw
+                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                else:
+                    g_overlay_row = g_overlay_base + (g_raw - WIN)
+                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
 
-        # Compressed slots [WIN, TOPK): paged compressed cache; -1 is padding.
-        for g_c in pl.range(WIN, TOPK):
-            g_dst_row = g_kv_base + g_c
+        # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
+        for g_c in pl.pipeline(WIN, TOPK, stage=4):
             g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-            if g_raw < 0:
-                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
-            else:
+            if g_raw >= 0:
+                g_dst_row = g_kv_base + g_c
                 g_slot = g_raw - (WIN + S)
                 g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
                 g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
                 sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-
-        # Padding tail [TOPK, PADDED_TOPK): always zero (empty when TOPK aligns).
-        for g_p in pl.range(TOPK, PADDED_TOPK):
-            g_dst_row = g_kv_base + g_p
-            sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = zero_kv_row
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -179,18 +190,24 @@ def sparse_attn(
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
         qk_kv_base = qk_t * PADDED_TOPK
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        for qk_h_idx in pl.range((H // H_TILE)):
-            qk_h0 = qk_h_idx * H_TILE
-            qk_head_row = qk_t * H + qk_h0
-            qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
-            qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
+        # Sparse-block OUTER / head-tile INNER: the KV tile and additive bias
+        # depend only on (token, sparse-block), so hoisting them above the
+        # head-tile loop lets one GM->L1 [ATTN_K_TILE, HEAD_DIM] KV load (and one
+        # bias load) serve all H//H_TILE head-tiles instead of being re-loaded
+        # per head. Pure loop reorder -- per-(head,block) math and the
+        # mi/li/oi output index are unchanged, so results are bit-identical.
+        for qk_sb in pl.range(SPARSE_BLOCKS):
+            qk_s0 = qk_sb * ATTN_K_TILE
+            qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+            qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+            qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
 
-            for qk_sb in pl.range(SPARSE_BLOCKS):
-                qk_s0 = qk_sb * ATTN_K_TILE
-                qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+            for qk_h_idx in pl.range((H // H_TILE)):
+                qk_h0 = qk_h_idx * H_TILE
+                qk_head_row = qk_t * H + qk_h0
+                qk_q_tile = q_flat[qk_head_row : qk_head_row + H_TILE, 0 : HEAD_DIM]
                 qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
                 qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([H_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
                 qk_mi = pl.row_max(qk_scores)
                 # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
@@ -198,8 +215,8 @@ def sparse_attn(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
-                qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
                 qk_row = qk_blk_base + qk_sb * H_TILE
                 sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi
                 sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li
@@ -245,7 +262,7 @@ def sparse_attn(
 
     # Inverse RoPE: gather even/odd lanes, rotate, then mask-scatter back to
     # interleaved layout. The BF16 round-trip on rotated values matches golden.
-    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
+    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
     for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
         r_t0 = r_idx * ROPE_TOKEN_TILE
         # A3 interleaved swap-gather, built ENTIRELY IN-KERNEL, replacing the de-interleave
@@ -279,24 +296,26 @@ def sparse_attn(
                 r_sin_il = pl.gather(r_sin_h, dim=-1, index=sp_dup_idx)
                 r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
                 r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(pl.mul(r_swapped, sp_sign), r_sin_il))
-                r_rot = pl.cast(pl.cast(r_rot, target_type=pl.BF16, mode="rint"), target_type=pl.FP32)
+                # Store the BF16-rounded rotated values directly (golden also
+                # rounds inverse-RoPE to bf16): rope_buf is BF16, halving its GM
+                # round-trip and dropping the rope_pack down-cast below.
+                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
                 rope_buf[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
-    for rp_block in pl.spmd((T // ROPE_PACK_TOKEN_TILE) * O_GROUPS, name_hint="rope_pack"):
-        rp_tb = rp_block // O_GROUPS
-        rp_g = rp_block - rp_tb * O_GROUPS
-        rp_t0 = rp_tb * ROPE_PACK_TOKEN_TILE
-
-        for rp_dt in pl.range(ROPE_PACK_TOKEN_TILE):
-            rp_t = rp_t0 + rp_dt
-            rp_row = rp_t * H + rp_g * HEADS_PER_GROUP
-
-            rp_rope = rope_buf[rp_row : rp_row + HEADS_PER_GROUP, 0 : ROPE_DIM]
-            rp_full = pl.cast(rp_rope, target_type=pl.BF16)
-            rp_pack_row = rp_g * T + rp_t
-            for rp_hh in pl.range(HEADS_PER_GROUP):
-                rp_col = rp_hh * HEAD_DIM + NOPE_DIM
-                o_packed[rp_pack_row : rp_pack_row + 1, rp_col : rp_col + ROPE_DIM] = rp_full[rp_hh : rp_hh + 1, 0 : ROPE_DIM]
+    # Pack the per-head inverse-RoPE results into o_packed's strided rope
+    # columns. For a fixed (group, head) the rope segment lands at the SAME 64
+    # columns for every token, so o_packed[g*T : g*T+T, col:col+ROPE_DIM] is a
+    # single [T, ROPE_DIM] tile -- write all T tokens of a head in one strided
+    # MTE store instead of T separate [1, ROPE_DIM] (128 B) dup-stores (Vec was
+    # ~0.5%). rope_buf_3d[:, gh, :] gathers that head's rope rows (stride H)
+    # across tokens; the values are bit-identical to the per-token scatter.
+    rope_buf_3d = pl.reshape(rope_buf, [T, H, ROPE_DIM])
+    for rp_gh in pl.spmd(H, name_hint="rope_pack"):
+        rp_g = rp_gh // HEADS_PER_GROUP
+        rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
+        rp_rope_tile = pl.reshape(rope_buf_3d[0:T, rp_gh : rp_gh + 1, 0:ROPE_DIM], [T, ROPE_DIM])
+        rp_col = rp_hh * HEAD_DIM + NOPE_DIM
+        o_packed[rp_g * T : rp_g * T + T, rp_col : rp_col + ROPE_DIM] = rp_rope_tile
 
     # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
     # (BF16 store + per-row partial amax) is T-tiled inside the scope as a
