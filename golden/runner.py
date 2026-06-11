@@ -385,10 +385,18 @@ def _maybe_reload_l3(
     """
     if not (work_dir / "distributed_meta.json").exists():
         return None
+    # The meta sidecar proves this is an L3 build, so a missing
+    # DistributedCompiledProgram is an unusable-pypto error, not a single-chip
+    # fallback: surface it explicitly instead of returning None and failing
+    # later in execute_compiled with a confusing single-chip error.
     try:
         from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    except ImportError:
-        return None
+    except ImportError as e:
+        raise ImportError(
+            "L3 build detected (distributed_meta.json present), but "
+            "DistributedCompiledProgram could not be imported. Ensure your "
+            "pypto installation supports L3 distributed execution."
+        ) from e
     return DistributedCompiledProgram.from_dir(
         work_dir,
         platform=runtime_cfg.get("platform"),

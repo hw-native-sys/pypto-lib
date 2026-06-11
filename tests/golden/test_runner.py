@@ -14,8 +14,10 @@ so they run without a device.
 """
 
 import ctypes
+import sys
+import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -1154,10 +1156,18 @@ class TestMaybeReloadL3:
         threading the run's platform + distributed_config as overrides."""
         (tmp_path / "distributed_meta.json").write_text("{}")
         sentinel = object()
-        with patch(
-            "pypto.ir.distributed_compiled_program.DistributedCompiledProgram.from_dir",
-            return_value=sentinel,
-        ) as from_dir:
+        # CI ships a lightweight pypto where pypto.ir is not a package, so the
+        # real module can't be import-patched. Inject a stand-in into sys.modules
+        # so the in-function `from pypto.ir.distributed_compiled_program import
+        # ...` resolves to our fake regardless of the installed pypto.
+        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        from_dir = MagicMock(return_value=sentinel)
+        fake_mod.DistributedCompiledProgram = type(
+            "DistributedCompiledProgram", (), {"from_dir": from_dir}
+        )
+        with patch.dict(
+            sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}
+        ):
             out = _maybe_reload_l3(
                 tmp_path,
                 {"platform": "a2a3"},
@@ -1167,6 +1177,18 @@ class TestMaybeReloadL3:
         from_dir.assert_called_once()
         assert from_dir.call_args.kwargs["platform"] == "a2a3"
         assert from_dir.call_args.kwargs["distributed_config"] == "DC"
+
+    def test_raises_when_l3_module_missing(self, tmp_path):
+        """An L3 build whose DistributedCompiledProgram can't be imported raises
+        a clear ImportError instead of silently returning None (which would fail
+        confusingly down the single-chip path)."""
+        (tmp_path / "distributed_meta.json").write_text("{}")
+        # sys.modules[name] = None makes `from name import ...` raise ImportError.
+        with patch.dict(
+            sys.modules, {"pypto.ir.distributed_compiled_program": None}
+        ):
+            with pytest.raises(ImportError, match="L3 build detected"):
+                _maybe_reload_l3(tmp_path, {"platform": "a2a3"}, {})
 
 
 if __name__ == "__main__":
