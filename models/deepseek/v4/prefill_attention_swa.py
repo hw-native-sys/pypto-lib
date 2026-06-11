@@ -17,19 +17,18 @@ import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from hc_post import golden_hc_post, hc_post
-from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre_packed
-from prefill_qkv_proj_rope import prefill_packed_qkv_proj_rope_core
-from prefill_rmsnorm import prefill_packed_attn_norm
+from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
+from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
+from prefill_rmsnorm import golden_prefill_attn_norm, prefill_attn_norm
 from prefill_sparse_attn import (
     HCA_CMP_BLOCK_NUM as SPARSE_HCA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
     ORI_BLOCK_NUM as SPARSE_ORI_BLOCK_NUM,
     ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
-    PREFILL_ATTN_TILE as SPARSE_PREFILL_ATTN_TILE,
     TOPK as SPARSE_TOPK,
-    _int8_quant_per_row,
     _quant_w_per_channel,
-    prefill_packed_sparse_attn_overlay,
+    golden_prefill_sparse_attn,
+    prefill_sparse_attn,
 )
 
 
@@ -52,7 +51,6 @@ ROPE_HALF = ROPE_DIM // 2
 HALF_ROPE = ROPE_HALF
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
-SOFTMAX_SCALE = M.softmax_scale
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -248,7 +246,7 @@ def prefill_attention_swa(
     comb = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed, post, comb = prefill_hc_pre_packed(
+    x_mixed, post, comb = prefill_hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -266,8 +264,8 @@ def prefill_attention_swa(
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = prefill_packed_attn_norm(x_mixed, attn_norm_w, x_normed)
-    q, kv, qr, qr_scale = prefill_packed_qkv_proj_rope_core(
+    x_normed = prefill_attn_norm(x_mixed, attn_norm_w, x_normed)
+    q, kv, qr, qr_scale = prefill_qkv_proj_rope_core(
         x_normed,
         wq_a,
         wq_b,
@@ -294,7 +292,7 @@ def prefill_attention_swa(
         for dummy_req in pl.range(MAX_REQS):
             for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
                 pl.write(cmp_block_table_dummy, [dummy_req, dummy_blk], pl.cast(0, pl.INT32))
-    attn_out = prefill_packed_sparse_attn_overlay(
+    attn_out = prefill_sparse_attn(
         q,
         kv_cache,
         block_table,
@@ -338,159 +336,6 @@ def _quant_w_per_output_channel(w):
     return w_i8, (1.0 / scale_quant).float()
 
 
-def _quant_w_per_row(w):
-    import torch
-
-    amax = w.float().abs().amax(dim=1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.view(-1, 1)
-    w_i32 = torch.round(scaled).to(torch.int32)
-    w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
-    w_i8 = w_i32.to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
-def _golden_swa_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale):
-    import torch
-
-    x = x_mixed.float()
-    norm_w = tensors["attn_norm_w"].float()
-    wq_a = tensors["wq_a"].float()
-    wq_b = tensors["wq_b"]
-    wq_b_scale = tensors["wq_b_scale"].float().view(-1)
-    wkv = tensors["wkv"].float()
-    freqs_cos = tensors["freqs_cos"]
-    freqs_sin = tensors["freqs_sin"]
-    gamma_cq = tensors["gamma_cq"].float()
-    gamma_ckv = tensors["gamma_ckv"].float()
-    positions = tensors["position_ids"].to(torch.long)
-    rope_cos_flat = freqs_cos.index_select(0, positions).contiguous()
-    rope_sin_flat = freqs_sin.index_select(0, positions).contiguous()
-
-    def rms_norm(v, gamma, eps=EPS):
-        inv = torch.rsqrt(v.square().mean(-1, keepdim=True) + eps)
-        return v * inv * gamma
-
-    def matmul_bf16_input_fp32(a, b):
-        return torch.matmul(a.to(torch.bfloat16).float(), b.to(torch.bfloat16).float()).float()
-
-    def apply_rope(x_rope, cos, sin):
-        x_pair = x_rope.unflatten(-1, (-1, 2))
-        x_even, x_odd = x_pair[..., 0], x_pair[..., 1]
-        cos_v = cos[..., :ROPE_HALF]
-        sin_v = sin[..., :ROPE_HALF]
-        while cos_v.ndim < x_even.ndim:
-            cos_v = cos_v.unsqueeze(-2)
-            sin_v = sin_v.unsqueeze(-2)
-        y_even = (x_even * cos_v - x_odd * sin_v).to(torch.bfloat16)
-        y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
-        return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
-
-    token_x = rms_norm(x.reshape(T, D), norm_w)
-    qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)
-    qr_i8, qr_scale_out = _int8_quant_per_row(qr_out.to(torch.bfloat16).float())
-    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
-    q_full = (q_i32.float() * qr_scale_out * wq_b_scale.view(1, -1)).view(T, H, HEAD_DIM)
-    q_full = q_full * torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
-    q_nope = q_full[..., :NOPE_DIM]
-    q_rope = apply_rope(q_full[..., NOPE_DIM:], rope_cos_flat, rope_sin_flat)
-    q_out = torch.cat([q_nope, q_rope], dim=-1)
-
-    kv_full = rms_norm(matmul_bf16_input_fp32(token_x, wkv), gamma_ckv)
-    kv_nope = kv_full[..., :NOPE_DIM]
-    kv_rope_in = kv_full[..., NOPE_DIM:].unsqueeze(1)
-    kv_rope = apply_rope(kv_rope_in, rope_cos_flat, rope_sin_flat).squeeze(1)
-    kv_out = torch.cat([kv_nope, kv_rope], dim=-1)
-
-    q[:] = q_out.to(torch.bfloat16)
-    kv[:] = kv_out.to(torch.bfloat16)
-    qr[:] = qr_i8
-    qr_scale[:] = qr_scale_out
-
-
-def _golden_swa_packed_sparse_attn(tensors, q, ori_kv, kv_overlay, rope_cos_t, rope_sin_t, attn_out):
-    import torch
-
-    num_tokens = int(tensors["num_tokens"])
-    q_f32 = q.float()
-    ori_kv_f32 = ori_kv.float()
-    kv_overlay_f32 = kv_overlay.float()
-    ori_block_table = tensors["block_table"]
-    cmp_sparse_indices = tensors["cmp_sparse_indices"]
-    token_to_request = tensors["token_to_request"]
-    attn_sink = tensors["attn_sink"].float()
-    wo_a = tensors["wo_a"].float()
-    wo_b_i8 = tensors["wo_b"]
-    wo_b_scale = tensors["wo_b_scale"].float()
-
-    o = torch.zeros(T, H, HEAD_DIM)
-    for t in range(num_tokens):
-        req = int(token_to_request[t].item())
-        gathered = []
-        for raw_i in cmp_sparse_indices[t, :SPARSE_TOPK].tolist():
-            raw = int(raw_i)
-            if raw < 0:
-                continue
-            if raw < WIN:
-                blk_id = int(ori_block_table[req, raw // BLOCK_SIZE].item())
-                intra = raw % BLOCK_SIZE
-                gathered.append(ori_kv_f32[blk_id, intra, 0])
-            elif raw < WIN + MAX_TOKENS:
-                overlay_t = raw - WIN
-                if overlay_t < num_tokens:
-                    gathered.append(kv_overlay_f32[overlay_t])
-            else:
-                continue
-        if not gathered:
-            continue
-        kv_b = torch.stack(gathered, dim=0)
-
-        mi = None
-        li = None
-        oi = None
-        for tile_start in range(0, kv_b.shape[0], SPARSE_PREFILL_ATTN_TILE):
-            kv_tile = kv_b[tile_start : tile_start + SPARSE_PREFILL_ATTN_TILE]
-            scores = (q_f32[t] @ kv_tile.T) * SOFTMAX_SCALE
-            cur_mi = scores.max(dim=-1, keepdim=True).values
-            exp_scores_bf16 = torch.exp(scores - cur_mi).to(torch.bfloat16)
-            cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
-            cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
-            if mi is None:
-                mi = cur_mi
-                li = cur_li
-                oi = cur_oi
-            else:
-                mi_new = torch.maximum(mi, cur_mi)
-                alpha = torch.exp(mi - mi_new)
-                beta = torch.exp(cur_mi - mi_new)
-                li = alpha * li + beta * cur_li
-                oi = oi * alpha + cur_oi * beta
-                mi = mi_new
-
-        if mi is not None:
-            denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
-            o[t] = oi / denom
-
-    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-    rope_even = rope_pair[..., 0]
-    rope_odd = rope_pair[..., 1]
-    cos_half = rope_cos_t.float()[:, :ROPE_HALF].unsqueeze(1)
-    sin_half = rope_sin_t.float()[:, :ROPE_HALF].unsqueeze(1)
-    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
-    o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
-
-    o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
-    o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)
-    o_r = o_r.to(torch.bfloat16).float()
-    o_r_q = o_r.flatten(1).view(T, O_GROUPS * O_LORA)
-    o_r_i8, o_r_scale = _int8_quant_per_row(o_r_q)
-    acc = o_r_i8.to(torch.int32) @ wo_b_i8.to(torch.int32).T
-    out = acc.float() * o_r_scale * wo_b_scale.unsqueeze(0)
-    attn_out[:] = out.to(torch.bfloat16)
-
-
 def golden_prefill_attention_swa(tensors):
     """Torch reference for token-major packed SWA prefill."""
     import torch
@@ -514,14 +359,48 @@ def golden_prefill_attention_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    _golden_swa_packed_qkv_proj_rope(tensors, x_mixed, q, kv, qr, qr_scale)
+    rope_cos_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
+    rope_sin_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
+    x_normed = golden_prefill_attn_norm(x_mixed.view(T, D), tensors["attn_norm_w"])
+    golden_prefill_qkv_proj_rope({
+        "x": x_normed,
+        "wq_a": tensors["wq_a"],
+        "wq_b": tensors["wq_b"],
+        "wq_b_scale": tensors["wq_b_scale"],
+        "wkv": tensors["wkv"],
+        "freqs_cos": tensors["freqs_cos"],
+        "freqs_sin": tensors["freqs_sin"],
+        "gamma_cq": tensors["gamma_cq"],
+        "gamma_ckv": tensors["gamma_ckv"],
+        "position_ids": tensors["position_ids"],
+        "q": q,
+        "kv": kv,
+        "qr": qr,
+        "qr_scale": qr_scale,
+        "rope_cos_t": rope_cos_t,
+        "rope_sin_t": rope_sin_t,
+    })
 
     kv_cache_in = tensors["kv_cache"].clone()
-    positions = tensors["position_ids"].to(torch.long)
-    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
-    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    _golden_swa_packed_sparse_attn(tensors, q, kv_cache_in, kv, rope_cos_t, rope_sin_t, attn_out)
+    golden_prefill_sparse_attn({
+        "q": q,
+        "ori_kv": kv_cache_in,
+        "ori_block_table": tensors["block_table"],
+        "kv_overlay": kv,
+        "cmp_kv": torch.zeros(SPARSE_HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
+        "cmp_block_table": torch.zeros(MAX_REQS, SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
+        "cmp_sparse_indices": tensors["cmp_sparse_indices"],
+        "attn_sink": tensors["attn_sink"],
+        "token_to_request": tensors["token_to_request"],
+        "num_tokens": tensors["num_tokens"],
+        "freqs_cos": rope_cos_t,
+        "freqs_sin": rope_sin_t,
+        "wo_a": tensors["wo_a"],
+        "wo_b": tensors["wo_b"],
+        "wo_b_scale": tensors["wo_b_scale"],
+        "attn_out": attn_out,
+    })
 
     kv_cache_out = kv_cache_in.clone()
     kv_cache_flat = kv_cache_out.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -748,7 +627,7 @@ def build_tensor_specs(
     ]
 
 
-def packed_x_out_compare(num_tokens: int):
+def active_x_out_compare(num_tokens: int):
     from golden import ratio_allclose
 
     base_cmp = ratio_allclose(atol=6e-3, rtol=2.0 / 128)
@@ -773,7 +652,7 @@ def packed_x_out_compare(num_tokens: int):
             atol=atol,
         )
 
-    cmp.__name__ = f"packed_x_out_compare(num_tokens={num_tokens})"
+    cmp.__name__ = f"active_x_out_compare(num_tokens={num_tokens})"
     return cmp
 
 
@@ -847,18 +726,6 @@ if __name__ == "__main__":
         default=False,
         help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
     )
-    parser.add_argument(
-        "--block-dim",
-        type=int,
-        default=None,
-        help="Optional compile/runtime block_dim override forwarded through runtime_cfg; leave unset for default.",
-    )
-    parser.add_argument(
-        "--aicpu-thread-num",
-        type=int,
-        default=None,
-        help="Optional AICPU scheduler thread count override forwarded through runtime_cfg; leave unset for default.",
-    )
     args = parser.parse_args()
     try:
         _, _, compare_tokens, _ = _resolve_swa_case(
@@ -885,13 +752,11 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
-            block_dim=args.block_dim,
-            aicpu_thread_num=args.aicpu_thread_num,
         ),
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": packed_x_out_compare(compare_tokens),
+            "x_out": active_x_out_compare(compare_tokens),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
         },
     )

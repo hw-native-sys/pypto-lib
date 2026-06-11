@@ -45,7 +45,7 @@ RMS_PIPE_STAGE = 1 if T >= 64 else 4
 
 
 @pl.jit.inline
-def prefill_hc_pre_packed(
+def prefill_hc_pre(
     x:        pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_fn:    pl.Tensor[[MIX_HC, HC_DIM],   pl.FP32],
     hc_scale: pl.Tensor[[3],                pl.FP32],
@@ -309,61 +309,6 @@ def prefill_hc_pre_packed(
     return x_mixed, post, comb
 
 
-@pl.jit.inline
-def prefill_hc_pre(
-    x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    hc_fn:    pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
-    hc_scale: pl.Tensor[[3], pl.FP32],
-    hc_base:  pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed:  pl.Tensor[[B, S, D], pl.BF16],
-    post:     pl.Tensor[[B, S, HC_MULT], pl.FP32],
-    comb:     pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32],
-):
-    x_packed = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_packed = pl.reshape(x, [T, HC_MULT, D])
-    x_mixed_packed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_mixed_packed = pl.reshape(x_mixed, [T, D])
-    post_packed = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-    post_packed = pl.reshape(post, [T, HC_MULT])
-    comb_packed = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
-    comb_packed = pl.reshape(comb, [T, HC_MULT, HC_MULT])
-    x_mixed_packed, post_packed, comb_packed = prefill_hc_pre_packed(
-        x_packed,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        x_mixed_packed,
-        post_packed,
-        comb_packed,
-    )
-    x_mixed = pl.reshape(x_mixed_packed, [B, S, D])
-    post = pl.reshape(post_packed, [B, S, HC_MULT])
-    comb = pl.reshape(comb_packed, [B, S, HC_MULT, HC_MULT])
-    return x_mixed, post, comb
-
-
-@pl.jit
-def prefill_hc_pre_test(
-    x:        pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
-    hc_fn:    pl.Tensor[[MIX_HC, HC_DIM],   pl.FP32],
-    hc_scale: pl.Tensor[[3],                pl.FP32],
-    hc_base:  pl.Tensor[[MIX_HC],           pl.FP32],
-    x_mixed:  pl.Out[pl.Tensor[[B, S, D],   pl.BF16]],
-    post:      pl.Out[pl.Tensor[[B, S, HC_MULT], pl.FP32]],
-    comb:      pl.Out[pl.Tensor[[B, S, HC_MULT, HC_MULT], pl.FP32]],
-):
-    x_mixed, post, comb = prefill_hc_pre(
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        x_mixed,
-        post,
-        comb,
-    )
-    return x_mixed, post, comb
-
-
 def golden_prefill_hc_pre(tensors):
     import torch
 
@@ -372,8 +317,8 @@ def golden_prefill_hc_pre(tensors):
     hc_scale = tensors["hc_scale"].float()
     hc_base = tensors["hc_base"].float()
 
-    x_flat = x.flatten(2)
-    x_flat_2d = x_flat.reshape(T, HC_DIM)
+    x_token = x.reshape(T, HC_MULT, D)
+    x_flat_2d = x_token.reshape(T, HC_DIM)
     sq_sum = torch.zeros(T, 1, dtype=torch.float32)
     for k0 in range(0, HC_DIM, RMS_K_CHUNK):
         x_chunk = x_flat_2d[:, k0:k0 + RMS_K_CHUNK]
@@ -409,17 +354,31 @@ def golden_prefill_hc_pre(tensors):
         comb_t = comb_t / (comb_t.sum(-1, keepdim=True) + HC_EPS)
         comb_t = comb_t / (comb_t.sum(-2, keepdim=True) + HC_EPS)
 
-    y01 = x[:, :, 0, :] * pre[:, :, 0:1] + x[:, :, 1, :] * pre[:, :, 1:2]
-    y23 = x[:, :, 2, :] * pre[:, :, 2:3] + x[:, :, 3, :] * pre[:, :, 3:4]
+    pre_2d = pre.reshape(T, HC_MULT)
+    y01 = x_token[:, 0, :] * pre_2d[:, 0:1] + x_token[:, 1, :] * pre_2d[:, 1:2]
+    y23 = x_token[:, 2, :] * pre_2d[:, 2:3] + x_token[:, 3, :] * pre_2d[:, 3:4]
     y = y01 + y23
 
     def _to_device_bf16(value):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
         return rounded.view(torch.float32).to(torch.bfloat16)
 
-    tensors["x_mixed"][:] = _to_device_bf16(y)
-    tensors["post"][:] = post
-    tensors["comb"][:] = comb_t
+    tensors["x_mixed"][:] = _to_device_bf16(y).reshape_as(tensors["x_mixed"])
+    tensors["post"][:] = post.reshape_as(tensors["post"])
+    tensors["comb"][:] = comb_t.reshape_as(tensors["comb"])
+
+
+@pl.jit
+def prefill_hc_pre_test(
+    x:        pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    hc_fn:    pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base:  pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed:  pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    post:     pl.Out[pl.Tensor[[T, HC_MULT], pl.FP32]],
+    comb:     pl.Out[pl.Tensor[[T, HC_MULT, HC_MULT], pl.FP32]],
+):
+    return prefill_hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
 
 
 def build_tensor_specs():
@@ -427,7 +386,7 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_x():
-        return torch.randn(B, S, HC_MULT, D) * 0.05
+        return torch.randn(T, HC_MULT, D) * 0.05
     def init_hc_fn():
         return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
     def init_hc_scale():
@@ -436,13 +395,13 @@ def build_tensor_specs():
         return torch.zeros(MIX_HC)
 
     return [
-        TensorSpec("x", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [T, HC_MULT, D], torch.bfloat16, init_value=init_x),
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),
-        TensorSpec("x_mixed", [B, S, D], torch.bfloat16, is_output=True),
-        TensorSpec("post", [B, S, HC_MULT], torch.float32, is_output=True),
-        TensorSpec("comb", [B, S, HC_MULT, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("x_mixed", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("post", [T, HC_MULT], torch.float32, is_output=True),
+        TensorSpec("comb", [T, HC_MULT, HC_MULT], torch.float32, is_output=True),
     ]
 
 
@@ -450,7 +409,7 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill HC pre validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)

@@ -38,7 +38,7 @@ assert T % PREFILL_RMSNORM_TOKEN_CHUNK == 0, "prefill token count must be divisi
 
 
 @pl.jit.inline
-def prefill_packed_attn_norm(
+def prefill_attn_norm(
     x: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     x_normed: pl.Tensor[[T, D], pl.BF16],
@@ -85,47 +85,13 @@ def prefill_packed_attn_norm(
     return x_normed
 
 
-@pl.jit.inline
-def prefill_attn_norm(
-    x:         pl.Tensor[[B, S, D],              pl.BF16],
-    norm_w:    pl.Tensor[[D],                    pl.FP32],
-    x_normed:  pl.Tensor[[B, S, D],              pl.BF16],
-):
-    x_flat = pl.reshape(x, [T, D])
-    x_normed_flat = pl.reshape(x_normed, [T, D])
-
-    for tg_idx in pl.spmd(T // PREFILL_ATTN_NORM_T_TILE, name_hint="prefill_attn_norm"):
-        tg = tg_idx * PREFILL_ATTN_NORM_T_TILE
-        x_sq_sum = pl.full([1, PREFILL_ATTN_NORM_T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_db in pl.pipeline(D_BLOCKS, stage=2):
-            rms_d0 = rms_db * D_CHUNK
-            rms_x_chunk = pl.cast(x_flat[tg : tg + PREFILL_ATTN_NORM_T_TILE, rms_d0 : rms_d0 + D_CHUNK], target_type=pl.FP32)
-            x_sq_sum = pl.add(
-                x_sq_sum,
-                pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, PREFILL_ATTN_NORM_T_TILE]),
-            )
-        x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
-        x_inv_rms_t = pl.reshape(x_inv_rms, [PREFILL_ATTN_NORM_T_TILE, 1])
-        for apply_db in pl.pipeline(D_BLOCKS, stage=2):
-            apply_d0 = apply_db * D_CHUNK
-            apply_x_chunk = pl.cast(x_flat[tg : tg + PREFILL_ATTN_NORM_T_TILE, apply_d0 : apply_d0 + D_CHUNK], target_type=pl.FP32)
-            norm_w_chunk = pl.reshape(norm_w[apply_d0 : apply_d0 + D_CHUNK], [1, D_CHUNK])
-            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed_flat[tg : tg + PREFILL_ATTN_NORM_T_TILE, apply_d0 : apply_d0 + D_CHUNK] = pl.cast(
-                        x_normed_chunk, target_type=pl.BF16, mode="rint"
-            )
-
-    x_normed = pl.reshape(x_normed_flat, [B, S, D])
-    return x_normed
-
-
 @pl.jit
 def prefill_rmsnorm(
     x: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    x_normed = prefill_packed_attn_norm(x, norm_w, x_normed)
+    x_normed = prefill_attn_norm(x, norm_w, x_normed)
     return x_normed
 
 
