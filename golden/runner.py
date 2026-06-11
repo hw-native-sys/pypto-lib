@@ -113,7 +113,13 @@ def _backend_for_platform(platform: str) -> Any:
         ) from None
 
 
-_DFX_FLAG_KEYS = ("enable_l2_swimlane", "enable_dump_tensor", "enable_pmu", "enable_dep_gen")
+_DFX_FLAG_KEYS = (
+    "enable_l2_swimlane",
+    "enable_dump_tensor",
+    "enable_pmu",
+    "enable_dep_gen",
+    "enable_scope_stats",
+)
 
 
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
