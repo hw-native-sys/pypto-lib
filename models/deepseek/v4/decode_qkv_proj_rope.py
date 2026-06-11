@@ -120,11 +120,16 @@ def qkv_proj_rope(
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
             qr[tg : tg + T_TILE, qa : qa + QUANT_TILE] = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
 
+    # UN-MIXED qproj: pure-matmul scope (cube, INT32 -> GM) + separate dequant scope (vec).
+    # The fused form pinned the dequant (vec) right after each matmul, so its AIV work ran in
+    # qproj's window and stole AIV cores from the critical qr_proj_aiv. Split so the scheduler
+    # can defer the off-critical-path dequant (q has large downstream slack) to when AIV is free.
     q_proj_fp32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.FP32)
-    for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj"):
+    q_proj_i32 = pl.create_tensor([T, H * HEAD_DIM], dtype=pl.INT32)
+    for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj_matmul"):
         hg = hg_idx * 16
-        col_acc = pl.create_tensor([T, Q_PROJ_OUT_TILE], dtype=pl.INT32)
         for h_inner in pl.pipeline(16, stage=2):
+            col_acc = pl.create_tensor([T, Q_PROJ_OUT_TILE], dtype=pl.INT32)
             for qb in pl.pipeline(0, Q_LORA // Q_PROJ_TILE, stage=2):
                 qr_proj_col0 = qb * Q_PROJ_TILE
                 qr_i8_chunk = qr[:, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
@@ -133,14 +138,19 @@ def qkv_proj_rope(
                     col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
                 else:
                     col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+            q_proj_i32[:, (hg + h_inner) * Q_PROJ_OUT_TILE : (hg + h_inner) * Q_PROJ_OUT_TILE + Q_PROJ_OUT_TILE] = col_acc
+
+    for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj_dequant"):
+        hg = hg_idx * 16
+        for h_inner in pl.pipeline(16, stage=2):
             w_col0 = (hg + h_inner) * Q_PROJ_OUT_TILE
             w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
             for tc in pl.pipeline(0, T, QPROJ_T_TILE, stage=2):
-                col_acc_t = col_acc[tc : tc + QPROJ_T_TILE, :]
+                col_acc_t = q_proj_i32[tc : tc + QPROJ_T_TILE, w_col0 : w_col0 + Q_PROJ_OUT_TILE]
                 col_fp32 = pl.cast(col_acc_t, target_type=pl.FP32, mode="none")
                 qr_scale_dq_t = qr_scale[tc : tc + QPROJ_T_TILE, :]
                 col_dequant = pl.col_expand_mul(pl.row_expand_mul(col_fp32, qr_scale_dq_t), w_scale)
-                q_proj_fp32[tc : tc + QPROJ_T_TILE, (hg + h_inner) * Q_PROJ_OUT_TILE : (hg + h_inner) * Q_PROJ_OUT_TILE + Q_PROJ_OUT_TILE] = col_dequant
+                q_proj_fp32[tc : tc + QPROJ_T_TILE, w_col0 : w_col0 + Q_PROJ_OUT_TILE] = col_dequant
 
     # Per-head RMS, NOPE projection, and RoPE rotation, staged through
     # q_head_inv_rms_all and q_rope_pair_stage.
