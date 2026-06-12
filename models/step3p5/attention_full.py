@@ -392,12 +392,10 @@ def attention_full(
         slot = pl.tensor.read(slot_mapping, [b_safe])
         slot_block = slot // BLOCK_SIZE
         slot_offset = slot - slot_block * BLOCK_SIZE
-        cos_row = pl.slice(rope_cos, [1, ROTARY_HALF_FULL * 2], [pos, 0])
-        sin_row = pl.slice(rope_sin, [1, ROTARY_HALF_FULL * 2], [pos, 0])
-        cos_lo = pl.slice(cos_row, [1, ROTARY_HALF_FULL], [0, 0])
-        cos_hi = pl.slice(cos_row, [1, ROTARY_HALF_FULL], [0, ROTARY_HALF_FULL])
-        sin_lo = pl.slice(sin_row, [1, ROTARY_HALF_FULL], [0, 0])
-        sin_hi = pl.slice(sin_row, [1, ROTARY_HALF_FULL], [0, ROTARY_HALF_FULL])
+        cos_lo = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, 0])
+        cos_hi = pl.slice(rope_cos, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
+        sin_lo = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, 0])
+        sin_hi = pl.slice(rope_sin, [1, ROTARY_HALF_FULL], [pos, ROTARY_HALF_FULL])
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="full_rope_kv_cache"):
             for ki in pl.range(KV_HEADS_LOCAL):
