@@ -106,7 +106,6 @@ def sparse_attn(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -426,7 +425,6 @@ def sparse_attn_test(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -443,7 +441,6 @@ def sparse_attn_test(
         cmp_block_table,
         cmp_sparse_indices,
         attn_sink,
-        seqused_kv,
         freqs_cos,
         freqs_sin,
         wo_a,
@@ -603,7 +600,6 @@ def build_tensor_specs(
     from golden import TensorSpec
 
     cmp_valid = get_standalone_cmp_valid(compress_ratio)
-    sparse_k = WIN + cmp_valid
 
     def seeded_uniform(shape, seed):
         """Create a deterministic centered uniform tensor for repeatable tests."""
@@ -682,10 +678,6 @@ def build_tensor_specs(
             indices[0, WIN - 1] = WIN - 1
         return indices
 
-    def init_seqused_kv():
-        """Expose the demo sequence-used length that matches the chosen ratio mode."""
-        return torch.full((B,), sparse_k, dtype=torch.int32)
-
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
         angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
@@ -722,7 +714,6 @@ def build_tensor_specs(
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),

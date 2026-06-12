@@ -111,7 +111,6 @@ def attention_hca(
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     # o_proj (fused into sparse_attn)
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -244,7 +243,6 @@ def attention_hca(
         cmp_block_table,
         topk_all,
         attn_sink,
-        seqused_kv,
         rope_cos_t,
         rope_sin_t,
         wo_a,
@@ -306,7 +304,6 @@ def attention_hca_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -321,7 +318,7 @@ def attention_hca_test(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
-        attn_sink, seqused_kv,
+        attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
         start_pos,
@@ -460,7 +457,6 @@ def golden_attention_hca(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": topk_all,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"],
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
         "wo_a": tensors["wo_a"],
@@ -582,11 +578,8 @@ def build_tensor_specs(start_pos=None):
     def init_start_pos():
         if start_pos is not None:
             return torch.full((B,), start_pos, dtype=torch.int32)
-        # Default per-batch pattern spans both HCA coverage axes at once: the
-        # sparse length / #compressed blocks (via seqused_kv) and the inner
-        # compressor branch. Values yield sparse regimes {pre-window (single
-        # K-tile), WIN boundary, 1/1/2/3 cmp blocks} and compressor branches
-        # {no-compress, aligned, crossing} across the first three blocks.
+        # Default per-batch pattern spans both HCA coverage axes at once:
+        # sparse visibility and compressor branches.
         pattern = torch.tensor([
             10,
             COMPRESS_RATIO - S,
@@ -596,11 +589,6 @@ def build_tensor_specs(start_pos=None):
             COMPRESS_RATIO * 3 - 1,
         ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
-    def init_seqused_kv():
-        # sparse_attn derives per-token causal lengths from this final sparse length.
-        seq = init_start_pos().to(torch.int64) + S
-        sparse_len = torch.where(seq <= WIN, seq, WIN + seq // COMPRESS_RATIO)
-        return sparse_len.to(torch.int32)
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -636,7 +624,6 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),

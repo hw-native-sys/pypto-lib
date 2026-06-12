@@ -158,7 +158,6 @@ def attention_csa(
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -335,7 +334,6 @@ def attention_csa(
         cmp_block_table,
         cmp_sparse_indices,
         attn_sink,
-        seqused_kv,
         rope_cos_t,
         rope_sin_t,
         wo_a,
@@ -405,7 +403,6 @@ def attention_csa_test(
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -449,7 +446,6 @@ def attention_csa_test(
         idx_kv_cache,
         idx_block_table,
         attn_sink,
-        seqused_kv,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -607,7 +603,6 @@ def golden_attention_csa(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": tensors["seqused_kv"],
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
         "wo_a": tensors["wo_a"],
@@ -845,12 +840,6 @@ def build_tensor_specs(start_pos=None):
         ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
 
-    def init_seqused_kv():
-        seq = init_start_pos().to(torch.int64) + S
-        sparse_len = torch.where(seq <= WIN, seq, WIN + seq // COMPRESS_RATIO)
-        return sparse_len.to(torch.int32)
-
-
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
 
@@ -927,7 +916,6 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.bfloat16, init_value=lambda: shared_idx_kv_cache.clone()),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),

@@ -80,9 +80,9 @@ def attention_swa(
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -182,7 +182,6 @@ def attention_swa(
         cmp_block_table_dummy,
         sparse_topk,
         attn_sink,
-        seqused_kv,
         rope_cos_t,
         rope_sin_t,
         wo_a,
@@ -200,13 +199,9 @@ def attention_swa(
         kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
         kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
         for write_t in pl.range(T):
-            write_b = write_t // S
-            write_s = write_t - write_b * S
-            write_start_b = pl.read(start_pos, [write_b])
-            write_slot = (write_start_b + write_s) % WIN
-            write_blk = pl.cast(pl.read(block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
-            write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
-            kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+            write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
+            if write_row >= 0:
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
     x_out = hc_post(
         attn_out,
@@ -238,9 +233,9 @@ def attention_swa_test(
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
-    seqused_kv: pl.Tensor[[B], pl.INT32],
     # o_proj
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -254,8 +249,8 @@ def attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
-        kv_cache, block_table,
-        attn_sink, seqused_kv,
+        kv_cache, block_table, ori_slot_mapping,
+        attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
         start_pos,
@@ -331,7 +326,6 @@ def golden_attention_swa(tensors):
 
     kv_cache = tensors["kv_cache"]
     block_table = tensors["block_table"]
-    seqused_kv = tensors["seqused_kv"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     cmp_kv_dummy = torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
@@ -364,7 +358,6 @@ def golden_attention_swa(tensors):
         "cmp_block_table": cmp_block_table_dummy,
         "cmp_sparse_indices": sparse_topk_all,
         "attn_sink": tensors["attn_sink"],
-        "seqused_kv": seqused_kv,
         "freqs_cos": rope_cos_T,
         "freqs_sin": rope_sin_T,
         "wo_a": tensors["wo_a"],
@@ -374,13 +367,13 @@ def golden_attention_swa(tensors):
     })
 
     # In-place sliding-window KV-cache update (validated as an inout tensor).
+    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
     for t in range(T):
-        b = t // S
-        s = t % S
-        start_pos_b = int(start_pos_t[b].item())
-        write_slot = (start_pos_b + s) % WIN
-        write_blk = int(block_table[b, write_slot // BLOCK_SIZE].item())
-        kv_cache[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
+        write_row = int(ori_slot_mapping[t].item())
+        if write_row >= 0:
+            write_blk = write_row // BLOCK_SIZE
+            write_intra = write_row % BLOCK_SIZE
+            kv_cache[write_blk, write_intra, 0] = kv[t]
 
     # ===== Block.hc_post (model.py:694) =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -461,17 +454,20 @@ def build_tensor_specs(start_pos=None):
     def init_start_pos():
         if start_pos is not None:
             return torch.full((B,), start_pos, dtype=torch.int32)
-        # Per-row start_pos -> seqused_kv = min(start_pos + S, WIN). Values span
-        # the sliding-window regimes (K-tile = 32 inside sparse_attn):
-        #   9      -> seqused 11   (single tile, seq <= 32)
-        #   31     -> seqused 33   (single/multi-tile boundary)
-        #   62     -> seqused 64   (multi-tile partial window)
-        #   WIN-1  -> seqused WIN  (full window, slot wraparound 127/0)
+        # Values span the sliding-window regimes and wraparound write slots.
         pattern = torch.tensor([9, 31, 62, WIN - 1], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
-    def init_seqused_kv():
-        seq = init_start_pos().to(torch.int64) + S
-        return torch.minimum(seq, torch.full_like(seq, WIN)).to(torch.int32)
+    def init_ori_slot_mapping():
+        starts = init_start_pos().to(torch.int64)
+        block_table = init_block_table().to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            s = t - b * S
+            slot = int((starts[b].item() + s) % WIN)
+            blk = int(block_table[b, slot // BLOCK_SIZE].item())
+            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
+        return mapping
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -498,8 +494,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
+        TensorSpec("ori_slot_mapping", [T], torch.int32, init_value=init_ori_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("seqused_kv", [B], torch.int32, init_value=init_seqused_kv),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
