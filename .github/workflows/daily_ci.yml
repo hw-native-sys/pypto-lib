@@ -18,7 +18,7 @@ jobs:
       PTOAS_VERSION: v0.45
       PTOAS_SHA256: 8d1c697e50de238606cec571ee5cdd31e0886476fdf62c4306d2af3bedca16b8
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 8e436661958d934be9fb1706c9ecc4a5c827d675
+      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
 
     steps:
       - name: Checkout pypto-lib
@@ -89,7 +89,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           PTO2_RING_DEP_POOL: 524288
           PTO2_RING_TASK_WINDOW: 524288
-          PTO2_RING_HEAP: 1073741824
+          PTO2_RING_HEAP: 2147483648
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
         run: |
@@ -147,7 +147,7 @@ jobs:
       PTOAS_VERSION: v0.45
       PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      PTO_ISA_COMMIT: 8e436661958d934be9fb1706c9ecc4a5c827d675
+      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
