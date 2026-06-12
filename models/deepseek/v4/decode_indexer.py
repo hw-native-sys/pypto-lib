@@ -83,7 +83,10 @@ def indexer(
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
-    start_pos: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
@@ -202,8 +205,9 @@ def indexer(
         sin,
         hadamard,
         idx_kv_cache,
-        idx_block_table,
-        start_pos,
+        position_ids,
+        idx_slot_mapping,
+        inner_state_slot_mapping,
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
@@ -216,8 +220,7 @@ def indexer(
     for bg in pl.spmd(B // B_TILE, name_hint="score"):
         for bi in pl.range(B_TILE):
             b = bg * B_TILE + bi
-            sp_b = pl.read(start_pos, [b])
-            clen_b = (sp_b + S) // COMPRESS_RATIO
+            clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
             cblk_b = (clen_b + CACHE_TILE - 1) // CACHE_TILE
             tb = b * S
             qb = b * S * IDX_N_HEADS
@@ -272,8 +275,7 @@ def indexer(
             invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
             topk_idxs_flat[t : t + 1, :] = invalid_idxs
             batch_idx = t // S
-            start_pos_b = pl.read(start_pos, [batch_idx])
-            cache_len_b = (start_pos_b + S) // COMPRESS_RATIO
+            cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
             if cache_len_b > 0:
                 offset_i32 = pl.cast(offset, target_type=pl.INT32)
                 score_row = score_flat[t : t + 1, :]
@@ -313,7 +315,10 @@ def indexer_test(
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
-    start_pos: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
     score, idx_kv_cache, topk_idxs = indexer(
@@ -337,7 +342,10 @@ def indexer_test(
         idx_block_table,
         score,
         topk_idxs,
-        start_pos,
+        position_ids,
+        idx_slot_mapping,
+        inner_state_slot_mapping,
+        kv_seq_lens,
         offset,
     )
     return score, idx_kv_cache, topk_idxs
@@ -382,7 +390,8 @@ def golden_indexer(tensors):
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
 
-    start_pos_t = tensors["start_pos"]
+    position_ids = tensors["position_ids"].to(torch.int64)
+    kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     offset = int(tensors["offset"])
 
     bsz, seqlen, _ = x.shape
@@ -418,8 +427,9 @@ def golden_indexer(tensors):
         "compress_state": tensors["inner_compress_state"],
         "compress_state_block_table": tensors["inner_compress_state_block_table"],
         "idx_kv_cache": tensors["idx_kv_cache"],
-        "idx_block_table": tensors["idx_block_table"],
-        "start_pos": tensors["start_pos"],
+        "position_ids": tensors["position_ids"],
+        "idx_slot_mapping": tensors["idx_slot_mapping"],
+        "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
     }
     golden_compressor(inner_tensors)
 
@@ -434,8 +444,7 @@ def golden_indexer(tensors):
     q_scale = q_scale.view(B, S, IDX_N_HEADS, 1)
 
     for b in range(bsz):
-        start_pos = int(start_pos_t[b].item())
-        cache_len = (start_pos + seqlen) // ratio
+        cache_len = int(kv_seq_lens[b].item()) // ratio
         if cache_len <= 0:
             continue
 
@@ -534,6 +543,42 @@ def build_tensor_specs(start_pos=None):
         for b in range(B):
             vals[b] = pattern[b % int(pattern.numel())]
         return vals
+    def init_position_ids():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((B, S), dtype=torch.int32)
+        for b in range(B):
+            for s in range(S):
+                positions[b, s] = starts[b] + s
+        return positions
+    def init_kv_seq_lens():
+        starts = init_start_pos().to(torch.int64)
+        return (starts + S).to(torch.int32)
+    def init_inner_state_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_inner_compress_state_block_table().to(torch.int64)
+        mapping = torch.full((B, S), -1, dtype=torch.int64)
+        for b in range(B):
+            for s in range(S):
+                pos = int(positions[b, s].item())
+                logical_blk = pos // INNER_STATE_BLOCK_SIZE
+                intra = pos % INNER_STATE_BLOCK_SIZE
+                blk = int(block_table[b, logical_blk].item())
+                mapping[b, s] = blk * INNER_STATE_BLOCK_SIZE + intra
+        return mapping
+    def init_idx_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_idx_block_table().to(torch.int64)
+        mapping = torch.full((B, S), -1, dtype=torch.int64)
+        for b in range(B):
+            for s in range(S):
+                pos = int(positions[b, s].item())
+                if (pos + 1) % COMPRESS_RATIO == 0:
+                    cache_col = pos // COMPRESS_RATIO
+                    logical_blk = cache_col // BLOCK_SIZE
+                    intra = cache_col % BLOCK_SIZE
+                    blk = int(block_table[b, logical_blk].item())
+                    mapping[b, s] = blk * BLOCK_SIZE + intra
+        return mapping
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     qr_i8, qr_scale = _int8_quant_per_row(init_qr())
@@ -561,7 +606,10 @@ def build_tensor_specs(start_pos=None):
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.
         TensorSpec("score", [B, S, SCORE_LEN], torch.float32, is_output=True),
         TensorSpec("topk_idxs", [B, S, SCORE_LEN], torch.int32, is_output=True),
-        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
+        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
+        TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [B, S], torch.int64, init_value=init_inner_state_slot_mapping),
+        TensorSpec("kv_seq_lens", [B], torch.int32, init_value=init_kv_seq_lens),
         ScalarSpec("offset", torch.int32, OFFSET),
     ]
 
@@ -578,7 +626,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--start-pos", type=int, default=None,
-                        help="If set, use this single start_pos for all batches; "
+                        help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     args = parser.parse_args()
 

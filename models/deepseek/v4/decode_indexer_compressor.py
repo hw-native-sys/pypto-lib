@@ -63,8 +63,9 @@ def indexer_compressor(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    start_pos: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
@@ -98,30 +99,25 @@ def indexer_compressor(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_paged"):
         for c_idx in pl.range(B):
-            start_pos_b = pl.read(start_pos, [c_idx])
-            ape_row_b = pl.cast(start_pos_b % COMPRESS_RATIO, target_type=pl.INDEX)
-
             for s in pl.pipeline(S, stage=2):
-                abs_pos_s = start_pos_b + s
-                state_blk_off = abs_pos_s // COMPRESS_STATE_BLOCK_SIZE
-                state_intra = abs_pos_s % COMPRESS_STATE_BLOCK_SIZE
-                state_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, state_blk_off]), pl.INDEX)
-                state_row = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + state_intra
+                token_pos = pl.read(position_ids, [c_idx, s])
+                state_row = pl.cast(pl.read(inner_state_slot_mapping, [c_idx, s]), pl.INDEX)
                 proj_col0 = s * OUT_DIM
-                token_ape_row = (ape_row_b + s) % COMPRESS_RATIO
-                kv_tile = kv_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                score_tile = score_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
-                score_tile = pl.add(score_tile, ape_tile)
-                compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
-                compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
+                token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                if state_row >= 0:
+                    kv_tile = kv_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    score_tile = score_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                    score_tile = pl.add(score_tile, ape_tile)
+                    compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
+                    compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
     pooled_kv = pl.create_tensor([B, HEAD_DIM], dtype=pl.FP32)
     for c_idx in pl.spmd(B, name_hint="softmax_pool"):
-        start_pos_b = pl.read(start_pos, [c_idx])
-        pos_b = start_pos_b % COMPRESS_RATIO
+        first_pos_b = pl.read(position_ids, [c_idx, 0])
+        pos_b = first_pos_b % COMPRESS_RATIO
         pre_tokens_b = COMPRESS_RATIO - pos_b
-        boundary_end_b = start_pos_b + pre_tokens_b - 1
+        boundary_end_b = first_pos_b + pre_tokens_b - 1
         cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
         prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
 
@@ -230,17 +226,15 @@ def indexer_compressor(
         batch_base = batch_base_idx * RMS_TILE
         for inner in pl.range(RMS_TILE):
             c_idx = batch_base + inner
-            start_pos_b = pl.read(start_pos, [c_idx])
-            pos_b = start_pos_b % COMPRESS_RATIO
-            cache_col = start_pos_b // COMPRESS_RATIO
+            first_pos_b = pl.read(position_ids, [c_idx, 0])
+            pos_b = first_pos_b % COMPRESS_RATIO
             if pos_b + S >= COMPRESS_RATIO:
+                boundary_s = COMPRESS_RATIO - 1 - pos_b
                 kv_row_fp32 = kv_final[c_idx : c_idx + 1, 0 : HEAD_DIM]
                 kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-                idx_blk_off = cache_col // BLOCK_SIZE
-                idx_intra = cache_col % BLOCK_SIZE
-                idx_blk_id = pl.cast(pl.read(idx_block_table, [c_idx, idx_blk_off]), pl.INDEX)
-                cache_row = idx_blk_id * BLOCK_SIZE + idx_intra
-                idx_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
+                cache_row = pl.cast(pl.read(idx_slot_mapping, [c_idx, boundary_s]), pl.INDEX)
+                if cache_row >= 0:
+                    idx_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     idx_kv_cache = pl.reshape(idx_kv_cache_flat, [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
@@ -262,8 +256,9 @@ def compressor_test(
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    start_pos: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[B, S], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
     kv, compress_state, idx_kv_cache = indexer_compressor(
         x,
@@ -278,8 +273,9 @@ def compressor_test(
         sin,
         hadamard,
         idx_kv_cache,
-        idx_block_table,
-        start_pos,
+        position_ids,
+        idx_slot_mapping,
+        inner_state_slot_mapping,
     )
     return kv, compress_state, idx_kv_cache
 
@@ -299,8 +295,9 @@ def golden_compressor(tensors):
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
     idx_kv_cache = tensors["idx_kv_cache"]
-    idx_block_table = tensors["idx_block_table"]
-    start_pos_t = tensors["start_pos"]
+    position_ids = tensors["position_ids"].to(torch.int64)
+    idx_slot_mapping = tensors["idx_slot_mapping"].to(torch.int64)
+    inner_state_slot_mapping = tensors["inner_state_slot_mapping"].to(torch.int64)
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
@@ -311,23 +308,25 @@ def golden_compressor(tensors):
     should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
 
     for b in range(bsz):
-        start_pos = int(start_pos_t[b].item())
-        pre_tokens = min(S, ratio - (start_pos % ratio))
-        should_compress = pre_tokens < S or (start_pos + S) % ratio == 0
-        boundary_end = start_pos + pre_tokens - 1
+        first_pos = int(position_ids[b, 0].item())
+        pre_tokens = min(S, ratio - (first_pos % ratio))
+        boundary_s = ratio - 1 - (first_pos % ratio)
+        should_compress = 0 <= boundary_s < S
+        boundary_end = first_pos + pre_tokens - 1
         cur_window_start = boundary_end - ratio + 1
         prev_window_start = cur_window_start - ratio
 
-        # Per-token ape add + state scatter through the compressor-state block table.
-        ape_row_g = start_pos % ratio
+        # Per-token ape add + state scatter through explicit token-major slots.
         for s in range(S):
-            token_ape_row = (ape_row_g + s) % ratio
+            pos = int(position_ids[b, s].item())
+            token_ape_row = pos % ratio
             score[b, s, :] = score[b, s, :] + ape[token_ape_row]
-            abs_pos = start_pos + s
-            blk_id = int(compress_state_block_table[b, abs_pos // COMPRESS_STATE_BLOCK_SIZE].item())
-            intra = abs_pos % COMPRESS_STATE_BLOCK_SIZE
-            compress_state[blk_id, intra, :OUT_DIM] = kv[b, s, :]
-            compress_state[blk_id, intra, OUT_DIM:] = score[b, s, :]
+            state_row = int(inner_state_slot_mapping[b, s].item())
+            if state_row >= 0:
+                blk_id = state_row // COMPRESS_STATE_BLOCK_SIZE
+                intra = state_row % COMPRESS_STATE_BLOCK_SIZE
+                compress_state[blk_id, intra, :OUT_DIM] = kv[b, s, :]
+                compress_state[blk_id, intra, OUT_DIM:] = score[b, s, :]
 
         if should_compress:
             should_compress_rows[b] = True
@@ -367,7 +366,8 @@ def golden_compressor(tensors):
     for b in range(bsz):
         if not bool(should_compress_rows[b]):
             continue
-        start_pos = int(start_pos_t[b].item())
+        first_pos = int(position_ids[b, 0].item())
+        boundary_s = ratio - 1 - (first_pos % ratio)
         kv_b = rmsnorm(pooled[b : b + 1], norm_w)
 
         x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
@@ -382,9 +382,10 @@ def golden_compressor(tensors):
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0.
         tensors["kv"][b : b + 1, 0:1, :] = kv_b
 
-        cache_col = start_pos // ratio
-        blk_id = int(idx_block_table[b, cache_col // BLOCK_SIZE].item())
-        idx_kv_cache[blk_id, cache_col % BLOCK_SIZE, 0] = kv_b[0, 0]
+        cache_row = int(idx_slot_mapping[b, boundary_s].item())
+        if cache_row >= 0:
+            blk_id = cache_row // BLOCK_SIZE
+            idx_kv_cache[blk_id, cache_row % BLOCK_SIZE, 0] = kv_b[0, 0]
 
     tensors["idx_kv_cache"][:] = idx_kv_cache
 
@@ -451,6 +452,39 @@ def build_tensor_specs(start_pos=None):
         for b in range(B):
             vals[b] = pattern[b % int(pattern.numel())]
         return vals
+    def init_position_ids():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((B, S), dtype=torch.int32)
+        for b in range(B):
+            for s in range(S):
+                positions[b, s] = starts[b] + s
+        return positions
+    def init_inner_state_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_compress_state_block_table().to(torch.int64)
+        mapping = torch.full((B, S), -1, dtype=torch.int64)
+        for b in range(B):
+            for s in range(S):
+                pos = int(positions[b, s].item())
+                logical_blk = pos // COMPRESS_STATE_BLOCK_SIZE
+                intra = pos % COMPRESS_STATE_BLOCK_SIZE
+                blk = int(block_table[b, logical_blk].item())
+                mapping[b, s] = blk * COMPRESS_STATE_BLOCK_SIZE + intra
+        return mapping
+    def init_idx_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_idx_block_table().to(torch.int64)
+        mapping = torch.full((B, S), -1, dtype=torch.int64)
+        for b in range(B):
+            for s in range(S):
+                pos = int(positions[b, s].item())
+                if (pos + 1) % COMPRESS_RATIO == 0:
+                    cache_col = pos // COMPRESS_RATIO
+                    logical_blk = cache_col // BLOCK_SIZE
+                    intra = cache_col % BLOCK_SIZE
+                    blk = int(block_table[b, logical_blk].item())
+                    mapping[b, s] = blk * BLOCK_SIZE + intra
+        return mapping
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
@@ -465,8 +499,9 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
-        TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
-        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
+        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
+        TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [B, S], torch.int64, init_value=init_inner_state_slot_mapping),
     ]
 
 
@@ -479,7 +514,7 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=None,
-                        help="If set, use this single start_pos for all batches; "
+                        help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)

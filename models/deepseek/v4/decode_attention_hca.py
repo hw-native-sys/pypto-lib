@@ -109,6 +109,11 @@ def attention_hca(
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj (fused into sparse_attn)
@@ -116,7 +121,6 @@ def attention_hca(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -134,22 +138,21 @@ def attention_hca(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    cmp_start_pos = pl.create_tensor([B], dtype=pl.INT32)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
         for b in pl.range(B):
-            start_pos_b = pl.read(start_pos, [b])
-            pl.write(cmp_start_pos, [b], pl.cast(start_pos_b, pl.INT32))
-            cmp_offset_b = COMPRESS_RATIO - (start_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(start_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
+            first_t = b * S
+            first_pos_b = pl.read(position_ids, [first_t])
+            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
+            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
             cmp_cos_row = freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
             cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
             cmp_cos[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_cos_row, target_type=pl.FP32)
             cmp_sin[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_sin_row, target_type=pl.FP32)
             for s in pl.range(S):
                 t = b * S + s
-                pos_b = pl.cast(start_pos_b + s, pl.INDEX)
+                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
                 step_cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
@@ -180,6 +183,12 @@ def attention_hca(
     x_normed_bsd = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed_bsd = pl.reshape(x_normed, [B, S, D])
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
+    position_ids_bsd = pl.create_tensor([B, S], dtype=pl.INT32)
+    position_ids_bsd = pl.reshape(position_ids, [B, S])
+    cmp_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
+    cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
+    state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
+    state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     cmp_kv_proj, compress_state, cmp_kv = compressor_ratio128(
         x_normed_bsd,
         cmp_kv_proj,
@@ -192,18 +201,18 @@ def attention_hca(
         cmp_cos,
         cmp_sin,
         cmp_kv,
-        cmp_block_table,
-        cmp_start_pos,
+        position_ids_bsd,
+        cmp_slot_mapping_bsd,
+        state_slot_mapping_bsd,
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     topk_all = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_overlay_topk"):
         for topk_b in pl.range(B):
-            topk_start_b = pl.read(start_pos, [topk_b])
             for topk_s in pl.range(S):
                 topk_t = topk_b * S + topk_s
-                topk_abs_pos = topk_start_b + topk_s
+                topk_abs_pos = pl.read(position_ids, [topk_t])
 
                 if topk_abs_pos >= WIN - 1:
                     topk_win_start = (topk_abs_pos % WIN) + 1
@@ -212,7 +221,9 @@ def attention_hca(
                         topk_out = topk_val
                         for topk_os in pl.range(S):
                             if topk_os <= topk_s:
-                                if topk_val == (topk_start_b + topk_os) % WIN:
+                                topk_overlay_t = topk_b * S + topk_os
+                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                if topk_val == topk_overlay_pos % WIN:
                                     topk_out = WIN + topk_os
                         pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                 else:
@@ -221,13 +232,18 @@ def attention_hca(
                             topk_out = topk_k
                             for topk_os in pl.range(S):
                                 if topk_os <= topk_s:
-                                    if topk_k == (topk_start_b + topk_os) % WIN:
+                                    topk_overlay_t = topk_b * S + topk_os
+                                    topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                    if topk_k == topk_overlay_pos % WIN:
                                         topk_out = WIN + topk_os
                             pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                         else:
                             pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
-                topk_cmp_valid = pl.min(HCA_TOPK_LIMIT, (topk_abs_pos + 1) // COMPRESS_RATIO)
+                topk_cmp_valid = pl.min(
+                    HCA_TOPK_LIMIT,
+                    pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
+                )
                 for topk_ck in pl.range(SPARSE_IDX_TOPK):
                     if topk_ck < topk_cmp_valid:
                         pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(WIN + S + topk_ck, pl.INT32))
@@ -260,13 +276,9 @@ def attention_hca(
         kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
         kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
         for write_t in pl.range(T):
-            write_b = write_t // S
-            write_s = write_t - write_b * S
-            write_start_b = pl.read(start_pos, [write_b])
-            write_slot = (write_start_b + write_s) % WIN
-            write_blk = pl.cast(pl.read(ori_block_table, [write_b, write_slot // BLOCK_SIZE]), pl.INDEX)
-            write_row = write_blk * BLOCK_SIZE + write_slot % BLOCK_SIZE
-            kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+            write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
+            if write_row >= 0:
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
     x_out = hc_post(
         attn_out,
@@ -303,12 +315,16 @@ def attention_hca_test(
     ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_hca(
         x_hc,
@@ -318,10 +334,11 @@ def attention_hca_test(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
         kv_cache, ori_block_table, cmp_kv, cmp_block_table,
+        ori_slot_mapping, cmp_slot_mapping, state_slot_mapping,
+        position_ids, kv_seq_lens,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        start_pos,
     )
     return x_out
 
@@ -354,7 +371,8 @@ def golden_attention_hca(tensors):
     })
 
     # ===== Attention.forward, ratio==128 branch =====
-    start_pos_t = tensors["start_pos"].to(torch.int64)
+    position_ids = tensors["position_ids"].to(torch.int64)
+    kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
@@ -363,13 +381,10 @@ def golden_attention_hca(tensors):
     freqs_sin = tensors["freqs_sin"]
     rope_cos_T = torch.empty(T, rd, dtype=freqs_cos.dtype)
     rope_sin_T = torch.empty(T, rd, dtype=freqs_sin.dtype)
-    for b in range(B):
-        start_pos_b = int(start_pos_t[b].item())
-        for s in range(S):
-            t = b * S + s
-            pos = start_pos_b + s
-            rope_cos_T[t] = freqs_cos[pos]
-            rope_sin_T[t] = freqs_sin[pos]
+    for t in range(T):
+        pos = int(position_ids[t].item())
+        rope_cos_T[t] = freqs_cos[pos]
+        rope_sin_T[t] = freqs_sin[pos]
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -400,17 +415,19 @@ def golden_attention_hca(tensors):
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
 
     half_rd = rd // 2
-    cmp_start_pos = start_pos_t.to(torch.int32).contiguous()
     cmp_cos = torch.empty(B, half_rd, dtype=torch.float32)
     cmp_sin = torch.empty(B, half_rd, dtype=torch.float32)
     for b in range(B):
-        start_pos_b = int(start_pos_t[b].item())
-        cmp_offset_b = ratio - (start_pos_b % ratio)
-        cmp_pos_b = start_pos_b + cmp_offset_b - ratio
+        first_pos_b = int(position_ids[b * S].item())
+        cmp_offset_b = ratio - (first_pos_b % ratio)
+        cmp_pos_b = first_pos_b + cmp_offset_b - ratio
         cmp_cos[b] = freqs_cos[cmp_pos_b, :half_rd].float()
         cmp_sin[b] = freqs_sin[cmp_pos_b, :half_rd].float()
 
     cmp_kv_proj = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
+    position_ids_bsd = position_ids.reshape(B, S).to(torch.int32).contiguous()
+    cmp_slot_mapping_bsd = tensors["cmp_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
+    state_slot_mapping_bsd = tensors["state_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
     golden_compressor({
         "x": x_normed.reshape(B, S, D),
         "kv": cmp_kv_proj,
@@ -423,28 +440,31 @@ def golden_attention_hca(tensors):
         "cos": cmp_cos,
         "sin": cmp_sin,
         "cmp_kv_cache": cmp_kv,
-        "cmp_block_table": cmp_block_table,
-        "start_pos": cmp_start_pos,
+        "position_ids": position_ids_bsd,
+        "cmp_slot_mapping": cmp_slot_mapping_bsd,
+        "state_slot_mapping": state_slot_mapping_bsd,
     })
 
     topk_all = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
         s = t % S
-        start_pos_b = int(start_pos_t[b].item())
-        abs_pos = int(start_pos_t[b].item()) + s
+        abs_pos = int(position_ids[t].item())
         if abs_pos >= win - 1:
             win_start = (abs_pos % win) + 1
             vals = ((torch.arange(win, dtype=torch.int32) + win_start) % win).tolist()
         else:
             vals = list(range(abs_pos + 1))
-        overlay_slots = {(start_pos_b + os) % win: os for os in range(s + 1)}
+        overlay_slots = {
+            int(position_ids[b * S + os].item()) % win: os
+            for os in range(s + 1)
+        }
         for k, raw in enumerate(vals):
             if raw in overlay_slots:
                 topk_all[t, k] = WIN + overlay_slots[raw]
             else:
                 topk_all[t, k] = raw
-        cmp_valid = min(HCA_TOPK_LIMIT, (abs_pos + 1) // ratio)
+        cmp_valid = min(HCA_TOPK_LIMIT, (abs_pos + 1) // ratio, int(kv_seq_lens[b].item()) // ratio)
         if cmp_valid:
             topk_all[t, win:win + cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32) + win + S
 
@@ -466,13 +486,13 @@ def golden_attention_hca(tensors):
     })
 
     # In-place sliding-window KV-cache update (validated as an inout tensor).
+    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
     for t in range(T):
-        b = t // S
-        s = t % S
-        start_pos_b = int(start_pos_t[b].item())
-        write_slot = (start_pos_b + s) % WIN
-        write_blk = int(ori_block_table[b, write_slot // BLOCK_SIZE].item())
-        kv_cache[write_blk, write_slot % BLOCK_SIZE, 0] = kv[t]
+        write_row = int(ori_slot_mapping[t].item())
+        if write_row >= 0:
+            write_blk = write_row // BLOCK_SIZE
+            write_intra = write_row % BLOCK_SIZE
+            kv_cache[write_blk, write_intra, 0] = kv[t]
 
     # ===== Block.hc_post =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -589,6 +609,54 @@ def build_tensor_specs(start_pos=None):
             COMPRESS_RATIO * 3 - 1,
         ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+    def init_position_ids():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((T,), dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            s = t - b * S
+            positions[t] = starts[b] + s
+        return positions
+    def init_kv_seq_lens():
+        starts = init_start_pos().to(torch.int64)
+        return (starts + S).to(torch.int32)
+    def init_ori_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_ori_block_table().to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // S
+            pos = int(positions[t].item())
+            slot = pos % WIN
+            blk = int(block_table[b, slot // BLOCK_SIZE].item())
+            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
+        return mapping
+    def init_cmp_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_cmp_block_table().to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // S
+            pos = int(positions[t].item())
+            if (pos + 1) % COMPRESS_RATIO == 0:
+                cache_col = pos // COMPRESS_RATIO
+                logical_blk = cache_col // BLOCK_SIZE
+                intra = cache_col % BLOCK_SIZE
+                blk = int(block_table[b, logical_blk].item())
+                mapping[t] = blk * BLOCK_SIZE + intra
+        return mapping
+    def init_state_slot_mapping():
+        positions = init_position_ids().to(torch.int64)
+        block_table = init_compress_state_block_table().to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // S
+            pos = int(positions[t].item())
+            logical_blk = pos // COMPRESS_STATE_BLOCK_SIZE
+            intra = pos % COMPRESS_STATE_BLOCK_SIZE
+            blk = int(block_table[b, logical_blk].item())
+            mapping[t] = blk * COMPRESS_STATE_BLOCK_SIZE + intra
+        return mapping
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -623,12 +691,16 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
+        TensorSpec("kv_seq_lens", [B], torch.int32, init_value=init_kv_seq_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
-        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
 
@@ -641,7 +713,7 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=None,
-                        help="If set, use this single start_pos for all batches; "
+                        help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()

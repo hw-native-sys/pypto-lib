@@ -80,7 +80,8 @@ def attention_swa(
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -88,7 +89,6 @@ def attention_swa(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
@@ -107,12 +107,11 @@ def attention_swa(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
         for b in pl.parallel(B):
-            start_pos_b = pl.read(start_pos, [b])
             for s_idx in pl.range(S):
-                pos_b = pl.cast(start_pos_b + s_idx, pl.INDEX)
+                t = b * S + s_idx
+                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
                 cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
                 sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                t = b * S + s_idx
                 rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
                 rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
 
@@ -144,10 +143,9 @@ def attention_swa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_topk"):
         for topk_b in pl.range(B):
             pl.write(cmp_block_table_dummy, [topk_b, 0], pl.cast(topk_b * SPARSE_CMP_MAX_BLOCKS, pl.INT32))
-            topk_start_b = pl.read(start_pos, [topk_b])
             for topk_s in pl.range(S):
                 topk_t = topk_b * S + topk_s
-                topk_abs_pos = topk_start_b + topk_s
+                topk_abs_pos = pl.read(position_ids, [topk_t])
                 if topk_abs_pos >= WIN - 1:
                     topk_win_start = (topk_abs_pos % WIN) + 1
                     for topk_k in pl.range(WIN):
@@ -155,7 +153,9 @@ def attention_swa(
                         topk_out = topk_val
                         for topk_os in pl.range(S):
                             if topk_os <= topk_s:
-                                if topk_val == (topk_start_b + topk_os) % WIN:
+                                topk_overlay_t = topk_b * S + topk_os
+                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                if topk_val == topk_overlay_pos % WIN:
                                     topk_out = WIN + topk_os
                         pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                 else:
@@ -164,7 +164,9 @@ def attention_swa(
                             topk_out = topk_k
                             for topk_os in pl.range(S):
                                 if topk_os <= topk_s:
-                                    if topk_k == (topk_start_b + topk_os) % WIN:
+                                    topk_overlay_t = topk_b * S + topk_os
+                                    topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                    if topk_k == topk_overlay_pos % WIN:
                                         topk_out = WIN + topk_os
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                         else:
@@ -233,7 +235,8 @@ def attention_swa_test(
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
     kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -241,7 +244,6 @@ def attention_swa_test(
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    start_pos: pl.Tensor[[B], pl.INT32],
 ):
     x_out = attention_swa(
         x_hc,
@@ -249,11 +251,10 @@ def attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
-        kv_cache, block_table, ori_slot_mapping,
+        kv_cache, block_table, ori_slot_mapping, position_ids,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
-        start_pos,
     )
     return x_out
 
@@ -285,7 +286,7 @@ def golden_attention_swa(tensors):
     })
 
     # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
-    start_pos_t = tensors["start_pos"].to(torch.int64)
+    position_ids = tensors["position_ids"].to(torch.int64)
     bsz, seqlen = B, S
     win = WIN
     rd = ROPE_HEAD_DIM
@@ -294,13 +295,10 @@ def golden_attention_swa(tensors):
     freqs_sin = tensors["freqs_sin"]
     rope_cos_T = torch.empty(T, rd, dtype=freqs_cos.dtype)
     rope_sin_T = torch.empty(T, rd, dtype=freqs_sin.dtype)
-    for b in range(B):
-        start_pos_b = int(start_pos_t[b].item())
-        for s in range(S):
-            t = b * S + s
-            pos = start_pos_b + s
-            rope_cos_T[t] = freqs_cos[pos]
-            rope_sin_T[t] = freqs_sin[pos]
+    for t in range(T):
+        pos = int(position_ids[t].item())
+        rope_cos_T[t] = freqs_cos[pos]
+        rope_sin_T[t] = freqs_sin[pos]
 
     # q + win kv (model.py:495-504)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -336,9 +334,11 @@ def golden_attention_swa(tensors):
     for t in range(T):
         b = t // S
         s = t % S
-        start_pos_b = int(start_pos_t[b].item())
-        abs_pos = int(start_pos_t[b].item()) + s
-        overlay_slots = {(start_pos_b + os) % win: os for os in range(s + 1)}
+        abs_pos = int(position_ids[t].item())
+        overlay_slots = {
+            int(position_ids[b * S + os].item()) % win: os
+            for os in range(s + 1)
+        }
         if abs_pos >= win - 1:
             win_start = (abs_pos % win) + 1
             vals = ((torch.arange(win, dtype=torch.int32) + win_start) % win).tolist()
@@ -457,10 +457,18 @@ def build_tensor_specs(start_pos=None):
         # Values span the sliding-window regimes and wraparound write slots.
         pattern = torch.tensor([9, 31, 62, WIN - 1], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+    def init_position_ids():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((T,), dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            s = t - b * S
+            positions[t] = starts[b] + s
+        return positions
     def init_ori_slot_mapping():
         starts = init_start_pos().to(torch.int64)
         block_table = init_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int32)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         for t in range(T):
             b = t // S
             s = t - b * S
@@ -494,13 +502,13 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("kv_cache", [B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
-        TensorSpec("ori_slot_mapping", [T], torch.int32, init_value=init_ori_slot_mapping),
+        TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
-        TensorSpec("start_pos", [B], torch.int32, init_value=init_start_pos),
     ]
 
 
