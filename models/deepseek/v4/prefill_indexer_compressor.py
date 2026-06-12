@@ -27,6 +27,9 @@ OUT_CHUNK = 64
 
 MAX_REQS = 2
 MAX_TOKENS = B * S
+INNER_STATE_BLOCK_SIZE = 4
+INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_BLOCK_NUM = MAX_REQS * INNER_STATE_MAX_BLOCKS
 MAX_CMP_WRITES = MAX_REQS * max(1, MAX_TOKENS // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_CHUNK
 PACKED_POOL_BLOCKS = MAX_CMP_WRITES * HEAD_BLOCKS
@@ -37,8 +40,9 @@ PACKED_RMS_TILE = 16
 @pl.jit.inline
 def prefill_indexer_compressor(
     x: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
-    kv_state: pl.Tensor[[MAX_REQS, STATE_LEN, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[MAX_REQS, STATE_LEN, OUT_DIM], pl.FP32],
+    kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[MAX_REQS, INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
     wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -50,14 +54,14 @@ def prefill_indexer_compressor(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    num_cmp_writes: pl.Scalar[pl.INT32],
-    cmp_write_token_ids: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
 ):
     kv_proj = pl.create_tensor([MAX_TOKENS, OUT_DIM], dtype=pl.FP32)
     score_proj = pl.create_tensor([MAX_TOKENS, OUT_DIM], dtype=pl.FP32)
-    kv_state_flat = pl.reshape(kv_state, [MAX_REQS * STATE_LEN, OUT_DIM])
-    score_state_flat = pl.reshape(score_state, [MAX_REQS * STATE_LEN, OUT_DIM])
+    kv_state_flat = pl.reshape(kv_state, [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM])
+    score_state_flat = pl.reshape(score_state, [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM])
+    state_block_table_flat = pl.reshape(inner_compress_state_block_table, [MAX_REQS * INNER_STATE_MAX_BLOCKS])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
@@ -87,51 +91,79 @@ def prefill_indexer_compressor(
         h0 = hb * HEAD_CHUNK
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
-        if write_i < num_cmp_writes:
-            write_token = pl.cast(pl.read(cmp_write_token_ids, [write_i]), pl.INDEX)
+        write_token = 0
+        write_slot_raw = pl.cast(-1, pl.INT32)
+        write_seen = pl.cast(0, pl.INDEX)
+        for scan_w in pl.range(MAX_TOKENS):
+            if scan_w < num_tokens:
+                scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
+                if scan_slot_raw >= 0:
+                    if write_seen == write_i:
+                        write_token = scan_w
+                        write_slot_raw = scan_slot_raw
+                    write_seen = write_seen + 1
+        if write_slot_raw >= 0:
             write_pos = pl.read(position_ids, [write_token])
             req = pl.cast(pl.read(token_to_request, [write_token]), pl.INDEX)
             cur_start = write_pos + 1 - COMPRESS_RATIO
             prev_start = cur_start - COMPRESS_RATIO
-            state_row0 = req * STATE_LEN
             for pool_s in pl.range(COMPRESS_RATIO):
                 prev_abs = prev_start + pool_s
                 front_slot = pool_s
+                pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
+                pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK],
+                    dtype=pl.FP32,
+                    value=FP32_NEG_INF,
+                )
                 if write_pos >= 2 * COMPRESS_RATIO - 1:
-                    prev_state_slot = pl.cast(prev_abs % STATE_LEN, pl.INDEX)
-                    prev_state_row = state_row0 + prev_state_slot
-                    pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
-                        prev_state_row : prev_state_row + 1,
-                        h0 : h0 + HEAD_CHUNK,
-                    ]
-                    pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
-                        prev_state_row : prev_state_row + 1,
-                        h0 : h0 + HEAD_CHUNK,
-                    ]
-                else:
-                    pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                        [1, HEAD_CHUNK],
-                        dtype=pl.FP32,
-                        value=0.0,
-                    )
-                    pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                        [1, HEAD_CHUNK],
-                        dtype=pl.FP32,
-                        value=FP32_NEG_INF,
-                    )
+                    prev_state_block = pl.cast(prev_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                    prev_state_intra = pl.cast(prev_abs - prev_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                    prev_state_block_pos = req * INNER_STATE_MAX_BLOCKS + prev_state_block
+                    prev_phys_block_raw = pl.read(state_block_table_flat, [prev_state_block_pos])
+                    if prev_phys_block_raw >= 0:
+                        prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
+                        prev_state_row = prev_phys_block * INNER_STATE_BLOCK_SIZE + prev_state_intra
+                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                            prev_state_row : prev_state_row + 1,
+                            h0 : h0 + HEAD_CHUNK,
+                        ]
+                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                            prev_state_row : prev_state_row + 1,
+                            h0 : h0 + HEAD_CHUNK,
+                        ]
 
                 cur_abs = cur_start + pool_s
                 back_slot = COMPRESS_RATIO + pool_s
-                cur_state_slot = pl.cast(cur_abs % STATE_LEN, pl.INDEX)
-                cur_state_row = state_row0 + cur_state_slot
-                pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
-                    cur_state_row : cur_state_row + 1,
-                    HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                ]
-                pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
-                    cur_state_row : cur_state_row + 1,
-                    HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                ]
+                pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
+                pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = pl.full(
+                    [1, HEAD_CHUNK],
+                    dtype=pl.FP32,
+                    value=FP32_NEG_INF,
+                )
+                cur_state_block = pl.cast(cur_abs // INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                cur_state_intra = pl.cast(cur_abs - cur_state_block * INNER_STATE_BLOCK_SIZE, pl.INDEX)
+                cur_state_block_pos = req * INNER_STATE_MAX_BLOCKS + cur_state_block
+                cur_phys_block_raw = pl.read(state_block_table_flat, [cur_state_block_pos])
+                if cur_phys_block_raw >= 0:
+                    cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
+                    cur_state_row = cur_phys_block * INNER_STATE_BLOCK_SIZE + cur_state_intra
+                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                        cur_state_row : cur_state_row + 1,
+                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
+                    ]
+                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                        cur_state_row : cur_state_row + 1,
+                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
+                    ]
 
             for pool_t in pl.range(MAX_TOKENS):
                 if pool_t < num_tokens:
@@ -208,8 +240,18 @@ def prefill_indexer_compressor(
         sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
-            if final_i < num_cmp_writes:
-                write_token = pl.cast(pl.read(cmp_write_token_ids, [final_i]), pl.INDEX)
+            write_token = 0
+            write_slot_raw = pl.cast(-1, pl.INT32)
+            write_seen = pl.cast(0, pl.INDEX)
+            for scan_w in pl.range(MAX_TOKENS):
+                if scan_w < num_tokens:
+                    scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
+                    if scan_slot_raw >= 0:
+                        if write_seen == final_i:
+                            write_token = scan_w
+                            write_slot_raw = scan_slot_raw
+                        write_seen = write_seen + 1
+            if write_slot_raw >= 0:
                 write_pos = pl.read(position_ids, [write_token])
                 cmp_pos = pl.cast(write_pos + 1 - COMPRESS_RATIO, pl.INDEX)
                 cos_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
@@ -266,8 +308,17 @@ def prefill_indexer_compressor(
         final_base = final_block * PACKED_RMS_TILE
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
-            if final_i < num_cmp_writes:
-                dst_row = pl.cast(pl.read(cmp_slot_mapping, [final_i]), pl.INDEX)
+            dst_row_raw = pl.cast(-1, pl.INT32)
+            write_seen = pl.cast(0, pl.INDEX)
+            for scan_w in pl.range(MAX_TOKENS):
+                if scan_w < num_tokens:
+                    scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
+                    if scan_slot_raw >= 0:
+                        if write_seen == final_i:
+                            dst_row_raw = scan_slot_raw
+                        write_seen = write_seen + 1
+            if dst_row_raw >= 0:
+                dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(
                     final_kv[final_i : final_i + 1, 0:HEAD_DIM],
                     target_type=pl.BF16,
@@ -280,47 +331,36 @@ def prefill_indexer_compressor(
                     0:HEAD_DIM,
                 ]
 
-    for update_idx in pl.spmd(MAX_REQS * STATE_LEN * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
+    for update_idx in pl.spmd(MAX_TOKENS * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
         update_ob = update_idx % PACKED_PROJ_BLOCKS
-        update_slot_tmp = update_idx // PACKED_PROJ_BLOCKS
-        update_slot = update_slot_tmp % STATE_LEN
-        update_req = update_slot_tmp // STATE_LEN
+        update_t = update_idx // PACKED_PROJ_BLOCKS
         update_o0 = update_ob * OUT_CHUNK
-        state_row = update_req * STATE_LEN + update_slot
-        latest_pos = pl.cast(-1, pl.INT32)
-        latest_token = 0
-        for scan_t in pl.range(MAX_TOKENS):
-            if scan_t < num_tokens:
-                scan_req = pl.cast(pl.read(token_to_request, [scan_t]), pl.INDEX)
-                if scan_req == update_req:
-                    scan_pos = pl.read(position_ids, [scan_t])
-                    scan_slot = pl.cast(scan_pos % STATE_LEN, pl.INDEX)
-                    if scan_slot == update_slot:
-                        if scan_pos > latest_pos:
-                            latest_pos = scan_pos
-                            latest_token = scan_t
-        if latest_pos >= 0:
-            ape_slot = pl.cast(latest_pos % COMPRESS_RATIO, pl.INDEX)
-            ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_CHUNK]
-            pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_CHUNK], 0.0)
-            kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
-                kv_proj[
-                    latest_token : latest_token + 1,
-                    update_o0 : update_o0 + OUT_CHUNK,
-                ],
-                pool_dep,
-            )
-            score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
-                pl.add(
-                    score_proj[latest_token : latest_token + 1, update_o0 : update_o0 + OUT_CHUNK],
-                    ape_row,
-                ),
-                pool_dep,
-            )
+        if update_t < num_tokens:
+            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
+            if state_row_raw >= 0:
+                state_row = pl.cast(state_row_raw, pl.INDEX)
+                update_pos = pl.read(position_ids, [update_t])
+                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_CHUNK]
+                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_CHUNK], 0.0)
+                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
+                    kv_proj[
+                        update_t : update_t + 1,
+                        update_o0 : update_o0 + OUT_CHUNK,
+                    ],
+                    pool_dep,
+                )
+                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
+                    pl.add(
+                        score_proj[update_t : update_t + 1, update_o0 : update_o0 + OUT_CHUNK],
+                        ape_row,
+                    ),
+                    pool_dep,
+                )
 
     idx_kv_cache = pl.reshape(idx_kv_cache_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-    kv_state = pl.reshape(kv_state_flat, [MAX_REQS, STATE_LEN, OUT_DIM])
-    score_state = pl.reshape(score_state_flat, [MAX_REQS, STATE_LEN, OUT_DIM])
+    kv_state = pl.reshape(kv_state_flat, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM])
+    score_state = pl.reshape(score_state_flat, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM])
     return idx_kv_cache, kv_state, score_state
 
 
@@ -328,8 +368,9 @@ def prefill_indexer_compressor(
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.BF16]],
-    kv_state: pl.Tensor[[MAX_REQS, STATE_LEN, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[MAX_REQS, STATE_LEN, OUT_DIM], pl.FP32],
+    kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[MAX_REQS, INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
     wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -341,22 +382,30 @@ def prefill_indexer_compressor_test(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    num_cmp_writes: pl.Scalar[pl.INT32],
-    cmp_write_token_ids: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_CMP_WRITES], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
 ):
     idx_kv_cache, kv_state, score_state = prefill_indexer_compressor(
-        x, kv_state, score_state, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
+        x, kv_state, score_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, token_to_request, position_ids, num_tokens,
-        num_cmp_writes, cmp_write_token_ids, cmp_slot_mapping,
+        idx_slot_mapping, inner_state_slot_mapping,
     )
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
         kv_base = kv_block * PACKED_RMS_TILE
         for kv_dt in pl.range(PACKED_RMS_TILE):
             kv_i = kv_base + kv_dt
-            if kv_i < num_cmp_writes:
-                src_row = pl.cast(pl.read(cmp_slot_mapping, [kv_i]), pl.INDEX)
+            src_row_raw = pl.cast(-1, pl.INT32)
+            write_seen = pl.cast(0, pl.INDEX)
+            for scan_w in pl.range(MAX_TOKENS):
+                if scan_w < num_tokens:
+                    scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
+                    if scan_slot_raw >= 0:
+                        if write_seen == kv_i:
+                            src_row_raw = scan_slot_raw
+                        write_seen = write_seen + 1
+            if src_row_raw >= 0:
+                src_row = pl.cast(src_row_raw, pl.INDEX)
                 kv[kv_i : kv_i + 1, 0:HEAD_DIM] = idx_kv_cache_flat[src_row : src_row + 1, 0:HEAD_DIM]
             else:
                 kv[kv_i : kv_i + 1, 0:HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
@@ -368,8 +417,9 @@ def golden_prefill_indexer_compressor(tensors):
 
     kv_proj = tensors["x"].float() @ tensors["wkv"].float()
     score_proj = tensors["x"].float() @ tensors["wgate"].float()
-    kv_state = tensors["kv_state"]
-    score_state = tensors["score_state"]
+    kv_state_flat = tensors["kv_state"].view(INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM)
+    score_state_flat = tensors["score_state"].view(INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM)
+    state_block_table = tensors["inner_compress_state_block_table"]
     idx_kv_cache = tensors["idx_kv_cache"]
     cache_rows = idx_kv_cache.view(idx_kv_cache.shape[0] * BLOCK_SIZE, 1, HEAD_DIM)[:, 0, :]
     token_to_req = tensors["token_to_request"]
@@ -379,8 +429,21 @@ def golden_prefill_indexer_compressor(tensors):
     hadamard = tensors["hadamard"].float()
     kv = torch.zeros(MAX_CMP_WRITES, HEAD_DIM, dtype=torch.bfloat16)
 
-    for write_i in range(int(tensors["num_cmp_writes"])):
-        token_id = int(tensors["cmp_write_token_ids"][write_i].item())
+    def state_row(req, abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        block = abs_pos // INNER_STATE_BLOCK_SIZE
+        intra = abs_pos % INNER_STATE_BLOCK_SIZE
+        phys_block = int(state_block_table[req, block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * INNER_STATE_BLOCK_SIZE + intra
+
+    write_i = 0
+    for token_id in range(int(tensors["num_tokens"])):
+        dst_row = int(tensors["idx_slot_mapping"][token_id].item())
+        if dst_row < 0:
+            continue
         req = int(token_to_req[token_id].item())
         write_pos = int(position_ids[token_id].item())
         cur_start = write_pos + 1 - COMPRESS_RATIO
@@ -391,14 +454,16 @@ def golden_prefill_indexer_compressor(tensors):
         for s in range(COMPRESS_RATIO):
             prev_abs = prev_start + s
             if write_pos >= 2 * COMPRESS_RATIO - 1:
-                prev_slot = prev_abs % STATE_LEN
-                pool_kv[s] = kv_state[req, prev_slot, :HEAD_DIM]
-                pool_score[s] = score_state[req, prev_slot, :HEAD_DIM]
+                prev_row = state_row(req, prev_abs)
+                if prev_row >= 0:
+                    pool_kv[s] = kv_state_flat[prev_row, :HEAD_DIM]
+                    pool_score[s] = score_state_flat[prev_row, :HEAD_DIM]
 
             cur_abs = cur_start + s
-            cur_slot = cur_abs % STATE_LEN
-            pool_kv[COMPRESS_RATIO + s] = kv_state[req, cur_slot, HEAD_DIM:OUT_DIM]
-            pool_score[COMPRESS_RATIO + s] = score_state[req, cur_slot, HEAD_DIM:OUT_DIM]
+            cur_row = state_row(req, cur_abs)
+            if cur_row >= 0:
+                pool_kv[COMPRESS_RATIO + s] = kv_state_flat[cur_row, HEAD_DIM:OUT_DIM]
+                pool_score[COMPRESS_RATIO + s] = score_state_flat[cur_row, HEAD_DIM:OUT_DIM]
 
         for t in range(int(tensors["num_tokens"])):
             if int(token_to_req[t].item()) != req:
@@ -447,20 +512,22 @@ def golden_prefill_indexer_compressor(tensors):
         normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2).to(torch.bfloat16).float()
         final = normed @ hadamard
         final_bf16 = final.to(torch.bfloat16)[0]
-        dst_row = int(tensors["cmp_slot_mapping"][write_i].item())
         cache_rows[dst_row] = final_bf16
-        kv[write_i] = final_bf16
+        if write_i < MAX_CMP_WRITES:
+            kv[write_i] = final_bf16
+        write_i += 1
 
     for t in range(int(tensors["num_tokens"])):
-        req = int(tensors["token_to_request"][t].item())
         pos = int(tensors["position_ids"][t].item())
-        slot = pos % STATE_LEN
+        dst_row = int(tensors["inner_state_slot_mapping"][t].item())
+        if dst_row < 0:
+            continue
         ape_slot = pos % COMPRESS_RATIO
-        kv_state[req, slot] = kv_proj[t]
-        score_state[req, slot] = score_proj[t] + tensors["ape"][ape_slot]
+        kv_state_flat[dst_row] = kv_proj[t]
+        score_state_flat[dst_row] = score_proj[t] + tensors["ape"][ape_slot]
     tensors["kv"][:] = kv
-    tensors["kv_state"][:] = kv_state
-    tensors["score_state"][:] = score_state
+    tensors["kv_state"][:] = kv_state_flat.view_as(tensors["kv_state"])
+    tensors["score_state"][:] = score_state_flat.view_as(tensors["score_state"])
     tensors["idx_kv_cache"][:] = idx_kv_cache
 
 
@@ -471,24 +538,37 @@ def build_tensor_specs(start_pos: int = START_POS):
     if start_pos < 0 or start_pos + MAX_TOKENS > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - MAX_TOKENS}, got {start_pos}")
 
-    cmp_write_records = [
-        (t, (start_pos + t + 1) // COMPRESS_RATIO - 1)
-        for t in range(MAX_TOKENS)
-        if (start_pos + t + 1) % COMPRESS_RATIO == 0
-    ]
-    if len(cmp_write_records) > MAX_CMP_WRITES:
-        raise ValueError(f"fixture generated {len(cmp_write_records)} compressed writes, cap is {MAX_CMP_WRITES}")
-    if cmp_write_records and max(dst_row for _, dst_row in cmp_write_records) >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
-        raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
+    write_count = sum(1 for t in range(MAX_TOKENS) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
+    if write_count > MAX_CMP_WRITES:
+        raise ValueError(f"fixture generated {write_count} compressed writes, cap is {MAX_CMP_WRITES}")
 
     def seeded_uniform(shape, seed, scale=1.0):
         generator = torch.Generator()
         generator.manual_seed(seed)
         return (torch.rand(*shape, generator=generator) - 0.5) * scale
+    def init_inner_compress_state_block_table():
+        table = torch.full((MAX_REQS, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for req in range(MAX_REQS):
+            for block in range(INNER_STATE_MAX_BLOCKS):
+                table[req, block] = req * INNER_STATE_MAX_BLOCKS + ((block * 17 + 3) % INNER_STATE_MAX_BLOCKS)
+        return table
+    def state_row(req, abs_pos):
+        if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
+            return -1
+        table = init_inner_compress_state_block_table()
+        block = abs_pos // INNER_STATE_BLOCK_SIZE
+        intra = abs_pos % INNER_STATE_BLOCK_SIZE
+        return int(table[req, block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
         return seeded_uniform((MAX_TOKENS, D), 1, 0.1).to(torch.bfloat16)
     def init_state():
-        return torch.zeros(MAX_REQS, STATE_LEN, OUT_DIM)
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM)
+        flat = state.view(-1, OUT_DIM)
+        for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
+            row = state_row(0, abs_pos)
+            if row >= 0:
+                flat[row] = seeded_uniform((OUT_DIM,), 1000 + abs_pos, 0.05)
+        return state
     def init_wkv():
         return seeded_uniform((D, OUT_DIM), 2, D ** -0.5).to(torch.bfloat16)
     def init_wgate():
@@ -512,22 +592,28 @@ def build_tensor_specs(start_pos: int = START_POS):
         return torch.zeros(MAX_TOKENS, dtype=torch.int32)
     def init_position_ids():
         return torch.arange(start_pos, start_pos + MAX_TOKENS, dtype=torch.int32)
-    def init_cmp_write_token_ids():
-        ids = torch.zeros(MAX_CMP_WRITES, dtype=torch.int32)
-        for i, (token_id, _) in enumerate(cmp_write_records):
-            ids[i] = token_id
-        return ids
-    def init_cmp_slot_mapping():
-        mapping = torch.zeros(MAX_CMP_WRITES, dtype=torch.int32)
-        for i, (_, dst_row) in enumerate(cmp_write_records):
-            mapping[i] = dst_row
+    def init_idx_slot_mapping():
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        for t in range(MAX_TOKENS):
+            pos = start_pos + t
+            if (pos + 1) % COMPRESS_RATIO == 0:
+                dst_row = (pos + 1) // COMPRESS_RATIO - 1
+                if dst_row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+                    raise ValueError("fixture compressed slot exceeds standalone idx_kv_cache capacity")
+                mapping[t] = dst_row
+        return mapping
+    def init_inner_state_slot_mapping():
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        for t in range(MAX_TOKENS):
+            mapping[t] = state_row(0, start_pos + t)
         return mapping
 
     return [
         TensorSpec("x", [MAX_TOKENS, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv", [MAX_CMP_WRITES, HEAD_DIM], torch.bfloat16, is_output=True),
-        TensorSpec("kv_state", [MAX_REQS, STATE_LEN, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
-        TensorSpec("score_state", [MAX_REQS, STATE_LEN, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("inner_compress_state_block_table", [MAX_REQS, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("wkv", [D, OUT_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [D, OUT_DIM], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
@@ -539,9 +625,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, MAX_TOKENS),
-        ScalarSpec("num_cmp_writes", torch.int32, len(cmp_write_records)),
-        TensorSpec("cmp_write_token_ids", [MAX_CMP_WRITES], torch.int32, init_value=init_cmp_write_token_ids),
-        TensorSpec("cmp_slot_mapping", [MAX_CMP_WRITES], torch.int32, init_value=init_cmp_slot_mapping),
+        TensorSpec("idx_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_inner_state_slot_mapping),
     ]
 
 
@@ -554,7 +639,7 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Fixture-only absolute position for token 0; lowered into position_ids for the kernel.")
+                        help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 

@@ -15,9 +15,12 @@ unified overlay raw-index contract:
 - `[WIN, WIN + MAX_TOKENS)`: current suffix overlay KV
 - `[WIN + MAX_TOKENS, ...)`: compressed KV
 
-The standalone harness keeps the decode-style `--compress-ratio {0,4,128}` as a
-fixture generator only. The kernel itself does not branch on ratio; the prebuilt
-raw indices fully describe which KV source each row comes from.
+`cmp_sparse_lens[t]` is the authoritative usable prefix length for
+`cmp_sparse_indices[t]`; any entries after that prefix are ignored even if they
+look like valid raw indices. The standalone harness keeps the decode-style
+`--compress-ratio {0,4,128}` as a fixture generator only. The kernel itself does
+not branch on ratio; the prebuilt raw indices fully describe which KV source
+each row comes from.
 """
 
 import pypto.language as pl
@@ -137,7 +140,7 @@ SPARSE_TOPK = TOPK
 @pl.jit.inline
 def _prefill_hca_sparse_from_gathered_kv(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, SPARSE_PREFILL_SPARSE_PAD], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -225,7 +228,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                                             value=0.0,
                                         ),
                                         qk_bias_row,
-                                    ),
+                                    )
                                 )
                                 softmax_mi = pl.row_max(softmax_scores)
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
@@ -567,6 +570,7 @@ def prefill_sparse_attn(
     cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -594,6 +598,7 @@ def prefill_sparse_attn(
     cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
 
     sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_indices_eff = pl.create_tensor([T, SPARSE_PREFILL_SPARSE_PAD], dtype=pl.INT32)
 
     # Stage 1: gather historical ring rows, current suffix overlay rows, and compressed rows.
     for gather_block in pl.spmd(HCA_GATHER_SPMD_BLOCKS, name_hint="prefill_hca_overlay_gather_kv_block"):
@@ -606,12 +611,18 @@ def prefill_sparse_attn(
             gather_t = gather_t0 + gather_dt
             if gather_t < T:
                 if gather_t < num_tokens:
+                    gather_len = pl.read(cmp_sparse_lens, [gather_t])
+                    gather_len_eff = pl.cast(SPARSE_PREFILL_SPARSE_PAD, pl.INT32)
+                    if gather_len > 0:
+                        gather_len_eff = gather_len
                     gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
                     for gather_ki in pl.pipeline(0, SPARSE_PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
                         gather_raw = pl.cast(-1, pl.INT32)
                         if gather_k < SPARSE_TOPK:
-                            gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
+                            if gather_k < gather_len_eff:
+                                gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
+                        pl.write(sparse_indices_eff, [gather_t, gather_k], gather_raw)
                         gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
                         if gather_raw >= 0:
                             if gather_raw < WIN:
@@ -650,12 +661,13 @@ def prefill_sparse_attn(
                 else:
                     for gather_ki in pl.pipeline(0, SPARSE_PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
+                        pl.write(sparse_indices_eff, [gather_t, gather_k], pl.cast(-1, pl.INT32))
                         gather_dst_row = gather_t * SPARSE_PREFILL_SPARSE_PAD + gather_k
                         sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
 
     attn_out = _prefill_hca_sparse_from_gathered_kv(
         q,
-        cmp_sparse_indices,
+        sparse_indices_eff,
         attn_sink,
         num_tokens,
         freqs_cos,
@@ -701,6 +713,7 @@ def prefill_sparse_attn_test(
     cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -719,6 +732,7 @@ def prefill_sparse_attn_test(
         cmp_kv,
         cmp_block_table,
         cmp_sparse_indices,
+        cmp_sparse_lens,
         attn_sink,
         token_to_request,
         num_tokens,
@@ -743,6 +757,7 @@ def golden_prefill_sparse_attn(tensors):
     ori_block_table = tensors["ori_block_table"]
     cmp_block_table = tensors["cmp_block_table"]
     cmp_sparse_indices = tensors["cmp_sparse_indices"]
+    cmp_sparse_lens = tensors["cmp_sparse_lens"]
     token_to_request = tensors["token_to_request"]
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
@@ -755,7 +770,8 @@ def golden_prefill_sparse_attn(tensors):
     for t in range(num_tokens):
         req = int(token_to_request[t].item())
         gathered = []
-        for raw_i in cmp_sparse_indices[t, :SPARSE_PREFILL_SPARSE_PAD].tolist():
+        sparse_len = max(0, min(int(cmp_sparse_lens[t].item()), SPARSE_PREFILL_SPARSE_PAD, SPARSE_TOPK))
+        for raw_i in cmp_sparse_indices[t, :sparse_len].tolist():
             raw = int(raw_i)
             if raw < 0:
                 continue
@@ -878,6 +894,14 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
                     comp = torch.arange(comp_count, dtype=torch.int32) + WIN + MAX_TOKENS
                     idx[t, cursor : cursor + comp_count] = comp
         return idx
+    def init_cmp_sparse_lens():
+        idx = init_cmp_sparse_indices()
+        lens = torch.zeros(T, dtype=torch.int32)
+        for t in range(num_tokens):
+            valid = (idx[t] >= 0).nonzero()
+            if valid.numel():
+                lens[t] = int(valid[-1].item()) + 1
+        return lens
     def init_attn_sink():
         return torch.zeros(H)
     def init_token_to_request():
@@ -901,6 +925,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [MAX_REQS, SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         ScalarSpec("num_tokens", torch.int32, num_tokens),

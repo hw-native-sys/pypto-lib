@@ -83,6 +83,7 @@ SWA_CASES = (
     "hetero_long_suffix_overlay",
     "hetero_full_capacity_overlay",
     "hetero_single_long_mix_overlay",
+    "cmp_sparse_lens_boundary",
 )
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
@@ -174,6 +175,9 @@ def _resolve_swa_case(
     elif swa_case == "hetero_single_long_mix_overlay":
         q_lens_values = [1, 127]
         context_lens_values = [255, 385]
+    elif swa_case == "cmp_sparse_lens_boundary":
+        q_lens_values = [50, 0]
+        context_lens_values = [100, 0]
     else:
         raise ValueError(f"unknown --swa-case {swa_case!r}; expected one of {SWA_CASES}")
 
@@ -194,22 +198,24 @@ def prefill_swa_write_kv_cache_overlay(
             for dt in pl.range(KV_CACHE_WRITE_TILE):
                 t = t0 + dt
                 if t < num_tokens:
-                    dst_row = pl.cast(pl.read(ori_slot_mapping, [t]), pl.INDEX)
-                    # `SWA_WRITEBACK_DEP_COLS` is a 32-byte BF16 dependency sentinel.
-                    # It orders the whole row writeback after attention without
-                    # forcing this tiny task to read the full 512-wide output row.
-                    dep_guard = pl.cast(
-                        attn_out[t : t + 1, 0:SWA_WRITEBACK_DEP_COLS],
-                        target_type=pl.FP32,
-                    )
-                    dep_zero = pl.mul(dep_guard, 0.0)
-                    kv_head = pl.cast(kv[t : t + 1, 0:SWA_WRITEBACK_DEP_COLS], target_type=pl.FP32)
-                    kv_head_dep = pl.cast(pl.add(kv_head, dep_zero), target_type=pl.BF16)
-                    kv_cache_flat[dst_row : dst_row + 1, 0:SWA_WRITEBACK_DEP_COLS] = kv_head_dep
-                    kv_cache_flat[dst_row : dst_row + 1, SWA_WRITEBACK_DEP_COLS:HEAD_DIM] = kv[
-                        t : t + 1,
-                        SWA_WRITEBACK_DEP_COLS:HEAD_DIM,
-                    ]
+                    dst_row_raw = pl.read(ori_slot_mapping, [t])
+                    if dst_row_raw >= 0:
+                        dst_row = pl.cast(dst_row_raw, pl.INDEX)
+                        # `SWA_WRITEBACK_DEP_COLS` is a 32-byte BF16 dependency sentinel.
+                        # It orders the whole row writeback after attention without
+                        # forcing this tiny task to read the full 512-wide output row.
+                        dep_guard = pl.cast(
+                            attn_out[t : t + 1, 0:SWA_WRITEBACK_DEP_COLS],
+                            target_type=pl.FP32,
+                        )
+                        dep_zero = pl.mul(dep_guard, 0.0)
+                        kv_head = pl.cast(kv[t : t + 1, 0:SWA_WRITEBACK_DEP_COLS], target_type=pl.FP32)
+                        kv_head_dep = pl.cast(pl.add(kv_head, dep_zero), target_type=pl.BF16)
+                        kv_cache_flat[dst_row : dst_row + 1, 0:SWA_WRITEBACK_DEP_COLS] = kv_head_dep
+                        kv_cache_flat[dst_row : dst_row + 1, SWA_WRITEBACK_DEP_COLS:HEAD_DIM] = kv[
+                            t : t + 1,
+                            SWA_WRITEBACK_DEP_COLS:HEAD_DIM,
+                        ]
     return pl.reshape(kv_cache_flat, [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
 
@@ -232,6 +238,7 @@ def prefill_attention_swa(
     block_table: pl.Tensor[[MAX_REQS, MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -300,6 +307,7 @@ def prefill_attention_swa(
         cmp_kv_dummy,
         cmp_block_table_dummy,
         cmp_sparse_indices,
+        cmp_sparse_lens,
         attn_sink,
         token_to_request,
         num_tokens,
@@ -391,6 +399,7 @@ def golden_prefill_attention_swa(tensors):
         "cmp_kv": torch.zeros(SPARSE_HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
         "cmp_block_table": torch.zeros(MAX_REQS, SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
         "cmp_sparse_indices": tensors["cmp_sparse_indices"],
+        "cmp_sparse_lens": tensors["cmp_sparse_lens"],
         "attn_sink": tensors["attn_sink"],
         "token_to_request": tensors["token_to_request"],
         "num_tokens": tensors["num_tokens"],
@@ -467,7 +476,7 @@ def build_tensor_specs(
             cursor += q_len
         return token_to_req, local_pos, pos
 
-    def validate_overlay_topk(topk_idxs, token_to_req, pos):
+    def validate_overlay_topk(topk_idxs, token_to_req, pos, sparse_lens=None):
         current_by_req = [dict() for _ in range(MAX_REQS)]
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -480,7 +489,8 @@ def build_tensor_specs(
             key_start_abs = abs_pos + 1 - window_valid
             seen_abs = set()
 
-            for raw_i in topk_idxs[t, :SPARSE_TOPK].tolist():
+            sparse_len = SPARSE_TOPK if sparse_lens is None else int(sparse_lens[t].item())
+            for raw_i in topk_idxs[t, :sparse_len].tolist():
                 raw = int(raw_i)
                 if raw < 0:
                     continue
@@ -579,8 +589,23 @@ def build_tensor_specs(
                     topk_idxs[t, key_i] = WIN + overlay_t
                 else:
                     topk_idxs[t, key_i] = key_abs % WIN
-        validate_overlay_topk(topk_idxs, token_to_req, pos)
+        sparse_lens = torch.zeros(MAX_TOKENS, dtype=torch.int32)
+        for t in range(num_tokens):
+            valid = (topk_idxs[t] >= 0).nonzero()
+            if valid.numel():
+                sparse_lens[t] = int(valid[-1].item()) + 1
+        validate_overlay_topk(topk_idxs, token_to_req, pos, sparse_lens)
         return topk_idxs
+    def init_cmp_sparse_lens():
+        topk_idxs = init_cmp_sparse_indices()
+        lens = torch.zeros(MAX_TOKENS, dtype=torch.int32)
+        for t in range(num_tokens):
+            valid = (topk_idxs[t] >= 0).nonzero()
+            if valid.numel():
+                lens[t] = int(valid[-1].item()) + 1
+                if swa_case == "cmp_sparse_lens_boundary":
+                    lens[t] = max(1, int(lens[t].item()) - 8)
+        return lens
     def init_token_to_request():
         return token_meta()[0]
     def init_position_ids():
@@ -616,6 +641,7 @@ def build_tensor_specs(
         TensorSpec("block_table", [MAX_REQS, MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
         TensorSpec("cmp_sparse_indices", [MAX_TOKENS, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
+        TensorSpec("cmp_sparse_lens", [MAX_TOKENS], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
