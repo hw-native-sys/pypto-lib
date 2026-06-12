@@ -16,6 +16,7 @@ Companion files: attention_swa.py (ratio=0)
 
 import pypto.language as pl
 
+import config
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -30,7 +31,8 @@ from hc_post import hc_post
 from decode_qkv_proj_rope import qkv_proj_rope
 from decode_rmsnorm import attn_norm
 from decode_compressor_ratio128 import compressor_ratio128
-from decode_sparse_attn import sparse_attn
+# NOTE: `sparse_attn` is imported lower down, AFTER config.SPARSE_TOPK_EFF is set,
+# so decode_sparse_attn bakes HCA's pruned sparse-K width at its import (issue #507).
 
 
 # model config
@@ -74,6 +76,16 @@ CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
 HCA_TOPK_LIMIT = min(CMP_TOPK, SPARSE_IDX_TOPK)
+
+# Specialize sparse_attn to HCA's window+compressed sparse-K width (issue #507):
+# WIN + HCA_TOPK_LIMIT (2 blocks after the min-2 floor) instead of the full
+# WIN+IDX_TOPK (5 blocks), pruning the padding compressed blocks. Publish it to
+# config BEFORE importing sparse_attn (same convention as moe_ep flipping
+# EP_ROUTING_GLOBAL), so the kernel and its torch golden bake this width at import.
+HCA_SPARSE_TOPK = WIN + HCA_TOPK_LIMIT
+config.SPARSE_TOPK_EFF = HCA_SPARSE_TOPK
+from decode_sparse_attn import sparse_attn  # noqa: E402  (must follow the config set above)
+
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
@@ -207,7 +219,7 @@ def attention_hca(
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    topk_all = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    topk_all = pl.create_tensor([T, HCA_SPARSE_TOPK], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_overlay_topk"):
         for topk_b in pl.range(B):
             for topk_s in pl.range(S):
@@ -244,7 +256,7 @@ def attention_hca(
                     HCA_TOPK_LIMIT,
                     pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
                 )
-                for topk_ck in pl.range(SPARSE_IDX_TOPK):
+                for topk_ck in pl.range(HCA_SPARSE_TOPK - WIN):
                     if topk_ck < topk_cmp_valid:
                         pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(WIN + S + topk_ck, pl.INT32))
                     else:
@@ -445,7 +457,7 @@ def golden_attention_hca(tensors):
         "state_slot_mapping": state_slot_mapping_bsd,
     })
 
-    topk_all = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
+    topk_all = torch.full((T, HCA_SPARSE_TOPK), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
         s = t % S

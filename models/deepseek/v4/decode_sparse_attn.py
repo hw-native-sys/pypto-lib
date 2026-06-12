@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 
+import config as _cfg
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
@@ -27,7 +28,9 @@ NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
 IDX_TOPK = M.index_topk
-TOPK = WIN + IDX_TOPK
+TOPK_FULL = WIN + IDX_TOPK           # full sparse-K width (window + indexer topk)
+# TOPK / SPARSE_BLOCKS / PADDED_TOPK are resolved below (after get_standalone_cmp_valid)
+# from config.SPARSE_TOPK_EFF, which importers set before import (issue #507).
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -55,8 +58,6 @@ H_TILE = 16
 # Largest sparse-K tile that fits the cube Mat buffer and divides TOPK with no
 # padding (WIN and IDX_TOPK are multiples of 128).
 ATTN_K_TILE = 128
-SPARSE_BLOCKS = (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE
-PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 A_T_TILE = 16
@@ -77,8 +78,6 @@ NEG_INF = -1.0e20
 assert T % VALID_TOKEN_TILE == 0, f"T ({T}) must be divisible by VALID_TOKEN_TILE ({VALID_TOKEN_TILE})"  # build_valid
 assert T % ROPE_TOKEN_TILE == 0, f"T ({T}) must be divisible by ROPE_TOKEN_TILE ({ROPE_TOKEN_TILE})"      # rope
 assert T % QUANT_TOKEN_TILE == 0, f"T ({T}) must be divisible by QUANT_TOKEN_TILE ({QUANT_TOKEN_TILE})"   # quant
-assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
-    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"             # gather_kv bulk-zero
 assert H % O_GROUPS == 0, f"H ({H}) must be divisible by O_GROUPS ({O_GROUPS})"                           # rope_pack / o_packed grouping
 assert (O_GROUPS * O_LORA) % B_K_TILE == 0, \
     f"O_GROUPS*O_LORA ({O_GROUPS * O_LORA}) must be divisible by B_K_TILE ({B_K_TILE})"                   # proj_b K-loop
@@ -94,6 +93,24 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     if compress_ratio == 128:
         return MAX_SEQ_LEN // compress_ratio
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
+
+
+# Resolve the active sparse-K width (issue #507), baked into sparse_attn's shapes
+# at import. Importers (decode_attention_{swa,hca}.py) set config.SPARSE_TOPK_EFF to
+# their pruned width (WIN / WIN+CMP_TOPK -> 2 blocks) BEFORE importing this module
+# (same convention as moe_ep/EP_ROUTING_GLOBAL); CSA / external importers and the
+# standalone test below leave it None for the full WIN+IDX_TOPK width (5 blocks) --
+# the pruned widths are exercised by the swa/hca variant tests that set them.
+TOPK = _cfg.SPARSE_TOPK_EFF if _cfg.SPARSE_TOPK_EFF is not None else TOPK_FULL
+# Floor to 2: a single sparse-K block (PADDED_TOPK == 128) deterministically
+# miscompiles in pypto (an S-stride cross-token output mixup on a2a3sim and real
+# a2a3); a 2-block build whose 2nd block is fully -inf/zero is bit-exact, so SWA is
+# 5->2 (not 5->1). The trailing all-invalid block is cheap.
+SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
+PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
+assert WIN <= TOPK <= TOPK_FULL, f"SPARSE_TOPK_EFF ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
+assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
+    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"  # gather_kv bulk-zero
 
 
 @pl.jit.inline
@@ -181,14 +198,17 @@ def sparse_attn(
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
 
         # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-        for g_c in pl.pipeline(WIN, TOPK, stage=4):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-            if g_raw >= 0:
-                g_dst_row = g_kv_base + g_c
-                g_slot = g_raw - (WIN + S)
-                g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+        # Guarded so the SWA (TOPK == WIN) specialization omits the loop
+        # entirely rather than emitting an empty pl.pipeline (issue #507).
+        if TOPK > WIN:
+            for g_c in pl.pipeline(WIN, TOPK, stage=4):
+                g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                if g_raw >= 0:
+                    g_dst_row = g_kv_base + g_c
+                    g_slot = g_raw - (WIN + S)
+                    g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                    g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -246,17 +266,21 @@ def sparse_attn(
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-            for m_sb in pl.range(1, SPARSE_BLOCKS):
-                m_row = m_blk_base + m_sb * H_TILE
-                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                m_mi = m_mi_new
+            # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
+            # single block's stats directly instead of emitting an empty
+            # pl.range(1, 1) merge loop (issue #507).
+            if SPARSE_BLOCKS > 1:
+                for m_sb in pl.range(1, SPARSE_BLOCKS):
+                    m_row = m_blk_base + m_sb * H_TILE
+                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                    m_mi = m_mi_new
 
             n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
             n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
@@ -654,9 +678,15 @@ def build_tensor_specs(
         return tbl
 
     def init_cmp_sparse_indices():
-        """Build the sparse index list with a full window prefix and padded compressed tail."""
+        """Build the sparse index list with a full window prefix and padded compressed tail.
+
+        The compressed tail width follows the active specialization (TOPK - WIN):
+        the issue#507-pruned build narrows it to exactly `cmp_valid` columns, the
+        full-blocks baseline keeps the IDX_TOPK-wide padded tail.
+        """
         win_part = torch.arange(WIN, dtype=torch.int32).unsqueeze(0).expand(T, -1)
-        cmp_part = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+        cmp_width = TOPK - WIN
+        cmp_part = torch.full((T, cmp_width), -1, dtype=torch.int32)
         cmp_part[:, :cmp_valid] = (torch.arange(cmp_valid, dtype=torch.int32) + WIN + S).unsqueeze(0).expand(T, -1)
         indices = torch.cat([win_part, cmp_part], dim=-1).contiguous()
         if short_window_fixture:
@@ -731,6 +761,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    # The standalone always tests the full-width (5-block) kernel; --compress-ratio
+    # only selects which compressed-tail data pattern to validate (the pruned 2-block
+    # widths are covered by the swa/hca variant tests).
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
@@ -746,10 +779,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
+    compress_ratio = args.compress_ratio
+    print(f"[#507] compress_ratio={compress_ratio} "
+          f"-> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
+
     result = run_jit(
         fn=sparse_attn_test,
         specs=build_tensor_specs(
-            args.compress_ratio,
+            compress_ratio,
             args.causal_regression_fixture,
             args.short_window_fixture,
             args.mixed_topk_fixture,

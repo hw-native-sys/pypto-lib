@@ -17,12 +17,14 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
+import config
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from decode_qkv_proj_rope import qkv_proj_rope
 from decode_rmsnorm import attn_norm
-from decode_sparse_attn import sparse_attn
+# NOTE: `sparse_attn` is imported lower down, AFTER config.SPARSE_TOPK_EFF is set,
+# so decode_sparse_attn bakes SWA's pruned sparse-K width at its import (issue #507).
 
 
 # model config
@@ -59,6 +61,14 @@ SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA b
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 
+# Specialize sparse_attn to SWA's window-only sparse-K width (issue #507): WIN
+# (2 blocks after the min-2 floor) instead of the full WIN+IDX_TOPK (5 blocks),
+# pruning the padding compressed blocks. Publish it to config BEFORE importing
+# sparse_attn (same convention as moe_ep flipping EP_ROUTING_GLOBAL), so the kernel
+# and its torch golden bake this width at import.
+config.SPARSE_TOPK_EFF = WIN
+from decode_sparse_attn import sparse_attn  # noqa: E402  (must follow the config set above)
+
 
 @pl.jit.inline
 def attention_swa(
@@ -82,6 +92,13 @@ def attention_swa(
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
+    # Compressed KV pool: SWA has no compressor, so this is an all-zero host
+    # placeholder the variant never gathers from (its compressed topk slots are
+    # all -1). It must still be a host-provided input (like HCA's real cmp_kv) --
+    # an internal create_tensor would be a 512 MB task-heap scratch that exhausts
+    # the orchestrator's heap and deadlocks.
+    cmp_kv: pl.Tensor[[B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -137,12 +154,9 @@ def attention_swa(
         qr_scale,
     )
 
-    sparse_topk = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    cmp_kv_dummy = pl.create_tensor([B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_block_table_dummy = pl.create_tensor([B, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    sparse_topk = pl.create_tensor([T, WIN], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_topk"):
         for topk_b in pl.range(B):
-            pl.write(cmp_block_table_dummy, [topk_b, 0], pl.cast(topk_b * SPARSE_CMP_MAX_BLOCKS, pl.INT32))
             for topk_s in pl.range(S):
                 topk_t = topk_b * S + topk_s
                 topk_abs_pos = pl.read(position_ids, [topk_t])
@@ -171,8 +185,6 @@ def attention_swa(
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
                         else:
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
-                for topk_pad in pl.range(SPARSE_IDX_TOPK):
-                    pl.write(sparse_topk, [topk_t, WIN + topk_pad], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
@@ -180,8 +192,8 @@ def attention_swa(
         kv_cache,
         block_table,
         kv,
-        cmp_kv_dummy,
-        cmp_block_table_dummy,
+        cmp_kv,
+        cmp_block_table,
         sparse_topk,
         attn_sink,
         rope_cos_t,
@@ -237,6 +249,9 @@ def attention_swa_test(
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
+    # all-zero compressed-KV placeholder (SWA has no compressor); see attention_swa
+    cmp_kv: pl.Tensor[[B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     # sparse_attn
     attn_sink: pl.Tensor[[H], pl.FP32],
     # o_proj
@@ -252,6 +267,7 @@ def attention_swa_test(
         gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, block_table, ori_slot_mapping, position_ids,
+        cmp_kv, cmp_block_table,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
         x_out,
@@ -325,12 +341,12 @@ def golden_attention_swa(tensors):
     kv_cache = tensors["kv_cache"]
     block_table = tensors["block_table"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    cmp_kv_dummy = torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
-    cmp_block_table_dummy = torch.full((B, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-    for b in range(B):
-        cmp_block_table_dummy[b, 0] = b * SPARSE_CMP_MAX_BLOCKS
+    # Compressed cache is a host-provided all-zero placeholder for SWA (never
+    # gathered: every compressed topk slot stays -1).
+    cmp_kv_dummy = tensors["cmp_kv"]
+    cmp_block_table_dummy = tensors["cmp_block_table"]
 
-    sparse_topk_all = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
+    sparse_topk_all = torch.full((T, WIN), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
         s = t % S
@@ -504,6 +520,11 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_kv", [B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
+                   init_value=lambda: torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)),
+        TensorSpec("cmp_block_table", [B, SPARSE_CMP_MAX_BLOCKS], torch.int32,
+                   init_value=lambda: (torch.arange(B, dtype=torch.int32).unsqueeze(1) * SPARSE_CMP_MAX_BLOCKS
+                                       + torch.arange(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32).unsqueeze(0))),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),

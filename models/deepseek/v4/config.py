@@ -268,3 +268,11 @@ RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
 # keeps the legacy single-card behavior where each rank only routes over its
 # own shard. moe_ep.py flips this before importing gate.
 EP_ROUTING_GLOBAL = False
+
+# Active sparse-K width for the decode sparse_attn kernel (issue #507). None means
+# the full WIN + index_topk width (5 blocks, used by CSA / external importers).
+# decode_attention_swa.py / decode_attention_hca.py set this to their pruned width
+# (WIN / WIN+CMP_TOPK -> 2 blocks) BEFORE importing decode_sparse_attn, so the
+# kernel bakes the narrowed shape at import time (same convention as
+# EP_ROUTING_GLOBAL above; decode_sparse_attn reads it via `import config`).
+SPARSE_TOPK_EFF = None
