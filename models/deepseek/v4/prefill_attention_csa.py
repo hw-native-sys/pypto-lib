@@ -49,7 +49,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    prefill_sparse_attn,
+    prefill_sparse_attn_padded_indices,
 )
 
 B = PREFILL_BATCH
@@ -264,7 +264,6 @@ def _prefill_csa_assemble_sparse_indices(
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
 ):
     for topk_block in pl.spmd((MAX_TOKENS + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
@@ -272,7 +271,6 @@ def _prefill_csa_assemble_sparse_indices(
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
             t_idx = topk_t0 + topk_dt
             sparse_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
-            sparse_len = pl.cast(0, pl.INDEX)
             if t_idx < num_tokens:
                 req = pl.read(token_to_request, [t_idx])
                 abs_pos = pl.read(position_ids, [t_idx])
@@ -303,11 +301,8 @@ def _prefill_csa_assemble_sparse_indices(
                                     if topk_raw >= WIN + MAX_TOKENS:
                                         sparse_raw = topk_raw
                     pl.write(sparse_row, [0, sparse_col], sparse_raw)
-                    if sparse_raw >= 0:
-                        sparse_len = sparse_col + 1
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, sparse_row, [t_idx, 0])
-            pl.write(cmp_sparse_lens, [t_idx], pl.cast(sparse_len, pl.INT32))
-    return cmp_sparse_indices, cmp_sparse_lens
+    return cmp_sparse_indices
 
 
 @pl.jit
@@ -444,18 +439,20 @@ def prefill_attention_csa(
     )
 
     cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    cmp_sparse_lens_work = pl.create_tensor([T], dtype=pl.INT32)
-    cmp_sparse_work, cmp_sparse_lens_work = _prefill_csa_assemble_sparse_indices(
+    cmp_sparse_work = _prefill_csa_assemble_sparse_indices(
         cmp_topk_indices,
         token_to_request,
         position_ids,
         num_tokens,
         cmp_sparse_work,
-        cmp_sparse_lens_work,
     )
+    # CSA builds every sparse row itself and pads unused entries with -1, so it
+    # can safely expose the full row width to the shared sparse-attn kernel,
+    # while external serving callers still use cmp_sparse_lens in
+    # prefill_sparse_attn where lens == 0 means no valid sparse indices.
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn(
+    attn_out = prefill_sparse_attn_padded_indices(
         q,
         kv_cache,
         ori_block_table,
@@ -463,7 +460,6 @@ def prefill_attention_csa(
         cmp_kv,
         cmp_block_table,
         cmp_sparse_work,
-        cmp_sparse_lens_work,
         attn_sink,
         token_to_request,
         num_tokens,
