@@ -33,7 +33,7 @@ from prefill_compressor_ratio4 import (
 )
 from hc_post import golden_hc_post, hc_post
 from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
-from prefill_indexer import INDEXER_TOPK_CAP, golden_prefill_indexer_core, prefill_indexer
+from prefill_indexer import IDX_CACHE_MAX_BLOCKS, INDEXER_TOPK_CAP, golden_prefill_indexer_core, prefill_indexer
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
@@ -117,6 +117,7 @@ CSA_CASES = (
     "cmp_sparse_lens_boundary",
     "issue511_mapping_boundary",
     "issue511_idx_slot_distinct",
+    "issue511_idx_block_table_permutation",
 )
 CSA_WRITEBACK_DEP_COLS = 16
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
@@ -197,6 +198,9 @@ def _resolve_csa_case(
     elif csa_case == "issue511_idx_slot_distinct":
         q_lens_values = [50, 40]
         context_lens_values = [96, 230]
+    elif csa_case == "issue511_idx_block_table_permutation":
+        q_lens_values = [50, 40]
+        context_lens_values = [96, 230]
     else:
         raise ValueError(f"unknown --csa-case {csa_case!r}; expected one of {CSA_CASES}")
 
@@ -228,7 +232,7 @@ def _resolve_csa_case(
 def _prefill_csa_cache_writeback_overlay(
     kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     attn_out: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -338,16 +342,17 @@ def prefill_attention_csa(
     inner_compress_state_block_table: pl.Tensor[[MAX_REQS, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Out[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_block_table: pl.Tensor[[MAX_REQS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -429,6 +434,7 @@ def prefill_attention_csa(
         inner_ape,
         inner_norm_w,
         idx_kv_cache,
+        idx_block_table,
         cmp_topk_indices,
         token_to_request,
         position_ids,
@@ -552,6 +558,7 @@ def golden_prefill_attention_csa(tensors):
         "inner_ape": tensors["inner_ape"],
         "inner_norm_w": tensors["inner_norm_w"],
         "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_block_table": tensors["idx_block_table"],
         "token_to_request": tensors["token_to_request"],
         "position_ids": tensors["position_ids"],
         "num_tokens": tensors["num_tokens"],
@@ -680,8 +687,7 @@ def build_tensor_specs(
             if (abs_pos + 1) % COMPRESS_RATIO == 0:
                 req = int(token_to_req[t].item())
                 cmp_slot = (abs_pos + 1) // COMPRESS_RATIO - 1
-                dst_row = req * SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE + cmp_slot
-                records.append((t, dst_row))
+                records.append((t, req, cmp_slot))
         if len(records) > MAX_CMP_WRITES:
             raise ValueError(f"CSA fixture generated {len(records)} compressed writes, cap is {MAX_CMP_WRITES}")
         return records
@@ -866,13 +872,15 @@ def build_tensor_specs(
     def init_idx_kv_cache():
         cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
         cache_flat = cache.view(CSA_CMP_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        table = init_idx_block_table()
         for req, ctx in enumerate(context_lens_values):
             completed = ctx // COMPRESS_RATIO
             for cmp_slot in range(completed):
                 if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
                     break
-                row = req * SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE + cmp_slot
-                cache_flat[row] = seeded_uniform((IDX_HEAD_DIM,), 7000 + req * 65536 + cmp_slot, 0.05).to(torch.bfloat16)
+                row = cache_row_from_table(table, req, cmp_slot)
+                if row >= 0:
+                    cache_flat[row] = seeded_uniform((IDX_HEAD_DIM,), 7000 + req * 65536 + cmp_slot, 0.05).to(torch.bfloat16)
         return cache
     def init_kv_cache():
         cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -891,7 +899,7 @@ def build_tensor_specs(
                 table[req, block] = req * SPARSE_ORI_MAX_BLOCKS + block
         return table
     def init_ori_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -915,6 +923,23 @@ def build_tensor_specs(
             for block in range(SPARSE_CMP_MAX_BLOCKS):
                 table[req, block] = req * SPARSE_CMP_MAX_BLOCKS + block
         return table
+    def init_idx_block_table():
+        table = torch.full((MAX_REQS, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
+        for req in range(MAX_REQS):
+            for block in range(IDX_CACHE_MAX_BLOCKS):
+                phys = block
+                if csa_case in ("issue511_idx_slot_distinct", "issue511_idx_block_table_permutation"):
+                    if IDX_CACHE_MAX_BLOCKS > 1:
+                        phys = (block * 5 + 1) % IDX_CACHE_MAX_BLOCKS
+                table[req, block] = req * IDX_CACHE_MAX_BLOCKS + phys
+        return table
+    def cache_row_from_table(table, req, slot):
+        block = slot // BLOCK_SIZE
+        intra = slot % BLOCK_SIZE
+        phys_block = int(table[req, block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * BLOCK_SIZE + intra
     def init_cmp_sparse_indices():
         topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
         token_to_req, _, pos = token_meta()
@@ -948,27 +973,26 @@ def build_tensor_specs(
     def init_position_ids():
         return token_meta()[2]
     def init_cmp_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
-        for token_id, dst_row in cmp_write_records():
-            mapping[token_id] = dst_row
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        table = init_cmp_block_table()
+        for token_id, req, cmp_slot in cmp_write_records():
+            mapping[token_id] = cache_row_from_table(table, req, cmp_slot)
         return mapping
     def init_idx_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
-        for token_id, dst_row in cmp_write_records():
-            if csa_case == "issue511_idx_slot_distinct":
-                mapping[token_id] = dst_row + 32
-            else:
-                mapping[token_id] = dst_row
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        table = init_idx_block_table()
+        for token_id, req, cmp_slot in cmp_write_records():
+            mapping[token_id] = cache_row_from_table(table, req, cmp_slot)
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             mapping[t] = state_row(req, int(pos[t].item()))
         return mapping
     def init_inner_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -1038,7 +1062,7 @@ def build_tensor_specs(
         TensorSpec("kv_cache", [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_block_table", [MAX_REQS, SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
+        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec(
             "cmp_kv",
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
@@ -1052,12 +1076,13 @@ def build_tensor_specs(
             torch.bfloat16,
             init_value=init_idx_kv_cache,
         ),
+        TensorSpec("idx_block_table", [MAX_REQS, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_cmp_slot_mapping),
-        TensorSpec("idx_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_idx_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_state_slot_mapping),
-        TensorSpec("inner_state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_inner_state_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("idx_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_inner_state_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),

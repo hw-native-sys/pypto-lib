@@ -82,8 +82,8 @@ def prefill_compressor_ratio128(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
 ):
     x_flat = x
     kv_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
@@ -127,7 +127,7 @@ def prefill_compressor_ratio128(
         pool_kv_tile = pl.create_tensor([MAIN_STATE_LEN, CMP_HEAD_CHUNK], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([MAIN_STATE_LEN, CMP_HEAD_CHUNK], dtype=pl.FP32)
         write_token = 0
-        write_slot_raw = pl.cast(-1, pl.INT32)
+        write_slot_raw = pl.cast(-1, pl.INT64)
         write_seen = pl.cast(0, pl.INDEX)
         for scan_w in pl.range(MAX_TOKENS):
             if scan_w < num_tokens:
@@ -223,7 +223,7 @@ def prefill_compressor_ratio128(
         sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         for norm_i in pl.range(HCA_C128_RMS_TILE):
             norm_write_token = 0
-            norm_slot_raw = pl.cast(-1, pl.INT32)
+            norm_slot_raw = pl.cast(-1, pl.INT64)
             norm_seen = pl.cast(0, pl.INDEX)
             for scan_w in pl.range(MAX_TOKENS):
                 if scan_w < num_tokens:
@@ -285,7 +285,7 @@ def prefill_compressor_ratio128(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):
-            final_cmp_row_raw = pl.cast(-1, pl.INT32)
+            final_cmp_row_raw = pl.cast(-1, pl.INT64)
             final_seen = pl.cast(0, pl.INDEX)
             for scan_w in pl.range(MAX_TOKENS):
                 if scan_w < num_tokens:
@@ -359,26 +359,12 @@ def prefill_compressor_ratio128_test(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
 ):
     return prefill_compressor_ratio128(
-        x,
-        kv_state,
-        score_state,
-        compress_state_block_table,
-        wkv,
-        wgate,
-        ape,
-        norm_w,
-        freqs_cos,
-        freqs_sin,
-        cmp_kv,
-        token_to_request,
-        position_ids,
-        num_tokens,
-        cmp_slot_mapping,
-        state_slot_mapping,
+        x, kv_state, score_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
+        cmp_kv, token_to_request, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
     )
 
 
@@ -505,14 +491,14 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_position_ids():
         return torch.arange(start_pos, start_pos + MAX_TOKENS, dtype=torch.int32)
     def init_cmp_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         for token_id in range(num_tokens):
             pos = start_pos + token_id
             if pos + 1 >= COMPRESS_RATIO and (pos + 1) % COMPRESS_RATIO == 0:
                 mapping[token_id] = (pos + 1) // COMPRESS_RATIO - 1
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         for token_id in range(num_tokens):
             mapping[token_id] = state_row(0, start_pos + token_id)
         return mapping
@@ -532,8 +518,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_state_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
     ]
 
 

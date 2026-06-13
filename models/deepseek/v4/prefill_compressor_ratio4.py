@@ -56,8 +56,8 @@ def prefill_compressor_ratio4(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
 ):
     kv_proj = pl.create_tensor([MAX_TOKENS, OUT_DIM], dtype=pl.FP32)
     score_proj = pl.create_tensor([MAX_TOKENS, OUT_DIM], dtype=pl.FP32)
@@ -93,7 +93,7 @@ def prefill_compressor_ratio4(
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
         write_token = 0
-        write_slot_raw = pl.cast(-1, pl.INT32)
+        write_slot_raw = pl.cast(-1, pl.INT64)
         write_seen = pl.cast(0, pl.INDEX)
         for scan_w in pl.range(MAX_TOKENS):
             if scan_w < num_tokens:
@@ -228,7 +228,7 @@ def prefill_compressor_ratio4(
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
             write_token = 0
-            write_slot_raw = pl.cast(-1, pl.INT32)
+            write_slot_raw = pl.cast(-1, pl.INT64)
             write_seen = pl.cast(0, pl.INDEX)
             for scan_w in pl.range(MAX_TOKENS):
                 if scan_w < num_tokens:
@@ -278,7 +278,7 @@ def prefill_compressor_ratio4(
         final_base = final_block * PACKED_RMS_TILE
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
-            dst_row_raw = pl.cast(-1, pl.INT32)
+            dst_row_raw = pl.cast(-1, pl.INT64)
             write_seen = pl.cast(0, pl.INDEX)
             for scan_w in pl.range(MAX_TOKENS):
                 if scan_w < num_tokens:
@@ -463,8 +463,8 @@ def prefill_compressor_ratio4_test(
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
 ):
     return prefill_compressor_ratio4(
         x, kv_state, score_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
@@ -525,7 +525,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_position_ids():
         return torch.arange(start_pos, start_pos + MAX_TOKENS, dtype=torch.int32)
     def init_cmp_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         for t in range(MAX_TOKENS):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
@@ -535,7 +535,7 @@ def build_tensor_specs(start_pos: int = START_POS):
                 mapping[t] = dst_row
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         for t in range(MAX_TOKENS):
             mapping[t] = state_row(0, start_pos + t)
         return mapping
@@ -555,8 +555,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, MAX_TOKENS),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_state_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
     ]
 
 

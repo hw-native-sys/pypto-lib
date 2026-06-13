@@ -114,7 +114,7 @@ assert HCA_WRITEBACK_DEP_COLS < HEAD_DIM, "writeback dependency sentinel must be
 def _prefill_hca_cache_writeback_overlay(
     kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     attn_out: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -165,7 +165,7 @@ def prefill_attention_hca(
     cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[MAX_REQS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
@@ -173,8 +173,8 @@ def prefill_attention_hca(
     cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -683,7 +683,7 @@ def build_tensor_specs(
                     cache_flat[req * BLOCK_SIZE + pos_i % WIN] = prefix[pos_i]
         return cache
     def init_ori_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, local_pos, _ = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -757,12 +757,12 @@ def build_tensor_specs(
     def init_position_ids():
         return token_meta()[2]
     def init_cmp_slot_mapping():
-        out = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        out = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         for req, token_id, cmp_slot in cmp_write_records():
             out[token_id] = req * BLOCK_SIZE + cmp_slot
         return out
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -820,7 +820,7 @@ def build_tensor_specs(
             init_value=init_kv_cache,
             is_output=True,
         ),
-        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
+        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("ori_block_table", [MAX_REQS, SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec(
             "cmp_kv",
@@ -834,8 +834,8 @@ def build_tensor_specs(
         TensorSpec("cmp_sparse_lens", [MAX_TOKENS], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_state_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),

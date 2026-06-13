@@ -188,7 +188,7 @@ def _resolve_swa_case(
 def prefill_swa_write_kv_cache_overlay(
     kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     attn_out: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -236,7 +236,7 @@ def prefill_attention_swa(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[MAX_REQS, MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
     cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
     token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
@@ -564,7 +564,7 @@ def build_tensor_specs(
                 cache_flat[row] = value.to(torch.bfloat16)
         return cache
     def init_ori_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int32)
+        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
@@ -639,7 +639,7 @@ def build_tensor_specs(
         TensorSpec("kv_cache", [BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [MAX_REQS, MAX_BLOCKS], torch.int32, init_value=init_block_table),
-        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int32, init_value=init_ori_slot_mapping),
+        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("cmp_sparse_indices", [MAX_TOKENS, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("cmp_sparse_lens", [MAX_TOKENS], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
