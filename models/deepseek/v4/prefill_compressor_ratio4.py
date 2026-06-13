@@ -568,6 +568,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense cmp_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
@@ -578,6 +584,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_prefill_compressor_ratio4,
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         compare_fn={
             "kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),

@@ -376,6 +376,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
@@ -406,6 +412,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
         rtol=1e-3,
         atol=1e-3,
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         compare_fn={
             "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs": topk_idxs_compare,

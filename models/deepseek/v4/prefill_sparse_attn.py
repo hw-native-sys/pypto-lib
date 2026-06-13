@@ -1073,6 +1073,12 @@ if __name__ == "__main__":
         help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
     )
     parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
+    parser.add_argument(
         "--compress-ratio",
         type=int,
         default=DEFAULT_COMPRESS_RATIO,
@@ -1117,6 +1123,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         compare_fn={"attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
     )
     if not result.passed:

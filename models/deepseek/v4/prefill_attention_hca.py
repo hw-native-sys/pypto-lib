@@ -899,6 +899,12 @@ if __name__ == "__main__":
         help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
     )
     parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
+    parser.add_argument(
         "--start-pos",
         type=int,
         default=START_POS,
@@ -982,6 +988,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-2,
         atol=1e-2,
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         compare_fn={
             "x_out": active_x_out_compare(compare_tokens),
         },

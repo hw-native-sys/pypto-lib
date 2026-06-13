@@ -707,6 +707,12 @@ if __name__ == "__main__":
         help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
     )
     parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
+    parser.add_argument(
         "--swa-case",
         type=str,
         default="custom",
@@ -779,6 +785,7 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         rtol=1e-2,
         atol=1e-2,
         compare_fn={

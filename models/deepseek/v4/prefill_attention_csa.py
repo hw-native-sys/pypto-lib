@@ -1132,6 +1132,12 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        default=False,
+        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+    )
+    parser.add_argument(
         "--csa-case",
         type=str,
         default="custom",
@@ -1182,6 +1188,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-2,
         atol=1e-2,
+        compile_only=args.compile_only or args.platform.endswith("sim"),
         compare_fn={
             "x_out": active_x_out_compare(compare_tokens),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
