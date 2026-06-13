@@ -7,9 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: F401,F403,F405,F821
-"""DeepSeek-V4 prefill indexer scaffold.
+"""DeepSeek-V4 packed prefill indexer.
 
-Kernel body is intentionally empty; golden follows the torch reference for this stage.
+This module builds the compressed index KV cache and per-token compressed top-k
+indices consumed by packed CSA prefill sparse attention.
 """
 
 import pypto.language as pl

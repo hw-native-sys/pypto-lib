@@ -17,7 +17,7 @@ import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from hc_post import golden_hc_post, hc_post
-from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
+from hc_pre import golden_hc_pre, hc_pre
 from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
 from prefill_rmsnorm import golden_prefill_attn_norm, prefill_attn_norm
 from prefill_sparse_attn import (
@@ -250,10 +250,10 @@ def prefill_attention_swa(
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-    comb = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed, post, comb = prefill_hc_pre(
+    x_mixed = hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -320,13 +320,11 @@ def prefill_attention_swa(
     )
     kv_cache = prefill_swa_write_kv_cache_overlay(kv, kv_cache, ori_slot_mapping, attn_out, num_tokens)
 
-    comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     x_out = hc_post(
         attn_out,
         x_hc,
         post,
-        comb_t,
+        comb,
         x_out,
     )
     return kv_cache, x_out
@@ -350,11 +348,12 @@ def golden_prefill_attention_swa(tensors):
 
     num_tokens = int(tensors["num_tokens"])
     x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
-    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
-    comb = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
-    golden_prefill_hc_pre({
-        "x": x_hc_rect,
+    x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
+    x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
+    post = torch.zeros(T, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
+    golden_hc_pre({
+        "x": x_hc_flat,
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
         "hc_base": tensors["hc_attn_base"],
@@ -369,7 +368,7 @@ def golden_prefill_attention_swa(tensors):
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
     rope_cos_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
     rope_sin_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
-    x_normed = golden_prefill_attn_norm(x_mixed.view(T, D), tensors["attn_norm_w"])
+    x_normed = golden_prefill_attn_norm(x_mixed, tensors["attn_norm_w"])
     golden_prefill_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -422,9 +421,9 @@ def golden_prefill_attention_swa(tensors):
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
         "x": attn_out.view(T, D),
-        "residual": x_hc_rect.view(T, HC_MULT, D),
-        "post": post.view(T, HC_MULT),
-        "comb": comb.view(T, HC_MULT, HC_MULT),
+        "residual": x_hc_flat,
+        "post": post,
+        "comb": comb,
         "y": y,
     })
     tensors["x_out"][:] = y

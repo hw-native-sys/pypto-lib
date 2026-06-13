@@ -6,19 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 Hyper-Connections pre-mix (decode): mixes the hc-stack into a single sublayer input
-and produces the post/comb weights used by hc_post."""
+"""DeepSeek-V4 Hyper-Connections pre-mix (dynamic shape): mixes the hc-stack into
+a single sublayer input and produces the post/comb weights used by hc_post."""
 
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+
+
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 
 # model config
-B = DECODE_BATCH
-S = DECODE_SEQ
-T = B * S
 D = M.hidden_size
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
@@ -32,6 +33,7 @@ NORM_EPS = M.rms_norm_eps
 MIX_PAD = 32  # MIX_HC padded for vector ops
 HC_PAD = 8  # HC_MULT padded
 NEG_INF = -1e20
+T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # tiling
 T_TILE = 16
@@ -40,19 +42,22 @@ COMB_T_TILE = 16
 RMS_K_TILE = 128
 LINEAR_K_TILE = 128
 D_TILE = 512
+assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
+assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
 @pl.jit.inline
 def hc_pre(
-    x: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Tensor[[T, D], pl.BF16],
-    post: pl.Tensor[[T, HC_MULT], pl.FP32],
-    comb: pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
 ):
-    x_flat = pl.reshape(x, [T, HC_DIM])
+    t_dim = pl.tensor.dim(x, 0)
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
@@ -60,8 +65,8 @@ def hc_pre(
     # fusing split_pre_post here would need sub-MIX_HC-wide vec slicing of the
     # row_expand_mul result, but pto.tpop_from_aic drops valid_shape across
     # the cube->vec bridge (pypto#1507), breaking the downstream subview.
-    mixes = pl.create_tensor([T, MIX_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(T // LINEAR_T_TILE, name_hint="linear"):
+    mixes = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
+    for ob in pl.spmd(T_MAX // LINEAR_T_TILE, name_hint="linear"):
         t0 = ob * LINEAR_T_TILE
         sq_sum = pl.full([1, LINEAR_T_TILE], dtype=pl.FP32, value=0.0)
 
@@ -82,31 +87,38 @@ def hc_pre(
         inv_rms_col = pl.reshape(inv_rms_val, [LINEAR_T_TILE, 1])
         mixes[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc, inv_rms_col)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="split_pre_post"):
+    pre_val_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    post_pad_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    comb_logits = pl.create_tensor([T_MAX, HC_MULT * HC_MULT], dtype=pl.FP32)
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+        t0 = ob * T_TILE
         pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
-        pre_scaled = pl.mul(mixes[0:T, 0:HC_PAD], scale0)
+        pre_scaled = pl.mul(mixes[t0:t0 + T_TILE, 0:HC_PAD], scale0)
         pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
         pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-        pre_val_store = pl.add(pre_sig, HC_EPS)
+        pre_val = pl.add(pre_sig, HC_EPS)
+        pre_val_store = pl.assemble(pre_val_store, pre_val, [t0, 0])
 
         post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
-        post_scaled = pl.mul(mixes[0:T, HC_MULT:HC_MULT + HC_PAD], scale1)
+        post_scaled = pl.mul(mixes[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], scale1)
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
+        post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
 
         comb_base = pl.reshape(hc_base[HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], [1, HC_MULT * HC_MULT])
-        comb_scaled = pl.mul(mixes[0:T, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], scale2)
-        comb_logits = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
+        comb_scaled = pl.mul(mixes[t0:t0 + T_TILE, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], scale2)
+        comb_logits_tile = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
+        comb_logits = pl.assemble(comb_logits, comb_logits_tile, [t0, 0])
 
-    for ob in pl.spmd(T // COMB_T_TILE, name_hint="write_post"):
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="write_post"):
         t0 = ob * COMB_T_TILE
-        post_tile = pl.load(post_pad, [t0, 0], [COMB_T_TILE, HC_PAD],
+        post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
                             valid_shapes=[COMB_T_TILE, HC_MULT],
                             target_memory=pl.MemorySpace.Vec)
         pl.store(post_tile, [t0, 0], post)
 
-    for ob in pl.spmd(T // COMB_T_TILE, name_hint="comb_sinkhorn"):
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
         t0 = ob * COMB_T_TILE
         row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
         row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -185,7 +197,7 @@ def hc_pre(
         pl.store(row2_out, [t0, 2 * HC_MULT], comb)
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
-    for ob in pl.spmd(T // T_TILE, name_hint="mix_x"):
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="mix_x"):
         t0 = ob * T_TILE
         pre_tile = pre_val_store[t0:t0 + T_TILE, 0:HC_PAD]
         pre_tile_t = pl.transpose(pre_tile, axis1=0, axis2=1)
@@ -210,14 +222,19 @@ def hc_pre(
 
 @pl.jit
 def hc_pre_test(
-    x: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
-    x_mixed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    post: pl.Out[pl.Tensor[[T, HC_MULT], pl.FP32]],
-    comb: pl.Out[pl.Tensor[[T, HC_MULT * HC_MULT], pl.FP32]],
+    x_mixed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    post: pl.Out[pl.Tensor[[T_DYN, HC_MULT], pl.FP32]],
+    comb: pl.Out[pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32]],
 ):
+    x.bind_dynamic(0, T_DYN)
+    x_mixed.bind_dynamic(0, T_DYN)
+    post.bind_dynamic(0, T_DYN)
+    comb.bind_dynamic(0, T_DYN)
+
     x_mixed = hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
 
@@ -225,16 +242,15 @@ def golden_hc_pre(tensors):
     """Torch reference, direct port of model.py Block.hc_pre 674-682 + hc_split_sinkhorn."""
     import torch
 
-    x = tensors["x"].float().reshape(B, S, HC_MULT, D)  # [B, S, hc, D]
+    x = tensors["x"].float()  # [T, hc, D]
     hc_fn = tensors["hc_fn"].float()  # [mix_hc, hc*D]
     hc_scale = tensors["hc_scale"].float()  # [3]
     hc_base = tensors["hc_base"].float()  # [mix_hc]
 
-    shape = x.size()
-    x_flat = x.flatten(2)  # [B, S, hc*D]
-    x_flat_2d = x_flat.reshape(T, HC_DIM)
+    t_dim = x.shape[0]
+    x_flat_2d = x.reshape(t_dim, HC_DIM)
 
-    sq_sum = torch.zeros(T, 1, dtype=torch.float32)
+    sq_sum = torch.zeros(t_dim, 1, dtype=torch.float32)
     for k0 in range(0, HC_DIM, RMS_K_TILE):
         x_chunk = x_flat_2d[:, k0:k0 + RMS_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
@@ -242,20 +258,20 @@ def golden_hc_pre(tensors):
 
     mix_cols = []
     for m in range(MIX_HC):
-        mix_col = torch.zeros(T, 1, dtype=torch.float32)
+        mix_col = torch.zeros(t_dim, 1, dtype=torch.float32)
         for k0 in range(0, HC_DIM, LINEAR_K_TILE):
             x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_TILE]
             w_chunk = hc_fn[m:m + 1, k0:k0 + LINEAR_K_TILE]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1).reshape(B, S, MIX_HC)  # [B, S, mix_hc]
+    mixes = torch.cat(mix_cols, dim=1)  # [T, mix_hc]
 
     # hc_split_sinkhorn (port of kernel.py 372-427)
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
     post_t = 2 * torch.sigmoid(mixes[..., HC_MULT:HC_MULT * 2] * hc_scale[1]
                                + hc_base[HC_MULT:HC_MULT * 2])
     comb_t = (mixes[..., HC_MULT * 2:] * hc_scale[2] + hc_base[HC_MULT * 2:]
-              ).view(*mixes.shape[:-1], HC_MULT, HC_MULT)
+              ).view(t_dim, HC_MULT, HC_MULT)
 
     # First step: row-softmax then col-normalize, with eps after softmax
     comb_t = torch.softmax(comb_t, dim=-1) + HC_EPS
@@ -265,22 +281,24 @@ def golden_hc_pre(tensors):
         comb_t = comb_t / (comb_t.sum(-1, keepdim=True) + HC_EPS)
         comb_t = comb_t / (comb_t.sum(-2, keepdim=True) + HC_EPS)
 
-    y = torch.zeros(B, S, D, dtype=torch.float32)
+    y = torch.zeros(t_dim, D, dtype=torch.float32)
     for h in range(HC_MULT):
-        y += x[:, :, h, :] * pre[:, :, h:h + 1]
+        y += x[:, h, :] * pre[:, h:h + 1]
 
     def _to_device_bf16(value):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
         return rounded.view(torch.float32).to(torch.bfloat16)
 
-    tensors["x_mixed"][:] = _to_device_bf16(y).reshape(T, D)
-    tensors["post"][:] = post_t.reshape(T, HC_MULT)
-    tensors["comb"][:] = comb_t.reshape(T, HC_MULT * HC_MULT)
+    tensors["x_mixed"][:] = _to_device_bf16(y).reshape(t_dim, D)
+    tensors["post"][:] = post_t.reshape(t_dim, HC_MULT)
+    tensors["comb"][:] = comb_t.reshape(t_dim, HC_MULT * HC_MULT)
 
 
-def build_tensor_specs():
+def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
+
+    T = B * S
 
     def init_x():
         return torch.rand(T, HC_MULT, D) - 0.5
@@ -306,37 +324,51 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
+    MODES = {
+        "decode":  (DECODE_BATCH, DECODE_SEQ),
+        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+    }
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
+                        help="Use decode or prefill batch sizes, or 'all' to test both.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
-        fn=hc_pre_test,
-        specs=build_tensor_specs(),
-        golden_fn=golden_hc_pre,
-        runtime_dir=args.runtime_dir,
-        golden_data=args.golden_data,
-        runtime_cfg=dict(
-            platform=args.platform,
-            device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
-        ),
-        rtol=1e-3,
-        atol=1e-3,
-        # Precision reference: pypto hc_pre —
-        # cann-recipes-infer/ops/pypto_python/example/test_hc_pre_pypto.py
-        compare_fn={
-            "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
-            "comb":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
+
+    for mode_name in modes_to_run:
+        B, S = MODES[mode_name]
+        print(f"--- hc_pre {mode_name}: B={B}, S={S} ---")
+        result = run_jit(
+            fn=hc_pre_test,
+            specs=build_tensor_specs(B, S),
+            golden_fn=golden_hc_pre,
+            runtime_dir=args.runtime_dir,
+            golden_data=args.golden_data,
+            runtime_cfg=dict(
+                platform=args.platform,
+                device_id=args.device,
+                enable_l2_swimlane=args.enable_l2_swimlane,
+            ),
+            rtol=1e-3,
+            atol=1e-3,
+            # Precision reference: pypto hc_pre —
+            # cann-recipes-infer/ops/pypto_python/example/test_hc_pre_pypto.py
+            compare_fn={
+                "x_mixed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+                "post":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+                "comb":    ratio_allclose(atol=2.5e-5, rtol=5e-3),
+            },
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)

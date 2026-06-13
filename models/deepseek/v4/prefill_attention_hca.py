@@ -18,7 +18,7 @@ import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from hc_post import golden_hc_post, hc_post
-from prefill_hc_pre import golden_prefill_hc_pre, prefill_hc_pre
+from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
@@ -184,8 +184,8 @@ def prefill_attention_hca(
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-    comb = pl.create_tensor([T, HC_MULT, HC_MULT], dtype=pl.FP32)
-    x_mixed, post, comb = prefill_hc_pre(
+    comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    x_mixed = hc_pre(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -265,13 +265,11 @@ def prefill_attention_hca(
     )
     kv_cache = _prefill_hca_cache_writeback_overlay(kv, kv_cache, ori_slot_mapping, attn_out, num_tokens)
 
-    comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    comb_t = pl.reshape(comb, [T, HC_MULT * HC_MULT])
     x_out = hc_post(
         attn_out,
         x_hc,
         post,
-        comb_t,
+        comb,
         x_out,
     )
     return x_out
@@ -294,11 +292,12 @@ def golden_prefill_attention_hca(tensors):
 
     num_tokens = int(tensors["num_tokens"])
     x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
-    x_mixed = torch.zeros(B, S, D, dtype=torch.bfloat16)
-    post = torch.zeros(B, S, HC_MULT, dtype=torch.float32)
-    comb = torch.zeros(B, S, HC_MULT, HC_MULT, dtype=torch.float32)
-    golden_prefill_hc_pre({
-        "x": x_hc_rect,
+    x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
+    x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
+    post = torch.zeros(T, HC_MULT, dtype=torch.float32)
+    comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
+    golden_hc_pre({
+        "x": x_hc_flat,
         "hc_fn": tensors["hc_attn_fn"],
         "hc_scale": tensors["hc_attn_scale"],
         "hc_base": tensors["hc_attn_base"],
@@ -385,9 +384,9 @@ def golden_prefill_attention_hca(tensors):
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
         "x": attn_out.view(T, D),
-        "residual": x_hc_rect.view(T, HC_MULT, D),
-        "post": post.view(T, HC_MULT),
-        "comb": comb.view(T, HC_MULT * HC_MULT),
+        "residual": x_hc_flat,
+        "post": post,
+        "comb": comb,
         "y": y.view(T, HC_MULT, D),
     })
     tensors["x_out"][:] = y.view(MAX_TOKENS, HC_MULT, D)
