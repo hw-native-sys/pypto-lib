@@ -612,7 +612,7 @@ def prefill_sparse_attn(
             if gather_t < T:
                 if gather_t < num_tokens:
                     gather_len = pl.read(cmp_sparse_lens, [gather_t])
-                    gather_len_eff = pl.cast(SPARSE_PREFILL_SPARSE_PAD, pl.INT32)
+                    gather_len_eff = pl.cast(0, pl.INT32)
                     if gather_len > 0:
                         gather_len_eff = gather_len
                     gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
