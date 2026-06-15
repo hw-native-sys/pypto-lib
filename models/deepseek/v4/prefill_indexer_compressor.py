@@ -536,6 +536,9 @@ def golden_prefill_indexer_compressor(tensors):
 def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     if start_pos < 0 or start_pos + MAX_TOKENS > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - MAX_TOKENS}, got {start_pos}")
@@ -580,9 +583,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_norm_w():
         return torch.ones(HEAD_DIM)
     def init_freqs_cos():
-        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_cos.clone()
     def init_freqs_sin():
-        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_sin.clone()
     def init_hadamard():
         h = torch.ones((1, 1))
         while h.shape[0] < HEAD_DIM:

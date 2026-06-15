@@ -256,6 +256,9 @@ def prefill_indexer_test(
 def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     num_tokens = T
     if start_pos < 0 or start_pos + MAX_TOKENS > MAX_SEQ_LEN:
@@ -284,9 +287,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_x():
         return seeded_uniform((MAX_TOKENS, D), 1, 0.1).to(torch.bfloat16)
     def init_freqs_cos():
-        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_cos.clone()
     def init_freqs_sin():
-        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_sin.clone()
     def init_hadamard():
         h = torch.ones((1, 1))
         while h.shape[0] < IDX_HEAD_DIM:

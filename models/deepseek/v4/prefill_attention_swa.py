@@ -442,6 +442,9 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, 0, dtype=torch.bfloat16)
 
     q_lens_values, context_lens_values, num_tokens, _ = _resolve_swa_case(
         start_pos,
@@ -548,9 +551,9 @@ def build_tensor_specs(
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
     def init_freqs_cos():
-        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_cos.clone()
     def init_freqs_sin():
-        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_sin.clone()
     def init_block_table():
         tbl = torch.full((MAX_REQS, MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):

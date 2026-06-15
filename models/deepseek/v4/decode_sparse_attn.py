@@ -625,8 +625,15 @@ def build_tensor_specs(
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
     from golden import TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
     cmp_valid = get_standalone_cmp_valid(compress_ratio)
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
+    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
+        shared_freqs_cos,
+        shared_freqs_sin,
+        torch.arange(T, dtype=torch.int32),
+    )
 
     def seeded_uniform(shape, seed):
         """Create a deterministic centered uniform tensor for repeatable tests."""
@@ -713,15 +720,11 @@ def build_tensor_specs(
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
-        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
-        cos_half = torch.cos(angles)
-        return torch.cat([cos_half, cos_half], dim=-1)
+        return shared_rope_cos.clone()
 
     def init_sin():
         """Build the split-half sine table used by the inverse-RoPE reference."""
-        angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
-        sin_half = torch.sin(angles)
-        return torch.cat([sin_half, sin_half], dim=-1)
+        return shared_rope_sin.clone()
 
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
