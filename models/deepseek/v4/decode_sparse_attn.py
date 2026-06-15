@@ -185,15 +185,24 @@ def sparse_attn(
 
         # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
         # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
+        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
+        # wide MTE3 store: gives each scattered load its own tile row (no
+        # buffer-reuse WAR, so loads stream on MTE2 instead of ping-ponging with
+        # MTE3 per row) and coalesces the many 1-row stores into one block store.
         if TOPK > WIN:
-            for g_c in pl.pipeline(WIN, TOPK, stage=4):
-                g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                if g_raw >= 0:
-                    g_dst_row = g_kv_base + g_c
-                    g_slot = g_raw - (WIN + S)
-                    g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                    g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+            for g_cb in pl.range(WIN, PADDED_TOPK, GATHER_FILL_TILE):
+                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for g_i in pl.range(GATHER_FILL_TILE):
+                    g_c = g_cb + g_i
+                    if g_c < TOPK:
+                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                        if g_raw >= 0:
+                            g_slot = g_raw - (WIN + S)
+                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                g_dst_blk = g_kv_base + g_cb
+                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
