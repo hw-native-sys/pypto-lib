@@ -963,9 +963,16 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
 def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
     num_tokens = T
     cmp_valid = get_prefill_cmp_valid(compress_ratio)
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
+    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
+        shared_freqs_cos,
+        shared_freqs_sin,
+        torch.arange(T, dtype=torch.int32),
+    )
 
     def seeded_uniform(shape, seed, scale=1.0):
         generator = torch.Generator()
@@ -1017,9 +1024,9 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_token_to_request():
         return torch.zeros(MAX_TOKENS, dtype=torch.int32)
     def init_freqs_cos():
-        return torch.cos(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3).to(torch.bfloat16)
+        return shared_rope_cos.clone()
     def init_freqs_sin():
-        return torch.sin(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3).to(torch.bfloat16)
+        return shared_rope_sin.clone()
     def init_wo_a():
         return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 5, O_GROUP_IN ** -0.5).to(torch.bfloat16)
     def init_wo_b():

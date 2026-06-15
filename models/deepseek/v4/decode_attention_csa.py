@@ -677,6 +677,9 @@ def build_tensor_specs(start_pos=None):
     import torch
     from golden import TensorSpec
     from hc_pre import golden_hc_pre
+    from rope_tables import build_deepseek_v4_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
     def round_half_away_from_zero(x):
         return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
 
@@ -729,10 +732,10 @@ def build_tensor_specs(start_pos=None):
         return torch.ones(HEAD_DIM)
 
     def init_freqs_cos():
-        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_cos.clone()
 
     def init_freqs_sin():
-        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_sin.clone()
 
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
@@ -992,8 +995,6 @@ def build_tensor_specs(start_pos=None):
     shared_weights_proj = init_weights_proj().to(torch.bfloat16)
     shared_hadamard_idx = init_hadamard_idx().to(torch.bfloat16)
     shared_idx_kv_cache = init_idx_kv_cache().to(torch.bfloat16)
-    shared_freqs_cos = init_freqs_cos().to(torch.bfloat16)
-    shared_freqs_sin = init_freqs_sin().to(torch.bfloat16)
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
