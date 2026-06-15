@@ -26,7 +26,7 @@ from prefill_compressor_ratio128 import (
     golden_prefill_compressor_ratio128,
     prefill_compressor_ratio128,
 )
-from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
+from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_attn_norm, attn_norm
 from prefill_sparse_attn import (
     CMP_BLOCK_NUM as SPARSE_CMP_BLOCK_NUM,
@@ -204,24 +204,28 @@ def prefill_attention_hca(
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    q, kv, qr, qr_scale = prefill_qkv_proj_rope_core(
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        num_tokens,
+        rope_cos_t,
+        rope_sin_t,
+    )
+    q = qkv_proj_rope(
         x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
         wkv,
-        freqs_cos,
-        freqs_sin,
+        rope_cos_t,
+        rope_sin_t,
         gamma_cq,
         gamma_ckv,
         q,
         kv,
         qr,
         qr_scale,
-        rope_cos_t,
-        rope_sin_t,
-        position_ids,
-        num_tokens,
     )
 
     cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio128(
@@ -313,23 +317,23 @@ def golden_prefill_attention_hca(tensors):
     x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     rope_cos_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
     rope_sin_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
-    golden_prefill_qkv_proj_rope({
+    positions = tensors["position_ids"].to(torch.long)
+    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
+    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
+    golden_qkv_proj_rope({
         "x": x_normed.view(T, D),
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
-        "freqs_cos": tensors["freqs_cos"],
-        "freqs_sin": tensors["freqs_sin"],
+        "rope_cos": rope_cos_t,
+        "rope_sin": rope_sin_t,
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
-        "position_ids": tensors["position_ids"],
         "q": q,
         "kv": kv,
         "qr": qr,
         "qr_scale": qr_scale,
-        "rope_cos_t": rope_cos_t,
-        "rope_sin_t": rope_sin_t,
     })
 
     ori_kv = tensors["kv_cache"]
