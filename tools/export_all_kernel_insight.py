@@ -312,6 +312,12 @@ def resolve_symbol(kernel_lib: Path, preferred_names: list[str]) -> tuple[str, s
         for sym, demangled in candidates:
             if demangled.startswith(name + "("):
                 return sym, demangled
+    # C-linkage device kernels demangle to the bare name (no arg list); match
+    # those exactly, preferring them over any host Launch* wrapper.
+    for name in preferred_names:
+        for sym, demangled in candidates:
+            if demangled == name:
+                return sym, demangled
     if len(candidates) == 1:
         return candidates[0]
     preview = "\n".join(f"  {sym} # {dem}" for sym, dem in candidates[:20])

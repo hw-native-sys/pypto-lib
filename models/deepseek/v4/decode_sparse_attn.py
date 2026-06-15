@@ -185,15 +185,24 @@ def sparse_attn(
 
         # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
         # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
+        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
+        # wide MTE3 store: gives each scattered load its own tile row (no
+        # buffer-reuse WAR, so loads stream on MTE2 instead of ping-ponging with
+        # MTE3 per row) and coalesces the many 1-row stores into one block store.
         if TOPK > WIN:
-            for g_c in pl.pipeline(WIN, TOPK, stage=4):
-                g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                if g_raw >= 0:
-                    g_dst_row = g_kv_base + g_c
-                    g_slot = g_raw - (WIN + S)
-                    g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                    g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+            for g_cb in pl.range(WIN, PADDED_TOPK, GATHER_FILL_TILE):
+                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for g_i in pl.range(GATHER_FILL_TILE):
+                    g_c = g_cb + g_i
+                    if g_c < TOPK:
+                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                        if g_raw >= 0:
+                            g_slot = g_raw - (WIN + S)
+                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                g_dst_blk = g_kv_base + g_cb
+                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -409,7 +418,12 @@ def sparse_attn(
             o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
 
     # INT8 projection `o_r_i8 @ wo_b^T`, then dequantize -> final BF16 output.
-    for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b"):
+    # LEFT_RIGHT column-halves the mixed cube+vec block so both AIV subblocks run
+    # the dequant epilogue (each on B_N_TILE/2 output channels with its own slice
+    # of the per-channel wo_b_scale) instead of the default dual-AIV no-op replay
+    # that lands the whole epilogue on lane 0.
+    for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b",
+                      optimizations=[pl.split(pl.SplitMode.LEFT_RIGHT)]):
         # K-split INT8 GEMM + dequant in one scope; T-tiled vec post-process
         # to keep the fused AIV side from oversizing UB (same as proj_a).
         n0 = nb * B_N_TILE
