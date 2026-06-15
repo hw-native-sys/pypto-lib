@@ -22,7 +22,7 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_
 from hc_pre import hc_pre
 from hc_post import hc_post
 from decode_qkv_proj_rope import qkv_proj_rope
-from decode_rmsnorm import attn_norm
+from rmsnorm import attn_norm
 # NOTE: `sparse_attn` is imported lower down, AFTER config.SPARSE_TOPK_EFF is set,
 # so decode_sparse_attn bakes SWA's pruned sparse-K width at its import (issue #507).
 
@@ -283,7 +283,7 @@ def golden_attention_swa(tensors):
 
     from hc_pre import golden_hc_pre
     from decode_qkv_proj_rope import golden_qkv_proj_rope
-    from decode_rmsnorm import golden_attn_norm
+    from rmsnorm import golden_attn_norm
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
 

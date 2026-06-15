@@ -6,30 +6,38 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 decode attention RMSNorm."""
+"""DeepSeek-V4 attention RMSNorm (dynamic shape): normalizes token-major
+activations for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
 
 
-B = DECODE_BATCH
-S = DECODE_SEQ
-T = B * S
+# Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")  # T = B * S
+
+
+# model config
 D = M.hidden_size
 EPS = M.rms_norm_eps
 
+# tiling
 D_TILE = 128
 T_TILE = 8
+assert D % D_TILE == 0, "D must be divisible by D_TILE"
+assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
+assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
 @pl.jit.inline
 def attn_norm(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
-    x_normed: pl.Tensor[[T, D], pl.BF16],
+    x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    for tg_idx in pl.spmd(T // T_TILE, name_hint="attn_norm"):
+    t_dim = pl.tensor.dim(x, 0)
+    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="attn_norm"):
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
@@ -44,18 +52,23 @@ def attn_norm(
             norm_w_chunk = pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE])
             x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
             x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
-                x_normed_chunk, target_type=pl.BF16, mode="rint"
+                x_normed_chunk,
+                target_type=pl.BF16,
+                mode="rint",
             )
 
     return x_normed
 
 
 @pl.jit
-def decode_rmsnorm(
-    x: pl.Tensor[[T, D], pl.BF16],
+def rmsnorm(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
-    x_normed: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    x_normed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
+    x.bind_dynamic(0, T_DYN)
+    x_normed.bind_dynamic(0, T_DYN)
+
     x_normed = attn_norm(x, norm_w, x_normed)
     return x_normed
 
@@ -69,13 +82,15 @@ def golden_attn_norm(x, norm_w):
     return (x * inv * norm_w).to(torch.bfloat16)
 
 
-def golden_decode_rmsnorm(tensors):
+def golden_rmsnorm(tensors):
     tensors["x_normed"][:] = golden_attn_norm(tensors["x"], tensors["norm_w"])
 
 
-def build_tensor_specs():
+def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
+
+    T = B * S
 
     def init_x():
         return torch.randn(T, D) - 0.5
@@ -94,28 +109,46 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 decode attention RMSNorm validation.")
+    MODES = {
+        "decode":  (DECODE_BATCH, DECODE_SEQ),
+        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+    }
+
+    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 attention RMSNorm validation.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
+                        help="Use decode or prefill batch sizes, or 'all' to test both.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = run_jit(
-        fn=decode_rmsnorm,
-        specs=build_tensor_specs(),
-        golden_fn=golden_decode_rmsnorm,
-        runtime_cfg=dict(
-            platform=args.platform,
-            device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
-        ),
-        rtol=5e-3,
-        atol=5e-3,
-        compare_fn={
-            "x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
-    )
-    if not result.passed:
-        if result.error:
-            print(result.error)
-        raise SystemExit(1)
+    modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
+
+    for mode_name in modes_to_run:
+        B, S = MODES[mode_name]
+        print(f"--- rmsnorm {mode_name}: B={B}, S={S} ---")
+        result = run_jit(
+            fn=rmsnorm,
+            specs=build_tensor_specs(B, S),
+            golden_fn=golden_rmsnorm,
+            runtime_dir=args.runtime_dir,
+            golden_data=args.golden_data,
+            runtime_cfg=dict(
+                platform=args.platform,
+                device_id=args.device,
+                enable_l2_swimlane=args.enable_l2_swimlane,
+            ),
+            rtol=5e-3,
+            atol=5e-3,
+            compare_fn={
+                "x_normed": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            },
+            compile_only=args.compile_only,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)

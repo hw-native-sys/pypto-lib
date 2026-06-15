@@ -41,7 +41,7 @@ from prefill_indexer_compressor import (
     INNER_STATE_MAX_BLOCKS,
 )
 from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
-from prefill_rmsnorm import golden_prefill_attn_norm, prefill_attn_norm
+from rmsnorm import golden_attn_norm, attn_norm
 from prefill_sparse_attn import (
     HCA_CMP_BLOCK_NUM as SPARSE_HCA_CMP_BLOCK_NUM,
     HCA_ORI_BLOCK_NUM as SPARSE_HCA_ORI_BLOCK_NUM,
@@ -370,7 +370,7 @@ def prefill_attention_csa(
     )
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = prefill_attn_norm(x_mixed, attn_norm_w, x_normed)
+    x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -501,7 +501,7 @@ def golden_prefill_attention_csa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_prefill_attn_norm(x_mixed, tensors["attn_norm_w"])
+    x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
     rope_cos_t = torch.zeros(T, ROPE_HEAD_DIM, dtype=torch.bfloat16)
     rope_sin_t = torch.zeros(T, ROPE_HEAD_DIM, dtype=torch.bfloat16)
     golden_prefill_qkv_proj_rope({
