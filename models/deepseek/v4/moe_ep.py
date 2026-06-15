@@ -438,7 +438,7 @@ def golden_moe_ep(tensors):
             d_running = torch.zeros(N_LOCAL, dtype=torch.int32)
             for src in range(N_RANKS):
                 d_slot_offsets[src] = d_running.clone()
-                d_running = d_running + send_counts[src, dst]
+                d_running = d_running + send_counts[src, dst] + 0
             for e in range(N_LOCAL):
                 d_recv_count[e, 0] = int(d_running[e].item())
             for src in range(N_RANKS):
