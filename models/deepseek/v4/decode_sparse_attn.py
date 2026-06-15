@@ -48,9 +48,13 @@ VALID_TOKEN_TILE = 16
 # (a multiple of ATTN_K_TILE); 128 rows x HEAD_DIM bf16 = 128 KB UB (well under
 # the 192 KB Vec budget).
 GATHER_FILL_TILE = 128
-ROPE_TOKEN_TILE = 2
-ROPE_PACK_TOKEN_TILE = 32
-ROPE_PACK_GROUP_TILE = 1
+# Inverse-RoPE is head-parallel; split each head's T tokens into ROPE_OUT_TILES
+# tiles so the task count (H * ROPE_OUT_TILES) fills the 48 AIV cores with a
+# smaller wave tail than one-task-per-head (H=64 on 48 cores = 2 waves, 16-task
+# tail). H and T are powers of two while 48 = 16*3, so no clean tiling divides
+# the core count evenly -- finer tiles only shrink the residual tail.
+ROPE_OUT_TILES = 2
+ROPE_OUT_TOK_TILE = T // ROPE_OUT_TILES
 H_TILE = 16
 # Largest sparse-K tile that fits the cube Mat buffer and divides TOPK with no
 # padding (WIN and IDX_TOPK are multiples of 128).
@@ -75,7 +79,7 @@ NEG_INF = -1.0e20
 # leaving rows uninitialized on the NPU (the spmd block counts and the
 # strided/bulk loops below all assume exact divisibility).
 assert T % VALID_TOKEN_TILE == 0, f"T ({T}) must be divisible by VALID_TOKEN_TILE ({VALID_TOKEN_TILE})"  # build_valid
-assert T % ROPE_TOKEN_TILE == 0, f"T ({T}) must be divisible by ROPE_TOKEN_TILE ({ROPE_TOKEN_TILE})"      # rope
+assert T % ROPE_OUT_TILES == 0, f"T ({T}) must be divisible by ROPE_OUT_TILES ({ROPE_OUT_TILES})"      # rope
 assert T % QUANT_TOKEN_TILE == 0, f"T ({T}) must be divisible by QUANT_TOKEN_TILE ({QUANT_TOKEN_TILE})"   # quant
 assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
     f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"             # gather_kv bulk-zero
@@ -307,12 +311,16 @@ def sparse_attn(
     # above (just loaded, not re-gathered); only swap_idx (j^1, applied to this
     # head's data) is rebuilt per task -- cheap arange, no big-tile gather.
     attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
-    for rp_gh in pl.spmd(H, name_hint="rope"):
+    for rp_idx in pl.spmd(H * ROPE_OUT_TILES, name_hint="rope"):
+        rp_gh = rp_idx // ROPE_OUT_TILES
+        rp_tt = rp_idx - rp_gh * ROPE_OUT_TILES
+        rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
         rp_g = rp_gh // HEADS_PER_GROUP
         rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
         rp_col = rp_hh * HEAD_DIM + NOPE_DIM
+        rp_o0 = rp_g * T + rp_t0
         sp_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
         sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
@@ -320,19 +328,19 @@ def sparse_attn(
 
         for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
             c0 = 2 * r_r0
-            # This head's rope rows across every token (stride H); gather needs
+            # This head's rope rows for this token tile (stride H); gather needs
             # FP/INT, so cast the strided BF16 slice to FP32 first.
             r_tile_fp32 = pl.cast(
-                pl.reshape(attn_rope_stage_3d[0:T, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [T, ROPE_INTERLEAVE_TILE]),
+                pl.reshape(attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE]),
                 target_type=pl.FP32)
-            r_cos_il = rope_cos_il[0:T, c0 : c0 + ROPE_INTERLEAVE_TILE]
-            r_sin_signed = rope_sin_signed[0:T, c0 : c0 + ROPE_INTERLEAVE_TILE]
+            r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+            r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
             r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
             r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
             # Store BF16-rounded rotated values straight into o_packed's rope
             # columns for this head (golden also rounds inverse-RoPE to bf16).
             r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-            o_packed[rp_g * T : rp_g * T + T, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
+            o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
     # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
     # (BF16 store + per-row partial amax) is T-tiled inside the scope as a
