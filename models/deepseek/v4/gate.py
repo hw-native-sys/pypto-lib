@@ -36,9 +36,9 @@ N_HASH_LAYERS = M.num_hash_layers
 # tiling
 T_TILE = 8
 GATE_T_TILE = 16
-D_CHUNK = 128
-GATE_D_CHUNK = 512
-QUANT_CHUNK = 32
+D_TILE = 128
+GATE_D_TILE = 256
+QUANT_TILE = 32
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
@@ -66,45 +66,45 @@ def gate(
     for ob_n in pl.spmd(T // T_TILE, name_hint="ffn_norm"):
         t0 = ob_n * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
-            rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_CHUNK], pl.FP32)
+        for rms_d0 in pl.pipeline(0, D, D_TILE, stage=2):
+            rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_TILE], pl.FP32)
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
         inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
-        for an_d0 in pl.pipeline(0, D, D_CHUNK, stage=2):
-            an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK], pl.FP32)
-            an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_CHUNK], [1, D_CHUNK])
+        for an_d0 in pl.pipeline(0, D, D_TILE, stage=2):
+            an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE], pl.FP32)
+            an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE])
             an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
             an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
-            x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = pl.cast(an_bf16, pl.FP32)
-            x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_CHUNK] = an_bf16
+            x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
+            x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
 
     # Per-token symmetric INT8 quant of x_norm.
     for ob_q in pl.spmd(T // T_TILE, name_hint="x_norm_quant"):
         t0 = ob_q * T_TILE
         xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for xq_a_k in pl.pipeline(0, D, QUANT_CHUNK, stage=2):
-            xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_CHUNK]
+        for xq_a_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+            xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_TILE]
             xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
             xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
             xn_amax = pl.maximum(xn_amax, xn_a_max)
         xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
         x_norm_scale[t0 : t0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
         xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
-        for xq_b_k in pl.pipeline(0, D, QUANT_CHUNK, stage=2):
-            xn_q_scaled = pl.row_expand_mul(x_norm_gate_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK], xn_sq_col)
+        for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+            xn_q_scaled = pl.row_expand_mul(x_norm_gate_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE], xn_sq_col)
             xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
             xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-            x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_CHUNK] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
+            x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
     # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
     for ob_g in pl.spmd(T // GATE_T_TILE, name_hint="gate"):
         t1 = ob_g * GATE_T_TILE
         gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
         gate_logits_tile = pl.create_tensor([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32)
-        for kb in pl.range(0, D // GATE_D_CHUNK):
-            gd_kd = kb * GATE_D_CHUNK
-            gd_x = x_norm_gate_buf[t1 : t1 + GATE_T_TILE, gd_kd : gd_kd + GATE_D_CHUNK]
-            gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_CHUNK]
+        for kb in pl.range(0, D // GATE_D_TILE):
+            gd_kd = kb * GATE_D_TILE
+            gd_x = x_norm_gate_buf[t1 : t1 + GATE_T_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_TILE]
             if gd_kd == 0:
                 gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
             else:

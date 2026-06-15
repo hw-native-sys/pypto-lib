@@ -7,19 +7,35 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
-"""DeepSeek-V4 MoE end-to-end (decode, 2-rank EP single-layer): FLASH preset
-with n_routed_experts shrunk 256 -> 64 so each rank keeps the 32-expert load."""
+"""DeepSeek-V4 MoE end-to-end (decode, N-rank EP single-layer): FLASH preset
+with n_routed_experts sized so each rank keeps the 32-expert load. The EP world
+size is chosen with --ep (2/4/8, default 2); see __main__."""
 
 
-# Override config before importing the sub-kernels — they bake EP_WORLD_SIZE /
-# EP_ROUTING_GLOBAL / n_routed_experts into their tensor shapes at import time.
+# Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
+# time, so read --ep from argv and override config before importing them below.
 import dataclasses
+import sys
 
 import config
 
-config.EP_WORLD_SIZE = 2
+_EP_CHOICES = (2, 4, 8)
+_EP_DEFAULT = 2
+
+
+def _parse_ep_argv():
+    for i, tok in enumerate(sys.argv):
+        if tok == "--ep" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if tok.startswith("--ep="):
+            return int(tok.split("=", 1)[1])
+    return _EP_DEFAULT
+
+
+EP = _parse_ep_argv()
+config.EP_WORLD_SIZE = EP
 config.EP_ROUTING_GLOBAL = True
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * 2)  # 256 -> 64
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)  # 32 experts/rank
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -56,7 +72,7 @@ N_ROUTES = T * TOPK
 W_PAD = 8   # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
 
-assert N_RANKS == 2, "moe_ep demo is wired for 2 ranks"
+assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 
 
@@ -627,8 +643,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=str, default="0,1",
-                        help="comma-separated device ids; need at least 2")
+    parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
+                        help="EP world size / rank count")
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
+                        help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
