@@ -7,7 +7,11 @@ on:
 
 jobs:
   model-tests-sim:
-    runs-on: ubuntu-latest
+    # Simulator job: no device needed, so it runs on the CPU runner inside the
+    # ci-py310 container (mirrors pypto's codegen-tests setup, registry on port
+    # 5001). pypto/ptoas/pto-isa are installed exactly like the on-device a2a3
+    # job — only the runner label and the lack of Ascend host env differ.
+    runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -16,72 +20,90 @@ jobs:
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
       PTOAS_VERSION: v0.45
-      PTOAS_SHA256: 8d1c697e50de238606cec571ee5cdd31e0886476fdf62c4306d2af3bedca16b8
+      PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
       PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_DIR: /root/.cache/ccache
+      CCACHE_MAXSIZE: 5G
+      PIP_CACHE_DIR: /root/.cache/pip
+    container:
+      image: localhost:5001/ci-py310:latest
+      options: >-
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
 
     steps:
       - name: Checkout pypto-lib
         uses: actions/checkout@v4
-
-      - name: Set up C++ compiler
-        run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
-          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
-          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          persist-credentials: false
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install nanobind
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Build and install pypto and simpler
-        run: |
-          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          pip install /tmp/pypto
-          pip install /tmp/pypto/runtime
-
-      - name: Cache ptoas binary
-        id: cache-ptoas
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/ptoas-bin
-          key: ptoas-x86_64-${{ env.PTOAS_VERSION }}-${{ env.PTOAS_SHA256 }}
-
-      - name: Install ptoas
-        if: steps.cache-ptoas.outputs.cache-hit != 'true'
-        run: |
-          curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/hw-native-sys/PTOAS/releases/download/${{ env.PTOAS_VERSION }}/ptoas-bin-x86_64.tar.gz \
-            -o /tmp/ptoas-bin-x86_64.tar.gz
-          echo "${{ env.PTOAS_SHA256 }}  /tmp/ptoas-bin-x86_64.tar.gz" | sha256sum -c -
-          mkdir -p $GITHUB_WORKSPACE/ptoas-bin
-          tar -xzf /tmp/ptoas-bin-x86_64.tar.gz -C $GITHUB_WORKSPACE/ptoas-bin
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/ptoas
-          chmod +x $GITHUB_WORKSPACE/ptoas-bin/bin/ptoas
+      - name: Show ccache stats (before)
+        run: ccache -s || true
 
       - name: Clone pto-isa repository (pinned)
         run: |
-          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git $GITHUB_WORKSPACE/pto-isa \
-            || { rm -rf $GITHUB_WORKSPACE/pto-isa; git clone https://gitcode.com/luohuan40/pto-isa.git $GITHUB_WORKSPACE/pto-isa; }
-          cd $GITHUB_WORKSPACE/pto-isa
+          rm -rf "$PTO_ISA_ROOT"
+          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
+            || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
+          cd "$PTO_ISA_ROOT"
           git checkout ${{ env.PTO_ISA_COMMIT }}
+
+      - name: Build and install pypto and simpler
+        # Clone pypto fresh into the job-private /tmp rather than a shared cache
+        # dir: this CPU host runs several runners (cpu-1..4), so the
+        # [a2a3sim, a5sim] matrix lands two jobs here at once. A shared git tree
+        # would let them corrupt each other's checkout (and clash with the a2a3
+        # host job's ci-runner-owned pypto-src). The mounted, concurrency-safe
+        # ccache keeps the rebuild fast despite the re-clone.
+        run: |
+          python -m pip install --upgrade pip
+          pip install scikit-build-core nanobind cmake ninja
+          rm -rf /tmp/pypto
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          pip install --no-build-isolation /tmp/pypto
+          pip install --no-build-isolation /tmp/pypto/runtime
+
+      - name: Install runner dependencies
+        run: |
+          pip install nanobind
+          pip install torch
+
+      - name: Show ccache stats (after)
+        run: ccache -s || true
+
+      - name: Install ptoas (local cache)
+        env:
+          PTOAS_CACHE_DIR: /opt/ptoas-cache
+        run: |
+          CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+          download_ptoas() {
+            echo "Downloading ptoas ${PTOAS_VERSION}"
+            mkdir -p "$PTOAS_CACHE_DIR"
+            curl --fail --location --retry 3 --retry-all-errors \
+              https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
+              -o "$CACHE_ARCHIVE.tmp"
+            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
+            mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+          }
+          if [ ! -f "$CACHE_ARCHIVE" ]; then
+            echo "Cache miss"
+            download_ptoas
+          elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
+            echo "Cache corrupted — removing and re-downloading"
+            rm -f "$CACHE_ARCHIVE"
+            download_ptoas
+          else
+            echo "Cache hit — using $CACHE_ARCHIVE"
+          fi
+          mkdir -p "$PTOAS_ROOT"
+          tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
+          chmod +x "$PTOAS_ROOT/ptoas"
+          chmod +x "$PTOAS_ROOT/bin/ptoas"
 
       - name: Run model tests (${{ matrix.platform }})
         shell: bash
@@ -238,17 +260,24 @@ jobs:
           PTOAS_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas
         run: |
           CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
-          if [ ! -f "$CACHE_ARCHIVE" ]; then
-            echo "Cache miss — downloading ptoas ${PTOAS_VERSION}"
+          download_ptoas() {
+            echo "Downloading ptoas ${PTOAS_VERSION}"
             mkdir -p "$PTOAS_CACHE_DIR"
             curl --fail --location --retry 3 --retry-all-errors \
               https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
               -o "$CACHE_ARCHIVE.tmp"
             echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
             mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+          }
+          if [ ! -f "$CACHE_ARCHIVE" ]; then
+            echo "Cache miss"
+            download_ptoas
+          elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
+            echo "Cache corrupted — removing and re-downloading"
+            rm -f "$CACHE_ARCHIVE"
+            download_ptoas
           else
             echo "Cache hit — using $CACHE_ARCHIVE"
-            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -
           fi
           mkdir -p "$PTOAS_ROOT"
           tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"

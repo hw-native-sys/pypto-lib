@@ -192,7 +192,7 @@ def indexer_compressor(
 
         kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM]
-        # A3 interleaved swap-gather (same form as kv_rope_fused in decode_qkv_proj_rope),
+        # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
         # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
         # carries gamma[j^1]; inv_rms is per-row so it commutes. swap_idx (j^1), sign

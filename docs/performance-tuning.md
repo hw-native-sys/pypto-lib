@@ -277,7 +277,7 @@ hint carries the exact source location:
 [perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost
 dim = 256B; recommended >= 512B for backend a2a3 (L2 cache line = 512B).
 Consider increasing tile shape on the innermost axis.
-at models/deepseek/v4/decode_qkv_proj_rope.py:68:4
+at models/deepseek/v4/qkv_proj_rope.py:68:4
 ```
 
 Walk the log and widen the trailing tile dimension at each flagged site

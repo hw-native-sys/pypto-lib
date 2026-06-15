@@ -18,7 +18,7 @@ import pypto.language as pl
 from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
-from prefill_qkv_proj_rope import golden_prefill_qkv_proj_rope, prefill_qkv_proj_rope_core
+from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_attn_norm, attn_norm
 from prefill_sparse_attn import (
     HCA_CMP_BLOCK_NUM as SPARSE_HCA_CMP_BLOCK_NUM,
@@ -272,24 +272,28 @@ def prefill_attention_swa(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
-    q, kv, qr, qr_scale = prefill_qkv_proj_rope_core(
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        num_tokens,
+        rope_cos_t,
+        rope_sin_t,
+    )
+    q = qkv_proj_rope(
         x_normed,
         wq_a,
         wq_b,
         wq_b_scale,
         wkv,
-        freqs_cos,
-        freqs_sin,
+        rope_cos_t,
+        rope_sin_t,
         gamma_cq,
         gamma_ckv,
         q,
         kv,
         qr,
         qr_scale,
-        rope_cos_t,
-        rope_sin_t,
-        position_ids,
-        num_tokens,
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -369,23 +373,23 @@ def golden_prefill_attention_swa(tensors):
     rope_cos_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
     rope_sin_t = torch.zeros(T, ROPE_DIM, dtype=torch.bfloat16)
     x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
-    golden_prefill_qkv_proj_rope({
+    positions = tensors["position_ids"].to(torch.long)
+    rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
+    rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
+    golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
         "wkv": tensors["wkv"],
-        "freqs_cos": tensors["freqs_cos"],
-        "freqs_sin": tensors["freqs_sin"],
+        "rope_cos": rope_cos_t,
+        "rope_sin": rope_sin_t,
         "gamma_cq": tensors["gamma_cq"],
         "gamma_ckv": tensors["gamma_ckv"],
-        "position_ids": tensors["position_ids"],
         "q": q,
         "kv": kv,
         "qr": qr,
         "qr_scale": qr_scale,
-        "rope_cos_t": rope_cos_t,
-        "rope_sin_t": rope_sin_t,
     })
 
     kv_cache_in = tensors["kv_cache"].clone()
