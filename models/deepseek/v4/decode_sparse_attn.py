@@ -29,8 +29,7 @@ WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
 IDX_TOPK = M.index_topk
 TOPK_FULL = WIN + IDX_TOPK           # full sparse-K width (window + indexer topk)
-# TOPK / SPARSE_BLOCKS / PADDED_TOPK are resolved below (after get_standalone_cmp_valid)
-# from config.SPARSE_TOPK_EFF, which importers set before import (issue #507).
+# TOPK / SPARSE_BLOCKS / PADDED_TOPK resolved below from config.SPARSE_TOPK_EFF.
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -39,7 +38,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 0
+DEFAULT_COMPRESS_RATIO = 4
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
@@ -47,27 +46,16 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 VALID_TOKEN_TILE = 16
-# gather_kv bulk zero-fill width (rows per wide MTE store). Divides PADDED_TOPK
-# (a multiple of ATTN_K_TILE); 128 rows x HEAD_DIM bf16 = 128 KB UB (well under
-# the 192 KB Vec budget).
 GATHER_FILL_TILE = 128
-# Inverse-RoPE is head-parallel; split each head's T tokens into ROPE_OUT_TILES
-# tiles so the task count (H * ROPE_OUT_TILES) fills the 48 AIV cores with a
-# smaller wave tail than one-task-per-head (H=64 on 48 cores = 2 waves, 16-task
-# tail). H and T are powers of two while 48 = 16*3, so no clean tiling divides
-# the core count evenly -- finer tiles only shrink the residual tail.
-ROPE_OUT_TILES = 2
-ROPE_OUT_TOK_TILE = T // ROPE_OUT_TILES
+ROPE_OUT_TOK_TILE = 64
 H_TILE = 16
-# Largest sparse-K tile that fits the cube Mat buffer and divides TOPK with no
-# padding (WIN and IDX_TOPK are multiples of 128).
 ATTN_K_TILE = 128
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
-A_T_TILE = 16
+A_T_TILE = 32
 A_K_TILE = 128
 A_N_TILE = 128
-B_T_TILE = 16
+B_T_TILE = 32
 B_K_TILE = 256
 B_N_TILE = 128
 QUANT_TILE = 512
@@ -75,17 +63,13 @@ QUANT_TOKEN_TILE = 8
 QUANT_K_TILE = O_GROUPS * O_LORA // 2
 NEG_INF = -1.0e20
 
-# Tiling invariants the kernels below rely on. Assert at import so a future
-# config change fails fast here instead of silently writing out of bounds or
-# leaving rows uninitialized on the NPU (the spmd block counts and the
-# strided/bulk loops below all assume exact divisibility).
-assert T % VALID_TOKEN_TILE == 0, f"T ({T}) must be divisible by VALID_TOKEN_TILE ({VALID_TOKEN_TILE})"  # build_valid
-assert T % ROPE_OUT_TILES == 0, f"T ({T}) must be divisible by ROPE_OUT_TILES ({ROPE_OUT_TILES})"      # rope
-assert T % QUANT_TOKEN_TILE == 0, f"T ({T}) must be divisible by QUANT_TOKEN_TILE ({QUANT_TOKEN_TILE})"   # quant
-assert H % O_GROUPS == 0, f"H ({H}) must be divisible by O_GROUPS ({O_GROUPS})"                           # rope_pack / o_packed grouping
-assert (O_GROUPS * O_LORA) % B_K_TILE == 0, \
-    f"O_GROUPS*O_LORA ({O_GROUPS * O_LORA}) must be divisible by B_K_TILE ({B_K_TILE})"                   # proj_b K-loop
-assert QUANT_K_TILE % QUANT_TILE == 0, f"QUANT_K_TILE ({QUANT_K_TILE}) must be divisible by QUANT_TILE ({QUANT_TILE})"  # quant inner K
+assert T % VALID_TOKEN_TILE == 0
+assert T % 2 == 0
+assert H % 4 == 0
+assert T % QUANT_TOKEN_TILE == 0
+assert H % O_GROUPS == 0
+assert (O_GROUPS * O_LORA) % B_K_TILE == 0
+assert QUANT_K_TILE % QUANT_TILE == 0
 
 
 def get_standalone_cmp_valid(compress_ratio: int) -> int:
@@ -99,17 +83,12 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-# Resolve the active sparse-K width (issue #507), baked into sparse_attn's shapes
-# at import. Importers (decode_attention_{swa,hca}.py) set config.SPARSE_TOPK_EFF to
-# their pruned width (WIN / WIN+CMP_TOPK -> 2 blocks) BEFORE importing this module
-# (same convention as moe_ep/EP_ROUTING_GLOBAL); CSA / external importers and the
-# standalone test below leave it None for the full WIN+IDX_TOPK width (5 blocks) --
-# the pruned widths are exercised by the swa/hca variant tests that set them.
+# Active sparse-K width: importers set config.SPARSE_TOPK_EFF to their pruned
+# width before import; standalone / external importers leave it None for the full
+# width, exercised by the swa/hca variant tests.
 TOPK = _cfg.SPARSE_TOPK_EFF if _cfg.SPARSE_TOPK_EFF is not None else TOPK_FULL
-# Floor to 2: a single sparse-K block (PADDED_TOPK == 128) deterministically
-# miscompiles in pypto (an S-stride cross-token output mixup on a2a3sim and real
-# a2a3); a 2-block build whose 2nd block is fully -inf/zero is bit-exact, so SWA is
-# 5->2 (not 5->1). The trailing all-invalid block is cheap.
+# Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
+# output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"SPARSE_TOPK_EFF ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
@@ -148,9 +127,6 @@ def sparse_attn(
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    # pl.spmd fans the independent token-bands across cores from one AICPU
-    # dispatch (each band writes a disjoint sparse_bias row range -> its own
-    # outlined scope, satisfying the one-tile-store-output rule).
     for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
         v_t0 = v_blk * VALID_TOKEN_TILE
         v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
@@ -168,13 +144,10 @@ def sparse_attn(
         g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
         ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
 
-        # Bulk-zero the token's whole packed-KV region in GATHER_FILL_TILE-row
-        # tiles up front, so invalid (-1) slots and the padding tail default to
-        # zero via a few wide, high-UB-utilization MTE stores instead of one
-        # [1, HEAD_DIM] dup-store per invalid slot (Vec was ~1% — almost pure
-        # MTE). The valid slots below then overwrite their rows. Keeping the
-        # NEG_INF softmax bias (build_valid) plus finite (zero) invalid KV rows
-        # is what lets qk_pv skip a per-block mask multiply.
+        # Bulk-zero the token's whole packed-KV region up front via wide MTE
+        # stores, so invalid (-1) slots and the padding tail default to zero;
+        # valid slots below overwrite their rows. Finite (zero) invalid KV rows
+        # plus the NEG_INF softmax bias let qk_pv skip a per-block mask multiply.
         zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
         for g_f in pl.range(0, PADDED_TOPK, GATHER_FILL_TILE):
             g_fill_row = g_kv_base + g_f
@@ -187,9 +160,8 @@ def sparse_attn(
         g_overlay_base = g_b * S
 
         # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        # Invalid (raw < 0) slots keep the bulk-zero fill (no per-slot store).
-        # pl.pipeline ping-pongs the per-row MTE staging so block k+1's load
-        # overlaps block k's store (matches prefill_sparse_attn's gather).
+        # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
+        # block k+1's load with block k's store.
         for g_w in pl.pipeline(WIN, stage=4):
             g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
             if g_raw >= 0:
@@ -202,8 +174,7 @@ def sparse_attn(
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
 
         # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-        # Guarded so the SWA (TOPK == WIN) specialization omits the loop
-        # entirely rather than emitting an empty pl.pipeline (issue #507).
+        # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
         if TOPK > WIN:
             for g_c in pl.pipeline(WIN, TOPK, stage=4):
                 g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
@@ -227,12 +198,9 @@ def sparse_attn(
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
         qk_kv_base = qk_t * PADDED_TOPK
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        # Sparse-block OUTER / head-tile INNER: the KV tile and additive bias
-        # depend only on (token, sparse-block), so hoisting them above the
-        # head-tile loop lets one GM->L1 [ATTN_K_TILE, HEAD_DIM] KV load (and one
-        # bias load) serve all H//H_TILE head-tiles instead of being re-loaded
-        # per head. Pure loop reorder -- per-(head,block) math and the
-        # mi/li/oi output index are unchanged, so results are bit-identical.
+        # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
+        # on (token, sparse-block), so hoisting them above the head-tile loop lets
+        # one KV/bias load serve all head-tiles instead of re-loading per head.
         for qk_sb in pl.range(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
@@ -271,8 +239,7 @@ def sparse_attn(
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
             # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
-            # single block's stats directly instead of emitting an empty
-            # pl.range(1, 1) merge loop (issue #507).
+            # single block's stats directly instead of an empty merge loop.
             if SPARSE_BLOCKS > 1:
                 for m_sb in pl.range(1, SPARSE_BLOCKS):
                     m_row = m_blk_base + m_sb * H_TILE
@@ -301,14 +268,10 @@ def sparse_attn(
                 n_col = n_hh * HEAD_DIM
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
-    # Precompute the head-INVARIANT interleaved cos and sign*sin once. cos_il[j],
-    # sin_il[j] and sign[j]=[+1,-1,...] depend only on (token, column), not head,
-    # so building them per head (as the head-parallel rope below would) repeats
-    # the same dup-gather H times on the bottleneck Vec engine. This pre-pass
-    # reads only freqs_cos/sin (no attention dependency), so the scheduler floats
-    # it ahead and overlaps it with the attention compute -- off the critical
-    # path. sign is folded into sin (exact: multiply by +/-1) so rope does one
-    # fewer multiply. The CONJUGATE (inverse) rotation is:
+    # Precompute the head-invariant interleaved cos and sign*sin once: they depend
+    # only on (token, column), not head, so building them per head would repeat the
+    # same dup-gather H times on the bottleneck Vec engine. sign is folded into sin
+    # (multiply by +/-1). The conjugate (inverse) rotation is:
     #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
@@ -328,21 +291,17 @@ def sparse_attn(
         rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
             pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
-    # Inverse RoPE fused with the rope-column pack: one task per head rotates
-    # that head's rope segment for all T tokens and stores it STRAIGHT into
-    # o_packed's strided rope columns -- dropping the separate rope_pack stage
-    # and the rope_buf GM round-trip. cos_il / sign*sin come from the pre-pass
-    # above (just loaded, not re-gathered); only swap_idx (j^1, applied to this
-    # head's data) is rebuilt per task -- cheap arange, no big-tile gather.
+    # Inverse RoPE fused with the rope-column pack: each task rotates its heads'
+    # rope segments and stores them straight into o_packed's strided rope columns,
+    # dropping a separate rope_pack stage and GM round-trip. cos_il / sign*sin come
+    # from the pre-pass above; only swap_idx (j^1) is rebuilt per task.
     attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
-    for rp_idx in pl.spmd(H * ROPE_OUT_TILES, name_hint="rope"):
-        rp_gh = rp_idx // ROPE_OUT_TILES
-        rp_tt = rp_idx - rp_gh * ROPE_OUT_TILES
+    for rp_idx in pl.spmd((H // 4) * 2, name_hint="rope"):
+        rp_hg = rp_idx // 2
+        rp_tt = rp_idx - rp_hg * 2
         rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
-        rp_g = rp_gh // HEADS_PER_GROUP
-        rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
-        rp_col = rp_hh * HEAD_DIM + NOPE_DIM
-        rp_o0 = rp_g * T + rp_t0
+        # Head-invariant swap index (j^1), built once and reused across the head
+        # group -- the only per-head input is this head's strided rope slice.
         sp_col = pl.col_expand_mul(
             pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
@@ -350,32 +309,35 @@ def sparse_attn(
         sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
         sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
 
-        for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-            c0 = 2 * r_r0
-            # This head's rope rows for this token tile (stride H); gather needs
-            # FP/INT, so cast the strided BF16 slice to FP32 first.
-            r_tile_fp32 = pl.cast(
-                pl.reshape(attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE]),
-                target_type=pl.FP32)
-            r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-            r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-            r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-            r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
-            # Store BF16-rounded rotated values straight into o_packed's rope
-            # columns for this head (golden also rounds inverse-RoPE to bf16).
-            r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-            o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
+        for rp_hl in pl.range(0, 4):
+            rp_gh = rp_hg * 4 + rp_hl
+            rp_g = rp_gh // HEADS_PER_GROUP
+            rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
+            rp_col = rp_hh * HEAD_DIM + NOPE_DIM
+            rp_o0 = rp_g * T + rp_t0
+            for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
+                c0 = 2 * r_r0
+                # This head's rope rows for this token tile (stride H); gather needs
+                # FP/INT, so cast the strided BF16 slice to FP32 first.
+                r_tile_fp32 = pl.cast(
+                    pl.reshape(attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE]),
+                    target_type=pl.FP32)
+                r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
+                # Store BF16-rounded rotated values straight into o_packed's rope
+                # columns for this head (golden also rounds inverse-RoPE to bf16).
+                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
+                o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
     # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
-    # (BF16 store + per-row partial amax) is T-tiled inside the scope as a
-    # pypto#1472 workaround — without it the fused proj_a AIV side oversizes
-    # UB and AllocateMemoryAddr rejects the kernel.
+    # (BF16 store + per-row amax) is T-tiled to keep the fused AIV side from
+    # oversizing UB.
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
     o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
     for proj_a_block in pl.spmd(O_GROUPS * (O_LORA // A_N_TILE), name_hint="proj_a"):
-        # K-split BF16 matmul for one wo_a output tile. Stays in
-        # peel-first-iter form: the `pl.create_tensor` + `if k0 == 0`
-        # carry hits pypto#1540 on the 3D wo_a slice.
+        # K-split BF16 matmul for one wo_a output tile, peel-first-iter form.
         g = proj_a_block // (O_LORA // A_N_TILE)
         nb = proj_a_block - g * (O_LORA // A_N_TILE)
         row_base_o = g * T
@@ -428,8 +390,8 @@ def sparse_attn(
 
     # INT8 projection `o_r_i8 @ wo_b^T`, then dequantize -> final BF16 output.
     for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b"):
-        # K-split INT8 GEMM + dequant in one scope. T-tiled vec post-process
-        # is the pypto#1472 workaround (same as proj_a).
+        # K-split INT8 GEMM + dequant in one scope; T-tiled vec post-process
+        # to keep the fused AIV side from oversizing UB (same as proj_a).
         n0 = nb * B_N_TILE
         acc_b = pl.create_tensor([T, B_N_TILE], dtype=pl.INT32)
         for kb in pl.pipeline(0, (O_GROUPS * O_LORA) // B_K_TILE, stage=2):
@@ -693,8 +655,8 @@ def build_tensor_specs(
         """Build the sparse index list with a full window prefix and padded compressed tail.
 
         The compressed tail width follows the active specialization (TOPK - WIN):
-        the issue#507-pruned build narrows it to exactly `cmp_valid` columns, the
-        full-blocks baseline keeps the IDX_TOPK-wide padded tail.
+        the pruned build narrows it to `cmp_valid` columns, the full-blocks
+        baseline keeps the IDX_TOPK-wide padded tail.
         """
         win_part = torch.arange(WIN, dtype=torch.int32).unsqueeze(0).expand(T, -1)
         cmp_width = TOPK - WIN
@@ -773,9 +735,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    # The standalone always tests the full-width (5-block) kernel; --compress-ratio
-    # only selects which compressed-tail data pattern to validate (the pruned 2-block
-    # widths are covered by the swa/hca variant tests).
+    # --compress-ratio only selects which compressed-tail data pattern to validate;
+    # the pruned widths are covered by the swa/hca variant tests.
     parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
@@ -795,7 +756,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     compress_ratio = args.compress_ratio
-    print(f"[#507] compress_ratio={compress_ratio} "
+    print(f"compress_ratio={compress_ratio} "
           f"-> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
