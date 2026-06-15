@@ -407,6 +407,9 @@ def golden_attention_swa(tensors):
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, 0, dtype=torch.bfloat16)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -447,9 +450,9 @@ def build_tensor_specs(start_pos=None):
     def init_gamma_ckv():
         return torch.ones(HEAD_DIM)
     def init_freqs_cos():
-        return torch.cos(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_cos.clone()
     def init_freqs_sin():
-        return torch.sin(torch.arange(MAX_SEQ_LEN * ROPE_HEAD_DIM).reshape(MAX_SEQ_LEN, ROPE_HEAD_DIM) * 1e-3)
+        return shared_freqs_sin.clone()
     def init_normalized_cache(shape):
         cache = torch.randn(*shape)
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)

@@ -466,8 +466,12 @@ def golden_qkv_proj_rope(tensors):
 def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
     T = B * S
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, 4, dtype=torch.bfloat16)
+    positions = torch.arange(T, dtype=torch.int32)
+    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(shared_freqs_cos, shared_freqs_sin, positions)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -487,9 +491,9 @@ def build_tensor_specs(B, S):
     def init_wkv():
         return torch.randn(D, HEAD_DIM) / (D ** 0.5)
     def init_cos():
-        return torch.cos(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
+        return shared_rope_cos.clone()
     def init_sin():
-        return torch.sin(torch.arange(T * ROPE_DIM).reshape(T, ROPE_DIM) * 1e-3)
+        return shared_rope_sin.clone()
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():

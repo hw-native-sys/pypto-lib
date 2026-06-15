@@ -474,6 +474,9 @@ def golden_indexer(tensors):
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import ScalarSpec, TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def init_x():
         return torch.rand(B, S, D)
@@ -483,10 +486,12 @@ def build_tensor_specs(start_pos=None):
         return torch.rand(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM)
     def init_weights_proj():
         return torch.rand(D, IDX_N_HEADS)
+    def init_rope_positions():
+        return init_position_ids().to(torch.int64)[:, 0]
     def init_cos():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
     def init_sin():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
     def init_hadamard():
         return torch.rand(IDX_HEAD_DIM, IDX_HEAD_DIM) * (IDX_HEAD_DIM ** -0.5)
     def init_inner_compress_state():

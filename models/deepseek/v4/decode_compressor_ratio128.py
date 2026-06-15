@@ -394,6 +394,9 @@ def golden_compressor(tensors):
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from golden import TensorSpec
+    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+
+    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def init_x():
         return torch.rand(B, S, D)
@@ -407,10 +410,14 @@ def build_tensor_specs(start_pos=None):
         return torch.rand(COMPRESS_RATIO, OUT_DIM)
     def init_norm_w():
         return torch.ones(HEAD_DIM)
+    def init_rope_positions():
+        first_pos = init_position_ids().to(torch.int64)[:, 0]
+        cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
+        return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
     def init_cos():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
     def init_sin():
-        return torch.rand(B, ROPE_HEAD_DIM // 2)
+        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
