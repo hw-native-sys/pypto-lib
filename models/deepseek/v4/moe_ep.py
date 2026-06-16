@@ -76,7 +76,7 @@ assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 
 
-@pl.jit
+@pl.jit.inline
 def moe_ep(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -184,6 +184,62 @@ def moe_ep(
     return x_next
 
 
+@pl.jit
+def moe_ep_test(
+    # model inputs
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    # final output
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    # windows
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    x_next = moe_ep(
+        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_next,
+        pub_counts, count_done, data_done,
+        recv_x, recv_scale, recv_w, recv_r_route,
+        routed_y_buf, combine_done,
+        layer_id, my_rank,
+    )
+    return x_next
+
+
 @pl.jit.host
 def l3_moe_ep(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
@@ -230,7 +286,7 @@ def l3_moe_ep(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        moe_ep(
+        moe_ep_test(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],

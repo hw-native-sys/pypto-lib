@@ -60,6 +60,8 @@ B_TILE = 4
 TOPK_TILE = 4
 QH_QUANT_BLOCK = 256
 QH_QUANT_ROW_TILE = 64
+ROPE_ROW_BLOCK = S * IDX_N_HEADS  # 128 rows = one batch
+ROPE_ROW_TILE = 32
 
 @pl.jit.inline
 def indexer(
@@ -115,8 +117,6 @@ def indexer(
     # task and reused across the inner 32-row sub-blocks. This coarsens the loop from
     # T*IDX_N_HEADS//32 (256) down to B (64) tasks while keeping the per-iter tile at
     # 32 rows (same Vec UB footprint), amortizing the in-kernel index build 4x.
-    ROPE_ROW_BLOCK = S * IDX_N_HEADS  # 128 rows = one batch
-    ROPE_ROW_TILE = 32
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="qr_rope"):
         o0 = idx * ROPE_ROW_BLOCK
         batch_idx = idx
