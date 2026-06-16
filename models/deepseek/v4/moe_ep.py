@@ -760,7 +760,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_ep,
         golden_data=golden_data,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
             distributed_config=DistributedConfig(
