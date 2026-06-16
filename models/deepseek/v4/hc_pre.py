@@ -55,6 +55,15 @@ LINEAR_K_TILE = 128
 D_TILE = 256
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+# The fused pre-mix below is hand-unrolled for HC_MULT == 4: the four pre0..pre3
+# residual scales, the four mix_g0..mix_g3 / comb base loads, the comb_off =
+# HC_MULT * 2 offset and the in_h * HC_MULT column strides all assume it. Fail
+# loudly if the model config changes hc_mult instead of silently mixing the
+# wrong comb columns.
+assert HC_MULT == 4, (
+    f"hc_pre is hand-specialized to HC_MULT == 4, got {HC_MULT}; "
+    "regenerate the pre0..pre3 / mix_g0..mix_g3 unrolling for the new hc_mult before using it."
+)
 
 
 @pl.jit.inline

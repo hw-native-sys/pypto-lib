@@ -1163,6 +1163,13 @@ if __name__ == "__main__":
     parser.add_argument("--hetero-smoke", action="store_true", default=False)
     parser.add_argument("--hetero-boundary", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-dep-gen",
+        action="store_true",
+        default=False,
+        help="Capture PTO2 dependency edges (deps.json). Required to recover function names in the "
+        "L2 swimlane for dynamic-shape kernels whose AICore records carry func_id=-1.",
+    )
     args = parser.parse_args()
     try:
         _, _, _, compare_tokens = _resolve_csa_case(
@@ -1189,6 +1196,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
         ),
         rtol=1e-2,
         atol=1e-2,

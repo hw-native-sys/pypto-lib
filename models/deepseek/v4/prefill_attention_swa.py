@@ -761,6 +761,13 @@ if __name__ == "__main__":
         default=False,
         help="Enable L2 swimlane profiling/report generation in runtime_cfg for this validation run.",
     )
+    parser.add_argument(
+        "--enable-dep-gen",
+        action="store_true",
+        default=False,
+        help="Capture PTO2 dependency edges (deps.json). Required to recover function names in the "
+        "L2 swimlane for dynamic-shape kernels whose AICore records carry func_id=-1.",
+    )
     args = parser.parse_args()
     try:
         _, _, compare_tokens, _ = _resolve_swa_case(
@@ -787,6 +794,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
         ),
         compile_only=args.compile_only or args.platform.endswith("sim"),
         rtol=1e-2,
