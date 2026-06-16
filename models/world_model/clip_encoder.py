@@ -8,14 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """CLIP image encoder for Fun-Control 1.3B — pypto3.0 implementation.
 
-Computation logic follows ``test_golden_fun_control_full.py::clip_encode``,
-with **standard GELU** (tanh approximation) instead of QuickGELU, matching
-the real ``open-clip-xlm-roberta-large-vit-huge-14`` model (activation='gelu').
+Computation logic follows ``test_golden_fun_control_full.py::clip_encode``
+exactly, using **QuickGELU** activation: ``x * sigmoid(1.702 * x)``.
 
 Architecture::
 
     PatchConv2d → CLS+PosEmbed → PreLN →
-    [LN → MHA → Proj → Res → LN → FFN(GELU) → Res] × L
+    [LN → MHA → Proj → Res → LN → FFN(QuickGELU) → Res] × L
 
 Layer count is parameterised via ``CLIP_LAYERS``; weights are concatenated into
 2-D tensors and sliced per layer inside a ``pl.unroll`` loop (compile-time
@@ -42,15 +41,19 @@ import torch
 import torch.nn.functional as F
 
 from config import (
-    CLIP_DIM, CLIP_HEADS, CLIP_HEAD_DIM, CLIP_LAYERS, CLIP_PATCH, CLIP_IMG,
-    CLIP_TOKENS, CLIP_FFN, CLIP_NORM_EPS,
+    CLIP_DIM, CLIP_HEADS, CLIP_LAYERS, CLIP_PATCH, CLIP_IMG, CLIP_TOKENS,
 )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Hardware-aligned padding / tiling + derived constants.
+# Derived constants — hardware-aligned padding / tiling.
 # ══════════════════════════════════════════════════════════════════════════════
 
+CLIP_HEAD_DIM = CLIP_DIM // CLIP_HEADS          # 32
+FFN_DIM = CLIP_DIM * 4                          # 512
+EPS = 1e-5
 ATTN_SCALE = CLIP_HEAD_DIM ** -0.5              # 1/√32
+
 T = ((CLIP_TOKENS + 15) // 16) * 16             # CLIP_TOKENS padded to innerRows=16
 NUM_PATCHES = (CLIP_IMG // CLIP_PATCH) ** 2
 PATCH_H = CLIP_IMG // CLIP_PATCH
@@ -60,9 +63,21 @@ COL_PAD = 608                                   # 32-byte aligned, avoids tmov b
 IMG_FLAT_SIZE = 3 * CLIP_IMG * CLIP_IMG         # 2352
 N_CHUNK = 32                                    # output-N tile (Right buffer safe)
 
-# ── GELU constants (tanh approximation, matches real model) ──
-GELU_SQRT_2_OVER_PI = 0.7978845608             # √(2/π)
-GELU_COEFF = 0.044715
+# ── QuickGELU constant (matches golden reference: x * sigmoid(1.702 * x)) ──
+QUICK_GELU_SCALE = 1.702
+
+# Geometry assertions — keep at the bottom of the derived-constants block.
+assert CLIP_DIM % CLIP_HEADS == 0, "CLIP_HEADS must divide CLIP_DIM"
+assert CLIP_HEAD_DIM * CLIP_HEADS == CLIP_DIM
+assert T % 16 == 0, "T must be a multiple of innerRows=16"
+assert T >= CLIP_TOKENS, "T must accommodate all real tokens"
+assert CLIP_TOKENS == NUM_PATCHES + 1, "expected CLS token + NUM_PATCHES patch tokens"
+assert COL_PAD >= COL_SIZE and COL_PAD % 4 == 0, "COL_PAD must be ≥ COL_SIZE and 32-byte aligned"
+assert FFN_DIM == CLIP_DIM * 4
+assert IMG_FLAT_SIZE == 3 * CLIP_IMG * CLIP_IMG
+assert CLIP_DIM % N_CHUNK == 0, "N_CHUNK must divide CLIP_DIM"
+assert FFN_DIM % N_CHUNK == 0, "N_CHUNK must divide FFN_DIM"
+assert (3 * CLIP_DIM) % N_CHUNK == 0, "N_CHUNK must divide 3*CLIP_DIM (QKV width)"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -88,13 +103,15 @@ def _layernorm(
     sq       = pl.mul(centred, centred)
     var      = pl.row_sum(sq)
     var      = pl.mul(var, 1.0 / CLIP_DIM)
-    var_eps  = pl.add(var, CLIP_NORM_EPS)
+    var_eps  = pl.add(var, EPS)
     var_eps  = pl.reshape(var_eps, [1, T])
     std      = pl.sqrt(var_eps)
     std      = pl.reshape(std, [T, 1])
     normed   = pl.row_expand_div(centred, std)
 
     scaled_n = pl.col_expand_mul(normed, w)
+    # A2/A3 does not support pl.full(dtype=pl.FP32).  Work around by zeroing
+    # a same-shape tile then adding 1.0 — produces an all-ones FP32 tile.
     ones     = pl.sub(x, x)
     ones     = pl.add(ones, 1.0)
     biased   = pl.add(scaled_n, pl.col_expand_mul(ones, b))
@@ -129,10 +146,10 @@ def clip_encoder(
     proj_w:       pl.Tensor[[CLIP_DIM, CLIP_LAYERS * CLIP_DIM], pl.BF16],
     norm2_w:      pl.Tensor[[CLIP_LAYERS, CLIP_DIM], pl.FP32],
     norm2_b:      pl.Tensor[[CLIP_LAYERS, CLIP_DIM], pl.FP32],
-    fc1_w:        pl.Tensor[[CLIP_DIM, CLIP_LAYERS * CLIP_FFN], pl.BF16],
-    fc2_w:        pl.Tensor[[CLIP_LAYERS * CLIP_FFN, CLIP_DIM], pl.BF16],
+    fc1_w:        pl.Tensor[[CLIP_DIM, CLIP_LAYERS * FFN_DIM], pl.BF16],
+    fc2_w:        pl.Tensor[[CLIP_LAYERS * FFN_DIM, CLIP_DIM], pl.BF16],
     # ── Output ──
-    out:          pl.Out[pl.Tensor[[T, CLIP_DIM], pl.BF16]],
+    out:          pl.Out[pl.Tensor[[CLIP_TOKENS, CLIP_DIM], pl.BF16]],
 ):
 
     # ── Scope 1: Patch embedding — im2col (kernel-side, scalar access). ──
@@ -200,15 +217,15 @@ def clip_encoder(
     # (each scope overwrites before the next scope reads).
     # ══════════════════════════════════════════════════════════════════════
     qkv_gm     = pl.create_tensor([T, 3 * CLIP_DIM], dtype=pl.BF16)
-    attn_gm    = pl.create_tensor([T, CLIP_DIM],     dtype=pl.BF16)
+    attn_gm    = pl.create_tensor([T, CLIP_DIM],     dtype=pl.FP32)
     attn_res_gm = pl.create_tensor([T, CLIP_DIM],    dtype=pl.FP32)
     ln1_gm     = pl.create_tensor([T, CLIP_DIM],     dtype=pl.FP32)
     ln2_gm     = pl.create_tensor([T, CLIP_DIM],     dtype=pl.FP32)
-    gelu_gm    = pl.create_tensor([T, CLIP_FFN],      dtype=pl.BF16)
+    gelu_gm    = pl.create_tensor([T, FFN_DIM],      dtype=pl.FP32)
 
     for layer_idx in pl.unroll(CLIP_LAYERS):
 
-        # ── LN1 + QKV projection. ──
+        # ── Scope 5: LN1 + QKV projection. ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ln_qkv"):
             ln1_w = pl.slice(norm1_w, [1, CLIP_DIM], [layer_idx, 0])
             ln1_b = pl.slice(norm1_b, [1, CLIP_DIM], [layer_idx, 0])
@@ -230,7 +247,7 @@ def clip_encoder(
                 zero_row = pl.full([1, 3 * CLIP_DIM], dtype=pl.BF16, value=0.0)
                 qkv_gm = pl.assemble(qkv_gm, zero_row, [r, 0])
 
-        # ── Multi-head self-attention (per-head, with scale). ──
+        # ── Scope 6: Multi-head self-attention (per-head, with scale). ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mha"):
             for h in pl.range(CLIP_HEADS):
                 h_col  = h * CLIP_HEAD_DIM
@@ -245,16 +262,14 @@ def clip_encoder(
                 exp_s   = pl.exp(shifted)
                 sm      = pl.row_expand_div(exp_s, pl.row_sum(exp_s))
                 ctx     = pl.matmul(pl.cast(sm, target_type=pl.BF16), v_h, out_dtype=pl.FP32)
-                attn_gm = pl.assemble(
-                    attn_gm, pl.cast(ctx, target_type=pl.BF16), [0, h_col],
-                )
+                attn_gm = pl.assemble(attn_gm, ctx, [0, h_col])
             for r in pl.range(CLIP_TOKENS, T):
-                zero_attn = pl.full([1, CLIP_DIM], dtype=pl.BF16, value=0.0)
+                zero_attn = pl.full([1, CLIP_DIM], dtype=pl.FP32, value=0.0)
                 attn_gm = pl.assemble(attn_gm, zero_attn, [r, 0])
 
-        # ── Output projection + residual. ──
+        # ── Scope 7: Output projection + residual. ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_res"):
-            attn_tile = pl.slice(attn_gm, [T, CLIP_DIM], [0, 0])
+            attn_tile = pl.cast(pl.slice(attn_gm, [T, CLIP_DIM], [0, 0]), target_type=pl.BF16)
             proj_offset = layer_idx * CLIP_DIM
             proj_w_l  = pl.slice(proj_w, [CLIP_DIM, CLIP_DIM], [0, proj_offset])
             proj      = pl.matmul(attn_tile, proj_w_l, out_dtype=pl.FP32)
@@ -264,7 +279,7 @@ def clip_encoder(
                 zero_res = pl.full([1, CLIP_DIM], dtype=pl.FP32, value=0.0)
                 attn_res_gm = pl.assemble(attn_res_gm, zero_res, [r, 0])
 
-        # ── LN2 + FC1 + GELU (standard tanh approximation). ──
+        # ── Scope 8: LN2 + FC1 + QuickGELU (x * sigmoid(1.702 * x)). ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ln_fc1"):
             ln2_w_l = pl.slice(norm2_w, [1, CLIP_DIM], [layer_idx, 0])
             ln2_b_l = pl.slice(norm2_b, [1, CLIP_DIM], [layer_idx, 0])
@@ -272,43 +287,40 @@ def clip_encoder(
             ln2_gm  = _layernorm(ar_tile, ln2_w_l, ln2_b_l, ln2_gm)
             ln2_tile = pl.slice(ln2_gm, [T, CLIP_DIM], [0, 0])
             normed_bf = pl.cast(ln2_tile, target_type=pl.BF16)
-            fc1_offset = layer_idx * CLIP_FFN
-            for n0 in pl.range(0, CLIP_FFN, N_CHUNK):
+            fc1_offset = layer_idx * FFN_DIM
+            for n0 in pl.range(0, FFN_DIM, N_CHUNK):
                 fc1 = pl.matmul(
                     normed_bf,
                     pl.slice(fc1_w, [CLIP_DIM, N_CHUNK], [0, fc1_offset + n0]),
                     out_dtype=pl.FP32,
                 )
-                # Standard GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                x3   = pl.mul(pl.mul(fc1, fc1), fc1)
-                inner = pl.add(fc1, pl.mul(x3, GELU_COEFF))
-                z    = pl.mul(inner, GELU_SQRT_2_OVER_PI)
-                two_z = pl.mul(z, 2.0)
-                exp_2z = pl.exp(two_z)
-                tanh_z = pl.div(pl.sub(exp_2z, 1.0), pl.add(exp_2z, 1.0))
-                gelu_out = pl.mul(pl.mul(fc1, 0.5), pl.add(tanh_z, 1.0))
-                gelu_gm = pl.assemble(
-                    gelu_gm, pl.cast(gelu_out, target_type=pl.BF16), [0, n0],
-                )
+                # QuickGELU: x * sigmoid(1.702 * x)
+                scaled   = pl.mul(fc1, QUICK_GELU_SCALE)
+                neg_sc   = pl.neg(scaled)
+                exp_neg  = pl.exp(neg_sc)
+                denom    = pl.add(exp_neg, 1.0)
+                sigmoid  = pl.recip(denom)
+                qgelu    = pl.mul(fc1, sigmoid)
+                gelu_gm = pl.assemble(gelu_gm, qgelu, [0, n0])
 
-        # ── FC2 (K-chunked accumulation) + residual → layer_x_gm. ──
-        # gelu [T, CLIP_FFN] @ fc2_w [CLIP_FFN, CLIP_DIM] → [T, CLIP_DIM]
+        # ── Scope 9: FC2 (K-chunked accumulation) + residual → layer_x_gm. ──
+        # qgelu [T, FFN_DIM] @ fc2_w [FFN_DIM, CLIP_DIM] → [T, CLIP_DIM]
         # K-chunk: [T, N_CHUNK] @ [N_CHUNK, CLIP_DIM] (no b_trans needed)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="fc2_res"):
-            fc2_offset = layer_idx * CLIP_FFN
-            g_chunk0 = pl.slice(gelu_gm, [T, N_CHUNK], [0, 0])
+            fc2_offset = layer_idx * FFN_DIM
+            g_chunk0 = pl.cast(pl.slice(gelu_gm, [T, N_CHUNK], [0, 0]), target_type=pl.BF16)
             w_chunk0 = pl.slice(fc2_w, [N_CHUNK, CLIP_DIM], [fc2_offset, 0])
             acc = pl.matmul(g_chunk0, w_chunk0, out_dtype=pl.FP32)
-            for k0 in pl.range(N_CHUNK, CLIP_FFN, N_CHUNK):
-                g_chunk = pl.slice(gelu_gm, [T, N_CHUNK], [0, k0])
+            for k0 in pl.range(N_CHUNK, FFN_DIM, N_CHUNK):
+                g_chunk = pl.cast(pl.slice(gelu_gm, [T, N_CHUNK], [0, k0]), target_type=pl.BF16)
                 w_chunk = pl.slice(fc2_w, [N_CHUNK, CLIP_DIM], [fc2_offset + k0, 0])
                 acc = pl.matmul_acc(acc, g_chunk, w_chunk)
             residual = pl.slice(attn_res_gm, [T, CLIP_DIM], [0, 0])
             layer_x_gm = pl.assemble(layer_x_gm, pl.add(residual, acc), [0, 0])
 
-    # ── Final output. ──
+    # ── Scope 10: Final output — only valid rows (no padding). ──
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="final"):
-        final_tile = pl.slice(layer_x_gm, [T, CLIP_DIM], [0, 0])
+        final_tile = pl.slice(layer_x_gm, [CLIP_TOKENS, CLIP_DIM], [0, 0])
         out = pl.assemble(out, pl.cast(final_tile, target_type=pl.BF16), [0, 0])
 
     return out
@@ -316,32 +328,113 @@ def clip_encoder(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Golden reference — mirrors test_golden_fun_control_full.py::clip_encode
-# with GELU instead of QuickGELU (matching the real model).
+# with QuickGELU: x * sigmoid(1.702 * x) (matching golden reference line 742).
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _bf16(t):
+    """Round through BF16 then back to FP32 — emulates kernel pl.cast(BF16)."""
+    if isinstance(t, torch.Tensor):
+        return t.to(torch.bfloat16).to(torch.float32)
+    return t
+
+
+def _im2col_clip(img_4d, patch_h, patch_w, clip_patch):
+    """im2col for CLIP patch conv: matches kernel's scalar read/write order.
+    img_4d: [B, 3, H, W].  Returns [B, num_patches, col_size].
+    """
+    B, C, H, W = img_4d.shape
+    num_patches = patch_h * patch_w
+    col_size = C * clip_patch * clip_patch
+    cols = torch.zeros(B, num_patches, col_size)
+    for b in range(B):
+        for ph in range(patch_h):
+            for pw in range(patch_w):
+                patch_idx = ph * patch_w + pw
+                col_offset = 0
+                for c in range(C):
+                    for kh in range(clip_patch):
+                        for kw in range(clip_patch):
+                            src_h = ph * clip_patch + kh
+                            src_w = pw * clip_patch + kw
+                            cols[b, patch_idx, col_offset] = img_4d[b, c, src_h, src_w]
+                            col_offset += 1
+    return cols
+
+
 def golden_clip_encode(img_tensor, w):
-    """PyTorch reference: PatchConv → CLS+Pos → PreLN → Transformer × L."""
+    """BF16-aware golden matching kernel's exact computation path.
+
+    Implements custom LayerNorm and N-chunked matmul to match kernel exactly.
+    Output: [CLIP_TOKENS, CLIP_DIM] — only valid rows, no padding.
+    """
     B = img_tensor.shape[0]
-    x = F.conv2d(img_tensor, w["clip_patch_conv"], stride=CLIP_PATCH)
-    x = x.flatten(2).transpose(1, 2)
+
+    def custom_layernorm(x, w, b):
+        """Match kernel's _layernorm exactly."""
+        scaled = x * (1.0 / CLIP_DIM)
+        mean = scaled.sum(dim=-1, keepdim=True)
+        centred = x - mean
+        sq = centred * centred
+        var = sq.sum(dim=-1, keepdim=True) * (1.0 / CLIP_DIM)
+        var_eps = var + EPS
+        std = var_eps.sqrt()
+        normed = centred / std
+        scaled_n = normed * w
+        biased = scaled_n + b
+        # Zero padding rows
+        if biased.shape[1] > CLIP_TOKENS:
+            biased[:, CLIP_TOKENS:, :] = 0.0
+        return biased
+
+    def n_chunked_matmul(x, w, n_chunk=N_CHUNK):
+        """Match kernel's N-chunked matmul accumulation order."""
+        result = torch.zeros(x.shape[0], w.shape[0], dtype=x.dtype)
+        for n0 in range(0, w.shape[0], n_chunk):
+            w_chunk = w[n0:n0+n_chunk]
+            result[:, n0:n0+n_chunk] = _bf16(x) @ _bf16(w_chunk).T
+        return result
+
+    col = _im2col_clip(img_tensor, PATCH_H, PATCH_W, CLIP_PATCH)
+    col_padded = torch.zeros(T, COL_PAD)
+    col_padded[:NUM_PATCHES, :COL_SIZE] = col.squeeze(0)
+    w_raw = w["clip_patch_conv"].reshape(CLIP_DIM, -1)
+    w_padded = torch.zeros(CLIP_DIM, COL_PAD, dtype=w_raw.dtype)
+    w_padded[:, :w_raw.shape[1]] = w_raw
+    patch_emb = _bf16(n_chunked_matmul(_bf16(col_padded), _bf16(w_padded)))
+    x = patch_emb[:NUM_PATCHES, :].unsqueeze(0)
+
     cls = w["clip_cls"].expand(B, -1, -1)
     x = torch.cat([cls, x], dim=1)
-    x = x + w["clip_pos"]
-    x = F.layer_norm(x, [CLIP_DIM], w["clip_pre_norm_w"], w["clip_pre_norm_b"])
+    x = _bf16(x + w["clip_pos"])
+    x = custom_layernorm(x, w["clip_pre_norm_w"], w["clip_pre_norm_b"])
     for i in range(CLIP_LAYERS):
         p = f"clip_l{i}"
-        h = F.layer_norm(x, [CLIP_DIM], w[f"{p}_norm1_w"], w[f"{p}_norm1_b"])
-        qkv = F.linear(h, w[f"{p}_qkv"]).view(B, -1, 3, CLIP_HEADS, CLIP_HEAD_DIM)
+        h = custom_layernorm(x, w[f"{p}_norm1_w"], w[f"{p}_norm1_b"])
+        qkv_w = w[f"{p}_qkv"]
+        qkv = _bf16(n_chunked_matmul(_bf16(h.squeeze(0)), _bf16(qkv_w), n_chunk=3*CLIP_DIM)).unsqueeze(0)
+        qkv = qkv.view(B, -1, 3, CLIP_HEADS, CLIP_HEAD_DIM)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        attn = F.softmax(q @ k.transpose(-2, -1) * ATTN_SCALE, dim=-1)
-        attn_out = (attn @ v).transpose(1, 2).contiguous().view(B, -1, CLIP_DIM)
-        x = x + F.linear(attn_out, w[f"{p}_proj"])
-        h = F.layer_norm(x, [CLIP_DIM], w[f"{p}_norm2_w"], w[f"{p}_norm2_b"])
-        ff = F.linear(h, w[f"{p}_fc1"])
-        ff = F.gelu(ff, approximate="tanh")  # Standard GELU (tanh approx, matches kernel)
-        x = x + F.linear(ff, w[f"{p}_fc2"])
-    return x
+        scores = _bf16(q) @ _bf16(k).transpose(-2, -1) * ATTN_SCALE
+        attn = F.softmax(scores, dim=-1)
+        attn_out = _bf16(_bf16(attn) @ _bf16(v)).transpose(1, 2).contiguous().view(B, -1, CLIP_DIM)
+        proj_w = w[f"{p}_proj"]
+        proj = _bf16(n_chunked_matmul(_bf16(attn_out.squeeze(0)), _bf16(proj_w))).unsqueeze(0)
+        x = _bf16(x + proj)
+        # Zero padding after residual
+        if x.shape[1] > CLIP_TOKENS:
+            x[:, CLIP_TOKENS:, :] = 0.0
+        h = custom_layernorm(x, w[f"{p}_norm2_w"], w[f"{p}_norm2_b"])
+        fc1_w = w[f"{p}_fc1"]
+        ff = _bf16(n_chunked_matmul(_bf16(h.squeeze(0)), _bf16(fc1_w), n_chunk=FFN_DIM)).unsqueeze(0)
+        ff = ff * torch.sigmoid(1.702 * ff)
+        fc2_w = w[f"{p}_fc2"]
+        fc2 = _bf16(n_chunked_matmul(_bf16(ff.squeeze(0)), _bf16(fc2_w))).unsqueeze(0)
+        x = _bf16(x + fc2)
+        # Zero padding after residual
+        if x.shape[1] > CLIP_TOKENS:
+            x[:, CLIP_TOKENS:, :] = 0.0
+    return x.squeeze(0)[:CLIP_TOKENS, :]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -384,11 +477,11 @@ def build_tensor_specs():
     stacked_norm2_w = torch.ones(CLIP_LAYERS, CLIP_DIM, dtype=torch.float32)
     stacked_norm2_b = torch.zeros(CLIP_LAYERS, CLIP_DIM, dtype=torch.float32)
     stacked_fc1_w = torch.cat([
-        (torch.randn(CLIP_FFN, CLIP_DIM, generator=g) * 0.02).bfloat16().T
+        (torch.randn(FFN_DIM, CLIP_DIM, generator=g) * 0.02).bfloat16().T
         for _ in range(CLIP_LAYERS)
     ], dim=1)
     stacked_fc2_w = torch.cat([
-        (torch.randn(CLIP_DIM, CLIP_FFN, generator=g) * 0.02).bfloat16().T
+        (torch.randn(CLIP_DIM, FFN_DIM, generator=g) * 0.02).bfloat16().T
         for _ in range(CLIP_LAYERS)
     ], dim=0)
 
@@ -399,16 +492,16 @@ def build_tensor_specs():
         TensorSpec("proj_w",  [CLIP_DIM, CLIP_LAYERS * CLIP_DIM],   torch.bfloat16, init_value=stacked_proj_w),
         TensorSpec("norm2_w", [CLIP_LAYERS, CLIP_DIM],              torch.float32,  init_value=stacked_norm2_w),
         TensorSpec("norm2_b", [CLIP_LAYERS, CLIP_DIM],              torch.float32,  init_value=stacked_norm2_b),
-        TensorSpec("fc1_w",   [CLIP_DIM, CLIP_LAYERS * CLIP_FFN],    torch.bfloat16, init_value=stacked_fc1_w),
-        TensorSpec("fc2_w",   [CLIP_LAYERS * CLIP_FFN, CLIP_DIM],    torch.bfloat16, init_value=stacked_fc2_w),
+        TensorSpec("fc1_w",   [CLIP_DIM, CLIP_LAYERS * FFN_DIM],    torch.bfloat16, init_value=stacked_fc1_w),
+        TensorSpec("fc2_w",   [CLIP_LAYERS * FFN_DIM, CLIP_DIM],    torch.bfloat16, init_value=stacked_fc2_w),
     ])
 
-    specs.append(TensorSpec("out", [T, CLIP_DIM], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("out", [CLIP_TOKENS, CLIP_DIM], torch.bfloat16, is_output=True))
     return specs
 
 
 def golden_clip_encoder(tensors):
-    """Run golden_clip_encode with GELU, pad output to T rows."""
+    """Run golden_clip_encode with QuickGELU, output only valid rows."""
     img_flat = tensors["img_flat"]
     img_4d = img_flat.reshape(1, 3, CLIP_IMG, CLIP_IMG).float()
 
@@ -430,19 +523,17 @@ def golden_clip_encoder(tensors):
         w[f"{p}_proj"]    = tensors["proj_w"][:, proj_start:proj_start + CLIP_DIM].float().T
         w[f"{p}_norm2_w"] = tensors["norm2_w"][i].float()
         w[f"{p}_norm2_b"] = tensors["norm2_b"][i].float()
-        fc1_start = i * CLIP_FFN
-        w[f"{p}_fc1"]     = tensors["fc1_w"][:, fc1_start:fc1_start + CLIP_FFN].float().T
-        fc2_start = i * CLIP_FFN
-        w[f"{p}_fc2"]     = tensors["fc2_w"][fc2_start:fc2_start + CLIP_FFN].float().T
+        fc1_start = i * FFN_DIM
+        w[f"{p}_fc1"]     = tensors["fc1_w"][:, fc1_start:fc1_start + FFN_DIM].float().T
+        fc2_start = i * FFN_DIM
+        w[f"{p}_fc2"]     = tensors["fc2_w"][fc2_start:fc2_start + FFN_DIM].float().T
 
     result = golden_clip_encode(img_4d, w)
-    out_padded = torch.zeros(T, CLIP_DIM, dtype=torch.bfloat16)
-    out_padded[:CLIP_TOKENS, :] = result.squeeze(0).bfloat16()
-    tensors["out"][:] = out_padded
+    tensors["out"][:] = result.bfloat16()
 
 
 if __name__ == "__main__":
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -460,8 +551,9 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
-        rtol=1.2e-1,
-        atol=1.2e-1,
+        rtol=3e-3,
+        atol=3e-3,
+        compare_fn={"out": ratio_allclose(atol=0.1, rtol=0.1, max_error_ratio=0.02)},
     )
     if not result.passed:
         if result.error:

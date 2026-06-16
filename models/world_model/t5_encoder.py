@@ -18,7 +18,7 @@ the T5 encoder in ``infer_fun_control_1_3b_text.py`` at reduced dimensions.
 
 Usage::
 
-    python t5_encoder.py -p a2a3 -d 0
+    python t5_encoder.py    # golden-case precision test (T5_DIM=128)
 """
 
 import argparse
@@ -63,6 +63,40 @@ else:  # Golden case (T5_DIM=128)
 HIDDEN_BLOCKS = T5_DIM // K_CHUNK       # dim splits for RMSNorm / QKV / out_proj
 FFN_BLOCKS = T5_FFN // K_CHUNK          # dim splits for the fc2 (down) matmul
 
+# Geometry assertions — keep at the bottom of the config block.
+assert T5_DIM % T5_HEADS == 0, "T5_HEADS must divide T5_DIM"
+assert T5_HEAD_DIM * T5_HEADS == T5_DIM
+assert T5_DIM % K_CHUNK == 0, "K_CHUNK must divide T5_DIM"
+assert T5_DIM % N_CHUNK == 0, "N_CHUNK must divide T5_DIM"
+assert T5_FFN % K_CHUNK == 0, "K_CHUNK must divide T5_FFN"
+assert T5_FFN % N_CHUNK == 0, "N_CHUNK must divide T5_FFN"
+assert T5_SEQ % SEQ_TILE == 0, "SEQ_TILE must divide T5_SEQ"
+
+
+@pl.jit.inline
+def _rmsnorm(
+    x_in: pl.Tensor[[T5_SEQ, T5_DIM], pl.FP32],
+    weight: pl.Tensor[[1, T5_DIM], pl.FP32],
+    out: pl.Tensor[[T5_SEQ, T5_DIM], pl.BF16],
+) -> pl.Tensor[[T5_SEQ, T5_DIM], pl.BF16]:
+    """RMSNorm: x * rsqrt(mean(x^2) + eps) * weight.  FP32 in → BF16 out."""
+    for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
+            partial_sq = pl.full([1, SEQ_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(HIDDEN_BLOCKS):
+                k0 = kb * K_CHUNK
+                xc = pl.slice(x_in, [SEQ_TILE, K_CHUNK], [st, k0])
+                partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(pl.mul(xc, xc)), [1, SEQ_TILE]))
+            var = pl.reshape(pl.add(pl.mul(partial_sq, 1.0 / T5_DIM), EPS), [SEQ_TILE, 1])
+            inv = pl.recip(pl.sqrt(var))
+            for kb in pl.range(HIDDEN_BLOCKS):
+                k0 = kb * K_CHUNK
+                xc = pl.slice(x_in, [SEQ_TILE, K_CHUNK], [st, k0])
+                g = pl.slice(weight, [1, K_CHUNK], [0, k0])
+                n = pl.col_expand_mul(pl.row_expand_mul(xc, inv), g)
+                out = pl.assemble(out, pl.cast(n, target_type=pl.BF16), [st, k0])
+    return out
+
 
 @pl.jit.inline
 def t5_encoder_layer(
@@ -104,95 +138,81 @@ def t5_encoder_layer(
 
     # ── Scope 1 · RMSNorm (pre-attention) ──
     normed_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
-    for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm1"):
-            partial_sq = pl.full([1, SEQ_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc = pl.slice(x_in, [SEQ_TILE, K_CHUNK], [st, k0])
-                partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(pl.mul(xc, xc)), [1, SEQ_TILE]))
-            var = pl.reshape(pl.add(pl.mul(partial_sq, 1.0 / T5_DIM), EPS), [SEQ_TILE, 1])
-            inv = pl.rsqrt(var)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc = pl.slice(x_in, [SEQ_TILE, K_CHUNK], [st, k0])
-                g = pl.slice(norm1_w_layer, [1, K_CHUNK], [0, k0])
-                n = pl.col_expand_mul(pl.row_expand_mul(xc, inv), g)
-                normed_gm = pl.assemble(normed_gm, pl.cast(n, target_type=pl.BF16), [st, k0])
+    normed_gm = _rmsnorm(x_in, norm1_w_layer, normed_gm)
 
-    # ── Scope 2 · Q projection ──
+    # ── Scope 2a · Q projection ──
     q_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
     for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw = pl.slice(q_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                qa = pl.matmul(ta, tw, b_trans=True, out_dtype=pl.FP32)
+                act_tile = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                w_chunk = pl.slice(q_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                q_acc = pl.matmul(act_tile, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_i = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw_i = pl.slice(q_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    qa = pl.matmul_acc(qa, ta_i, tw_i, b_trans=True)
-                q_gm = pl.assemble(q_gm, pl.cast(qa, target_type=pl.BF16), [st, n0])
+                    act_chunk = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    w_chunk_i = pl.slice(q_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    q_acc = pl.matmul_acc(q_acc, act_chunk, w_chunk_i, b_trans=True)
+                q_gm = pl.assemble(q_gm, pl.cast(q_acc, target_type=pl.BF16), [st, n0])
 
-    # ── Scope 2 · K projection ──
+    # ── Scope 2b · K projection ──
     k_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
     for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_proj"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw = pl.slice(k_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                ka = pl.matmul(ta, tw, b_trans=True, out_dtype=pl.FP32)
+                act_tile = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                w_chunk = pl.slice(k_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                k_acc = pl.matmul(act_tile, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_i = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw_i = pl.slice(k_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    ka = pl.matmul_acc(ka, ta_i, tw_i, b_trans=True)
-                k_gm = pl.assemble(k_gm, pl.cast(ka, target_type=pl.BF16), [st, n0])
+                    act_chunk = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    w_chunk_i = pl.slice(k_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    k_acc = pl.matmul_acc(k_acc, act_chunk, w_chunk_i, b_trans=True)
+                k_gm = pl.assemble(k_gm, pl.cast(k_acc, target_type=pl.BF16), [st, n0])
 
-    # ── Scope 2 · V projection ──
+    # ── Scope 2c · V projection ──
     v_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
     for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_proj"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw = pl.slice(v_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                va = pl.matmul(ta, tw, b_trans=True, out_dtype=pl.FP32)
+                act_tile = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                w_chunk = pl.slice(v_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                v_acc = pl.matmul(act_tile, w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_i = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw_i = pl.slice(v_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    va = pl.matmul_acc(va, ta_i, tw_i, b_trans=True)
-                v_gm = pl.assemble(v_gm, pl.cast(va, target_type=pl.BF16), [st, n0])
+                    act_chunk = pl.slice(normed_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    w_chunk_i = pl.slice(v_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    v_acc = pl.matmul_acc(v_acc, act_chunk, w_chunk_i, b_trans=True)
+                v_gm = pl.assemble(v_gm, pl.cast(v_acc, target_type=pl.BF16), [st, n0])
 
     # ── Scope 3 · Multi-head self-attention (with relative position bias) ──
     ctx_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="mha"):
         for h in pl.range(T5_HEADS):
-            hc = h * T5_HEAD_DIM
-            qh = pl.slice(q_gm, [T5_SEQ, T5_HEAD_DIM], [0, hc])
-            kh = pl.slice(k_gm, [T5_SEQ, T5_HEAD_DIM], [0, hc])
-            vh = pl.slice(v_gm, [T5_SEQ, T5_HEAD_DIM], [0, hc])
-            sc = pl.matmul(qh, kh, b_trans=True, out_dtype=pl.FP32)
+            head_col = h * T5_HEAD_DIM
+            q_head = pl.slice(q_gm, [T5_SEQ, T5_HEAD_DIM], [0, head_col])
+            k_head = pl.slice(k_gm, [T5_SEQ, T5_HEAD_DIM], [0, head_col])
+            v_head = pl.slice(v_gm, [T5_SEQ, T5_HEAD_DIM], [0, head_col])
+            raw_scores = pl.matmul(q_head, k_head, b_trans=True, out_dtype=pl.FP32)
             
             # Add relative position bias for this head
             # pos_bias_h: [T5_SEQ, T5_SEQ] - precomputed on host
             pos_bias_h = pl.slice(pos_bias_layer, [1, T5_SEQ, T5_SEQ], [h, 0, 0])
             pos_bias_h = pl.reshape(pos_bias_h, [T5_SEQ, T5_SEQ])
             # Add to scores (both are FP32)
-            sc = pl.add(sc, pos_bias_h)
+            raw_scores = pl.add(raw_scores, pos_bias_h)
             
-            rm = pl.row_max(sc)
-            sh = pl.row_expand_sub(sc, rm)
-            es = pl.exp(sh)
-            dn = pl.row_sum(es)
-            sm = pl.row_expand_div(es, dn)
-            sb = pl.cast(sm, target_type=pl.BF16)
-            cx = pl.matmul(sb, vh, out_dtype=pl.FP32)
-            ctx_gm = pl.assemble(ctx_gm, pl.cast(cx, target_type=pl.BF16), [0, hc])
+            row_max_val = pl.row_max(raw_scores)
+            shifted  = pl.row_expand_sub(raw_scores, row_max_val)
+            exp_scores = pl.exp(shifted)
+            exp_sum    = pl.row_sum(exp_scores)
+            attn_weights = pl.row_expand_div(exp_scores, exp_sum)
+            attn_weights_bf = pl.cast(attn_weights, target_type=pl.BF16)
+            head_out = pl.matmul(attn_weights_bf, v_head, out_dtype=pl.FP32)
+            ctx_gm = pl.assemble(ctx_gm, pl.cast(head_out, target_type=pl.BF16), [0, head_col])
 
     # ── Scope 4 · Output projection ──
     attn_out_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
@@ -200,15 +220,15 @@ def t5_encoder_layer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_proj"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta = pl.slice(ctx_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw = pl.slice(o_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                oa = pl.matmul(ta, tw, b_trans=True, out_dtype=pl.FP32)
+                ctx_tile = pl.slice(ctx_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                o_w_chunk = pl.slice(o_w_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                oproj_acc = pl.matmul(ctx_tile, o_w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_i = pl.slice(ctx_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw_i = pl.slice(o_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    oa = pl.matmul_acc(oa, ta_i, tw_i, b_trans=True)
-                attn_out_gm = pl.assemble(attn_out_gm, pl.cast(oa, target_type=pl.BF16), [st, n0])
+                    ctx_chunk = pl.slice(ctx_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    o_w_chunk_i = pl.slice(o_w_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    oproj_acc = pl.matmul_acc(oproj_acc, ctx_chunk, o_w_chunk_i, b_trans=True)
+                attn_out_gm = pl.assemble(attn_out_gm, pl.cast(oproj_acc, target_type=pl.BF16), [st, n0])
 
     # ── Scope 5 · Residual add (attention) ──
     x_after_attn_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.FP32)
@@ -216,28 +236,14 @@ def t5_encoder_layer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="residual"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                xa = pl.slice(x_in, [SEQ_TILE, N_CHUNK], [st, n0])
-                ao = pl.cast(pl.slice(attn_out_gm, [SEQ_TILE, N_CHUNK], [st, n0]), target_type=pl.FP32)
-                xr = pl.add(xa, ao)
-                x_after_attn_gm = pl.assemble(x_after_attn_gm, xr, [st, n0])
+                orig_tile = pl.slice(x_in, [SEQ_TILE, N_CHUNK], [st, n0])
+                attn_out_fp32 = pl.cast(pl.slice(attn_out_gm, [SEQ_TILE, N_CHUNK], [st, n0]), target_type=pl.FP32)
+                attention_residual = pl.add(orig_tile, attn_out_fp32)
+                x_after_attn_gm = pl.assemble(x_after_attn_gm, attention_residual, [st, n0])
 
     # ── Scope 6 · RMSNorm (pre-FFN) ──
     normed2_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
-    for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm2"):
-            partial_sq2 = pl.full([1, SEQ_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc2 = pl.slice(x_after_attn_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                partial_sq2 = pl.add(partial_sq2, pl.reshape(pl.row_sum(pl.mul(xc2, xc2)), [1, SEQ_TILE]))
-            var2 = pl.reshape(pl.add(pl.mul(partial_sq2, 1.0 / T5_DIM), EPS), [SEQ_TILE, 1])
-            inv2 = pl.rsqrt(var2)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc2 = pl.slice(x_after_attn_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                g2 = pl.slice(norm2_w_layer, [1, K_CHUNK], [0, k0])
-                n2 = pl.col_expand_mul(pl.row_expand_mul(xc2, inv2), g2)
-                normed2_gm = pl.assemble(normed2_gm, pl.cast(n2, target_type=pl.BF16), [st, k0])
+    normed2_gm = _rmsnorm(x_after_attn_gm, norm2_w_layer, normed2_gm)
 
     # ── Scope 7 · FFN gate + fc1 (GELU-tanh activation) ──
     fc1_gm = pl.create_tensor([T5_SEQ, T5_FFN], dtype=pl.BF16)
@@ -245,27 +251,28 @@ def t5_encoder_layer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_gate_fc1"):
             for ob in pl.range(T5_FFN // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta_f = pl.slice(normed2_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw0 = pl.slice(wi_0_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                ga = pl.matmul(ta_f, tw0, b_trans=True, out_dtype=pl.FP32)
-                tw1 = pl.slice(wi_1_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                fa = pl.matmul(ta_f, tw1, b_trans=True, out_dtype=pl.FP32)
+                ffn_act_tile = pl.slice(normed2_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                gate_w_chunk = pl.slice(wi_0_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                gate_acc = pl.matmul(ffn_act_tile, gate_w_chunk, b_trans=True, out_dtype=pl.FP32)
+                fc1_w_chunk = pl.slice(wi_1_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                fc1_acc = pl.matmul(ffn_act_tile, fc1_w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, HIDDEN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_fi = pl.slice(normed2_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw0i = pl.slice(wi_0_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    ga = pl.matmul_acc(ga, ta_fi, tw0i, b_trans=True)
-                    tw1i = pl.slice(wi_1_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    fa = pl.matmul_acc(fa, ta_fi, tw1i, b_trans=True)
-                g3 = pl.mul(pl.mul(ga, ga), ga)
-                gi = pl.add(ga, pl.mul(g3, 0.044715))
-                gs = pl.mul(gi, 0.7978845608)
-                g2x = pl.mul(gs, 2.0)
-                ge = pl.exp(g2x)
-                gt = pl.div(pl.sub(ge, 1.0), pl.add(ge, 1.0))
-                go = pl.mul(pl.mul(ga, 0.5), pl.add(gt, 1.0))
-                mo = pl.mul(fa, go)
-                fc1_gm = pl.assemble(fc1_gm, pl.cast(mo, target_type=pl.BF16), [st, n0])
+                    act_chunk = pl.slice(normed2_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    gate_w_chunk_i = pl.slice(wi_0_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    gate_acc = pl.matmul_acc(gate_acc, act_chunk, gate_w_chunk_i, b_trans=True)
+                    fc1_w_chunk_i = pl.slice(wi_1_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    fc1_acc = pl.matmul_acc(fc1_acc, act_chunk, fc1_w_chunk_i, b_trans=True)
+                # GELU-tanh: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                x_cubed     = pl.mul(pl.mul(gate_acc, gate_acc), gate_acc)
+                gelu_inner  = pl.add(gate_acc, pl.mul(x_cubed, 0.044715))
+                gelu_scaled = pl.mul(gelu_inner, 0.7978845608)
+                gelu_2z     = pl.mul(gelu_scaled, 2.0)
+                gelu_exp    = pl.exp(gelu_2z)
+                tanh_val    = pl.div(pl.sub(gelu_exp, 1.0), pl.add(gelu_exp, 1.0))
+                gelu_out    = pl.mul(pl.mul(gate_acc, 0.5), pl.add(tanh_val, 1.0))
+                gated_fc1   = pl.mul(fc1_acc, gelu_out)
+                fc1_gm = pl.assemble(fc1_gm, pl.cast(gated_fc1, target_type=pl.BF16), [st, n0])
 
     # ── Scope 8 · FFN fc2 + residual ──
     x_final_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.FP32)
@@ -273,17 +280,17 @@ def t5_encoder_layer(
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_fc2"):
             for ob in pl.range(T5_DIM // N_CHUNK):
                 n0 = ob * N_CHUNK
-                ta_fc2 = pl.slice(fc1_gm, [SEQ_TILE, K_CHUNK], [st, 0])
-                tw_fc2 = pl.slice(wo_layer, [N_CHUNK, K_CHUNK], [n0, 0])
-                f2 = pl.matmul(ta_fc2, tw_fc2, b_trans=True, out_dtype=pl.FP32)
+                fc1_out_tile = pl.slice(fc1_gm, [SEQ_TILE, K_CHUNK], [st, 0])
+                fc2_w_chunk = pl.slice(wo_layer, [N_CHUNK, K_CHUNK], [n0, 0])
+                fc2_acc = pl.matmul(fc1_out_tile, fc2_w_chunk, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, FFN_BLOCKS):
                     k0 = kb * K_CHUNK
-                    ta_fci = pl.slice(fc1_gm, [SEQ_TILE, K_CHUNK], [st, k0])
-                    tw_fci = pl.slice(wo_layer, [N_CHUNK, K_CHUNK], [n0, k0])
-                    f2 = pl.matmul_acc(f2, ta_fci, tw_fci, b_trans=True)
-                xa_fc2 = pl.slice(x_after_attn_gm, [SEQ_TILE, N_CHUNK], [st, n0])
-                x_final = pl.add(xa_fc2, f2)
-                x_final_gm = pl.assemble(x_final_gm, x_final, [st, n0])
+                    fc1_out_chunk = pl.slice(fc1_gm, [SEQ_TILE, K_CHUNK], [st, k0])
+                    fc2_w_chunk_i = pl.slice(wo_layer, [N_CHUNK, K_CHUNK], [n0, k0])
+                    fc2_acc = pl.matmul_acc(fc2_acc, fc1_out_chunk, fc2_w_chunk_i, b_trans=True)
+                attn_residual = pl.slice(x_after_attn_gm, [SEQ_TILE, N_CHUNK], [st, n0])
+                ffn_residual  = pl.add(attn_residual, fc2_acc)
+                x_final_gm = pl.assemble(x_final_gm, ffn_residual, [st, n0])
 
     out = pl.assemble(out, x_final_gm, [0, 0])
     return out
@@ -324,21 +331,7 @@ def t5_encoder(
     
     # ── Final RMSNorm ──
     x_final_normed_gm = pl.create_tensor([T5_SEQ, T5_DIM], dtype=pl.BF16)
-    for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
-            partial_sq_final = pl.full([1, SEQ_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc_final = pl.slice(cur, [SEQ_TILE, K_CHUNK], [st, k0])
-                partial_sq_final = pl.add(partial_sq_final, pl.reshape(pl.row_sum(pl.mul(xc_final, xc_final)), [1, SEQ_TILE]))
-            var_final = pl.reshape(pl.add(pl.mul(partial_sq_final, 1.0 / T5_DIM), EPS), [SEQ_TILE, 1])
-            inv_final = pl.rsqrt(var_final)
-            for kb in pl.range(HIDDEN_BLOCKS):
-                k0 = kb * K_CHUNK
-                xc_final = pl.slice(cur, [SEQ_TILE, K_CHUNK], [st, k0])
-                g_final = pl.slice(final_norm_w, [1, K_CHUNK], [0, k0])
-                n_final = pl.col_expand_mul(pl.row_expand_mul(xc_final, inv_final), g_final)
-                x_final_normed_gm = pl.assemble(x_final_normed_gm, pl.cast(n_final, target_type=pl.BF16), [st, k0])
+    x_final_normed_gm = _rmsnorm(cur, final_norm_w, x_final_normed_gm)
 
     # ── Output copy (BF16) ──
     for st in pl.parallel(0, T5_SEQ, SEQ_TILE):
@@ -351,120 +344,136 @@ def t5_encoder(
     return out
 
 
+def _golden_t5_encoder(x, norm1_w, q_w, k_w, v_w, o_w, rel_pos_bias, norm2_w, wi_0, wi_1, wo, final_norm_w):
+    """Golden reference using the EXACT same classes as test_golden_fun_control_full.py."""
+    layer_weights = {
+        'norm1_w': norm1_w,
+        'norm2_w': norm2_w,
+        'attn': {'q': q_w, 'k': k_w, 'v': v_w, 'o': o_w},
+        'ffn': {'wi_0': wi_0, 'wi_1': wi_1, 'wo': wo},
+        'pos_embedding': rel_pos_bias,
+    }
+    block = T5SelfAttention(
+        layer_weights, T5_DIM, T5_DIM, T5_FFN, T5_HEADS, T5_NUM_BUCKETS,
+        shared_pos=False, dropout=0.1,
+    )
+    x = block(x, mask=None, pos_bias=None)
+    x = T5LayerNorm(final_norm_w, T5_DIM)(x)
+    return x
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test harness — build_tensor_specs / golden_fn / __main__.
 # ══════════════════════════════════════════════════════════════════════════════
 
+_GOLDEN_DATA = None  # populated by build_tensor_specs, consumed by golden_t5_encoder_fn
+
+
 def build_tensor_specs():
+    global _GOLDEN_DATA
     from golden import TensorSpec
 
-    torch.manual_seed(42)
+    g = torch.Generator().manual_seed(42)
 
     norm1_w_1d = torch.ones(T5_DIM, dtype=torch.float32)
     norm2_w_1d = torch.ones(T5_DIM, dtype=torch.float32)
     final_norm_w_1d = torch.ones(T5_DIM, dtype=torch.float32)
 
-    q_w_fp32 = torch.randn(T5_DIM, T5_DIM, dtype=torch.float32) * 0.02
-    k_w_fp32 = torch.randn(T5_DIM, T5_DIM, dtype=torch.float32) * 0.02
-    v_w_fp32 = torch.randn(T5_DIM, T5_DIM, dtype=torch.float32) * 0.02
-    o_w_fp32 = torch.randn(T5_DIM, T5_DIM, dtype=torch.float32) * 0.02
-    rel_pos_bias_fp32 = torch.randn(T5_NUM_BUCKETS, T5_HEADS, dtype=torch.float32) * 0.02
-    wi_0_fp32 = torch.randn(T5_FFN, T5_DIM, dtype=torch.float32) * 0.02
-    wi_1_fp32 = torch.randn(T5_FFN, T5_DIM, dtype=torch.float32) * 0.02
-    wo_fp32 = torch.randn(T5_DIM, T5_FFN, dtype=torch.float32) * 0.02
+    def rn(shape):
+        return torch.empty(shape).normal_(generator=g) * 0.02
+
+    q_w = rn([T5_DIM, T5_DIM])
+    k_w = rn([T5_DIM, T5_DIM])
+    v_w = rn([T5_DIM, T5_DIM])
+    o_w = rn([T5_DIM, T5_DIM])
+    rel_pos_bias = rn([T5_NUM_BUCKETS, T5_HEADS])
+    wi_0 = rn([T5_FFN, T5_DIM])
+    wi_1 = rn([T5_FFN, T5_DIM])
+    wo = rn([T5_DIM, T5_FFN])
+
+    x_batch = torch.empty(1, T5_SEQ, T5_DIM).normal_(generator=g)
+    x_flat = x_batch.squeeze(0).contiguous()
 
     norm1_w_stacked = norm1_w_1d.unsqueeze(0).unsqueeze(0).expand(T5_LAYERS, 1, T5_DIM).contiguous()
     norm2_w_stacked = norm2_w_1d.unsqueeze(0).unsqueeze(0).expand(T5_LAYERS, 1, T5_DIM).contiguous()
     final_norm_w_2d = final_norm_w_1d.unsqueeze(0)
 
-    q_w_stacked = q_w_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
-    k_w_stacked = k_w_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
-    v_w_stacked = v_w_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
-    o_w_stacked = o_w_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
-    wi_0_stacked = wi_0_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_FFN, T5_DIM).contiguous()
-    wi_1_stacked = wi_1_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_FFN, T5_DIM).contiguous()
-    wo_stacked = wo_fp32.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_FFN).contiguous()
+    q_w_stacked = q_w.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
+    k_w_stacked = k_w.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
+    v_w_stacked = v_w.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
+    o_w_stacked = o_w.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_DIM).contiguous()
+    wi_0_stacked = wi_0.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_FFN, T5_DIM).contiguous()
+    wi_1_stacked = wi_1.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_FFN, T5_DIM).contiguous()
+    wo_stacked = wo.bfloat16().unsqueeze(0).expand(T5_LAYERS, T5_DIM, T5_FFN).contiguous()
 
-    pos_emb = T5RelativeEmbedding(rel_pos_bias_fp32, T5_NUM_BUCKETS, T5_HEADS, bidirectional=True)
-    pos_bias = pos_emb(T5_SEQ, T5_SEQ).squeeze(0)  # [H, S, S]
+    pos_emb = T5RelativeEmbedding(rel_pos_bias, T5_NUM_BUCKETS, T5_HEADS, bidirectional=True)
+    pos_bias = pos_emb(T5_SEQ, T5_SEQ).squeeze(0)
     pos_bias_stacked = pos_bias.unsqueeze(0).expand(T5_LAYERS, T5_HEADS, T5_SEQ, T5_SEQ).contiguous()
 
-    return [
-        TensorSpec("x_in",         [T5_SEQ, T5_DIM],                       torch.float32,  init_value=torch.randn),
-        TensorSpec("norm1_w",      [T5_LAYERS, 1, T5_DIM],                torch.float32,  init_value=norm1_w_stacked),
-        TensorSpec("q_w",          [T5_LAYERS, T5_DIM, T5_DIM],           torch.bfloat16, init_value=q_w_stacked),
-        TensorSpec("k_w",          [T5_LAYERS, T5_DIM, T5_DIM],           torch.bfloat16, init_value=k_w_stacked),
-        TensorSpec("v_w",          [T5_LAYERS, T5_DIM, T5_DIM],           torch.bfloat16, init_value=v_w_stacked),
-        TensorSpec("o_w",          [T5_LAYERS, T5_DIM, T5_DIM],           torch.bfloat16, init_value=o_w_stacked),
-        TensorSpec("pos_bias",     [T5_LAYERS, T5_HEADS, T5_SEQ, T5_SEQ], torch.float32,  init_value=pos_bias_stacked),
-        TensorSpec("norm2_w",      [T5_LAYERS, 1, T5_DIM],                torch.float32,  init_value=norm2_w_stacked),
-        TensorSpec("wi_0",         [T5_LAYERS, T5_FFN, T5_DIM],           torch.bfloat16, init_value=wi_0_stacked),
-        TensorSpec("wi_1",         [T5_LAYERS, T5_FFN, T5_DIM],           torch.bfloat16, init_value=wi_1_stacked),
-        TensorSpec("wo",           [T5_LAYERS, T5_DIM, T5_FFN],           torch.bfloat16, init_value=wo_stacked),
-        TensorSpec("final_norm_w", [1, T5_DIM],                           torch.float32,  init_value=final_norm_w_2d),
-        TensorSpec("out",          [T5_SEQ, T5_DIM],                      torch.bfloat16, is_output=True),
+    def _identity(t):
+        return lambda: t
+
+    specs = [
+        TensorSpec("x_in",       [T5_SEQ, T5_DIM],                        torch.float32,  init_value=_identity(x_flat)),
+        TensorSpec("norm1_w",    [T5_LAYERS, 1, T5_DIM],                  torch.float32,  init_value=_identity(norm1_w_stacked)),
+        TensorSpec("q_w",        [T5_LAYERS, T5_DIM, T5_DIM],             torch.bfloat16, init_value=_identity(q_w_stacked)),
+        TensorSpec("k_w",        [T5_LAYERS, T5_DIM, T5_DIM],             torch.bfloat16, init_value=_identity(k_w_stacked)),
+        TensorSpec("v_w",        [T5_LAYERS, T5_DIM, T5_DIM],             torch.bfloat16, init_value=_identity(v_w_stacked)),
+        TensorSpec("o_w",        [T5_LAYERS, T5_DIM, T5_DIM],             torch.bfloat16, init_value=_identity(o_w_stacked)),
+        TensorSpec("pos_bias",   [T5_LAYERS, T5_HEADS, T5_SEQ, T5_SEQ],   torch.float32,  init_value=_identity(pos_bias_stacked)),
+        TensorSpec("norm2_w",    [T5_LAYERS, 1, T5_DIM],                  torch.float32,  init_value=_identity(norm2_w_stacked)),
+        TensorSpec("wi_0",       [T5_LAYERS, T5_FFN, T5_DIM],             torch.bfloat16, init_value=_identity(wi_0_stacked)),
+        TensorSpec("wi_1",       [T5_LAYERS, T5_FFN, T5_DIM],             torch.bfloat16, init_value=_identity(wi_1_stacked)),
+        TensorSpec("wo",         [T5_LAYERS, T5_DIM, T5_FFN],             torch.bfloat16, init_value=_identity(wo_stacked)),
+        TensorSpec("final_norm_w", [1, T5_DIM],                           torch.float32,  init_value=_identity(final_norm_w_2d)),
     ]
+    specs.append(TensorSpec("out", [T5_SEQ, T5_DIM], torch.bfloat16, is_output=True))
 
-
-def golden_t5_encoder(tensors):
-    """Golden reference using precomputed position bias (shared_pos=True).
-
-    Extracts layer-0 weights from the stacked kernel tensors and passes the
-    precomputed ``pos_bias`` through ``T5SelfAttention`` with ``shared_pos=True``,
-    producing identical results to the per-layer ``shared_pos=False`` path used by
-    ``t5_encode`` in ``test_golden_fun_control_full.py``.
-    """
-    x = tensors["x_in"].unsqueeze(0)  # [1, S, D]
-
-    pos_bias_4d = tensors["pos_bias"][0].unsqueeze(0)  # [1, H, S, S]
-
-    layer_weights = {
-        'norm1_w': tensors["norm1_w"][0, 0, :],
-        'norm2_w': tensors["norm2_w"][0, 0, :],
-        'attn': {
-            'q': tensors["q_w"][0].float(),
-            'k': tensors["k_w"][0].float(),
-            'v': tensors["v_w"][0].float(),
-            'o': tensors["o_w"][0].float(),
-        },
-        'ffn': {
-            'wi_0': tensors["wi_0"][0].float(),
-            'wi_1': tensors["wi_1"][0].float(),
-            'wo': tensors["wo"][0].float(),
-        },
+    _GOLDEN_DATA = {
+        "x_batch": x_batch, "norm1_w": norm1_w_1d, "q_w": q_w, "k_w": k_w,
+        "v_w": v_w, "o_w": o_w, "rel_pos_bias": rel_pos_bias,
+        "norm2_w": norm2_w_1d, "wi_0": wi_0, "wi_1": wi_1, "wo": wo,
+        "final_norm_w": final_norm_w_1d,
     }
+    return specs
 
-    block = T5SelfAttention(
-        layer_weights, T5_DIM, T5_DIM, T5_FFN, T5_HEADS, T5_NUM_BUCKETS,
-        shared_pos=True, dropout=0.1,
+
+def golden_t5_encoder_fn(tensors):
+    """Run golden T5 encoder and fill tensors['out']."""
+    x_expected = _golden_t5_encoder(
+        _GOLDEN_DATA["x_batch"], _GOLDEN_DATA["norm1_w"],
+        _GOLDEN_DATA["q_w"], _GOLDEN_DATA["k_w"], _GOLDEN_DATA["v_w"], _GOLDEN_DATA["o_w"],
+        _GOLDEN_DATA["rel_pos_bias"], _GOLDEN_DATA["norm2_w"],
+        _GOLDEN_DATA["wi_0"], _GOLDEN_DATA["wi_1"], _GOLDEN_DATA["wo"],
+        _GOLDEN_DATA["final_norm_w"],
     )
-    x = block(x, mask=None, pos_bias=pos_bias_4d)
-    x = T5LayerNorm(tensors["final_norm_w"].squeeze(0), T5_DIM)(x)
-
-    tensors["out"][:] = x.squeeze(0).bfloat16()
+    tensors["out"][:] = x_expected.squeeze(0).bfloat16()
 
 
 if __name__ == "__main__":
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+    parser = argparse.ArgumentParser(description="T5 Encoder pypto3.0 kernel test")
+    parser.add_argument("-p", "--platform", default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
+    specs = build_tensor_specs()
+
     result = run_jit(
         fn=t5_encoder,
-        specs=build_tensor_specs(),
-        golden_fn=golden_t5_encoder,
+        specs=specs,
+        golden_fn=golden_t5_encoder_fn,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
-        rtol=1.2e-1,
-        atol=1.2e-1,
+        rtol=3e-3,
+        atol=3e-3,
+        compare_fn={"out": ratio_allclose(atol=3e-3, rtol=3e-3, max_error_ratio=0.02)},
     )
     if not result.passed:
         if result.error:
