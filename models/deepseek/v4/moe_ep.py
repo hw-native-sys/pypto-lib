@@ -36,6 +36,7 @@ EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
 config.EP_ROUTING_GLOBAL = True
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)  # 32 experts/rank
+config.RECV_MAX = max(config.RECV_MAX, config.PREFILL_LAYER_RECV_MAX)
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -772,7 +773,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_moe_ep,
         golden_data=golden_data,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
             distributed_config=DistributedConfig(

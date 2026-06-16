@@ -147,8 +147,8 @@ def _prefill_hca_cache_writeback_overlay(
     return pl.reshape(ori_kv_flat, [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
 
-@pl.jit
-def prefill_attention_hca(
+@pl.jit.inline
+def prefill_attention_hca_core(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -280,6 +280,88 @@ def prefill_attention_hca(
         post,
         comb,
         x_out,
+    )
+    return x_out
+
+
+@pl.jit
+def prefill_attention_hca(
+    x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[MAX_REQS, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    x_out = prefill_attention_hca_core(
+        x_hc,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        cmp_kv_state,
+        cmp_score_state,
+        compress_state_block_table,
+        kv_cache,
+        ori_slot_mapping,
+        ori_block_table,
+        cmp_kv,
+        cmp_block_table,
+        cmp_sparse_indices,
+        cmp_sparse_lens,
+        token_to_request,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        x_out,
+        num_tokens,
     )
     return x_out
 
@@ -1057,7 +1139,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-2,
         atol=1e-2,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         compare_fn={
             "x_out": active_x_out_compare(compare_tokens),
         },

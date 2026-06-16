@@ -9,6 +9,7 @@
 """DeepSeek-V4 configuration"""
 
 from dataclasses import dataclass
+import os
 from typing import Literal, Optional, Tuple
 
 
@@ -262,6 +263,7 @@ EP_RANK = 0
 RECV_SAFETY = 4
 RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
             // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY
+PREFILL_LAYER_RECV_MAX = int(os.environ.get("DSV4_MOE_EP_RECV_MAX", str(RECV_MAX)))
 
 # When True, gate.py's N_EXPERTS uses the full global expert space
 # (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
