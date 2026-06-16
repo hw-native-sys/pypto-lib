@@ -84,6 +84,10 @@ SWA_CASES = (
     "hetero_full_capacity_overlay",
     "hetero_single_long_mix_overlay",
     "cmp_sparse_lens_boundary",
+    "cmp_sparse_lens_zero_garbage",
+    "hetero_second_only",
+    "issue511_active_no_write_slot",
+    "issue511_ori_block_table_permutation",
 )
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
@@ -178,6 +182,18 @@ def _resolve_swa_case(
     elif swa_case == "cmp_sparse_lens_boundary":
         q_lens_values = [50, 0]
         context_lens_values = [100, 0]
+    elif swa_case == "cmp_sparse_lens_zero_garbage":
+        q_lens_values = [50, 0]
+        context_lens_values = [100, 0]
+    elif swa_case == "hetero_second_only":
+        q_lens_values = [0, 17]
+        context_lens_values = [0, 100]
+    elif swa_case == "issue511_active_no_write_slot":
+        q_lens_values = [17, 0]
+        context_lens_values = [64, 0]
+    elif swa_case == "issue511_ori_block_table_permutation":
+        q_lens_values = [32, 32]
+        context_lens_values = [64, 120]
     else:
         raise ValueError(f"unknown --swa-case {swa_case!r}; expected one of {SWA_CASES}")
 
@@ -557,24 +573,40 @@ def build_tensor_specs(
     def init_block_table():
         tbl = torch.full((MAX_REQS, MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
-            tbl[req, 0] = req
+            phys = req
+            if swa_case == "issue511_ori_block_table_permutation":
+                phys = (req + 1) % MAX_REQS
+            tbl[req, 0] = phys
         return tbl
+    def cache_row_from_table(table, req, slot):
+        block = slot // BLOCK_SIZE
+        intra = slot % BLOCK_SIZE
+        phys_block = int(table[req, block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * BLOCK_SIZE + intra
     def init_kv_cache():
         cache = torch.zeros(BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        table = init_block_table()
         for req, ctx in enumerate(context_lens_values):
             start = max(0, ctx - WIN)
             for abs_pos in range(start, ctx):
-                row = req * BLOCK_SIZE + abs_pos % WIN
+                row = cache_row_from_table(table, req, abs_pos % WIN)
                 value = seeded_uniform((HEAD_DIM,), 11 + req * 4096 + abs_pos, 0.1)
-                cache_flat[row] = value.to(torch.bfloat16)
+                if row >= 0:
+                    cache_flat[row] = value.to(torch.bfloat16)
         return cache
     def init_ori_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
+        table = init_block_table()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
-            mapping[t] = req * BLOCK_SIZE + int(pos[t].item()) % WIN
+            mapping[t] = cache_row_from_table(table, req, int(pos[t].item()) % WIN)
+        if swa_case == "issue511_active_no_write_slot":
+            mapping[0] = -1
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_cmp_sparse_indices():
         topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -600,6 +632,10 @@ def build_tensor_specs(
             valid = (topk_idxs[t] >= 0).nonzero()
             if valid.numel():
                 sparse_lens[t] = int(valid[-1].item()) + 1
+        if swa_case == "cmp_sparse_lens_zero_garbage":
+            for t in range(0, num_tokens, 7):
+                topk_idxs[t, :] = torch.arange(SPARSE_TOPK, dtype=torch.int32) + WIN + MAX_TOKENS + 1024
+                sparse_lens[t] = 0
         validate_overlay_topk(topk_idxs, token_to_req, pos, sparse_lens)
         return topk_idxs
     def init_cmp_sparse_lens():
@@ -611,6 +647,8 @@ def build_tensor_specs(
                 lens[t] = int(valid[-1].item()) + 1
                 if swa_case == "cmp_sparse_lens_boundary":
                     lens[t] = max(1, int(lens[t].item()) - 8)
+                elif swa_case == "cmp_sparse_lens_zero_garbage" and t % 7 == 0:
+                    lens[t] = 0
         return lens
     def init_token_to_request():
         return token_meta()[0]

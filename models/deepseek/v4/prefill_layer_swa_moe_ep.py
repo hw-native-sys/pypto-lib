@@ -1,0 +1,438 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ci: devices=2
+"""DeepSeek-V4 packed prefill SWA single layer with MoE EP2."""
+
+import os
+
+import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
+
+# Import moe_ep first. It applies the EP2 FLASH override before dependent
+# modules bake config-derived MoE shapes.
+os.environ.setdefault("DSV4_MOE_EP_RECV_MAX", "96")
+from moe_ep import (
+    D,
+    HC_DIM,
+    HC_MULT,
+    IDX_PAD,
+    MIX_HC,
+    MOE_INTER,
+    N_EXPERTS_GLOBAL,
+    N_LOCAL,
+    N_RANKS,
+    N_ROUTES,
+    RECV_MAX,
+    T,
+    TOPK,
+    VOCAB,
+    W_PAD,
+    build_tensor_specs as build_moe_tensor_specs,
+    golden_moe_ep,
+    moe_ep,
+    prefill_layer_select_active_x_attn,
+)
+from hc_pre import hc_pre
+from hc_post import hc_post
+from prefill_attention_swa import (
+    BLOCK_NUM,
+    BLOCK_SIZE,
+    HEAD_DIM,
+    H,
+    MAX_BLOCKS,
+    MAX_REQS,
+    MAX_SEQ_LEN,
+    MAX_TOKENS,
+    O_GROUPS,
+    O_GROUP_IN,
+    O_LORA,
+    Q_LORA,
+    ROPE_HEAD_DIM,
+    SPARSE_CMP_MAX_BLOCKS,
+    SPARSE_HCA_CMP_BLOCK_NUM,
+    SPARSE_TOPK,
+    START_POS,
+    SWA_CASES,
+    _resolve_swa_case,
+    build_tensor_specs as build_attention_tensor_specs,
+    golden_prefill_attention_swa,
+    prefill_swa_write_kv_cache_overlay,
+)
+from prefill_layer_ep_common import (
+    active_ranked_x_next_compare,
+    build_ranked_layer_specs,
+    golden_prefill_layer_ep,
+)
+from qkv_proj_rope import materialize_rope_rows, qkv_proj_rope
+from rmsnorm import attn_norm
+from prefill_sparse_attn import prefill_sparse_attn
+
+
+assert MAX_TOKENS == T, "prefill SWA and MoE EP must agree on token-major T"
+assert HC_MULT == 4, "DeepSeek V4 FLASH HC_MULT is expected to be 4"
+
+ATTENTION_NAME_MAP = {
+    "hc_attn_fn": "hc_fn",
+    "hc_attn_scale": "hc_scale",
+    "hc_attn_base": "hc_base",
+}
+
+
+@pl.jit
+def prefill_layer_swa_moe_ep(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    block_table: pl.Tensor[[MAX_REQS, MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    x_attn: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    layer_id: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    x_mixed = hc_pre(
+        x_hc,
+        hc_fn, hc_scale, hc_base,
+        x_mixed, post, comb,
+    )
+
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed = attn_norm(x_mixed, attn_norm_w, x_normed)
+
+    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
+    q = qkv_proj_rope(
+        x_normed,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
+    )
+
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    cmp_kv_dummy = pl.create_tensor([SPARSE_HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_block_table_dummy = pl.create_tensor([MAX_REQS, SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_swa_dummy_cmp_table"):
+        for dummy_req in pl.range(MAX_REQS):
+            for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
+                pl.write(cmp_block_table_dummy, [dummy_req, dummy_blk], pl.cast(0, pl.INT32))
+    attn_out = prefill_sparse_attn(
+        q,
+        kv_cache,
+        block_table,
+        kv,
+        cmp_kv_dummy,
+        cmp_block_table_dummy,
+        cmp_sparse_indices,
+        cmp_sparse_lens,
+        attn_sink,
+        token_to_request,
+        num_tokens,
+        rope_cos_t,
+        rope_sin_t,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+    )
+    prefill_swa_write_kv_cache_overlay(kv, kv_cache, ori_slot_mapping, attn_out, num_tokens)
+
+    x_attn = hc_post(attn_out, x_hc, post, comb, x_attn)
+    x_moe = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_moe = prefill_layer_select_active_x_attn(x_attn, x_hc, x_moe, num_tokens)
+    x_next = moe_ep(
+        x_moe,
+        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_next,
+        pub_counts, count_done, data_done,
+        recv_x, recv_scale, recv_w, recv_r_route,
+        routed_y_buf, combine_done,
+        layer_id, my_rank,
+    )
+    return x_next
+
+@pl.jit.host
+def l3_prefill_layer_swa_moe_ep(
+    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
+    hc_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
+    hc_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
+    wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[N_RANKS, H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.Out[pl.Tensor[[N_RANKS, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    block_table: pl.Tensor[[N_RANKS, MAX_REQS, MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
+    cmp_sparse_indices: pl.Tensor[[N_RANKS, MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
+    token_to_request: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
+    attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
+    wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
+    gate_w: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
+    routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_RANKS, N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
+    x_attn: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+    layer_id: pl.Scalar[pl.INT32],
+):
+    pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
+    count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
+    recv_scale_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
+    recv_w_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
+    recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
+    routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
+    combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    for rank in pl.range(pld.world_size()):
+        pub_counts = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
+        count_done = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_done = pld.window(data_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_scale = pld.window(recv_scale_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
+        recv_w = pld.window(recv_w_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
+        recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        prefill_layer_swa_moe_ep(
+            x_hc[rank],
+            hc_fn[rank], hc_scale[rank], hc_base[rank],
+            attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
+            wkv[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
+            kv_cache[rank], block_table[rank], ori_slot_mapping[rank],
+            cmp_sparse_indices[rank], cmp_sparse_lens[rank],
+            token_to_request[rank], position_ids[rank],
+            attn_sink[rank], wo_a[rank], wo_b[rank], wo_b_scale[rank],
+            hc_ffn_fn[rank], hc_ffn_scale[rank], hc_ffn_base[rank],
+            norm_w[rank], gate_w[rank], gate_bias[rank], tid2eid[rank], input_ids[rank],
+            routed_w1[rank], routed_w1_scale[rank], routed_w3[rank], routed_w3_scale[rank],
+            routed_w2[rank], routed_w2_scale[rank],
+            shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
+            shared_w2[rank], shared_w2_scale[rank],
+            x_attn[rank],
+            x_next[rank],
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            routed_y_buf, combine_done,
+            num_tokens, layer_id, rank,
+            device=rank,
+        )
+
+
+def build_tensor_specs(start_pos=START_POS, num_tokens=MAX_TOKENS, swa_case="custom",
+                       hetero_smoke=False, hetero_boundary=False, layer_id=0):
+    import torch
+    from golden import TensorSpec
+
+    attention_specs = build_attention_tensor_specs(
+        start_pos=start_pos,
+        num_tokens=num_tokens,
+        swa_case=swa_case,
+        hetero_smoke=hetero_smoke,
+        hetero_boundary=hetero_boundary,
+    )
+    moe_specs = build_moe_tensor_specs(layer_id=layer_id)
+    return build_ranked_layer_specs(
+        attention_specs,
+        moe_specs,
+        N_RANKS,
+        [N_RANKS, T, HC_MULT, D],
+        torch,
+        TensorSpec,
+        attention_name_map=ATTENTION_NAME_MAP,
+        n_experts_global=N_EXPERTS_GLOBAL,
+    )
+
+def golden_prefill_layer_swa_moe_ep(tensors):
+    import torch
+    from golden import TensorSpec
+
+    attention_specs = build_attention_tensor_specs(
+        num_tokens=int(tensors["num_tokens"]),
+    )
+    golden_prefill_layer_ep(
+        tensors,
+        attention_specs,
+        golden_prefill_attention_swa,
+        golden_moe_ep,
+        N_RANKS,
+        torch,
+        TensorSpec,
+        attention_name_map=ATTENTION_NAME_MAP,
+    )
+
+
+def _resolve_compare_tokens(args):
+    q_lens_values, _, num_tokens, _ = _resolve_swa_case(
+        args.start_pos,
+        args.num_tokens,
+        args.swa_case,
+        args.hetero_smoke,
+        args.hetero_boundary,
+    )
+    return min(num_tokens, sum(q_lens_values))
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from golden import ratio_allclose, run_jit
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=str, default="0,1",
+                        help="comma-separated device ids; need at least 2")
+    parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Fixture-only prefix length for --swa-case=custom.")
+    parser.add_argument("--num-tokens", type=int, default=MAX_TOKENS,
+                        help="Fixture active token count for --swa-case=custom.")
+    parser.add_argument("--swa-case", type=str, default="custom", choices=SWA_CASES)
+    parser.add_argument("--hetero-smoke", action="store_true", default=False)
+    parser.add_argument("--hetero-boundary", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    args = parser.parse_args()
+
+    device_ids = [int(d) for d in args.device.split(",")]
+    assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+
+    compare_tokens = _resolve_compare_tokens(args)
+    result = run_jit(
+        fn=l3_prefill_layer_swa_moe_ep,
+        specs=build_tensor_specs(
+            start_pos=args.start_pos,
+            num_tokens=args.num_tokens,
+            swa_case=args.swa_case,
+            hetero_smoke=args.hetero_smoke,
+            hetero_boundary=args.hetero_boundary,
+            layer_id=args.layer_id,
+        ),
+        golden_fn=golden_prefill_layer_swa_moe_ep,
+        compile_only=args.platform.endswith("sim"),
+        compile_cfg=dict(
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:N_RANKS],
+                num_sub_workers=0,
+            ),
+        ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            "x_attn": active_ranked_x_next_compare(compare_tokens),
+            "x_next": active_ranked_x_next_compare(compare_tokens),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
+        },
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

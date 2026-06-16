@@ -116,7 +116,12 @@ CSA_CASES = (
     "hetero_full_capacity_overlay_cmp",
     "hetero_single_long_mix_overlay_cmp",
     "cmp_sparse_lens_boundary",
+    "cmp_sparse_lens_zero_garbage",
     "issue511_mapping_boundary",
+    "hetero_second_only",
+    "issue511_active_no_write_slot",
+    "issue511_ori_block_table_permutation",
+    "issue511_cmp_block_table_permutation",
     "issue511_idx_slot_distinct",
     "issue511_idx_block_table_permutation",
 )
@@ -193,9 +198,24 @@ def _resolve_csa_case(
     elif csa_case == "cmp_sparse_lens_boundary":
         q_lens_values = [7, 0]
         context_lens_values = [5, 0]
+    elif csa_case == "cmp_sparse_lens_zero_garbage":
+        q_lens_values = [7, 0]
+        context_lens_values = [5, 0]
     elif csa_case == "issue511_mapping_boundary":
         q_lens_values = [5, 5]
         context_lens_values = [2, 6]
+    elif csa_case == "hetero_second_only":
+        q_lens_values = [0, 17]
+        context_lens_values = [0, 100]
+    elif csa_case == "issue511_active_no_write_slot":
+        q_lens_values = [32, 32]
+        context_lens_values = [96, 230]
+    elif csa_case == "issue511_ori_block_table_permutation":
+        q_lens_values = [32, 32]
+        context_lens_values = [64, 120]
+    elif csa_case == "issue511_cmp_block_table_permutation":
+        q_lens_values = [50, 40]
+        context_lens_values = [96, 230]
     elif csa_case == "issue511_idx_slot_distinct":
         q_lens_values = [50, 40]
         context_lens_values = [96, 230]
@@ -888,43 +908,57 @@ def build_tensor_specs(
     def init_kv_cache():
         cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        table = init_ori_block_table()
         for req, ctx in enumerate(context_lens_values):
             start = max(0, ctx - WIN)
             for abs_pos in range(start, ctx):
-                row = req * SPARSE_ORI_MAX_BLOCKS * BLOCK_SIZE + abs_pos % WIN
+                row = cache_row_from_table(table, req, abs_pos % WIN)
                 value = seeded_uniform((HEAD_DIM,), 1000 + req * 4096 + abs_pos, 0.1)
-                cache_flat[row] = value.to(torch.bfloat16)
+                if row >= 0:
+                    cache_flat[row] = value.to(torch.bfloat16)
         return cache
     def init_ori_block_table():
         table = torch.full((MAX_REQS, SPARSE_ORI_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
             for block in range(SPARSE_ORI_MAX_BLOCKS):
-                table[req, block] = req * SPARSE_ORI_MAX_BLOCKS + block
+                phys_req = req
+                if csa_case == "issue511_ori_block_table_permutation":
+                    phys_req = (req + 1) % MAX_REQS
+                table[req, block] = phys_req * SPARSE_ORI_MAX_BLOCKS + block
         return table
     def init_ori_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, _, pos = token_meta()
+        table = init_ori_block_table()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
-            mapping[t] = req * SPARSE_ORI_MAX_BLOCKS * BLOCK_SIZE + int(pos[t].item()) % WIN
+            mapping[t] = cache_row_from_table(table, req, int(pos[t].item()) % WIN)
+        if csa_case == "issue511_active_no_write_slot":
+            mapping[0] = -1
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_cmp_kv():
         cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(CSA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        table = init_cmp_block_table()
         for req, ctx in enumerate(context_lens_values):
             completed = ctx // COMPRESS_RATIO
             for cmp_slot in range(completed):
                 if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
                     break
-                row = req * SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE + cmp_slot
+                row = cache_row_from_table(table, req, cmp_slot)
                 value = seeded_uniform((HEAD_DIM,), 2000 + req * 4096 + cmp_slot, 0.1)
-                cache_flat[row] = value.to(torch.bfloat16)
+                if row >= 0:
+                    cache_flat[row] = value.to(torch.bfloat16)
         return cache
     def init_cmp_block_table():
         table = torch.full((MAX_REQS, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
             for block in range(SPARSE_CMP_MAX_BLOCKS):
-                table[req, block] = req * SPARSE_CMP_MAX_BLOCKS + block
+                phys_req = req
+                if csa_case == "issue511_cmp_block_table_permutation":
+                    phys_req = (req + 1) % MAX_REQS
+                table[req, block] = phys_req * SPARSE_CMP_MAX_BLOCKS + block
         return table
     def init_idx_block_table():
         table = torch.full((MAX_REQS, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
@@ -978,14 +1012,22 @@ def build_tensor_specs(
     def init_cmp_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         table = init_cmp_block_table()
-        for token_id, req, cmp_slot in cmp_write_records():
+        records = cmp_write_records()
+        for token_id, req, cmp_slot in records:
             mapping[token_id] = cache_row_from_table(table, req, cmp_slot)
+        if csa_case == "issue511_active_no_write_slot" and records:
+            token_id, _, _ = records[0]
+            mapping[token_id] = -1
         return mapping
     def init_idx_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         table = init_idx_block_table()
-        for token_id, req, cmp_slot in cmp_write_records():
+        records = cmp_write_records()
+        for token_id, req, cmp_slot in records:
             mapping[token_id] = cache_row_from_table(table, req, cmp_slot)
+        if csa_case == "issue511_active_no_write_slot" and records:
+            token_id, _, _ = records[0]
+            mapping[token_id] = -1
         return mapping
     def init_state_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
@@ -993,6 +1035,9 @@ def build_tensor_specs(
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             mapping[t] = state_row(req, int(pos[t].item()))
+        if csa_case == "issue511_active_no_write_slot":
+            mapping[0] = -1
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_inner_state_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
@@ -1000,6 +1045,9 @@ def build_tensor_specs(
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             mapping[t] = inner_state_row(req, int(pos[t].item()))
+        if csa_case == "issue511_active_no_write_slot":
+            mapping[0] = -1
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_attn_sink():
         return torch.zeros(H)
@@ -1071,6 +1119,7 @@ def build_tensor_specs(
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
+            is_output=True,
         ),
         TensorSpec("cmp_block_table", [MAX_REQS, SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
@@ -1078,6 +1127,7 @@ def build_tensor_specs(
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.bfloat16,
             init_value=init_idx_kv_cache,
+            is_output=True,
         ),
         TensorSpec("idx_block_table", [MAX_REQS, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
@@ -1207,6 +1257,8 @@ if __name__ == "__main__":
         compare_fn={
             "x_out": active_x_out_compare(compare_tokens),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
+            "cmp_kv": ratio_allclose(atol=5e-3, rtol=1e-2),
+            "idx_kv_cache": ratio_allclose(atol=5e-3, rtol=1e-2),
         },
     )
     if not result.passed:
