@@ -310,29 +310,32 @@ def prefill_compressor_ratio128(
                     0:CMP_HEAD_CHUNK,
                 ]
 
-    for update_idx in pl.spmd(MAX_TOKENS * CMP_OUT_BLOCKS, name_hint="prefill_hca_c128_state_update"):
-        update_ob = update_idx % CMP_OUT_BLOCKS
-        update_t = update_idx // CMP_OUT_BLOCKS
-        update_o0 = update_ob * CMP_OUT_CHUNK
+    # State writeback: one SPMD task per token (was per token x out-block =
+    # MAX_TOKENS*CMP_OUT_BLOCKS tiny tasks). The per-token guard is checked once
+    # so a skipped token costs one empty task instead of CMP_OUT_BLOCKS of them;
+    # the out-blocks are looped inside the task to keep each vector op at the
+    # CMP_OUT_CHUNK width. pool_dep keeps the (zero-weighted) ordering after
+    # softmax_pool and is hoisted to once per token.
+    for update_t in pl.spmd(MAX_TOKENS, name_hint="prefill_hca_c128_state_update"):
         if update_t < num_tokens:
             state_row_raw = pl.read(state_slot_mapping, [update_t])
             if state_row_raw >= 0:
                 state_row = pl.cast(state_row_raw, pl.INDEX)
                 update_pos = pl.read(position_ids, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + CMP_OUT_CHUNK]
-                pool_dep = pl.mul(pooled_kv_pad[0:1, 0:CMP_OUT_CHUNK], 0.0)
-                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + CMP_OUT_CHUNK] = pl.add(
-                    kv_proj[
-                        update_t : update_t + 1,
-                        update_o0 : update_o0 + CMP_OUT_CHUNK,
-                    ],
+                # MAIN_OUT_DIM (= HEAD_DIM, 512 fp32 / 2 KB) fits one vector op, so
+                # write the whole state row at once instead of CMP_OUT_BLOCKS chunks.
+                # pool_dep is the zero-weighted read that keeps the ordering after
+                # softmax_pool (pooled_kv_pad is MAIN_OUT_DIM wide).
+                pool_dep = pl.mul(pooled_kv_pad[0:1, 0:MAIN_OUT_DIM], 0.0)
+                kv_state_flat[state_row : state_row + 1, 0:MAIN_OUT_DIM] = pl.add(
+                    kv_proj[update_t : update_t + 1, 0:MAIN_OUT_DIM],
                     pool_dep,
                 )
-                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + CMP_OUT_CHUNK] = pl.add(
+                score_state_flat[state_row : state_row + 1, 0:MAIN_OUT_DIM] = pl.add(
                     pl.add(
-                        score_proj[update_t : update_t + 1, update_o0 : update_o0 + CMP_OUT_CHUNK],
-                        ape_row,
+                        score_proj[update_t : update_t + 1, 0:MAIN_OUT_DIM],
+                        ape[ape_slot : ape_slot + 1, 0:MAIN_OUT_DIM],
                     ),
                     pool_dep,
                 )

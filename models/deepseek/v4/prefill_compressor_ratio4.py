@@ -301,32 +301,37 @@ def prefill_compressor_ratio4(
                     0:HEAD_DIM,
                 ]
 
-    for update_idx in pl.spmd(MAX_TOKENS * PACKED_PROJ_BLOCKS, name_hint="prefill_c4_state_update"):
-        update_ob = update_idx % PACKED_PROJ_BLOCKS
-        update_t = update_idx // PACKED_PROJ_BLOCKS
-        update_o0 = update_ob * OUT_CHUNK
+    # State writeback: one SPMD task per token (was per token x out-block =
+    # MAX_TOKENS*PACKED_PROJ_BLOCKS tiny tasks). The per-token guard is checked
+    # once so a skipped token costs one empty task instead of PACKED_PROJ_BLOCKS
+    # of them; out-blocks are looped inside the task at the OUT_CHUNK width.
+    # pool_dep keeps the (zero-weighted) ordering after the pool and is hoisted
+    # to once per token.
+    for update_t in pl.spmd(MAX_TOKENS, name_hint="prefill_c4_state_update"):
         if update_t < num_tokens:
             state_row_raw = pl.read(state_slot_mapping, [update_t])
             if state_row_raw >= 0:
                 state_row = pl.cast(state_row_raw, pl.INDEX)
                 update_pos = pl.read(position_ids, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_CHUNK]
                 pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_CHUNK], 0.0)
-                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
-                    kv_proj[
-                        update_t : update_t + 1,
-                        update_o0 : update_o0 + OUT_CHUNK,
-                    ],
-                    pool_dep,
-                )
-                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
-                    pl.add(
-                        score_proj[update_t : update_t + 1, update_o0 : update_o0 + OUT_CHUNK],
-                        ape_row,
-                    ),
-                    pool_dep,
-                )
+                for update_ob in pl.range(PACKED_PROJ_BLOCKS):
+                    update_o0 = update_ob * OUT_CHUNK
+                    ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_CHUNK]
+                    kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
+                        kv_proj[
+                            update_t : update_t + 1,
+                            update_o0 : update_o0 + OUT_CHUNK,
+                        ],
+                        pool_dep,
+                    )
+                    score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_CHUNK] = pl.add(
+                        pl.add(
+                            score_proj[update_t : update_t + 1, update_o0 : update_o0 + OUT_CHUNK],
+                            ape_row,
+                        ),
+                        pool_dep,
+                    )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv_state = pl.reshape(kv_state_flat, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM])
