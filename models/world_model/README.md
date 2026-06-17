@@ -142,7 +142,7 @@ AdaLN → Self-Attn(RoPE) → Cross-Attn(text+img) → FFN → Head → output
 ```
 
 **输入**:
-- `x_input`: [1, DIT_IN_DIM + COND_CH, FP, LAT_H, LAT_W] — noisy latent
+- `patch_col`: [X_N, PATCH_CONV_COL] — im2col'd noisy latent (BF16)
 - `text_raw`: [T5_SEQ, T5_DIM] — text context from T5 encoder (BF16)
 - `clip_raw`: [CLIP_PAD, CLIP_DIM] — image context from CLIP encoder (BF16, padded)
 - `ref_col`: [REF_N, REF_CONV_COL] — im2col'd reference latent (BF16)
