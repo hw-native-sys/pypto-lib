@@ -48,14 +48,11 @@ T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # tiling
 T_TILE = 16  # unified row-tile for the fused spmd
-SINK_ST = T_TILE * HC_MULT  # rows of the [T*hc, HC_PAD] reshape (each group -> one row)
-SINK_W = HC_MULT * HC_PAD   # padded width of the 4 stacked comb groups (4*8 = 32)
 RMS_K_TILE = 128
 LINEAR_K_TILE = 128
-# 512: the mix_x heads are now accumulated SEQUENTIALLY (load->cast->mac->free
-# one head at a time) instead of materializing all 4 x_fp32 + 4 y tiles at once,
-# so the Vec live-set drops ~3x and D_TILE=512 (512B = one L2 line) fits.
-D_TILE = 512
+# 256 (not 512): in the single fused spmd the mix_x FP32 tiles share Vec UB with
+# the matmul / sinkhorn buffers; D_TILE=512 overflows the 192KB Vec limit.
+D_TILE = 256
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 # The fused pre-mix below is hand-unrolled for HC_MULT == 4: the four pre0..pre3
@@ -145,26 +142,20 @@ def hc_pre(
         pre3 = pl.mul(pl.reshape(pre_eps_t[3:4, 0:T_TILE], [T_TILE, 1]), 1.0)
         for db in pl.range(D // D_TILE):
             d0 = db * D_TILE
-            # Accumulate the 4 heads SEQUENTIALLY: each head's x is loaded, cast
-            # to FP32, weighted by pre_h, added into y, then freed before the next
-            # head loads. This keeps only ~1 x_fp32 + y live (vs all 4 x + 4 y),
-            # so the Vec live-set is ~3x smaller and D_TILE=512 fits. The
-            # left-to-right sum order also matches the torch golden's `y += ...`.
-            y = pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 0 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32), pre0)
-            y = pl.add(y, pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 1 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32), pre1))
-            y = pl.add(y, pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 2 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32), pre2))
-            y = pl.add(y, pl.row_expand_mul(pl.cast(pl.load(x_flat, [t0, 3 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32), pre3))
-            pl.store(pl.cast(y, target_type=pl.BF16, mode="rint"), [t0, d0], x_mixed)
+            x0 = pl.cast(pl.load(x_flat, [t0, 0 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32)
+            x1 = pl.cast(pl.load(x_flat, [t0, 1 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32)
+            x2 = pl.cast(pl.load(x_flat, [t0, 2 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32)
+            x3 = pl.cast(pl.load(x_flat, [t0, 3 * D + d0], [T_TILE, D_TILE], target_memory=pl.MemorySpace.Vec), target_type=pl.FP32)
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
+            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+            pl.store(pl.cast(y_tile, target_type=pl.BF16, mode="rint"), [t0, d0], x_mixed)
 
-        # --- comb = sinkhorn(reshape(mixes[:, 2hc:]*s2 + base, hc, hc)). The 4
-        # groups are stacked col-wise (pl.concat) into one padded [T_TILE, hc*8]
-        # tile, then a FREE reshape to [T_TILE*hc, 8] makes each group ONE row so
-        # the 20-iter loop's per-group row_sum / row_expand_div collapse into a
-        # SINGLE op each (the loop is latency-bound on tiny tiles). Groups are
-        # padded to 8 cols (not 4) because ptoas requires >=32B row-major tile
-        # rows. Col-normalize (over the 4 groups) sums the 4 col-blocks and
-        # divides by col_sum replicated back via concat. Pad cols stay 0
-        # throughout, so this is bit-identical to the per-group form. ---
+        # --- comb = sinkhorn(reshape(mixes[:, 2hc:]*s2 + base, hc, hc)). Each
+        # group read 8-wide DIRECTLY from mixes_gm (offsets 8/12/16/20 fit in the
+        # MIX_PAD=32 row); scale2 + base applied per group in-scope. ---
         comb_off = HC_MULT * 2
         mix_g0 = pl.load(mixes_gm, [t0, comb_off + 0 * HC_MULT], [T_TILE, HC_PAD], valid_shapes=[T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
         mix_g1 = pl.load(mixes_gm, [t0, comb_off + 1 * HC_MULT], [T_TILE, HC_PAD], valid_shapes=[T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -174,48 +165,75 @@ def hc_pre(
         cb1 = pl.load(hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb2 = pl.load(hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
         cb3 = pl.load(hc_base_2d, [0, comb_off + 3 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        row0_p = pl.fillpad(pl.add(pl.mul(mix_g0, scale2), pl.col_expand(mix_g0, cb0)), pad_value=pl.PadValue.min)
-        row1_p = pl.fillpad(pl.add(pl.mul(mix_g1, scale2), pl.col_expand(mix_g1, cb1)), pad_value=pl.PadValue.min)
-        row2_p = pl.fillpad(pl.add(pl.mul(mix_g2, scale2), pl.col_expand(mix_g2, cb2)), pad_value=pl.PadValue.min)
-        row3_p = pl.fillpad(pl.add(pl.mul(mix_g3, scale2), pl.col_expand(mix_g3, cb3)), pad_value=pl.PadValue.min)
+        row0 = pl.add(pl.mul(mix_g0, scale2), pl.col_expand(mix_g0, cb0))
+        row1 = pl.add(pl.mul(mix_g1, scale2), pl.col_expand(mix_g1, cb1))
+        row2 = pl.add(pl.mul(mix_g2, scale2), pl.col_expand(mix_g2, cb2))
+        row3 = pl.add(pl.mul(mix_g3, scale2), pl.col_expand(mix_g3, cb3))
+        row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
+        row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
+        row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
+        row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
-        # softmax over each group's hc cols (group = one row of the [SINK_ST, HC_PAD] reshape)
-        sm = pl.reshape(pl.concat(pl.concat(row0_p, row1_p), pl.concat(row2_p, row3_p)), [SINK_ST, HC_PAD])
-        sm_max_tmp = pl.create_tile([SINK_ST, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        sm_sum_tmp = pl.create_tile([SINK_ST, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        sm_max = pl.row_max(sm, sm_max_tmp)
-        sm_exp = pl.exp(pl.row_expand_sub(sm, sm_max))
-        sm_sum = pl.row_sum(sm_exp, sm_sum_tmp)
-        sm_soft = pl.add(pl.row_expand_div(sm_exp, sm_sum), HC_EPS)
-        sm_soft = pl.fillpad(pl.set_validshape(sm_soft, SINK_ST, HC_MULT), pad_value=pl.PadValue.zero)
-        c32 = pl.reshape(sm_soft, [T_TILE, SINK_W])
+        row_max_tmp = pl.create_tile([T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp = pl.create_tile([T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row0_max = pl.row_max(row0_p, row_max_tmp)
+        row1_max = pl.row_max(row1_p, row_max_tmp)
+        row2_max = pl.row_max(row2_p, row_max_tmp)
+        row3_max = pl.row_max(row3_p, row_max_tmp)
+        row0_exp = pl.exp(pl.row_expand_sub(row0_p, row0_max))
+        row1_exp = pl.exp(pl.row_expand_sub(row1_p, row1_max))
+        row2_exp = pl.exp(pl.row_expand_sub(row2_p, row2_max))
+        row3_exp = pl.exp(pl.row_expand_sub(row3_p, row3_max))
+        row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
+        row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
+        row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
+        row3_sum = pl.row_sum(row3_exp, row_sum_tmp)
+        row0_soft = pl.add(pl.row_expand_div(row0_exp, row0_sum), HC_EPS)
+        row1_soft = pl.add(pl.row_expand_div(row1_exp, row1_sum), HC_EPS)
+        row2_soft = pl.add(pl.row_expand_div(row2_exp, row2_sum), HC_EPS)
+        row3_soft = pl.add(pl.row_expand_div(row3_exp, row3_sum), HC_EPS)
 
-        # first col-normalize (over the 4 groups = the 4 padded col-blocks)
-        cs = pl.add(pl.add(c32[0:T_TILE, 0 * HC_PAD:1 * HC_PAD], c32[0:T_TILE, 1 * HC_PAD:2 * HC_PAD]),
-                    pl.add(c32[0:T_TILE, 2 * HC_PAD:3 * HC_PAD], c32[0:T_TILE, 3 * HC_PAD:4 * HC_PAD]))
-        cs = pl.add(cs, HC_EPS)
-        c32 = pl.div(c32, pl.concat(pl.concat(cs, cs), pl.concat(cs, cs)))
+        row0_valid = pl.set_validshape(row0_soft, T_TILE, HC_MULT)
+        row1_valid = pl.set_validshape(row1_soft, T_TILE, HC_MULT)
+        row2_valid = pl.set_validshape(row2_soft, T_TILE, HC_MULT)
+        row3_valid = pl.set_validshape(row3_soft, T_TILE, HC_MULT)
+        row0_eff = pl.fillpad(row0_valid, pad_value=pl.PadValue.zero)
+        row1_eff = pl.fillpad(row1_valid, pad_value=pl.PadValue.zero)
+        row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
+        row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
-        sink_sum_tmp = pl.create_tile([SINK_ST, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp_iter = pl.create_tile([T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
+        col_sum = pl.add(col_sum, HC_EPS)
+        row0_cur = pl.div(row0_eff, col_sum)
+        row1_cur = pl.div(row1_eff, col_sum)
+        row2_cur = pl.div(row2_eff, col_sum)
+        row3_cur = pl.div(row3_eff, col_sum)
+
         for sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
-            sr = pl.reshape(c32, [SINK_ST, HC_PAD])
-            sr_sum = pl.add(pl.row_sum(sr, sink_sum_tmp), HC_EPS)
-            c32 = pl.reshape(pl.row_expand_div(sr, sr_sum), [T_TILE, SINK_W])
-            cs = pl.add(pl.add(c32[0:T_TILE, 0 * HC_PAD:1 * HC_PAD], c32[0:T_TILE, 1 * HC_PAD:2 * HC_PAD]),
-                        pl.add(c32[0:T_TILE, 2 * HC_PAD:3 * HC_PAD], c32[0:T_TILE, 3 * HC_PAD:4 * HC_PAD]))
-            cs = pl.add(cs, HC_EPS)
-            c32 = pl.div(c32, pl.concat(pl.concat(cs, cs), pl.concat(cs, cs)))
+            row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
+            row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
+            row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
+            row3_rowsum = pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS)
+            row0_norm = pl.row_expand_div(row0_cur, row0_rowsum)
+            row1_norm = pl.row_expand_div(row1_cur, row1_rowsum)
+            row2_norm = pl.row_expand_div(row2_cur, row2_rowsum)
+            row3_norm = pl.row_expand_div(row3_cur, row3_rowsum)
+            col_sum = pl.add(pl.add(row0_norm, row1_norm), pl.add(row2_norm, row3_norm))
+            col_sum = pl.add(col_sum, HC_EPS)
+            row0_cur = pl.div(row0_norm, col_sum)
+            row1_cur = pl.div(row1_norm, col_sum)
+            row2_cur = pl.div(row2_norm, col_sum)
+            row3_cur = pl.div(row3_norm, col_sum)
 
-        # Materialize each padded group block (x1.0) into a fresh tile so
-        # set_validshape sees a dynamic-validShape source (sub-views don't qualify).
-        out0 = pl.mul(c32[0:T_TILE, 0 * HC_PAD:1 * HC_PAD], 1.0)
-        out1 = pl.mul(c32[0:T_TILE, 1 * HC_PAD:2 * HC_PAD], 1.0)
-        out2 = pl.mul(c32[0:T_TILE, 2 * HC_PAD:3 * HC_PAD], 1.0)
-        out3 = pl.mul(c32[0:T_TILE, 3 * HC_PAD:4 * HC_PAD], 1.0)
-        pl.store(pl.set_validshape(out0, T_TILE, HC_MULT), [t0, 0 * HC_MULT], comb)
-        pl.store(pl.set_validshape(out1, T_TILE, HC_MULT), [t0, 1 * HC_MULT], comb)
-        pl.store(pl.set_validshape(out2, T_TILE, HC_MULT), [t0, 2 * HC_MULT], comb)
-        pl.store(pl.set_validshape(out3, T_TILE, HC_MULT), [t0, 3 * HC_MULT], comb)
+        row0_out = pl.set_validshape(row0_cur, T_TILE, HC_MULT)
+        row1_out = pl.set_validshape(row1_cur, T_TILE, HC_MULT)
+        row2_out = pl.set_validshape(row2_cur, T_TILE, HC_MULT)
+        row3_out = pl.set_validshape(row3_cur, T_TILE, HC_MULT)
+        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
     return x_mixed
 
 
