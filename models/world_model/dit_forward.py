@@ -196,7 +196,6 @@ def dit_forward(
     l_o_w:         pl.Tensor[[DIT_DIM, DIT_DIM], pl.BF16],
     l_q_rms:       pl.Tensor[[1, DIT_DIM], pl.FP32],
     l_k_rms:       pl.Tensor[[1, DIT_DIM], pl.FP32],
-    l_gate_attn:   pl.Tensor[[1, DIT_DIM], pl.FP32],
     l_norm3_w:     pl.Tensor[[1, DIT_DIM], pl.FP32],
     l_norm3_b:     pl.Tensor[[1, DIT_DIM], pl.FP32],
     l_cross_q:     pl.Tensor[[DIT_DIM, DIT_DIM], pl.BF16],
@@ -212,7 +211,6 @@ def dit_forward(
     l_norm2_b:     pl.Tensor[[1, DIT_DIM], pl.FP32],
     l_ffn1:        pl.Tensor[[DIT_FFN, DIT_DIM], pl.BF16],
     l_ffn2:        pl.Tensor[[DIT_DIM, DIT_FFN], pl.BF16],
-    l_gate_ffn:    pl.Tensor[[1, DIT_DIM], pl.FP32],
     # ── Head weights ──
     head_mod_w:    pl.Tensor[[1, 2, DIT_DIM], pl.BF16],
     head_ln_w:     pl.Tensor[[1, DIT_DIM], pl.FP32],
@@ -268,8 +266,9 @@ def dit_forward(
             te_fc3_out = pl.assemble(te_fc3_out, te_chunk_mm, [0, n0])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="time_final"):
-        t_mod_slice = pl.slice(te_fc3_out, [6, DIT_DIM], [0, 0])
-        t_mod_gm = pl.assemble(t_mod_gm, pl.cast(t_mod_slice, target_type=pl.BF16), [0, 0])
+        for mod_i in pl.unroll(6):
+            mod_slice = pl.slice(te_fc3_out, [1, DIT_DIM], [0, mod_i * DIT_DIM])
+            t_mod_gm = pl.assemble(t_mod_gm, pl.cast(mod_slice, target_type=pl.BF16), [mod_i, 0])
 
     # ══════════════════════════════════════════════════════════════════════
     # Phase A: Conv + Concat (was K1)
@@ -935,7 +934,6 @@ def build_tensor_specs():
         spec("l_o_w",        [DIT_DIM, DIT_DIM],           torch.bfloat16, w["dit_l0_o"].bfloat16()),
         spec("l_q_rms",      [1, DIT_DIM],                 torch.float32,  w["dit_l0_q_rms"].unsqueeze(0)),
         spec("l_k_rms",      [1, DIT_DIM],                 torch.float32,  w["dit_l0_k_rms"].unsqueeze(0)),
-        spec("l_gate_attn",  [1, DIT_DIM],                 torch.float32,  w["dit_l0_gate_attn"].unsqueeze(0)),
         spec("l_norm3_w",    [1, DIT_DIM],                 torch.float32,  w["dit_l0_norm3_w"].unsqueeze(0)),
         spec("l_norm3_b",    [1, DIT_DIM],                 torch.float32,  w["dit_l0_norm3_b"].unsqueeze(0)),
         spec("l_cross_q",    [DIT_DIM, DIT_DIM],           torch.bfloat16, w["dit_l0_cross_q"].bfloat16()),
@@ -951,7 +949,6 @@ def build_tensor_specs():
         spec("l_norm2_b",    [1, DIT_DIM],                 torch.float32,  w["dit_l0_norm2_b"].unsqueeze(0)),
         spec("l_ffn1",       [DIT_FFN, DIT_DIM],          torch.bfloat16, w["dit_l0_ffn1"].bfloat16()),
         spec("l_ffn2",       [DIT_DIM, DIT_FFN],          torch.bfloat16, w["dit_l0_ffn2"].bfloat16()),
-        spec("l_gate_ffn",   [1, DIT_DIM],                 torch.float32,  w["dit_l0_gate_ffn"].unsqueeze(0)),
         # Head weights
         spec("head_mod_w",   [1, 2, DIT_DIM],              torch.bfloat16, w["dit_head_mod"].bfloat16()),
         spec("head_ln_w",    [1, DIT_DIM],                 torch.float32,  w["dit_head_ln_w"].unsqueeze(0)),
