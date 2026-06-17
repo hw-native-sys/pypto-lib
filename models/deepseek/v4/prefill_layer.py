@@ -100,10 +100,6 @@ assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block siz
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
-ACTIVE_TOKEN_TILE = 16
-ACTIVE_D_TILE = 512
-
-
 @pl.jit
 def prefill_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -331,36 +327,8 @@ def prefill_layer(
             x_attn,
             num_tokens,
         )
-    x_moe = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_attn_flat = pl.reshape(x_attn, [T * HC_MULT, D])
-    x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
-    x_moe_flat = pl.reshape(x_moe, [T * HC_MULT, D])
-    for act_t0 in pl.parallel(0, T, ACTIVE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_prepare_x_moe"):
-            for act_dt in pl.range(ACTIVE_TOKEN_TILE):
-                act_t = act_t0 + act_dt
-                if act_t < T:
-                    for act_h in pl.range(HC_MULT):
-                        act_row = (act_t * HC_MULT) + act_h
-                        for act_d0 in pl.range(0, D, ACTIVE_D_TILE):
-                            if act_t < num_tokens:
-                                act_tile = pl.load(
-                                    x_attn_flat,
-                                    [act_row, act_d0],
-                                    [1, ACTIVE_D_TILE],
-                                    target_memory=pl.MemorySpace.Vec,
-                                )
-                            else:
-                                act_tile = pl.load(
-                                    x_hc_flat,
-                                    [act_row, act_d0],
-                                    [1, ACTIVE_D_TILE],
-                                    target_memory=pl.MemorySpace.Vec,
-                                )
-                            x_moe_flat = pl.store(act_tile, [act_row, act_d0], x_moe_flat)
-    x_moe = pl.reshape(x_moe_flat, [T, HC_MULT, D])
     x_next = moe_ep(
-        x_moe,
+        x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -371,7 +339,7 @@ def prefill_layer(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        layer_id, my_rank,
+        layer_id, num_tokens, my_rank,
     )
     return x_next
 
@@ -866,12 +834,10 @@ def golden_prefill_layer(tensors):
         attention_golden(attn_tensors)
 
     tensors["x_attn"][:] = x_attn
-    moe_x = x_attn.clone()
-    num_tokens = int(tensors.get("num_tokens", moe_x.shape[1]))
-    if num_tokens < moe_x.shape[1]:
-        moe_x[:, num_tokens:] = tensors["x_hc"][:, num_tokens:]
+    num_tokens = int(tensors.get("num_tokens", x_attn.shape[1]))
     moe_tensors = dict(tensors)
-    moe_tensors["x_hc"] = moe_x
+    moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = num_tokens
     golden_moe_ep(moe_tensors)
 
 

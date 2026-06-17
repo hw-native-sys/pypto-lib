@@ -115,6 +115,7 @@ def moe_ep(
     combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     # All non-output intermediates allocate locally so the convert pass sees
@@ -162,7 +163,7 @@ def moe_ep(
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
-        my_rank,
+        num_tokens, my_rank,
     )
 
     recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
@@ -178,7 +179,7 @@ def moe_ep(
         recv_y, recv_r_route_out, sh,
         ffn_out,
         pub_counts, routed_y_buf, combine_done,
-        my_rank,
+        num_tokens, my_rank,
     )
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
@@ -236,7 +237,7 @@ def moe_ep_test(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        layer_id, my_rank,
+        layer_id, pl.const(T, pl.INT32), my_rank,
     )
     return x_next
 
@@ -317,6 +318,7 @@ def golden_moe_ep(tensors):
     from expert_routed import golden_expert_routed
 
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+    num_tokens = int(tensors.get("num_tokens", T))
 
     for r in range(N_RANKS):
         # Stage 1: hc_pre
@@ -419,7 +421,7 @@ def golden_moe_ep(tensors):
             all_x_i8.append(src_x_norm_i8)
             all_scale.append(src_x_norm_scale)
             all_weights.append(src_weights)
-            for t in range(T):
+            for t in range(num_tokens):
                 for k in range(TOPK):
                     eid = int(src_indices[t, k].item())
                     dst = eid // N_LOCAL
@@ -438,7 +440,7 @@ def golden_moe_ep(tensors):
 
         for src in range(N_RANKS):
             cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
-            for t in range(T):
+            for t in range(num_tokens):
                 for k in range(TOPK):
                     eid = int(all_indices[src][t, k].item())
                     if eid // N_LOCAL != r:
@@ -472,7 +474,7 @@ def golden_moe_ep(tensors):
         # landed, then accumulate by r_route = t*TOPK+k.
         # Recreate the slot bookkeeping for each dst from this rank r's POV.
         my_routes = []
-        for t in range(T):
+        for t in range(num_tokens):
             for k in range(TOPK):
                 eid = int(all_indices[r][t, k].item())
                 dst = eid // N_LOCAL
@@ -500,7 +502,7 @@ def golden_moe_ep(tensors):
                 d_recv_count[e, 0] = int(d_running[e].item())
             for src in range(N_RANKS):
                 cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
-                for t in range(T):
+                for t in range(num_tokens):
                     for k in range(TOPK):
                         eid = int(all_indices[src][t, k].item())
                         if eid // N_LOCAL != dst:
@@ -552,7 +554,7 @@ def golden_moe_ep(tensors):
         # Stage 7: reduce + sh + hc_post
         acc = sh.float().clone()
         for k in range(TOPK):
-            for t in range(T):
+            for t in range(num_tokens):
                 acc[t, :] += routed_y_buf_r[t * TOPK + k, :].float()
         ffn_out = acc.to(torch.bfloat16)
         x_next_r = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)

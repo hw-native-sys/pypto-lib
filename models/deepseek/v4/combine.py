@@ -79,6 +79,7 @@ def combine_ep(
     pub_counts: pld.DistributedTensor[[EP_WORLD_SIZE * EP_WORLD_SIZE, N_LOCAL_EXPERTS], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     # Push recv_y rows to each peer's routed_y_buf, then a cross-rank barrier, in
@@ -131,14 +132,16 @@ def combine_ep(
 
     # reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k]. Separate pl.spmd
     # scope (ordered after the push via the window write->read dep).
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
     for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
         for tt in pl.range(4):
             t = tb * 4 + tt
-            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                r = t * TOPK + k
-                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            if t < active_tokens:
+                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    r = t * TOPK + k
+                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
 
 
 @pl.jit
