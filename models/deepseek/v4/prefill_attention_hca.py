@@ -148,7 +148,7 @@ def _prefill_hca_cache_writeback_overlay(
 
 
 @pl.jit.inline
-def prefill_attention_hca_core(
+def prefill_attention_hca(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -285,7 +285,7 @@ def prefill_attention_hca_core(
 
 
 @pl.jit
-def prefill_attention_hca(
+def prefill_attention_hca_test(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -324,7 +324,7 @@ def prefill_attention_hca(
     x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_out = prefill_attention_hca_core(
+    x_out = prefill_attention_hca(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -1121,7 +1121,7 @@ if __name__ == "__main__":
         raise SystemExit(str(exc)) from exc
 
     result = run_jit(
-        fn=prefill_attention_hca,
+        fn=prefill_attention_hca_test,
         specs=build_tensor_specs(
             args.start_pos,
             args.num_tokens,

@@ -36,7 +36,6 @@ from moe_ep import (
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe_ep,
     moe_ep,
-    prefill_layer_select_active_x_attn,
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_attention_swa import (
@@ -45,7 +44,7 @@ from prefill_attention_swa import (
     _resolve_swa_case,
     build_tensor_specs as build_swa_attention_tensor_specs,
     golden_prefill_attention_swa,
-    prefill_attention_swa_core,
+    prefill_attention_swa,
 )
 from prefill_attention_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -58,7 +57,7 @@ from prefill_attention_hca import (
     _resolve_hca_case,
     build_tensor_specs as build_hca_attention_tensor_specs,
     golden_prefill_attention_hca,
-    prefill_attention_hca_core,
+    prefill_attention_hca,
 )
 from prefill_attention_csa import (
     BLOCK_SIZE,
@@ -92,7 +91,7 @@ from prefill_attention_csa import (
     _resolve_csa_case,
     build_tensor_specs as build_csa_attention_tensor_specs,
     golden_prefill_attention_csa,
-    prefill_attention_csa_core,
+    prefill_attention_csa,
 )
 
 
@@ -100,6 +99,9 @@ assert MAX_TOKENS == T, "prefill attention and MoE EP must agree on token-major 
 assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block size"
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
+
+ACTIVE_TOKEN_TILE = 16
+ACTIVE_D_TILE = 512
 
 
 @pl.jit
@@ -202,7 +204,7 @@ def prefill_layer_moe_ep(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     if layer_id < 2:
-        kv_cache, x_attn = prefill_attention_swa_core(
+        kv_cache, x_attn = prefill_attention_swa(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -231,7 +233,7 @@ def prefill_layer_moe_ep(
             num_tokens,
         )
     elif layer_id % 2 == 1:
-        x_attn = prefill_attention_hca_core(
+        x_attn = prefill_attention_hca(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -280,7 +282,7 @@ def prefill_layer_moe_ep(
             csa_inner_kv_state,
             csa_inner_score_state,
             x_attn,
-        ) = prefill_attention_csa_core(
+        ) = prefill_attention_csa(
             x_hc,
             hc_attn_fn,
             hc_attn_scale,
@@ -330,7 +332,33 @@ def prefill_layer_moe_ep(
             num_tokens,
         )
     x_moe = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_moe = prefill_layer_select_active_x_attn(x_attn, x_hc, x_moe, num_tokens)
+    x_attn_flat = pl.reshape(x_attn, [T * HC_MULT, D])
+    x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
+    x_moe_flat = pl.reshape(x_moe, [T * HC_MULT, D])
+    for act_t0 in pl.parallel(0, T, ACTIVE_TOKEN_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_select_active_x"):
+            for act_dt in pl.range(ACTIVE_TOKEN_TILE):
+                act_t = act_t0 + act_dt
+                if act_t < T:
+                    for act_h in pl.range(HC_MULT):
+                        act_row = (act_t * HC_MULT) + act_h
+                        for act_d0 in pl.range(0, D, ACTIVE_D_TILE):
+                            if act_t < num_tokens:
+                                act_tile = pl.load(
+                                    x_attn_flat,
+                                    [act_row, act_d0],
+                                    [1, ACTIVE_D_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                            else:
+                                act_tile = pl.load(
+                                    x_hc_flat,
+                                    [act_row, act_d0],
+                                    [1, ACTIVE_D_TILE],
+                                    target_memory=pl.MemorySpace.Vec,
+                                )
+                            x_moe_flat = pl.store(act_tile, [act_row, act_d0], x_moe_flat)
+    x_moe = pl.reshape(x_moe_flat, [T, HC_MULT, D])
     x_next = moe_ep(
         x_moe,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,

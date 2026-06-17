@@ -327,7 +327,7 @@ def _prefill_csa_assemble_sparse_indices(
 
 
 @pl.jit.inline
-def prefill_attention_csa_core(
+def prefill_attention_csa(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -502,7 +502,7 @@ def prefill_attention_csa_core(
 
 
 @pl.jit
-def prefill_attention_csa(
+def prefill_attention_csa_test(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -560,7 +560,7 @@ def prefill_attention_csa(
         inner_kv_state,
         inner_score_state,
         x_out,
-    ) = prefill_attention_csa_core(
+    ) = prefill_attention_csa(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -1347,7 +1347,7 @@ if __name__ == "__main__":
         raise SystemExit(str(exc)) from exc
 
     result = run_jit(
-        fn=prefill_attention_csa,
+        fn=prefill_attention_csa_test,
         specs=build_tensor_specs(
             args.start_pos,
             args.num_tokens,

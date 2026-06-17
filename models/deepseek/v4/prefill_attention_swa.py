@@ -236,7 +236,7 @@ def prefill_swa_write_kv_cache_overlay(
 
 
 @pl.jit.inline
-def prefill_attention_swa_core(
+def prefill_attention_swa(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -351,7 +351,7 @@ def prefill_attention_swa_core(
 
 
 @pl.jit
-def prefill_attention_swa(
+def prefill_attention_swa_test(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -379,7 +379,7 @@ def prefill_attention_swa(
     x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    kv_cache, x_out = prefill_attention_swa_core(
+    kv_cache, x_out = prefill_attention_swa(
         x_hc,
         hc_attn_fn,
         hc_attn_scale,
@@ -882,7 +882,7 @@ if __name__ == "__main__":
         raise SystemExit(str(exc)) from exc
 
     result = run_jit(
-        fn=prefill_attention_swa,
+        fn=prefill_attention_swa_test,
         specs=build_tensor_specs(
             args.start_pos,
             args.num_tokens,
