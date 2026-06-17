@@ -72,49 +72,9 @@ N_ROUTES = T * TOPK
 # Padding widths required by tile vector ops (32 B minimum tile).
 W_PAD = 8   # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
-PREFILL_LAYER_ZERO_TOKEN_TILE = 16
-PREFILL_LAYER_ZERO_D_TILE = 512
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
-
-
-@pl.jit.inline
-def prefill_layer_select_active_x_attn(
-    x_attn: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    x_fallback: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    x_eff: pl.Tensor[[T, HC_MULT, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    x_attn_flat = pl.reshape(x_attn, [T * HC_MULT, D])
-    x_fallback_flat = pl.reshape(x_fallback, [T * HC_MULT, D])
-    x_eff_flat = pl.reshape(x_eff, [T * HC_MULT, D])
-    for t0 in pl.parallel(0, T, PREFILL_LAYER_ZERO_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_select_active_x_attn"):
-            for dt in pl.range(PREFILL_LAYER_ZERO_TOKEN_TILE):
-                t = t0 + dt
-                if t < T:
-                    for h in pl.range(HC_MULT):
-                        row = t * HC_MULT + h
-                        for db in pl.range(D // PREFILL_LAYER_ZERO_D_TILE):
-                            d0 = db * PREFILL_LAYER_ZERO_D_TILE
-                            if t < num_tokens:
-                                active_tile = pl.load(
-                                    x_attn_flat,
-                                    [row, d0],
-                                    [1, PREFILL_LAYER_ZERO_D_TILE],
-                                    target_memory=pl.MemorySpace.Vec,
-                                )
-                                x_eff_flat = pl.store(active_tile, [row, d0], x_eff_flat)
-                            else:
-                                fallback_tile = pl.load(
-                                    x_fallback_flat,
-                                    [row, d0],
-                                    [1, PREFILL_LAYER_ZERO_D_TILE],
-                                    target_memory=pl.MemorySpace.Vec,
-                                )
-                                x_eff_flat = pl.store(fallback_tile, [row, d0], x_eff_flat)
-    return pl.reshape(x_eff_flat, [T, HC_MULT, D])
 
 
 @pl.jit.inline

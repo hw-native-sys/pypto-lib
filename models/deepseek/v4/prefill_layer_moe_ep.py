@@ -336,7 +336,7 @@ def prefill_layer_moe_ep(
     x_hc_flat = pl.reshape(x_hc, [T * HC_MULT, D])
     x_moe_flat = pl.reshape(x_moe, [T * HC_MULT, D])
     for act_t0 in pl.parallel(0, T, ACTIVE_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_select_active_x"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_layer_prepare_x_moe"):
             for act_dt in pl.range(ACTIVE_TOKEN_TILE):
                 act_t = act_t0 + act_dt
                 if act_t < T:
