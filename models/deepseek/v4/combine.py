@@ -142,6 +142,8 @@ def combine_ep(
                     r = t * TOPK + k
                     acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
                 ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            else:
+                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
 
 
 @pl.jit
