@@ -1303,7 +1303,7 @@ if __name__ == "__main__":
         "--compile-only",
         action="store_true",
         default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
+        help="Compile/codegen only; enabled only when this flag is explicitly passed.",
     )
     parser.add_argument(
         "--csa-case",
