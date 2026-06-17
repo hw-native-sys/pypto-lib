@@ -35,7 +35,7 @@ from moe_ep import (
     W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe_ep,
-    moe_ep,
+    moe_ep_active,
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_attention_swa import (
@@ -327,7 +327,7 @@ def prefill_layer(
             x_attn,
             num_tokens,
         )
-    x_next = moe_ep(
+    x_next = moe_ep_active(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
