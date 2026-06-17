@@ -1,6 +1,7 @@
 # Fun-Control 1.3B World Model — pypto3.0 Sub-Networks
 
 本目录包含 Fun-Control 1.3B 世界模型的 5 个 pypto3.0 子网络实现，对应 `infer_fun_control_1_3b_text.py` 推理 pipeline 中 `WanVideoPipeline` 内部的各个计算阶段。
+
 ## Pipeline 总览
 
 ```
@@ -142,9 +143,9 @@ AdaLN → Self-Attn(RoPE) → Cross-Attn(text+img) → FFN → Head → output
 
 **输入**:
 - `x_input`: [1, DIT_IN_DIM + COND_CH, FP, LAT_H, LAT_W] — noisy latent
-- `text_raw`: [1, T5_SEQ, T5_DIM] — text context from T5 encoder
-- `clip_raw`: [1, CLIP_TOKENS, CLIP_DIM] — image context from CLIP encoder
-- `ref_latents`: [1, DIT_IN_DIM, LAT_H, LAT_W] — reference latent
+- `text_raw`: [T5_SEQ, T5_DIM] — text context from T5 encoder (BF16)
+- `clip_raw`: [CLIP_PAD, CLIP_DIM] — image context from CLIP encoder (BF16, padded)
+- `ref_col`: [REF_N, REF_CONV_COL] — im2col'd reference latent (BF16)
 - `timestep`: [1] — current diffusion timestep
 - `weights`: DiT weights (time embedding, projections, transformer blocks, head)
 
