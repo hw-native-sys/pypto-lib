@@ -105,7 +105,7 @@ ACTIVE_D_TILE = 512
 
 
 @pl.jit
-def prefill_layer_moe_ep(
+def prefill_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -377,7 +377,7 @@ def prefill_layer_moe_ep(
 
 
 @pl.jit.host
-def l3_prefill_layer_moe_ep(
+def l3_prefill_layer(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -485,7 +485,7 @@ def l3_prefill_layer_moe_ep(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        prefill_layer_moe_ep(
+        prefill_layer(
             x_hc[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
@@ -841,7 +841,7 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=MAX_TOKENS, case="custom"
     return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + ordered_scalars
 
 
-def golden_prefill_layer_moe_ep(tensors):
+def golden_prefill_layer(tensors):
     import torch
     from golden import TensorSpec
 
@@ -960,14 +960,14 @@ if __name__ == "__main__":
     kind = _attention_kind_for_layer(args.layer_id)
     compare_tokens = _resolve_compare_tokens(args)
     result = run_jit(
-        fn=l3_prefill_layer_moe_ep,
+        fn=l3_prefill_layer,
         specs=build_tensor_specs(
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             case=args.case,
             layer_id=args.layer_id,
         ),
-        golden_fn=golden_prefill_layer_moe_ep,
+        golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         compile_cfg=dict(
             distributed_config=DistributedConfig(
