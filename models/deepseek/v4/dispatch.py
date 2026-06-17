@@ -138,16 +138,17 @@ def dispatch_ep(
             for d in pl.range(EP_WORLD_SIZE):
                 for e in pl.range(N_LOCAL_EXPERTS):
                     v = send_counts[d * N_LOCAL_EXPERTS + e]
-                    # Each (src, dst, expert) count cell is single-writer. Set
-                    # every cell, including zero, so active-only prefill does
-                    # not depend on fresh-zero window contents.
-                    pld.system.notify(
-                        target=pub_counts,
-                        peer=peer,
-                        offsets=[my_rank * EP_WORLD_SIZE + d, e],
-                        value=v,
-                        op=pld.NotifyOp.Set,
-                    )
+                    if v != 0:
+                        # AtomicAdd is the proven count protocol for the L3 EP
+                        # path. Active-only prefill keeps this protocol and
+                        # simply emits fewer nonzero route counts.
+                        pld.system.notify(
+                            target=pub_counts,
+                            peer=peer,
+                            offsets=[my_rank * EP_WORLD_SIZE + d, e],
+                            value=v,
+                            op=pld.NotifyOp.AtomicAdd,
+                        )
 
         # ---------- count_done barrier ----------
         # AtomicAdd, NOT Set: the same per-src cell is bumped again by the data
