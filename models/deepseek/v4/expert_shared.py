@@ -22,6 +22,7 @@ amax+rescale of the same tokens.
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS)
+from expert_routed import gen_int8_weight
 
 
 # model config
@@ -170,19 +171,6 @@ def _int8_quant_per_row(x):
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
-def _quant_w_per_channel(w):
-    """Per-output-channel INT8 quant on the last axis. Returns (i8_tensor, dequant_scale).
-
-    For w shaped [..., N, K] (b_trans=True layout), the per-channel scale has shape [..., N].
-    """
-    import torch
-    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
 def golden_expert_shared(tensors):
     """Torch reference for the shared expert.
 
@@ -224,13 +212,14 @@ def build_tensor_specs():
     x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
     x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
 
-    sw1_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw3_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw2_bf16 = (torch.randn(D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-
-    sw1_i8, sw1_s = _quant_w_per_channel(sw1_bf16)
-    sw3_i8, sw3_s = _quant_w_per_channel(sw3_bf16)
-    sw2_i8, sw2_s = _quant_w_per_channel(sw2_bf16)
+    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
+    # shared-expert distribution (across-layer-mean dequant std). gen_int8_weight is
+    # shared from expert_routed; see its docstring for the measurement.
+    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
+    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
 
     return [
         TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8_pre),
@@ -268,7 +257,8 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "sh": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            # BF16 sh, ~1 ULP. Gen weights reproduce real(L21): 0.01% vs 0.004% of points > 1e-3.
+            "sh": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
     if not result.passed:

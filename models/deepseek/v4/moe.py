@@ -16,8 +16,6 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
     EP_WORLD_SIZE,
     EP_RANK,
     RECV_MAX,
@@ -285,16 +283,7 @@ def golden_moe(tensors):
 def build_tensor_specs(layer_id=0):
     import torch
     from golden import ScalarSpec, TensorSpec
-
-    def round_haz(x):
-        return torch.sign(x) * torch.floor(torch.abs(x) + 0.5)
-
-    def quant_w_per_channel_last(w_bf16):
-        amax = w_bf16.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = w_bf16.float() * scale_quant.unsqueeze(-1)
-        w_i8 = round_haz(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-        return w_i8, (1.0 / scale_quant).float()
+    from expert_routed import gen_int8_weight
 
     def init_x_hc():           return torch.randn(T, HC_MULT, D)
     def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
@@ -308,18 +297,18 @@ def build_tensor_specs(layer_id=0):
     def init_input_ids():
         return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
 
-    w1_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    w3_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    w2_bf16 = (torch.randn(N_LOCAL_EXPERTS, D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-    sw1_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw3_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw2_bf16 = (torch.randn(D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-    w1_i8, w1_s = quant_w_per_channel_last(w1_bf16)
-    w3_i8, w3_s = quant_w_per_channel_last(w3_bf16)
-    w2_i8, w2_s = quant_w_per_channel_last(w2_bf16)
-    sw1_i8, sw1_s = quant_w_per_channel_last(sw1_bf16)
-    sw3_i8, sw3_s = quant_w_per_channel_last(sw3_bf16)
-    sw2_i8, sw2_s = quant_w_per_channel_last(sw2_bf16)
+    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
+    # expert distribution (across-layer-mean dequant std). gen_int8_weight is shared
+    # from expert_routed; see its docstring for the measurement.
+    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
+    SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
+    w1_i8, w1_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+    w3_i8, w3_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+    w2_i8, w2_s = gen_int8_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
 
     return [
         TensorSpec("x_hc",          [T, HC_MULT, D],    torch.bfloat16, init_value=init_x_hc),
@@ -385,7 +374,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            # BF16 x_next. Gen reproduces real(L21): ~1.0% vs 1.5% of points > 5e-3
+            # (10.6% vs 8.0% > 1e-3). No max_diff_hd -- near-zero residual/FFN
+            # cancellations blow up relatively.
+            "x_next": ratio_reldiff(diff_thd=5e-3, pct_thd=0.05),
         },
     )
     if not result.passed:

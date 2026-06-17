@@ -47,7 +47,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import expert_routed
+from expert_routed import expert_routed, gen_int8_weight
 from dispatch import dispatch_ep
 from combine import combine_ep
 
@@ -608,22 +608,15 @@ def golden_moe_ep(tensors):
     tensors["x_next"][:] = x_next_out
 
 
-def _int8_amax_per_row(x_bf16):
-    return x_bf16.float().abs().amax(dim=-1, keepdim=True).clamp_min(config.INT8_AMAX_EPS)
-
-
-def _quant_w_per_channel(w_bf16):
-    import torch
-    amax = w_bf16.float().abs().amax(dim=-1).clamp_min(config.INT8_AMAX_EPS)
-    scale_quant = config.INT8_SCALE_MAX / amax
-    scaled = w_bf16.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
 def build_tensor_specs(layer_id=0):
     import torch
     from golden import ScalarSpec, TensorSpec
+
+    # INT8 grid std + across-layer-mean dequant std, matched to the real
+    # DeepSeek-V4-Flash w8a8 expert distribution (see expert_routed.gen_int8_weight).
+    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
+    SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
     # Shared (replicated) weights are broadcast across ranks; the routed
     # weights are per-rank shards.
@@ -670,12 +663,9 @@ def build_tensor_specs(layer_id=0):
     routed_w2_i8_list = []
     routed_w2_s_list = []
     for _ in range(N_RANKS):
-        w1_bf16 = (torch.randn(N_LOCAL, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-        w3_bf16 = (torch.randn(N_LOCAL, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-        w2_bf16 = (torch.randn(N_LOCAL, D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-        w1_i8, w1_s = _quant_w_per_channel(w1_bf16)
-        w3_i8, w3_s = _quant_w_per_channel(w3_bf16)
-        w2_i8, w2_s = _quant_w_per_channel(w2_bf16)
+        w1_i8, w1_s = gen_int8_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+        w3_i8, w3_s = gen_int8_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+        w2_i8, w2_s = gen_int8_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
         routed_w1_i8_list.append(w1_i8)
         routed_w1_s_list.append(w1_s)
         routed_w3_i8_list.append(w3_i8)
@@ -691,12 +681,9 @@ def build_tensor_specs(layer_id=0):
     rw2_s = torch.stack(routed_w2_s_list)
 
     # Shared expert weights — replicated across ranks.
-    sw1_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw3_bf16 = (torch.randn(MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    sw2_bf16 = (torch.randn(D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-    sw1_i8, sw1_s = _quant_w_per_channel(sw1_bf16)
-    sw3_i8, sw3_s = _quant_w_per_channel(sw3_bf16)
-    sw2_i8, sw2_s = _quant_w_per_channel(sw2_bf16)
+    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
     sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
     sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
     sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
@@ -789,7 +776,9 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            # BF16 x_next, same FFN precision floor as single-card moe.py (real-matched
+            # weights): ~1% of points > 5e-3. No max_diff_hd (near-zero cancellations).
+            "x_next": ratio_reldiff(diff_thd=5e-3, pct_thd=0.05),
         },
     )
     if not result.passed:

@@ -229,19 +229,6 @@ def _int8_quant_per_row(x):
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
-def _quant_w_per_channel(w):
-    """Per-output-channel INT8 quant on the last axis. Returns (i8_tensor, dequant_scale).
-
-    For w shaped [..., N, K] (b_trans=True layout), the per-channel scale has shape [..., N].
-    """
-    import torch
-    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
 def golden_expert_routed(tensors):
     """Torch reference for the routed expert. recv_y is the per-row routing-
     weight-scaled SwiGLU output, ready for combine reduce to simply sum.
@@ -286,9 +273,34 @@ def golden_expert_routed(tensors):
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
 
+def gen_int8_weight(shape, dequant_std, int8_std):
+    """Synthesize a per-channel-symmetric INT8 weight + FP32 scale matching the real
+    DeepSeek-V4-Flash w8a8 expert distribution (shared by expert_shared.py / moe.py).
+
+    Measured (extract_moe_weights.py + a sweep over all 43 layers x 256 experts): the
+    INT8 weights are zero-mean Gaussian (kurtosis ~3.0; NOT uniform), std ~33.5 gate/up
+    / ~35.2 down; per-channel scale CV ~0.09. So we generate (int8, scale) directly --
+    the bf16->quant roundtrip was never needed (kernel + golden both consume int8+scale).
+
+    ``shape`` last dim = reduction (in) dim; leading dims are the per-output-channel
+    scale shape ([E, out, in] -> scale [E, out]).
+    """
+    import torch
+    SCALE_CV = 0.09
+    w_i8 = torch.clamp(torch.round(torch.randn(*shape) * int8_std), -127, 127).to(torch.int8)
+    base = dequant_std / int8_std
+    scale = (base * torch.exp(SCALE_CV * torch.randn(*shape[:-1]))).to(torch.float32)
+    return w_i8, scale
+
+
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
+
+    # INT8 grid std + across-layer-mean dequant std (typical layer), from the real
+    # DeepSeek-V4-Flash w8a8 ckpt; the dequant magnitude grows ~2.5x with depth.
+    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
 
     # Distribute B*S*TOPK token-expert pairs uniformly across local experts.
     total = B * S * M.num_experts_per_tok
@@ -333,14 +345,12 @@ def build_tensor_specs():
     def init_recv_weights():
         return recv_weights_pre
 
-    # Pre-quantize all three weights once so the i8 / scale specs see consistent values.
-    w1_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    w3_bf16 = (torch.randn(N_LOCAL_EXPERTS, MOE_INTER, D) / D ** 0.5).to(torch.bfloat16)
-    w2_bf16 = (torch.randn(N_LOCAL_EXPERTS, D, MOE_INTER) / MOE_INTER ** 0.5).to(torch.bfloat16)
-
-    w1_i8, w1_s = _quant_w_per_channel(w1_bf16)
-    w3_i8, w3_s = _quant_w_per_channel(w3_bf16)
-    w2_i8, w2_s = _quant_w_per_channel(w2_bf16)
+    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
+    # expert distribution (zero-mean Gaussian int8 + across-layer-mean dequant std);
+    # see moe_weight_fixtures for the measurement. No bf16->quant roundtrip needed.
+    w1_i8, w1_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
+    w3_i8, w3_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
+    w2_i8, w2_s = gen_int8_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
 
     return [
         TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
@@ -380,7 +390,8 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "recv_y": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            # BF16 recv_y, ~1 ULP. Gen weights reproduce real(L21): 0.016% vs 0.015% of points > 1e-3.
+            "recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
     if not result.passed:
