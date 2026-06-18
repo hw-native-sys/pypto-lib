@@ -277,7 +277,7 @@ def gen_int8_weight(shape, dequant_std, int8_std):
     """Synthesize a per-channel-symmetric INT8 weight + FP32 scale matching the real
     DeepSeek-V4-Flash w8a8 expert distribution (shared by expert_shared.py / moe.py).
 
-    Measured (extract_moe_weights.py + a sweep over all 43 layers x 256 experts): the
+    Measured (extract_weights.py --component moe + a sweep over all 43 layers x 256 experts): the
     INT8 weights are zero-mean Gaussian (kurtosis ~3.0; NOT uniform), std ~33.5 gate/up
     / ~35.2 down; per-channel scale CV ~0.09. So we generate (int8, scale) directly --
     the bf16->quant roundtrip was never needed (kernel + golden both consume int8+scale).
