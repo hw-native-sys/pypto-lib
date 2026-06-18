@@ -359,7 +359,7 @@ def sparse_attn_hca(
     # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
     # (BF16 store + per-row amax) is T-tiled to keep the fused AIV side from
     # oversizing UB.
-    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
+    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
     for proj_a_block in pl.spmd(O_GROUPS * (O_LORA // A_N_TILE), name_hint="proj_a"):
         # K-split BF16 matmul for one wo_a output tile, peel-first-iter form.
@@ -382,10 +382,8 @@ def sparse_attn_hca(
         acc_a_2d = pl.reshape(acc_a, [T, A_N_TILE])
         for tb in pl.range(0, T, A_T_TILE):
             acc_t = acc_a_2d[tb:tb + A_T_TILE, 0:A_N_TILE]
-            acc_t_bf16 = pl.cast(acc_t, target_type=pl.BF16)
-            o_r[tb:tb + A_T_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_t_bf16
-            acc_t_f32 = pl.cast(acc_t_bf16, target_type=pl.FP32)
-            acc_t_abs = pl.maximum(acc_t_f32, pl.neg(acc_t_f32))
+            o_r[tb:tb + A_T_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_t
+            acc_t_abs = pl.maximum(acc_t, pl.neg(acc_t))
             acc_t_amax = pl.reshape(pl.row_max(acc_t_abs), [1, A_T_TILE])
             o_r_amax_parts[amax_part_row:amax_part_row + 1, tb:tb + A_T_TILE] = acc_t_amax
 
@@ -407,7 +405,7 @@ def sparse_attn_hca(
         o_r_scale_dq[quant_t0:quant_t0 + QUANT_TOKEN_TILE, 0:1] = or_scale_dq
         or_sq_col = pl.reshape(or_sq_row, [QUANT_TOKEN_TILE, 1])
         for k1 in pl.range(k0, k0 + QUANT_K_TILE, QUANT_TILE):
-            or_q_f32 = pl.cast(o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE], target_type=pl.FP32)
+            or_q_f32 = o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE]
             or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
             or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
             or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
@@ -603,7 +601,6 @@ def golden_sparse_attn(tensors):
     seq_per_batch = T // B
     o_model = o.float().view(B, seq_per_batch, O_GROUPS, O_GROUP_IN)
     o_r = torch.einsum("bsgd,grd->bsgr", o_model, wo_a)
-    o_r = o_r.to(torch.bfloat16).float()
     o_r_q = o_r.flatten(2).view(T, O_GROUPS * O_LORA)
     o_r_i8, o_r_scale = _int8_quant_per_row(o_r_q)
     acc = o_r_i8.to(torch.int32) @ wo_b_i8.to(torch.int32).T

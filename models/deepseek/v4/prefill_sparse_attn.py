@@ -457,7 +457,7 @@ def _prefill_hca_sparse_from_gathered_kv(
         rope_pack_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
         o_packed[rope_pack_g * T : rope_pack_g * T + T, rope_pack_col : rope_pack_col + ROPE_DIM] = rope_pack_tile
 
-    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.BF16)
+    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
     o_r_amax_parts = pl.create_tensor([A_AMAX_BLOCKS, T], dtype=pl.FP32)
     o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
@@ -486,10 +486,8 @@ def _prefill_hca_sparse_from_gathered_kv(
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_a_store_amax_tile"):
                     acc_a_2d = pl.reshape(acc_a, [SPARSE_PROJ_TOKEN_TILE, SPARSE_A_N_CHUNK])
-                    acc_a_bf16 = pl.cast(acc_a_2d, target_type=pl.BF16)
-                    o_r[proj_t0:proj_t0 + SPARSE_PROJ_TOKEN_TILE, out_col_g + n0:out_col_g + n0 + SPARSE_A_N_CHUNK] = acc_a_bf16
-                    acc_a_f32 = pl.cast(acc_a_bf16, target_type=pl.FP32)
-                    acc_a_abs = pl.maximum(acc_a_f32, pl.neg(acc_a_f32))
+                    o_r[proj_t0:proj_t0 + SPARSE_PROJ_TOKEN_TILE, out_col_g + n0:out_col_g + n0 + SPARSE_A_N_CHUNK] = acc_a_2d
+                    acc_a_abs = pl.maximum(acc_a_2d, pl.neg(acc_a_2d))
                     acc_a_amax = pl.reshape(pl.row_max(acc_a_abs), [1, SPARSE_PROJ_TOKEN_TILE])
                     amax_part_row = g * A_N_BLOCKS + nb
                     o_r_amax_parts[
@@ -517,10 +515,7 @@ def _prefill_hca_sparse_from_gathered_kv(
             o_r_scale_dq[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, 0:1] = or_scale_dq
         or_sq_col = pl.reshape(or_sq_row, [SPARSE_QUANT_TOKEN_TILE, 1])
         for k1 in pl.range(quant_k0, quant_k0 + SPARSE_QUANT_K_TILE, SPARSE_QUANT_CHUNK):
-            or_q_f32 = pl.cast(
-                o_r[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK],
-                target_type=pl.FP32,
-            )
+            or_q_f32 = o_r[quant_t0:quant_t0 + SPARSE_QUANT_TOKEN_TILE, k1:k1 + SPARSE_QUANT_CHUNK]
             or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
             or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
             or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
@@ -943,7 +938,6 @@ def golden_prefill_sparse_attn(tensors):
 
     o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
     o_r = torch.einsum("tgd,grd->tgr", o_model, wo_a)
-    o_r = o_r.to(torch.bfloat16).float()
     o_r_q = o_r.flatten(1).view(T, O_GROUPS * O_LORA)
     o_r_i8, o_r_scale = _int8_quant_per_row(o_r_q)
     acc = o_r_i8.to(torch.int32) @ wo_b_i8.to(torch.int32).T
