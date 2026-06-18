@@ -287,9 +287,17 @@ def build_tensor_specs(layer_id=0):
     from expert_shared import gen_shared_weight
 
     def init_x_hc():           return torch.randn(T, HC_MULT, D)
-    def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
-    def init_hc_ffn_scale():   return torch.ones(3) * 0.5
-    def init_hc_ffn_base():    return torch.zeros(MIX_HC)
+    # Real layer-0 hc_ffn scale/base verbatim (mirrors moe_ep): the prior scale=0.5/base=0
+    # left hc_pre post~=1 + near-uniform comb, cancelling the FFN output and hc residual to
+    # near-zero in x_next; the real gates (tiny post scale + diag-dominant comb) keep x_next
+    # well-conditioned (rel-L2 halves, worst tail drops). fn stays synthetic at real magnitude.
+    def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) * 0.0635
+    def init_hc_ffn_scale():   return torch.tensor([0.11334, 0.035901, 0.058183])
+    def init_hc_ffn_base():    return torch.tensor([
+        2.4153, -2.0252, -2.0019, -2.1947, -1.5430, -3.0228, -6.8248, 0.5894,
+        2.1916, -7.2132, -3.0938, -2.1119, -3.0161, 3.3293, -3.2224, -4.0226,
+        -2.0428, -3.3478, 3.0893, -3.4166, -1.8144, -3.8147, -3.1307, 1.7862,
+    ])
     def init_norm_w():         return torch.ones(D)
     def init_gate_w():         return torch.randn(N_EXPERTS, D) / D ** 0.5
     def init_gate_bias():      return torch.zeros(N_EXPERTS)
@@ -383,10 +391,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            # BF16 x_next. Gen reproduces real(L21): ~1.0% vs 1.5% of points > 5e-3
-            # (10.6% vs 8.0% > 1e-3). No max_diff_hd -- near-zero residual/FFN
-            # cancellations blow up relatively.
-            "x_next": ratio_reldiff(diff_thd=5e-3, pct_thd=0.05),
+            # BF16 x_next. Tightened 5e-3 -> 3e-3 after the real layer-0 hc_ffn gate
+            # (~2.3% of points > 3e-3 vs 4.2% with the old scale=0.5/base=0). No
+            # max_diff_hd -- near-zero residual/FFN cancellations blow up relatively.
+            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
         },
     )
     if not result.passed:

@@ -755,9 +755,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            # BF16 x_next, same FFN precision floor as single-card moe.py (real-matched
-            # weights): ~1% of points > 5e-3. No max_diff_hd (near-zero cancellations).
-            "x_next": ratio_reldiff(diff_thd=5e-3, pct_thd=0.05),
+            # BF16 x_next, same FFN floor as single-card moe.py. Tightened 5e-3 -> 3e-3 with
+            # the real layer-0 hc_ffn gate (~2.1% of points > 3e-3). No max_diff_hd
+            # (near-zero residual/FFN cancellations blow up relatively).
+            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
         },
     )
     if not result.passed:
