@@ -828,10 +828,11 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # The composed attention->MoE smoke feeds quantized MoE with the
-            # real attention output distribution; keep KV strict and use a
-            # wider FFN envelope for this end-to-end bring-up check.
-            "x_next": ratio_reldiff(diff_thd=0.1, pct_thd=0.05),
+            # Composed attention->MoE smoke: KV strict, x_next on an FFN envelope.
+            # Tightened 0.1 -> 0.03 after the moe_ep hc_ffn fixture fix (real layer-0
+            # gates) removed the hc_post near-zero cancellation that was inflating the
+            # tail; all three attention paths (swa/hca/csa) hold <=1.4% over 3e-2 here.
+            "x_next": ratio_reldiff(diff_thd=0.03, pct_thd=0.05),
         },
     )
     if not result.passed:
