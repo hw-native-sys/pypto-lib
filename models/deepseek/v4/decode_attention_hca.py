@@ -537,12 +537,25 @@ def build_tensor_specs(start_pos=None):
 
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
+    # Real layer-9 (HCA, ratio-128) hc_attn scale/base verbatim (3 + 24 numbers). The
+    # prior scale=0.5/base=0 left hc_pre post~=1 + near-uniform comb, so attn_out and the
+    # hc residual cancelled to near-zero in x_out -> the W8A8 attn quant noise blew up the
+    # relative error (synthetic gate + real attn weights: 4.6% of points over 1e-2). The
+    # real gates (tiny post scale + diag-dominant comb) keep x_out well-conditioned. fn
+    # (24x16384) stays synthetic at the real magnitude.
     def init_hc_attn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.079046, 0.04213, 0.121901])
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            -3.3004, 2.5553, -2.2787, -3.4925,
+            -3.8197, -3.4161, -2.7144, -2.9181,
+            2.362, -2.4746, -2.1352, -3.2216,
+            -4.474, 2.2488, -2.1053, -3.1675,
+            -2.8362, -1.9042, 2.0432, -3.062,
+            -2.7902, -3.0908, -3.002, 3.1161,
+        ])
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
@@ -735,9 +748,9 @@ if __name__ == "__main__":
         ),
         atol=1e-2,
         compare_fn={
-            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
-            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
-            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
+            # Tightened from CANN's 1e-2 bar: the realistic layer-9 hc_attn gates keep
+            # x_out well-conditioned, so it holds 0% over 3e-3 (worst rdiff well under 1).
+            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
         rtol=1e-2,
