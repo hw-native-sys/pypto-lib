@@ -1066,28 +1066,41 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # column slab is accumulated. Transitivity covers post_norm_partial: every
     # down_proj K-slice deps on a silu task, which deps on ALL cast_tids =
     # residual_rms_cast — the full producer of post_norm_partial.
-    for n_out in pl.parallel(DOWN_ON):
+    # dcr_xgamma as a SINGLE pl.spmd(DOWN_ON) dispatch (was DOWN_ON separate pl.parallel
+    # pl.at tasks). PERF: the separate-task form WAW-serialized the DOWN_ON sliced writers
+    # of `out` / `normed_out` on this runtime — the OptimizeOrchTensors region-narrowing
+    # that was meant to keep them parallel did NOT fire (measured: the 5 dcr ran SERIAL on
+    # one core, ~35us, both at the chunk tail AND every layer boundary). A single spmd
+    # dispatch's blocks are inherently parallel (exactly like x_gamma's disjoint
+    # normed_states writes), so the disjoint-slice writes run on DOWN_ON cores. Trade-offs:
+    # the dispatch deps on ALL down_proj tids (not per-column), but down_proj finishes
+    # ~together; and the carry is ONE dispatch tid for all DOWN_ON slabs (the next layer's
+    # rms_recip/QKV/seeds wait on the whole dcr dispatch — fine once it is ~3us not ~35us).
+    with pl.spmd(
+        DOWN_ON,
+        name_hint="dcr_xgamma",
+        deps=[down_tids[i] for i in range(DOWN_ON * K_SPLITS)],
+    ) as dcr_tid:
+        n_out = pl.tile.get_block_idx()
         n0 = n_out * DOWN_TN
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            name_hint="dcr_xgamma",
-            deps=[down_tids[n_out * K_SPLITS + k] for k in range(K_SPLITS)],
-        ) as dcr_tid:
-            # OUTPUT 1: layer residual (down_acc + post_norm, both FP32) -> `out` (cur).
-            # Needed by rms_recip (full-row reduction) and the residual stream.
-            out_chunk = pl.add(
-                down_acc_all[:, n0 : n0 + DOWN_TN], post_norm_partial[:, n0 : n0 + DOWN_TN]
-            )
-            out = pl.assemble(out, out_chunk, [0, n0])
-            # OUTPUT 2: NEXT layer's x*gamma from the same in-register FP32 chunk (no GM
-            # re-read of `out`). gamma row clamped via next_gamma_idx (last layer unused).
-            gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
-            xg = pl.col_expand_mul(out_chunk, gamma_next)
-            normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
-        # Refill BOTH carries (same dcr_xgamma task writes out + normed_out):
-        # prev_out_tids -> next rms_recip/residual/seeds; prev_normed_tids -> next QKV.
-        prev_out_tids[n_out] = dcr_tid
-        prev_normed_tids[n_out] = dcr_tid
+        # OUTPUT 1: layer residual (down_acc + post_norm, both FP32) -> `out` (cur).
+        out_chunk = pl.add(
+            down_acc_all[:, n0 : n0 + DOWN_TN], post_norm_partial[:, n0 : n0 + DOWN_TN]
+        )
+        out = pl.assemble(out, out_chunk, [0, n0])
+        # OUTPUT 2: NEXT layer's x*gamma from the same in-register FP32 chunk (no GM
+        # re-read of `out`). gamma row clamped via next_gamma_idx (last layer unused).
+        gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
+        xg = pl.col_expand_mul(out_chunk, gamma_next)
+        normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
+    # One spmd dispatch tid carries BOTH out + normed_out for all DOWN_ON slabs (the
+    # per-block tids of the old pl.parallel form are gone): the next layer's rms_recip
+    # / seeds (read prev_out_tids[*]) and QKV (read prev_normed_tids[*]) all wait on
+    # the single dcr dispatch. Fill every slab slot so the DOWN_ON-wide carry (sized
+    # for copy_hidden's layer-0 seed) stays valid.
+    for _slab in pl.unroll(DOWN_ON):
+        prev_out_tids[_slab] = dcr_tid
+        prev_normed_tids[_slab] = dcr_tid
     return out
 
 
