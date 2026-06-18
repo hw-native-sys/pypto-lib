@@ -287,10 +287,9 @@ def build_tensor_specs(layer_id=0):
     from expert_shared import gen_shared_weight
 
     def init_x_hc():           return torch.randn(T, HC_MULT, D)
-    # Real layer-0 hc_ffn scale/base verbatim (mirrors moe_ep): the prior scale=0.5/base=0
-    # left hc_pre post~=1 + near-uniform comb, cancelling the FFN output and hc residual to
-    # near-zero in x_next; the real gates (tiny post scale + diag-dominant comb) keep x_next
-    # well-conditioned (rel-L2 halves, worst tail drops). fn stays synthetic at real magnitude.
+    # Real layer-0 hc_ffn scale/base (mirrors moe_ep; fn synthetic at real magnitude). A
+    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling the FFN
+    # output and hc residual to near-zero in x_next where quant noise inflates the tail.
     def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) * 0.0635
     def init_hc_ffn_scale():   return torch.tensor([0.11334, 0.035901, 0.058183])
     def init_hc_ffn_base():    return torch.tensor([

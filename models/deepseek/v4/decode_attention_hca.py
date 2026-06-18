@@ -533,12 +533,9 @@ def build_tensor_specs(start_pos=None):
 
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
-    # Real layer-9 (HCA, ratio-128) hc_attn scale/base verbatim (3 + 24 numbers). The
-    # prior scale=0.5/base=0 left hc_pre post~=1 + near-uniform comb, so attn_out and the
-    # hc residual cancelled to near-zero in x_out -> the W8A8 attn quant noise blew up the
-    # relative error (synthetic gate + real attn weights: 4.6% of points over 1e-2). The
-    # real gates (tiny post scale + diag-dominant comb) keep x_out well-conditioned. fn
-    # (24x16384) stays synthetic at the real magnitude.
+    # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
+    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
+    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():

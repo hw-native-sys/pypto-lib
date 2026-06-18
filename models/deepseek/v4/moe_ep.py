@@ -589,12 +589,9 @@ def build_tensor_specs(layer_id=0):
     def init_x_hc():
         return torch.randn(N_RANKS, T, HC_MULT, D)
 
-    # Real layer-0 hc_ffn scale/base verbatim (3 + 24 numbers). The prior scale=0.5/base=0
-    # left hc_pre post~=1 + near-uniform comb, so the FFN output and the hc residual
-    # cancelled to near-zero in x_next -> the W8A8 MoE quant noise blew up the relative
-    # error (a catastrophic worst-rdiff~2 tail). The real gates (tiny post scale +
-    # diag-dominant comb) keep x_next well-conditioned. fn stays synthetic at the real
-    # magnitude. Mirrors the hc_attn fixture fixes (af65fed1 / 8769dd16 / 1467e3f1).
+    # Real layer-0 hc_ffn scale/base (fn synthetic at real magnitude). A synthetic
+    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling the FFN output and
+    # hc residual to near-zero in x_next where W8A8 noise blows up the relative tail.
     def init_hc_ffn_fn():
         x = torch.randn(MIX_HC, HC_DIM) * 0.0635
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()

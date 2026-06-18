@@ -420,10 +420,9 @@ def build_tensor_specs(start_pos=None):
 
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
-    # Real layer-0 (SWA) hc_attn scale/base verbatim (3 + 24 numbers). The prior
-    # scale=0.5/base=0 left hc_pre post~=1 + near-uniform comb, so attn_out and the hc
-    # residual cancelled to near-zero in x_out; the real gates (tiny post scale +
-    # diag-dominant comb) keep x_out well-conditioned. fn (24x16384) stays synthetic.
+    # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
+    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
+    # hc residual to near-zero in x_out where quant noise blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.039
     def init_hc_attn_scale():
@@ -568,7 +567,7 @@ if __name__ == "__main__":
         compare_fn={
             # Tightened from CANN's 1e-2 bar: realistic hc_attn gates keep x_out
             # well-conditioned (0% over 3e-3 across seeds; worst rdiff ~0.16).
-            "x_out": ratio_reldiff(diff_thd=0.003, pct_thd=0.005, max_diff_hd=1),
+            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
