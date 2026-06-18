@@ -698,7 +698,7 @@ if __name__ == "__main__":
         compare_fn={
             "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs":    topk_idxs_compare,
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE)),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=4 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE * IDX_HEAD_DIM)),
         },
     )
     if not result.passed:

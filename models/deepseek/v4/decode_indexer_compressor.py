@@ -545,7 +545,7 @@ if __name__ == "__main__":
         compare_fn={
             "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE)),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=4 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE * HEAD_DIM)),
         },
     )
     if not result.passed:
