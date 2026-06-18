@@ -273,23 +273,37 @@ def golden_expert_routed(tensors):
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
 
-def gen_int8_weight(shape, dequant_std, int8_std):
-    """Synthesize a per-channel-symmetric INT8 weight + FP32 scale matching the real
-    DeepSeek-V4-Flash w8a8 expert distribution (shared by expert_shared.py / moe.py).
+def gen_routed_weight(shape, dequant_std):
+    """Synthesize a routed-expert per-channel-symmetric INT8 weight + FP32 scale by
+    simulating the real DeepSeek-V4-Flash MXFP4 routed-expert quant grid (e2m1, per-32-group
+    E8M0 scale), then re-quantizing per-output-channel. A plain ``randn`` INT8 is wrong:
+    routed collapses onto ~37 discrete levels with an ~11.6% zero spike (the FP4 grid) and a
+    per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
+    scale-invariant, so the level structure / zero spike emerge from the grid alone and
+    ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
+    grid -- see expert_shared.gen_shared_weight.)
 
-    Measured (extract_moe_weights.py + a sweep over all 43 layers x 256 experts): the
-    INT8 weights are zero-mean Gaussian (kurtosis ~3.0; NOT uniform), std ~33.5 gate/up
-    / ~35.2 down; per-channel scale CV ~0.09. So we generate (int8, scale) directly --
-    the bf16->quant roundtrip was never needed (kernel + golden both consume int8+scale).
-
-    ``shape`` last dim = reduction (in) dim; leading dims are the per-output-channel
+    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
     scale shape ([E, out, in] -> scale [E, out]).
     """
     import torch
-    SCALE_CV = 0.09
-    w_i8 = torch.clamp(torch.round(torch.randn(*shape) * int8_std), -127, 127).to(torch.int8)
-    base = dequant_std / int8_std
-    scale = (base * torch.exp(SCALE_CV * torch.randn(*shape[:-1]))).to(torch.float32)
+
+    FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
+    FP4_MAX, TINY = 6.0, 1e-20
+
+    def sim_fp4(W, group=32):    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim
+        *lead, out, inn = W.shape
+        Wg = W.reshape(*lead, out, inn // group, group)
+        scale = torch.exp2(torch.ceil(torch.log2((Wg.abs().amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
+        q = torch.sign(Wg) * FP4_MAG[torch.searchsorted(FP4_MID, (Wg / scale).abs()).clamp_max(7)]
+        return (q * scale).reshape(*lead, out, inn)
+
+    Wq = sim_fp4(torch.randn(*shape))
+    amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale = amax / INT8_SCALE_MAX
+    w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
     return w_i8, scale
 
 
@@ -297,10 +311,9 @@ def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    # INT8 grid std + across-layer-mean dequant std (typical layer), from the real
-    # DeepSeek-V4-Flash w8a8 ckpt; the dequant magnitude grows ~2.5x with depth.
-    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
-    ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
+    # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
+    # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
+    ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 
     # Distribute B*S*TOPK token-expert pairs uniformly across local experts.
     total = B * S * M.num_experts_per_tok
@@ -345,12 +358,11 @@ def build_tensor_specs():
     def init_recv_weights():
         return recv_weights_pre
 
-    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
-    # expert distribution (zero-mean Gaussian int8 + across-layer-mean dequant std);
-    # see moe_weight_fixtures for the measurement. No bf16->quant roundtrip needed.
-    w1_i8, w1_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-    w3_i8, w3_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-    w2_i8, w2_s = gen_int8_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+    # Synthesize (int8, per-channel scale) by simulating the real MXFP4 routed-expert
+    # quant grid (see gen_routed_weight). The kernel + golden both consume int8+scale.
+    w1_i8, w1_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w3_i8, w3_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
+    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
         TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),

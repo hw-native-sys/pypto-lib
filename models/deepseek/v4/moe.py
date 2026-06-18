@@ -283,7 +283,8 @@ def golden_moe(tensors):
 def build_tensor_specs(layer_id=0):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from expert_routed import gen_int8_weight
+    from expert_routed import gen_routed_weight
+    from expert_shared import gen_shared_weight
 
     def init_x_hc():           return torch.randn(T, HC_MULT, D)
     def init_hc_ffn_fn():      return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
@@ -297,18 +298,26 @@ def build_tensor_specs(layer_id=0):
     def init_input_ids():
         return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
 
-    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
-    # expert distribution (across-layer-mean dequant std). gen_int8_weight is shared
-    # from expert_routed; see its docstring for the measurement.
-    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    # Synthesize (int8, per-channel scale) by simulating the real DeepSeek-V4-Flash quant
+    # grids: routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). shared
+    # chan_cv reproduces the per-output-channel scale CV (~0.5 gate/up, ~0.35 down).
+    #
+    # NOTE on magnitude: unlike the standalone expert_routed/expert_shared tests (which use
+    # the real dequant std ~2.5e-2 routed / ~1.7e-2 shared), x_next here is an integration
+    # metric dominated by near-zero residual+FFN cancellations whose relative error depends
+    # on weight CORRELATION structure that random fixtures can't reproduce. At the real
+    # magnitude a random fixture blows up to ~9.7% > gate (vs ~0.4% for real structured
+    # weights). So moe keeps the smaller *behaviorally-calibrated* magnitude that reproduces
+    # the real x_next metric (~1%); only the grid SHAPE (FP4/FP8 discreteness, scale CV) is
+    # upgraded to match the real distribution.
     ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
     SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
-    w1_i8, w1_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-    w3_i8, w3_s = gen_int8_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-    w2_i8, w2_s = gen_int8_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
-    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+    w1_i8, w1_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+    w3_i8, w3_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
+    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+    sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
+    sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
+    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
 
     return [
         TensorSpec("x_hc",          [T, HC_MULT, D],    torch.bfloat16, init_value=init_x_hc),

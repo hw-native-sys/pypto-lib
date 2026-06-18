@@ -47,7 +47,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
-from expert_routed import expert_routed, gen_int8_weight
+from expert_routed import expert_routed
 from dispatch import dispatch_ep
 from combine import combine_ep
 
@@ -573,10 +573,14 @@ def golden_moe_ep(tensors):
 def build_tensor_specs(layer_id=0):
     import torch
     from golden import ScalarSpec, TensorSpec
+    from expert_routed import gen_routed_weight
+    from expert_shared import gen_shared_weight
 
-    # INT8 grid std + across-layer-mean dequant std, matched to the real
-    # DeepSeek-V4-Flash w8a8 expert distribution (see expert_routed.gen_int8_weight).
-    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
+    # Routed = MXFP4 (gen_routed_weight), shared = MXFP8 (gen_shared_weight). Like moe.py,
+    # this is an integration test whose x_next-equivalent output is dominated by near-zero
+    # residual+FFN cancellations, so it keeps the smaller *behaviorally-calibrated* magnitude
+    # (random fixtures blow up the relative metric at the real ~2.5e-2 magnitude); only the
+    # grid SHAPE (FP4/FP8 discreteness, scale CV) matches the real distribution.
     ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
     SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
@@ -625,9 +629,9 @@ def build_tensor_specs(layer_id=0):
     routed_w2_i8_list = []
     routed_w2_s_list = []
     for _ in range(N_RANKS):
-        w1_i8, w1_s = gen_int8_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-        w3_i8, w3_s = gen_int8_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-        w2_i8, w2_s = gen_int8_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+        w1_i8, w1_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+        w3_i8, w3_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
+        w2_i8, w2_s = gen_routed_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
         routed_w1_i8_list.append(w1_i8)
         routed_w1_s_list.append(w1_s)
         routed_w3_i8_list.append(w3_i8)
@@ -643,9 +647,9 @@ def build_tensor_specs(layer_id=0):
     rw2_s = torch.stack(routed_w2_s_list)
 
     # Shared expert weights — replicated across ranks.
-    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+    sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
+    sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
+    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
     sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
     sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
     sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()

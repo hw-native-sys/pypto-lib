@@ -22,7 +22,6 @@ amax+rescale of the same tokens.
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS)
-from expert_routed import gen_int8_weight
 
 
 # model config
@@ -203,6 +202,40 @@ def golden_expert_shared(tensors):
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
 
+def gen_shared_weight(shape, dequant_std, chan_cv):
+    """Synthesize a shared-expert per-channel-symmetric INT8 weight + FP32 scale by
+    simulating the real DeepSeek-V4-Flash MXFP8 shared-expert quant grid (e4m3, 128x128-block
+    E8M0 scale), then re-quantizing per-output-channel. Unlike routed (MXFP4 -> ~37 discrete
+    levels), shared stays near-Gaussian (~200 levels). The coarse 128-block scale does NOT
+    flatten the real per-output-channel magnitude spread, so ``chan_cv`` (log-space source-gain
+    std) injects it to reproduce the real INT8 scale CV (~0.5 gate/up, ~0.35 down). Per-output-
+    channel INT8 is scale-invariant, so the grid sets the level shape and ``dequant_std`` only
+    sets the absolute scale magnitude. (routed experts use a different grid -- see
+    expert_routed.gen_routed_weight.)
+
+    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
+    scale shape ([out, in] -> scale [out]).
+    """
+    import torch
+
+    FP8_MAX, TINY = 448.0, 1e-20
+
+    def sim_fp8(W, block=128):   # e4m3 + 128x128-block E8M0 (round-up) scale on (out, in)
+        out, inn = W.shape
+        Wb = W.reshape(out // block, block, inn // block, block)
+        scale = torch.exp2(torch.ceil(torch.log2((Wb.abs().amax(dim=(1, 3), keepdim=True) / FP8_MAX).clamp_min(TINY))))
+        q = (Wb / scale).to(torch.float8_e4m3fn).float() * scale
+        return q.reshape(out, inn)
+
+    W = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))  # per-channel gain
+    Wq = sim_fp8(W)
+    amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale = amax / INT8_SCALE_MAX
+    w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
+    return w_i8, scale
+
+
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
@@ -212,14 +245,13 @@ def build_tensor_specs():
     x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
     x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
 
-    # Synthesize (int8, per-channel scale) directly from the REAL DeepSeek-V4-Flash
-    # shared-expert distribution (across-layer-mean dequant std). gen_int8_weight is
-    # shared from expert_routed; see its docstring for the measurement.
-    INT8_STD_GATE_UP, INT8_STD_DOWN = 33.5, 35.2
-    SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
-    sw1_i8, sw1_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], INT8_STD_GATE_UP)
-    sw3_i8, sw3_s = gen_int8_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], INT8_STD_GATE_UP)
-    sw2_i8, sw2_s = gen_int8_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], INT8_STD_DOWN)
+    # Synthesize (int8, per-channel scale) by simulating the real MXFP8 shared-expert
+    # quant grid (gen_shared_weight). chan_cv reproduces the real per-output-channel scale
+    # CV (~0.5 gate/up, ~0.35 down) the coarse FP8 block scale leaves behind.
+    SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
+    sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
+    sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
+    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
 
     return [
         TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8_pre),
