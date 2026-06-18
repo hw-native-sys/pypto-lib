@@ -104,9 +104,9 @@ NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 INTERMEDIATE = 17408
-# MAX_SEQ is env-overridable for the e2e generate harness: it sizes the
-# (non-paged) KV cache rows and the RoPE tables, so a 512-token run can use a
-# 512-row cache instead of the 4096 micro-benchmark default (8x less KV memory).
+# MAX_SEQ is env-overridable for the e2e generate harness: it sizes the standalone
+# paged KV pool (CACHE_ROWS) and the RoPE tables, so a 512-token run can use a much
+# smaller pool than the 4096 micro-benchmark default (less KV memory).
 MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", "4096"))
 EPS = 1e-6  # RMSNorm epsilon
 
@@ -121,7 +121,6 @@ HALF_DIM = HEAD_DIM // 2  # 64 (RoPE rotates lo/hi halves)
 ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
 HIDDEN_INV = 1.0 / HIDDEN
 HEAD_DIM_INV = 1.0 / HEAD_DIM  # per-head QK-norm RMSNorm denominator
-CACHE_ROWS = BATCH * NUM_KV_HEADS * MAX_SEQ  # k_cache / v_cache row count
 
 # Attention head grouping. Q_HEAD_BATCH = Q_PER_KV (one attn lane per KV head).
 Q_HEAD_BATCH = Q_PER_KV  # 5: Q heads bundled per attention task
@@ -167,14 +166,22 @@ QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
-# ── Scope 2 · grouped-query attention (fused) ──
-# SEQ_TILE = seq length per KV block. 256 compiles after the AutoTileMatmulL0 fix
-# (#1595): the pass now tiles the PV (score·V) matmul like QK, so V's L0B right
-# buffer reuses QK's freed buffer instead of co-residing — peak L0B = max(QK, PV)
-# rather than the sum. (Pre-fix, 256 hit "Right buffer usage 131072 exceeds
-# platform limit 65536" at AllocateMemoryAddr; 128 was the cap.)
-SEQ_TILE = 256
-MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # 16
+# ── Scope 2 · grouped-query attention (fused, PAGED) ──
+# SEQ_TILE = seq length per KV block. PINNED to the serving paged page_size (128):
+# decode reads KV from the PAGED pool via block_table, so one logical block must
+# map to exactly one physical page — i.e. SEQ_TILE == page_size — or a block would
+# straddle two pages whose physical ids are unrelated. prefill_fwd uses the same
+# 128 page; 128 is also the known-good L0B double-buffer cap. BLOCK_SIZE is an
+# alias used by the paged cache-row arithmetic.
+SEQ_TILE = 128
+BLOCK_SIZE = SEQ_TILE  # paged page size (== serving runtime.page_size)
+MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # logical blocks per seq (32 @ 4096)
+# Worst-case physical page count for the standalone golden/smoke pool (one band
+# per (batch, block)); the kernel itself reads the pool size from k_cache's dynamic
+# dim, so this only sizes the test fixtures.
+MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
+NUM_PAGES = BATCH * MAX_BLOCKS_PER_SEQ
+CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE  # paged k_cache / v_cache rows (one layer)
 
 # ── Scope 2 · KV-block split (flash-decoding) for ragged load balance ──
 # Each fa_fused lane (a Q-group pair) is split into contiguous KV partitions of
@@ -303,6 +310,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -328,12 +337,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     prev_out_tids: pl.Array[DOWN_ON, pl.TASK_ID],
     prev_normed_tids: pl.Array[DOWN_ON, pl.TASK_ID],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.FP32]:
-    # Per-layer offsets into the STACKED weights / KV cache. decode_fwd passes the
-    # running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes 0.._CHUNK_NLAYERS-1
-    # (per-chunk weight slices).
+    # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
+    # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
+    # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
-    layer_cache_base = layer_idx * (BATCH * NUM_KV_HEADS * MAX_SEQ)
+    # Paged KV: rows are runtime-dynamic (the paged pool sizes them). Derive the
+    # per-layer stride and the block-table row stride from the tensor dims, exactly
+    # as prefill_fwd does, so decode reads the SAME pool prefill wrote.
+    num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
+    layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
+    layer_cache_base = layer_idx * layer_cache_rows
+    user_batch = pl.tensor.dim(seq_lens, 0)
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
@@ -615,7 +631,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 b = g_idx % BATCH
                 ctx_len = pl.read(seq_lens, [b])
                 inv_rms_b = pl.read(inv_rms_states, [b, 0])
-                pos = ctx_len - 1
+                pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
+                # Paged write target for this row's current token: slot_mapping[b]
+                # decomposes into (physical page, in-page offset). Same scheme prefill
+                # uses; one physical page == one SEQ_TILE/BLOCK_SIZE band of the pool.
+                wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+                wr_slot_block = wr_slot // BLOCK_SIZE
+                wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
                 cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
                 cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
                 sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
@@ -630,7 +652,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 k_hi = k_full[:, HALF_DIM:HEAD_DIM]
                 rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
                 rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-                cache_row = layer_cache_base + b * NUM_KV_HEADS * MAX_SEQ + ki * MAX_SEQ + pos
+                cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
                 k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
                 k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
                 v_row_bf16 = pl.cast(
@@ -726,9 +748,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
                 fa_ctx_len = pl.read(seq_lens, [fa_b])
                 # Table holds only real blocks → exactly one block per entry, at fa_p.
-                sb = fa_p  # global KV block index (no inner loop — old p_blocks was 1)
+                sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
                 s0 = sb * SEQ_TILE
                 valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
+                # Paged read: map logical block sb -> physical page via this request's
+                # block_table row. SEQ_TILE == page_size, so one page is exactly one
+                # contiguous SEQ_TILE-row slice of the pool (shared by all GP_SIZE heads
+                # of this (b, block) work item below).
+                fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
 
                 # Declarative software pipeline over the per-head gp loop: instead of
                 # manually unrolling and reordering (QK0,QK1 -> softmax0,softmax1 ->
@@ -740,7 +767,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                     q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
                     g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-                    cache_row = layer_cache_base + fa_b * NUM_KV_HEADS * MAX_SEQ + kvh * MAX_SEQ + s0
+                    cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
 
                     # QK matmul (cube) -> C2V boundary move (first vec consumer).
                     k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
@@ -784,22 +811,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             NUM_CORES * 2, name_hint="online_softmax", deps=[fa_tid]
         ) as attn_done_tid:
             os_core = pl.get_block_idx()
-            # Snake (boustrophedon) lane assignment. Same round-robin grid-stride
-            # as before, but ODD rounds deal the lanes in REVERSE across the cores
-            # (round 0 left-to-right, round 1 right-to-left, round 2 left-to-right,
-            # ...). When the lanes are ordered by descending cost this pairs a heavy
-            # lane (one round) with a light lane (the next) on each core, so the
-            # per-core totals equalize — vs plain round-robin, which hands core 0 the
-            # heaviest lane of EVERY round and leaves it the straggler. Every lane is
-            # still processed exactly once and lanes carry no cross-iteration state,
-            # so the reorder is correctness-preserving.
-            os_ncore = NUM_CORES * 2
-            for os_rr in pl.range(os_core, OS_WORK, os_ncore):
-                # os_rr walks this core's plain round-robin slots (os_core,
-                # os_core+ncore, ...). Convert to the snake slot: even rounds keep
-                # os_rr; odd rounds mirror the core index within the round.
-                os_round = (os_rr - os_core) // os_ncore
-                os_spmd_idx = os_rr + (os_round % 2) * (os_ncore - 1 - 2 * os_core)
+            # Grid-stride over online_softmax work items (one per (b, kvh) lane).
+            for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
                 os_b = os_spmd_idx // NUM_KV_HEADS
                 os_gi = os_spmd_idx % NUM_KV_HEADS
                 os_ctx_len = pl.read(seq_lens, [os_b])
@@ -1092,6 +1105,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -1165,7 +1180,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
         next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
             carry_tids, carry_normed_tids,
         )
@@ -1202,6 +1217,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
@@ -1265,7 +1282,7 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, normed, next_normed, i, next_gamma_idx,
             carry_tids, carry_normed_tids,
         )
@@ -1299,6 +1316,8 @@ INPUT_NAMES = (
     "q_norm_weight",
     "k_norm_weight",
     "seq_lens",
+    "block_table",
+    "slot_mapping",
     "rope_cos",
     "rope_sin",
     "k_cache",
@@ -1315,14 +1334,28 @@ def load_inputs(data_in_dir: Path) -> list[torch.Tensor]:
     return [torch.load(data_in_dir / f"{name}.pt", weights_only=True) for name in INPUT_NAMES]
 
 
+def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Identity paging for the standalone harness: batch b's logical blocks map to
+    physical pages [b*MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
+    token's (pos=seq_len-1) physical row. Mirrors the serving runner's layout."""
+    block_table = torch.arange(BATCH * MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    slot_mapping = torch.empty(BATCH, dtype=torch.int32)
+    for b in range(BATCH):
+        pos = int(seq_lens[b].item()) - 1
+        logical_block = pos // BLOCK_SIZE
+        phys_page = b * MAX_BLOCKS_PER_SEQ + logical_block
+        slot_mapping[b] = phys_page * BLOCK_SIZE + (pos % BLOCK_SIZE)
+    return block_table, slot_mapping
+
+
 def _smoke_inputs() -> list[torch.Tensor]:
     """Single-layer (_CHUNK_NLAYERS == 1) input list for the compile-only smoke,
-    in decode_fwd_layers parameter order (no block_table / slot_mapping — the KV
-    cache is now a CONTIGUOUS per-(batch, kv-head, seq) pool, not paged)."""
+    in decode_fwd_layers parameter order (PAGED KV via block_table + slot_mapping)."""
     def randn(shape, dtype):
         return torch.empty(shape, dtype=dtype).normal_()
 
     seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
+    block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
     return [
         randn([BATCH, HIDDEN], torch.bfloat16),
         randn([1, HIDDEN], torch.float32),
@@ -1332,6 +1365,8 @@ def _smoke_inputs() -> list[torch.Tensor]:
         torch.ones([1, HEAD_DIM], dtype=torch.float32),  # q_norm_weight
         torch.ones([1, HEAD_DIM], dtype=torch.float32),  # k_norm_weight
         seq_lens,
+        block_table,
+        slot_mapping,
         randn([MAX_SEQ, HEAD_DIM], torch.float32),
         randn([MAX_SEQ, HEAD_DIM], torch.float32),
         randn([CACHE_ROWS, HEAD_DIM], torch.bfloat16),
@@ -1404,6 +1439,10 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
     else:
         seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), generator=g, dtype=torch.int32)
 
+    # Paged block_table / slot_mapping (identity paging) for the PAGED KV pool the
+    # kernel reads — k_cache/v_cache below are sized as the paged pool (CACHE_ROWS).
+    block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
+
     # Proper NeoX half-split RoPE tables (cols [0:64] and [64:128] duplicated).
     posv = torch.arange(MAX_SEQ).float().unsqueeze(1)
     inv_freq = 1.0 / (1.0e4 ** (torch.arange(0, HALF_DIM).float() / HALF_DIM))
@@ -1411,8 +1450,8 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
     rope_cos = torch.cat([ang.cos(), ang.cos()], dim=1).float()
     rope_sin = torch.cat([ang.sin(), ang.sin()], dim=1).float()
 
-    # k_cache / v_cache are the CONTIGUOUS (non-paged) per-(batch, kv-head, seq) pool
-    # the kernel reads/writes: row(b, kvh, s) = (b*NUM_KV_HEADS + kvh)*MAX_SEQ + s.
+    # k_cache / v_cache are the PAGED pool (rows = NUM_PAGES * NUM_KV_HEADS *
+    # BLOCK_SIZE) the kernel reads/writes via block_table / slot_mapping.
     return {
         "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
         "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
@@ -1422,6 +1461,8 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
         "q_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
         "k_norm_weight": rn([1, HEAD_DIM], 0.1, 1.0).float(),
         "seq_lens": seq_lens,
+        "block_table": block_table,
+        "slot_mapping": slot_mapping,
         "rope_cos": rope_cos,
         "rope_sin": rope_sin,
         "k_cache": rn([CACHE_ROWS, HEAD_DIM], 0.01).to(torch.bfloat16),
@@ -1467,6 +1508,7 @@ def golden_decode_layer(values: dict) -> None:
     v_heads = (v_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
 
     seq_lens = values["seq_lens"]
+    block_table = values["block_table"]
     rope_cos = values["rope_cos"].float()
     rope_sin = values["rope_sin"].float()
     k_cache = values["k_cache"].float()
@@ -1480,13 +1522,20 @@ def golden_decode_layer(values: dict) -> None:
         q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))             # [40,128] current Q (bf16)
         k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))           # [8,128] current K (bf16)
         v_cur = _bf16(v_heads[b])                                # [8,128]
+        n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
         for kvh in range(NUM_KV_HEADS):
-            # Gather this (b, kvh) lane's past KV from the CONTIGUOUS (non-paged)
-            # pool exactly as the kernel does: row(b, kvh, s) starts at
-            # (b*NUM_KV_HEADS + kvh)*MAX_SEQ, seq positions [0, slen) are contiguous.
-            base = (b * NUM_KV_HEADS + kvh) * MAX_SEQ
-            k_lane = k_cache[base : base + slen].clone()
-            v_lane = v_cache[base : base + slen].clone()
+            # Gather this (b, kvh) lane's past KV from the PAGED pool exactly as the
+            # kernel does: logical block sb -> physical page block_table[b*MBPS + sb],
+            # whose (page, kvh) tile starts at (pbid*NUM_KV_HEADS + kvh)*BLOCK_SIZE.
+            k_lane = torch.empty(slen, HEAD_DIM)
+            v_lane = torch.empty(slen, HEAD_DIM)
+            for sb in range(n_blocks):
+                pbid = int(block_table[b * MAX_BLOCKS_PER_SEQ + sb].item())
+                row = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+                lo = sb * BLOCK_SIZE
+                blk = min(BLOCK_SIZE, slen - lo)
+                k_lane[lo : lo + blk] = k_cache[row : row + blk]
+                v_lane[lo : lo + blk] = v_cache[row : row + blk]
             k_lane[p] = k_cur[kvh]                               # current token (kernel writes it first)
             v_lane[p] = v_cur[kvh]
             for j in range(Q_PER_KV):
@@ -1649,16 +1698,16 @@ if __name__ == "__main__":
         _FWD_NLAYERS = N
         def stack0(t, reps):  # replicate along dim 0
             return torch.cat([t] * reps, dim=0).contiguous()
-        hs, irw, wq_, wk_, wv_, qn, kn, sl, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
+        hs, irw, wq_, wk_, wv_, qn, kn, sl, bt, sm, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
         torch.manual_seed(1234)
         final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
         lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
-        # seq_lens / rope tables are shared across layers (NOT per-layer stacked); the
-        # contiguous KV pool kc/vc IS stacked N times (one [BATCH*NUM_KV_HEADS*MAX_SEQ]
-        # pool per layer, indexed by layer_cache_base).
+        # seq_lens / block_table / slot_mapping / rope tables are shared across layers
+        # (NOT per-layer stacked); the PAGED KV pool kc/vc IS stacked N times (one
+        # paged pool per layer, indexed by layer_cache_base).
         stacked = [
             hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
-            stack0(qn, N), stack0(kn, N), sl, rc, rs, stack0(kc, N), stack0(vc, N),
+            stack0(qn, N), stack0(kn, N), sl, bt, sm, rc, rs, stack0(kc, N), stack0(vc, N),
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
         ]
