@@ -137,9 +137,7 @@ def qkv_proj_rope(
                 [1, Q_LORA_TILE],
             )
             qr_normed = pl.col_expand_mul(pl.row_expand_mul(qr_norm_chunk, qr_inv_rms_t), gamma_chunk)
-            qr_normed_bf16 = pl.cast(qr_normed, target_type=pl.BF16, mode="rint")
-            qr_norm_amax_f32 = pl.cast(qr_normed_bf16, target_type=pl.FP32)
-            qr_norm_amax_abs = pl.maximum(qr_norm_amax_f32, pl.neg(qr_norm_amax_f32))
+            qr_norm_amax_abs = pl.maximum(qr_normed, pl.neg(qr_normed))
             qr_tile_amax = pl.maximum(qr_tile_amax, pl.reshape(pl.row_max(qr_norm_amax_abs), [1, T_TILE]))
 
         qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
@@ -154,9 +152,7 @@ def qkv_proj_rope(
                 [1, QUANT_TILE],
             )
             qr_q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_q_chunk)
-            qr_q_normed_bf16 = pl.cast(qr_q_normed, target_type=pl.BF16, mode="rint")
-            qr_q_f32 = pl.cast(qr_q_normed_bf16, target_type=pl.FP32)
-            qr_q_scaled = pl.row_expand_mul(qr_q_f32, qr_scale_quant_t)
+            qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
             qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
             qr_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
@@ -440,8 +436,7 @@ def golden_qkv_proj_rope(tensors):
     qr_out = rms_norm(matmul_bf16_input_fp32(token_x, wq_a), gamma_cq)   # [T, Q_LORA]
     # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
-    qr_out_bf16 = qr_out.to(torch.bfloat16)
-    qr_i8, qr_scale = int8_quant_per_row(qr_out_bf16.float())
+    qr_i8, qr_scale = int8_quant_per_row(qr_out.float())
     q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
     q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, H, HEAD_DIM)
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
@@ -466,12 +461,8 @@ def golden_qkv_proj_rope(tensors):
 def build_tensor_specs(B, S):
     import torch
     from golden import TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
     T = B * S
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, 4, dtype=torch.bfloat16)
-    positions = torch.arange(T, dtype=torch.int32)
-    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(shared_freqs_cos, shared_freqs_sin, positions)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
@@ -482,22 +473,23 @@ def build_tensor_specs(B, S):
         w_i8 = w_i32.to(torch.float16).to(torch.int8)
         return w_i8, (1.0 / scale_quant).float()
 
+    # Inputs match cann test_mla_prolog_quant_pypto gen_mla_prolog_input_data (uniform).
     def init_x():
-        return (torch.randn(T, D) - 0.5)
+        return torch.empty([T, D], dtype=torch.bfloat16).uniform_(-1, 1)
     def init_wq_a():
-        return (torch.randn(D, Q_LORA) - 0.5) / (D ** 0.5)
+        return torch.empty([D, Q_LORA], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
     def init_wq_b():
-        return (torch.randn(Q_LORA, H * HEAD_DIM) - 0.5) / ((H * HEAD_DIM) ** 0.5)
+        return torch.empty([Q_LORA, H * HEAD_DIM], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
     def init_wkv():
-        return torch.randn(D, HEAD_DIM) / (D ** 0.5)
+        return torch.empty([D, HEAD_DIM], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
     def init_cos():
-        return shared_rope_cos.clone()
+        return torch.empty([T, ROPE_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
     def init_sin():
-        return shared_rope_sin.clone()
+        return torch.empty([T, ROPE_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
     def init_gamma_cq():
-        return torch.ones(Q_LORA)
+        return torch.empty([Q_LORA], dtype=torch.bfloat16).uniform_(-1, 1)
     def init_gamma_ckv():
-        return torch.ones(HEAD_DIM)
+        return torch.empty([HEAD_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
