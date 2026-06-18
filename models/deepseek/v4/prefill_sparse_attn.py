@@ -51,7 +51,7 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # cache shapes
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 0
+DEFAULT_COMPRESS_RATIO = 4
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 PREFILL_SPARSE_TOPK = min(TOPK, min(M.sliding_window, S) + PREFILL_MAX_COMPRESSED)
 ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -785,30 +785,6 @@ def prefill_sparse_attn_padded_indices(
     return attn_out
 
 
-def _quant_w_per_channel(w):
-    """Per-output-channel INT8 quant on the last axis."""
-    import torch
-
-    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
-def _int8_quant_per_row(x):
-    """Per-row INT8 symmetric quant matching the W8A8C16 activation path."""
-    import torch
-
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
 @pl.jit
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
@@ -848,6 +824,30 @@ def prefill_sparse_attn_test(
         wo_b_scale,
         attn_out,
     )
+
+
+def _quant_w_per_channel(w):
+    """Per-output-channel INT8 quant on the last axis."""
+    import torch
+
+    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = w.float() * scale_quant.unsqueeze(-1)
+    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    return w_i8, (1.0 / scale_quant).float()
+
+
+def _int8_quant_per_row(x):
+    """Per-row INT8 symmetric quant matching the W8A8C16 activation path."""
+    import torch
+
+    rows = x.float().reshape(-1, x.shape[-1])
+    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = rows * scale_quant
+    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dequant = 1.0 / scale_quant
+    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
 def golden_prefill_sparse_attn(tensors):
@@ -968,14 +968,10 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         torch.arange(T, dtype=torch.int32),
     )
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return (torch.rand(*shape, generator=generator) - 0.5) * scale
     def init_q():
-        return seeded_uniform((T, H, HEAD_DIM), 1, 0.05).to(torch.bfloat16)
+        return ((torch.rand(T, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_kv():
-        return seeded_uniform((HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 2, 0.05).to(torch.bfloat16)
+        return ((torch.rand(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_block_table():
         table = torch.zeros(MAX_REQS, SPARSE_ORI_MAX_BLOCKS, dtype=torch.int32)
         for req in range(MAX_REQS):
@@ -983,9 +979,9 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
                 table[req, blk] = req * SPARSE_ORI_MAX_BLOCKS + blk
         return table
     def init_kv_overlay():
-        return seeded_uniform((MAX_TOKENS, HEAD_DIM), 3, 0.05).to(torch.bfloat16)
+        return ((torch.rand(MAX_TOKENS, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
-        return seeded_uniform((HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 4, 0.05).to(torch.bfloat16)
+        return ((torch.rand(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_block_table():
         table = torch.zeros(MAX_REQS, SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32)
         for req in range(MAX_REQS):
@@ -1022,9 +1018,9 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_freqs_sin():
         return shared_rope_sin.clone()
     def init_wo_a():
-        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 5, O_GROUP_IN ** -0.5).to(torch.bfloat16)
+        return ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5).to(torch.bfloat16)
     def init_wo_b():
-        return seeded_uniform((D, O_GROUPS * O_LORA), 6, (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
+        return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
 
     wo_b_i8, wo_b_scale = _quant_w_per_channel(init_wo_b())
 
@@ -1124,7 +1120,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         compare_fn={"attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128)},
     )
     if not result.passed:
