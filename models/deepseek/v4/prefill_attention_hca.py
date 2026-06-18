@@ -714,17 +714,32 @@ def build_tensor_specs(
         generator = torch.Generator()
         generator.manual_seed(seed)
         return (torch.rand(*shape, generator=generator) - 0.5) * scale
+    def seeded_normal(shape, seed, std=1.0):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.randn(*shape, generator=generator) * std
 
     def init_x_hc():
-        x = seeded_uniform((MAX_TOKENS, HC_MULT, D), 1, 0.1)
+        x = seeded_normal((MAX_TOKENS, HC_MULT, D), 1, 0.05)
         x[num_tokens:] = 0
         return x
+    # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
+    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
+    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
+    # Mirrors decode_attention_hca.
     def init_hc_attn_fn():
-        return seeded_uniform((MIX_HC, HC_DIM), 2, HC_DIM ** -0.5)
+        return seeded_normal((MIX_HC, HC_DIM), 2, 0.0495)
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.079046, 0.04213, 0.121901])
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            -3.3004, 2.5553, -2.2787, -3.4925,
+            -3.8197, -3.4161, -2.7144, -2.9181,
+            2.362, -2.4746, -2.1352, -3.2216,
+            -4.474, 2.2488, -2.1053, -3.1675,
+            -2.8362, -1.9042, 2.0432, -3.062,
+            -2.7902, -3.0908, -3.002, 3.1161,
+        ])
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
@@ -741,14 +756,17 @@ def build_tensor_specs(
         return shared_freqs_cos.clone()
     def init_freqs_sin():
         return shared_freqs_sin.clone()
+    # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
+    # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
+    # Mirrors decode_attention_hca / decode_compressor_ratio128.
     def init_cmp_wkv():
-        return seeded_uniform((D, MAIN_OUT_DIM), 6, D ** -0.5)
+        return seeded_normal((D, MAIN_OUT_DIM), 6, 0.0246)
     def init_cmp_wgate():
-        return seeded_uniform((D, MAIN_OUT_DIM), 7, D ** -0.5)
+        return seeded_normal((D, MAIN_OUT_DIM), 7, 0.0316)
     def init_cmp_ape():
-        return seeded_uniform((COMPRESS_RATIO, MAIN_OUT_DIM), 8, 0.1)
+        return seeded_normal((COMPRESS_RATIO, MAIN_OUT_DIM), 8, 0.0340)
     def init_cmp_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.1001 + seeded_normal((HEAD_DIM,), 9, 0.0549)
     def init_compress_state_block_table():
         table = torch.full((MAX_REQS, HCA_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):

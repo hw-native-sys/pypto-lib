@@ -542,6 +542,10 @@ def build_tensor_specs(
         generator = torch.Generator()
         generator.manual_seed(seed)
         return (torch.rand(*shape, generator=generator) - 0.5) * scale
+    def seeded_normal(shape, seed, std=1.0):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.randn(*shape, generator=generator) * std
 
     def token_meta():
         token_to_req = torch.zeros(MAX_TOKENS, dtype=torch.int32)
@@ -605,15 +609,26 @@ def build_tensor_specs(
                 seen_abs.add(key_abs)
 
     def init_x_hc():
-        x = seeded_uniform((MAX_TOKENS, HC_MULT, D), 1, 0.1)
+        x = seeded_normal((MAX_TOKENS, HC_MULT, D), 1, 0.05)
         x[num_tokens:] = 0
         return x
+    # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
+    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
+    # hc residual to near-zero in x_out where quant noise blows up the relative tail. Mirrors
+    # decode_attention_swa.
     def init_hc_attn_fn():
-        return seeded_uniform((MIX_HC, HC_DIM), 2, HC_DIM ** -0.5)
+        return seeded_normal((MIX_HC, HC_DIM), 2, 0.039)
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([2.076026, 0.018729, 0.245936])
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            3.9083, -2.0399, -2.2033, -2.017,
+            -2.4443, -10.3158, -8.9943, -6.3581,
+            9.8577, -9.5177, -24.8724, -22.8929,
+            -21.545, 0.7791, -3.386, 1.1948,
+            -20.9605, -0.7702, 1.4218, -4.8994,
+            1.5177, -29.7663, -30.1413, -1.2413,
+        ])
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():

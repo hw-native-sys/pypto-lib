@@ -797,6 +797,10 @@ def build_tensor_specs(
         generator = torch.Generator()
         generator.manual_seed(seed)
         return (torch.rand(*shape, generator=generator) - 0.5) * scale
+    def seeded_normal(shape, seed, std=1.0):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        return torch.randn(*shape, generator=generator) * std
 
     def token_meta():
         token_to_req = torch.zeros(MAX_TOKENS, dtype=torch.int32)
@@ -879,15 +883,26 @@ def build_tensor_specs(
                     seen_cmp.add(cmp_slot)
 
     def init_x_hc():
-        x = seeded_uniform((MAX_TOKENS, HC_MULT, D), 1, 0.1)
+        x = seeded_normal((MAX_TOKENS, HC_MULT, D), 1, 0.05)
         x[num_tokens:] = 0
         return x
+    # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
+    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
+    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
+    # Mirrors decode_attention_csa.
     def init_hc_attn_fn():
-        return seeded_uniform((MIX_HC, HC_DIM), 2, HC_DIM ** -0.5)
+        return seeded_normal((MIX_HC, HC_DIM), 2, 0.0519)
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.076099, 0.032597, 0.226994])
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            5.9166, -3.6223, -2.9324, -3.3124,
+            -3.9100, -0.9384, -3.3256, -2.5240,
+            2.0706, -2.5728, 0.1424, -3.9453,
+            -3.8859, 3.4634, -3.3799, -2.6077,
+            -2.7191, -2.4846, 2.0395, -0.5010,
+            -3.5992, -2.7520, -3.3493, 3.1587,
+        ])
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
@@ -904,14 +919,17 @@ def build_tensor_specs(
         return shared_freqs_cos.clone()
     def init_freqs_sin():
         return shared_freqs_sin.clone()
+    # Quant-faithful CSA (ratio-4) main compressor fixtures (mean l8/l32 of extract_weights_flash):
+    # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
+    # Mirrors decode_attention_csa / decode_compressor_ratio4.
     def init_cmp_wkv():
-        return seeded_uniform((D, MAIN_OUT_DIM), 11, D ** -0.5)
+        return seeded_normal((D, MAIN_OUT_DIM), 11, 0.0245)
     def init_cmp_wgate():
-        return seeded_uniform((D, MAIN_OUT_DIM), 12, D ** -0.5)
+        return seeded_normal((D, MAIN_OUT_DIM), 12, 0.0388)
     def init_cmp_ape():
-        return seeded_uniform((COMPRESS_RATIO, MAIN_OUT_DIM), 13, 0.01)
+        return seeded_normal((COMPRESS_RATIO, MAIN_OUT_DIM), 13, 0.1243)
     def init_cmp_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.9666 + seeded_normal((HEAD_DIM,), 14, 0.1929)
     def init_compress_state_block_table():
         table = torch.full((MAX_REQS, CSA_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
@@ -956,14 +974,17 @@ def build_tensor_specs(
         while h.shape[0] < IDX_HEAD_DIM:
             h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
         return h * (IDX_HEAD_DIM ** -0.5)
+    # Quant-faithful indexer inner compressor fixtures (mean l8/l32 of extract_weights_flash):
+    # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
+    # Mirrors decode_attention_csa / decode_indexer.
     def init_inner_wkv():
-        return seeded_uniform((D, INNER_OUT_DIM), 16, D ** -0.5)
+        return seeded_normal((D, INNER_OUT_DIM), 16, 0.0293)
     def init_inner_wgate():
-        return seeded_uniform((D, INNER_OUT_DIM), 17, D ** -0.5)
+        return seeded_normal((D, INNER_OUT_DIM), 17, 0.0512)
     def init_inner_ape():
-        return seeded_uniform((COMPRESS_RATIO, INNER_OUT_DIM), 18, 0.01)
+        return seeded_normal((COMPRESS_RATIO, INNER_OUT_DIM), 18, 0.1528)
     def init_inner_norm_w():
-        return torch.ones(IDX_HEAD_DIM)
+        return 0.6850 + seeded_normal((IDX_HEAD_DIM,), 19, 0.2610)
     def init_inner_compress_state_block_table():
         table = torch.full((MAX_REQS, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
