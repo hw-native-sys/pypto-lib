@@ -249,7 +249,7 @@ def decode_layer_dp_ep(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        layer_id, my_rank,
+        layer_id, pl.const(T, pl.INT32), my_rank,
     )
     return x_next
 
@@ -432,6 +432,7 @@ def golden_decode_layer(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe_ep(moe_tensors)
 
 
@@ -478,6 +479,7 @@ def golden_decode_layer_hca(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe_ep(moe_tensors)
 
 
@@ -538,6 +540,7 @@ def golden_decode_layer_csa(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe_ep(moe_tensors)
 
 
