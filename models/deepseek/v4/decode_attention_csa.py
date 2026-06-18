@@ -235,18 +235,12 @@ def attention_csa(
         qr_scale,
     )
 
-    x_normed = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.create_tensor([B, S], dtype=pl.INT32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    idx_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    inner_state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
     cmp_out, compress_state, cmp_kv = compressor_ratio4(
         x_normed,

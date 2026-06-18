@@ -183,14 +183,10 @@ def attention_hca(
         qr_scale,
     )
 
-    x_normed_bsd = pl.create_tensor([B, S, D], dtype=pl.BF16)
     x_normed_bsd = pl.reshape(x_normed, [B, S, D])
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.create_tensor([B, S], dtype=pl.INT32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.create_tensor([B, S], dtype=pl.INT64)
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     cmp_kv_proj, compress_state, cmp_kv = compressor_ratio128(
         x_normed_bsd,
