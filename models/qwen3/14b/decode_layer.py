@@ -1590,7 +1590,17 @@ if __name__ == "__main__":
         choices=["a2a3", "a2a3sim", "a5", "a5sim"],
     )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+             "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
+             "phases, 4=+orch phases; 0 (default) disables.",
+    )
     parser.add_argument("--max-seq", action="store_true", default=False,
                         help="set EVERY sequence length to MAX_SEQ (full KV cache) for a stable, "
                              "maximum-load performance run; default samples varied random lengths.")
