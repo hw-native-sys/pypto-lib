@@ -108,6 +108,7 @@ def dispatch_ep(
     recv_scale: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_w: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, W_PAD], pl.FP32],
     recv_r_route: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, IDX_PAD], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
@@ -117,13 +118,18 @@ def dispatch_ep(
     # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_ep"):
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > T:
+            active_tokens = pl.cast(T, pl.INDEX)
         # ---------- histogram: scalar histogram on indices ----------
         send_counts = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
             for e in pl.range(N_LOCAL_EXPERTS):
                 send_counts[d * N_LOCAL_EXPERTS + e] = 0
 
-        for t in pl.range(T):
+        for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
                 d = eid // N_LOCAL_EXPERTS
@@ -137,9 +143,9 @@ def dispatch_ep(
                 for e in pl.range(N_LOCAL_EXPERTS):
                     v = send_counts[d * N_LOCAL_EXPERTS + e]
                     if v != 0:
-                        # AtomicAdd to mirror the L3 reference protocol; the
-                        # cell is single-writer so Add and Set are equivalent
-                        # in value, but Add avoids TNOTIFY ordering pitfalls.
+                        # AtomicAdd is the proven count protocol for the L3 EP
+                        # path. Active-only prefill keeps this protocol and
+                        # simply emits fewer nonzero route counts.
                         pld.system.notify(
                             target=pub_counts,
                             peer=peer,
@@ -200,7 +206,7 @@ def dispatch_ep(
         w_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
         idx_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
 
-        for t in pl.range(T):
+        for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
                 dst = eid // N_LOCAL_EXPERTS
