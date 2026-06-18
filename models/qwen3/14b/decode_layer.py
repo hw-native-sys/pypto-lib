@@ -6,7 +6,35 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Qwen3-14B decode — FUSED attn + dense balance + gp-loop pl.pipeline.
+"""Qwen3-14B decode kernel — FP32 inter-layer carry + fused layer output.
+
+The inter-layer hidden (hidden_states / out / cur / post_norm_partial) is carried
+as FP32. The layer output and the next layer's x*gamma are produced together by a
+single fused `dcr_xgamma` task (DOWN_ON-way), emitting `out` (the residual, for
+rms_recip + the residual stream) and `normed_out` (x*gamma, for the next layer's
+QKV) from the same in-register chunk — no GM round-trip for x_gamma.
+
+Why fuse: inside manual_scope, tensormap / auto-dep registration is suppressed —
+only explicit `deps=[tid]` edges apply — so the old DOWN_ON-way
+`down_cast_residual` PARTIAL writers (to `out_partial`) registered NO tensormap
+edge to the next layer's reader. `out_consolidate` re-emitted `out` as a single
+full-tensor writer in the auto-dep region to restore that edge. Carrying the
+residual-add out of manual_scope directly into that single consolidated writer
+drops both the `out_partial` scratch tensor and the extra copy task: the residual
+add (down_acc_all + post_norm_partial, both FP32) now writes `out` straight, as a
+single full-tensor auto-dep writer gated on the 85 down_proj TaskIds.
+
+FP32 boundaries:
+  * FIRST layer  — `copy_hidden` casts the external BF16 embed input -> FP32 once.
+  * LAST layer   — `cast_lmhead_in` casts the final FP32 hidden -> BF16 once for the
+                   (unchanged, BF16-input) rms_lm_head.
+`decode_fwd` (single-dispatch, with LM head) and `decode_fwd_layers` (chunked, no
+LM head) share the one FP32-carry `_decode_layer`.
+Numerics differ from the BF16 baseline (more precise — no per-layer BF16 rounding),
+so the saved golden's argmax is the sanity check, not bit-equality.
+
+-- original header --
+Qwen3-14B decode — FUSED attn + dense balance + gp-loop pl.pipeline.
 
 Same as the blocklevel variant but expresses the cube/vector software pipeline
 DECLARATIVELY: the per-head ``gp`` loop is a ``pl.pipeline(GP_SIZE, stage=2)``
@@ -76,9 +104,9 @@ NUM_HEADS = 40
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 INTERMEDIATE = 17408
-# MAX_SEQ is env-overridable for the e2e generate harness: it sizes the
-# (non-paged) KV cache rows and the RoPE tables, so a 512-token run can use a
-# 512-row cache instead of the 4096 micro-benchmark default (8x less KV memory).
+# MAX_SEQ is env-overridable for the e2e generate harness: it sizes the standalone
+# paged KV pool (CACHE_ROWS) and the RoPE tables, so a 512-token run can use a much
+# smaller pool than the 4096 micro-benchmark default (less KV memory).
 MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", "4096"))
 EPS = 1e-6  # RMSNorm epsilon
 
@@ -134,18 +162,17 @@ QKV_N_TILE = 512  # outer N-tile width (one ON unit) = N_SUB inner TN subtiles
 N_SUB = QKV_N_TILE // TN  # 2 inner N-subtiles per outer N-tile
 Q_ON = HIDDEN // QKV_N_TILE  # 10 outer N-tiles (Q)
 KV_ON = KV_HIDDEN // QKV_N_TILE  # 2 outer N-tiles (K, V)
-QKV_OK = 4  # split-K slices (atomic-add)
+QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab (1:1 partial-Q)
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
 # ── Scope 2 · grouped-query attention (fused, PAGED) ──
 # SEQ_TILE = seq length per KV block. PINNED to the serving paged page_size (128):
-# decode now reads KV from the PAGED pool via block_table, so one logical block
-# must map to exactly one physical page — i.e. SEQ_TILE == page_size — or a block
-# would straddle two pages whose physical ids are unrelated. prefill_fwd uses the
-# same 128 page; 128 is also the known-good L0B double-buffer cap (256 only became
-# legal after the AutoTileMatmulL0 fix #1595, and is not needed once tiling tracks
-# the page size). BLOCK_SIZE is an alias used by the paged cache-row arithmetic.
+# decode reads KV from the PAGED pool via block_table, so one logical block must
+# map to exactly one physical page — i.e. SEQ_TILE == page_size — or a block would
+# straddle two pages whose physical ids are unrelated. prefill_fwd uses the same
+# 128 page; 128 is also the known-good L0B double-buffer cap. BLOCK_SIZE is an
+# alias used by the paged cache-row arithmetic.
 SEQ_TILE = 128
 BLOCK_SIZE = SEQ_TILE  # paged page size (== serving runtime.page_size)
 MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # logical blocks per seq (32 @ 4096)
@@ -197,6 +224,17 @@ NUM_CORES = 24
 FA_TABLE_CAP = BATCH * MAX_CTX_BLOCKS  # upper bound on real blocks (all seqs full)
 OS_WORK = BATCH * NUM_KV_HEADS  # online_softmax work items (128)
 
+# RoPE GROUPED by HEADS_PER_ROPE heads/grid (re-test @ swimlane level 2).
+HEADS_PER_ROPE = 4
+NUM_ROPE_GROUPS = NUM_KV_HEADS // HEADS_PER_ROPE
+ROPE_GROUP_CORES = 16
+ROPE_GROUP_ITEMS_PER_CORE = (HEADS_PER_ROPE * BATCH) // ROPE_GROUP_CORES
+# RoPE SINGLE spmd grid (fork): all NUM_KV_HEADS*BATCH items in ONE launch,
+# replacing the 2 grouped grids (per-grid scheduler overhead). 32 cores @ 4/core.
+ROPE_CORES = 32
+ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
+assert (NUM_KV_HEADS * BATCH) % ROPE_CORES == 0
+
 # ── Scope 3a · out_proj (split-K × split-N, atomic-add into attn_proj_fp32) ──
 K_SPLITS_OUT = 5
 N_SPLITS_OUT = 10
@@ -236,7 +274,7 @@ assert HIDDEN % QKV_N_TILE == 0 and KV_HIDDEN % QKV_N_TILE == 0, "QKV_N_TILE mus
 assert HIDDEN % QKV_OK == 0, "OK must divide HIDDEN (K dim)"
 assert QKV_K_SLICE % TK == 0, "TK must divide the split-K slice"
 assert Q_ON == 10 and KV_ON == 2, "expected ON = 10 (Q) + 2 (K) + 2 (V)"
-assert TM == BATCH and N_SUB == 2 and QKV_K_CHUNKS == 5
+assert TM == BATCH and N_SUB == 2 and QKV_K_CHUNKS == 4
 assert TOKENS_PER_SPLIT % SEQ_TILE == 0, "TOKENS_PER_SPLIT must be a multiple of SEQ_TILE"
 assert MAX_CTX_BLOCKS % BLOCKS_PER_SPLIT == 0, "BLOCKS_PER_SPLIT must divide MAX_CTX_BLOCKS"
 assert KV_SPLITS * BLOCKS_PER_SPLIT == MAX_CTX_BLOCKS
@@ -264,7 +302,7 @@ assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
 
 @pl.jit.inline
 def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -283,12 +321,25 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     w_up: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
-    out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    out: pl.Tensor[[BATCH, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
+    # normed_in: THIS layer's x*gamma (BF16), produced by the previous layer's fused
+    # dcr_xgamma (x_gamma_0 for layer 0). Consumed by QKV — replaces the local x_gamma.
+    normed_in: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    # normed_out: NEXT layer's x*gamma, written by THIS layer's dcr_xgamma. Escapes via
+    # the inline alias (verified: inline out-param tensor writes are visible to caller).
+    normed_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-    # Per-layer offsets into the STACKED weights / PAGED KV cache. For the
-    # single-layer entry (qwen3_decode_mpmd) layer_idx==0 so every base is 0 and
-    # single-layer tensors work unchanged; decode_fwd passes the running loop index.
+    next_gamma_idx: pl.Scalar[pl.INT32],  # clamped min(layer_idx+1, N-1) for dcr_xgamma's gamma
+    # Cross-iteration carries: prev_out_tids = DOWN_ON slab writers of `hidden_states`
+    # (prev dcr / copy_hidden) — gate rms_recip / residual / seeds. prev_normed_tids =
+    # DOWN_ON slab writers of `normed_in` (prev dcr_xgamma / x_gamma_0) — gate QKV. Both
+    # refilled by this layer's dcr_xgamma (same task writes out + normed_out).
+    prev_out_tids: pl.Array[DOWN_ON, pl.TASK_ID],
+    prev_normed_tids: pl.Array[DOWN_ON, pl.TASK_ID],
+) -> pl.Tensor[[BATCH, HIDDEN], pl.FP32]:
+    # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
+    # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
+    # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
     # Paged KV: rows are runtime-dynamic (the paged pool sizes them). Derive the
@@ -303,9 +354,18 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
     # Scope 1
-    normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    out_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # pre-consolidation layer output
-    dcr_tids = pl.array.create(DOWN_ON, pl.TASK_ID)  # terminal writers of out_partial (filled in manual_scope)
+    # down_proj TaskIds — HOISTED to orchestration scope (declared before
+    # manual_scope) so the consolidated `down_cast_residual` writer that runs
+    # AFTER the manual_scope can gate on them via deps=. Filled inside the
+    # manual_scope down_proj loop; the consolidated writer reads them per-index
+    # (deps=[down_tids[k] for k in range(DOWN_ON * K_SPLITS)] — list-comprehension
+    # per-index fence works for large N; whole-array deps=[down_tids] does not).
+    down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
+    q_tile_tids = pl.array.create(Q_ON * QKV_OK, pl.TASK_ID)
+    k_tile_tids = pl.array.create(KV_ON * QKV_OK, pl.TASK_ID)
+    v_tile_tids = pl.array.create(KV_ON * QKV_OK, pl.TASK_ID)
+    qk_tids = pl.array.create(NUM_KV_HEADS, pl.TASK_ID)  # fused qk_norm (gamma+recip)
+    rope_grp_tids = pl.array.create(NUM_ROPE_GROUPS, pl.TASK_ID)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
@@ -318,93 +378,17 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # 1/rms division past the projections and fold it into rope_qkv (one scalar mul
     # per batch row). This decouples the sum-of-squares reduction from the gamma
     # scaling: `x_gamma` (which feeds QKV) no longer waits on the reduction, and
-    # `rms_recip` overlaps the QKV proj. normed_states is consumed ONLY by QKV; the
+    # `rms_recip` overlaps the QKV proj. normed_in is consumed ONLY by QKV; the
     # residual / post_rms path reads raw hidden_states, so it is unaffected.
-    for xg_core in pl.spmd(XG_BLOCKS, name_hint="x_gamma"):
-        for kb in pl.pipeline(xg_core, HIDDEN // RMSNORM_K_CHUNK, XG_BLOCKS, stage=2):
-            k0 = kb * RMSNORM_K_CHUNK
-            x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-            gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [layer_idx, k0])
-            xg = pl.col_expand_mul(x_chunk, gamma)
-            normed_states = pl.assemble(normed_states, pl.cast(xg, target_type=pl.BF16), [0, k0])
+    #
+    # WHOLE-LAYER manual scope (x_gamma .. rope): tensormap registration is
+    # suppressed; every cross-task edge below is an explicit deps=. x_gamma slab
+    # n deps ONLY on prev_out_tids[n] (the previous layer's dcr writer of that
+    # carry slab, copy_hidden for layer 0) — the fine-grained dcr->x_gamma edge
+    # the auto path cannot express without whole-parent WAW serialization.
+    # normed_in is now the `normed_in` PARAM (produced by prev dcr_xgamma / x_gamma_0).
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rms_recip"):
-        partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-        for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-            k0 = kb * RMSNORM_K_CHUNK
-            x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-            partial_sq = pl.add(
-                partial_sq,
-                pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]),
-            )
-        variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
-        inv_rms = pl.recip(pl.sqrt(variance))
-        inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
-
-    # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed"):
-        for snb in pl.pipeline(Q_ON, stage=2):
-            q_proj = pl.assemble(
-                q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
-            )
-    for q_core in pl.spmd(Q_ON * QKV_OK, name_hint="q_proj"):
-        q_n_region = (q_core // QKV_OK) * QKV_N_TILE
-        q_k_base = (q_core % QKV_OK) * QKV_K_SLICE
-        for n_sub in pl.range(N_SUB):
-            n0 = q_n_region + n_sub * TN
-            q_acc = pl.matmul(
-                normed_states[:, q_k_base : q_k_base + TK],
-                wq[layer_hidden_base + q_k_base : layer_hidden_base + q_k_base + TK, n0 : n0 + TN],
-                out_dtype=pl.FP32,
-            )
-            for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
-                kk = q_k_base + kc * TK
-                q_acc = pl.matmul_acc(
-                    q_acc, normed_states[:, kk : kk + TK], wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
-                )
-            q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
-
-    # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_seed"):
-        k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-    for k_core in pl.spmd(KV_ON * QKV_OK, name_hint="k_proj"):
-        k_n_region = (k_core // QKV_OK) * QKV_N_TILE
-        k_k_base = (k_core % QKV_OK) * QKV_K_SLICE
-        for n_sub in pl.range(N_SUB):
-            n0 = k_n_region + n_sub * TN
-            k_acc = pl.matmul(
-                normed_states[:, k_k_base : k_k_base + TK],
-                wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
-                out_dtype=pl.FP32,
-            )
-            for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
-                kk = k_k_base + kc * TK
-                k_acc = pl.matmul_acc(
-                    k_acc, normed_states[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
-                )
-            k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
-
-    # ── Scope 1: V projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_seed"):
-        v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-    for v_core in pl.spmd(KV_ON * QKV_OK, name_hint="v_proj"):
-        v_n_region = (v_core // QKV_OK) * QKV_N_TILE
-        v_k_base = (v_core % QKV_OK) * QKV_K_SLICE
-        for n_sub in pl.range(N_SUB):
-            n0 = v_n_region + n_sub * TN
-            v_acc = pl.matmul(
-                normed_states[:, v_k_base : v_k_base + TK],
-                wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
-                out_dtype=pl.FP32,
-            )
-            for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
-                kk = v_k_base + kc * TK
-                v_acc = pl.matmul_acc(
-                    v_acc, normed_states[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
-                )
-            v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
-
-    # ── Scope 2: RoPE + KV cache update + fused flash-attention. ──
+    # ── Scope 2 allocations (hoisted before the manual scope). ──
     all_q_padded = pl.create_tensor([BATCH * NUM_KV_HEADS * Q_HEAD_PAD, HEAD_DIM], dtype=pl.BF16)
     attn_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     all_oi_tmp = pl.create_tensor(
@@ -416,359 +400,478 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     all_cur_li = pl.create_tensor(
         [BATCH * NUM_KV_HEADS * MAX_CTX_BLOCKS * Q_HEAD_PAD, 1], dtype=pl.FP32
     )
-
     # Block-level (dense) work list. `fa_work_table[w]` encodes the w-th REAL
     # seq-block as `b * MAX_CTX_BLOCKS + p`; `fa_total[0]` holds the number of
-    # real blocks. Built once by the `fa_work_build` AIV task below, consumed by
+    # real blocks. Built once by the `fa_work_build` AIV task, consumed by
     # fa_fused's grid-stride. Sized to the worst case (every sequence full).
     fa_work_table = pl.create_tensor([FA_TABLE_CAP, 1], dtype=pl.INT32)
     fa_total = pl.create_tensor([1, 1], dtype=pl.INT32)
 
-    # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
-    # Walk batches in order; for each, append its real blocks [0, ctx_blocks[b])
-    # to the table at a running cursor (prefix-sum), so the table is gap-free and
-    # `core = w % NUM_CORES` over [0, fa_total) load-balances equal-cost blocks
-    # across cores regardless of per-batch length skew.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build"):
-        cursor = pl.read(seq_lens, [0]) * 0  # scalar 0 (INDEX)
-        for wb in pl.unroll(BATCH):
-            wb_ctx = (pl.read(seq_lens, [wb]) + (SEQ_TILE - 1)) // SEQ_TILE
-            for wp in pl.range(wb_ctx):
-                # fa_work_table is INT32 (fixed-width for the host↔ptoas ABI; see
-                # KNOWN_ISSUES "pl.INDEX GM tensor width mismatch") — cast the
-                # index-typed encoding to match the tensor dtype.
-                pl.tensor.write(
-                    fa_work_table, [cursor + wp, 0], pl.cast(wb * MAX_CTX_BLOCKS + wp, target_type=pl.INT32)
-                )
-            cursor = cursor + wb_ctx
-        pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
-
-    # ── Scope 2: per-head Qwen3 QK-norm, SPLIT into two INDEPENDENT steps. ──
-    # Same trick as the input RMSNorm above. QKnorm(x)_head = (x * qk_inv_head) *
-    # gamma, where qk_inv_head[b,h] = 1/sqrt(mean_d x^2 + eps) is a per-(row, head)
-    # SCALAR. RoPE is linear within a head, so qk_inv commutes through it. We
-    # therefore (a) apply ONLY the elementwise `* gamma` here — q_proj_norm /
-    # k_proj_norm no longer wait on the reduction — and (b) DEFER the per-head
-    # qk_inv reciprocal past RoPE, folding it into rope_qkv as one scalar mul per
-    # head-row. The two steps read q_proj / k_proj independently, so `qk_recip`
-    # (the sum-of-squares reduction) overlaps `qk_gamma` instead of serializing
-    # after it.
-    #
-    # CONTROL EXPERIMENT: the deferred input-RMSNorm inv_rms is a POSITIVE per-row
-    # scalar and QK-norm is scale-invariant, so it CANCELS inside this QK-norm and
-    # the optimized path omits it on Q/K. Here we instead APPLY it explicitly — we
-    # scale q_proj / k_proj by inv_rms[b] BEFORE the QK-norm in BOTH sub-steps
-    # (qk_gamma AND qk_recip). Because the reciprocal step sees inv_rms*x its
-    # denominator picks up a 1/inv_rms factor that exactly undoes the inv_rms in
-    # the gamma step, so q_out / k_out are bit-for-bit the SAME as the optimized
-    # path (RoPE folds the two together). This makes the full mathematical chain
-    # input-RMSNorm -> proj -> QK-norm visible in the code, at the cost of two
-    # redundant row-scales. Must be in BOTH steps; applying it to only one would
-    # NOT cancel and would change the result.
-    #
-    # qk_inv layout is (head, batch[, q-in-group]) so rope_qkv can slice a
-    # contiguous per-(KV head, batch) column. Per head h, the q reduction yields
-    # [BATCH * Q_PER_KV, 1] rows ordered (b, j); we stack the NUM_KV_HEADS blocks,
-    # so global row = h*BATCH*Q_PER_KV + b*Q_PER_KV + j.
-    q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-    q_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH * Q_PER_KV, 1], dtype=pl.FP32)
-    k_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH, 1], dtype=pl.FP32)
-
-    # inv_rms[b] as a [BATCH, 1] column — applied row-wise to q_proj / k_proj
-    # BEFORE QK-norm in both sub-steps below (the control-experiment scale).
-    inv_rms_col = inv_rms_states[:, 0:1]
-
-    # Step (a): input inv_rms (control scale) + `* gamma` — elementwise along
-    # HEAD_DIM, no reduction dep.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_gamma"):
-        for h in pl.range(NUM_KV_HEADS):
-            q0 = h * Q_PER_KV * HEAD_DIM
-            # Scale by inv_rms[b] per row while still [BATCH, Q_PER_KV*HEAD_DIM]
-            # (one column hits all Q_PER_KV heads of a batch row), then reshape.
-            q_slice = pl.row_expand_mul(
-                pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0]), inv_rms_col
-            )
-            q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
-            q_g = pl.col_expand_mul(q_chunk, q_norm_w)
-            q_proj_norm = pl.assemble(
-                q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
-            )
-            k0 = h * HEAD_DIM
-            k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
-            k_g = pl.col_expand_mul(k_chunk, k_norm_w)
-            k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
-
-    # Step (b): per-head 1/rms reciprocal — DEFERRED, folded into rope_qkv below.
-    # Same inv_rms[b] control scale on the input; its 1/inv_rms in the denominator
-    # cancels the inv_rms in step (a) (see CONTROL EXPERIMENT note above).
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_recip"):
-        for h in pl.range(NUM_KV_HEADS):
-            q0 = h * Q_PER_KV * HEAD_DIM
-            q_slice = pl.row_expand_mul(
-                pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0]), inv_rms_col
-            )
-            q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
-            q_ss = pl.row_sum(pl.mul(q_chunk, q_chunk))
-            q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-            q_inv_states = pl.assemble(q_inv_states, q_inv, [h * BATCH * Q_PER_KV, 0])
-            k0 = h * HEAD_DIM
-            k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
-            k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
-            k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-            k_inv_states = pl.assemble(k_inv_states, k_inv, [h * BATCH, 0])
-
-    # Per-batch rope_kv_cache: K RoPE + K/V cache write + Q RoPE + Q-pad.
-    for b in pl.spmd(BATCH, name_hint="rope_qkv"):
-        ctx_len = pl.read(seq_lens, [b])
-        # Deferred RMSNorm denominator: scale this row's q/k/v by inv_rms[b] (a
-        # per-row scalar) here, instead of normalizing before the projection.
-        # Read on-device so it auto-deps on the rms_recip producer.
-        inv_rms_b = pl.read(inv_rms_states, [b, 0])
-        pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
-        # Paged write target for this row's current token: slot_mapping[b] decomposes
-        # into (physical page, in-page offset). Same scheme prefill_fwd uses.
-        wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
-        wr_slot_block = wr_slot // BLOCK_SIZE
-        wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
-        cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
-        cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
-        sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
-        sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
-
-        for ki in pl.pipeline(NUM_KV_HEADS, stage=2):
-            kv_col = ki * HEAD_DIM
-            # K carries the qk_norm gamma (applied batch-wide in qk_gamma above);
-            # fold in the DEFERRED per-head qk_inv scalar here (one scalar mul before
-            # the linear RoPE — read on-device so it auto-deps on qk_recip). The
-            # input-RMSNorm inv_rms cancels inside qk_norm, so no extra inv_rms factor
-            # is needed on K. Then split lo/hi for RoPE.
-            k_inv_b = pl.read(k_inv_states, [ki * BATCH + b, 0])
-            k_full = pl.mul(k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM], k_inv_b)
-            k_lo = k_full[:, 0:HALF_DIM]
-            k_hi = k_full[:, HALF_DIM:HEAD_DIM]
-            rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
-            rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-            cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
-            k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
-            k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
-            v_row_bf16 = pl.cast(
-                pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
-                target_type=pl.BF16,
-            )
-            v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
-
-            q_base = ki * Q_PER_KV
-            q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
-            # Q carries the qk_norm gamma (applied batch-wide in qk_gamma above);
-            # fold in the DEFERRED per-head qk_inv scalar here. The Q_PER_KV Q heads
-            # bundled under this KV head each have their OWN qk_inv scalar, so we
-            # scale + rotate one head at a time (a bundled [Q_PER_KV, 1] column is
-            # too small for the 32B col-major tile-alloc constraint; per-head
-            # pl.read scalars sidestep it). inv_rms cancels inside qk_norm, so no
-            # inv_rms factor on Q either.
-            q_inv_base = ki * BATCH * Q_PER_KV + b * Q_PER_KV
-            for qj in pl.range(Q_PER_KV):
-                q_inv_bj = pl.read(q_inv_states, [q_inv_base + qj, 0])
-                q_head = pl.mul(
-                    q_proj_norm[
-                        b : b + 1, (q_base + qj) * HEAD_DIM : (q_base + qj + 1) * HEAD_DIM
-                    ],
-                    q_inv_bj,
-                )
-                q_lo = q_head[:, 0:HALF_DIM]
-                q_hi = q_head[:, HALF_DIM:HEAD_DIM]
-                q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_rot_lo, target_type=pl.BF16), [q_pad_row0 + qj, 0]
-                )
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_rot_hi, target_type=pl.BF16), [q_pad_row0 + qj, HALF_DIM]
-                )
-            q_pad_zero = pl.cast(
-                pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                target_type=pl.BF16,
-            )
-            all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
-
-    # ── Scope 3b MLP-accumulator seeds, HOISTED between rope and attn. ──
-    # gate/up/down accumulators are zeroed for the later split-K atomic-add
-    # tasks; the seeds have NO data dependency on rope or attention, so placing
-    # them here lets the scheduler overlap the (vector) zero-fills with the
-    # fa_fused cube/vector work instead of serializing them at the head of the
-    # MLP manual_scope. Their TASK_IDs (seed_tid / gate_seed_tid / up_seed_tid)
-    # cross into the manual_scope below as explicit deps — the same pattern as
-    # online_softmax's captured online_done_tid. The accumulator create_tensor
-    # calls move up with them (a seed must follow its tensor's allocation).
-    down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
-    up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_seed") as seed_tid:
-        for nb in pl.pipeline(DOWN_ON, stage=2):
-            n0 = nb * DOWN_TN
-            zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
-            down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_seed") as gate_seed_tid:
-        for nb in pl.pipeline(MLP_ON, stage=2):
-            n0 = nb * MLP_TN
-            zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
-            gate_acc_all = pl.assemble(gate_acc_all, zero, [0, n0])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_seed") as up_seed_tid:
-        for nb in pl.pipeline(MLP_ON, stage=2):
-            n0 = nb * MLP_TN
-            zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
-            up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
-
-    # fa_fused: ONE mixed cube+vec root (QK -> softmax -> SV), BLOCK-LEVEL dense
-    # static dispatch. Each grid-stride step processes exactly ONE real seq-block
-    # (×GP_SIZE heads), decoded from the dense work table. Because the table holds
-    # only real blocks, core = w % NUM_CORES distributes total_real_blocks evenly
-    # across cores (≈1.25x of ideal), independent of per-batch length skew.
-    for fa_core in pl.spmd(
-        NUM_CORES,
-        name_hint="fa_fused",
-        optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
-    ):
-        # Read the device-computed block count ON-DEVICE (inside the kernel) so
-        # `fa_total` enters fa_fused as an INPUT and the normal task auto-dep
-        # orders it after the `fa_work_build` producer. Reading it at
-        # orchestration scope instead lowers to a host get_tensor_data that does
-        # NOT wait for the producer (stale ~0 read → empty dispatch; see
-        # KNOWN_ISSUES). This mirrors the existing on-device fa_work_table read.
-        fa_total_blocks = pl.cast(pl.read(fa_total, [0, 0]), target_type=pl.INDEX)
-        # Grid-stride over the dense real-block list: core fa_core owns table
-        # entries fa_core, fa_core+NUM_CORES, … < fa_total_blocks.
-        for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
-            fa_enc = pl.cast(pl.read(fa_work_table, [fa_w, 0]), target_type=pl.INDEX)
-            fa_b = fa_enc // MAX_CTX_BLOCKS
-            fa_p = fa_enc % MAX_CTX_BLOCKS
-            fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
-            fa_ctx_len = pl.read(seq_lens, [fa_b])
-            # Table holds only real blocks → exactly one block per entry, at fa_p.
-            sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
-            s0 = sb * SEQ_TILE
-            valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
-            # Paged read: map logical block sb -> physical page via this request's
-            # block_table row. SEQ_TILE == page_size, so one page is exactly one
-            # contiguous SEQ_TILE-row slice of the pool (shared with the kvh below).
-            fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
-
-            # Declarative software pipeline over the per-head gp loop: instead of
-            # manually unrolling and reordering (QK0,QK1 -> softmax0,softmax1 ->
-            # SV0,SV1), let pl.pipeline stage=2 overlap iteration i+1's QK (AIC)
-            # with iteration i's softmax (AIV) through the C2V/V2C pipe.
-            for gp in pl.pipeline(GP_SIZE, stage=2):
-                gi = fa_hg * GP_SIZE + gp
-                kvh = gi  # Q_GROUPS=1
-                q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-                q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
-                g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-                cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
-
-                # QK matmul (cube) -> C2V boundary move (first vec consumer).
-                k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
-                raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
-                scores_scaled = pl.mul(raw_scores, ATTN_SCALE)
-                # Mark only the Q_HEAD_BATCH (5) real rows valid (tile stays 16):
-                # the vec softmax and the cur_mi / cur_li GM stores then touch 5
-                # rows, not the padded 16. NOTE: this cannot shrink the AIC<->AIV
-                # C2V/V2C transfer — tpush/tpop always carry the full 16-row tile
-                # box (matmul M fractal).
-                scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
-                scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                cur_mi = pl.row_max(scores)
-                exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
-                cur_li = pl.row_sum(exp_scores_fp32)
-
-                # SV matmul (cube) reads exp directly -> V2C boundary move.
-                v_tile = v_cache[cache_row : cache_row + SEQ_TILE, :]
-                oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
-                # The SV-matmul output spans the full padded 16 rows but only
-                # the first Q_HEAD_BATCH are real — mark 5 valid (tile stays 16)
-                # so the (dominant) all_oi_tmp GM write stores 5 rows instead of 16.
-                oi_tmp = pl.set_validshape(oi_tmp, Q_HEAD_BATCH, HEAD_DIM)
-
-                all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
-                all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
-                all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
-
-    # online_softmax: flat top-level spmd, writes attn_out directly. Reduces the
-    # per-block partials across ALL blocks of a lane (hence across the KV
-    # partitions that produced them); auto-dep on the scratch serializes it after
-    # every contributing fa_fused partition. Captured in the `as tid` form so the
-    # dispatch's producer TASK_ID (online_done_tid) crosses directly into the MLP
-    # manual_scope as the out_proj dep — no dummy attn_fence task needed.
-    with pl.spmd(NUM_CORES * 2, name_hint="online_softmax") as online_done_tid:
-        os_core = pl.tile.get_block_idx()
-        # Grid-stride over online_softmax work items (one per (b, kvh) lane).
-        for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
-            os_b = os_spmd_idx // NUM_KV_HEADS
-            os_gi = os_spmd_idx % NUM_KV_HEADS
-            os_ctx_len = pl.read(seq_lens, [os_b])
-            os_ctx_blocks = (os_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-            os_kvh = os_gi  # Q_GROUPS=1
-            os_q_base = os_kvh * Q_PER_KV
-            os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-
-            # Loop-carried accumulators: full Q_HEAD_PAD (16) rows. They can't be
-            # valid-shaped because the recurrence (add / maximum) drops valid_shape,
-            # which would break loop-carry type consistency. Only the per-block GM
-            # reads below are trimmed to the 5 real rows via pl.slice valid_shape.
-            oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
-            mi = all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :]
-            li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
-            for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
-                rec = os_g_base + sb * Q_HEAD_PAD
-                # Partial load: tile stays Q_HEAD_PAD (16) rows, GM transfer = the 5
-                # real rows (valid_shape on the slice → tile.load valid_shapes).
-                oi_tmp_valid = pl.slice(
-                    all_oi_tmp, [Q_HEAD_PAD, HEAD_DIM], [rec, 0], valid_shape=[Q_HEAD_BATCH, HEAD_DIM]
-                )
-                online_cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                online_cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                mi_new = pl.maximum(mi, online_cur_mi)
-                alpha = pl.exp(pl.sub(mi, mi_new))
-                beta = pl.exp(pl.sub(online_cur_mi, mi_new))
-                li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
-                oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
-                mi = mi_new
-
-            ctx = pl.row_expand_div(oi, li)
-            ctx_valid = ctx[0:Q_HEAD_BATCH, :]
-            ctx_flat_bf16 = pl.cast(
-                pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16
-            )
-            attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
-
-    # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all are created
-    # earlier, alongside their hoisted seed tasks between rope and attn.)
-    attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # raw residual h1 (add-back)
-    mlp_norm_in = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
-    inv_rms_tile = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-    mlp_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
-
-    # Out_seed zeros attn_proj_fp32 in OUT_TN-wide chunks so out_proj
-    # split-K tasks can atomic-add into it.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_seed") as out_seed_tid:
-        for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
-            out_seed_n0 = nb * OUT_TN
-            out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
-            attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
-
-    # ── Scope 3b: manual_scope MLP block. ──
-    # out_proj depends on online_done_tid (the captured online_softmax dispatch
-    # TASK_ID) directly — bridging attn→out_proj across the manual_scope boundary
-    # without a dummy attn_fence task.
     with pl.manual_scope():
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="rms_recip",
+            deps=[prev_out_tids[i] for i in range(DOWN_ON)],
+        ) as rms_tid:
+            partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+            for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
+                k0 = kb * RMSNORM_K_CHUNK
+                x_chunk = hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK]  # FP32 already (was cast from BF16)
+                partial_sq = pl.add(
+                    partial_sq,
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]),
+                )
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
+            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
+
+        # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed") as q_seed_tid:  # no explicit dep: runtime q_proj WAR hazard orders it after prev qk_norm
+            for snb in pl.pipeline(Q_ON, stage=2):
+                q_proj = pl.assemble(
+                    q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
+                )
+        for q_nt in pl.parallel(Q_ON):
+            q_n_region = q_nt * QKV_N_TILE
+            for q_ks in pl.range(QKV_OK):
+                q_k_base = q_ks * QKV_K_SLICE
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="q_proj",
+                    deps=[prev_normed_tids[q_ks], q_seed_tid],  # 1:1 with normed slab (QKV_K_SLICE=DOWN_TN)
+                ) as q_tid:
+                    for n_sub in pl.range(N_SUB):
+                        n0 = q_n_region + n_sub * TN
+                        q_acc = pl.matmul(
+                            normed_in[:, q_k_base : q_k_base + TK],
+                            wq[layer_hidden_base + q_k_base : layer_hidden_base + q_k_base + TK, n0 : n0 + TN],
+                            out_dtype=pl.FP32,
+                        )
+                        for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                            kk = q_k_base + kc * TK
+                            q_acc = pl.matmul_acc(
+                                q_acc, normed_in[:, kk : kk + TK], wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                            )
+                        q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
+                q_tile_tids[q_nt * QKV_OK + q_ks] = q_tid
+
+        # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as k_seed_tid:
+            k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+        for k_nt in pl.parallel(KV_ON):
+            k_n_region = k_nt * QKV_N_TILE
+            for k_ks in pl.range(QKV_OK):
+                k_k_base = k_ks * QKV_K_SLICE
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="k_proj",
+                    deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], k_seed_tid],
+                ) as k_tid:
+                    for n_sub in pl.range(N_SUB):
+                        n0 = k_n_region + n_sub * TN
+                        k_acc = pl.matmul(
+                            normed_in[:, k_k_base : k_k_base + TK],
+                            wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
+                            out_dtype=pl.FP32,
+                        )
+                        for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                            kk = k_k_base + kc * TK
+                            k_acc = pl.matmul_acc(
+                                k_acc, normed_in[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                            )
+                        k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
+                k_tile_tids[k_nt * QKV_OK + k_ks] = k_tid
+
+        # ── Scope 1: V projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as v_seed_tid:
+            v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+        for v_nt in pl.parallel(KV_ON):
+            v_n_region = v_nt * QKV_N_TILE
+            for v_ks in pl.range(QKV_OK):
+                v_k_base = v_ks * QKV_K_SLICE
+                with pl.at(
+                    level=pl.Level.CORE_GROUP,
+                    name_hint="v_proj",
+                    deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], v_seed_tid],
+                ) as v_tid:
+                    for n_sub in pl.range(N_SUB):
+                        n0 = v_n_region + n_sub * TN
+                        v_acc = pl.matmul(
+                            normed_in[:, v_k_base : v_k_base + TK],
+                            wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
+                            out_dtype=pl.FP32,
+                        )
+                        for kc in pl.pipeline(1, QKV_K_CHUNKS, stage=2):
+                            kk = v_k_base + kc * TK
+                            v_acc = pl.matmul_acc(
+                                v_acc, normed_in[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
+                            )
+                        v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
+                v_tile_tids[v_nt * QKV_OK + v_ks] = v_tid
+
+        # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
+        # Inputs are external (seq_lens) — no deps.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build") as work_tid:
+            cursor = pl.read(seq_lens, [0]) * 0  # scalar 0 (INDEX)
+            for wb in pl.unroll(BATCH):
+                wb_ctx = (pl.read(seq_lens, [wb]) + (SEQ_TILE - 1)) // SEQ_TILE
+                for wp in pl.range(wb_ctx):
+                    # fa_work_table is INT32 (fixed-width for the host↔ptoas ABI; see
+                    # KNOWN_ISSUES "pl.INDEX GM tensor width mismatch") — cast the
+                    # index-typed encoding to match the tensor dtype.
+                    pl.tensor.write(
+                        fa_work_table, [cursor + wp, 0], pl.cast(wb * MAX_CTX_BLOCKS + wp, target_type=pl.INT32)
+                    )
+                cursor = cursor + wb_ctx
+            pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
+
+        # ── Scope 2: per-head Qwen3 QK-norm, SPLIT into two INDEPENDENT steps. ──
+        # Same trick as the input RMSNorm above. QKnorm(x)_head = (x * qk_inv_head) *
+        # gamma, where qk_inv_head[b,h] = 1/sqrt(mean_d x^2 + eps) is a per-(row, head)
+        # SCALAR. RoPE is linear within a head, so qk_inv commutes through it. We
+        # therefore (a) apply ONLY the elementwise `* gamma` here — q_proj_norm /
+        # k_proj_norm no longer wait on the reduction — and (b) DEFER the per-head
+        # qk_inv reciprocal past RoPE, folding it into rope_qkv as one scalar mul per
+        # head-row. The two steps read q_proj / k_proj independently, so `qk_recip`
+        # (the sum-of-squares reduction) overlaps `qk_gamma` instead of serializing
+        # after it.
+        #
+        # CONTROL EXPERIMENT: the deferred input-RMSNorm inv_rms is a POSITIVE per-row
+        # scalar and QK-norm is scale-invariant, so it CANCELS inside this QK-norm and
+        # the optimized path omits it on Q/K. Here we instead APPLY it explicitly — we
+        # scale q_proj / k_proj by inv_rms[b] BEFORE the QK-norm in BOTH sub-steps
+        # (qk_gamma AND qk_recip). Because the reciprocal step sees inv_rms*x its
+        # denominator picks up a 1/inv_rms factor that exactly undoes the inv_rms in
+        # the gamma step, so q_out / k_out are bit-for-bit the SAME as the optimized
+        # path (RoPE folds the two together). This makes the full mathematical chain
+        # input-RMSNorm -> proj -> QK-norm visible in the code, at the cost of two
+        # redundant row-scales. Must be in BOTH steps; applying it to only one would
+        # NOT cancel and would change the result.
+        #
+        # qk_inv layout is (head, batch[, q-in-group]) so rope_qkv can slice a
+        # contiguous per-(KV head, batch) column. Per head h, the q reduction yields
+        # [BATCH * Q_PER_KV, 1] rows ordered (b, j); we stack the NUM_KV_HEADS blocks,
+        # so global row = h*BATCH*Q_PER_KV + b*Q_PER_KV + j.
+        q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
+        q_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH * Q_PER_KV, 1], dtype=pl.FP32)
+        k_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH, 1], dtype=pl.FP32)
+
+        # inv_rms[b] as a [BATCH, 1] column — applied row-wise to q_proj / k_proj
+        # BEFORE QK-norm in both sub-steps below (the control-experiment scale).
+        inv_rms_col = inv_rms_states[:, 0:1]
+
+        # FUSED qk_norm PER KV-HEAD: gamma (q/k_proj_norm) AND the 1/rms reduction
+        # (q/k_inv) in ONE task, reading each q/k tile from GM ONCE (qk_gamma + qk_recip
+        # used to read the same data twice). Halves qk-stage GM reads and the qk task
+        # count (16 -> 8). q_chunk/k_chunk (= inv_rms-scaled input) feed BOTH the gamma
+        # assemble and the sum-of-squares. Each head gates on its 2 straddled q tiles +
+        # 1 k tile. (recip is still deferred — folded into rope as a per-head scalar mul.)
+        for h in pl.unroll(NUM_KV_HEADS):
+            qt0 = (h * Q_PER_KV * HEAD_DIM) // QKV_N_TILE
+            kt = (h * HEAD_DIM) // QKV_N_TILE
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                name_hint="qk_norm",
+                deps=[
+                    q_tile_tids[qt0 * QKV_OK + 0], q_tile_tids[qt0 * QKV_OK + 1],
+                    q_tile_tids[qt0 * QKV_OK + 2], q_tile_tids[qt0 * QKV_OK + 3],
+                    q_tile_tids[qt0 * QKV_OK + 4], q_tile_tids[qt0 * QKV_OK + 5],
+                    q_tile_tids[qt0 * QKV_OK + 6], q_tile_tids[qt0 * QKV_OK + 7],
+                    q_tile_tids[qt0 * QKV_OK + 8], q_tile_tids[qt0 * QKV_OK + 9],
+                    k_tile_tids[kt * QKV_OK + 0], k_tile_tids[kt * QKV_OK + 1],
+                    k_tile_tids[kt * QKV_OK + 2], k_tile_tids[kt * QKV_OK + 3],
+                    k_tile_tids[kt * QKV_OK + 4],
+                    rms_tid,
+                ],
+            ) as qk_tid_h:
+                q0 = h * Q_PER_KV * HEAD_DIM
+                # Read q_proj[h] ONCE, scale by inv_rms -> q_chunk; feed both gamma + recip.
+                q_slice = pl.row_expand_mul(
+                    pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0]), inv_rms_col
+                )
+                q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
+                q_g = pl.col_expand_mul(q_chunk, q_norm_w)
+                q_proj_norm = pl.assemble(
+                    q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
+                )
+                q_ss = pl.row_sum(pl.mul(q_chunk, q_chunk))
+                q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
+                q_inv_states = pl.assemble(q_inv_states, q_inv, [h * BATCH * Q_PER_KV, 0])
+                # K: same, read once.
+                k0 = h * HEAD_DIM
+                k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
+                k_g = pl.col_expand_mul(k_chunk, k_norm_w)
+                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
+                k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
+                k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
+                k_inv_states = pl.assemble(k_inv_states, k_inv, [h * BATCH, 0])
+            qk_tids[h] = qk_tid_h
+
+        # rope GROUPED: NUM_ROPE_GROUPS grids of HEADS_PER_ROPE heads each, depping on
+        # the group's qk + v tile (re-test @ swimlane level 2 to remove per-task overhead).
+        # rope SINGLE spmd grid over ALL NUM_KV_HEADS*BATCH items — one launch (was 2
+        # grouped grids = 2x per-grid scheduler overhead). Deps on all qk + v (rope follows).
+        with pl.spmd(
+            ROPE_CORES,
+            name_hint="rope_qkv",
+            deps=[
+                qk_tids[0], qk_tids[1], qk_tids[2], qk_tids[3],
+                qk_tids[4], qk_tids[5], qk_tids[6], qk_tids[7],
+                rms_tid,
+                v_tile_tids[0], v_tile_tids[1], v_tile_tids[2], v_tile_tids[3],
+                v_tile_tids[4], v_tile_tids[5], v_tile_tids[6], v_tile_tids[7],
+                v_tile_tids[8], v_tile_tids[9],
+            ],
+        ) as rope_tid:
+            rope_core = pl.get_block_idx()
+            for it in pl.pipeline(ROPE_GROUP_ITEMS_PER_CORE, stage=2):
+                g_idx = rope_core * ROPE_ITEMS_PER_CORE + it
+                ki = g_idx // BATCH
+                b = g_idx % BATCH
+                ctx_len = pl.read(seq_lens, [b])
+                inv_rms_b = pl.read(inv_rms_states, [b, 0])
+                pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
+                # Paged write target for this row's current token: slot_mapping[b]
+                # decomposes into (physical page, in-page offset). Same scheme prefill
+                # uses; one physical page == one SEQ_TILE/BLOCK_SIZE band of the pool.
+                wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+                wr_slot_block = wr_slot // BLOCK_SIZE
+                wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
+                cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
+                cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
+                sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
+                sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
+
+                kv_col = ki * HEAD_DIM
+                # K carries qk_norm gamma (qk_gamma); fold the deferred per-head qk_inv
+                # scalar here. inv_rms cancels inside qk_norm, so no inv_rms factor on K.
+                k_inv_b = pl.read(k_inv_states, [ki * BATCH + b, 0])
+                k_full = pl.mul(k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM], k_inv_b)
+                k_lo = k_full[:, 0:HALF_DIM]
+                k_hi = k_full[:, HALF_DIM:HEAD_DIM]
+                rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
+                rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
+                cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
+                k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
+                k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
+                v_row_bf16 = pl.cast(
+                    pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
+                    target_type=pl.BF16,
+                )
+                v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
+
+                q_base = ki * Q_PER_KV
+                q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
+                q_inv_base = ki * BATCH * Q_PER_KV + b * Q_PER_KV
+                for qj in pl.range(Q_PER_KV):
+                    q_inv_bj = pl.read(q_inv_states, [q_inv_base + qj, 0])
+                    q_head = pl.mul(
+                        q_proj_norm[
+                            b : b + 1, (q_base + qj) * HEAD_DIM : (q_base + qj + 1) * HEAD_DIM
+                        ],
+                        q_inv_bj,
+                    )
+                    q_lo = q_head[:, 0:HALF_DIM]
+                    q_hi = q_head[:, HALF_DIM:HEAD_DIM]
+                    q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
+                    q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_rot_lo, target_type=pl.BF16), [q_pad_row0 + qj, 0]
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_rot_hi, target_type=pl.BF16), [q_pad_row0 + qj, HALF_DIM]
+                    )
+                q_pad_zero = pl.cast(
+                    pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                    target_type=pl.BF16,
+                )
+                all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
+        rope_grp_tids[0] = rope_tid
+
+        # ── Scope 3b MLP-accumulator seeds, HOISTED between rope and attn. ──
+        # gate/up/down accumulators are zeroed for the later split-K atomic-add
+        # tasks; the seeds have NO data dependency on rope or attention, so placing
+        # them here lets the scheduler overlap the (vector) zero-fills with the
+        # fa_fused cube/vector work instead of serializing them at the head of the
+        # MLP manual_scope. Their TASK_IDs (seed_tid / gate_seed_tid / up_seed_tid)
+        # cross into the manual_scope below as explicit deps — the same pattern as
+        # online_softmax's captured attn_done_tid. The accumulator create_tensor
+        # calls move up with them (a seed must follow its tensor's allocation).
+        down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
+        up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as seed_tid:
+            for nb in pl.pipeline(DOWN_ON, stage=2):
+                n0 = nb * DOWN_TN
+                zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
+                down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as gate_seed_tid:
+            for nb in pl.pipeline(MLP_ON, stage=2):
+                n0 = nb * MLP_TN
+                zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
+                gate_acc_all = pl.assemble(gate_acc_all, zero, [0, n0])
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as up_seed_tid:
+            for nb in pl.pipeline(MLP_ON, stage=2):
+                n0 = nb * MLP_TN
+                zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
+                up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
+
+        # fa_fused: ONE mixed cube+vec root (QK -> softmax -> SV), BLOCK-LEVEL dense
+        # static dispatch. Each grid-stride step processes exactly ONE real seq-block
+        # (×GP_SIZE heads), decoded from the dense work table. Because the table holds
+        # only real blocks, core = w % NUM_CORES distributes total_real_blocks evenly
+        # across cores (≈1.25x of ideal), independent of per-batch length skew.
+        with pl.spmd(
+            NUM_CORES,
+            name_hint="fa_fused",
+            optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
+            deps=[work_tid, rope_grp_tids[0]],  # single rope grid now
+        ) as fa_tid:
+            fa_core = pl.get_block_idx()
+            # Read the device-computed block count ON-DEVICE (inside the kernel) so
+            # `fa_total` enters fa_fused as an INPUT and the normal task auto-dep
+            # orders it after the `fa_work_build` producer. Reading it at
+            # orchestration scope instead lowers to a host get_tensor_data that does
+            # NOT wait for the producer (stale ~0 read → empty dispatch; see
+            # KNOWN_ISSUES). This mirrors the existing on-device fa_work_table read.
+            fa_total_blocks = pl.cast(pl.read(fa_total, [0, 0]), target_type=pl.INDEX)
+            # Grid-stride over the dense real-block list: core fa_core owns table
+            # entries fa_core, fa_core+NUM_CORES, … < fa_total_blocks.
+            for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
+                fa_enc = pl.cast(pl.read(fa_work_table, [fa_w, 0]), target_type=pl.INDEX)
+                fa_b = fa_enc // MAX_CTX_BLOCKS
+                fa_p = fa_enc % MAX_CTX_BLOCKS
+                fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
+                fa_ctx_len = pl.read(seq_lens, [fa_b])
+                # Table holds only real blocks → exactly one block per entry, at fa_p.
+                sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
+                s0 = sb * SEQ_TILE
+                valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
+                # Paged read: map logical block sb -> physical page via this request's
+                # block_table row. SEQ_TILE == page_size, so one page is exactly one
+                # contiguous SEQ_TILE-row slice of the pool (shared by all GP_SIZE heads
+                # of this (b, block) work item below).
+                fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
+
+                # Declarative software pipeline over the per-head gp loop: instead of
+                # manually unrolling and reordering (QK0,QK1 -> softmax0,softmax1 ->
+                # SV0,SV1), let pl.pipeline stage=2 overlap iteration i+1's QK (AIC)
+                # with iteration i's softmax (AIV) through the C2V/V2C pipe.
+                for gp in pl.pipeline(GP_SIZE, stage=2):
+                    gi = fa_hg * GP_SIZE + gp
+                    kvh = gi  # Q_GROUPS=1
+                    q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
+                    q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
+                    g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
+                    cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+
+                    # QK matmul (cube) -> C2V boundary move (first vec consumer).
+                    k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
+                    raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
+                    scores_scaled = pl.mul(raw_scores, ATTN_SCALE)
+                    # Mark only the Q_HEAD_BATCH (5) real rows valid (tile stays 16):
+                    # the vec softmax and the cur_mi / cur_li GM stores then touch 5
+                    # rows, not the padded 16. NOTE: this cannot shrink the AIC<->AIV
+                    # C2V/V2C transfer — tpush/tpop always carry the full 16-row tile
+                    # box (matmul M fractal).
+                    scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
+                    scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                    cur_mi = pl.row_max(scores)
+                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                    cur_li = pl.row_sum(exp_scores)
+                    exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+
+                    # SV matmul (cube) reads exp directly -> V2C boundary move.
+                    v_tile = v_cache[cache_row : cache_row + SEQ_TILE, :]
+                    oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
+                    # The SV-matmul output spans the full padded 16 rows but only
+                    # the first Q_HEAD_BATCH are real — mark 5 valid (tile stays 16)
+                    # so the (dominant) all_oi_tmp GM write stores 5 rows instead of 16.
+                    oi_tmp = pl.set_validshape(oi_tmp, Q_HEAD_BATCH, HEAD_DIM)
+
+                    all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
+                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
+                    all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
+
+        # online_softmax: flat top-level spmd, writes attn_out directly. Reduces
+        # per-block partials across ALL blocks of a lane (hence across the KV
+        # partitions that produced them); auto-dep on the scratch serializes it
+        # after every contributing fa_fused partition. Captured as `attn_done_tid`
+        # (the dispatch's producer TaskId via the `with pl.spmd(...) as tid` form)
+        # so the manual_scope out_proj tasks can take it as an explicit `deps=`
+        # edge — auto-dep (tensormap) is suppressed inside manual_scope, so the
+        # cross-boundary attn->out_proj order needs the TaskId. (This previously
+        # required a dummy `attn_fence` pl.at task that read attn_out only to mint
+        # the TaskId; capturing the spmd dispatch tid directly removes it.)
+        with pl.spmd(
+            NUM_CORES * 2, name_hint="online_softmax", deps=[fa_tid]
+        ) as attn_done_tid:
+            os_core = pl.get_block_idx()
+            # Grid-stride over online_softmax work items (one per (b, kvh) lane).
+            for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
+                os_b = os_spmd_idx // NUM_KV_HEADS
+                os_gi = os_spmd_idx % NUM_KV_HEADS
+                os_ctx_len = pl.read(seq_lens, [os_b])
+                os_ctx_blocks = (os_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                os_kvh = os_gi  # Q_GROUPS=1
+                os_q_base = os_kvh * Q_PER_KV
+                os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
+
+                # Loop-carried accumulators: full Q_HEAD_PAD (16) rows. They can't be
+                # valid-shaped because the recurrence (add / maximum) drops valid_shape,
+                # which would break loop-carry type consistency. Only the per-block GM
+                # reads below are trimmed to the 5 real rows via pl.slice valid_shape.
+                oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                mi = all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
+                    rec = os_g_base + sb * Q_HEAD_PAD
+                    # Partial load: tile stays Q_HEAD_PAD (16) rows, GM transfer = the 5
+                    # real rows (valid_shape on the slice → tile.load valid_shapes).
+                    oi_tmp_valid = pl.slice(
+                        all_oi_tmp, [Q_HEAD_PAD, HEAD_DIM], [rec, 0], valid_shape=[Q_HEAD_BATCH, HEAD_DIM]
+                    )
+                    online_cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
+                    online_cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
+                    mi_new = pl.maximum(mi, online_cur_mi)
+                    alpha = pl.exp(pl.sub(mi, mi_new))
+                    beta = pl.exp(pl.sub(online_cur_mi, mi_new))
+                    li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
+                    oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
+                    mi = mi_new
+
+                ctx = pl.row_expand_div(oi, li)
+                ctx_valid = ctx[0:Q_HEAD_BATCH, :]
+                ctx_flat_bf16 = pl.cast(
+                    pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16
+                )
+                attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
+
+        # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all are created
+        # earlier, alongside their hoisted seed tasks between rope and attn.)
+        attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # raw residual h1 (add-back); FP32 (was BF16)
+        mlp_norm_in = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
+        inv_rms_tile = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
+        mlp_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
+
+        # Out_seed zeros attn_proj_fp32 in OUT_TN-wide chunks so out_proj
+        # split-K tasks can atomic-add into it.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as out_seed_tid:
+            for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
+                out_seed_n0 = nb * OUT_TN
+                out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
+                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
+
+        # ── Scope 3b: manual_scope MLP block. ──
         silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
-        down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
+        # down_tids is hoisted to orchestration scope (declared before this
+        # manual_scope) so the post-scope consolidated writer can gate on it;
+        # it is FILLED here in the down_proj loop below.
         gate_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         up_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         cast_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
@@ -782,7 +885,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="out_proj",
-                    deps=[out_seed_tid, online_done_tid],
+                    deps=[out_seed_tid, attn_done_tid],
                 ) as out_tid:
                     out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
                     out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
@@ -823,12 +926,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 for kb in pl.pipeline(MLP_K_SLICE // K_CHUNK, stage=2):
                     k0 = k_base + kb * K_CHUNK
                     attn_chunk = attn_proj_fp32[:, k0 : k0 + K_CHUNK]
-                    hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]
-                    resid_fp32 = pl.add(attn_chunk, pl.cast(hidden_chunk, target_type=pl.FP32))
+                    hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]  # FP32 already
+                    resid_fp32 = pl.add(attn_chunk, hidden_chunk)
                     # Raw residual h1 — added back after down_proj (must NOT be gamma-scaled).
-                    post_norm_partial = pl.assemble(
-                        post_norm_partial, pl.cast(resid_fp32, target_type=pl.BF16), [0, k0]
-                    )
+                    post_norm_partial = pl.assemble(post_norm_partial, resid_fp32, [0, k0])  # FP32 (no BF16 cast)
                     # Explicit post-RMS gamma: gate/up input = h1 * post_gamma. gamma is
                     # per-K (the matmul contraction dim) so it canNOT defer past the matmul
                     # like inv_rms does — it scales the input here (with raw w_gate/w_up).
@@ -846,8 +947,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             for kb in pl.pipeline(HIDDEN // K_CHUNK, stage=2):
                 k0 = kb * K_CHUNK
                 attn_chunk = attn_proj_fp32[:, k0 : k0 + K_CHUNK]
-                hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]
-                resid_chunk = pl.add(attn_chunk, pl.cast(hidden_chunk, target_type=pl.FP32))
+                hidden_chunk = hidden_states[:, k0 : k0 + K_CHUNK]  # FP32 already
+                resid_chunk = pl.add(attn_chunk, hidden_chunk)
                 sq_sum = pl.add(
                     sq_sum,
                     pl.reshape(pl.row_sum(pl.mul(resid_chunk, resid_chunk)), [1, BATCH]),
@@ -945,78 +1046,53 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     down_acc_all = pl.assemble(down_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 down_tids[n_out * K_SPLITS + k_split] = down_tid
 
-        for n_out in pl.parallel(DOWN_ON):
-            n0 = n_out * DOWN_TN
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="down_cast_residual",
-                deps=[down_tids[n_out * K_SPLITS + k] for k in range(K_SPLITS)],
-            ) as dcr_tid:
-                resid_block_bf16 = post_norm_partial[:, n0 : n0 + DOWN_TN]
-                resid_block = pl.cast(resid_block_bf16, target_type=pl.FP32)
-                acc_chunk = down_acc_all[:, n0 : n0 + DOWN_TN]
-                out_chunk = pl.add(acc_chunk, resid_block)
-                out_partial = pl.assemble(out_partial, pl.cast(out_chunk, target_type=pl.BF16), [0, n0])
-            dcr_tids[n_out] = dcr_tid
-
-    # ── out_consolidate (OUTSIDE manual_scope): copy out_partial -> out in a SINGLE
-    # pl.at task in the AUTO-DEP region. Inside manual_scope, auto-dep (tensormap)
-    # registration is suppressed (explicit deps= only), so a write to `out` there is
-    # invisible to caller-scope readers. The body's terminal write is otherwise the
-    # DOWN_ON-way `down_cast_residual` pl.parallel fan-out inside manual_scope, whose
-    # partial writers register NO tensormap edge to a downstream caller reader (proven
-    # on device: next_hidden's writers had no edge to copy_out). Re-emitting `out` here
-    # as a single full-tensor writer in the auto-dep region — exactly the copy_hidden
-    # -> x_gamma path that works — makes the layer output visible to the next layer /
-    # copy_out / LM head, fixing the fused multi-layer decode_fwd with no caller-side
-    # plumbing. Gated on all down_cast_residual writers via deps=.
-    for oc_b in pl.parallel(0, BATCH, BATCH):
+    # ── down_cast_residual (DOWN_ON-way, OUTSIDE manual_scope): the residual
+    # add (down_acc_all + post_norm_partial, both FP32) is the layer output,
+    # emitted as DOWN_ON sliced writers of `out` in the AUTO-DEP region —
+    # restoring the baseline's 5-way parallelism while keeping the fusion
+    # (no scratch out_partial, no out_consolidate copy).
+    #
+    # Why outside manual_scope: inside manual_scope, auto-dep (tensormap)
+    # registration is suppressed (explicit deps= only), so partial writers
+    # register NO tensormap edge to downstream caller readers (proven on
+    # device: next_hidden's writers had no edge to copy_out → garbage). In the
+    # auto-dep region each sliced writer registers `out`; OptimizeOrchTensors
+    # Pattern-5 narrows the footprint to a window, and the runtime tensormap
+    # check is region-precise per-dim, so the 5 writers do not serialize
+    # against each other while the next layer's x_gamma still waits on all 5.
+    #
+    # Deps: each block needs only its own K_SPLITS (=17) down_proj atomic-add
+    # tids (per-index list comprehension), so block n starts as soon as its
+    # column slab is accumulated. Transitivity covers post_norm_partial: every
+    # down_proj K-slice deps on a silu task, which deps on ALL cast_tids =
+    # residual_rms_cast — the full producer of post_norm_partial.
+    for n_out in pl.parallel(DOWN_ON):
+        n0 = n_out * DOWN_TN
         with pl.at(
             level=pl.Level.CORE_GROUP,
-            name_hint="out_consolidate",
-            deps=[dcr_tids[k] for k in range(DOWN_ON)],
-        ):
-            for oc_kb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
-                oc_k0 = oc_kb * RMSNORM_K_CHUNK
-                out = pl.assemble(
-                    out, pl.slice(out_partial, [BATCH, RMSNORM_K_CHUNK], [oc_b, oc_k0]), [oc_b, oc_k0]
-                )
+            name_hint="dcr_xgamma",
+            deps=[down_tids[n_out * K_SPLITS + k] for k in range(K_SPLITS)],
+        ) as dcr_tid:
+            # OUTPUT 1: layer residual (down_acc + post_norm, both FP32) -> `out` (cur).
+            # Needed by rms_recip (full-row reduction) and the residual stream.
+            out_chunk = pl.add(
+                down_acc_all[:, n0 : n0 + DOWN_TN], post_norm_partial[:, n0 : n0 + DOWN_TN]
+            )
+            out = pl.assemble(out, out_chunk, [0, n0])
+            # OUTPUT 2: NEXT layer's x*gamma from the same in-register FP32 chunk (no GM
+            # re-read of `out`). gamma row clamped via next_gamma_idx (last layer unused).
+            gamma_next = pl.slice(input_rms_weight, [1, DOWN_TN], [next_gamma_idx, n0])
+            xg = pl.col_expand_mul(out_chunk, gamma_next)
+            normed_out = pl.assemble(normed_out, pl.cast(xg, target_type=pl.BF16), [0, n0])
+        # Refill BOTH carries (same dcr_xgamma task writes out + normed_out):
+        # prev_out_tids -> next rms_recip/residual/seeds; prev_normed_tids -> next QKV.
+        prev_out_tids[n_out] = dcr_tid
+        prev_normed_tids[n_out] = dcr_tid
     return out
 
 
 NUM_LAYERS = 40  # full Qwen3-14B depth, for the fused decode_fwd loop
 _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
-
-
-@pl.jit
-def qwen3_decode_mpmd(  # noqa: PLR0913 — single-layer entry (external API unchanged)
-    hidden_states: pl.Tensor,
-    input_rms_weight: pl.Tensor,
-    wq: pl.Tensor,
-    wk: pl.Tensor,
-    wv: pl.Tensor,
-    q_norm_weight: pl.Tensor,
-    k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor,
-    block_table: pl.Tensor,
-    slot_mapping: pl.Tensor,
-    rope_cos: pl.Tensor,
-    rope_sin: pl.Tensor,
-    k_cache: pl.Tensor,
-    v_cache: pl.Tensor,
-    wo: pl.Tensor,
-    w_gate: pl.Tensor,
-    w_up: pl.Tensor,
-    w_down: pl.Tensor,
-    post_rms_weight: pl.Tensor,
-    out: pl.Out[pl.Tensor],
-):
-    res = _decode_layer(
-        hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-        seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
-        post_rms_weight, out, 0,
-    )
-    return res
 
 
 @pl.jit
@@ -1053,26 +1129,78 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     #
     # The loop-carried `cur` is seeded from hidden_states via a create_tensor + tiled
     # copy (copy_hidden, a single full-tensor pl.at writer). Each layer's output is made
-    # visible to the next layer / the LM head by _decode_layer's `out_consolidate` scope
-    # (a single full-tensor writer in the auto-dep region) — without it, the inline body's
-    # `down_cast_residual` pl.parallel writes do not register a tensormap edge to the
-    # downstream reader and the fused output is garbage. See decode-fwd-dep-fix notes.
-    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    # visible to the next layer / the LM head by _decode_layer's CONSOLIDATED
+    # `down_cast_residual` writer (a single full-tensor writer in the auto-dep region,
+    # placed after the MLP manual_scope and gated on the down_proj TaskIds) — without it,
+    # the inline body's manual_scope partial writes do not register a tensormap edge to
+    # the downstream reader and the fused output is garbage. See decode-fwd-dep-fix notes.
+    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
+    # Cross-iteration carry-writer tids (see _decode_layer's prev_out_tids):
+    # seeded with copy_hidden for layer 0, refilled per layer by the dcr writers.
+    carry_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
     for cb0 in pl.parallel(0, BATCH, BATCH):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden") as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ck0 = ckb * RMSNORM_K_CHUNK
+                # FIRST-layer boundary: cast the external BF16 embed input -> FP32 once,
+                # so every layer consumes FP32 hidden with no per-boundary round-trip.
                 cur = pl.assemble(
-                    cur, pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]), [cb0, ck0]
+                    cur,
+                    pl.cast(
+                        pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
+                        target_type=pl.FP32,
+                    ),
+                    [cb0, ck0],
                 )
+        for cseed in pl.range(DOWN_ON):
+            carry_tids[cseed] = ch_tid
+
+    # ── Pre-loop x_gamma_0: layer 0's normed = cur_0 * gamma_0 (BF16). For layers 1+,
+    # the per-layer normed is produced by the PREVIOUS layer's fused dcr_xgamma; only
+    # layer 0 (whose cur comes from copy_hidden, not a dcr) needs this standalone task.
+    normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    carry_normed_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
+    with pl.manual_scope():
+        for xg_n in pl.range(XG_BLOCKS):
+            xg_k0 = xg_n * (HIDDEN // XG_BLOCKS)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="x_gamma0", deps=[carry_tids[xg_n]]
+            ) as xg0_tid:
+                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
+                    k0 = xg_k0 + kb * RMSNORM_K_CHUNK
+                    x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]  # FP32 carry
+                    gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
+                    xg = pl.col_expand_mul(x_chunk, gamma)
+                    normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
+            carry_normed_tids[xg_n] = xg0_tid
+
     for layer_idx in pl.range(_FWD_NLAYERS):
-        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 layer output
+        next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
+        next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
-            post_rms_weight, next_hidden, layer_idx,
+            post_rms_weight, next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
+            carry_tids, carry_normed_tids,
         )
-    out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
+        normed = next_normed
+    # LAST-layer boundary: cast the final FP32 hidden -> BF16 once for the (unchanged,
+    # BF16-input) rms_lm_head. This single cast replaces the per-layer round-trips.
+    cur_bf16 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    for lb0 in pl.parallel(0, BATCH, BATCH):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cast_lmhead_in"):
+            for lkb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                lk0 = lkb * RMSNORM_K_CHUNK
+                cur_bf16 = pl.assemble(
+                    cur_bf16,
+                    pl.cast(
+                        pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [lb0, lk0]),
+                        target_type=pl.BF16,
+                    ),
+                    [lb0, lk0],
+                )
+    out = rms_lm_head(cur_bf16, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
 
 
@@ -1109,29 +1237,70 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     # out_consolidate (the fused-decode dependency fix). The caller passes the weight /
     # KV-cache SLICES for the chunk's layers (stacked [_CHUNK_NLAYERS*dim, ...]); the body
     # indexes them with layer_idx 0.._CHUNK_NLAYERS-1.
-    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    # FP32 inter-layer carry (matches _decode_layer's FP32-carry signature). The
+    # chunk input/output hidden are BF16 (host passes BF16 between chunks), so cast
+    # BF16->FP32 at the chunk head (copy_hidden) and FP32->BF16 at the tail (copy_out),
+    # mirroring decode_fwd's embed-in / lm-head-in casts. (Without these the BF16 cur
+    # hits _decode_layer's FP32 x_gamma/rms_recip -> ptoas bfloat16 type error.)
+    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+    carry_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
     for cb0 in pl.parallel(0, BATCH, BATCH):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden"):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden") as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ck0 = ckb * RMSNORM_K_CHUNK
                 cur = pl.assemble(
-                    cur, pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]), [cb0, ck0]
+                    cur,
+                    pl.cast(
+                        pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
+                        target_type=pl.FP32,
+                    ),
+                    [cb0, ck0],
                 )
+        for cseed in pl.range(DOWN_ON):
+            carry_tids[cseed] = ch_tid
+
+    # Pre-loop x_gamma_0: chunk layer 0's normed = cur * gamma_0 (mirrors decode_fwd).
+    normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    carry_normed_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
+    with pl.manual_scope():
+        for xg_n in pl.range(XG_BLOCKS):
+            xg_k0 = xg_n * (HIDDEN // XG_BLOCKS)
+            with pl.at(
+                level=pl.Level.CORE_GROUP, name_hint="x_gamma0", deps=[carry_tids[xg_n]]
+            ) as xg0_tid:
+                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
+                    k0 = xg_k0 + kb * RMSNORM_K_CHUNK
+                    x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]
+                    gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
+                    xg = pl.col_expand_mul(x_chunk, gamma)
+                    normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
+            carry_normed_tids[xg_n] = xg0_tid
+
     for i in pl.range(_CHUNK_NLAYERS):
-        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
-            post_rms_weight, next_hidden, i,
+            post_rms_weight, next_hidden, normed, next_normed, i, next_gamma_idx,
+            carry_tids, carry_normed_tids,
         )
+        normed = next_normed
     for ob0 in pl.parallel(0, BATCH, BATCH):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_out"):
             for okb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ok0 = okb * RMSNORM_K_CHUNK
                 out = pl.assemble(
-                    out, pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [ob0, ok0]), [ob0, ok0]
+                    out,
+                    pl.cast(
+                        pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [ob0, ok0]), target_type=pl.BF16
+                    ),
+                    [ob0, ok0],
                 )
     return out
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1180,6 +1349,8 @@ def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tenso
 
 
 def _smoke_inputs() -> list[torch.Tensor]:
+    """Single-layer (_CHUNK_NLAYERS == 1) input list for the compile-only smoke,
+    in decode_fwd_layers parameter order (PAGED KV via block_table + slot_mapping)."""
     def randn(shape, dtype):
         return torch.empty(shape, dtype=dtype).normal_()
 
@@ -1217,7 +1388,8 @@ def _backend_type(platform: str) -> BackendType:
 #
 # The default `-p a2a3 -d N` run builds a deterministic RANDOM fixture, computes
 # the golden with `golden_decode_layer` (a torch reference mirroring the kernel's
-# math AND its bf16 cast points), runs qwen3_decode_mpmd on device through the
+# math AND its bf16 cast points), runs decode_fwd_layers with _CHUNK_NLAYERS == 1
+# (a single fused decode layer, hidden -> hidden, no LM head) on device through the
 # `golden/` harness (golden.run_jit), and validates the device output against the
 # golden — no pre-generated data files needed.
 #
@@ -1252,7 +1424,7 @@ def _rope_half(vec: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
 
 
 def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.Tensor]:
-    """Deterministic random fixture (name -> tensor) for qwen3_decode_mpmd.
+    """Deterministic random fixture (name -> tensor) for decode_fwd_layers (N==1).
 
     full_seq: set every sequence length to MAX_SEQ (full KV cache) for a stable,
     maximum-load performance run; otherwise sample varied lengths in [1, MAX_SEQ].
@@ -1278,6 +1450,8 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
     rope_cos = torch.cat([ang.cos(), ang.cos()], dim=1).float()
     rope_sin = torch.cat([ang.sin(), ang.sin()], dim=1).float()
 
+    # k_cache / v_cache are the PAGED pool (rows = NUM_PAGES * NUM_KV_HEADS *
+    # BLOCK_SIZE) the kernel reads/writes via block_table / slot_mapping.
     return {
         "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
         "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
@@ -1304,11 +1478,17 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
 def golden_decode_layer(values: dict) -> None:
     """Torch reference for ONE Qwen3 decode layer; fills ``values['out']`` in place.
 
-    Mirrors qwen3_decode_mpmd / _decode_layer at layer_idx 0: RMSNorm -> Q/K/V proj
-    -> per-head QK-norm -> RoPE -> KV-cache write at pos=seq_len-1 -> GQA flash
-    attention over [0, seq_len) -> out_proj -> residual -> post-RMSNorm -> SwiGLU
-    MLP -> residual. The deferred input-RMSNorm inv_rms and the QK-norm control
-    scale cancel to the standard math (QK-norm is scale-invariant).
+    Mirrors decode_fwd_layers (N==1) / _decode_layer at layer_idx 0: RMSNorm ->
+    Q/K/V proj -> per-head QK-norm -> RoPE -> KV-cache write at pos=seq_len-1 -> GQA
+    flash attention over [0, seq_len) -> out_proj -> residual -> post-RMSNorm ->
+    SwiGLU MLP -> residual. The deferred input-RMSNorm inv_rms and the QK-norm
+    control scale cancel to the standard math (QK-norm is scale-invariant).
+
+    The inter-layer hidden is carried in FP32 now: the residual stream (h1, out)
+    stays FP32 with NO intermediate bf16 rounding; only the chunk boundary casts
+    (BF16 embed-in at copy_hidden, FP32->BF16 hidden-out at copy_out) round. So the
+    only bf16 cast points are normed, the QKV inputs, q/k/v cache, attn_out, the
+    gate/up input, the SwiGLU output, and the final copy_out — NOT the residual add.
     """
     x = values["hidden_states"].float()                          # [B,H], residual source
     gamma_in = values["input_rms_weight"].float()[0]             # [H]
@@ -1365,11 +1545,10 @@ def golden_decode_layer(values: dict) -> None:
                 attn_out[b, hq * HEAD_DIM : (hq + 1) * HEAD_DIM] = (w.unsqueeze(-1) * v_lane).sum(0)
     attn_out = _bf16(attn_out)
 
-    attn_proj = attn_out @ values["wo"].float()                  # out_proj
-    h1 = x + attn_proj                                           # raw residual
-    h1_bf16 = _bf16(h1)
+    attn_proj = attn_out @ values["wo"].float()                  # out_proj (FP32)
+    h1 = x + attn_proj                                           # raw residual (FP32, NOT bf16-rounded)
     post_gamma = values["post_rms_weight"].float()[0]
-    post_inv = _rmsnorm_inv(h1)                                  # deferred into silu
+    post_inv = _rmsnorm_inv(h1)                                  # deferred into silu (FP32 h1)
     mlp_in = _bf16(h1 * post_gamma)                              # gamma before inv_rms
     gate = mlp_in @ values["w_gate"].float()
     up = mlp_in @ values["w_up"].float()
@@ -1377,11 +1556,13 @@ def golden_decode_layer(values: dict) -> None:
     su = up * post_inv
     mlp = _bf16(sg * torch.sigmoid(sg) * su)                     # SwiGLU
     down = mlp @ values["w_down"].float()
-    values["out"] = _bf16(down + h1_bf16).to(torch.bfloat16)     # residual is bf16(h1)
+    # FP32-carry residual: out = down + h1 in FP32 (no per-layer bf16(h1) rounding);
+    # the single FP32->BF16 round is decode_fwd_layers' copy_out at the chunk tail.
+    values["out"] = (down + h1).to(torch.bfloat16)
 
 
 def _build_specs(inputs: dict) -> list:
-    """TensorSpec list in qwen3_decode_mpmd parameter order, from a fixture dict."""
+    """TensorSpec list in decode_fwd_layers parameter order, from a fixture dict."""
     from golden import TensorSpec  # repo root added to sys.path in __main__
 
     specs = [
@@ -1409,7 +1590,17 @@ if __name__ == "__main__":
         choices=["a2a3", "a2a3sim", "a5", "a5sim"],
     )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+             "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
+             "phases, 4=+orch phases; 0 (default) disables.",
+    )
     parser.add_argument("--max-seq", action="store_true", default=False,
                         help="set EVERY sequence length to MAX_SEQ (full KV cache) for a stable, "
                              "maximum-load performance run; default samples varied random lengths.")
@@ -1436,12 +1627,18 @@ if __name__ == "__main__":
 
     set_backend_type(_backend_type(args.platform))
 
+    # The single-layer golden test and the smoke run both drive decode_fwd_layers
+    # with a 1-layer chunk (hidden -> hidden, no LM head). Force the chunk size to 1
+    # so the single-layer (un-stacked) weights / KV pool line up; decode_fwd_layers
+    # reads _CHUNK_NLAYERS at trace time, so the rebind must precede any call.
+    _CHUNK_NLAYERS = 1
+
     # Compile-only smoke: explicit --smoke, or any *sim platform (the CI
     # `python decode_layer.py -p a2a3sim` sweep — codegen regressions are still
     # caught without needing a device or the heavy full-graph simulation).
     if args.smoke or args.platform.endswith("sim"):
         smoke_out = torch.empty([BATCH, HIDDEN], dtype=torch.bfloat16)
-        post_pass = qwen3_decode_mpmd.compile_for_test(*_smoke_inputs(), smoke_out)
+        post_pass = decode_fwd_layers.compile_for_test(*_smoke_inputs(), smoke_out)
         print(f"Compiled program has {len(post_pass.functions)} function(s):")
         for fn in post_pass.functions.values():
             print(f"  {fn.name}: {fn.func_type}")
@@ -1462,7 +1659,7 @@ if __name__ == "__main__":
         # up to 2% outliers — the codebase's ratio_allclose convention. Remaining
         # mismatches are 1-2 ULP bf16 quantization, not errors.
         result = run_jit(
-            fn=qwen3_decode_mpmd,
+            fn=decode_fwd_layers,
             specs=specs,
             golden_fn=golden_decode_layer,
             runtime_cfg=dict(
@@ -1485,7 +1682,7 @@ if __name__ == "__main__":
     # ── --validate-fwd: pre-generated stacked-fwd inputs from --data-dir. ──
     inputs = load_inputs(args.data_dir / "in")
     # dep_gen is force-disabled here: --validate-fwd runs two on-device programs in
-    # one process (decode_fwd, then the host-ref loop's qwen3_decode_mpmd), and the
+    # one process (decode_fwd, then the host-ref loop's decode_fwd_layers), and the
     # dep_gen collector cannot register host buffers for the second program
     # (`halHostRegister for dep_gen SHM failed: 8` -> `init_dep_gen failed: 8`). On
     # this 40-layer graph dep_gen also overflows ("records dropped", no deps.json),
@@ -1515,8 +1712,9 @@ if __name__ == "__main__":
         torch.manual_seed(1234)
         final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
         lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
-        # block_table / slot_mapping are shared across layers (NOT per-layer stacked);
-        # the paged pool kc/vc IS stacked N times (one paged pool per layer).
+        # seq_lens / block_table / slot_mapping / rope tables are shared across layers
+        # (NOT per-layer stacked); the PAGED KV pool kc/vc IS stacked N times (one
+        # paged pool per layer, indexed by layer_cache_base).
         stacked = [
             hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
             stack0(qn, N), stack0(kn, N), sl, bt, sm, rc, rs, stack0(kc, N), stack0(vc, N),
@@ -1526,20 +1724,21 @@ if __name__ == "__main__":
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
         decode_fwd(*stacked, logits, config=run_cfg)
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
-        # second on-device program in the same process (the host-ref loop below would
+        # second on-device program in the same process (the host-ref call below would
         # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
         # so skip the reference comparison and exit cleanly.
         if args.enable_l2_swimlane:
             print(f"[stacked-fwd {N}L+LMhead] swimlane perf run complete "
                   f"(host-ref argmax check skipped under --enable-l2-swimlane)")
             raise SystemExit(0)
-        # host ref: chain N -> final RMSNorm -> lm_head
-        ref_hidden = inputs[0]; ref_out = None
-        for _step in range(N):
-            ci = load_inputs(args.data_dir / "in"); ci[0] = ref_hidden
-            ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-            qwen3_decode_mpmd(*ci, ref_out, config=run_cfg)
-            ref_hidden = ref_out.clone()
+        # host ref: run one N-layer decode_fwd_layers chunk -> final RMSNorm -> lm_head.
+        # _CHUNK_NLAYERS = N keeps the inter-layer residual FP32 (chunk casts BF16 only at
+        # its boundaries), matching decode_fwd's FP32-carry-until-LM-head path. A per-layer
+        # chain (N single-layer dispatches) would re-enter each layer from BF16, diverging
+        # from decode_fwd and making the argmax check pass/fail for the wrong reason.
+        _CHUNK_NLAYERS = N
+        ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        decode_fwd_layers(*stacked[:len(INPUT_NAMES)], ref_out, config=run_cfg)
         hn = ref_out.float()
         inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
         ref_normed = (hn * inv) * final_norm_w.float()
