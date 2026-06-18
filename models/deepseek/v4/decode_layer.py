@@ -828,11 +828,10 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # Composed attention->MoE smoke: KV strict, x_next on an FFN envelope.
-            # Tightened 0.1 -> 0.03 after the moe_ep hc_ffn fixture fix (real layer-0
-            # gates) removed the hc_post near-zero cancellation that was inflating the
-            # tail; all three attention paths (swa/hca/csa) hold <=1.4% over 3e-2 here.
-            "x_next": ratio_reldiff(diff_thd=0.03, pct_thd=0.05),
+            # KV strict, x_next on an FFN envelope (one gate for all layer_id branches).
+            # Strict per-point bar: over-1e-2 fraction is swa ~6.1% / hca ~6.2% / csa ~8.1%
+            # (csa binding), so pct_thd=0.10. Alt: diff_thd=0.03, pct_thd=0.05 (all <=1.4%).
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.1),
         },
     )
     if not result.passed:
