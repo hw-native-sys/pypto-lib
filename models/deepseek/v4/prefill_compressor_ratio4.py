@@ -487,10 +487,6 @@ def build_tensor_specs(start_pos: int = START_POS):
     if start_pos < 0 or start_pos + MAX_TOKENS > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - MAX_TOKENS}, got {start_pos}")
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return (torch.rand(*shape, generator=generator) - 0.5) * scale
     def init_compress_state_block_table():
         table = torch.full((MAX_REQS, CSA_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
@@ -505,23 +501,26 @@ def build_tensor_specs(start_pos: int = START_POS):
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
         return int(table[req, block].item()) * CSA_STATE_BLOCK_SIZE + intra
     def init_x():
-        return seeded_uniform((MAX_TOKENS, D), 1, 0.1).to(torch.bfloat16)
+        return ((torch.rand(MAX_TOKENS, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_state():
         state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM)
         flat = state.view(-1, OUT_DIM)
         for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
             row = state_row(0, abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform((OUT_DIM,), 1000 + abs_pos, 0.05)
+                flat[row] = (torch.rand(OUT_DIM) - 0.5) * 0.05
         return state
+    # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) compressor (mean l8/l32 of
+    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
+    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_compressor_ratio4.
     def init_wkv():
-        return seeded_uniform((D, OUT_DIM), 2, D ** -0.5).to(torch.bfloat16)
+        return torch.randn(D, OUT_DIM) * 0.0245
     def init_wgate():
-        return seeded_uniform((D, OUT_DIM), 3, D ** -0.5).to(torch.bfloat16)
+        return torch.randn(D, OUT_DIM) * 0.0388
     def init_ape():
-        return seeded_uniform((COMPRESS_RATIO, OUT_DIM), 4, 0.01)
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1243
     def init_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
     def init_freqs_cos():
         return shared_freqs_cos.clone()
     def init_freqs_sin():
@@ -592,7 +591,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_prefill_compressor_ratio4,
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         compare_fn={
             "kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),

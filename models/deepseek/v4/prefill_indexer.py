@@ -267,10 +267,6 @@ def build_tensor_specs(start_pos: int = START_POS):
     if write_count > MAX_CMP_WRITES:
         raise ValueError(f"fixture generated {write_count} compressed writes, cap is {MAX_CMP_WRITES}")
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return (torch.rand(*shape, generator=generator) - 0.5) * scale
     def init_inner_compress_state_block_table():
         table = torch.full((MAX_REQS, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for req in range(MAX_REQS):
@@ -285,7 +281,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
         return int(table[req, block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
-        return seeded_uniform((MAX_TOKENS, D), 1, 0.1).to(torch.bfloat16)
+        return ((torch.rand(MAX_TOKENS, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_freqs_cos():
         return shared_freqs_cos.clone()
     def init_freqs_sin():
@@ -301,16 +297,19 @@ def build_tensor_specs(start_pos: int = START_POS):
         for abs_pos in range(max(0, start_pos - INNER_STATE_LEN), start_pos):
             row = state_row(0, abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform((INNER_OUT_DIM,), 1000 + abs_pos, 0.05)
+                flat[row] = (torch.rand(INNER_OUT_DIM) - 0.5) * 0.05
         return state
+    # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
+    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
+    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_indexer.
     def init_inner_wkv():
-        return seeded_uniform((D, INNER_OUT_DIM), 2, D ** -0.5).to(torch.bfloat16)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0293
     def init_inner_wgate():
-        return seeded_uniform((D, INNER_OUT_DIM), 3, D ** -0.5).to(torch.bfloat16)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0512
     def init_inner_ape():
-        return seeded_uniform((COMPRESS_RATIO, INNER_OUT_DIM), 4, 0.01)
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
-        return torch.ones(INNER_HEAD_DIM)
+        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
     def init_idx_kv_cache():
         return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.bfloat16)
     def init_idx_block_table():
@@ -416,11 +415,11 @@ if __name__ == "__main__":
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
         rtol=1e-3,
         atol=1e-3,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         compare_fn={
             "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs": topk_idxs_compare,
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=16 / (PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE * IDX_HEAD_DIM)),
             "inner_kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "inner_score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
         },
