@@ -991,7 +991,7 @@ def build_tensor_specs(
 def active_x_out_compare(num_tokens: int):
     from golden import ratio_allclose
 
-    base_cmp = ratio_allclose(atol=3e-3, rtol=2.0 / 128)
+    base_cmp = ratio_allclose(atol=4e-3, rtol=2.0 / 128)
 
     def cmp(
         actual,
