@@ -1714,22 +1714,21 @@ if __name__ == "__main__":
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
         decode_fwd(*stacked, logits, config=run_cfg)
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
-        # second on-device program in the same process (the host-ref loop below would
+        # second on-device program in the same process (the host-ref call below would
         # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
         # so skip the reference comparison and exit cleanly.
         if args.enable_l2_swimlane:
             print(f"[stacked-fwd {N}L+LMhead] swimlane perf run complete "
                   f"(host-ref argmax check skipped under --enable-l2-swimlane)")
             raise SystemExit(0)
-        # host ref: chain N single-layer decode_fwd_layers (N==1) -> final RMSNorm -> lm_head.
-        # Each step reloads the un-stacked single-layer inputs and overrides the hidden.
-        _CHUNK_NLAYERS = 1
-        ref_hidden = inputs[0]; ref_out = None
-        for _step in range(N):
-            ci = load_inputs(args.data_dir / "in"); ci[0] = ref_hidden
-            ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-            decode_fwd_layers(*ci, ref_out, config=run_cfg)
-            ref_hidden = ref_out.clone()
+        # host ref: run one N-layer decode_fwd_layers chunk -> final RMSNorm -> lm_head.
+        # _CHUNK_NLAYERS = N keeps the inter-layer residual FP32 (chunk casts BF16 only at
+        # its boundaries), matching decode_fwd's FP32-carry-until-LM-head path. A per-layer
+        # chain (N single-layer dispatches) would re-enter each layer from BF16, diverging
+        # from decode_fwd and making the argmax check pass/fail for the wrong reason.
+        _CHUNK_NLAYERS = N
+        ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        decode_fwd_layers(*stacked[:len(INPUT_NAMES)], ref_out, config=run_cfg)
         hn = ref_out.float()
         inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
         ref_normed = (hn * inv) * final_norm_w.float()
