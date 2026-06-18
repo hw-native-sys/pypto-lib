@@ -420,12 +420,23 @@ def build_tensor_specs(start_pos=None):
 
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
+    # Real layer-0 (SWA) hc_attn scale/base verbatim (3 + 24 numbers). The prior
+    # scale=0.5/base=0 left hc_pre post~=1 + near-uniform comb, so attn_out and the hc
+    # residual cancelled to near-zero in x_out; the real gates (tiny post scale +
+    # diag-dominant comb) keep x_out well-conditioned. fn (24x16384) stays synthetic.
     def init_hc_attn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        return torch.randn(MIX_HC, HC_DIM) * 0.039
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([2.076026, 0.018729, 0.245936])
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            3.9083, -2.0399, -2.2033, -2.017,
+            -2.4443, -10.3158, -8.9943, -6.3581,
+            9.8577, -9.5177, -24.8724, -22.8929,
+            -21.545, 0.7791, -3.386, 1.1948,
+            -20.9605, -0.7702, 1.4218, -4.8994,
+            1.5177, -29.7663, -30.1413, -1.2413,
+        ])
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
@@ -555,9 +566,9 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
-            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
-            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
+            # Tightened from CANN's 1e-2 bar: realistic hc_attn gates keep x_out
+            # well-conditioned (0% over 3e-3 across seeds; worst rdiff ~0.16).
+            "x_out": ratio_reldiff(diff_thd=0.003, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
