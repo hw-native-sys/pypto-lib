@@ -1,17 +1,62 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *.pyo
+*$py.class
 .Python
 *.so
+
+# Packaging / distribution
 .eggs/
-.egg-info/
+*.egg-info/
+*.egg
 dist/
 build/
+sdist/
+wheels/
+develop-eggs/
+*.manifest
+*.spec
+
+# Project build artifacts
 build_output/
 pa_build/
-.DS_Store
-.cursor/
+
+# Virtual environments
 .env/
 .venv/
-KNOWN_ISSUES.md
+env/
+venv/
+ENV/
+
+# Testing / coverage / type-checking caches
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs / editors
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
+
+# Project-specific
+KNOWN_ISSUES.md
