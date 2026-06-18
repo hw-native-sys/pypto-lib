@@ -704,14 +704,27 @@ def build_tensor_specs(start_pos=None):
     def init_x_hc():
         return torch.randn(T, HC_MULT, D) * 0.05
 
+    # Real layer-8 (CSA, ratio-4) hc_attn scale/base verbatim (3 + 24 numbers). The prior
+    # scale=0.5/base=0 left hc_pre post~=1 + near-uniform comb, so attn_out and the hc
+    # residual cancelled to near-zero in x_out -> the W8A8 attn quant noise blew up the
+    # relative error (synthetic gate + real attn weights: 7.6% of points over 1e-2). The
+    # real gates (tiny post scale + diag-dominant comb) keep x_out well-conditioned. fn
+    # (24x16384) stays synthetic at the real magnitude.
     def init_hc_attn_fn():
-        return torch.randn(MIX_HC, HC_DIM) / HC_DIM ** 0.5
+        return torch.randn(MIX_HC, HC_DIM) * 0.0519
 
     def init_hc_attn_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.076099, 0.032597, 0.226994])
 
     def init_hc_attn_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            5.9166, -3.6223, -2.9324, -3.3124,
+            -3.9100, -0.9384, -3.3256, -2.5240,
+            2.0706, -2.5728, 0.1424, -3.9453,
+            -3.8859, 3.4634, -3.3799, -2.6077,
+            -2.7191, -2.4846, 2.0395, -0.5010,
+            -3.5992, -2.7520, -3.3493, 3.1587,
+        ])
 
     def init_attn_norm_w():
         return torch.ones(D)
@@ -1077,9 +1090,9 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            # Precision reference: CANN model-level criterion (quantized rel < 1e-2) —
-            # cann-recipes-infer/.agents/agents/model-infer-reviewer.md
-            "x_out": ratio_reldiff(diff_thd=0.01, pct_thd=0.005, max_diff_hd=10),
+            # Tightened from CANN's 1e-2 bar: the realistic layer-8 hc_attn gates keep
+            # x_out well-conditioned, so it holds 0% over 3e-3 (worst rdiff well under 1).
+            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
