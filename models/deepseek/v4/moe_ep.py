@@ -429,7 +429,7 @@ def golden_moe_ep(tensors):
     from expert_routed import golden_expert_routed
 
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
-    num_tokens = int(tensors.get("num_tokens", T))
+    num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
     for r in range(N_RANKS):
         # Stage 1: hc_pre

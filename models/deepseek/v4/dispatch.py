@@ -119,6 +119,10 @@ def dispatch_ep(
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_ep"):
         active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > T:
+            active_tokens = pl.cast(T, pl.INDEX)
         # ---------- histogram: scalar histogram on indices ----------
         send_counts = pl.array.create(EP_WORLD_SIZE * N_LOCAL_EXPERTS, pl.INT32)
         for d in pl.range(EP_WORLD_SIZE):
