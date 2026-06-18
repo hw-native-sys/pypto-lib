@@ -96,7 +96,7 @@ assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_
 
 
 @pl.jit
-def decode_layer_dp_ep(
+def decode_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -256,7 +256,7 @@ def decode_layer_dp_ep(
 
 
 @pl.jit.host
-def host_orch_auto(
+def l3_decode_layer(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -363,7 +363,7 @@ def host_orch_auto(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        decode_layer_dp_ep(
+        decode_layer(
             x_hc[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
             attn_norm_w[r], wq_a[r], wq_b[r], wq_b_scale[r],
@@ -802,7 +802,7 @@ if __name__ == "__main__":
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
-    host_fn = host_orch_auto
+    host_fn = l3_decode_layer
     golden_fn = golden_decode_layer_auto
 
     result = run_jit(
