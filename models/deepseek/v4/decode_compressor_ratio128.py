@@ -402,14 +402,17 @@ def build_tensor_specs(start_pos=None):
         return torch.rand(B, S, D)
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+    # Calibrated to the real DeepSeek-V4-Flash HCA (ratio-128) main compressor (mean l7/l9 of
+    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
+    # gamma centers near the measured mean (not ones / not uniform).
     def init_wkv():
-        return torch.rand(D, OUT_DIM)
+        return torch.randn(D, OUT_DIM) * 0.0246
     def init_wgate():
-        return torch.rand(D, OUT_DIM)
+        return torch.randn(D, OUT_DIM) * 0.0316
     def init_ape():
-        return torch.rand(COMPRESS_RATIO, OUT_DIM)
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.0340
     def init_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.1001 + 0.0549 * torch.randn(HEAD_DIM)
     def init_rope_positions():
         first_pos = init_position_ids().to(torch.int64)[:, 0]
         cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)

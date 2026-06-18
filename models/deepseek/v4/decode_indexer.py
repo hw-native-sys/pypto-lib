@@ -364,15 +364,37 @@ def _int8_quant_per_row(x):
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
-def _quant_w_per_output_channel(w):
-    """Per-output-channel INT8 quant for [in_features, out_features] weights."""
+def gen_shared_weight(shape, dequant_std, chan_cv):
+    """Synthesize a per-output-channel-symmetric INT8 weight + FP32 scale by simulating the
+    real DeepSeek-V4-Flash MXFP8 quant grid (e4m3, 128x128-block E8M0 scale), then re-quantizing
+    per-output-channel. Used for the indexer ``idx wq_b`` (and shared by decode_attention_csa),
+    which follows the same FP8 grid as the shared experts: ~200 discrete levels, ~1.1% zero
+    spike, per-channel scale CV ~0.61. A plain randn INT8 misses that level/scale structure.
+    ``chan_cv`` (log-space source-gain std) injects the per-output-channel magnitude spread the
+    coarse 128-block scale leaves behind; per-channel INT8 is scale-invariant, so the grid sets
+    the level shape and ``dequant_std`` only sets the absolute scale magnitude.
+
+    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel scale
+    shape ([out, in] -> scale [out]).
+    """
     import torch
 
-    amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.view(1, -1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
+    FP8_MAX, TINY = 448.0, 1e-20
+
+    def sim_fp8(W, block=128):   # e4m3 + 128x128-block E8M0 (round-up) scale on (out, in)
+        out, inn = W.shape
+        Wb = W.reshape(out // block, block, inn // block, block)
+        scale = torch.exp2(torch.ceil(torch.log2((Wb.abs().amax(dim=(1, 3), keepdim=True) / FP8_MAX).clamp_min(TINY))))
+        q = (Wb / scale).to(torch.float8_e4m3fn).float() * scale
+        return q.reshape(out, inn)
+
+    W = torch.randn(*shape) * torch.exp(chan_cv * torch.randn(*shape[:-1], 1))  # per-channel gain
+    Wq = sim_fp8(W)
+    amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale = amax / INT8_SCALE_MAX
+    w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
+    return w_i8, scale
 
 
 def golden_indexer(tensors):
@@ -482,10 +504,11 @@ def build_tensor_specs(start_pos=None):
         return torch.rand(B, S, D)
     def init_qr():
         return torch.rand(T, Q_LORA)
-    def init_wq_b():
-        return torch.rand(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM)
+    # weights_proj / inner compressor calibrated to the real DeepSeek-V4-Flash CSA indexer
+    # (mean l8/l32 of extract_weights_flash): zero-mean Gaussian at the measured std, gamma
+    # near the measured mean. idx wq_b uses the MXFP8 grid below (not a benign randn INT8).
     def init_weights_proj():
-        return torch.rand(D, IDX_N_HEADS)
+        return torch.randn(D, IDX_N_HEADS) * 0.2313
     def init_rope_positions():
         return init_position_ids().to(torch.int64)[:, 0]
     def init_cos():
@@ -505,13 +528,13 @@ def build_tensor_specs(start_pos=None):
                 tbl[b, j] = b * INNER_STATE_MAX_BLOCKS + j
         return tbl
     def init_inner_wkv():
-        return torch.rand(D, INNER_OUT_DIM)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0293
     def init_inner_wgate():
-        return torch.rand(D, INNER_OUT_DIM)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0512
     def init_inner_ape():
-        return torch.rand(COMPRESS_RATIO, INNER_OUT_DIM)
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
-        return torch.ones(INNER_HEAD_DIM)
+        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
     def init_idx_kv_cache():
         return torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     def init_idx_block_table():
@@ -585,9 +608,13 @@ def build_tensor_specs(start_pos=None):
                     mapping[b, s] = blk * BLOCK_SIZE + intra
         return mapping
 
-    wq_b_bf16 = init_wq_b().to(torch.bfloat16)
+    # idx wq_b: simulate the real MXFP8 (e4m3 + 128x128-block E8M0) grid (~200 levels, scaleCV
+    # ~0.61, ~1.1% zero spike) instead of a benign randn INT8. gen_shared_weight reduces over
+    # the last (in) dim, so build [out, in] then transpose.
+    wq_b_i8_T, wq_b_scale = gen_shared_weight(
+        (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
+    wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = _int8_quant_per_row(init_qr())
-    wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),

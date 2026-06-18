@@ -755,17 +755,21 @@ def build_tensor_specs(start_pos=None):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
+    # Compressor/indexer fixtures calibrated to the real DeepSeek-V4-Flash CSA layers
+    # (mean l8/l32 of extract_weights_flash). The BF16 weights are clean zero-mean Gaussian
+    # (no quant grid), so randn x measured-std is in-distribution; the RMSNorm gammas center
+    # near a measured mean (not ones); idx_wq_b is the only quantized one (see below).
     def init_cmp_wkv():
-        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0245
 
     def init_cmp_wgate():
-        return torch.randn(D, MAIN_OUT_DIM) / D ** 0.5
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0388
 
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.01
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
 
     def init_cmp_norm_w():
-        return torch.ones(HEAD_DIM)
+        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
 
     def init_compress_state():
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
@@ -788,11 +792,8 @@ def build_tensor_specs(start_pos=None):
                 tbl[b, j] = b * MAIN_STATE_MAX_BLOCKS + j
         return tbl
 
-    def init_idx_wq_b():
-        return torch.randn(Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM) / Q_LORA ** 0.5
-
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) / D ** 0.5
+        return torch.randn(D, IDX_N_HEADS) * 0.2313
 
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -804,16 +805,16 @@ def build_tensor_specs(start_pos=None):
         return h / (IDX_HEAD_DIM ** 0.5)
 
     def init_inner_wkv():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.randn(D, INNER_OUT_DIM) * 0.0293
 
     def init_inner_wgate():
-        return torch.randn(D, INNER_OUT_DIM) / D ** 0.5
+        return torch.randn(D, INNER_OUT_DIM) * 0.0512
 
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.01
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
 
     def init_inner_norm_w():
-        return torch.ones(IDX_HEAD_DIM)
+        return 0.6850 + 0.2610 * torch.randn(IDX_HEAD_DIM)
 
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
@@ -1003,8 +1004,14 @@ def build_tensor_specs(start_pos=None):
         "post": shared_post,
         "comb": shared_comb,
     })
-    shared_idx_wq_b = init_idx_wq_b().to(torch.bfloat16)
-    idx_wq_b_i8, idx_wq_b_scale = quant_w_per_output_channel(shared_idx_wq_b)
+    # idx_wq_b is the only quantized indexer weight: simulate the real MXFP8 (e4m3 +
+    # 128x128-block E8M0) grid like the shared experts (199 levels, scaleCV ~0.61, ~1.1% zero
+    # spike) instead of a benign randn INT8. gen_shared_weight reduces over the last (in) dim
+    # and yields scale per output channel, so build [out, in] then transpose to [Q_LORA, out].
+    from decode_indexer import gen_shared_weight
+    idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight(
+        (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
+    idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()
     shared_weights_proj = init_weights_proj().to(torch.bfloat16)
     shared_hadamard_idx = init_hadamard_idx().to(torch.bfloat16)
     shared_idx_kv_cache = init_idx_kv_cache().to(torch.bfloat16)
