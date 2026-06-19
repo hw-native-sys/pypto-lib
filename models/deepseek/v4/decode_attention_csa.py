@@ -766,9 +766,7 @@ def build_tensor_specs(start_pos=None):
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
         state[:, :, MAIN_OUT_DIM:] = float("-inf")
         starts = init_start_pos().to(torch.int64)
-        gen = torch.Generator()
-        gen.manual_seed(101)
-        hist = torch.randn(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM, generator=gen) * 0.05
+        hist = torch.randn(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM) * 0.05
         for b in range(B):
             for abs_pos in range(int(starts[b].item())):
                 blk = b * MAIN_STATE_MAX_BLOCKS + abs_pos // MAIN_STATE_BLOCK_SIZE
@@ -811,9 +809,7 @@ def build_tensor_specs(start_pos=None):
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
         state[:, :, INNER_OUT_DIM:] = float("-inf")
         starts = init_start_pos().to(torch.int64)
-        gen = torch.Generator()
-        gen.manual_seed(102)
-        hist = torch.randn(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM, generator=gen) * 0.05
+        hist = torch.randn(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM) * 0.05
         for b in range(B):
             for abs_pos in range(int(starts[b].item())):
                 blk = b * INNER_STATE_MAX_BLOCKS + abs_pos // INNER_STATE_BLOCK_SIZE

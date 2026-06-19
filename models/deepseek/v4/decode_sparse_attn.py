@@ -630,33 +630,27 @@ def build_tensor_specs(
         torch.arange(T, dtype=torch.int32),
     )
 
-    def seeded_uniform(shape, seed):
-        """Create a deterministic centered uniform tensor for repeatable tests."""
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return torch.rand(*shape, generator=generator) - 0.5
-
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
-        q = seeded_uniform((T, H, HEAD_DIM), 1)
+        q = torch.rand(T, H, HEAD_DIM) - 0.5
         if causal_regression_fixture:
             q[0].fill_(1.0)
         return q
 
     def init_ori_kv():
         """Initialize the sliding-window KV cache pages."""
-        kv = seeded_uniform((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 2)
+        kv = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
         if causal_regression_fixture:
             kv[0, WIN - 1, 0].fill_(8.0)
         return kv
 
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
-        return seeded_uniform((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM), 3)
+        return torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
 
     def init_mtp_kv_overlay():
         """Initialize the current decode-chunk overlay KV rows."""
-        overlay = seeded_uniform((T, HEAD_DIM), 6)
+        overlay = torch.rand(T, HEAD_DIM) - 0.5
         if overlay_replacement_fixture:
             overlay[:, :] = 0.0
             overlay[:, 0] = 4.0
@@ -723,9 +717,9 @@ def build_tensor_specs(
 
     def init_wo_a():
         """Initialize the grouped first-stage output-projection weights."""
-        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 4) / (O_GROUP_IN ** 0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
 
-    wo_b_bf16 = (seeded_uniform((D, O_GROUPS * O_LORA), 5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
+    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
 
     def init_wo_b():

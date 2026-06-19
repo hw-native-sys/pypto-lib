@@ -7,10 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
-"""DeepSeek-V4 decode layer smoke: attention DP2 followed by MoE EP2.
+"""DeepSeek-V4 decode layer smoke: attention DP-N followed by MoE EP-N.
 
 Each rank owns a local decode micro-batch for the selected attention stage.
-The resulting per-rank hidden states feed the two-rank EP MoE path.
+The resulting per-rank hidden states feed the N-rank EP MoE path. The EP world
+size is chosen with --ep (2/4/8, default 2), inherited from moe_ep; see __main__.
 """
 
 import pypto.language as pl
@@ -90,7 +91,6 @@ from moe_ep import (
     moe_ep,
 )
 
-assert N_RANKS == 2, "decode layer smoke is wired for attention DP2 + MoE EP2"
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 
@@ -790,8 +790,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=str, default="0,1",
-                        help="comma-separated device ids; need at least 2")
+    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
+                        help="EP world size / rank count (parsed at import by moe_ep)")
+    parser.add_argument("-d", "--device", type=str,
+                        default=",".join(str(i) for i in range(N_RANKS)),
+                        help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=None,
                         help="If set, use this single start_pos for all batches.")
     parser.add_argument("--layer-id", type=int, default=10)
