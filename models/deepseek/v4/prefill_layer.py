@@ -76,9 +76,7 @@ from prefill_attention_csa import (
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
-    MAX_REQS,
     MAX_SEQ_LEN,
-    MAX_TOKENS,
     O_GROUPS,
     O_GROUP_IN,
     O_LORA,
@@ -95,7 +93,6 @@ from prefill_attention_csa import (
 )
 
 
-assert MAX_TOKENS == T, "prefill attention and MoE EP must agree on token-major T"
 assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block size"
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
@@ -127,14 +124,14 @@ def prefill_layer(
         [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
         pl.FP32,
     ],
-    hca_compress_state_block_table: pl.Tensor[[MAX_REQS, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
     csa_cmp_kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_compress_state_block_table: pl.Tensor[[MAX_REQS, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     csa_inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
@@ -142,24 +139,23 @@ def prefill_layer(
     csa_inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.FP32],
     csa_inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     csa_inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    csa_inner_compress_state_block_table: pl.Tensor[[MAX_REQS, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Out[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
-    idx_block_table: pl.Tensor[[MAX_REQS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -219,7 +215,6 @@ def prefill_layer(
             ori_slot_mapping,
             cmp_sparse_indices,
             cmp_sparse_lens,
-            token_to_request,
             position_ids,
             attn_sink,
             wo_a,
@@ -257,7 +252,6 @@ def prefill_layer(
             cmp_block_table,
             cmp_sparse_indices,
             cmp_sparse_lens,
-            token_to_request,
             position_ids,
             hca_cmp_slot_mapping,
             hca_state_slot_mapping,
@@ -314,7 +308,6 @@ def prefill_layer(
             cmp_block_table,
             idx_kv_cache,
             idx_block_table,
-            token_to_request,
             position_ids,
             csa_cmp_slot_mapping,
             csa_idx_slot_mapping,
@@ -371,14 +364,14 @@ def l3_prefill_layer(
         [N_RANKS, HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
         pl.FP32,
     ],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, MAX_REQS, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.FP32],
     csa_cmp_kv_state: pl.Tensor[[N_RANKS, CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_score_state: pl.Tensor[[N_RANKS, CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, MAX_REQS, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_inner_wkv: pl.Tensor[[N_RANKS, D, INNER_OUT_DIM], pl.BF16],
     csa_inner_wgate: pl.Tensor[[N_RANKS, D, INNER_OUT_DIM], pl.BF16],
@@ -386,24 +379,23 @@ def l3_prefill_layer(
     csa_inner_norm_w: pl.Tensor[[N_RANKS, IDX_HEAD_DIM], pl.FP32],
     csa_inner_kv_state: pl.Tensor[[N_RANKS, INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     csa_inner_score_state: pl.Tensor[[N_RANKS, INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, MAX_REQS, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Out[pl.Tensor[[N_RANKS, CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[N_RANKS, MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
+    ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_block_table: pl.Tensor[[N_RANKS, MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[N_RANKS, MAX_TOKENS, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
+    cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[N_RANKS, T, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
-    idx_block_table: pl.Tensor[[N_RANKS, MAX_REQS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    token_to_request: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
-    position_ids: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, MAX_TOKENS], pl.INT64],
+    idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
+    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
@@ -470,7 +462,7 @@ def l3_prefill_layer(
             cmp_kv[rank], cmp_block_table[rank],
             cmp_sparse_indices[rank], cmp_sparse_lens[rank],
             idx_kv_cache[rank], idx_block_table[rank],
-            token_to_request[rank], position_ids[rank],
+            position_ids[rank],
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
             csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank],
             csa_state_slot_mapping[rank], csa_inner_state_slot_mapping[rank],
@@ -573,7 +565,6 @@ HOST_TENSOR_ORDER = (
     "cmp_sparse_lens",
     "idx_kv_cache",
     "idx_block_table",
-    "token_to_request",
     "position_ids",
     "hca_cmp_slot_mapping",
     "hca_state_slot_mapping",
@@ -657,7 +648,7 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
 
 
-def _attention_specs(kind, start_pos=START_POS, num_tokens=MAX_TOKENS, case="custom"):
+def _attention_specs(kind, start_pos=START_POS, num_tokens=T, case="custom"):
     if kind == "swa":
         return build_swa_attention_tensor_specs(
             start_pos=start_pos,
@@ -751,7 +742,7 @@ def _add_moe_specs(moe_specs, tensor_specs, scalar_specs, tensor_names, scalar_n
             scalar_names.add(spec.name)
 
 
-def build_tensor_specs(start_pos=START_POS, num_tokens=MAX_TOKENS, case="custom", layer_id=2):
+def build_tensor_specs(start_pos=START_POS, num_tokens=T, case="custom", layer_id=2):
     import torch
     from golden import TensorSpec
 
@@ -805,7 +796,11 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=MAX_TOKENS, case="custom"
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
         raise ValueError(f"missing unified prefill layer tensor specs: {missing}")
-    ordered_scalars = [scalar_by_name[name] for name in ("num_tokens", "layer_id") if name in scalar_by_name]
+    ordered_scalars = [
+        scalar_by_name[name]
+        for name in ("num_tokens", "layer_id")
+        if name in scalar_by_name
+    ]
     return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + ordered_scalars
 
 
@@ -856,31 +851,24 @@ def active_ranked_x_next_compare(num_tokens):
 def _resolve_compare_tokens(args):
     kind = _attention_kind_for_layer(args.layer_id)
     if kind == "swa":
-        q_lens_values, _, num_tokens, _ = _resolve_swa_case(
+        _, _, num_tokens, _ = _resolve_swa_case(
             args.start_pos,
             args.num_tokens,
             args.case,
-            False,
-            False,
         )
     elif kind == "hca":
-        _, q_lens_values, _, num_tokens = _resolve_hca_case(
+        _, _, _, num_tokens = _resolve_hca_case(
             args.start_pos,
             args.num_tokens,
             args.case,
-            False,
-            False,
-            False,
         )
     else:
-        _, q_lens_values, _, num_tokens = _resolve_csa_case(
+        _, _, _, num_tokens = _resolve_csa_case(
             args.start_pos,
             args.num_tokens,
             args.case,
-            False,
-            False,
         )
-    return min(num_tokens, sum(q_lens_values))
+    return num_tokens
 
 
 def _compare_fns(kind, compare_tokens):
@@ -912,7 +900,7 @@ if __name__ == "__main__":
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only prefix length for --case=custom.")
-    parser.add_argument("--num-tokens", type=int, default=MAX_TOKENS,
+    parser.add_argument("--num-tokens", type=int, default=T,
                         help="Fixture active token count for --case=custom.")
     parser.add_argument("--case", type=str, default="custom",
                         help="Attention fixture case for the selected layer type.")
