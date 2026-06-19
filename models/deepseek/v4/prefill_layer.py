@@ -177,7 +177,6 @@ def prefill_layer(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_attn: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
     count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -192,130 +191,46 @@ def prefill_layer(
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     if layer_id < 2:
-        kv_cache, x_attn = prefill_attention_swa(
-            x_hc,
-            hc_attn_fn,
-            hc_attn_scale,
-            hc_attn_base,
-            attn_norm_w,
-            wq_a,
-            wq_b,
-            wq_b_scale,
-            wkv,
-            gamma_cq,
-            gamma_ckv,
-            freqs_cos,
-            freqs_sin,
-            kv_cache,
-            ori_block_table,
-            ori_slot_mapping,
-            cmp_sparse_indices,
-            cmp_sparse_lens,
-            position_ids,
-            attn_sink,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            x_attn,
-            num_tokens,
+        prefill_attention_swa(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            kv_cache, ori_block_table, ori_slot_mapping,
+            cmp_sparse_indices, cmp_sparse_lens, position_ids,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn, num_tokens,
         )
     elif layer_id % 2 == 1:
-        x_attn = prefill_attention_hca(
-            x_hc,
-            hc_attn_fn,
-            hc_attn_scale,
-            hc_attn_base,
-            attn_norm_w,
-            wq_a,
-            wq_b,
-            wq_b_scale,
-            wkv,
-            gamma_cq,
-            gamma_ckv,
-            freqs_cos,
-            freqs_sin,
-            hca_cmp_wkv,
-            hca_cmp_wgate,
-            hca_cmp_ape,
-            hca_cmp_norm_w,
-            hca_cmp_kv_state,
-            hca_cmp_score_state,
-            hca_compress_state_block_table,
-            kv_cache,
-            ori_slot_mapping,
-            ori_block_table,
-            cmp_kv,
-            cmp_block_table,
-            cmp_sparse_indices,
-            cmp_sparse_lens,
-            position_ids,
-            hca_cmp_slot_mapping,
-            hca_state_slot_mapping,
-            attn_sink,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            x_attn,
-            num_tokens,
+        prefill_attention_hca(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
+            hca_cmp_kv_state, hca_cmp_score_state, hca_compress_state_block_table,
+            kv_cache, ori_slot_mapping, ori_block_table,
+            cmp_kv, cmp_block_table, cmp_sparse_indices, cmp_sparse_lens,
+            position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn, num_tokens,
         )
     else:
-        (
-            kv_cache,
-            cmp_kv,
-            csa_cmp_kv_state,
-            csa_cmp_score_state,
-            idx_kv_cache,
-            csa_inner_kv_state,
-            csa_inner_score_state,
-            x_attn,
-        ) = prefill_attention_csa(
-            x_hc,
-            hc_attn_fn,
-            hc_attn_scale,
-            hc_attn_base,
-            attn_norm_w,
-            wq_a,
-            wq_b,
-            wq_b_scale,
-            wkv,
-            gamma_cq,
-            gamma_ckv,
-            freqs_cos,
-            freqs_sin,
-            csa_cmp_wkv,
-            csa_cmp_wgate,
-            csa_cmp_ape,
-            csa_cmp_norm_w,
-            csa_cmp_kv_state,
-            csa_cmp_score_state,
-            csa_compress_state_block_table,
+        prefill_attention_csa(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
+            csa_cmp_kv_state, csa_cmp_score_state, csa_compress_state_block_table,
             csa_hadamard_idx,
-            csa_inner_wkv,
-            csa_inner_wgate,
-            csa_inner_ape,
-            csa_inner_norm_w,
-            csa_inner_kv_state,
-            csa_inner_score_state,
-            csa_inner_compress_state_block_table,
-            kv_cache,
-            ori_block_table,
-            ori_slot_mapping,
-            cmp_kv,
-            cmp_block_table,
-            idx_kv_cache,
-            idx_block_table,
-            position_ids,
-            csa_cmp_slot_mapping,
-            csa_idx_slot_mapping,
-            csa_state_slot_mapping,
-            csa_inner_state_slot_mapping,
-            attn_sink,
-            wo_a,
-            wo_b,
-            wo_b_scale,
-            x_attn,
-            num_tokens,
+            csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
+            csa_inner_kv_state, csa_inner_score_state, csa_inner_compress_state_block_table,
+            kv_cache, ori_block_table, ori_slot_mapping,
+            cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
+            position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+            csa_state_slot_mapping, csa_inner_state_slot_mapping,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn, num_tokens,
         )
     x_next = moe_ep(
         x_attn,
@@ -417,7 +332,6 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_attn: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
@@ -470,7 +384,6 @@ def l3_prefill_layer(
             routed_w2[rank], routed_w2_scale[rank],
             shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
-            x_attn[rank],
             x_next[rank],
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
@@ -478,44 +391,6 @@ def l3_prefill_layer(
             num_tokens, layer_id, rank,
             device=rank,
         )
-
-HCA_NAME_MAP = {
-    "cmp_wkv": "hca_cmp_wkv",
-    "cmp_wgate": "hca_cmp_wgate",
-    "cmp_ape": "hca_cmp_ape",
-    "cmp_norm_w": "hca_cmp_norm_w",
-    "cmp_kv_state": "hca_cmp_kv_state",
-    "cmp_score_state": "hca_cmp_score_state",
-    "compress_state_block_table": "hca_compress_state_block_table",
-    "cmp_slot_mapping": "hca_cmp_slot_mapping",
-    "state_slot_mapping": "hca_state_slot_mapping",
-}
-
-CSA_NAME_MAP = {
-    "cmp_wkv": "csa_cmp_wkv",
-    "cmp_wgate": "csa_cmp_wgate",
-    "cmp_ape": "csa_cmp_ape",
-    "cmp_norm_w": "csa_cmp_norm_w",
-    "cmp_kv_state": "csa_cmp_kv_state",
-    "cmp_score_state": "csa_cmp_score_state",
-    "compress_state_block_table": "csa_compress_state_block_table",
-    "hadamard_idx": "csa_hadamard_idx",
-    "inner_wkv": "csa_inner_wkv",
-    "inner_wgate": "csa_inner_wgate",
-    "inner_ape": "csa_inner_ape",
-    "inner_norm_w": "csa_inner_norm_w",
-    "inner_kv_state": "csa_inner_kv_state",
-    "inner_score_state": "csa_inner_score_state",
-    "inner_compress_state_block_table": "csa_inner_compress_state_block_table",
-    "cmp_slot_mapping": "csa_cmp_slot_mapping",
-    "idx_slot_mapping": "csa_idx_slot_mapping",
-    "state_slot_mapping": "csa_state_slot_mapping",
-    "inner_state_slot_mapping": "csa_inner_state_slot_mapping",
-}
-
-SWA_NAME_MAP = {
-    "block_table": "ori_block_table",
-}
 
 HOST_TENSOR_ORDER = (
     "x_hc",
@@ -593,7 +468,6 @@ HOST_TENSOR_ORDER = (
     "shared_w3_scale",
     "shared_w2",
     "shared_w2_scale",
-    "x_attn",
     "x_next",
 )
 
@@ -645,185 +519,196 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
 
 
-def _attention_specs(kind, start_pos=START_POS, num_tokens=T):
-    # All three attention geometries are fully described by start_pos/num_tokens.
-    if kind == "swa":
-        return build_swa_attention_tensor_specs(
-            start_pos=start_pos,
-            num_tokens=num_tokens,
-        ), SWA_NAME_MAP, golden_prefill_attention_swa
-    if kind == "hca":
-        return build_hca_attention_tensor_specs(
-            start_pos=start_pos,
-            num_tokens=num_tokens,
-        ), HCA_NAME_MAP, golden_prefill_attention_hca
-    if kind == "csa":
-        return build_csa_attention_tensor_specs(
-            start_pos=start_pos,
-            num_tokens=num_tokens,
-        ), CSA_NAME_MAP, golden_prefill_attention_csa
-    raise ValueError(f"unknown attention kind {kind}")
-
-
-def _add_ranked_attention_specs(specs, name_map, tensor_specs, scalar_specs, tensor_names,
-                                scalar_names, active_tokens, torch, TensorSpec):
-    for spec in specs:
-        if isinstance(spec, TensorSpec):
-            if spec.name == "x_out":
-                continue
-            spec_name = name_map.get(spec.name, spec.name)
-            if spec_name in tensor_names:
-                continue
-            tensor_specs.append(
-                TensorSpec(
-                    spec_name,
-                    [N_RANKS, *spec.shape],
-                    spec.dtype,
-                    init_value=(
-                        ranked_x_hc_init(spec, N_RANKS, active_tokens, torch)
-                        if spec_name == "x_hc" else ranked_init(spec, N_RANKS, torch)
-                    ),
-                    is_output=spec.is_output,
-                )
-            )
-            tensor_names.add(spec_name)
-        else:
-            if spec.name in scalar_names:
-                continue
-            scalar_specs.append(spec)
-            scalar_names.add(spec.name)
-
-
-def _add_moe_specs(moe_specs, tensor_specs, scalar_specs, tensor_names, scalar_names,
-                   active_tokens, layer_id_value, torch, TensorSpec):
-    for spec in moe_specs:
-        if isinstance(spec, TensorSpec):
-            if spec.name in {"x_hc", "x_next"} or spec.name in tensor_names:
-                continue
-            if spec.name == "tid2eid":
-                def init_tid2eid(spec=spec):
-                    _, vocab, topk = spec.shape
-                    ids = torch.arange(vocab, dtype=torch.int64).view(vocab, 1)
-                    ks = torch.arange(topk, dtype=torch.int64).view(1, topk)
-                    table = ((ids * topk + ks) % N_EXPERTS_GLOBAL).to(dtype=spec.dtype)
-                    return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-
-                tensor_specs.append(
-                    TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_tid2eid, is_output=spec.is_output)
-                )
-            elif spec.name == "input_ids":
-                def init_input_ids(spec=spec):
-                    _, tokens = spec.shape
-                    active = min(active_tokens, tokens)
-                    rows = []
-                    for rank in range(N_RANKS):
-                        ids = torch.arange(tokens, dtype=spec.dtype)
-                        row = torch.roll(ids, shifts=rank)
-                        if layer_id_value >= 3 and active < tokens:
-                            row[active:] = -1
-                        rows.append(row)
-                    return torch.stack(rows, dim=0).contiguous()
-
-                tensor_specs.append(
-                    TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_input_ids, is_output=spec.is_output)
-                )
-            else:
-                tensor_specs.append(spec)
-            tensor_names.add(spec.name)
-        else:
-            if spec.name in scalar_names:
-                continue
-            scalar_specs.append(spec)
-            scalar_names.add(spec.name)
-
-
 def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
+    def kind_specs(build_fn):
+        return {s.name: s for s in build_fn(start_pos=start_pos, num_tokens=num_tokens) if isinstance(s, TensorSpec)}
+
+    swa = kind_specs(build_swa_attention_tensor_specs)
+    hca = kind_specs(build_hca_attention_tensor_specs)
+    csa = kind_specs(build_csa_attention_tensor_specs)
     active_kind = _attention_kind_for_layer(layer_id)
-    ordered_kinds = [active_kind] + [kind for kind in ("swa", "hca", "csa") if kind != active_kind]
-    tensor_specs = []
-    scalar_specs = []
-    tensor_names = set()
-    scalar_names = set()
+    active = {"swa": swa, "hca": hca, "csa": csa}[active_kind]
     active_tokens = num_tokens
-    for kind in ordered_kinds:
-        specs, name_map, _ = _attention_specs(
-            kind,
-            start_pos=start_pos,
-            num_tokens=num_tokens,
-        )
-        if kind == active_kind:
-            for spec in specs:
-                if not isinstance(spec, TensorSpec) and spec.name == "num_tokens":
-                    active_tokens = int(spec.value.item())
-                    break
-        _add_ranked_attention_specs(
-            specs,
-            name_map,
-            tensor_specs,
-            scalar_specs,
-            tensor_names,
-            scalar_names,
-            active_tokens,
-            torch,
-            TensorSpec,
-        )
 
-    moe_specs = build_moe_tensor_specs(layer_id=layer_id)
-    _add_moe_specs(
-        moe_specs,
-        tensor_specs,
-        scalar_specs,
-        tensor_names,
-        scalar_names,
-        active_tokens,
-        layer_id,
-        torch,
-        TensorSpec,
-    )
-    tensor_specs.append(TensorSpec("x_attn", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
+    # (layer_name, source_spec). Shared state is taken from the active kind (its
+    # init is what the active attention + its golden both consume). The hca_/csa_
+    # compressor + indexer params are namespaced from their own kind; cmp_kv and
+    # the idx caches fall back to the owning kind when the active kind lacks them.
+    attention_specs = [
+        ("x_hc", active["x_hc"]),
+        ("hc_attn_fn", active["hc_attn_fn"]),
+        ("hc_attn_scale", active["hc_attn_scale"]),
+        ("hc_attn_base", active["hc_attn_base"]),
+        ("attn_norm_w", active["attn_norm_w"]),
+        ("wq_a", active["wq_a"]),
+        ("wq_b", active["wq_b"]),
+        ("wq_b_scale", active["wq_b_scale"]),
+        ("wkv", active["wkv"]),
+        ("gamma_cq", active["gamma_cq"]),
+        ("gamma_ckv", active["gamma_ckv"]),
+        ("freqs_cos", active["freqs_cos"]),
+        ("freqs_sin", active["freqs_sin"]),
+        ("hca_cmp_wkv", hca["cmp_wkv"]),
+        ("hca_cmp_wgate", hca["cmp_wgate"]),
+        ("hca_cmp_ape", hca["cmp_ape"]),
+        ("hca_cmp_norm_w", hca["cmp_norm_w"]),
+        ("hca_cmp_kv_state", hca["cmp_kv_state"]),
+        ("hca_cmp_score_state", hca["cmp_score_state"]),
+        ("hca_compress_state_block_table", hca["compress_state_block_table"]),
+        ("csa_cmp_wkv", csa["cmp_wkv"]),
+        ("csa_cmp_wgate", csa["cmp_wgate"]),
+        ("csa_cmp_ape", csa["cmp_ape"]),
+        ("csa_cmp_norm_w", csa["cmp_norm_w"]),
+        ("csa_cmp_kv_state", csa["cmp_kv_state"]),
+        ("csa_cmp_score_state", csa["cmp_score_state"]),
+        ("csa_compress_state_block_table", csa["compress_state_block_table"]),
+        ("csa_hadamard_idx", csa["hadamard_idx"]),
+        ("csa_inner_wkv", csa["inner_wkv"]),
+        ("csa_inner_wgate", csa["inner_wgate"]),
+        ("csa_inner_ape", csa["inner_ape"]),
+        ("csa_inner_norm_w", csa["inner_norm_w"]),
+        ("csa_inner_kv_state", csa["inner_kv_state"]),
+        ("csa_inner_score_state", csa["inner_score_state"]),
+        ("csa_inner_compress_state_block_table", csa["inner_compress_state_block_table"]),
+        ("kv_cache", active["kv_cache"]),
+        ("ori_block_table", active.get("ori_block_table", swa.get("block_table"))),
+        ("ori_slot_mapping", active["ori_slot_mapping"]),
+        ("cmp_kv", active.get("cmp_kv", hca["cmp_kv"])),
+        ("cmp_block_table", active.get("cmp_block_table", hca["cmp_block_table"])),
+        ("cmp_sparse_indices", active.get("cmp_sparse_indices", swa["cmp_sparse_indices"])),
+        ("cmp_sparse_lens", active.get("cmp_sparse_lens", swa["cmp_sparse_lens"])),
+        ("idx_kv_cache", csa["idx_kv_cache"]),
+        ("idx_block_table", csa["idx_block_table"]),
+        ("position_ids", active["position_ids"]),
+        ("hca_cmp_slot_mapping", hca["cmp_slot_mapping"]),
+        ("hca_state_slot_mapping", hca["state_slot_mapping"]),
+        ("csa_cmp_slot_mapping", csa["cmp_slot_mapping"]),
+        ("csa_idx_slot_mapping", csa["idx_slot_mapping"]),
+        ("csa_state_slot_mapping", csa["state_slot_mapping"]),
+        ("csa_inner_state_slot_mapping", csa["inner_state_slot_mapping"]),
+        ("attn_sink", active["attn_sink"]),
+        ("wo_a", active["wo_a"]),
+        ("wo_b", active["wo_b"]),
+        ("wo_b_scale", active["wo_b_scale"]),
+    ]
+
+    tensor_specs = [
+        TensorSpec(
+            name,
+            [N_RANKS, *src.shape],
+            src.dtype,
+            init_value=(ranked_x_hc_init(src, N_RANKS, active_tokens, torch) if name == "x_hc"
+                        else ranked_init(src, N_RANKS, torch)),
+            is_output=src.is_output,
+        )
+        for name, src in attention_specs
+    ]
+
+    for spec in build_moe_tensor_specs(layer_id=layer_id):
+        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next"}:
+            continue
+        if spec.name == "tid2eid":
+            def init_tid2eid(spec=spec):
+                _, vocab, topk = spec.shape
+                ids = torch.arange(vocab, dtype=torch.int64).view(vocab, 1)
+                ks = torch.arange(topk, dtype=torch.int64).view(1, topk)
+                table = ((ids * topk + ks) % N_EXPERTS_GLOBAL).to(dtype=spec.dtype)
+                return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+            tensor_specs.append(TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_tid2eid))
+        elif spec.name == "input_ids":
+            def init_input_ids(spec=spec):
+                _, tokens = spec.shape
+                active = min(active_tokens, tokens)
+                rows = []
+                for rank in range(N_RANKS):
+                    row = torch.roll(torch.arange(tokens, dtype=spec.dtype), shifts=rank)
+                    if layer_id >= 3 and active < tokens:
+                        row[active:] = -1
+                    rows.append(row)
+                return torch.stack(rows, dim=0).contiguous()
+
+            tensor_specs.append(TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_input_ids))
+        else:
+            tensor_specs.append(spec)
+
     tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
-    scalar_by_name = {spec.name: spec for spec in scalar_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
         raise ValueError(f"missing unified prefill layer tensor specs: {missing}")
-    ordered_scalars = [
-        scalar_by_name[name]
-        for name in ("num_tokens", "layer_id")
-        if name in scalar_by_name
+    return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + [
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("layer_id", torch.int32, layer_id),
     ]
-    return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + ordered_scalars
 
 
 def golden_prefill_layer(tensors):
     import torch
     from golden import TensorSpec
 
-    layer_id = int(tensors["layer_id"])
-    kind = _attention_kind_for_layer(layer_id)
-    attention_specs, name_map, attention_golden = _attention_specs(
-        kind,
-        num_tokens=int(tensors["num_tokens"]),
-    )
+    num_tokens = int(tensors["num_tokens"])
+    kind = _attention_kind_for_layer(int(tensors["layer_id"]))
+
+    # Un-namespace the active kind's params back to the attention-local names its
+    # golden expects (decode-style mapped dict), then build a per-rank view.
+    mapped = dict(tensors)
+    if kind == "swa":
+        mapped["block_table"] = tensors["ori_block_table"]
+        specs = build_swa_attention_tensor_specs(num_tokens=num_tokens)
+        attention_golden = golden_prefill_attention_swa
+    elif kind == "hca":
+        mapped.update({
+            "cmp_wkv": tensors["hca_cmp_wkv"],
+            "cmp_wgate": tensors["hca_cmp_wgate"],
+            "cmp_ape": tensors["hca_cmp_ape"],
+            "cmp_norm_w": tensors["hca_cmp_norm_w"],
+            "cmp_kv_state": tensors["hca_cmp_kv_state"],
+            "cmp_score_state": tensors["hca_cmp_score_state"],
+            "compress_state_block_table": tensors["hca_compress_state_block_table"],
+            "cmp_slot_mapping": tensors["hca_cmp_slot_mapping"],
+            "state_slot_mapping": tensors["hca_state_slot_mapping"],
+        })
+        specs = build_hca_attention_tensor_specs(num_tokens=num_tokens)
+        attention_golden = golden_prefill_attention_hca
+    else:
+        mapped.update({
+            "cmp_wkv": tensors["csa_cmp_wkv"],
+            "cmp_wgate": tensors["csa_cmp_wgate"],
+            "cmp_ape": tensors["csa_cmp_ape"],
+            "cmp_norm_w": tensors["csa_cmp_norm_w"],
+            "cmp_kv_state": tensors["csa_cmp_kv_state"],
+            "cmp_score_state": tensors["csa_cmp_score_state"],
+            "compress_state_block_table": tensors["csa_compress_state_block_table"],
+            "hadamard_idx": tensors["csa_hadamard_idx"],
+            "inner_wkv": tensors["csa_inner_wkv"],
+            "inner_wgate": tensors["csa_inner_wgate"],
+            "inner_ape": tensors["csa_inner_ape"],
+            "inner_norm_w": tensors["csa_inner_norm_w"],
+            "inner_kv_state": tensors["csa_inner_kv_state"],
+            "inner_score_state": tensors["csa_inner_score_state"],
+            "inner_compress_state_block_table": tensors["csa_inner_compress_state_block_table"],
+            "cmp_slot_mapping": tensors["csa_cmp_slot_mapping"],
+            "idx_slot_mapping": tensors["csa_idx_slot_mapping"],
+            "state_slot_mapping": tensors["csa_state_slot_mapping"],
+            "inner_state_slot_mapping": tensors["csa_inner_state_slot_mapping"],
+        })
+        specs = build_csa_attention_tensor_specs(num_tokens=num_tokens)
+        attention_golden = golden_prefill_attention_csa
+
     x_attn = torch.zeros_like(tensors["x_hc"])
     for rank in range(N_RANKS):
         attn_tensors = {}
-        for spec in attention_specs:
+        for spec in specs:
             if isinstance(spec, TensorSpec):
-                if spec.name == "x_out":
-                    attn_tensors[spec.name] = x_attn[rank]
-                else:
-                    source_name = name_map.get(spec.name, spec.name)
-                    attn_tensors[spec.name] = tensors[source_name][rank]
+                attn_tensors[spec.name] = x_attn[rank] if spec.name == "x_out" else mapped[spec.name][rank]
             else:
-                attn_tensors[spec.name] = tensors[spec.name]
+                attn_tensors[spec.name] = mapped[spec.name]
         attention_golden(attn_tensors)
 
-    tensors["x_attn"][:] = x_attn
-    num_tokens = int(tensors.get("num_tokens", x_attn.shape[1]))
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["num_tokens"] = num_tokens
@@ -871,27 +756,9 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    kind = _attention_kind_for_layer(args.layer_id)
-    # Single-request geometry: active rows = num_tokens.
-    compare_tokens = args.num_tokens
-    # x_next on decode_layer's FFN envelope (diff_thd 0.01; pct_thd 0.1 wide
-    # enough for the csa branch). x_attn (pre-MoE) shares the same bar.
-    compare_fn = {
-        "x_attn": valid_ratio_reldiff(compare_tokens, diff_thd=0.01, pct_thd=0.1),
-        "x_next": valid_ratio_reldiff(compare_tokens, diff_thd=0.01, pct_thd=0.1),
-        "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-    }
-    if kind in {"hca", "csa"}:
-        compare_fn["cmp_kv"] = ratio_allclose(atol=5e-3, rtol=1e-2)
-    if kind == "csa":
-        compare_fn["idx_kv_cache"] = ratio_allclose(atol=5e-3, rtol=1e-2)
     result = run_jit(
         fn=l3_prefill_layer,
-        specs=build_tensor_specs(
-            start_pos=args.start_pos,
-            num_tokens=args.num_tokens,
-            layer_id=args.layer_id,
-        ),
+        specs=build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens, layer_id=args.layer_id),
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         compile_cfg=dict(
@@ -906,7 +773,14 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn=compare_fn,
+        # Same validation set as decode_layer: x_next on the FFN envelope
+        # (diff_thd 0.01; pct_thd 0.1 wide enough for the csa branch) and kv_cache
+        # strict. The attention output is an internal intermediate (not exposed),
+        # and the compressor/indexer caches are covered by their dedicated tests.
+        compare_fn={
+            "x_next": valid_ratio_reldiff(args.num_tokens, diff_thd=0.01, pct_thd=0.1),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        },
     )
     if not result.passed:
         if result.error:
