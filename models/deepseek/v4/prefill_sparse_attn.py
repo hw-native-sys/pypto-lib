@@ -98,12 +98,13 @@ assert T % PROJ_TOKEN_TILE == 0, "T must be divisible by PROJ_TOKEN_TILE for pro
 assert (O_GROUPS * O_LORA) % 2 == 0, "2-way quant K split requires an even O_GROUPS * O_LORA width"
 
 
-# Token-major sparse-attention helpers consume lowered sparse indices and
-# request metadata. The public overlay entry is `prefill_sparse_attn` below.
-MAX_REQS = 2
+# Token-major sparse-attention helpers consume lowered sparse indices for a
+# single request (issue #560): the layer owns the per-request loop and feeds
+# this op one contiguous run of <=T tokens. The public overlay entry is
+# `prefill_sparse_attn` below.
 MAX_TOKENS = T
-HCA_ORI_BLOCK_NUM = MAX_REQS * ORI_MAX_BLOCKS
-HCA_CMP_BLOCK_NUM = MAX_REQS * CMP_MAX_BLOCKS
+HCA_ORI_BLOCK_NUM = ORI_MAX_BLOCKS
+HCA_CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 HCA_GATHER_TOKEN_TILE = 4
 ROPE_HALF = HALF_ROPE
 SPARSE_A_K_CHUNK = A_K_CHUNK
@@ -560,14 +561,13 @@ def _prefill_hca_sparse_from_gathered_kv(
 def prefill_sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -589,8 +589,6 @@ def prefill_sparse_attn(
     """
     ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    ori_block_table_flat = pl.reshape(ori_block_table, [MAX_REQS * SPARSE_ORI_MAX_BLOCKS])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
 
     sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, SPARSE_PREFILL_SPARSE_PAD], dtype=pl.INT32)
@@ -610,7 +608,6 @@ def prefill_sparse_attn(
                     gather_len_eff = pl.cast(0, pl.INT32)
                     if gather_len > 0:
                         gather_len_eff = gather_len
-                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
                     for gather_ki in pl.pipeline(0, SPARSE_PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
                         gather_raw = pl.cast(-1, pl.INT32)
@@ -623,8 +620,7 @@ def prefill_sparse_attn(
                             if gather_raw < WIN:
                                 gather_ori_slot = gather_raw
                                 gather_block_slot = gather_ori_slot // BLOCK_SIZE
-                                gather_block_pos = gather_b * SPARSE_ORI_MAX_BLOCKS + gather_block_slot
-                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
+                                gather_blk = pl.cast(pl.read(ori_block_table, [gather_block_slot]), pl.INDEX)
                                 gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
                                 gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
                                 sparse_kv = pl.assemble(
@@ -642,8 +638,7 @@ def prefill_sparse_attn(
                             else:
                                 gather_cmp_slot = gather_raw - (WIN + MAX_TOKENS)
                                 gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
-                                gather_cmp_block_pos = gather_b * SPARSE_CMP_MAX_BLOCKS + gather_cmp_block_slot
-                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
+                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table, [gather_cmp_block_slot]), pl.INDEX)
                                 gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
                                 gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
                                 sparse_kv = pl.assemble(
@@ -680,13 +675,12 @@ def prefill_sparse_attn(
 def prefill_sparse_attn_padded_indices(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -704,8 +698,6 @@ def prefill_sparse_attn_padded_indices(
     """
     ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    ori_block_table_flat = pl.reshape(ori_block_table, [MAX_REQS * SPARSE_ORI_MAX_BLOCKS])
-    cmp_block_table_flat = pl.reshape(cmp_block_table, [MAX_REQS * SPARSE_CMP_MAX_BLOCKS])
 
     sparse_kv = pl.create_tensor([T * SPARSE_PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, SPARSE_PREFILL_SPARSE_PAD], dtype=pl.INT32)
@@ -720,7 +712,6 @@ def prefill_sparse_attn_padded_indices(
             gather_t = gather_t0 + gather_dt
             if gather_t < T:
                 if gather_t < num_tokens:
-                    gather_b = pl.cast(pl.read(token_to_request, [gather_t]), pl.INDEX)
                     for gather_ki in pl.pipeline(0, SPARSE_PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
                         gather_raw = pl.cast(-1, pl.INT32)
@@ -732,8 +723,7 @@ def prefill_sparse_attn_padded_indices(
                             if gather_raw < WIN:
                                 gather_ori_slot = gather_raw
                                 gather_block_slot = gather_ori_slot // BLOCK_SIZE
-                                gather_block_pos = gather_b * SPARSE_ORI_MAX_BLOCKS + gather_block_slot
-                                gather_blk = pl.cast(pl.read(ori_block_table_flat, [gather_block_pos]), pl.INDEX)
+                                gather_blk = pl.cast(pl.read(ori_block_table, [gather_block_slot]), pl.INDEX)
                                 gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
                                 gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
                                 sparse_kv = pl.assemble(
@@ -751,8 +741,7 @@ def prefill_sparse_attn_padded_indices(
                             else:
                                 gather_cmp_slot = gather_raw - (WIN + MAX_TOKENS)
                                 gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
-                                gather_cmp_block_pos = gather_b * SPARSE_CMP_MAX_BLOCKS + gather_cmp_block_slot
-                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table_flat, [gather_cmp_block_pos]), pl.INDEX)
+                                gather_cmp_blk = pl.cast(pl.read(cmp_block_table, [gather_cmp_block_slot]), pl.INDEX)
                                 gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
                                 gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
                                 sparse_kv = pl.assemble(
@@ -789,14 +778,13 @@ def prefill_sparse_attn_padded_indices(
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
-    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -815,7 +803,6 @@ def prefill_sparse_attn_test(
         cmp_sparse_indices,
         cmp_sparse_lens,
         attn_sink,
-        token_to_request,
         num_tokens,
         freqs_cos,
         freqs_sin,
@@ -863,7 +850,6 @@ def golden_prefill_sparse_attn(tensors):
     cmp_block_table = tensors["cmp_block_table"]
     cmp_sparse_indices = tensors["cmp_sparse_indices"]
     cmp_sparse_lens = tensors["cmp_sparse_lens"]
-    token_to_request = tensors["token_to_request"]
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
@@ -873,7 +859,6 @@ def golden_prefill_sparse_attn(tensors):
 
     o = torch.zeros(T, H, HEAD_DIM)
     for t in range(num_tokens):
-        req = int(token_to_request[t].item())
         gathered = []
         sparse_len = max(0, min(int(cmp_sparse_lens[t].item()), SPARSE_PREFILL_SPARSE_PAD, SPARSE_TOPK))
         for raw_i in cmp_sparse_indices[t, :sparse_len].tolist():
@@ -881,7 +866,7 @@ def golden_prefill_sparse_attn(tensors):
             if raw < 0:
                 continue
             if raw < WIN:
-                block_id = int(ori_block_table[req, raw // BLOCK_SIZE].item())
+                block_id = int(ori_block_table[raw // BLOCK_SIZE].item())
                 intra = raw % BLOCK_SIZE
                 gathered.append(ori_kv[block_id, intra, 0])
             elif raw < WIN + MAX_TOKENS:
@@ -892,7 +877,7 @@ def golden_prefill_sparse_attn(tensors):
                 cmp_slot = raw - (WIN + MAX_TOKENS)
                 if cmp_slot < 0 or cmp_slot >= HCA_CMP_BLOCK_NUM * BLOCK_SIZE:
                     continue
-                block_id = int(cmp_block_table[req, cmp_slot // BLOCK_SIZE].item())
+                block_id = int(cmp_block_table[cmp_slot // BLOCK_SIZE].item())
                 intra = cmp_slot % BLOCK_SIZE
                 gathered.append(cmp_kv[block_id, intra, 0])
 
@@ -973,20 +958,18 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_ori_kv():
         return ((torch.rand(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_block_table():
-        table = torch.zeros(MAX_REQS, SPARSE_ORI_MAX_BLOCKS, dtype=torch.int32)
-        for req in range(MAX_REQS):
-            for blk in range(SPARSE_ORI_MAX_BLOCKS):
-                table[req, blk] = req * SPARSE_ORI_MAX_BLOCKS + blk
+        table = torch.zeros(SPARSE_ORI_MAX_BLOCKS, dtype=torch.int32)
+        for blk in range(SPARSE_ORI_MAX_BLOCKS):
+            table[blk] = blk
         return table
     def init_kv_overlay():
         return ((torch.rand(MAX_TOKENS, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
         return ((torch.rand(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_block_table():
-        table = torch.zeros(MAX_REQS, SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32)
-        for req in range(MAX_REQS):
-            for blk in range(SPARSE_CMP_MAX_BLOCKS):
-                table[req, blk] = req * SPARSE_CMP_MAX_BLOCKS + blk
+        table = torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32)
+        for blk in range(SPARSE_CMP_MAX_BLOCKS):
+            table[blk] = blk
         return table
     def init_cmp_sparse_indices():
         idx = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -1011,8 +994,6 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         return lens
     def init_attn_sink():
         return torch.zeros(H)
-    def init_token_to_request():
-        return torch.zeros(MAX_TOKENS, dtype=torch.int32)
     def init_freqs_cos():
         return shared_rope_cos.clone()
     def init_freqs_sin():
@@ -1027,14 +1008,13 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("ori_block_table", [MAX_REQS, SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
+        TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("kv_overlay", [MAX_TOKENS, HEAD_DIM], torch.bfloat16, init_value=init_kv_overlay),
         TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
-        TensorSpec("cmp_block_table", [MAX_REQS, SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
+        TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
-        TensorSpec("token_to_request", [MAX_TOKENS], torch.int32, init_value=init_token_to_request),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
