@@ -1000,12 +1000,14 @@ def build_tensor_specs(
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        # Compressor / indexer caches are written in-place but not validated here
+        # (decode parity); the dedicated prefill_compressor_ratio4 and
+        # prefill_indexer tests cover them.
         TensorSpec(
             "cmp_kv",
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
-            is_output=True,
         ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
@@ -1013,7 +1015,6 @@ def build_tensor_specs(
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.bfloat16,
             init_value=init_idx_kv_cache,
-            is_output=True,
         ),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
@@ -1109,9 +1110,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         compare_fn={
             "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
-            "cmp_kv": ratio_allclose(atol=5e-3, rtol=1e-2),
-            "idx_kv_cache": ratio_allclose(atol=5e-3, rtol=1e-2),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:

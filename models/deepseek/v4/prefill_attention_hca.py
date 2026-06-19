@@ -729,19 +729,19 @@ def build_tensor_specs(
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
+        # Compressor caches are written in-place but not validated here (decode
+        # parity); the dedicated prefill_compressor_ratio128 test covers them.
         TensorSpec(
             "cmp_kv_state",
             [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
             torch.float32,
             init_value=init_cmp_state,
-            is_output=True,
         ),
         TensorSpec(
             "cmp_score_state",
             [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
             torch.float32,
             init_value=init_cmp_score_state,
-            is_output=True,
         ),
         TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec(
@@ -758,7 +758,6 @@ def build_tensor_specs(
             [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
             torch.bfloat16,
             init_value=init_cmp_kv,
-            is_output=True,
         ),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
@@ -819,7 +818,7 @@ def valid_ratio_reldiff(
 
 if __name__ == "__main__":
     import argparse
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill HCA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -853,6 +852,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         compare_fn={
             "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:
