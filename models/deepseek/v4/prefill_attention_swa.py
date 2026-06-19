@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 packed prefill SWA attention.
 
-The public contract is single-request token-major prefill (issue #560): the
+The public contract is single-request token-major prefill: the
 layer owns the per-request loop and feeds this op one contiguous run of <=T
 tokens. SWA consumes lowered metadata such as position_ids, slot mappings, and
 window-ring sparse indices.
@@ -114,7 +114,7 @@ def _resolve_swa_case(
     num_tokens: int = T,
     swa_case: str = "custom",
 ):
-    """Resolve a single-request fixture scenario (issue #560).
+    """Resolve a single-request fixture scenario.
 
     Returns this request's q_len and context_len (absolute position base). The
     layer owns the per-request loop, so the attention op only ever sees one
@@ -487,7 +487,7 @@ def build_tensor_specs(
 
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
-        # (issue #560). Padding rows keep their arange default; they are inactive.
+        # Padding rows keep their arange default; they are inactive.
         pos = torch.arange(T, dtype=torch.int32)
         for local_s in range(q_len):
             pos[local_s] = context_len + local_s

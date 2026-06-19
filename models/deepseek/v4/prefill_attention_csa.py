@@ -11,7 +11,7 @@
 
 This module wires HC pre/post, ratio-4 compressor, indexer, sparse attention,
 and cache writeback for the compressed sparse attention path. Single-request
-(issue #560): the layer owns the per-request loop and feeds this op one
+the layer owns the per-request loop and feeds this op one
 contiguous run of <=T tokens.
 """
 
@@ -95,8 +95,7 @@ Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 
 
-MAX_TOKENS = T
-MAX_CMP_WRITES = max(1, MAX_TOKENS // COMPRESS_RATIO)
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = SPARSE_HCA_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = SPARSE_HCA_CMP_BLOCK_NUM
 CSA_CASES = (
@@ -124,10 +123,10 @@ assert CSA_WRITEBACK_DEP_COLS < HEAD_DIM
 
 def _resolve_csa_case(
     start_pos: int = START_POS,
-    num_tokens: int = MAX_TOKENS,
+    num_tokens: int = T,
     csa_case: str = "custom",
 ):
-    """Resolve a single-request fixture scenario (issue #560).
+    """Resolve a single-request fixture scenario.
 
     Returns this request's q_len and context_len (absolute position base). The
     layer owns the per-request loop, so the attention op only ever sees one
@@ -169,8 +168,8 @@ def _resolve_csa_case(
         raise ValueError(f"unknown --csa-case {csa_case!r}; expected one of {CSA_CASES}")
 
     active_tokens = q_len
-    if active_tokens <= 0 or active_tokens > MAX_TOKENS:
-        raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}], got {active_tokens}")
+    if active_tokens <= 0 or active_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {active_tokens}")
     max_position = context_len + q_len - 1 if q_len > 0 else 0
     if max_position >= MAX_SEQ_LEN:
         raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
@@ -191,14 +190,14 @@ def _resolve_csa_case(
 
 @pl.jit.inline
 def _prefill_csa_cache_writeback_overlay(
-    kv: pl.Tensor[[MAX_TOKENS, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     kv_cache: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    attn_out: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    attn_out: pl.Tensor[[T, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for t0 in pl.parallel(0, MAX_TOKENS, 16):
+    for t0 in pl.parallel(0, T, 16):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_writeback_overlay"):
             for dt in pl.range(16):
                 t = t0 + dt
@@ -220,12 +219,12 @@ def _prefill_csa_cache_writeback_overlay(
 
 @pl.jit.inline
 def _prefill_csa_assemble_sparse_indices(
-    cmp_topk_indices: pl.Tensor[[MAX_TOKENS, IDX_TOPK], pl.INT32],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_topk_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
 ):
-    for topk_block in pl.spmd((MAX_TOKENS + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
+    for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
@@ -241,7 +240,7 @@ def _prefill_csa_assemble_sparse_indices(
                     if sparse_col_i32 < window_valid:
                         key_abs = key_start_abs + sparse_col_i32
                         sparse_raw = pl.cast(key_abs % WIN, pl.INT32)
-                        for scan_t in pl.range(MAX_TOKENS):
+                        for scan_t in pl.range(T):
                             if scan_t < num_tokens:
                                 if scan_t <= t_idx:
                                     scan_pos = pl.read(position_ids, [scan_t])
@@ -255,7 +254,7 @@ def _prefill_csa_assemble_sparse_indices(
                             if comp_col < visible_cmp:
                                 if comp_col < pl.cast(INDEXER_TOPK_CAP, pl.INT32):
                                     topk_raw = pl.read(cmp_topk_indices, [t_idx, comp_col])
-                                    if topk_raw >= WIN + MAX_TOKENS:
+                                    if topk_raw >= WIN + T:
                                         sparse_raw = topk_raw
                     pl.write(sparse_row, [0, sparse_col], sparse_raw)
             cmp_sparse_indices = pl.assemble(cmp_sparse_indices, sparse_row, [t_idx, 0])
@@ -264,7 +263,7 @@ def _prefill_csa_assemble_sparse_indices(
 
 @pl.jit.inline
 def prefill_attention_csa(
-    x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -294,21 +293,21 @@ def prefill_attention_csa(
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Out[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -434,7 +433,7 @@ def prefill_attention_csa(
 
 @pl.jit
 def prefill_attention_csa_test(
-    x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -464,21 +463,21 @@ def prefill_attention_csa_test(
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Out[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    idx_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     (
@@ -625,8 +624,8 @@ def golden_prefill_attention_csa(tensors):
     })
 
     def assemble_sparse_indices(cmp_topk):
-        topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
-        sparse_lens = torch.zeros(MAX_TOKENS, dtype=torch.int32)
+        topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
+        sparse_lens = torch.zeros(T, dtype=torch.int32)
         pos = tensors["position_ids"]
         current = {int(pos[t].item()): t for t in range(num_tokens)}
         compressed_cap = SPARSE_PREFILL_SPARSE_PAD - WIN
@@ -646,7 +645,7 @@ def golden_prefill_attention_csa(tensors):
                 if cursor >= SPARSE_PREFILL_SPARSE_PAD:
                     break
                 raw = int(raw_t)
-                if raw >= WIN + MAX_TOKENS and raw - (WIN + MAX_TOKENS) < visible_cmp:
+                if raw >= WIN + T and raw - (WIN + T) < visible_cmp:
                     topk_idxs[t, cursor] = raw
                     cursor += 1
             sparse_lens[t] = cursor
@@ -695,7 +694,7 @@ def golden_prefill_attention_csa(tensors):
 
 def build_tensor_specs(
     start_pos: int = START_POS,
-    num_tokens: int = MAX_TOKENS,
+    num_tokens: int = T,
     csa_case: str = "custom",
 ):
     import torch
@@ -721,8 +720,8 @@ def build_tensor_specs(
 
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
-        # (issue #560). Padding rows keep their arange default; they are inactive.
-        pos = torch.arange(MAX_TOKENS, dtype=torch.int32)
+        # Padding rows keep their arange default; they are inactive.
+        pos = torch.arange(T, dtype=torch.int32)
         for local_s in range(q_len):
             pos[local_s] = context_len + local_s
         return pos
@@ -765,7 +764,7 @@ def build_tensor_specs(
                     if key_abs in seen_window_abs:
                         raise ValueError(f"duplicate CSA window abs_pos={key_abs} for token {t}")
                     seen_window_abs.add(key_abs)
-                elif raw < WIN + MAX_TOKENS:
+                elif raw < WIN + T:
                     overlay_t = raw - WIN
                     if overlay_t >= num_tokens:
                         raise ValueError(f"CSA overlay raw={raw} points past active tokens for token {t}")
@@ -776,7 +775,7 @@ def build_tensor_specs(
                         raise ValueError(f"duplicate CSA overlay abs_pos={key_abs} for token {t}")
                     seen_window_abs.add(key_abs)
                 else:
-                    cmp_slot = raw - (WIN + MAX_TOKENS)
+                    cmp_slot = raw - (WIN + T)
                     visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
                     if cmp_slot < 0 or cmp_slot >= visible_cmp:
                         raise ValueError(f"CSA compressed slot={cmp_slot} is not visible for token {t}")
@@ -785,7 +784,7 @@ def build_tensor_specs(
                     seen_cmp.add(cmp_slot)
 
     def init_x_hc():
-        x = seeded_normal((MAX_TOKENS, HC_MULT, D), 1, 0.05)
+        x = seeded_normal((T, HC_MULT, D), 1, 0.05)
         x[num_tokens:] = 0
         return x
     # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
@@ -949,7 +948,7 @@ def build_tensor_specs(
             table[block] = block
         return table
     def init_ori_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
         table = init_ori_block_table()
         for t in range(num_tokens):
@@ -993,7 +992,7 @@ def build_tensor_specs(
             return -1
         return phys_block * BLOCK_SIZE + intra
     def init_cmp_sparse_indices():
-        topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
+        topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
         pos = token_pos()
         current = {int(pos[t].item()): t for t in range(num_tokens)}
         for t in range(num_tokens):
@@ -1012,14 +1011,14 @@ def build_tensor_specs(
             for cmp_slot in range(visible_cmp):
                 if cursor >= SPARSE_PREFILL_SPARSE_PAD:
                     break
-                topk_idxs[t, cursor] = WIN + MAX_TOKENS + cmp_slot
+                topk_idxs[t, cursor] = WIN + T + cmp_slot
                 cursor += 1
         validate_overlay_topk(topk_idxs, pos)
         return topk_idxs
     def init_position_ids():
         return token_pos()
     def init_cmp_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         table = init_cmp_block_table()
         records = cmp_write_records()
         for token_id, cmp_slot in records:
@@ -1029,7 +1028,7 @@ def build_tensor_specs(
             mapping[token_id] = -1
         return mapping
     def init_idx_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         table = init_idx_block_table()
         records = cmp_write_records()
         for token_id, cmp_slot in records:
@@ -1039,7 +1038,7 @@ def build_tensor_specs(
             mapping[token_id] = -1
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
         for t in range(num_tokens):
             mapping[t] = state_row(int(pos[t].item()))
@@ -1048,7 +1047,7 @@ def build_tensor_specs(
             mapping[num_tokens - 1] = -1
         return mapping
     def init_inner_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
         for t in range(num_tokens):
             mapping[t] = inner_state_row(int(pos[t].item()))
@@ -1069,7 +1068,7 @@ def build_tensor_specs(
     wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
 
     return [
-        TensorSpec("x_hc", [MAX_TOKENS, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -1120,7 +1119,7 @@ def build_tensor_specs(
         TensorSpec("kv_cache", [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec("ori_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec(
             "cmp_kv",
             [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
@@ -1137,16 +1136,16 @@ def build_tensor_specs(
             is_output=True,
         ),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
-        TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("idx_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_idx_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
-        TensorSpec("inner_state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_inner_state_slot_mapping),
+        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("idx_slot_mapping", [T], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [T], torch.int64, init_value=init_inner_state_slot_mapping),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [MAX_TOKENS, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
 
@@ -1216,7 +1215,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=MAX_TOKENS,
+        default=T,
         help="Fixture active token count for --csa-case=custom; passed to the JIT as num_tokens.",
     )
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)

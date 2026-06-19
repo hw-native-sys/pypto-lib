@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 single-request token-major prefill compressor, ratio=128.
 
-The public contract is single-request token-major prefill (issue #560): the
+The public contract is single-request token-major prefill: the
 layer owns the per-request loop and feeds this op one contiguous run of <=T
 tokens.
 """
@@ -46,7 +46,6 @@ HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 assert S == COMPRESS_RATIO, "ratio128 prefill compressor bring-up expects one full compression chunk"
 
 
-MAX_TOKENS = T
 MAIN_OUT_DIM = OUT_DIM
 MAIN_STATE_LEN = STATE_LEN
 HCA_STATE_BLOCK_SIZE = 8
@@ -54,7 +53,7 @@ HCA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + HCA_STATE_BLOCK_SIZE - 1) // HCA_STATE_BLO
 HCA_STATE_BLOCK_NUM = HCA_STATE_MAX_BLOCKS
 ROPE_DIM = ROPE_HEAD_DIM
 NOPE_DIM = NOPE_HEAD_DIM
-MAX_CMP_WRITES = max(1, MAX_TOKENS // COMPRESS_RATIO)
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
 CMP_K_CHUNK = K_CHUNK
 CMP_OUT_CHUNK = OUT_CHUNK
@@ -72,7 +71,7 @@ PACKED_C128_POOL_BLOCKS = MAX_CMP_WRITES * CMP_HEAD_BLOCKS
 
 @pl.jit.inline
 def prefill_compressor_ratio128(
-    x: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
+    x: pl.Tensor[[T, D], pl.BF16],
     kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -83,14 +82,14 @@ def prefill_compressor_ratio128(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     x_flat = x
-    kv_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
-    score_proj = pl.create_tensor([MAX_TOKENS, MAIN_OUT_DIM], dtype=pl.FP32)
+    kv_proj = pl.create_tensor([T, MAIN_OUT_DIM], dtype=pl.FP32)
+    score_proj = pl.create_tensor([T, MAIN_OUT_DIM], dtype=pl.FP32)
     kv_state_flat = pl.reshape(kv_state, [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM])
     score_state_flat = pl.reshape(score_state, [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -106,11 +105,11 @@ def prefill_compressor_ratio128(
 
     for proj_idx in pl.spmd(PACKED_C128_PROJ_BLOCKS, name_hint="prefill_hca_c128_state_proj"):
         o0 = proj_idx * CMP_OUT_CHUNK
-        kv_acc = pl.create_tensor([MAX_TOKENS, CMP_OUT_CHUNK], dtype=pl.FP32)
-        score_acc = pl.create_tensor([MAX_TOKENS, CMP_OUT_CHUNK], dtype=pl.FP32)
+        kv_acc = pl.create_tensor([T, CMP_OUT_CHUNK], dtype=pl.FP32)
+        score_acc = pl.create_tensor([T, CMP_OUT_CHUNK], dtype=pl.FP32)
         for kb in pl.pipeline(0, CMP_K_BLOCKS, stage=2):
             k0 = kb * CMP_K_CHUNK
-            x_tile = x_flat[0:MAX_TOKENS, k0 : k0 + CMP_K_CHUNK]
+            x_tile = x_flat[0:T, k0 : k0 + CMP_K_CHUNK]
             wkv_tile = wkv[k0 : k0 + CMP_K_CHUNK, o0 : o0 + CMP_OUT_CHUNK]
             wgate_tile = wgate[k0 : k0 + CMP_K_CHUNK, o0 : o0 + CMP_OUT_CHUNK]
             if k0 == 0:
@@ -119,8 +118,8 @@ def prefill_compressor_ratio128(
             else:
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
-        kv_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = kv_acc
-        score_proj[0:MAX_TOKENS, o0 : o0 + CMP_OUT_CHUNK] = score_acc
+        kv_proj[0:T, o0 : o0 + CMP_OUT_CHUNK] = kv_acc
+        score_proj[0:T, o0 : o0 + CMP_OUT_CHUNK] = score_acc
 
     for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
         write_i = pool_idx // CMP_HEAD_BLOCKS
@@ -131,7 +130,7 @@ def prefill_compressor_ratio128(
         write_token = 0
         write_slot_raw = pl.cast(-1, pl.INT64)
         write_seen = pl.cast(0, pl.INDEX)
-        for scan_w in pl.range(MAX_TOKENS):
+        for scan_w in pl.range(T):
             if scan_w < num_tokens:
                 scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
                 if scan_slot_raw >= 0:
@@ -167,7 +166,7 @@ def prefill_compressor_ratio128(
                         pool_state_row : pool_state_row + 1,
                         h0 : h0 + CMP_HEAD_CHUNK,
                     ]
-            for pool_t in pl.range(MAX_TOKENS):
+            for pool_t in pl.range(T):
                 if pool_t < num_tokens:
                     pool_pos = pl.read(position_ids, [pool_t])
                     if pool_pos <= write_pos:
@@ -223,7 +222,7 @@ def prefill_compressor_ratio128(
             norm_write_token = 0
             norm_slot_raw = pl.cast(-1, pl.INT64)
             norm_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(MAX_TOKENS):
+            for scan_w in pl.range(T):
                 if scan_w < num_tokens:
                     scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
                     if scan_slot_raw >= 0:
@@ -285,7 +284,7 @@ def prefill_compressor_ratio128(
         for final_i in pl.range(MAX_CMP_WRITES):
             final_cmp_row_raw = pl.cast(-1, pl.INT64)
             final_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(MAX_TOKENS):
+            for scan_w in pl.range(T):
                 if scan_w < num_tokens:
                     scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
                     if scan_slot_raw >= 0:
@@ -304,12 +303,12 @@ def prefill_compressor_ratio128(
                     )
 
     # State writeback: one SPMD task per token (was per token x out-block =
-    # MAX_TOKENS*CMP_OUT_BLOCKS tiny tasks). The per-token guard is checked once
+    # T*CMP_OUT_BLOCKS tiny tasks). The per-token guard is checked once
     # so a skipped token costs one empty task instead of CMP_OUT_BLOCKS of them;
     # the out-blocks are looped inside the task to keep each vector op at the
     # CMP_OUT_CHUNK width. pool_dep keeps the (zero-weighted) ordering after
     # softmax_pool and is hoisted to once per token.
-    for update_t in pl.spmd(MAX_TOKENS, name_hint="prefill_hca_c128_state_update"):
+    for update_t in pl.spmd(T, name_hint="prefill_hca_c128_state_update"):
         if update_t < num_tokens:
             state_row_raw = pl.read(state_slot_mapping, [update_t])
             if state_row_raw >= 0:
@@ -341,7 +340,7 @@ def prefill_compressor_ratio128(
 
 @pl.jit
 def prefill_compressor_ratio128_test(
-    x: pl.Tensor[[MAX_TOKENS, D], pl.BF16],
+    x: pl.Tensor[[T, D], pl.BF16],
     kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -352,10 +351,10 @@ def prefill_compressor_ratio128_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
-    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     return prefill_compressor_ratio128(
         x, kv_state, score_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
@@ -454,7 +453,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         intra = abs_pos % HCA_STATE_BLOCK_SIZE
         return int(table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
     def init_x():
-        return ((torch.rand(MAX_TOKENS, D) - 0.5) * 0.1).to(torch.bfloat16)
+        return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_state():
         state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
         for abs_pos in range(max(0, start_pos - COMPRESS_RATIO), start_pos):
@@ -480,22 +479,22 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_cmp_kv():
         return torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     def init_position_ids():
-        return torch.arange(start_pos, start_pos + MAX_TOKENS, dtype=torch.int32)
+        return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
     def init_cmp_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         for token_id in range(num_tokens):
             pos = start_pos + token_id
             if pos + 1 >= COMPRESS_RATIO and (pos + 1) % COMPRESS_RATIO == 0:
                 mapping[token_id] = (pos + 1) // COMPRESS_RATIO - 1
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
         for token_id in range(num_tokens):
             mapping[token_id] = state_row(start_pos + token_id)
         return mapping
 
     return [
-        TensorSpec("x", [MAX_TOKENS, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("score_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
@@ -506,10 +505,10 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
-        TensorSpec("position_ids", [MAX_TOKENS], torch.int32, init_value=init_position_ids),
+        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
-        TensorSpec("cmp_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [MAX_TOKENS], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
     ]
 
 
