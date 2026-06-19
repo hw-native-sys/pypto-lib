@@ -495,13 +495,7 @@ def ranked_x_hc_init(spec, n_ranks, active_tokens, torch):
         stacked = torch.stack(values, dim=0).contiguous()
         active = min(active_tokens, stacked.shape[1])
         if active < stacked.shape[1]:
-            gen = torch.Generator(device="cpu")
-            gen.manual_seed(20260616 + active)
-            inactive = torch.randn(
-                stacked[:, active:].shape,
-                generator=gen,
-                dtype=torch.float32,
-            ).to(stacked.dtype)
+            inactive = torch.randn(stacked[:, active:].shape, dtype=torch.float32).to(stacked.dtype)
             stacked[:, active:] = inactive / 10.0
         return stacked
 

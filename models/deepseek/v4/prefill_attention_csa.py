@@ -609,13 +609,9 @@ def build_tensor_specs(
         )
 
     def seeded_uniform(shape, seed, scale=1.0):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return (torch.rand(*shape, generator=generator) - 0.5) * scale
+        return (torch.rand(*shape) - 0.5) * scale
     def seeded_normal(shape, seed, std=1.0):
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        return torch.randn(*shape, generator=generator) * std
+        return torch.randn(*shape) * std
 
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
