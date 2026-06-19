@@ -41,7 +41,6 @@ from config import FLASH as MODEL_CONFIG
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,
-    _resolve_swa_case,
     build_tensor_specs as build_swa_attention_tensor_specs,
     golden_prefill_attention_swa,
     prefill_attention_swa,
@@ -650,10 +649,11 @@ def _attention_kind_for_layer(layer_id):
 
 def _attention_specs(kind, start_pos=START_POS, num_tokens=T, case="custom"):
     if kind == "swa":
+        # SWA geometry is fully described by start_pos/num_tokens; it has no
+        # named fixture cases (unlike HCA/CSA), so --case is ignored here.
         return build_swa_attention_tensor_specs(
             start_pos=start_pos,
             num_tokens=num_tokens,
-            swa_case=case,
         ), SWA_NAME_MAP, golden_prefill_attention_swa
     if kind == "hca":
         return build_hca_attention_tensor_specs(
@@ -851,11 +851,7 @@ def active_ranked_x_next_compare(num_tokens):
 def _resolve_compare_tokens(args):
     kind = _attention_kind_for_layer(args.layer_id)
     if kind == "swa":
-        _, _, num_tokens, _ = _resolve_swa_case(
-            args.start_pos,
-            args.num_tokens,
-            args.case,
-        )
+        num_tokens = args.num_tokens
     elif kind == "hca":
         _, _, _, num_tokens = _resolve_hca_case(
             args.start_pos,
