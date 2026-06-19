@@ -1053,7 +1053,7 @@ def valid_ratio_reldiff(
     """Relative-diff comparator restricted to the valid (active) token rows.
 
     Mirrors decode_attention_csa's ``ratio_reldiff`` bar and prefill_layer's
-    ``active_ranked_x_next_compare`` pattern: the packed buffer carries up to
+    ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
     ``T`` rows but only the leading ``num_tokens`` are active, so the trailing
     padding rows (whose device scratch is undefined) are sliced off before the
     relative-diff check.

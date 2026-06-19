@@ -830,42 +830,28 @@ def golden_prefill_layer(tensors):
     golden_moe_ep(moe_tensors)
 
 
-def active_ranked_x_next_compare(num_tokens):
+def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
+    """Relative-diff comparator restricted to the valid (active) token rows.
+
+    Same bar as decode_layer's plain ``ratio_reldiff``, but the ranked buffer is
+    ``[N_RANKS, T, ...]`` with only the leading ``num_tokens`` active per rank,
+    so the trailing padding rows are sliced off before the check.
+    """
     from golden import ratio_reldiff
 
-    base_compare = ratio_reldiff(diff_thd=0.1, pct_thd=0.05)
+    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
 
-    def compare(actual, expected, **kwargs):
-        return base_compare(actual[:, :num_tokens], expected[:, :num_tokens], **kwargs)
+    def cmp(actual, expected, **kwargs):
+        return base_cmp(actual[:, :num_tokens], expected[:, :num_tokens], **kwargs)
 
-    compare.__name__ = f"active_ranked_x_next_compare(num_tokens={num_tokens})"
-    return compare
-
-
-def _resolve_compare_tokens(args):
-    # Every attention geometry is single-request: active rows = num_tokens.
-    return args.num_tokens
-
-
-def _compare_fns(kind, compare_tokens):
-    from golden import ratio_allclose
-
-    compare_fn = {
-        "x_attn": active_ranked_x_next_compare(compare_tokens),
-        "x_next": active_ranked_x_next_compare(compare_tokens),
-        "kv_cache": ratio_allclose(atol=3e-3 if kind == "hca" else 1e-4, rtol=1e-2),
-    }
-    if kind in {"hca", "csa"}:
-        compare_fn["cmp_kv"] = ratio_allclose(atol=5e-3, rtol=1e-2)
-    if kind == "csa":
-        compare_fn["idx_kv_cache"] = ratio_allclose(atol=5e-3, rtol=1e-2)
-    return compare_fn
+    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
+    return cmp
 
 
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -886,7 +872,19 @@ if __name__ == "__main__":
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
     kind = _attention_kind_for_layer(args.layer_id)
-    compare_tokens = _resolve_compare_tokens(args)
+    # Single-request geometry: active rows = num_tokens.
+    compare_tokens = args.num_tokens
+    # x_next on decode_layer's FFN envelope (diff_thd 0.01; pct_thd 0.1 wide
+    # enough for the csa branch). x_attn (pre-MoE) shares the same bar.
+    compare_fn = {
+        "x_attn": valid_ratio_reldiff(compare_tokens, diff_thd=0.01, pct_thd=0.1),
+        "x_next": valid_ratio_reldiff(compare_tokens, diff_thd=0.01, pct_thd=0.1),
+        "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+    }
+    if kind in {"hca", "csa"}:
+        compare_fn["cmp_kv"] = ratio_allclose(atol=5e-3, rtol=1e-2)
+    if kind == "csa":
+        compare_fn["idx_kv_cache"] = ratio_allclose(atol=5e-3, rtol=1e-2)
     result = run_jit(
         fn=l3_prefill_layer,
         specs=build_tensor_specs(
@@ -908,7 +906,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn=_compare_fns(kind, compare_tokens),
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:
