@@ -735,8 +735,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=str, default="0,1",
-                        help="comma-separated device ids; need at least 2")
+    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
+                        help="EP world size / rank count (parsed at import by moe_ep)")
+    parser.add_argument("-d", "--device", type=str,
+                        default=",".join(str(i) for i in range(N_RANKS)),
+                        help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--layer-id", type=int, default=2,
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
     parser.add_argument("--start-pos", type=int, default=START_POS,
