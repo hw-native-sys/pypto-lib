@@ -102,50 +102,6 @@ assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
 
 @pl.jit.inline
-def _prefill_csa_assemble_sparse_indices(
-    cmp_topk_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
-):
-    for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
-                              name_hint="prefill_csa_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            sparse_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
-            if t_idx < num_tokens:
-                abs_pos = pl.read(position_ids, [t_idx])
-                window_valid = pl.min(WIN, abs_pos + 1)
-                key_start_abs = abs_pos + 1 - window_valid
-                for sparse_col in pl.range(SPARSE_TOPK):
-                    sparse_raw = pl.cast(-1, pl.INT32)
-                    sparse_col_i32 = pl.cast(sparse_col, pl.INT32)
-                    if sparse_col_i32 < window_valid:
-                        key_abs = key_start_abs + sparse_col_i32
-                        sparse_raw = pl.cast(key_abs % WIN, pl.INT32)
-                        for scan_t in pl.range(T):
-                            if scan_t < num_tokens:
-                                if scan_t <= t_idx:
-                                    scan_pos = pl.read(position_ids, [scan_t])
-                                    if scan_pos == key_abs:
-                                        sparse_raw = pl.cast(WIN + scan_t, pl.INT32)
-                    else:
-                        comp_start = window_valid
-                        if sparse_col_i32 >= comp_start:
-                            comp_col = sparse_col_i32 - comp_start
-                            visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                            if comp_col < visible_cmp:
-                                if comp_col < pl.cast(INDEXER_TOPK_CAP, pl.INT32):
-                                    topk_raw = pl.read(cmp_topk_indices, [t_idx, comp_col])
-                                    if topk_raw >= WIN + T:
-                                        sparse_raw = topk_raw
-                    pl.write(sparse_row, [0, sparse_col], sparse_raw)
-            cmp_sparse_indices = pl.assemble(cmp_sparse_indices, sparse_row, [t_idx, 0])
-    return cmp_sparse_indices
-
-
-@pl.jit.inline
 def prefill_attention_csa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -279,13 +235,43 @@ def prefill_attention_csa(
         inner_state_slot_mapping,
     )
 
+    # Assemble the packed sparse-index rows (window ring + overlay + compressed
+    # slots) inline; padding rows stay all -1 via the pl.full row template.
     cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    cmp_sparse_work = _prefill_csa_assemble_sparse_indices(
-        cmp_topk_indices,
-        position_ids,
-        num_tokens,
-        cmp_sparse_work,
-    )
+    for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
+                              name_hint="prefill_csa_sparse_idx_tile"):
+        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+            t_idx = topk_t0 + topk_dt
+            sparse_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
+            if t_idx < num_tokens:
+                abs_pos = pl.read(position_ids, [t_idx])
+                window_valid = pl.min(WIN, abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                for sparse_col in pl.range(SPARSE_TOPK):
+                    sparse_raw = pl.cast(-1, pl.INT32)
+                    sparse_col_i32 = pl.cast(sparse_col, pl.INT32)
+                    if sparse_col_i32 < window_valid:
+                        key_abs = key_start_abs + sparse_col_i32
+                        sparse_raw = pl.cast(key_abs % WIN, pl.INT32)
+                        for scan_t in pl.range(T):
+                            if scan_t < num_tokens:
+                                if scan_t <= t_idx:
+                                    scan_pos = pl.read(position_ids, [scan_t])
+                                    if scan_pos == key_abs:
+                                        sparse_raw = pl.cast(WIN + scan_t, pl.INT32)
+                    else:
+                        comp_start = window_valid
+                        if sparse_col_i32 >= comp_start:
+                            comp_col = sparse_col_i32 - comp_start
+                            visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
+                            if comp_col < visible_cmp:
+                                if comp_col < pl.cast(INDEXER_TOPK_CAP, pl.INT32):
+                                    topk_raw = pl.read(cmp_topk_indices, [t_idx, comp_col])
+                                    if topk_raw >= WIN + T:
+                                        sparse_raw = topk_raw
+                    pl.write(sparse_row, [0, sparse_col], sparse_raw)
+            cmp_sparse_work = pl.assemble(cmp_sparse_work, sparse_row, [t_idx, 0])
     # CSA builds every sparse row itself and pads unused entries with -1, so it
     # can safely expose the full row width to the shared sparse-attn kernel,
     # while external serving callers still use cmp_sparse_lens in
