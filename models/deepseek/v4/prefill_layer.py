@@ -14,8 +14,8 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 # Import moe_ep first. It applies the EP2 FLASH override before dependent
-# modules bake config-derived MoE shapes. The stress case
-# `--case basic128 --layer-id 3` was validated with
+# modules bake config-derived MoE shapes. The full-T stress case
+# `--num-tokens 128 --layer-id 3` was validated with
 # `DSV4_MOE_EP_RECV_MAX=128`; default RECV_MAX=96 is not its pass criterion.
 from moe_ep import (
     D,
@@ -53,7 +53,6 @@ from prefill_attention_hca import (
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
-    _resolve_hca_case,
     build_tensor_specs as build_hca_attention_tensor_specs,
     golden_prefill_attention_hca,
     prefill_attention_hca,
@@ -85,7 +84,6 @@ from prefill_attention_csa import (
     SPARSE_CMP_MAX_BLOCKS,
     SPARSE_ORI_MAX_BLOCKS,
     START_POS,
-    _resolve_csa_case,
     build_tensor_specs as build_csa_attention_tensor_specs,
     golden_prefill_attention_csa,
     prefill_attention_csa,
@@ -647,10 +645,9 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
 
 
-def _attention_specs(kind, start_pos=START_POS, num_tokens=T, case="custom"):
+def _attention_specs(kind, start_pos=START_POS, num_tokens=T):
+    # All three attention geometries are fully described by start_pos/num_tokens.
     if kind == "swa":
-        # SWA geometry is fully described by start_pos/num_tokens; it has no
-        # named fixture cases (unlike HCA/CSA), so --case is ignored here.
         return build_swa_attention_tensor_specs(
             start_pos=start_pos,
             num_tokens=num_tokens,
@@ -659,13 +656,11 @@ def _attention_specs(kind, start_pos=START_POS, num_tokens=T, case="custom"):
         return build_hca_attention_tensor_specs(
             start_pos=start_pos,
             num_tokens=num_tokens,
-            hca_case=case,
         ), HCA_NAME_MAP, golden_prefill_attention_hca
     if kind == "csa":
         return build_csa_attention_tensor_specs(
             start_pos=start_pos,
             num_tokens=num_tokens,
-            csa_case=case,
         ), CSA_NAME_MAP, golden_prefill_attention_csa
     raise ValueError(f"unknown attention kind {kind}")
 
@@ -742,7 +737,7 @@ def _add_moe_specs(moe_specs, tensor_specs, scalar_specs, tensor_names, scalar_n
             scalar_names.add(spec.name)
 
 
-def build_tensor_specs(start_pos=START_POS, num_tokens=T, case="custom", layer_id=2):
+def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
     import torch
     from golden import TensorSpec
 
@@ -758,7 +753,6 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, case="custom", layer_i
             kind,
             start_pos=start_pos,
             num_tokens=num_tokens,
-            case=case if kind == active_kind else "custom",
         )
         if kind == active_kind:
             for spec in specs:
@@ -849,22 +843,8 @@ def active_ranked_x_next_compare(num_tokens):
 
 
 def _resolve_compare_tokens(args):
-    kind = _attention_kind_for_layer(args.layer_id)
-    if kind == "swa":
-        num_tokens = args.num_tokens
-    elif kind == "hca":
-        _, _, _, num_tokens = _resolve_hca_case(
-            args.start_pos,
-            args.num_tokens,
-            args.case,
-        )
-    else:
-        _, _, _, num_tokens = _resolve_csa_case(
-            args.start_pos,
-            args.num_tokens,
-            args.case,
-        )
-    return num_tokens
+    # Every attention geometry is single-request: active rows = num_tokens.
+    return args.num_tokens
 
 
 def _compare_fns(kind, compare_tokens):
@@ -895,11 +875,9 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=2,
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
     parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Fixture-only prefix length for --case=custom.")
+                        help="Fixture-only context_len (multiple of S=WIN).")
     parser.add_argument("--num-tokens", type=int, default=T,
-                        help="Fixture active token count for --case=custom.")
-    parser.add_argument("--case", type=str, default="custom",
-                        help="Attention fixture case for the selected layer type.")
+                        help="Fixture active token count (q_len), capped by T.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     args = parser.parse_args()
@@ -914,7 +892,6 @@ if __name__ == "__main__":
         specs=build_tensor_specs(
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
-            case=args.case,
             layer_id=args.layer_id,
         ),
         golden_fn=golden_prefill_layer,

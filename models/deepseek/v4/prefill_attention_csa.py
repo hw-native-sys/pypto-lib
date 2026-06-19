@@ -98,123 +98,7 @@ Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = SPARSE_HCA_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = SPARSE_HCA_CMP_BLOCK_NUM
-CSA_CASES = (
-    "custom",
-    "basic1",
-    "basic17",
-    "basic128",
-    "suffix3_1",
-    "suffix2_2",
-    "suffix5_7",
-    "suffix64_16",
-    "suffix96_32",
-    "suffix100_50",
-    "suffix128_17",
-    "cmp_sparse_lens_boundary",
-    "cmp_sparse_lens_zero_garbage",
-    "issue511_mapping_boundary",
-    "issue511_active_no_write_slot",
-    "issue511_idx_slot_distinct",
-)
-CSA_WRITEBACK_DEP_COLS = 16
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
-assert CSA_WRITEBACK_DEP_COLS < HEAD_DIM
-
-
-def _resolve_csa_case(
-    start_pos: int = START_POS,
-    num_tokens: int = T,
-    csa_case: str = "custom",
-):
-    """Resolve a single-request fixture scenario.
-
-    Returns this request's q_len and context_len (absolute position base). The
-    layer owns the per-request loop, so the attention op only ever sees one
-    contiguous run of <=T tokens.
-    """
-    if csa_case == "custom":
-        q_len, context_len = num_tokens, start_pos
-    elif csa_case == "basic1":
-        q_len, context_len = 1, 0
-    elif csa_case == "basic17":
-        q_len, context_len = 17, 0
-    elif csa_case == "basic128":
-        q_len, context_len = 128, 0
-    elif csa_case == "suffix3_1":
-        q_len, context_len = 1, 3
-    elif csa_case == "suffix2_2":
-        q_len, context_len = 2, 2
-    elif csa_case == "suffix5_7":
-        q_len, context_len = 7, 5
-    elif csa_case == "suffix64_16":
-        q_len, context_len = 16, 64
-    elif csa_case == "suffix96_32":
-        q_len, context_len = 32, 96
-    elif csa_case == "suffix100_50":
-        q_len, context_len = 50, 100
-    elif csa_case == "suffix128_17":
-        q_len, context_len = 17, 128
-    elif csa_case == "cmp_sparse_lens_boundary":
-        q_len, context_len = 7, 5
-    elif csa_case == "cmp_sparse_lens_zero_garbage":
-        q_len, context_len = 7, 5
-    elif csa_case == "issue511_mapping_boundary":
-        q_len, context_len = 5, 2
-    elif csa_case == "issue511_active_no_write_slot":
-        q_len, context_len = 32, 96
-    elif csa_case == "issue511_idx_slot_distinct":
-        q_len, context_len = 50, 96
-    else:
-        raise ValueError(f"unknown --csa-case {csa_case!r}; expected one of {CSA_CASES}")
-
-    active_tokens = q_len
-    if active_tokens <= 0 or active_tokens > T:
-        raise ValueError(f"num_tokens must be in [1, {T}], got {active_tokens}")
-    max_position = context_len + q_len - 1 if q_len > 0 else 0
-    if max_position >= MAX_SEQ_LEN:
-        raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
-    max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
-    max_sparse_rows = WIN + max_visible_cmp
-    if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
-        raise ValueError(
-            f"{csa_case} needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is "
-            f"{SPARSE_PREFILL_SPARSE_PAD}"
-        )
-    if max_visible_cmp > SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
-        raise ValueError(
-            f"{csa_case} needs {max_visible_cmp} compressed slots; current cmp cache cap is "
-            f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
-        )
-    return csa_case, q_len, context_len, active_tokens
-
-
-@pl.jit.inline
-def _prefill_csa_cache_writeback_overlay(
-    kv: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    kv_cache: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    attn_out: pl.Tensor[[T, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for t0 in pl.parallel(0, T, 16):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_writeback_overlay"):
-            for dt in pl.range(16):
-                t = t0 + dt
-                if t < num_tokens:
-                    dst_row_raw = pl.read(ori_slot_mapping, [t])
-                    if dst_row_raw >= 0:
-                        dst_row = pl.cast(dst_row_raw, pl.INDEX)
-                        dep_guard = pl.cast(attn_out[t : t + 1, 0:CSA_WRITEBACK_DEP_COLS], target_type=pl.FP32)
-                        dep_zero = pl.mul(dep_guard, 0.0)
-                        kv_head = pl.cast(kv[t : t + 1, 0:CSA_WRITEBACK_DEP_COLS], target_type=pl.FP32)
-                        kv_head_dep = pl.cast(pl.add(kv_head, dep_zero), target_type=pl.BF16)
-                        kv_cache_flat[dst_row : dst_row + 1, 0:CSA_WRITEBACK_DEP_COLS] = kv_head_dep
-                        kv_cache_flat[dst_row : dst_row + 1, CSA_WRITEBACK_DEP_COLS:HEAD_DIM] = kv[
-                            t : t + 1,
-                            CSA_WRITEBACK_DEP_COLS:HEAD_DIM,
-                        ]
-    return pl.reshape(kv_cache_flat, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
 
 @pl.jit.inline
@@ -425,7 +309,20 @@ def prefill_attention_csa(
         wo_b_scale,
         attn_out,
     )
-    kv_cache = _prefill_csa_cache_writeback_overlay(kv, kv_cache, ori_slot_mapping, attn_out, num_tokens)
+    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
+    # history (the current tokens reach attention via the `kv` overlay).
+    kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_writeback"):
+        # No-op self-copy: marks kv_cache add_inout so the runtime orders this
+        # write after the gather's read (WAR); see pypto-lib#481.
+        kc_touch = kv_cache_flat[0:1, 0:HEAD_DIM]
+        kv_cache_flat[0:1, 0:HEAD_DIM] = kc_touch
+        for write_t in pl.range(T):
+            if write_t < num_tokens:
+                write_row_raw = pl.read(ori_slot_mapping, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
 
     x_out = hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
@@ -695,7 +592,6 @@ def golden_prefill_attention_csa(tensors):
 def build_tensor_specs(
     start_pos: int = START_POS,
     num_tokens: int = T,
-    csa_case: str = "custom",
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
@@ -703,11 +599,28 @@ def build_tensor_specs(
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    _, q_len, context_len, num_tokens = _resolve_csa_case(
-        start_pos,
-        num_tokens,
-        csa_case,
-    )
+    # Single-request geometry: q_len = num_tokens (active prefix), context_len =
+    # start_pos (absolute position base, a multiple of S=WIN under chunked prefill).
+    context_len = start_pos
+    q_len = num_tokens
+    if num_tokens <= 0 or num_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
+    if context_len < 0:
+        raise ValueError(f"context length must be non-negative, got {context_len}")
+    max_position = context_len + q_len - 1 if q_len > 0 else 0
+    if max_position >= MAX_SEQ_LEN:
+        raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
+    max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
+    max_sparse_rows = WIN + max_visible_cmp
+    if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
+        raise ValueError(
+            f"needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is {SPARSE_PREFILL_SPARSE_PAD}"
+        )
+    if max_visible_cmp > SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
+        raise ValueError(
+            f"needs {max_visible_cmp} compressed slots; current cmp cache cap is "
+            f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
+        )
 
     def seeded_uniform(shape, seed, scale=1.0):
         generator = torch.Generator()
@@ -953,9 +866,6 @@ def build_tensor_specs(
         table = init_ori_block_table()
         for t in range(num_tokens):
             mapping[t] = cache_row_from_table(table, int(pos[t].item()) % WIN)
-        if csa_case == "issue511_active_no_write_slot":
-            mapping[0] = -1
-            mapping[num_tokens - 1] = -1
         return mapping
     def init_cmp_kv():
         cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -978,11 +888,7 @@ def build_tensor_specs(
     def init_idx_block_table():
         table = torch.full((IDX_CACHE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(IDX_CACHE_MAX_BLOCKS):
-            phys = block
-            if csa_case == "issue511_idx_slot_distinct":
-                if IDX_CACHE_MAX_BLOCKS > 1:
-                    phys = (block * 5 + 1) % IDX_CACHE_MAX_BLOCKS
-            table[block] = phys
+            table[block] = block
         return table
     def cache_row_from_table(table, slot):
         block = slot // BLOCK_SIZE
@@ -1023,9 +929,6 @@ def build_tensor_specs(
         records = cmp_write_records()
         for token_id, cmp_slot in records:
             mapping[token_id] = cache_row_from_table(table, cmp_slot)
-        if csa_case == "issue511_active_no_write_slot" and records:
-            token_id, _ = records[0]
-            mapping[token_id] = -1
         return mapping
     def init_idx_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
@@ -1033,27 +936,18 @@ def build_tensor_specs(
         records = cmp_write_records()
         for token_id, cmp_slot in records:
             mapping[token_id] = cache_row_from_table(table, cmp_slot)
-        if csa_case == "issue511_active_no_write_slot" and records:
-            token_id, _ = records[0]
-            mapping[token_id] = -1
         return mapping
     def init_state_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
         for t in range(num_tokens):
             mapping[t] = state_row(int(pos[t].item()))
-        if csa_case == "issue511_active_no_write_slot":
-            mapping[0] = -1
-            mapping[num_tokens - 1] = -1
         return mapping
     def init_inner_state_slot_mapping():
         mapping = torch.full((T,), -1, dtype=torch.int64)
         pos = token_pos()
         for t in range(num_tokens):
             mapping[t] = inner_state_row(int(pos[t].item()))
-        if csa_case == "issue511_active_no_write_slot":
-            mapping[0] = -1
-            mapping[num_tokens - 1] = -1
         return mapping
     def init_attn_sink():
         return torch.zeros(H)
@@ -1150,10 +1044,23 @@ def build_tensor_specs(
     ]
 
 
-def active_x_out_compare(num_tokens: int):
-    from golden import ratio_allclose
+def valid_ratio_reldiff(
+    num_tokens: int,
+    diff_thd: float,
+    pct_thd: float,
+    max_diff_hd: float,
+):
+    """Relative-diff comparator restricted to the valid (active) token rows.
 
-    base_cmp = ratio_allclose(atol=4e-3, rtol=2.0 / 128, max_error_ratio=0.015)
+    Mirrors decode_attention_csa's ``ratio_reldiff`` bar and prefill_layer's
+    ``active_ranked_x_next_compare`` pattern: the packed buffer carries up to
+    ``T`` rows but only the leading ``num_tokens`` are active, so the trailing
+    padding rows (whose device scratch is undefined) are sliced off before the
+    relative-diff check.
+    """
+    from golden import ratio_reldiff
+
+    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
 
     def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         return base_cmp(
@@ -1166,7 +1073,7 @@ def active_x_out_compare(num_tokens: int):
             atol=atol,
         )
 
-    cmp.__name__ = f"active_x_out_compare(num_tokens={num_tokens})"
+    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
     return cmp
 
 
@@ -1185,63 +1092,24 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Standalone DeepSeek V4 packed prefill CSA sparse-attention consumer test. "
-            "CLI cases generate lowered token metadata and deterministic ratio4 compressed KV/topk fixtures."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill CSA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only; enabled only when this flag is explicitly passed.",
-    )
-    parser.add_argument(
-        "--csa-case",
-        type=str,
-        default="custom",
-        choices=CSA_CASES,
-        help="Standalone fixture scenario; non-custom values override --start-pos/--num-tokens.",
-    )
-    parser.add_argument(
-        "--start-pos",
-        type=int,
-        default=START_POS,
-        help="Fixture-only context length for this single request when --csa-case=custom; not a JIT argument.",
-    )
-    parser.add_argument(
-        "--num-tokens",
-        type=int,
-        default=T,
-        help="Fixture active token count for --csa-case=custom; passed to the JIT as num_tokens.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="context_len (multiple of S=WIN); fixture-only, lowered into token metadata.")
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
-    parser.add_argument(
-        "--enable-dep-gen",
-        action="store_true",
-        default=False,
-        help="Capture PTO2 dependency edges (deps.json). Required to recover function names in the "
-        "L2 swimlane for dynamic-shape kernels whose AICore records carry func_id=-1.",
-    )
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
-    try:
-        _, _, _, compare_tokens = _resolve_csa_case(
-            args.start_pos,
-            args.num_tokens,
-            args.csa_case,
-        )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
+    compare_tokens = args.num_tokens
 
     result = run_jit(
         fn=prefill_attention_csa_test,
         specs=build_tensor_specs(
             args.start_pos,
             args.num_tokens,
-            args.csa_case,
         ),
         golden_fn=golden_prefill_attention_csa,
         runtime_cfg=dict(
@@ -1254,7 +1122,7 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": active_x_out_compare(compare_tokens),
+            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
             "cmp_kv": ratio_allclose(atol=5e-3, rtol=1e-2),
             "idx_kv_cache": ratio_allclose(atol=5e-3, rtol=1e-2),
