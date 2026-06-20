@@ -78,7 +78,7 @@ def prefill_compressor_ratio128(
     wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -203,11 +203,7 @@ def prefill_compressor_ratio128(
                 oi_buf[0:1, 0:CMP_HEAD_CHUNK],
                 li_buf[0:1, 0:CMP_HEAD_CHUNK],
             )
-            pooled_bf16 = pl.cast(pooled_chunk, target_type=pl.BF16, mode="rint")
-            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + CMP_HEAD_CHUNK] = pl.cast(
-                pooled_bf16,
-                target_type=pl.FP32,
-            )
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + CMP_HEAD_CHUNK] = pooled_chunk
         else:
             pooled_kv_pad[write_i : write_i + 1, h0 : h0 + CMP_HEAD_CHUNK] = pooled_kv_pad[
                 write_i : write_i + 1,
@@ -248,33 +244,25 @@ def prefill_compressor_ratio128(
         for norm_kb in pl.pipeline(NOPE_DIM // CMP_HEAD_CHUNK, stage=2):
             norm_h0 = norm_kb * CMP_HEAD_CHUNK
             kv_norm_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + CMP_HEAD_CHUNK]
-            gamma = norm_w_2d[:, norm_h0 : norm_h0 + CMP_HEAD_CHUNK]
+            gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + CMP_HEAD_CHUNK], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_chunk_bf16 = pl.cast(normed_chunk, target_type=pl.BF16, mode="rint")
-            normed_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + CMP_HEAD_CHUNK] = pl.cast(
-                normed_chunk_bf16,
-                target_type=pl.FP32,
-            )
+            normed_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + CMP_HEAD_CHUNK] = normed_chunk
 
         kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM]
-        gamma_rope = norm_w_2d[:, NOPE_DIM:HEAD_DIM]
+        gamma_rope = pl.cast(norm_w_2d[:, NOPE_DIM:HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
-        rope_normed_bf16 = pl.cast(rope_normed, target_type=pl.BF16, mode="rint")
-        rope_normed_fp32 = pl.cast(rope_normed_bf16, target_type=pl.FP32)
-        rope_even = pl.gather(rope_normed_fp32, mask_pattern=pl.tile.MaskPattern.P0101)
-        rope_odd = pl.gather(rope_normed_fp32, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        rope_odd = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
         rope_rot_even = pl.sub(pl.mul(rope_even, cos_b), pl.mul(rope_odd, sin_b))
         rope_rot_odd = pl.add(pl.mul(rope_even, sin_b), pl.mul(rope_odd, cos_b))
-        rope_even_bf16 = pl.cast(rope_rot_even, target_type=pl.BF16, mode="rint")
-        rope_odd_bf16 = pl.cast(rope_rot_odd, target_type=pl.BF16, mode="rint")
         rope_buf = pl.full([HCA_C128_RMS_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
         rope_buf = pl.tensor.scatter(
-            pl.cast(rope_even_bf16, target_type=pl.FP32),
+            rope_rot_even,
             mask_pattern=pl.tile.MaskPattern.P0101,
             dst=rope_buf,
         )
         rope_buf = pl.tensor.scatter(
-            pl.cast(rope_odd_bf16, target_type=pl.FP32),
+            rope_rot_odd,
             mask_pattern=pl.tile.MaskPattern.P1010,
             dst=rope_buf,
         )
@@ -347,7 +335,7 @@ def prefill_compressor_ratio128_test(
     wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_DIM], pl.BF16],
     cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -403,17 +391,16 @@ def golden_prefill_compressor_ratio128(tensors):
             pool_kv_state[slot] = kv_proj[t]
             pool_score_state[slot] = score_proj[t] + tensors["ape"][slot]
         pooled = (pool_kv_state * pool_score_state.softmax(dim=0)).sum(dim=0, keepdim=True)
-        pooled = pooled.to(torch.bfloat16).float()
         inv = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
-        normed = (pooled * inv * tensors["norm_w"].float().view(1, HEAD_DIM)).to(torch.bfloat16)
+        normed = pooled * inv * tensors["norm_w"].float().view(1, HEAD_DIM)
         rope_pair = normed[..., NOPE_DIM:].unflatten(-1, (-1, 2))
         even = rope_pair[..., 0].float()
         odd = rope_pair[..., 1].float()
         cmp_pos = write_pos + 1 - COMPRESS_RATIO
         cos = tensors["freqs_cos"][cmp_pos : cmp_pos + 1, 0:ROPE_HALF].float()
         sin = tensors["freqs_sin"][cmp_pos : cmp_pos + 1, 0:ROPE_HALF].float()
-        rot_even = (even * cos - odd * sin).to(torch.bfloat16)
-        rot_odd = (even * sin + odd * cos).to(torch.bfloat16)
+        rot_even = even * cos - odd * sin
+        rot_odd = even * sin + odd * cos
         normed[:, NOPE_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
         cmp_kv_flat[dst_row] = normed[0]
 
@@ -501,7 +488,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_ape),
-        TensorSpec("norm_w", [HEAD_DIM], torch.float32, init_value=init_norm_w),
+        TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),

@@ -158,7 +158,9 @@ def _prefill_hca_sparse_from_gathered_kv(
     B_N_BLOCKS = D // SPARSE_B_N_CHUNK
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
+    # FP32 so the inverse rotation runs on the full-precision attention output
+    # (the NOPE half still narrows to BF16 when packed into o_packed).
+    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
 
     # Per-(token, slot) additive bias: 0 for valid raw indices, -3e38 for
@@ -232,7 +234,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                                 )
                                 softmax_mi = pl.row_max(softmax_scores)
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
-                                softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16)
+                                softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
                                 softmax_li = pl.row_sum(pl.cast(softmax_exp_scores_bf16, target_type=pl.FP32))
                                 prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
                                 prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
@@ -277,6 +279,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                 for merge_norm_t_delta in pl.parallel(0, SPARSE_ATTN_TOKEN_TILE, SPARSE_MERGE_NORM_TOKEN_TILE):
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_merge_norm_head_tile"):
                         zero_head_tile = pl.full([SPARSE_PV_HEAD_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        zero_head_tile_fp32 = pl.full([SPARSE_PV_HEAD_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
                         for merge_norm_dt in pl.range(SPARSE_MERGE_NORM_TOKEN_TILE):
                             merge_norm_t = attn_t0 + merge_norm_t_delta + merge_norm_dt
                             merge_norm_t_local = merge_norm_t_delta + merge_norm_dt
@@ -374,16 +377,19 @@ def _prefill_hca_sparse_from_gathered_kv(
                                     pl.exp(pl.sub(merge_norm_sink_tile, merge_norm_mi)),
                                 )
                                 merge_norm_out = pl.row_expand_div(merge_norm_oi, merge_norm_denom)
+                                attn_stage_full = merge_norm_out[0 : SPARSE_PV_HEAD_TILE, 0 : HEAD_DIM]
                                 attn_stage_row = pl.cast(
-                                    merge_norm_out[0 : SPARSE_PV_HEAD_TILE, 0 : HEAD_DIM],
+                                    attn_stage_full,
                                     target_type=pl.BF16,
+                                    mode="rint",
                                 )
                             else:
+                                attn_stage_full = zero_head_tile_fp32
                                 attn_stage_row = zero_head_tile
 
                             attn_rope_stage = pl.assemble(
                                 attn_rope_stage,
-                                attn_stage_row[0 : SPARSE_PV_HEAD_TILE, NOPE_DIM:HEAD_DIM],
+                                attn_stage_full[0 : SPARSE_PV_HEAD_TILE, NOPE_DIM:HEAD_DIM],
                                 [merge_norm_head_row, 0],
                             )
 
@@ -427,13 +433,10 @@ def _prefill_hca_sparse_from_gathered_kv(
 
                 for rope_asm_r0 in pl.range(0, ROPE_HALF, SPARSE_ROPE_CHUNK):
                     rope_c0 = 2 * rope_asm_r0
-                    r_tile_fp32 = pl.cast(
-                        attn_rope_stage[
-                            rope_apply_head_row : rope_apply_head_row + H,
-                            rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
-                        ],
-                        target_type=pl.FP32,
-                    )
+                    r_tile_fp32 = attn_rope_stage[
+                        rope_apply_head_row : rope_apply_head_row + H,
+                        rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
+                    ]
                     r_cos = pl.cast(freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
                     r_sin = pl.cast(freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
                     r_cos_h = pl.col_expand_mul(pl.full([H, SPARSE_ROPE_CHUNK], dtype=pl.FP32, value=1.0), r_cos)
