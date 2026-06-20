@@ -622,7 +622,9 @@ def build_tensor_specs(layer_id=0):
         return x.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_tid2eid():
-        x = torch.randint(0, N_EXPERTS_GLOBAL, (VOCAB, TOPK), dtype=torch.int32)
+        # Distinct experts per token (sample without replacement) like real top-k,
+        # so token-keyed combine_ep1 == route-keyed distributed combine.
+        x = torch.argsort(torch.rand(VOCAB, N_EXPERTS_GLOBAL), dim=1)[:, :TOPK].to(torch.int32)
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
     def init_input_ids():
@@ -811,127 +813,22 @@ def moe_ep1_test(
     return x_next
 
 
-# EP1 build reuses the distributed specs (rank-0 projection); the EP1 golden is a
-# direct single-card reference. The distributed golden's per-rank reverse-lookup
-# combine is NOT bit-equivalent to the single-card local combine even at N_RANKS==1
-# (it diverges structurally, not just by BF16 rounding), so the single-card kernel
-# must validate against the local-stage reference below. __main__ dispatches to
-# these *_ep1 defs directly when EP == 1.
+# EP1 golden/fixtures reuse the distributed builders: build_tensor_specs_ep1 projects
+# the rank-0 slice; golden_moe_ep1 wraps a rank-0 axis and replays golden_moe.
 def golden_moe_ep1(tensors):
-    """EP1 single-card torch reference: mirrors the local DSL stages (one rank owns
-    every expert, so dispatch/combine are pure in-card scatter/gather)."""
+    """EP1 golden = the 1-rank distributed reference, wrapped/unwrapped on the rank axis."""
     import torch
 
-    from hc_pre import golden_hc_pre
-    from hc_post import golden_hc_post
-    from gate import golden_gate_core
-    from dispatch import golden_dispatch
-    from expert_routed import golden_expert_routed
-    from expert_shared import golden_expert_shared
-    from combine import golden_combine
-
-    x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
-    post_t = torch.zeros(T, HC_MULT, dtype=torch.float32)
-    comb_t = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
-    golden_hc_pre({
-        "x":        tensors["x_hc"],
-        "hc_fn":    tensors["hc_ffn_fn"],
-        "hc_scale": tensors["hc_ffn_scale"],
-        "hc_base":  tensors["hc_ffn_base"],
-        "x_mixed":  x_mixed,
-        "post":     post_t,
-        "comb":     comb_t,
-    })
-
-    x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
-    x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
-    x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
-    indices = torch.zeros(T, TOPK, dtype=torch.int32)
-    weights = torch.zeros(T, TOPK, dtype=torch.float32)
-    golden_gate_core({
-        "x_mixed":      x_mixed,
-        "norm_w":       tensors["norm_w"],
-        "gate_w":       tensors["gate_w"],
-        "gate_bias":    tensors["gate_bias"],
-        "layer_id":     tensors["layer_id"],
-        "tid2eid":      tensors["tid2eid"],
-        "input_ids":    tensors["input_ids"],
-        "x_norm":       x_norm,
-        "x_norm_i8":    x_norm_i8,
-        "x_norm_scale": x_norm_scale,
-        "indices":      indices,
-        "weights":      weights,
-    })
-
-    sh = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_expert_shared({
-        "x_local_i8":       x_norm_i8,
-        "x_local_scale_dq": x_norm_scale,
-        "shared_w1":        tensors["shared_w1"],
-        "shared_w1_scale":  tensors["shared_w1_scale"],
-        "shared_w3":        tensors["shared_w3"],
-        "shared_w3_scale":  tensors["shared_w3_scale"],
-        "shared_w2":        tensors["shared_w2"],
-        "shared_w2_scale":  tensors["shared_w2_scale"],
-        "sh":               sh,
-    })
-
-    recv_x = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.int8)
-    recv_scale_dq = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-    recv_weights = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-    recv_token = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.int32)
-    recv_count = torch.zeros(N_LOCAL, 1, dtype=torch.int32)
-    golden_dispatch({
-        "x_norm_i8":         x_norm_i8,
-        "x_norm_scale":      x_norm_scale,
-        "indices":           indices,
-        "weights":           weights,
-        "recv_x":            recv_x,
-        "recv_scale_dq":     recv_scale_dq,
-        "recv_weights":      recv_weights,
-        "recv_token":        recv_token,
-        "recv_expert_count": recv_count,
-    })
-
-    recv_y = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.bfloat16)
-    golden_expert_routed({
-        "recv_x":            recv_x,
-        "recv_scale_dq":     recv_scale_dq,
-        "recv_weights":      recv_weights,
-        "recv_expert_count": recv_count,
-        "routed_w1":         tensors["routed_w1"],
-        "routed_w1_scale":   tensors["routed_w1_scale"],
-        "routed_w3":         tensors["routed_w3"],
-        "routed_w3_scale":   tensors["routed_w3_scale"],
-        "routed_w2":         tensors["routed_w2"],
-        "routed_w2_scale":   tensors["routed_w2_scale"],
-        "recv_y":            recv_y,
-    })
-
-    ffn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    golden_combine({
-        "recv_y":            recv_y,
-        "recv_token":        recv_token,
-        "recv_expert_count": recv_count,
-        "sh":                sh,
-        "ffn_out":           ffn_out,
-    })
-
-    x_next = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
-    golden_hc_post({
-        "x":        ffn_out,
-        "residual": tensors["x_hc"],
-        "post":     post_t,
-        "comb":     comb_t,
-        "y":        x_next,
-    })
-
-    tensors["x_next"][:] = x_next
+    wrapped = {
+        k: (v.unsqueeze(0) if isinstance(v, torch.Tensor) and v.ndim >= 1 else v)
+        for k, v in tensors.items()
+    }
+    golden_moe(wrapped)
+    tensors["x_next"][:] = wrapped["x_next"][0]
 
 
 def build_tensor_specs_ep1(layer_id=0):
-    """EP1 fixtures = the 1-rank distributed specs with the rank-0 leading dim
-    dropped (the single-card kernel takes per-rank tensors without a rank axis)."""
+    """EP1 fixtures = the distributed specs with the rank-0 leading dim dropped."""
     from golden import ScalarSpec, TensorSpec
 
     flat = []
@@ -941,7 +838,6 @@ def build_tensor_specs_ep1(layer_id=0):
         elif s.is_output:
             flat.append(TensorSpec(s.name, s.shape[1:], s.dtype, is_output=True))
         else:
-            # Bind iv per-spec; drop the rank-0 axis the distributed init adds.
             flat.append(TensorSpec(
                 s.name, s.shape[1:], s.dtype,
                 init_value=(lambda iv: (lambda: iv()[0]))(s.init_value),
