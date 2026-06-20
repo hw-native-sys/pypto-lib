@@ -447,7 +447,7 @@ def build_tensor_specs(
                 seen_abs.add(key_abs)
 
     def init_x_hc():
-        x = seeded_normal((T, HC_MULT, D), 1, 0.05)
+        x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
         return x
     # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic

@@ -696,7 +696,7 @@ def build_tensor_specs(start_pos=None):
         return w_i8, (1.0 / scale_quant).float()
 
     def init_x_hc():
-        return torch.randn(T, HC_MULT, D) * 0.05
+        return torch.empty(T, HC_MULT, D).uniform_(-1, 1)
 
     # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
     # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out

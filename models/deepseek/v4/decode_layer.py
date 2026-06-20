@@ -830,10 +830,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
-            # swa(L0) 3.0% / 0.2%, hca(L9) 3.6% / 1.0%, csa(L8) 9.7% / 1.8%.
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.1),
+            # swa(L0) 0.4% / 0.003%, hca(L9) 1.9% / 1.0%, csa(L8) 3.8% / 0.6%.
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
     if not result.passed:

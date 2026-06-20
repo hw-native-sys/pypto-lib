@@ -768,10 +768,10 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
-        # swa(L0) 20.9% / 7.5%, hca(L9) 38.0% / 17.2%, csa(L8) 48.3% / 28.6%.
         compare_fn={
-            "x_next": valid_ratio_reldiff(args.num_tokens, diff_thd=0.01, pct_thd=0.1),
+            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
+            # swa(L0) 9.2% / 1.8%, hca(L9) 16.6% / 5.7%, csa(L8) 31.2% / 14.7%.
+            "x_next": valid_ratio_reldiff(args.num_tokens, diff_thd=0.01, pct_thd=0.05),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )
