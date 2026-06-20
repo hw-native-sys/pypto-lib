@@ -66,38 +66,35 @@ def lm_head(
         for ob in pl.parallel(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
-                hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, 0])
-                weight_chunk = pl.slice(
-                    lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [o0, 0]
-                )
-                acc = pl.matmul(hidden_chunk, weight_chunk, b_trans=True, out_dtype=pl.FP32)
+                # The peeled (kb==0) matmul tiles must use names distinct from the
+                # loop-body tiles below; reusing one name across the peel and the
+                # carry loop collides under SSA and corrupts the accumulation.
+                hidden0 = hidden_states[t0 : t0 + T_TILE, 0:LM_HEAD_K_CHUNK]
+                weight0 = lm_head_weight[o0 : o0 + VOCAB_CHUNK, 0:LM_HEAD_K_CHUNK]
+                acc = pl.matmul(hidden0, weight0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, k0])
-                    weight_chunk = pl.slice(
-                        lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [o0, k0]
-                    )
+                    hidden_chunk = hidden_states[t0 : t0 + T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    weight_chunk = lm_head_weight[o0 : o0 + VOCAB_CHUNK, k0 : k0 + LM_HEAD_K_CHUNK]
                     acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
-                logits_shard = pl.assemble(logits_shard, acc, [t0, o0])
+                logits_shard[t0 : t0 + T_TILE, o0 : o0 + VOCAB_CHUNK] = acc
 
         if VOCAB_TAIL != 0:
             tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_tail"):
-                hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, 0])
-                weight_chunk = pl.slice(
-                    lm_head_weight, [VOCAB_TAIL, LM_HEAD_K_CHUNK], [tail_o0, 0]
-                )
-                acc = pl.matmul(hidden_chunk, weight_chunk, b_trans=True, out_dtype=pl.FP32)
+                # Every tile/accumulator here uses a name distinct from the main
+                # block above: they live in the same inlined function scope, and a
+                # shared name carrying a different shape (e.g. VOCAB_TAIL vs
+                # VOCAB_CHUNK) collides under SSA and corrupts the result.
+                hidden_t0 = hidden_states[t0 : t0 + T_TILE, 0:LM_HEAD_K_CHUNK]
+                weight_t0 = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, 0:LM_HEAD_K_CHUNK]
+                acc_tail = pl.matmul(hidden_t0, weight_t0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_chunk = pl.slice(hidden_states, [T_TILE, LM_HEAD_K_CHUNK], [t0, k0])
-                    weight_chunk = pl.slice(
-                        lm_head_weight,
-                        [VOCAB_TAIL, LM_HEAD_K_CHUNK],
-                        [tail_o0, k0],
-                    )
-                    acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
-                logits_shard = pl.assemble(logits_shard, acc, [t0, tail_o0])
+                    hidden_tk = hidden_states[t0 : t0 + T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    weight_tk = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, k0 : k0 + LM_HEAD_K_CHUNK]
+                    acc_tail = pl.matmul_acc(acc_tail, hidden_tk, weight_tk, b_trans=True)
+                logits_shard[t0 : t0 + T_TILE, tail_o0 : tail_o0 + VOCAB_TAIL] = acc_tail
     return logits_shard
 
 
@@ -283,7 +280,7 @@ def lm_head_tp(
 
 
 @pl.jit.host
-def host_orch(
+def l3_lm_head(
     hidden_states: pl.Tensor[[TP_SIZE, T, D], pl.BF16],
     lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PADDED_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[TP_SIZE, T, VOCAB], pl.FP32]],
@@ -373,7 +370,7 @@ if __name__ == "__main__":
     )
 
     result = run_jit(
-        fn=host_orch,
+        fn=l3_lm_head,
         specs=build_tensor_specs(),
         golden_fn=golden_lm_head,
         compile_only=args.compile_only,
