@@ -116,7 +116,7 @@ def prefill_indexer(
                         if ck < visible_len:
                             pl.write(cmp_topk_indices, [topk_token, ck], pl.cast(INDEXER_OFFSET + ck, pl.INT32))
 
-    return idx_kv_cache, inner_kv_state, inner_score_state, cmp_topk_indices
+    return idx_kv_cache, cmp_topk_indices
 
 
 def golden_prefill_indexer_core(tensors):
@@ -144,8 +144,6 @@ def golden_prefill_indexer_core(tensors):
     }
     golden_prefill_indexer_compressor(compressor_tensors)
     tensors["idx_kv_cache"][:] = compressor_tensors["idx_kv_cache"]
-    tensors["inner_kv_state"][:] = compressor_tensors["kv_state"]
-    tensors["inner_score_state"][:] = compressor_tensors["score_state"]
 
     num_tokens = int(tensors["num_tokens"])
     position_ids = tensors["position_ids"]
@@ -193,7 +191,7 @@ def prefill_indexer_test(
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_kv_cache_out, inner_kv_state_out, inner_score_state_out, cmp_topk_indices = prefill_indexer(
+    idx_kv_cache_out, cmp_topk_indices = prefill_indexer(
         x,
         freqs_cos,
         freqs_sin,
@@ -243,7 +241,7 @@ def prefill_indexer_test(
                 for topk_col in pl.range(IDX_TOPK):
                     topk_val = pl.read(cmp_topk_indices, [score_token, topk_col])
                     pl.write(topk_idxs, [score_token, topk_col], topk_val)
-    return score, idx_kv_cache_out, inner_kv_state_out, inner_score_state_out, topk_idxs
+    return score, idx_kv_cache_out, topk_idxs
 
 
 def build_tensor_specs(start_pos: int = START_POS):
@@ -340,8 +338,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("inner_kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state, is_output=True),
-        TensorSpec("inner_score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state, is_output=True),
+        TensorSpec("inner_kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
+        TensorSpec("inner_score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("inner_wkv", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wgate),
@@ -408,8 +406,6 @@ if __name__ == "__main__":
             "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             "topk_idxs": topk_idxs_compare,
             "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=16 / (PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE * IDX_HEAD_DIM)),
-            "inner_kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "inner_score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
         },
     )
     if not result.passed:

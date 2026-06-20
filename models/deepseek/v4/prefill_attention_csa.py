@@ -214,7 +214,7 @@ def prefill_attention_csa(
         state_slot_mapping,
     )
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_kv_cache, inner_kv_state, inner_score_state, cmp_topk_indices = prefill_indexer(
+    idx_kv_cache, cmp_topk_indices = prefill_indexer(
         x_normed,
         freqs_cos,
         freqs_sin,
