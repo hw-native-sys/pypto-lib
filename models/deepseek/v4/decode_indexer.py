@@ -412,7 +412,6 @@ def golden_indexer(tensors):
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
 
-    position_ids = tensors["position_ids"].to(torch.int64)
     kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     offset = int(tensors["offset"])
 
@@ -431,7 +430,7 @@ def golden_indexer(tensors):
 
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-    q = q @ hadamard
+    q = q.to(torch.bfloat16).float() @ hadamard
     # W8A8C16: q and Indexer Cache are quantized per row to INT8 for score matmul,
     # then dequantized with q_scale * kv_scale.
     # flash: fp4_act_quant on q (FP4 simulation).

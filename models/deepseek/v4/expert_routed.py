@@ -257,8 +257,8 @@ def golden_expert_routed(tensors):
         h = F.silu(gate) * up
         # A8 requant before w2 matmul.
         h_i8, h_sd = _int8_quant_per_row(h)
-        h = h_i8.float() * h_sd
-        recv_y[e, :n_rows, :] = (h @ w2[e].T) * w_per_row
+        h = h_i8.float() * (h_sd * w_per_row)
+        recv_y[e, :n_rows, :] = h @ w2[e].T
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 

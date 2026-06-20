@@ -204,7 +204,7 @@ def sparse_attn_hca(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
+    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
@@ -241,7 +241,7 @@ def sparse_attn_hca(
                 # blocks die in the merge alpha/beta -- no mask multiply needed.
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
-                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16)
+                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                 qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
                 for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
                     qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
@@ -281,9 +281,10 @@ def sparse_attn_hca(
             n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
             n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
             n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-            n_out = pl.cast(pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM], target_type=pl.BF16)
+            n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
+            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
             n_rope_row = m_t * H + m_h0
-            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_out[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
 
             for n_hi in pl.range(H_TILE):
                 n_gh = m_h0 + n_hi
@@ -291,7 +292,7 @@ def sparse_attn_hca(
                 n_hh = n_gh - n_g * HEADS_PER_GROUP
                 n_pack_row = n_g * T + m_t
                 n_col = n_hh * HEAD_DIM
-                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
+                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
@@ -342,11 +343,10 @@ def sparse_attn_hca(
             rp_o0 = rp_g * T + rp_t0
             for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
                 c0 = 2 * r_r0
-                # This head's rope rows for this token tile (stride H); gather needs
-                # FP/INT, so cast the strided BF16 slice to FP32 first.
-                r_tile_fp32 = pl.cast(
-                    pl.reshape(attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE]),
-                    target_type=pl.FP32)
+                # This head's rope rows for this token tile (stride H).
+                r_tile_fp32 = pl.reshape(
+                    attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE],
+                    [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
                 r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
                 r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
                 r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
