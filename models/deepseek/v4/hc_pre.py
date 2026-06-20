@@ -316,13 +316,20 @@ def build_tensor_specs(B, S):
     T = B * S
 
     def init_x():
-        return torch.rand(T, HC_MULT, D) - 0.5
+        return torch.randn(T, HC_MULT, D) * 0.05
     def init_hc_fn():
-        return (torch.randn(MIX_HC, HC_DIM) - 0.5) / (HC_DIM ** 0.5)
+        return torch.randn(MIX_HC, HC_DIM) * 0.0519
     def init_hc_scale():
-        return torch.ones(3) * 0.5
+        return torch.tensor([0.076099, 0.032597, 0.226994])
     def init_hc_base():
-        return torch.zeros(MIX_HC)
+        return torch.tensor([
+            5.9166, -3.6223, -2.9324, -3.3124,
+            -3.9100, -0.9384, -3.3256, -2.5240,
+            2.0706, -2.5728, 0.1424, -3.9453,
+            -3.8859, 3.4634, -3.3799, -2.6077,
+            -2.7191, -2.4846, 2.0395, -0.5010,
+            -3.5992, -2.7520, -3.3493, 3.1587,
+        ])
 
     return [
         TensorSpec("x", [T, HC_MULT, D], torch.bfloat16, init_value=init_x),

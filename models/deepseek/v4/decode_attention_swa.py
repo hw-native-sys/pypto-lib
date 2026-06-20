@@ -21,7 +21,7 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import attn_norm
+from rmsnorm import rms_norm
 from decode_sparse_attn_swa import sparse_attn_swa
 
 
@@ -126,7 +126,7 @@ def attention_swa(
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed_t = attn_norm(x_mixed, attn_norm_w, x_normed_t)
+    x_normed_t = rms_norm(x_mixed, attn_norm_w, x_normed_t)
     q = qkv_proj_rope(
         x_normed_t,
         wq_a,
@@ -272,7 +272,7 @@ def golden_attention_swa(tensors):
 
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
-    from rmsnorm import golden_attn_norm
+    from rmsnorm import golden_rms_norm
     from decode_sparse_attn_swa import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -310,7 +310,7 @@ def golden_attention_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_attn_norm(x_mixed, tensors["attn_norm_w"])
+    x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],

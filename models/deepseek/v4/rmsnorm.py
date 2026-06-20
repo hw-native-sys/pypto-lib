@@ -31,13 +31,13 @@ assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
 
 @pl.jit.inline
-def attn_norm(
+def rms_norm(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
-    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="attn_norm"):
+    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="rms_norm"):
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
@@ -61,7 +61,7 @@ def attn_norm(
 
 
 @pl.jit
-def rmsnorm(
+def rms_norm_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.FP32],
     x_normed: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
@@ -69,11 +69,11 @@ def rmsnorm(
     x.bind_dynamic(0, T_DYN)
     x_normed.bind_dynamic(0, T_DYN)
 
-    x_normed = attn_norm(x, norm_w, x_normed)
+    x_normed = rms_norm(x, norm_w, x_normed)
     return x_normed
 
 
-def golden_attn_norm(x, norm_w):
+def golden_rms_norm(x, norm_w):
     import torch
 
     x = x.float()
@@ -82,8 +82,8 @@ def golden_attn_norm(x, norm_w):
     return (x * inv * norm_w).to(torch.bfloat16)
 
 
-def golden_rmsnorm(tensors):
-    tensors["x_normed"][:] = golden_attn_norm(tensors["x"], tensors["norm_w"])
+def golden_rms_norm_test(tensors):
+    tensors["x_normed"][:] = golden_rms_norm(tensors["x"], tensors["norm_w"])
 
 
 def build_tensor_specs(B, S):
@@ -129,11 +129,11 @@ if __name__ == "__main__":
 
     for mode_name in modes_to_run:
         B, S = MODES[mode_name]
-        print(f"--- rmsnorm {mode_name}: B={B}, S={S} ---")
+        print(f"--- rms_norm_test {mode_name}: B={B}, S={S} ---")
         result = run_jit(
-            fn=rmsnorm,
+            fn=rms_norm_test,
             specs=build_tensor_specs(B, S),
-            golden_fn=golden_rmsnorm,
+            golden_fn=golden_rms_norm_test,
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,
             runtime_cfg=dict(

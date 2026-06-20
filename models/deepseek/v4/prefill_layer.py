@@ -14,9 +14,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 # Import moe_ep first. It applies the EP2 FLASH override before dependent
-# modules bake config-derived MoE shapes. The full-T stress case
-# `--num-tokens 128 --layer-id 3` was validated with
-# `DSV4_MOE_EP_RECV_MAX=128`; default RECV_MAX=96 is not its pass criterion.
+# modules bake config-derived MoE shapes.
 from moe_ep import (
     D,
     HC_DIM,

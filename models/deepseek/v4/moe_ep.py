@@ -36,7 +36,6 @@ EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
 config.EP_ROUTING_GLOBAL = True
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)  # 32 experts/rank
-config.RECV_MAX = max(config.RECV_MAX, config.PREFILL_LAYER_RECV_MAX)
 
 import pypto.language as pl
 import pypto.language.distributed as pld
