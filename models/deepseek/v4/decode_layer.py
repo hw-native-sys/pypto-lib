@@ -831,9 +831,8 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # KV strict, x_next on an FFN envelope (one gate for all layer_id branches).
-            # Strict per-point bar: over-1e-2 fraction is swa ~6.1% / hca ~6.2% / csa ~8.1%
-            # (csa binding), so pct_thd=0.10. Alt: diff_thd=0.03, pct_thd=0.05 (all <=1.4%).
+            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
+            # swa(L0) 3.0% / 0.2%, hca(L9) 3.6% / 1.0%, csa(L8) 9.7% / 1.8%.
             "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.1),
         },
     )
