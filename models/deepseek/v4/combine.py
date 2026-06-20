@@ -28,7 +28,7 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
 
 @pl.jit.inline
-def combine(
+def combine_ep1(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_token: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
@@ -71,7 +71,7 @@ def combine(
 
 
 @pl.jit.inline
-def combine_ep(
+def combine(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_r_route_out: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
@@ -158,7 +158,7 @@ def combine_test(
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    combine(recv_y, recv_token, recv_expert_count, sh, ffn_out)
+    combine_ep1(recv_y, recv_token, recv_expert_count, sh, ffn_out)
     return ffn_out
 
 

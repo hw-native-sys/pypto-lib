@@ -11,7 +11,7 @@
 
 Each rank owns a local decode micro-batch for the selected attention stage.
 The resulting per-rank hidden states feed the N-rank EP MoE path. The EP world
-size is chosen with --ep (2/4/8, default 2), inherited from moe_ep; see __main__.
+size is chosen with --ep (2/4/8, default 2), inherited from moe; see __main__.
 """
 
 import pypto.language as pl
@@ -75,7 +75,7 @@ from decode_attention_csa import (
     golden_attention_csa,
 )
 from config import FLASH as MODEL_CONFIG
-from moe_ep import (
+from moe import (
     IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
@@ -87,8 +87,8 @@ from moe_ep import (
     VOCAB,
     W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
-    golden_moe_ep,
-    moe_ep,
+    golden_moe,
+    moe,
 )
 
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
@@ -237,7 +237,7 @@ def decode_layer(
             x_attn,
         )
 
-    x_next = moe_ep(
+    x_next = moe(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -433,7 +433,7 @@ def golden_decode_layer(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["num_tokens"] = T
-    golden_moe_ep(moe_tensors)
+    golden_moe(moe_tensors)
 
 
 def golden_decode_layer_hca(tensors):
@@ -480,7 +480,7 @@ def golden_decode_layer_hca(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["num_tokens"] = T
-    golden_moe_ep(moe_tensors)
+    golden_moe(moe_tensors)
 
 
 def golden_decode_layer_csa(tensors):
@@ -541,7 +541,7 @@ def golden_decode_layer_csa(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["num_tokens"] = T
-    golden_moe_ep(moe_tensors)
+    golden_moe(moe_tensors)
 
 
 def golden_decode_layer_auto(tensors):
@@ -791,7 +791,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe_ep)")
+                        help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str,
                         default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")

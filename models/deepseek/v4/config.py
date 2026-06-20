@@ -266,5 +266,5 @@ RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
 # When True, gate.py's N_EXPERTS uses the full global expert space
 # (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
 # keeps the legacy single-card behavior where each rank only routes over its
-# own shard. moe_ep.py flips this before importing gate.
+# own shard. moe.py flips this before importing gate.
 EP_ROUTING_GLOBAL = False

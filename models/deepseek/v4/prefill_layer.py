@@ -13,9 +13,9 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-# Import moe_ep first. It applies the EP2 FLASH override before dependent
+# Import moe first. It applies the EP2 FLASH override before dependent
 # modules bake config-derived MoE shapes.
-from moe_ep import (
+from moe import (
     D,
     HC_DIM,
     HC_MULT,
@@ -32,8 +32,8 @@ from moe_ep import (
     VOCAB,
     W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
-    golden_moe_ep,
-    moe_ep,
+    golden_moe,
+    moe,
 )
 from config import FLASH as MODEL_CONFIG
 from prefill_attention_swa import (
@@ -230,7 +230,7 @@ def prefill_layer(
             attn_sink, wo_a, wo_b, wo_b_scale,
             x_attn, num_tokens,
         )
-    x_next = moe_ep(
+    x_next = moe(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -704,7 +704,7 @@ def golden_prefill_layer(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["num_tokens"] = num_tokens
-    golden_moe_ep(moe_tensors)
+    golden_moe(moe_tensors)
 
 
 def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
@@ -734,7 +734,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe_ep)")
+                        help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str,
                         default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")

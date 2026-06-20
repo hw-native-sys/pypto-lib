@@ -65,7 +65,7 @@ host (no container)** — set up via conda + `set_env.sh`, mirroring pypto's
 keeping the large ring sizes for single-card ones. Running a multi-card
 kernel locally needs the same: a real `set_env.sh`-sourced shell with
 `PTO2_RING_*` unset, e.g.
-`python models/deepseek/v4/moe_ep.py -p a2a3 -d 0,1`.
+`python models/deepseek/v4/moe.py -p a2a3 -d 0,1`.
 
 ## Phases inside `golden.run`
 

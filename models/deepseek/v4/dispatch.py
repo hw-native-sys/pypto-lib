@@ -34,7 +34,7 @@ EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 
 @pl.jit.inline
-def dispatch(
+def dispatch_ep1(
     x_norm_i8:       pl.Tensor[[T, D],    pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1],    pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
@@ -91,7 +91,7 @@ N_ROUTES = T * TOPK
 
 
 @pl.jit.inline
-def dispatch_ep(
+def dispatch(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     x_norm_i8: pl.Tensor[[T, D], pl.INT8],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
@@ -117,7 +117,7 @@ def dispatch_ep(
 
     # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
     # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_ep"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch"):
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -287,7 +287,7 @@ def dispatch_test(
     recv_token:        pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX],    pl.INT32]],
     recv_expert_count: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32]],
 ):
-    dispatch(
+    dispatch_ep1(
         x_norm_i8, x_norm_scale, indices, weights,
         recv_x, recv_scale_dq, recv_weights, recv_token, recv_expert_count,
     )

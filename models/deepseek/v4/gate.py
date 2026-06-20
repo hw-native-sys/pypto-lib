@@ -25,7 +25,7 @@ NORM_EPS = M.rms_norm_eps
 # Routing space:
 #   EP_ROUTING_GLOBAL=False (default, legacy single-card): each rank only routes
 #     over its own [n_routed_experts // EP_WORLD_SIZE] shard.
-#   EP_ROUTING_GLOBAL=True (used by moe_ep.py): every rank routes over the full
+#   EP_ROUTING_GLOBAL=True (used by moe.py): every rank routes over the full
 #     global expert set so dispatch can fan tokens across ranks.
 N_EXPERTS = M.n_routed_experts if _cfg.EP_ROUTING_GLOBAL else M.n_routed_experts // EP_WORLD_SIZE
 TOPK = M.num_experts_per_tok
