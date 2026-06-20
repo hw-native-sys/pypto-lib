@@ -47,7 +47,7 @@ assert TOPK <= TOPK_PAD
 @pl.jit.inline
 def gate(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
@@ -72,7 +72,7 @@ def gate(
         inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
         for an_d0 in pl.pipeline(0, D, D_TILE, stage=2):
             an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE], pl.FP32)
-            an_w = pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE])
+            an_w = pl.cast(pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE]), pl.FP32)
             an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
             an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
             x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
@@ -191,7 +191,7 @@ def gate(
 @pl.jit
 def gate_test(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
-    norm_w: pl.Tensor[[D], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
     layer_id: pl.Scalar[pl.INT32],
@@ -289,7 +289,7 @@ def build_tensor_specs(layer_id=0):
         return torch.randint(0, VOCAB, (T,), dtype=torch.int64)
     return [
         TensorSpec("x_mixed", [T, D], torch.bfloat16, init_value=init_x_mixed),
-        TensorSpec("norm_w", [D], torch.float32, init_value=init_norm_w),
+        TensorSpec("norm_w", [D], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("gate_w", [N_EXPERTS, D], torch.float32, init_value=init_gate_w),
         TensorSpec("gate_bias", [N_EXPERTS], torch.float32, init_value=init_gate_bias),
         ScalarSpec("layer_id", torch.int32, layer_id),
