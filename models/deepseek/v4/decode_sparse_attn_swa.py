@@ -321,9 +321,9 @@ def sparse_attn_swa(
     # dropping a separate rope_pack stage and GM round-trip. cos_il / sign*sin come
     # from the pre-pass above; only swap_idx (j^1) is rebuilt per task.
     attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
-    for rp_idx in pl.spmd((H // 4) * 2, name_hint="rope"):
-        rp_hg = rp_idx // 2
-        rp_tt = rp_idx - rp_hg * 2
+    for rp_idx in pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope"):
+        rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
+        rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
         rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
         # Head-invariant swap index (j^1), built once and reused across the head
         # group -- the only per-head input is this head's strided rope slice.
