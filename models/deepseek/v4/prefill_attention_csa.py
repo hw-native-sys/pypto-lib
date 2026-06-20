@@ -608,10 +608,6 @@ def build_tensor_specs(
             f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
         )
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        return (torch.rand(*shape) - 0.5) * scale
-    def seeded_normal(shape, seed, std=1.0):
-        return torch.randn(*shape) * std
 
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
@@ -687,7 +683,7 @@ def build_tensor_specs(
     # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
     # Mirrors decode_attention_csa.
     def init_hc_attn_fn():
-        return seeded_normal((MIX_HC, HC_DIM), 2, 0.0519)
+        return torch.randn(MIX_HC, HC_DIM) * 0.0519
     def init_hc_attn_scale():
         return torch.tensor([0.076099, 0.032597, 0.226994])
     def init_hc_attn_base():
@@ -702,11 +698,11 @@ def build_tensor_specs(
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return seeded_uniform((D, Q_LORA), 3, D ** -0.5)
+        return (torch.rand(D, Q_LORA) - 0.5) * D ** -0.5
     def init_wq_b():
-        return seeded_uniform((Q_LORA, H * HEAD_DIM), 4, Q_LORA ** -0.5)
+        return (torch.rand(Q_LORA, H * HEAD_DIM) - 0.5) * Q_LORA ** -0.5
     def init_wkv():
-        return seeded_uniform((D, HEAD_DIM), 5, D ** -0.5)
+        return (torch.rand(D, HEAD_DIM) - 0.5) * D ** -0.5
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -719,13 +715,13 @@ def build_tensor_specs(
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_attention_csa / decode_compressor_ratio4.
     def init_cmp_wkv():
-        return seeded_normal((D, MAIN_OUT_DIM), 11, 0.0245)
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0245
     def init_cmp_wgate():
-        return seeded_normal((D, MAIN_OUT_DIM), 12, 0.0388)
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0388
     def init_cmp_ape():
-        return seeded_normal((COMPRESS_RATIO, MAIN_OUT_DIM), 13, 0.1243)
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
     def init_cmp_norm_w():
-        return 0.9666 + seeded_normal((HEAD_DIM,), 14, 0.1929)
+        return 0.9666 + torch.randn(HEAD_DIM,) * 0.1929
     def init_compress_state_block_table():
         table = torch.full((CSA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(CSA_STATE_MAX_BLOCKS):
@@ -744,11 +740,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - MAIN_STATE_LEN), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform(
-                (MAIN_OUT_DIM,),
-                3000 + abs_pos,
-                0.05,
-            )
+                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_cmp_score_state():
         state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
@@ -756,11 +748,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - MAIN_STATE_LEN), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform(
-                (MAIN_OUT_DIM,),
-                4000 + abs_pos,
-                0.05,
-            )
+                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -771,13 +759,13 @@ def build_tensor_specs(
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_attention_csa / decode_indexer.
     def init_inner_wkv():
-        return seeded_normal((D, INNER_OUT_DIM), 16, 0.0293)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0293
     def init_inner_wgate():
-        return seeded_normal((D, INNER_OUT_DIM), 17, 0.0512)
+        return torch.randn(D, INNER_OUT_DIM) * 0.0512
     def init_inner_ape():
-        return seeded_normal((COMPRESS_RATIO, INNER_OUT_DIM), 18, 0.1528)
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
-        return 0.6850 + seeded_normal((IDX_HEAD_DIM,), 19, 0.2610)
+        return 0.6850 + torch.randn(IDX_HEAD_DIM,) * 0.2610
     def init_inner_compress_state_block_table():
         table = torch.full((INNER_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(INNER_STATE_MAX_BLOCKS):
@@ -796,11 +784,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - INNER_STATE_LEN), context_len):
             row = inner_state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform(
-                (INNER_OUT_DIM,),
-                5000 + abs_pos,
-                0.05,
-            )
+                flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_inner_score_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
@@ -808,11 +792,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - INNER_STATE_LEN), context_len):
             row = inner_state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform(
-                (INNER_OUT_DIM,),
-                6000 + abs_pos,
-                0.05,
-            )
+                flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_idx_kv_cache():
         cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
@@ -824,7 +804,7 @@ def build_tensor_specs(
                 break
             row = cache_row_from_table(table, cmp_slot)
             if row >= 0:
-                cache_flat[row] = seeded_uniform((IDX_HEAD_DIM,), 7000 + cmp_slot, 0.05).to(torch.bfloat16)
+                cache_flat[row] = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
         return cache
     def init_kv_cache():
         cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -833,7 +813,7 @@ def build_tensor_specs(
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
             row = cache_row_from_table(table, abs_pos % WIN)
-            value = seeded_uniform((HEAD_DIM,), 1000 + abs_pos, 0.1)
+            value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
         return cache
@@ -858,7 +838,7 @@ def build_tensor_specs(
             if cmp_slot >= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE:
                 break
             row = cache_row_from_table(table, cmp_slot)
-            value = seeded_uniform((HEAD_DIM,), 2000 + cmp_slot, 0.1)
+            value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
         return cache
@@ -934,9 +914,9 @@ def build_tensor_specs(
     def init_attn_sink():
         return torch.zeros(H)
     def init_wo_a():
-        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 9, O_GROUP_IN ** -0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5
     def init_wo_b():
-        return seeded_uniform((D, O_GROUPS * O_LORA), 10, (O_GROUPS * O_LORA) ** -0.5)
+        return (torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel_local(wq_b_bf16)

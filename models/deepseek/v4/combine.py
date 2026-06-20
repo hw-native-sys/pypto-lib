@@ -193,9 +193,8 @@ def build_tensor_specs():
     # RECV_MAX clamp); recv_token[e, :counts[e]] is the matching token list
     # with no per-expert duplicates. Mirrors expert_routed.build_tensor_specs.
     topk = min(M.num_experts_per_tok, N_LOCAL_EXPERTS)
-    gen = torch.Generator().manual_seed(0)
     routing = torch.stack(
-        [torch.randperm(N_LOCAL_EXPERTS, generator=gen)[:topk] for _ in range(T)]
+        [torch.randperm(N_LOCAL_EXPERTS)[:topk] for _ in range(T)]
     )
 
     per_expert_tokens = [[] for _ in range(N_LOCAL_EXPERTS)]
