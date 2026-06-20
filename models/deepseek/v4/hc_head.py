@@ -33,13 +33,13 @@ RMS_K_BLOCKS = HC_DIM // RMS_K_CHUNK
 LINEAR_K_BLOCKS = HC_DIM // LINEAR_K_CHUNK
 D_BLOCKS = D // D_CHUNK
 
-@pl.jit
+@pl.jit.inline
 def hc_head(
     x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+    y: pl.Tensor[[B, S, D], pl.BF16],
 ):
     x_flat = pl.reshape(x_hc, [T, HC_DIM])
     y_flat = pl.reshape(y, [T, D])
@@ -154,6 +154,18 @@ def hc_head(
     return y
 
 
+@pl.jit
+def hc_head_test(
+    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[1], pl.FP32],
+    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    y: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+):
+    y = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y)
+    return y
+
+
 def golden_hc_head(tensors):
     import torch
 
@@ -206,16 +218,18 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_x_hc():
-        return torch.rand(B, S, HC_MULT, D) - 0.5
+        return torch.randn(B, S, HC_MULT, D) * 0.05
 
     def init_hc_head_fn():
-        return (torch.randn(HC_MULT, HC_DIM) - 0.5) / HC_DIM ** 0.5
+        return torch.randn(HC_MULT, HC_DIM) * 0.0519
 
     return [
         TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
-        TensorSpec("hc_head_scale", [1], torch.float32, init_value=lambda: torch.ones(1) * 0.5),
-        TensorSpec("hc_head_base", [HC_MULT], torch.float32, init_value=lambda: torch.zeros(HC_MULT)),
+        TensorSpec("hc_head_scale", [1], torch.float32,
+                   init_value=lambda: torch.tensor([0.076099])),
+        TensorSpec("hc_head_base", [HC_MULT], torch.float32,
+                   init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124])),
         TensorSpec("y", [B, S, D], torch.bfloat16, is_output=True),
     ]
 
@@ -235,7 +249,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
     result = run_jit(
-        fn=hc_head,
+        fn=hc_head_test,
         specs=build_tensor_specs(),
         golden_fn=golden_hc_head,
         runtime_cfg=dict(
