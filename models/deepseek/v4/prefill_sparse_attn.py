@@ -127,21 +127,13 @@ def _prefill_hca_sparse_from_gathered_kv(
                     3.0e38,
                 )
 
-    # Stage 2: causal prefill attention, tiled across context rows.
+    # Causal prefill attention over the gathered sparse KV.
     for attn_t0 in pl.parallel(0, T, ATTN_TOKEN_TILE):
         for h0 in pl.parallel(0, H, HEAD_TILE):
-            prefill_blk_mi = pl.create_tensor(
-                [ATTN_TOKEN_TILE * HEAD_TILE * PREFILL_ATTN_BLOCKS, 1],
-                dtype=pl.FP32,
-            )
-            prefill_blk_li = pl.create_tensor(
-                [ATTN_TOKEN_TILE * HEAD_TILE * PREFILL_ATTN_BLOCKS, 1],
-                dtype=pl.FP32,
-            )
-            prefill_blk_oi = pl.create_tensor(
-                [ATTN_TOKEN_TILE * HEAD_TILE * PREFILL_ATTN_BLOCKS, HEAD_DIM],
-                dtype=pl.FP32,
-            )
+            blk_rows = ATTN_TOKEN_TILE * HEAD_TILE * PREFILL_ATTN_BLOCKS
+            prefill_blk_mi = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
+            prefill_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
+            prefill_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_pv"):
                 for qk_dt in pl.range(ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
@@ -150,49 +142,29 @@ def _prefill_hca_sparse_from_gathered_kv(
                         qk_q_batch = q_flat[qk_head_row : qk_head_row + HEAD_TILE, 0 : HEAD_DIM]
                         qk_kv_base = qk_t * PREFILL_SPARSE_PAD
 
-                        # All sparse blocks are processed unconditionally (decode parity):
-                        # invalid slots carry a -inf bias, so an all-invalid block gets
-                        # mi == -inf and is zeroed out by beta == 0 in the merge below.
-                        # qk_kv_k / qk_kv_v are two views of the same KV tile so the QK
-                        # (b_trans=True) and PV (b_trans=False) loads do not collide on one
-                        # param (pypto#1532) -- this lets QK, softmax, and PV share one scope
-                        # with no prefill_exp GM round-trip.
+                        # Process all blocks unconditionally: an all-invalid block carries a
+                        # -inf bias so it dies via beta == 0 in the merge. qk_kv_k / qk_kv_v are
+                        # two views of one KV tile so QK (b_trans) and PV do not collide (#1532).
                         for qk_sb in pl.range(PREFILL_ATTN_BLOCKS):
                             qk_tile_start = qk_sb * PREFILL_ATTN_TILE
-                            qk_kv_k = sparse_kv[
-                                qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + PREFILL_ATTN_TILE,
-                                0 : HEAD_DIM,
-                            ]
-                            qk_kv_v = sparse_kv[
-                                qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + PREFILL_ATTN_TILE,
-                                0 : HEAD_DIM,
-                            ]
+                            qk_kv0 = qk_kv_base + qk_tile_start
+                            qk_kv_k = sparse_kv[qk_kv0:qk_kv0 + PREFILL_ATTN_TILE, :]
+                            qk_kv_v = sparse_kv[qk_kv0:qk_kv0 + PREFILL_ATTN_TILE, :]
                             qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                            qk_block_row = (
-                                qk_dt * HEAD_TILE * PREFILL_ATTN_BLOCKS + qk_sb * HEAD_TILE
-                            )
+                            qk_block_row = qk_dt * HEAD_TILE * PREFILL_ATTN_BLOCKS + qk_sb * HEAD_TILE
                             qk_scaled_scores = pl.mul(qk_raw_scores, SOFTMAX_SCALE)
                             qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_tile_start:qk_tile_start + PREFILL_ATTN_TILE]
-                            softmax_scores = pl.add(
-                                qk_scaled_scores,
-                                pl.col_expand(
-                                    pl.full(
-                                        [HEAD_TILE, PREFILL_ATTN_TILE],
-                                        dtype=pl.FP32,
-                                        value=0.0,
-                                    ),
-                                    qk_bias_row,
-                                )
-                            )
+                            zero_tile = pl.full([HEAD_TILE, PREFILL_ATTN_TILE], dtype=pl.FP32, value=0.0)
+                            softmax_scores = pl.add(qk_scaled_scores, pl.col_expand(zero_tile, qk_bias_row))
                             softmax_mi = pl.row_max(softmax_scores)
                             softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
                             softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
-                            # li sums the FP32 exp (decode parity); only the PV matmul uses the BF16 cast.
+                            # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
                             softmax_li = pl.row_sum(softmax_exp_scores)
                             pv_oi = pl.matmul(softmax_exp_scores_bf16, qk_kv_v, out_dtype=pl.FP32)
-                            prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
-                            prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
-                            prefill_blk_oi = pl.assemble(prefill_blk_oi, pv_oi, [qk_block_row, 0])
+                            prefill_blk_mi[qk_block_row:qk_block_row + HEAD_TILE, :] = softmax_mi
+                            prefill_blk_li[qk_block_row:qk_block_row + HEAD_TILE, :] = softmax_li
+                            prefill_blk_oi[qk_block_row:qk_block_row + HEAD_TILE, :] = pv_oi
 
             for merge_norm_t_delta in pl.parallel(0, ATTN_TOKEN_TILE, MERGE_NORM_TOKEN_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_merge_norm_head_tile"):
@@ -203,91 +175,46 @@ def _prefill_hca_sparse_from_gathered_kv(
                         merge_norm_t_local = merge_norm_t_delta + merge_norm_dt
                         merge_norm_head_row = merge_norm_t * H + h0
                         if merge_norm_t < num_tokens:
-                            merge_norm_block_row0 = (
-                                merge_norm_t_local * HEAD_TILE * PREFILL_ATTN_BLOCKS
-                            )
-                            merge_norm_mi = prefill_blk_mi[
-                                merge_norm_block_row0 : merge_norm_block_row0 + HEAD_TILE,
-                                0 : 1,
-                            ]
-                            merge_norm_li = prefill_blk_li[
-                                merge_norm_block_row0 : merge_norm_block_row0 + HEAD_TILE,
-                                0 : 1,
-                            ]
-                            merge_norm_oi = prefill_blk_oi[
-                                merge_norm_block_row0 : merge_norm_block_row0 + HEAD_TILE,
-                                0 : HEAD_DIM,
-                            ]
+                            row0 = merge_norm_t_local * HEAD_TILE * PREFILL_ATTN_BLOCKS
+                            merge_norm_mi = prefill_blk_mi[row0:row0 + HEAD_TILE, :]
+                            merge_norm_li = prefill_blk_li[row0:row0 + HEAD_TILE, :]
+                            merge_norm_oi = prefill_blk_oi[row0:row0 + HEAD_TILE, :]
 
-                            # Online-softmax merge of the remaining sparse blocks,
-                            # unconditional (decode parity): an all-invalid block has
-                            # mi == -inf, so beta == 0 leaves li/oi unchanged. Updating the
-                            # carry every iteration avoids the pl.range conditional-carry
-                            # phi corruption that an `if valid` guard would trigger.
+                            # Merge the remaining blocks unconditionally: an all-invalid block has
+                            # mi == -inf so beta == 0 leaves li/oi unchanged. Updating the carry
+                            # every iteration avoids the pl.range conditional-carry phi corruption.
                             for merge_norm_sb in pl.range(1, PREFILL_ATTN_BLOCKS):
-                                merge_norm_sb_row = (
-                                    merge_norm_t_local * HEAD_TILE * PREFILL_ATTN_BLOCKS
-                                    + merge_norm_sb * HEAD_TILE
-                                )
-                                merge_norm_cur_mi = prefill_blk_mi[
-                                    merge_norm_sb_row : merge_norm_sb_row + HEAD_TILE,
-                                    0 : 1,
-                                ]
-                                merge_norm_cur_li = prefill_blk_li[
-                                    merge_norm_sb_row : merge_norm_sb_row + HEAD_TILE,
-                                    0 : 1,
-                                ]
-                                merge_norm_cur_oi = prefill_blk_oi[
-                                    merge_norm_sb_row : merge_norm_sb_row + HEAD_TILE,
-                                    0 : HEAD_DIM,
-                                ]
-                                merge_norm_mi_new = pl.maximum(merge_norm_mi, merge_norm_cur_mi)
-                                merge_norm_alpha = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new))
-                                merge_norm_beta = pl.exp(pl.sub(merge_norm_cur_mi, merge_norm_mi_new))
-                                merge_norm_li = pl.add(
-                                    pl.mul(merge_norm_alpha, merge_norm_li),
-                                    pl.mul(merge_norm_beta, merge_norm_cur_li),
-                                )
-                                merge_norm_oi = pl.add(
-                                    pl.row_expand_mul(merge_norm_oi, merge_norm_alpha),
-                                    pl.row_expand_mul(merge_norm_cur_oi, merge_norm_beta),
-                                )
-                                merge_norm_mi = merge_norm_mi_new
+                                sb_row = row0 + merge_norm_sb * HEAD_TILE
+                                cur_mi = prefill_blk_mi[sb_row:sb_row + HEAD_TILE, :]
+                                cur_li = prefill_blk_li[sb_row:sb_row + HEAD_TILE, :]
+                                cur_oi = prefill_blk_oi[sb_row:sb_row + HEAD_TILE, :]
+                                mi_new = pl.maximum(merge_norm_mi, cur_mi)
+                                alpha = pl.exp(pl.sub(merge_norm_mi, mi_new))
+                                beta = pl.exp(pl.sub(cur_mi, mi_new))
+                                merge_norm_li = pl.add(pl.mul(alpha, merge_norm_li), pl.mul(beta, cur_li))
+                                merge_norm_oi = pl.add(pl.row_expand_mul(merge_norm_oi, alpha),
+                                                       pl.row_expand_mul(cur_oi, beta))
+                                merge_norm_mi = mi_new
 
-                            merge_norm_sink_bias = pl.reshape(attn_sink[h0 : h0 + HEAD_TILE], [HEAD_TILE, 1])
-                            merge_norm_sink_tile = pl.add(pl.sub(merge_norm_mi, merge_norm_mi), merge_norm_sink_bias)
-                            merge_norm_denom = pl.add(
-                                merge_norm_li,
-                                pl.exp(pl.sub(merge_norm_sink_tile, merge_norm_mi)),
-                            )
-                            merge_norm_out = pl.row_expand_div(merge_norm_oi, merge_norm_denom)
-                            attn_stage_full = merge_norm_out[0 : HEAD_TILE, 0 : HEAD_DIM]
-                            attn_stage_row = pl.cast(
-                                attn_stage_full,
-                                target_type=pl.BF16,
-                                mode="rint",
-                            )
+                            sink_bias = pl.reshape(attn_sink[h0:h0 + HEAD_TILE], [HEAD_TILE, 1])
+                            sink_tile = pl.add(pl.sub(merge_norm_mi, merge_norm_mi), sink_bias)
+                            denom = pl.add(merge_norm_li, pl.exp(pl.sub(sink_tile, merge_norm_mi)))
+                            attn_stage_full = pl.row_expand_div(merge_norm_oi, denom)[0:HEAD_TILE, :]
+                            attn_stage_row = pl.cast(attn_stage_full, target_type=pl.BF16, mode="rint")
                         else:
                             attn_stage_full = zero_head_tile_fp32
                             attn_stage_row = zero_head_tile
 
-                        attn_rope_stage = pl.assemble(
-                            attn_rope_stage,
-                            attn_stage_full[0 : HEAD_TILE, NOPE_DIM:HEAD_DIM],
-                            [merge_norm_head_row, 0],
-                        )
+                        attn_rope_stage[merge_norm_head_row:merge_norm_head_row + HEAD_TILE, :] = \
+                            attn_stage_full[0:HEAD_TILE, NOPE_DIM:HEAD_DIM]
 
                         for merge_norm_head_i in pl.range(HEAD_TILE):
-                            merge_norm_global_head = h0 + merge_norm_head_i
-                            merge_norm_g = merge_norm_global_head // HEADS_PER_GROUP
-                            merge_norm_hh = merge_norm_global_head - merge_norm_g * HEADS_PER_GROUP
-                            merge_norm_pack_row = merge_norm_g * T + merge_norm_t
-                            merge_norm_head_col = merge_norm_hh * HEAD_DIM
-                            o_packed = pl.assemble(
-                                o_packed,
-                                attn_stage_row[merge_norm_head_i : merge_norm_head_i + 1, 0:NOPE_DIM],
-                                [merge_norm_pack_row, merge_norm_head_col],
-                            )
+                            gh = h0 + merge_norm_head_i
+                            g = gh // HEADS_PER_GROUP
+                            pack_row = g * T + merge_norm_t
+                            col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
+                            o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = \
+                                attn_stage_row[merge_norm_head_i:merge_norm_head_i + 1, 0:NOPE_DIM]
 
     # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
     # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
@@ -345,7 +272,7 @@ def _prefill_hca_sparse_from_gathered_kv(
     o_r_amax_parts = pl.create_tensor([A_AMAX_BLOCKS, T], dtype=pl.FP32)
     o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
 
-    # Stage 5: grouped BF16 projection `o_packed @ wo_a^T`.
+    # Grouped BF16 projection o_packed @ wo_a^T, with per-row amax for the INT8 quant.
     for g in pl.parallel(0, O_GROUPS, 1):
         row_base_o = g * T
         out_col_g = g * O_LORA
@@ -354,7 +281,7 @@ def _prefill_hca_sparse_from_gathered_kv(
             n0 = nb * A_N_TILE
 
             for proj_t0 in pl.parallel(0, T, PROJ_TOKEN_TILE):
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_a_accum_tile"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a"):
                     xa0_chunk = o_packed[row_base_o + proj_t0:row_base_o + proj_t0 + PROJ_TOKEN_TILE, 0:A_K_TILE]
                     wa0_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, 0:A_K_TILE]
                     acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
@@ -367,7 +294,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                         wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, k0:k0 + A_K_TILE]
                         acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
 
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_a_store_amax_tile"):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_amax"):
                     acc_a_2d = pl.reshape(acc_a, [PROJ_TOKEN_TILE, A_N_TILE])
                     o_r[proj_t0:proj_t0 + PROJ_TOKEN_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_a_2d
                     acc_a_abs = pl.maximum(acc_a_2d, pl.neg(acc_a_2d))
@@ -378,11 +305,8 @@ def _prefill_hca_sparse_from_gathered_kv(
                         proj_t0:proj_t0 + PROJ_TOKEN_TILE,
                     ] = acc_a_amax
 
-    # Stage 6: per-row symmetric INT8 activation quantization. Split the
-    # output-rank dimension into two SPMD blocks, matching the decode path, so
-    # quantization does not serialize the full O_GROUPS * O_LORA width in one
-    # task.
-    for quant_block in pl.spmd((T // QUANT_TOKEN_TILE) * 2, name_hint="prefill_hca_stage_b_quant_k_tile"):
+    # Per-row symmetric INT8 activation quant; K-dim split into 2 SPMD blocks.
+    for quant_block in pl.spmd((T // QUANT_TOKEN_TILE) * 2, name_hint="quant"):
         quant_t_block = quant_block // 2
         quant_k_block = quant_block - quant_t_block * 2
         quant_t0 = quant_t_block * QUANT_TOKEN_TILE
@@ -408,12 +332,12 @@ def _prefill_hca_sparse_from_gathered_kv(
                 mode="trunc",
             )
 
-    # Stage 7: INT8 output projection and dequantization.
+    # INT8 output projection, then dequant to BF16.
     for nb in pl.parallel(0, B_N_BLOCKS, 1):
         n0 = nb * B_N_TILE
 
         for proj_t0 in pl.parallel(0, T, PROJ_TOKEN_TILE):
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_b_accum_tile"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b"):
                 xb0_chunk = o_r_i8[proj_t0:proj_t0 + PROJ_TOKEN_TILE, 0:B_K_TILE]
                 wb0_chunk = wo_b[n0:n0 + B_N_TILE, 0:B_K_TILE]
                 acc_b = pl.matmul(xb0_chunk, wb0_chunk, b_trans=True, out_dtype=pl.INT32)
@@ -423,7 +347,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                     wb_k_chunk = wo_b[n0:n0 + B_N_TILE, k0:k0 + B_K_TILE]
                     acc_b = pl.matmul_acc(acc_b, xb_k_chunk, wb_k_chunk, b_trans=True)
 
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_stage_b_store_tile"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_b_store"):
                 wb_scale_chunk = pl.reshape(wo_b_scale[n0:n0 + B_N_TILE], [1, B_N_TILE])
                 attn_chunk = pl.cast(acc_b, target_type=pl.FP32, mode="none")
                 attn_scale_tile = o_r_scale_dq[proj_t0:proj_t0 + PROJ_TOKEN_TILE, 0:1]
@@ -475,7 +399,7 @@ def prefill_sparse_attn(
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.INT32)
 
-    # Stage 1: gather historical ring rows, current suffix overlay rows, and compressed rows.
+    # Gather sliding-window, current-overlay, and compressed KV rows per token.
     for gather_block in pl.spmd(((T + HCA_GATHER_TOKEN_TILE - 1) // HCA_GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="prefill_hca_overlay_gather_kv_block"):
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
         gather_sb = gather_block - gather_token_block * PREFILL_ATTN_BLOCKS
@@ -505,37 +429,28 @@ def prefill_sparse_attn(
                                 gather_blk = pl.cast(pl.read(ori_block_table, [gather_block_slot]), pl.INDEX)
                                 gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
                                 gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    ori_kv_flat[gather_src_row:gather_src_row + 1, :]
                             elif gather_raw < WIN + T:
                                 gather_overlay_row = pl.cast(gather_raw - WIN, pl.INDEX)
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    kv_overlay[gather_overlay_row : gather_overlay_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    kv_overlay[gather_overlay_row:gather_overlay_row + 1, :]
                             else:
                                 gather_cmp_slot = gather_raw - (WIN + T)
                                 gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
                                 gather_cmp_blk = pl.cast(pl.read(cmp_block_table, [gather_cmp_block_slot]), pl.INDEX)
                                 gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
                                 gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    cmp_kv_flat[gather_cmp_src_row:gather_cmp_src_row + 1, :]
                         else:
-                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                            sparse_kv[gather_dst_row:gather_dst_row + 1, :] = zero_kv_row
                 else:
                     for gather_ki in pl.pipeline(0, PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
                         pl.write(sparse_indices_eff, [gather_t, gather_k], pl.cast(-1, pl.INT32))
                         gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
-                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                        sparse_kv[gather_dst_row:gather_dst_row + 1, :] = zero_kv_row
 
     attn_out = _prefill_hca_sparse_from_gathered_kv(
         q,
@@ -608,37 +523,28 @@ def prefill_sparse_attn_padded_indices(
                                 gather_blk = pl.cast(pl.read(ori_block_table, [gather_block_slot]), pl.INDEX)
                                 gather_intra = gather_ori_slot - gather_block_slot * BLOCK_SIZE
                                 gather_src_row = gather_blk * BLOCK_SIZE + gather_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    ori_kv_flat[gather_src_row : gather_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    ori_kv_flat[gather_src_row:gather_src_row + 1, :]
                             elif gather_raw < WIN + T:
                                 gather_overlay_row = pl.cast(gather_raw - WIN, pl.INDEX)
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    kv_overlay[gather_overlay_row : gather_overlay_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    kv_overlay[gather_overlay_row:gather_overlay_row + 1, :]
                             else:
                                 gather_cmp_slot = gather_raw - (WIN + T)
                                 gather_cmp_block_slot = gather_cmp_slot // BLOCK_SIZE
                                 gather_cmp_blk = pl.cast(pl.read(cmp_block_table, [gather_cmp_block_slot]), pl.INDEX)
                                 gather_cmp_intra = gather_cmp_slot - gather_cmp_block_slot * BLOCK_SIZE
                                 gather_cmp_src_row = gather_cmp_blk * BLOCK_SIZE + gather_cmp_intra
-                                sparse_kv = pl.assemble(
-                                    sparse_kv,
-                                    cmp_kv_flat[gather_cmp_src_row : gather_cmp_src_row + 1, 0 : HEAD_DIM],
-                                    [gather_dst_row, 0],
-                                )
+                                sparse_kv[gather_dst_row:gather_dst_row + 1, :] = \
+                                    cmp_kv_flat[gather_cmp_src_row:gather_cmp_src_row + 1, :]
                         else:
-                            sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                            sparse_kv[gather_dst_row:gather_dst_row + 1, :] = zero_kv_row
                 else:
                     for gather_ki in pl.pipeline(0, PREFILL_ATTN_TILE, stage=4):
                         gather_k = gather_k0 + gather_ki
                         pl.write(sparse_indices_eff, [gather_t, gather_k], pl.cast(-1, pl.INT32))
                         gather_dst_row = gather_t * PREFILL_SPARSE_PAD + gather_k
-                        sparse_kv = pl.assemble(sparse_kv, zero_kv_row, [gather_dst_row, 0])
+                        sparse_kv[gather_dst_row:gather_dst_row + 1, :] = zero_kv_row
 
     attn_out = _prefill_hca_sparse_from_gathered_kv(
         q,
@@ -912,63 +818,14 @@ if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Standalone DeepSeek V4 prefill sparse-attn validation. "
-            "The kernel consumes prebuilt overlay raw indices; --compress-ratio only controls "
-            "the deterministic fixture/golden sparse-index pattern."
-        )
-    )
-    parser.add_argument(
-        "-p", "--platform",
-        type=str,
-        default="a2a3",
-        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-        help="PyPTO compile/runtime backend for this standalone validation. Default: %(default)s.",
-    )
-    parser.add_argument(
-        "-d", "--device",
-        type=int,
-        default=0,
-        help="NPU device id passed to runtime_cfg.device_id. Under task-submit, '{}' is usually substituted here.",
-    )
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
-    parser.add_argument(
-        "--compress-ratio",
-        type=int,
-        default=DEFAULT_COMPRESS_RATIO,
-        choices=list(SUPPORTED_COMPRESS_RATIOS),
-        help=(
-            "Standalone sparse-index fixture mode: 0 uses current-suffix overlay KV only; "
-            "4 and 128 append deterministic visible compressed slots."
-        ),
-    )
-    parser.add_argument(
-        "--enable-l2-swimlane",
-        nargs="?",
-        const=4,
-        default=0,
-        type=int,
-        metavar="PERF_LEVEL",
-        help=(
-            "Enable L2 swimlane profiling/report generation. May be passed without a value "
-            "to use level 4, or with an explicit PERF_LEVEL."
-        ),
-    )
-    parser.add_argument(
-        "--enable-pmu",
-        nargs="?",
-        const=2,
-        default=0,
-        type=int,
-        choices=[0, 1, 2, 4],
-        help="Enable PMU profiling level for runtime_cfg. Omit for 0; pass without value for level 2.",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
+                        choices=list(SUPPORTED_COMPRESS_RATIOS))
+    parser.add_argument("--enable-l2-swimlane", nargs="?", const=4, default=0, type=int)
+    parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
     result = run_jit(
