@@ -185,11 +185,6 @@ def attention_csa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    # Half-width unsigned inverse-RoPE snapshots for the split-half sparse_attn: the first
-    # HALF columns of the per-token cos/sin (one value per frequency), cast BF16->FP32 once per
-    # token so sparse_attn's per-head rope loop rotates with no in-loop cast and no gather.
-    rope_cos_half_t = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
-    rope_sin_half_t = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
@@ -204,10 +199,6 @@ def attention_csa(
                 sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
                 rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16), [t, 0])
                 rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16), [t, 0])
-                rope_cos_half_t = pl.assemble(
-                    rope_cos_half_t, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [pos_b, 0]), target_type=pl.FP32), [t, 0])
-                rope_sin_half_t = pl.assemble(
-                    rope_sin_half_t, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [pos_b, 0]), target_type=pl.FP32), [t, 0])
             step_cos = pl.assemble(step_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
             step_sin = pl.assemble(step_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
 
@@ -360,8 +351,8 @@ def attention_csa(
         cmp_block_table,
         cmp_sparse_indices,
         attn_sink,
-        rope_cos_half_t,
-        rope_sin_half_t,
+        rope_cos_t,
+        rope_sin_t,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -526,9 +517,6 @@ def golden_attention_csa(tensors):
     freqs_sin = tensors["freqs_sin"]
     rope_cos_t = freqs_cos[position_ids].contiguous()
     rope_sin_t = freqs_sin[position_ids].contiguous()
-    # Half-width unsigned inverse-RoPE tables (first HALF columns, FP32) for the split-half sparse_attn golden.
-    rope_cos_half_t = freqs_cos[position_ids, :HALF_ROPE].float().contiguous()
-    rope_sin_half_t = freqs_sin[position_ids, :HALF_ROPE].float().contiguous()
     first_pos = position_ids.reshape(B, S)[:, 0]
     step_cos = freqs_cos[first_pos, :HALF_ROPE].float().contiguous()
     step_sin = freqs_sin[first_pos, :HALF_ROPE].float().contiguous()
@@ -650,8 +638,8 @@ def golden_attention_csa(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
         "attn_sink": tensors["attn_sink"],
-        "rope_cos_half": rope_cos_half_t,
-        "rope_sin_half": rope_sin_half_t,
+        "freqs_cos": rope_cos_t,
+        "freqs_sin": rope_sin_t,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],

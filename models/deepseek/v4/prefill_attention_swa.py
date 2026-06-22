@@ -148,25 +148,6 @@ def prefill_attention_swa(
         rope_sin_t,
     )
 
-    # Half-width FP32 inverse-RoPE tables for the split-half prefill_sparse_attn: the first
-    # HALF_ROPE columns (one value per frequency) of the per-token cos/sin rows, cast BF16->FP32
-    # once so the inverse rope rotates with contiguous lo/hi slices (no j^1 swap-gather and no
-    # in-kernel dup-gather pre-pass). Same first-HALF columns qkv_proj_rope's forward rope
-    # consumes -> a single rope profile. Mirrors decode_attention_swa's rope_cos_half_t.
-    rope_cos_half = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
-    rope_sin_half = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_rope_half"):
-        # Identity-init all T rows (cos=1, sin=0) so padding rows (>= num_tokens) stay finite:
-        # prefill_sparse_attn rotates all T rows.
-        rope_cos_half[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=1.0)
-        rope_sin_half[0:T, 0:HALF_ROPE] = pl.full([T, HALF_ROPE], dtype=pl.FP32, value=0.0)
-        for half_t in pl.range(T):
-            if half_t < num_tokens:
-                rope_cos_half[half_t : half_t + 1, 0:HALF_ROPE] = pl.cast(
-                    rope_cos_t[half_t : half_t + 1, 0:HALF_ROPE], target_type=pl.FP32)
-                rope_sin_half[half_t : half_t + 1, 0:HALF_ROPE] = pl.cast(
-                    rope_sin_t[half_t : half_t + 1, 0:HALF_ROPE], target_type=pl.FP32)
-
     # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -205,8 +186,8 @@ def prefill_attention_swa(
         cmp_sparse_lens,
         attn_sink,
         num_tokens,
-        rope_cos_half,
-        rope_sin_half,
+        rope_cos_t,
+        rope_sin_t,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -337,10 +318,6 @@ def golden_prefill_attention_swa(tensors):
     positions = tensors["position_ids"].to(torch.long)
     rope_cos_t = tensors["freqs_cos"].index_select(0, positions).contiguous()
     rope_sin_t = tensors["freqs_sin"].index_select(0, positions).contiguous()
-    # Half-width FP32 inverse-RoPE tables for the split-half golden_prefill_sparse_attn.
-    # Mirrors decode_attention_csa/_swa: freqs_cos[positions, :HALF_ROPE].float().
-    rope_cos_half_t = rope_cos_t[:, :HALF_ROPE].float().contiguous()
-    rope_sin_half_t = rope_sin_t[:, :HALF_ROPE].float().contiguous()
     golden_qkv_proj_rope({
         "x": x_normed,
         "wq_a": tensors["wq_a"],
@@ -370,8 +347,8 @@ def golden_prefill_attention_swa(tensors):
         "cmp_sparse_lens": tensors["cmp_sparse_lens"],
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],
-        "rope_cos_half": rope_cos_half_t,
-        "rope_sin_half": rope_sin_half_t,
+        "freqs_cos": rope_cos_t,
+        "freqs_sin": rope_sin_t,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],

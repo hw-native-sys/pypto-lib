@@ -652,10 +652,6 @@ def build_tensor_specs(start_pos=None, layer_id=10):
         "csa": csa_specs,
     }[attention_kind]
 
-    # Split-half (NeoX) RoPE: the sparse_attn kernels read the half-width unsigned cos/sin
-    # straight from the first HALF columns of freqs_cos/freqs_sin (the caller slices them), so
-    # there is no separate interleaved/sign-folded table -- one rope profile for qkv + sparse_attn.
-
     replicated_attention = {
         "hc_attn_fn",
         "hc_attn_scale",

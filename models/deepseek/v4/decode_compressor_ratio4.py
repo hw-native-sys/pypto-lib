@@ -195,23 +195,26 @@ def compressor_ratio4(
 
         kv_rope_norm = pooled_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
-        # Split-half (NeoX) forward RoPE, gather-free. rope segment = [x_lo | x_hi] = dims
-        # [0:rh | rh:ROPE_HEAD_DIM]; partner of lane k is k+rh (contiguous slice, no j^1 gather
-        # and no j>>1 dup-gather -- cos_b/sin_b are already half-width). gamma is per-column so
-        # it does NOT commute with the rotation: fold gamma_lo onto x_lo, gamma_hi onto x_hi
-        # BEFORE rotating; inv_rms is per-row and commutes. gamma is cast to FP32 (norm_w is
-        # BF16 since #568) so the fold runs in FP32, matching the NOPE branch and float golden.
-        #   out_lo = x_lo*cos - x_hi*sin ;  out_hi = x_lo*sin + x_hi*cos
-        gamma_lo = gamma_rope[0:1, 0 : ROPE_HEAD_DIM // 2]
-        gamma_hi = gamma_rope[0:1, ROPE_HEAD_DIM // 2 : ROPE_HEAD_DIM]
-        kv_lo = kv_rope_norm[0 : RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-        kv_hi = kv_rope_norm[0 : RMS_TILE, ROPE_HEAD_DIM // 2 : ROPE_HEAD_DIM]
-        lo_n = pl.col_expand_mul(pl.row_expand_mul(kv_lo, inv_rms), gamma_lo)
-        hi_n = pl.col_expand_mul(pl.row_expand_mul(kv_hi, inv_rms), gamma_hi)
-        out_lo = pl.sub(pl.mul(lo_n, cos_b), pl.mul(hi_n, sin_b))   # x_lo*c - x_hi*s
-        out_hi = pl.add(pl.mul(lo_n, sin_b), pl.mul(hi_n, cos_b))   # x_lo*s + x_hi*c
-        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : NOPE_HEAD_DIM + ROPE_HEAD_DIM // 2] = out_lo
-        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM + ROPE_HEAD_DIM // 2 : HEAD_DIM] = out_hi
+        # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
+        # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
+        # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
+        # carries gamma[j^1]; inv_rms is per-row so it commutes. swap_idx (j^1), sign
+        # ([-1,+1,...]) and dup_idx (j>>1) are built IN-KERNEL from pl.arange; cos_il/sin_il
+        # are dup-gathered from the per-batch cos/sin rows. normed_kv is FP32 -> write directly.
+        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        rope_ones = pl.full([RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
+        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
+        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
+        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        normed_kv[batch_base : batch_base + RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
     for batch_base_idx in pl.spmd(B // RMS_TILE, name_hint="kv_and_cache_write"):
         batch_base = batch_base_idx * RMS_TILE
@@ -358,15 +361,13 @@ def golden_compressor(tensors):
         boundary_s = ratio - 1 - (first_pos % ratio)
         kv_b = rmsnorm(pooled[b : b + 1], norm_w)
 
-        # Split-half (NeoX) forward RoPE: lo = first rd/2 rope dims, hi = last rd/2.
-        rope = kv_b[..., -rd:]
-        x_lo = rope[..., : rd // 2]
-        x_hi = rope[..., rd // 2 :]
+        x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
+        x0, x1 = x_pair[..., 0], x_pair[..., 1]
         cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
-        y_lo = x_lo * cos_v - x_hi * sin_v
-        y_hi = x_lo * sin_v + x_hi * cos_v
+        y0 = x0 * cos_v - x1 * sin_v
+        y1 = x0 * sin_v + x1 * cos_v
 
-        kv_b = torch.cat([kv_b[..., :-rd], y_lo, y_hi], dim=-1)
+        kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
         # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0
         # so the golden matches its [B, S, HEAD_DIM] zero-init.
