@@ -13,7 +13,7 @@ import pypto.language as pl
 
 from config import FP32_NEG_INF
 from decode_indexer_compressor import *  # noqa: F401,F403
-from prefill_sparse_attn import CMP_MAX_BLOCKS as IDX_CACHE_MAX_BLOCKS, HCA_CMP_BLOCK_NUM as PREFILL_IDX_BLOCK_NUM
+from prefill_sparse_attn import CMP_MAX_BLOCKS as IDX_CACHE_MAX_BLOCKS, CMP_MAX_BLOCKS as PREFILL_IDX_BLOCK_NUM
 
 B = 1
 S = 128

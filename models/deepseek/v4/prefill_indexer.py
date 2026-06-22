@@ -27,7 +27,7 @@ from prefill_indexer_compressor import (
 )
 from prefill_sparse_attn import (
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
-    HCA_CMP_BLOCK_NUM as PREFILL_IDX_BLOCK_NUM,
+    CMP_MAX_BLOCKS as PREFILL_IDX_BLOCK_NUM,
     WIN,
 )
 

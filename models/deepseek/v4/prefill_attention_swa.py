@@ -22,7 +22,6 @@ from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
-    HCA_CMP_BLOCK_NUM as SPARSE_HCA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
     ORI_BLOCK_NUM as SPARSE_ORI_BLOCK_NUM,
     ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
@@ -167,7 +166,7 @@ def prefill_attention_swa(
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    cmp_kv_dummy = pl.create_tensor([SPARSE_HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
         for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
@@ -338,7 +337,7 @@ def golden_prefill_attention_swa(tensors):
         "ori_kv": kv_cache_in,
         "ori_block_table": tensors["block_table"],
         "kv_overlay": kv,
-        "cmp_kv": torch.zeros(SPARSE_HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
+        "cmp_kv": torch.zeros(SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
         "cmp_block_table": torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
         "cmp_sparse_indices": tensors["cmp_sparse_indices"],
         "cmp_sparse_lens": tensors["cmp_sparse_lens"],

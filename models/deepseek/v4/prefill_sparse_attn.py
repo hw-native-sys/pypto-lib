@@ -48,15 +48,11 @@ ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
-# Single-request KV-cache block counts, re-exported for the prefill swa/hca/csa
-# attention, indexer, and compressor modules that share this op's cache layout.
-HCA_ORI_BLOCK_NUM = ORI_MAX_BLOCKS
-HCA_CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
 # Kernel tiling (mirrors decode sparse-attn).
 HEAD_TILE = 16                       # head-tile granularity for storage / merge
 QK_M_TILE = 32                       # head rows cube-batched per QK/PV matmul
-HCA_GATHER_TOKEN_TILE = 4
+GATHER_TOKEN_TILE = 4
 BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
 ROPE_OUT_TOK_TILE = T // 2
@@ -110,12 +106,12 @@ def prefill_sparse_attn(
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.INT32)
-    for gather_block in pl.spmd(((T + HCA_GATHER_TOKEN_TILE - 1) // HCA_GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
+    for gather_block in pl.spmd(((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
         gather_sb = gather_block - gather_token_block * PREFILL_ATTN_BLOCKS
-        gather_t0 = gather_token_block * HCA_GATHER_TOKEN_TILE
+        gather_t0 = gather_token_block * GATHER_TOKEN_TILE
         gather_k0 = gather_sb * PREFILL_ATTN_TILE
-        for gather_dt in pl.range(HCA_GATHER_TOKEN_TILE):
+        for gather_dt in pl.range(GATHER_TOKEN_TILE):
             gather_t = gather_t0 + gather_dt
             if gather_t < T:
                 block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
