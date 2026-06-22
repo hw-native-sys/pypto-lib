@@ -545,9 +545,7 @@ def error_distribution(
         # frac>thd: floored relative diff, same rule as ratio_reldiff.
         for thd in diff_thds:
             floor = (1.0 / (1 << 14)) / thd
-            denom = torch.maximum(
-                torch.maximum(a.abs(), e.abs()), torch.full_like(a, floor)
-            ) + 1e-9
+            denom = torch.maximum(a.abs(), e.abs()).clamp_min(floor) + 1e-9
             rdiff = torch.where(diff < thd, diff, diff / denom)
             bad = rdiff > thd
             ec = int(bad.sum().item())
@@ -557,6 +555,10 @@ def error_distribution(
             )
 
         def _pct(label: str, flat: torch.Tensor) -> None:
+            flat = flat[torch.isfinite(flat)]
+            if flat.numel() == 0:
+                print(f"  {label}: (no finite values)")
+                return
             pv = torch.quantile(flat, qs)
             print(
                 f"  {label}: "
