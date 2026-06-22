@@ -70,6 +70,9 @@ QUANT_K_TILE = O_GROUPS * O_LORA // 2
 PREFILL_ATTN_TILE = 128
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
 PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
+# Columns of the padded sparse window that carry a real cmp_sparse_indices entry
+# (the rest of the [TOPK, PREFILL_SPARSE_PAD) tail, if any, is always masked).
+SPARSE_BIAS_COLS = min(TOPK, PREFILL_SPARSE_PAD)
 
 @pl.jit.inline
 def prefill_sparse_attn(
@@ -105,7 +108,6 @@ def prefill_sparse_attn(
     ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
-    sparse_indices_eff = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.INT32)
     for gather_block in pl.spmd(((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
         gather_sb = gather_block - gather_token_block * PREFILL_ATTN_BLOCKS
@@ -127,7 +129,6 @@ def prefill_sparse_attn(
                         if gather_k < TOPK:
                             if gather_k < gather_len_eff:
                                 gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
-                        pl.write(sparse_indices_eff, [gather_t, gather_k], gather_raw)
                         if gather_raw >= 0:
                             if gather_raw < WIN:
                                 blk_slot = gather_raw // BLOCK_SIZE
@@ -143,19 +144,28 @@ def prefill_sparse_attn(
                                 blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
                                 src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
                                 stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
-                else:
-                    for gather_ki in pl.range(PREFILL_ATTN_TILE):
-                        pl.write(sparse_indices_eff, [gather_t, gather_k0 + gather_ki], pl.cast(-1, pl.INT32))
                 sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
-    # Additive softmax bias: 0 for valid raw indices, FP32_NEG_INF for padding, so the QK
-    # softmax masks invalid slots without rescanning validity per head.
+    # Additive softmax bias: 0 for valid slots, FP32_NEG_INF for padding, so the QK softmax
+    # masks invalid slots without rescanning validity per head. A slot is valid when its raw
+    # index is >= 0 AND its column lies inside the per-token cmp_sparse_lens prefix; the
+    # [TOPK, PREFILL_SPARSE_PAD) tail (no raw index exists) is always masked.
+    cmp_sparse_lens_2d = pl.reshape(cmp_sparse_lens, [T, 1])
     sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
     for bias_blk in pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias"):
         bias_t0 = bias_blk * BIAS_TOKEN_TILE
-        bias_idx = pl.cast(sparse_indices_eff[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:PREFILL_SPARSE_PAD], target_type=pl.FP32)
-        bias_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
-        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:PREFILL_SPARSE_PAD] = pl.mul(pl.sub(bias_flag, 1.0), -FP32_NEG_INF)
+        bias_idx = pl.cast(cmp_sparse_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_BIAS_COLS], target_type=pl.FP32)
+        bias_raw_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
+        bias_col = pl.col_expand(
+            pl.full([BIAS_TOKEN_TILE, SPARSE_BIAS_COLS], dtype=pl.FP32, value=0.0),
+            pl.cast(pl.arange(0, [1, SPARSE_BIAS_COLS], dtype=pl.INT32), target_type=pl.FP32))
+        bias_len = pl.cast(cmp_sparse_lens_2d[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:1], target_type=pl.FP32)
+        bias_len_flag = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(bias_col, bias_len)), 0.0), 1.0)
+        bias_valid = pl.mul(bias_raw_flag, bias_len_flag)
+        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_BIAS_COLS] = pl.mul(pl.sub(bias_valid, 1.0), -FP32_NEG_INF)
+        if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
+            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = pl.full(
+                [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
 
     # Block OUTER (one KV/bias load per block), head-batch INNER (QK_M_TILE rows per matmul,
     # sliced to HEAD_TILE stores). qk_kv_k/qk_kv_v are two views so QK (b_trans) and PV don't
