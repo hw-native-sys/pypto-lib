@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
 """DeepSeek-V4 packed prefill CSA attention.
 
 This module wires HC pre/post, ratio-4 compressor, indexer, sparse attention,
@@ -26,7 +25,6 @@ from config import (
     PREFILL_SEQ,
 )
 
-from decode_attention_csa import *  # noqa: F401,F403
 from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
@@ -45,9 +43,6 @@ from prefill_indexer_compressor import (
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
-    CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
-    ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
-    PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
     prefill_sparse_attn,
@@ -91,7 +86,17 @@ SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 Q_PROJ_OUT_CHUNK = 128
 Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
+CSA_TOPK_TOKEN_TILE = 2
 
+
+# prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
+PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
+SPARSE_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+PREFILL_SPARSE_TOPK = min(SPARSE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
+PREFILL_ATTN_TILE = 128
+PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
+SPARSE_PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS

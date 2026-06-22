@@ -15,7 +15,6 @@ tokens.
 
 import pypto.language as pl
 
-from prefill_sparse_attn import CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS
 from config import BLOCK_SIZE, FLASH as M, PREFILL_BATCH, PREFILL_SEQ
 
 
@@ -54,7 +53,10 @@ HCA_STATE_BLOCK_NUM = HCA_STATE_MAX_BLOCKS
 ROPE_DIM = ROPE_HEAD_DIM
 NOPE_DIM = NOPE_HEAD_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-HCA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
+# Compressed-KV cache pool consumed by prefill_sparse_attn: one BLOCK_SIZE page
+# per PREFILL_MAX_COMPRESSED compressed entries.
+PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_window // 2))
+HCA_CMP_BLOCK_NUM = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 CMP_K_CHUNK = K_CHUNK
 CMP_OUT_CHUNK = OUT_CHUNK
 CMP_HEAD_CHUNK = HEAD_CHUNK

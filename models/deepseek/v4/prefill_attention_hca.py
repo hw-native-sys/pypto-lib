@@ -30,11 +30,6 @@ from prefill_compressor_ratio128 import (
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
-    CMP_BLOCK_NUM as SPARSE_CMP_BLOCK_NUM,
-    CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
-    ORI_BLOCK_NUM as SPARSE_ORI_BLOCK_NUM,
-    ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
-    TOPK as SPARSE_TOPK,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
     prefill_sparse_attn,
@@ -56,6 +51,7 @@ NOPE_DIM = NOPE_HEAD_DIM
 Q_LORA = M.q_lora_rank
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
+IDX_TOPK = M.index_topk
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -63,6 +59,14 @@ O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
+
+# prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
+SPARSE_TOPK = WIN + IDX_TOPK
+SPARSE_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+SPARSE_ORI_BLOCK_NUM = B * SPARSE_ORI_MAX_BLOCKS
+PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
+SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
 
 COMPRESS_RATIO = 128
 MAIN_OUT_DIM = HEAD_DIM

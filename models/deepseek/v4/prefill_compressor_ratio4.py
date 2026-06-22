@@ -6,14 +6,32 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
 """DeepSeek-V4 prefill attention compressor for ratio-4 overlapping KV cache (rotate=False)."""
 
 import pypto.language as pl
 
-from config import FP32_NEG_INF
-from decode_compressor_ratio4 import *  # noqa: F401,F403
-from prefill_sparse_attn import CMP_MAX_BLOCKS as PREFILL_CMP_BLOCK_NUM
+from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+
+# model config (mirrors decode_compressor_ratio4)
+EPS = M.rms_norm_eps
+D = M.hidden_size
+HEAD_DIM = M.head_dim
+HEAD_DIM_INV = 1.0 / HEAD_DIM
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.nope_head_dim
+MAX_SEQ_LEN = M.max_position_embeddings
+
+# kernel-local (ratio-4 overlapping compressor)
+COMPRESS_RATIO = 4
+OVERLAP = COMPRESS_RATIO == 4
+COFF = 1 + int(OVERLAP)
+OUT_DIM = COFF * HEAD_DIM
+STATE_LEN = COFF * COMPRESS_RATIO
+
+# Compressed-KV cache pool consumed by prefill_sparse_attn: one BLOCK_SIZE page
+# per PREFILL_MAX_COMPRESSED compressed entries (S=128 needs PREFILL_CMP_BLOCK_NUM pages).
+PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_window // 2))
+PREFILL_CMP_BLOCK_NUM = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
 B = 1
 S = 128

@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
 """DeepSeek-V4 packed prefill indexer.
 
 This module builds the compressed index KV cache and per-token compressed top-k
@@ -15,7 +14,7 @@ indices consumed by packed CSA prefill sparse attention.
 
 import pypto.language as pl
 
-from decode_indexer import *  # noqa: F401,F403
+from config import FLASH as M, BLOCK_SIZE
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
@@ -25,11 +24,29 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
-from prefill_sparse_attn import (
-    CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
-    CMP_MAX_BLOCKS as PREFILL_IDX_BLOCK_NUM,
-    WIN,
-)
+
+# model config (mirrors decode_indexer)
+D = M.hidden_size
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+IDX_N_HEADS = M.index_n_heads
+IDX_HEAD_DIM = M.index_head_dim
+MAX_SEQ_LEN = M.max_position_embeddings
+WIN = M.sliding_window
+
+# kernel-local
+COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
+IDX_TOPK = M.index_topk
+INNER_OVERLAP = COMPRESS_RATIO == 4
+INNER_COFF = 1 + int(INNER_OVERLAP)
+INNER_HEAD_DIM = IDX_HEAD_DIM
+INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
+CACHE_TILE = 32
+
+# Compressed index-KV cache pool consumed by prefill_sparse_attn: one BLOCK_SIZE
+# page per PREFILL_MAX_COMPRESSED compressed entries.
+PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
+SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+PREFILL_IDX_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
 
 B = 1
 S = 128

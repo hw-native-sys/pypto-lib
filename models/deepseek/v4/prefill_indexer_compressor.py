@@ -6,14 +6,33 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: F401,F403,F405,F821
 """DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
 
 import pypto.language as pl
 
-from config import FP32_NEG_INF
-from decode_indexer_compressor import *  # noqa: F401,F403
-from prefill_sparse_attn import CMP_MAX_BLOCKS as IDX_CACHE_MAX_BLOCKS, CMP_MAX_BLOCKS as PREFILL_IDX_BLOCK_NUM
+from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+
+# model config (mirrors decode_indexer_compressor)
+EPS = M.rms_norm_eps
+D = M.hidden_size
+HEAD_DIM = M.index_head_dim
+HEAD_DIM_INV = 1.0 / HEAD_DIM
+ROPE_HEAD_DIM = M.qk_rope_head_dim
+NOPE_HEAD_DIM = M.index_nope_head_dim
+MAX_SEQ_LEN = M.max_position_embeddings
+
+# kernel-local (ratio-4 overlapping compressor)
+COMPRESS_RATIO = 4
+OVERLAP = COMPRESS_RATIO == 4
+COFF = 1 + int(OVERLAP)
+OUT_DIM = COFF * HEAD_DIM
+STATE_LEN = COFF * COMPRESS_RATIO
+
+# Index-KV cache pool consumed by prefill_indexer: one BLOCK_SIZE page per
+# PREFILL_MAX_COMPRESSED compressed entries.
+PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_window // 2))
+IDX_CACHE_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+PREFILL_IDX_BLOCK_NUM = IDX_CACHE_MAX_BLOCKS
 
 B = 1
 S = 128
@@ -24,6 +43,7 @@ HEAD_CHUNK = 32
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_CHUNK = 512
 OUT_CHUNK = 64
+HEAD_TILE = 64
 
 T = B * S
 INNER_STATE_BLOCK_SIZE = 4
