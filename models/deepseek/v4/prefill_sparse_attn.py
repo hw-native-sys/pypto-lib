@@ -86,8 +86,13 @@ def prefill_sparse_attn(
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    # Half-width unsigned inverse-RoPE tables for the gather-free split-half rotate:
+    #   rope_cos_half = [c0,c1,...,c_{HALF-1}]   rope_sin_half = [s0,s1,...]  (one per freq)
+    # The rope segment is split-half ([x_lo | x_hi] = dims [0:HALF | HALF:ROPE_DIM]),
+    # so the rotation partner of lane k is lane k+HALF -- a contiguous slice, not a
+    # j^1 swap gather. FP32 so the rope loop reads them straight into its FP32 rotate.
+    rope_cos_half: pl.Tensor[[T, HALF_ROPE], pl.FP32],
+    rope_sin_half: pl.Tensor[[T, HALF_ROPE], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -248,56 +253,39 @@ def prefill_sparse_attn(
                 col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
                 o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_bf16[n_hi:n_hi + 1, 0:NOPE_DIM]
 
-    # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
-    # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
-    # segment and store it straight into o_packed (no rope_buf round-trip).
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...]
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
-
+    # Gather-free conjugate (inverse) split-half RoPE. The rope segment is laid out
+    # split-half ([x_lo | x_hi] = dims [0:HALF_ROPE | HALF_ROPE:ROPE_DIM]), so the
+    # rotation partner of lane k is lane k+HALF_ROPE -- a contiguous slice, never a
+    # j^1 swap gather. For k in [0, HALF_ROPE):
+    #   out_lo[k] = x_lo[k]*cos[k] + x_hi[k]*sin[k]
+    #   out_hi[k] = x_hi[k]*cos[k] - x_lo[k]*sin[k]
+    # cos/sin are half-width (one value per frequency); no in-kernel index build.
     attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
     for rp_idx in pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope"):
         rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
         rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
         rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
-        # Head-invariant swap index (j^1), built once and reused across the head group.
-        sp_col = pl.col_expand_mul(
-            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+        # Head-invariant half-width tables, hoisted once per task.
+        r_cos = rope_cos_half[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, 0 : HALF_ROPE]
+        r_sin = rope_sin_half[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, 0 : HALF_ROPE]
         for rp_hl in pl.range(0, 4):
             rp_gh = rp_hg * 4 + rp_hl
             rp_g = rp_gh // HEADS_PER_GROUP
             rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
             rp_col = rp_hh * HEAD_DIM + NOPE_DIM
             rp_o0 = rp_g * T + rp_t0
-            for r_r0 in pl.range(0, ROPE_HALF, ROPE_TILE):
-                c0 = 2 * r_r0
-                r_tile_fp32 = pl.reshape(
-                    attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE],
-                    [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
-                r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
-                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-                o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
+            # This head's full ROPE_DIM rope rows for this token tile (stride H).
+            # attn_rope_stage is already FP32, so read it directly -- no cast.
+            r_tile = pl.reshape(
+                attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, 0 : ROPE_DIM], [ROPE_OUT_TOK_TILE, ROPE_DIM])
+            r_lo = r_tile[0 : ROPE_OUT_TOK_TILE, 0 : HALF_ROPE]              # x_lo (contiguous, no gather)
+            r_hi = r_tile[0 : ROPE_OUT_TOK_TILE, HALF_ROPE : ROPE_DIM]       # x_hi (contiguous, no gather)
+            out_lo = pl.add(pl.mul(r_lo, r_cos), pl.mul(r_hi, r_sin))        # x_lo*c + x_hi*s
+            out_hi = pl.sub(pl.mul(r_hi, r_cos), pl.mul(r_lo, r_sin))        # x_hi*c - x_lo*s
+            # Two contiguous BF16-rounded stores into o_packed's rope columns
+            # (golden also rounds inverse-RoPE to bf16).
+            o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col : rp_col + HALF_ROPE] = pl.cast(out_lo, target_type=pl.BF16, mode="rint")
+            o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + HALF_ROPE : rp_col + ROPE_DIM] = pl.cast(out_hi, target_type=pl.BF16, mode="rint")
 
     # Grouped BF16 projection o_packed @ wo_a^T -> o_r, with per-row amax for the INT8
     # quant. Flattened (group, n-block) spmd; the BF16 store + amax vec post-process is
@@ -389,8 +377,8 @@ def prefill_sparse_attn_test(
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    rope_cos_half: pl.Tensor[[T, HALF_ROPE], pl.FP32],
+    rope_sin_half: pl.Tensor[[T, HALF_ROPE], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
@@ -407,8 +395,8 @@ def prefill_sparse_attn_test(
         cmp_sparse_lens,
         attn_sink,
         num_tokens,
-        freqs_cos,
-        freqs_sin,
+        rope_cos_half,
+        rope_sin_half,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -451,8 +439,8 @@ def golden_prefill_sparse_attn(tensors):
     cmp_sparse_indices = tensors["cmp_sparse_indices"]
     cmp_sparse_lens = tensors["cmp_sparse_lens"]
     attn_sink = tensors["attn_sink"].float()
-    cos = tensors["freqs_cos"].float()
-    sin = tensors["freqs_sin"].float()
+    cos = tensors["rope_cos_half"].float()
+    sin = tensors["rope_sin_half"].float()
     wo_a = tensors["wo_a"].float()
     wo_b_i8 = tensors["wo_b"]
     wo_b_scale = tensors["wo_b_scale"].float()
@@ -512,14 +500,15 @@ def golden_prefill_sparse_attn(tensors):
             denom = li + torch.exp(attn_sink.unsqueeze(-1) - mi)
             o[t] = oi / denom
 
-    rope_pair = o[..., NOPE_DIM:].unflatten(-1, (-1, 2))
-    rope_even = rope_pair[..., 0]
-    rope_odd = rope_pair[..., 1]
-    cos_half = cos[:, :ROPE_HALF].unsqueeze(1)
-    sin_half = sin[:, :ROPE_HALF].unsqueeze(1)
-    inv_even = (rope_even * cos_half + rope_odd * sin_half).to(torch.bfloat16).float()
-    inv_odd = (rope_odd * cos_half - rope_even * sin_half).to(torch.bfloat16).float()
-    o_rope = torch.stack([inv_even, inv_odd], dim=-1).flatten(-2)
+    # Split-half inverse RoPE: lo = dims [:HALF_ROPE], hi = dims [HALF_ROPE:].
+    rope_seg = o[..., NOPE_DIM:]
+    x_lo = rope_seg[..., :HALF_ROPE]
+    x_hi = rope_seg[..., HALF_ROPE:]
+    cos_h = cos.unsqueeze(1)  # [T, 1, HALF_ROPE] broadcast over heads
+    sin_h = sin.unsqueeze(1)
+    inv_lo = (x_lo * cos_h + x_hi * sin_h).to(torch.bfloat16).float()
+    inv_hi = (x_hi * cos_h - x_lo * sin_h).to(torch.bfloat16).float()
+    o_rope = torch.cat([inv_lo, inv_hi], dim=-1)
     o = torch.cat([o[..., :NOPE_DIM], o_rope], dim=-1).to(torch.bfloat16)
 
     o_model = o.float().view(T, O_GROUPS, O_GROUP_IN)
@@ -541,16 +530,14 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
 def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
     num_tokens = T
     cmp_valid = get_prefill_cmp_valid(compress_ratio)
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
-    shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
-        shared_freqs_cos,
-        shared_freqs_sin,
-        torch.arange(T, dtype=torch.int32),
-    )
+    # Half-width unsigned cos/sin (one value per frequency), rounded to BF16 then back to
+    # FP32 so the FP32 kernel input holds exactly the bf16 values (bit-exact with the reference).
+    angles = torch.arange(T * HALF_ROPE).reshape(T, HALF_ROPE) * 1e-3
+    rope_cos_half_tbl = torch.cos(angles).to(torch.bfloat16).float()
+    rope_sin_half_tbl = torch.sin(angles).to(torch.bfloat16).float()
 
     def init_q():
         return ((torch.rand(T, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
@@ -593,10 +580,10 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         return lens
     def init_attn_sink():
         return torch.zeros(H)
-    def init_freqs_cos():
-        return shared_rope_cos.clone()
-    def init_freqs_sin():
-        return shared_rope_sin.clone()
+    def init_rope_cos_half():
+        return rope_cos_half_tbl.clone()
+    def init_rope_sin_half():
+        return rope_sin_half_tbl.clone()
     def init_wo_a():
         return ((torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5).to(torch.bfloat16)
     def init_wo_b():
@@ -615,8 +602,8 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
-        TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
-        TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_sin),
+        TensorSpec("rope_cos_half", [T, HALF_ROPE], torch.float32, init_value=init_rope_cos_half),
+        TensorSpec("rope_sin_half", [T, HALF_ROPE], torch.float32, init_value=init_rope_sin_half),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
