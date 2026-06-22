@@ -6,27 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 token-major prefill sparse attention.
+"""DeepSeek-V4 token-major prefill sparse attention with grouped output projection.
 
-The public entry `prefill_sparse_attn` consumes lowered token-major metadata and a
-unified overlay raw-index contract:
-- `-1`: invalid
-- `[0, WIN)`: historical sliding-window ring KV
-- `[WIN, WIN + T)`: current suffix overlay KV
-- `[WIN + T, ...)`: compressed KV
-
-`cmp_sparse_lens[t]` is the authoritative usable prefix length for
-`cmp_sparse_indices[t]`; any entries after that prefix are ignored even if they
-look like valid raw indices. The standalone harness keeps the decode-style
-`--compress-ratio {0,4,128}` as a fixture generator only. The kernel itself does
-not branch on ratio; the prebuilt raw indices fully describe which KV source
-each row comes from.
+Raw-index contract for cmp_sparse_indices: -1 invalid; [0, WIN) ring KV;
+[WIN, WIN + T) current-suffix overlay; [WIN + T, ...) compressed KV. cmp_sparse_lens[t]
+is the usable prefix length; --compress-ratio {0,4,128} is a standalone fixture knob only.
 """
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
-
+from config import BLOCK_SIZE, FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
 
 # Prefill target shape. T is fixed at 128.
 B = PREFILL_BATCH
@@ -68,6 +57,7 @@ HCA_CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 HEAD_TILE = 16                       # head-tile granularity for storage / merge
 QK_M_TILE = 32                       # head rows cube-batched per QK/PV matmul
 HCA_GATHER_TOKEN_TILE = 4
+BIAS_TOKEN_TILE = 16
 QUANT_TOKEN_TILE = 8
 ROPE_OUT_TOK_TILE = T // 2
 ROPE_TILE = 16
@@ -113,14 +103,13 @@ def prefill_sparse_attn(
     [WIN + T, ...) compressed slot. HCA/CSA use all three sources; SWA passes dummy
     compressed tensors with compressed raw indices unreachable. cmp_sparse_lens is the
     usable prefix per row (pass TOPK when the rows are already -1 padded, e.g. CSA)."""
+    # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
+    # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
+    # single wide MTE3 store. cmp_sparse_lens clamps the usable prefix.
     ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.INT32)
-
-    # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged
-    # into one UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then
-    # flushed with a single wide MTE3 store. cmp_sparse_lens clamps the usable prefix.
     for gather_block in pl.spmd(((T + HCA_GATHER_TOKEN_TILE - 1) // HCA_GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
         gather_sb = gather_block - gather_token_block * PREFILL_ATTN_BLOCKS
@@ -163,40 +152,24 @@ def prefill_sparse_attn(
                         pl.write(sparse_indices_eff, [gather_t, gather_k0 + gather_ki], pl.cast(-1, pl.INT32))
                 sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
-
-    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    # FP32 so the inverse rotation runs on the full-precision attention output
-    # (the NOPE half still narrows to BF16 when packed into o_packed).
-    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
-    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-
-    # Per-(token, slot) additive bias: 0 for valid raw indices, -3e38 for
-    # padding. QK adds this once-built bias row instead of rescanning slot
-    # validity for every head tile.
+    # Additive softmax bias: 0 for valid raw indices, FP32_NEG_INF for padding, so the QK
+    # softmax masks invalid slots without rescanning validity per head.
     sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
-    for bias_t0 in pl.parallel(0, T, QUANT_TOKEN_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_pad_bias"):
-            for bias_sb in pl.range(PREFILL_ATTN_BLOCKS):
-                bias_start = bias_sb * PREFILL_ATTN_TILE
-                bias_idx = pl.cast(
-                    sparse_indices_eff[bias_t0:bias_t0 + QUANT_TOKEN_TILE, bias_start:bias_start + PREFILL_ATTN_TILE],
-                    target_type=pl.FP32,
-                )
-                bias_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
-                sparse_bias[bias_t0:bias_t0 + QUANT_TOKEN_TILE, bias_start:bias_start + PREFILL_ATTN_TILE] = pl.mul(
-                    pl.sub(bias_flag, 1.0),
-                    3.0e38,
-                )
-
-    # Global per-(token, head-tile, block) softmax stats feeding the online merge.
-    blk_rows = T * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
-    sparse_blk_mi = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
+    for bias_blk in pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias"):
+        bias_t0 = bias_blk * BIAS_TOKEN_TILE
+        bias_idx = pl.cast(sparse_indices_eff[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:PREFILL_SPARSE_PAD], target_type=pl.FP32)
+        bias_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
+        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:PREFILL_SPARSE_PAD] = pl.mul(pl.sub(bias_flag, 1.0), -FP32_NEG_INF)
 
     # Block OUTER (one KV/bias load per block), head-batch INNER (QK_M_TILE rows per matmul,
     # sliced to HEAD_TILE stores). qk_kv_k/qk_kv_v are two views so QK (b_trans) and PV don't
     # collide (#1532). Invalid blocks carry a -inf bias and die via beta == 0 in the merge.
+    # sparse_blk_* are the per-(token, head-tile, block) softmax stats for that merge.
+    blk_rows = T * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
+    sparse_blk_mi = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
+    sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
+    sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
+    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
@@ -227,7 +200,10 @@ def prefill_sparse_attn(
                         sparse_blk_oi[qk_row:qk_row + HEAD_TILE, :] = qk_oi[qk_r0:qk_r0 + HEAD_TILE, :]
 
     # Online-softmax merge across blocks, sink-norm, then pack NOPE into o_packed and the
-    # rope slice into attn_rope_stage. Padding tokens (t >= num_tokens) write zeros.
+    # FP32 rope slice into attn_rope_stage (full precision for the inverse rotation). Padding
+    # tokens (t >= num_tokens) write zeros.
+    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
+    o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     for m_t in pl.spmd(T, name_hint="merge_norm"):
         m_token_base = m_t * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
         for m_h_idx in pl.range(H // HEAD_TILE):
@@ -317,12 +293,11 @@ def prefill_sparse_attn(
                 r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
                 o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
-    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
-    o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
-
     # Grouped BF16 projection o_packed @ wo_a^T -> o_r, with per-row amax for the INT8
     # quant. Flattened (group, n-block) spmd; the BF16 store + amax vec post-process is
     # T-tiled by A_T_TILE to bound UB.
+    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
+    o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
     for proj_a_block in pl.spmd(O_GROUPS * (O_LORA // A_N_TILE), name_hint="proj_a"):
         g = proj_a_block // (O_LORA // A_N_TILE)
         nb = proj_a_block - g * (O_LORA // A_N_TILE)
@@ -348,9 +323,9 @@ def prefill_sparse_attn(
             acc_t_amax = pl.reshape(pl.row_max(acc_t_abs), [1, A_T_TILE])
             o_r_amax_parts[amax_part_row:amax_part_row + 1, tb:tb + A_T_TILE] = acc_t_amax
 
+    # Per-row symmetric INT8 quant of o_r, K-dim as a second parallel axis.
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
     o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
-    # Per-row symmetric INT8 quant of o_r, K-dim as a second parallel axis.
     for q_block in pl.spmd((T // QUANT_TOKEN_TILE) * ((O_GROUPS * O_LORA) // QUANT_K_TILE), name_hint="quant"):
         qt_idx = q_block // ((O_GROUPS * O_LORA) // QUANT_K_TILE)
         qk_idx = q_block - qt_idx * ((O_GROUPS * O_LORA) // QUANT_K_TILE)
@@ -434,7 +409,6 @@ def prefill_sparse_attn_test(
         attn_out,
     )
 
-
 def _quant_w_per_channel(w):
     """Per-output-channel INT8 quant on the last axis."""
     import torch
@@ -444,7 +418,6 @@ def _quant_w_per_channel(w):
     scaled = w.float() * scale_quant.unsqueeze(-1)
     w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     return w_i8, (1.0 / scale_quant).float()
-
 
 def _int8_quant_per_row(x):
     """Per-row INT8 symmetric quant matching the W8A8C16 activation path."""
@@ -457,7 +430,6 @@ def _int8_quant_per_row(x):
     out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dequant = 1.0 / scale_quant
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
 
 def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the unified overlay sparse-attn entry."""
@@ -552,7 +524,6 @@ def golden_prefill_sparse_attn(tensors):
     out = acc.float() * o_r_scale * wo_b_scale.unsqueeze(0)
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
-
 def get_prefill_cmp_valid(compress_ratio: int) -> int:
     """Map standalone ratio modes to visible compressed-cache length."""
     if compress_ratio == 0:
@@ -560,7 +531,6 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
     if compress_ratio in (4, 128):
         return min(IDX_TOPK, S // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
-
 
 def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     import torch
@@ -646,7 +616,6 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
         TensorSpec("attn_out", [T, D], torch.bfloat16, is_output=True),
     ]
-
 
 if __name__ == "__main__":
     import argparse
