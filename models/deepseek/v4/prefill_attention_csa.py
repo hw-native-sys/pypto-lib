@@ -52,7 +52,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     _quant_w_per_channel,
     golden_prefill_sparse_attn,
-    prefill_sparse_attn_padded_indices,
+    prefill_sparse_attn,
 )
 
 B = PREFILL_BATCH
@@ -238,6 +238,17 @@ def prefill_attention_csa(
     # Assemble the packed sparse-index rows (window ring + overlay + compressed
     # slots) inline; padding rows stay all -1 via the pl.full row template.
     cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    # Rows are fully -1 padded below, so expose the whole width to the shared kernel
+    # via a constant lens == SPARSE_TOPK (the kernel's per-slot >= 0 check does the
+    # masking). Build it through assemble (SSA-tracked) so the gather's read is ordered
+    # after this write, not via in-place pl.write which can race the round-trip.
+    # Build it 2D ([1, T], assemble-friendly) inside a scope, then reshape to the
+    # [T] the kernel expects -- assemble + reshape is SSA-tracked so the gather's read
+    # is ordered after this write (a 1D in-place pl.write races the round-trip).
+    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_sparse_lens"):
+        cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
+    cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
@@ -278,7 +289,7 @@ def prefill_attention_csa(
     # prefill_sparse_attn where lens == 0 means no valid sparse indices.
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn_padded_indices(
+    attn_out = prefill_sparse_attn(
         q,
         kv_cache,
         ori_block_table,
@@ -286,6 +297,7 @@ def prefill_attention_csa(
         cmp_kv,
         cmp_block_table,
         cmp_sparse_work,
+        cmp_sparse_lens,
         attn_sink,
         num_tokens,
         rope_cos_t,
