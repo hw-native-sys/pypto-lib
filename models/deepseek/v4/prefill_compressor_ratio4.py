@@ -274,23 +274,15 @@ def prefill_compressor_ratio4(
             normed_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
         kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
-        # Split-half (NeoX) forward RoPE, gather-free. rope segment = [x_lo | x_hi] = dims
-        # [0:rh | rh:ROPE_HEAD_DIM]; partner of lane k is k+rh (contiguous slice, no P0101/P1010
-        # gather and no scatter -- cos_b/sin_b are already half-width). gamma is per-column so it
-        # does NOT commute with the rotation: fold gamma_lo onto x_lo, gamma_hi onto x_hi BEFORE
-        # rotating; inv_rms is per-row and commutes. gamma is cast to FP32 (norm_w is BF16 since
-        # #568) so the fold runs in FP32, matching the NOPE branch and float golden.
-        #   out_lo = x_lo*cos - x_hi*sin ;  out_hi = x_lo*sin + x_hi*cos
-        gamma_lo = gamma_rope[0:1, 0 : ROPE_HEAD_DIM // 2]
-        gamma_hi = gamma_rope[0:1, ROPE_HEAD_DIM // 2 : ROPE_HEAD_DIM]
-        kv_lo = kv_rope_norm[0:PACKED_RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-        kv_hi = kv_rope_norm[0:PACKED_RMS_TILE, ROPE_HEAD_DIM // 2 : ROPE_HEAD_DIM]
-        lo_n = pl.col_expand_mul(pl.row_expand_mul(kv_lo, inv_rms), gamma_lo)
-        hi_n = pl.col_expand_mul(pl.row_expand_mul(kv_hi, inv_rms), gamma_hi)
-        out_lo = pl.sub(pl.mul(lo_n, cos_b), pl.mul(hi_n, sin_b))   # x_lo*c - x_hi*s
-        out_hi = pl.add(pl.mul(lo_n, sin_b), pl.mul(hi_n, cos_b))   # x_lo*s + x_hi*c
-        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : NOPE_HEAD_DIM + ROPE_HEAD_DIM // 2] = out_lo
-        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM + ROPE_HEAD_DIM // 2 : HEAD_DIM] = out_hi
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        even_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        odd_tile = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_even = pl.sub(pl.mul(even_tile, cos_b), pl.mul(odd_tile, sin_b))
+        rope_odd = pl.add(pl.mul(even_tile, sin_b), pl.mul(odd_tile, cos_b))
+        rope_buf = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(rope_even, mask_pattern=pl.tile.MaskPattern.P0101, dst=rope_buf)
+        rope_buf = pl.tensor.scatter(rope_odd, mask_pattern=pl.tile.MaskPattern.P1010, dst=rope_buf)
+        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_buf
 
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_c4_cache_write"):
         final_base = final_block * PACKED_RMS_TILE
@@ -442,16 +434,15 @@ def golden_prefill_compressor_ratio4(tensors):
         pooled = oi / li
         inv_rms = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
         normed = pooled * inv_rms * norm_w.float().view(1, HEAD_DIM)
-        # Split-half (NeoX) forward RoPE: lo = first ROPE_HEAD_DIM/2 rope dims, hi = last half.
-        rope = normed[..., NOPE_HEAD_DIM:HEAD_DIM]
-        rope_lo = rope[..., : ROPE_HEAD_DIM // 2]
-        rope_hi = rope[..., ROPE_HEAD_DIM // 2 :]
+        rope_pair = normed[..., NOPE_HEAD_DIM:HEAD_DIM].unflatten(-1, (-1, 2))
+        rope_even = rope_pair[..., 0]
+        rope_odd = rope_pair[..., 1]
         cmp_pos = write_pos + 1 - COMPRESS_RATIO
         cos = tensors["freqs_cos"][cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2].float()
         sin = tensors["freqs_sin"][cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2].float()
-        rot_lo = rope_lo * cos - rope_hi * sin
-        rot_hi = rope_lo * sin + rope_hi * cos
-        normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.cat([rot_lo, rot_hi], dim=-1)
+        rot_even = rope_even * cos - rope_odd * sin
+        rot_odd = rope_even * sin + rope_odd * cos
+        normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
         cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
 
     for t in range(int(tensors["num_tokens"])):

@@ -141,12 +141,6 @@ def attention_hca(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    # Half-width unsigned inverse-RoPE snapshots for the split-half sparse_attn_hca: the first
-    # HALF columns of the per-token cos/sin (one value per frequency), cast BF16->FP32 once per
-    # token so the per-head rope loop rotates with no in-loop cast and no gather. Same first-HALF
-    # columns qkv_proj_rope's forward rope consumes -> a single rope profile, no separate il table.
-    rope_cos_half_t = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    rope_sin_half_t = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
@@ -166,10 +160,6 @@ def attention_hca(
                 step_sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
-                rope_cos_half_t[t : t + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
-                    freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM // 2], target_type=pl.FP32)
-                rope_sin_half_t[t : t + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
-                    freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM // 2], target_type=pl.FP32)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -268,8 +258,8 @@ def attention_hca(
         cmp_block_table,
         topk_all,
         attn_sink,
-        rope_cos_half_t,
-        rope_sin_half_t,
+        rope_cos_t,
+        rope_sin_t,
         wo_a,
         wo_b,
         wo_b_scale,
@@ -390,15 +380,10 @@ def golden_attention_hca(tensors):
     freqs_sin = tensors["freqs_sin"]
     rope_cos_T = torch.empty(T, rd, dtype=freqs_cos.dtype)
     rope_sin_T = torch.empty(T, rd, dtype=freqs_sin.dtype)
-    # Half-width unsigned inverse-RoPE tables for the split-half sparse_attn_hca golden.
-    rope_cos_half_T = torch.empty(T, rd // 2, dtype=torch.float32)
-    rope_sin_half_T = torch.empty(T, rd // 2, dtype=torch.float32)
     for t in range(T):
         pos = int(position_ids[t].item())
         rope_cos_T[t] = freqs_cos[pos]
         rope_sin_T[t] = freqs_sin[pos]
-        rope_cos_half_T[t] = freqs_cos[pos, : rd // 2].float()
-        rope_sin_half_T[t] = freqs_sin[pos, : rd // 2].float()
 
     # q + win kv (W8A8 q_proj)
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
@@ -491,8 +476,8 @@ def golden_attention_hca(tensors):
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": topk_all,
         "attn_sink": tensors["attn_sink"],
-        "rope_cos_half": rope_cos_half_T,
-        "rope_sin_half": rope_sin_half_T,
+        "freqs_cos": rope_cos_T,
+        "freqs_sin": rope_sin_T,
         "wo_a": tensors["wo_a"],
         "wo_b": tensors["wo_b"],
         "wo_b_scale": tensors["wo_b_scale"],

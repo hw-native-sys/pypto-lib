@@ -252,24 +252,23 @@ def prefill_compressor_ratio128(
 
         kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_DIM:HEAD_DIM], pl.FP32)
-        # Split-half (NeoX) forward RoPE, gather-free. rope segment = [x_lo | x_hi] = dims
-        # [0:ROPE_HALF | ROPE_HALF:ROPE_DIM]; partner of lane k is k+ROPE_HALF (contiguous
-        # slice, no P0101/P1010 gather and no scatter -- cos_b/sin_b are already half-width).
-        # gamma is per-column so it does NOT commute with the rotation: fold gamma_lo onto
-        # x_lo, gamma_hi onto x_hi BEFORE rotating; inv_rms is per-row and commutes. gamma is
-        # cast to FP32 (norm_w is BF16 since #568) so the fold runs in FP32, matching the NOPE
-        # branch and float golden. kv_rope is an FP32 slice of pooled_kv_pad -> read directly.
-        #   out_lo = x_lo*cos - x_hi*sin ;  out_hi = x_lo*sin + x_hi*cos
-        gamma_lo = gamma_rope[0:1, 0:ROPE_HALF]
-        gamma_hi = gamma_rope[0:1, ROPE_HALF:ROPE_DIM]
-        kv_lo = kv_rope[0:HCA_C128_RMS_TILE, 0:ROPE_HALF]
-        kv_hi = kv_rope[0:HCA_C128_RMS_TILE, ROPE_HALF:ROPE_DIM]
-        lo_n = pl.col_expand_mul(pl.row_expand_mul(kv_lo, inv_rms), gamma_lo)
-        hi_n = pl.col_expand_mul(pl.row_expand_mul(kv_hi, inv_rms), gamma_hi)
-        out_lo = pl.sub(pl.mul(lo_n, cos_b), pl.mul(hi_n, sin_b))   # x_lo*c - x_hi*s
-        out_hi = pl.add(pl.mul(lo_n, sin_b), pl.mul(hi_n, cos_b))   # x_lo*s + x_hi*c
-        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:NOPE_DIM + ROPE_HALF] = out_lo
-        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM + ROPE_HALF:HEAD_DIM] = out_hi
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
+        rope_even = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
+        rope_odd = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
+        rope_rot_even = pl.sub(pl.mul(rope_even, cos_b), pl.mul(rope_odd, sin_b))
+        rope_rot_odd = pl.add(pl.mul(rope_even, sin_b), pl.mul(rope_odd, cos_b))
+        rope_buf = pl.full([HCA_C128_RMS_TILE, ROPE_DIM], dtype=pl.FP32, value=0.0)
+        rope_buf = pl.tensor.scatter(
+            rope_rot_even,
+            mask_pattern=pl.tile.MaskPattern.P0101,
+            dst=rope_buf,
+        )
+        rope_buf = pl.tensor.scatter(
+            rope_rot_odd,
+            mask_pattern=pl.tile.MaskPattern.P1010,
+            dst=rope_buf,
+        )
+        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_DIM:HEAD_DIM] = rope_buf
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):
@@ -396,16 +395,15 @@ def golden_prefill_compressor_ratio128(tensors):
         pooled = (pool_kv_state * pool_score_state.softmax(dim=0)).sum(dim=0, keepdim=True)
         inv = torch.rsqrt(pooled.square().mean(dim=-1, keepdim=True) + EPS)
         normed = pooled * inv * tensors["norm_w"].float().view(1, HEAD_DIM)
-        # Split-half (NeoX) forward RoPE: lo = first ROPE_HALF rope dims, hi = last ROPE_HALF.
-        rope = normed[..., NOPE_DIM:]
-        x_lo = rope[..., :ROPE_HALF].float()
-        x_hi = rope[..., ROPE_HALF:].float()
+        rope_pair = normed[..., NOPE_DIM:].unflatten(-1, (-1, 2))
+        even = rope_pair[..., 0].float()
+        odd = rope_pair[..., 1].float()
         cmp_pos = write_pos + 1 - COMPRESS_RATIO
         cos = tensors["freqs_cos"][cmp_pos : cmp_pos + 1, 0:ROPE_HALF].float()
         sin = tensors["freqs_sin"][cmp_pos : cmp_pos + 1, 0:ROPE_HALF].float()
-        y_lo = x_lo * cos - x_hi * sin
-        y_hi = x_lo * sin + x_hi * cos
-        normed[:, NOPE_DIM:] = torch.cat([y_lo, y_hi], dim=-1)
+        rot_even = even * cos - odd * sin
+        rot_odd = even * sin + odd * cos
+        normed[:, NOPE_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
         cmp_kv_flat[dst_row] = normed[0]
 
     for t in range(num_tokens):

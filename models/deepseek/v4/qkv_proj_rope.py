@@ -222,21 +222,33 @@ def qkv_proj_rope(
                         q_normed, target_type=pl.BF16, mode="rint"
                     )
 
-    # Per-head split-half (NeoX) RoPE: the rope segment is laid out [x_lo | x_hi] =
-    # dims [0:ROPE_HALF | ROPE_HALF:ROPE_DIM], so the rotation partner of lane k is
-    # lane k+ROPE_HALF -- a contiguous slice, not a j^1 swap gather. No in-kernel
-    # index build and no dup-gather: the half-width cos/sin are read straight from the
-    # first ROPE_HALF columns of the (duplicated) tables. inv_rms is per-row so it
-    # factors out of the rotation and is applied after; the q_flat writeback is folded
-    # in (no FP32 GM stage).
-    #   out_lo = x_lo*cos - x_hi*sin ;  out_hi = x_lo*sin + x_hi*cos
+    # Per-head RoPE (CANN A3 rotate_interleaved): stay on the interleaved layout and
+    # rotate via an i^1 swap gather + sign mask, dropping the de-interleave gather +
+    # re-interleave scatter. The rotation indices/sign and the interleave-duplicated
+    # cos/sin are built ENTIRELY IN-KERNEL (no host inputs): swap_idx (j^1), sign
+    # ([-1,+1,...]) and dup_idx (j>>1) come from pl.arange per task, and cos_il/sin_il
+    # are dup-gathered from rope_cos/rope_sin in-task. The prior in-task index-tile
+    # tail clobber (-> tgather UB-OOB -> 507018 hang) that once forced these to be
+    # kernel inputs is resolved. inv_rms is per-row so it factors out of the rotation
+    # and is applied after; the writeback into q_flat is folded in (no FP32 GM stage).
+    #   swapped = gather(x, j^1) = [x1,x0,x3,x2,...]; sign = [-1,+1,...]
+    #   out = inv_rms * (x*cos_il + swapped*sign*sin_il)
     for hg_idx in pl.spmd(H // 2, name_hint="q_head_rope_fused"):
         hg = hg_idx * 2
-        # tg-outer / head-inner: cos/sin are head-independent, so read once per tg.
+        # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
+        q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        q_col = pl.col_expand_mul(q_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        q_dup_f = pl.cast(pl.cast(pl.mul(q_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        q_dup_idx = pl.cast(q_dup_f, target_type=pl.INT32)                                       # j>>1
+        q_lane = pl.sub(q_col, pl.mul(q_dup_f, 2.0))                                             # j%2
+        q_swap_idx = pl.cast(pl.sub(pl.add(q_col, 1.0), pl.mul(q_lane, 2.0)), target_type=pl.INT32)  # j^1
+        q_sign = pl.sub(pl.mul(q_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        # tg-outer / head-inner: cos_il/sin_il are head-independent, so dup-gather once
+        # per tg and reuse for both heads.
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
             tg = tg_idx * Q_ROPE_T_TILE
-            q_cos = pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, 0 : ROPE_HALF], target_type=pl.FP32)
-            q_sin = pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, 0 : ROPE_HALF], target_type=pl.FP32)
+            q_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
+            q_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
             for h_inner in pl.range(2):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
@@ -244,15 +256,10 @@ def qkv_proj_rope(
                     q_head_inv_rms_all[h : h + 1, tg : tg + Q_ROPE_T_TILE], [Q_ROPE_T_TILE, 1]
                 )
                 q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
-                q_lo = q_rope_chunk[0 : Q_ROPE_T_TILE, 0 : ROPE_HALF]              # x_lo (contiguous, no gather)
-                q_hi = q_rope_chunk[0 : Q_ROPE_T_TILE, ROPE_HALF : ROPE_DIM]       # x_hi (contiguous, no gather)
-                q_out_lo = pl.sub(pl.mul(q_lo, q_cos), pl.mul(q_hi, q_sin))        # x_lo*c - x_hi*s
-                q_out_hi = pl.add(pl.mul(q_lo, q_sin), pl.mul(q_hi, q_cos))        # x_lo*s + x_hi*c
-                q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_HALF] = pl.cast(
-                    pl.row_expand_mul(q_out_lo, q_rope_inv_rms_chunk), target_type=pl.BF16, mode="rint"
-                )
-                q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM + ROPE_HALF : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
-                    pl.row_expand_mul(q_out_hi, q_rope_inv_rms_chunk), target_type=pl.BF16, mode="rint"
+                q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
+                q_rope_rot = pl.add(pl.mul(q_rope_chunk, q_cos_il), pl.mul(pl.mul(q_rope_swapped, q_sign), q_sin_il))
+                q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
+                    pl.row_expand_mul(q_rope_rot, q_rope_inv_rms_chunk), target_type=pl.BF16, mode="rint"
                 )
 
     kv_fp32 = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
@@ -300,35 +307,35 @@ def qkv_proj_rope(
     # task's chunk keeps Vec UB well under the 192 KB cap.
     for tg_idx in pl.spmd(t_dim // KV_ROPE_T_TILE, name_hint="kv_rope_fused"):
         tg = tg_idx * KV_ROPE_T_TILE
-        # Split-half (NeoX) RoPE, gather-free. gamma is per-column so it does NOT
-        # commute with the rotation -- fold gamma_lo onto x_lo and gamma_hi onto x_hi
-        # (matching the golden rms_norm-then-rope, which scales every column by gamma
-        # before rotating). inv_rms is per-row and commutes; fold it in too.
-        #   out_lo = x_lo*cos - x_hi*sin ;  out_hi = x_lo*sin + x_hi*cos
         gamma_rope = pl.reshape(
             pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32),
             [1, ROPE_DIM],
         )
-        gamma_lo = gamma_rope[0:1, 0 : ROPE_HALF]
-        gamma_hi = gamma_rope[0:1, ROPE_HALF : ROPE_DIM]
         kv_rope_inv_rms_chunk = pl.reshape(
             kv_inv_rms_tensor[0:1, tg : tg + KV_ROPE_T_TILE], [KV_ROPE_T_TILE, 1]
         )
         kv_rope_chunk = kv_fp32[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
-        kv_lo = kv_rope_chunk[0 : KV_ROPE_T_TILE, 0 : ROPE_HALF]
-        kv_hi = kv_rope_chunk[0 : KV_ROPE_T_TILE, ROPE_HALF : ROPE_DIM]
-        # Fold inv_rms (per-row) + gamma (per-column) into each half BEFORE the rotation.
-        kv_lo_n = pl.col_expand_mul(pl.row_expand_mul(kv_lo, kv_rope_inv_rms_chunk), gamma_lo)
-        kv_hi_n = pl.col_expand_mul(pl.row_expand_mul(kv_hi, kv_rope_inv_rms_chunk), gamma_hi)
-        kv_cos = pl.cast(rope_cos_view[tg : tg + KV_ROPE_T_TILE, 0 : ROPE_HALF], target_type=pl.FP32)
-        kv_sin = pl.cast(rope_sin_view[tg : tg + KV_ROPE_T_TILE, 0 : ROPE_HALF], target_type=pl.FP32)
-        kv_out_lo = pl.sub(pl.mul(kv_lo_n, kv_cos), pl.mul(kv_hi_n, kv_sin))   # x_lo*c - x_hi*s
-        kv_out_hi = pl.add(pl.mul(kv_lo_n, kv_sin), pl.mul(kv_hi_n, kv_cos))   # x_lo*s + x_hi*c
-        kv_view[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_HALF] = pl.cast(
-            kv_out_lo, target_type=pl.BF16, mode="rint"
+        # A3 interleaved swap-gather (same form as q_head_rope_fused), built in-kernel.
+        # gamma is folded into kv_rope_norm_chunk BEFORE the swap so the swapped lane
+        # n[j^1] correctly carries gamma[j^1] (gamma is per-column, does NOT commute);
+        # inv_rms is per-row so it commutes. out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j].
+        kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_rope_inv_rms_chunk), gamma_rope)
+        kv_ones = pl.full([KV_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        kv_col = pl.col_expand_mul(kv_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        kv_dup_f = pl.cast(pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        kv_dup_idx = pl.cast(kv_dup_f, target_type=pl.INT32)                                       # j>>1
+        kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))                                            # j%2
+        kv_swap_idx = pl.cast(pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0)), target_type=pl.INT32)  # j^1
+        kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        kv_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + KV_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
+        kv_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + KV_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
+        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx)
+        kv_rope_rot = pl.add(
+            pl.mul(kv_rope_norm_chunk, kv_cos_il),
+            pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il),
         )
-        kv_view[tg : tg + KV_ROPE_T_TILE, NOPE_DIM + ROPE_HALF : NOPE_DIM + ROPE_DIM] = pl.cast(
-            kv_out_hi, target_type=pl.BF16, mode="rint"
+        kv_view[tg : tg + KV_ROPE_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
+            kv_rope_rot, target_type=pl.BF16, mode="rint"
         )
 
     return q
@@ -410,17 +417,17 @@ def golden_qkv_proj_rope(tensors):
         return torch.matmul(a_fp32, b_fp32).float()
 
     def apply_rope(x_rope, cos, sin):
-        # x_rope: [T, ..., ROPE_DIM] split-half layout (lo = [:ROPE_HALF], hi = [ROPE_HALF:]).
-        x_lo = x_rope[..., :ROPE_HALF]
-        x_hi = x_rope[..., ROPE_HALF:]
+        # x_rope: [T, ..., ROPE_DIM] with interleaved even/odd rotary pairs.
+        x_pair = x_rope.unflatten(-1, (-1, 2))
+        x_even, x_odd = x_pair[..., 0], x_pair[..., 1]
         cos_v = cos[..., :ROPE_HALF]
         sin_v = sin[..., :ROPE_HALF]
-        while cos_v.ndim < x_lo.ndim:
+        while cos_v.ndim < x_even.ndim:
             cos_v = cos_v.unsqueeze(-2)
             sin_v = sin_v.unsqueeze(-2)
-        y_lo = (x_lo * cos_v - x_hi * sin_v).to(torch.bfloat16)
-        y_hi = (x_lo * sin_v + x_hi * cos_v).to(torch.bfloat16)
-        return torch.cat([y_lo, y_hi], dim=-1)
+        y_even = (x_even * cos_v - x_odd * sin_v).to(torch.bfloat16)
+        y_odd = (x_even * sin_v + x_odd * cos_v).to(torch.bfloat16)
+        return torch.stack([y_even, y_odd], dim=-1).flatten(-2)
 
     t_dim = x.shape[0]
     token_x = x.view(t_dim, D)
