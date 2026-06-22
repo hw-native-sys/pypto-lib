@@ -130,11 +130,9 @@ SPARSE_ROPE_CHUNK = ROPE_CHUNK
 SPARSE_ROPE_INTERLEAVE_CHUNK = ROPE_INTERLEAVE_CHUNK
 SPARSE_ROPE_PACK_SPMD_BLOCKS = ROPE_PACK_SPMD_BLOCKS
 SPARSE_ROPE_PACK_TOKEN_TILE = ROPE_PACK_TOKEN_TILE
-# Keep packed inverse-RoPE token tiles small enough to expose per-output-group
-# AIV parallelism; larger tiles reduce task count but leave longer RoPE work on
-# the critical path.
-SPARSE_ROPE_TOKEN_TILE = 4
-SPARSE_ROPE_APPLY_SPMD_BLOCKS = (T + SPARSE_ROPE_TOKEN_TILE - 1) // SPARSE_ROPE_TOKEN_TILE
+# Token tile for the fused inverse-RoPE pass: small enough to expose per-output-
+# group AIV parallelism, large enough to keep the task count low.
+ROPE_OUT_TOK_TILE = T // 2
 SPARSE_TOPK = TOPK
 
 @pl.jit.inline
@@ -235,7 +233,8 @@ def _prefill_hca_sparse_from_gathered_kv(
                                 softmax_mi = pl.row_max(softmax_scores)
                                 softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
                                 softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
-                                softmax_li = pl.row_sum(pl.cast(softmax_exp_scores_bf16, target_type=pl.FP32))
+                                # li sums the FP32 exp (decode parity); only the PV matmul uses the BF16 cast.
+                                softmax_li = pl.row_sum(softmax_exp_scores)
                                 prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
                                 prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
                                 prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [qk_block_row, 0])
@@ -405,60 +404,56 @@ def _prefill_hca_sparse_from_gathered_kv(
                                     [merge_norm_pack_row, merge_norm_head_col],
                                 )
 
-    # Stage 3: inverse RoPE on the rope slice of the attention output.
-    # Split by token tile and output group so the long vector RoPE task fans
-    # out across all AIV lanes instead of processing all heads in one task.
-    # In-kernel interleaved swap-gather (ported from decode_sparse_attn): one
-    # gather (j^1 swap) + dup-gathered cos/sin replaces the de-interleave/rotate/
-    # re-interleave mask gather+scatter; out[j] = x[j]*cos[j>>1] + x[j^1]*sign[j]
-    # *sin[j>>1] with sign = [+1,-1,...] (conjugate/inverse rotation). All H heads
-    # of a token share cos/sin so they rotate together; rope_buf is BF16 (halves
-    # GM traffic, drops the rope_pack down-cast). Bit-equivalent to the mask path.
-    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
-    for rope_apply_block in pl.spmd(SPARSE_ROPE_APPLY_SPMD_BLOCKS, name_hint="prefill_hca_rope_apply_assemble_group"):
-        rope_apply_t0 = rope_apply_block * SPARSE_ROPE_TOKEN_TILE
-        # swap_idx (j^1), sign and dup_idx (j>>1) are chunk-independent column
-        # patterns from pl.arange -- build once per task.
-        sp_ones = pl.full([H, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=1.0)
-        sp_col = pl.col_expand_mul(sp_ones, pl.cast(pl.arange(0, [1, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.INT32), target_type=pl.FP32))
+    # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
+    # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
+    # segment and store it straight into o_packed (no rope_buf round-trip).
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    for cp in pl.spmd(ROPE_HALF // SPARSE_ROPE_CHUNK, name_hint="rope_cs"):
+        cp_r0 = cp * SPARSE_ROPE_CHUNK
+        cp_c0 = 2 * cp_r0
+        cs_col = pl.col_expand_mul(
+            pl.full([T, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.INT32), target_type=pl.FP32))
+        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...]
+        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
+        rope_cos_il[0:T, cp_c0 : cp_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, cp_c0 : cp_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK] = pl.mul(
+            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+
+    attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
+    for rp_idx in pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope"):
+        rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
+        rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
+        rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
+        # Head-invariant swap index (j^1), built once and reused across the head group.
+        sp_col = pl.col_expand_mul(
+            pl.full([ROPE_OUT_TOK_TILE, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, SPARSE_ROPE_INTERLEAVE_CHUNK], dtype=pl.INT32), target_type=pl.FP32))
         sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_dup_idx = pl.cast(sp_dup_f, target_type=pl.INT32)
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)
-        sp_sign = pl.neg(pl.sub(pl.mul(sp_lane, 2.0), 1.0))
-        for rope_apply_dt in pl.range(SPARSE_ROPE_TOKEN_TILE):
-            rope_apply_t = rope_apply_t0 + rope_apply_dt
-            if rope_apply_t < T:
-                rope_apply_head_row = rope_apply_t * H
-
-                for rope_asm_r0 in pl.range(0, ROPE_HALF, SPARSE_ROPE_CHUNK):
-                    rope_c0 = 2 * rope_asm_r0
-                    r_tile_fp32 = attn_rope_stage[
-                        rope_apply_head_row : rope_apply_head_row + H,
-                        rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK,
-                    ]
-                    r_cos = pl.cast(freqs_cos[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
-                    r_sin = pl.cast(freqs_sin[rope_apply_t : rope_apply_t + 1, rope_asm_r0 : rope_asm_r0 + SPARSE_ROPE_CHUNK], target_type=pl.FP32)
-                    r_cos_h = pl.col_expand_mul(pl.full([H, SPARSE_ROPE_CHUNK], dtype=pl.FP32, value=1.0), r_cos)
-                    r_sin_h = pl.col_expand_mul(pl.full([H, SPARSE_ROPE_CHUNK], dtype=pl.FP32, value=1.0), r_sin)
-                    r_cos_il = pl.gather(r_cos_h, dim=-1, index=sp_dup_idx)
-                    r_sin_il = pl.gather(r_sin_h, dim=-1, index=sp_dup_idx)
-                    r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-                    r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(pl.mul(r_swapped, sp_sign), r_sin_il))
-                    r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-                    rope_buf[rope_apply_head_row : rope_apply_head_row + H, rope_c0 : rope_c0 + SPARSE_ROPE_INTERLEAVE_CHUNK] = r_rot
-
-    # Pack the per-head rope into o_packed's strided rope columns. For a fixed
-    # head, the rope segment lands at the SAME columns for every token, so write
-    # all T tokens of a head in one [T, ROPE_DIM] strided store (ported from
-    # decode_sparse_attn) instead of T separate [1, ROPE_DIM] assembles.
-    rope_buf_3d = pl.reshape(rope_buf, [T, H, ROPE_DIM])
-    for rope_pack_gh in pl.spmd(H, name_hint="prefill_hca_rope_pack_group_spmd"):
-        rope_pack_g = rope_pack_gh // HEADS_PER_GROUP
-        rope_pack_hh = rope_pack_gh - rope_pack_g * HEADS_PER_GROUP
-        rope_pack_tile = pl.reshape(rope_buf_3d[0:T, rope_pack_gh : rope_pack_gh + 1, 0:ROPE_DIM], [T, ROPE_DIM])
-        rope_pack_col = rope_pack_hh * HEAD_DIM + NOPE_DIM
-        o_packed[rope_pack_g * T : rope_pack_g * T + T, rope_pack_col : rope_pack_col + ROPE_DIM] = rope_pack_tile
+        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
+        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+        for rp_hl in pl.range(0, 4):
+            rp_gh = rp_hg * 4 + rp_hl
+            rp_g = rp_gh // HEADS_PER_GROUP
+            rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
+            rp_col = rp_hh * HEAD_DIM + NOPE_DIM
+            rp_o0 = rp_g * T + rp_t0
+            for r_r0 in pl.range(0, ROPE_HALF, SPARSE_ROPE_CHUNK):
+                c0 = 2 * r_r0
+                r_tile_fp32 = pl.reshape(
+                    attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + SPARSE_ROPE_INTERLEAVE_CHUNK],
+                    [ROPE_OUT_TOK_TILE, SPARSE_ROPE_INTERLEAVE_CHUNK])
+                r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + SPARSE_ROPE_INTERLEAVE_CHUNK]
+                r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + SPARSE_ROPE_INTERLEAVE_CHUNK]
+                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
+                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
+                o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + SPARSE_ROPE_INTERLEAVE_CHUNK] = r_rot
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
@@ -894,8 +889,9 @@ def golden_prefill_sparse_attn(tensors):
             kv_tile = kv_rows[tile_start : tile_start + SPARSE_PREFILL_ATTN_TILE]
             scores = (q[t] @ kv_tile.T) * SOFTMAX_SCALE
             cur_mi = scores.max(dim=-1, keepdim=True).values
-            exp_scores_bf16 = torch.exp(scores - cur_mi).to(torch.bfloat16)
-            cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
+            exp_scores = torch.exp(scores - cur_mi)
+            cur_li = exp_scores.sum(dim=-1, keepdim=True)
+            exp_scores_bf16 = exp_scores.to(torch.bfloat16)
             cur_oi = exp_scores_bf16.float() @ kv_tile.to(torch.bfloat16).float()
             if mi is None:
                 mi = cur_mi
