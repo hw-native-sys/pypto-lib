@@ -113,6 +113,22 @@ def prefill_compressor_ratio128(
         kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
+    # State scatter (decode order): write every token's raw projection (+APE on score) into
+    # paged kv_state/score_state BEFORE pooling, so softmax_pool reads its window straight from
+    # state (no seed+overlay, no pool_dep ordering hack). pool depends on this via kv_state RAW.
+    for scatter_t in pl.spmd(T, name_hint="prefill_hca_c128_state_scatter_pre"):
+        if scatter_t < num_tokens:
+            scatter_row_raw = pl.read(state_slot_mapping, [scatter_t])
+            if scatter_row_raw >= 0:
+                scatter_row = pl.cast(scatter_row_raw, pl.INDEX)
+                scatter_pos = pl.read(position_ids, [scatter_t])
+                scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
+                kv_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
+                score_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = pl.add(
+                    score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM],
+                    ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
+                )
+
     for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
         hb = pool_idx - write_i * HEAD_BLOCKS
@@ -158,18 +174,6 @@ def prefill_compressor_ratio128(
                         pool_state_row : pool_state_row + 1,
                         h0 : h0 + HEAD_TILE,
                     ]
-            for pool_t in pl.range(T):
-                if pool_t < num_tokens:
-                    pool_pos = pl.read(position_ids, [pool_t])
-                    if pool_pos <= write_pos:
-                        pool_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
-                        pool_ape = ape[pool_slot : pool_slot + 1, h0 : h0 + HEAD_TILE]
-                        pool_score = pl.add(score_proj_scratch[pool_t : pool_t + 1, h0 : h0 + HEAD_TILE], pool_ape)
-                        pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_TILE] = kv_proj_scratch[
-                            pool_t : pool_t + 1,
-                            h0 : h0 + HEAD_TILE,
-                        ]
-                        pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_TILE] = pool_score
             # Vectorized softmax over all STATE_LEN slots (matches decode128): transpose the
             # assembled [STATE_LEN, HEAD_TILE] tile and do row_max/exp/sum/div + weighted sum,
             # replacing the STATE_LEN-1 serial online-flash fold. Same result, no long chain.
@@ -265,36 +269,6 @@ def prefill_compressor_ratio128(
                         target_type=pl.BF16,
                         mode="rint",
                     )
-
-    # State writeback: one SPMD task per token (was per token x out-block =
-    # T*OUT_BLOCKS tiny tasks). The per-token guard is checked once
-    # so a skipped token costs one empty task instead of OUT_BLOCKS of them;
-    # the out-blocks are looped inside the task to keep each vector op at the
-    # OUT_TILE width. pool_dep keeps the (zero-weighted) ordering after
-    # softmax_pool and is hoisted to once per token.
-    for update_t in pl.spmd(T, name_hint="prefill_hca_c128_state_update"):
-        if update_t < num_tokens:
-            state_row_raw = pl.read(state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                # OUT_DIM (= HEAD_DIM, 512 fp32 / 2 KB) fits one vector op, so
-                # write the whole state row at once instead of OUT_BLOCKS chunks.
-                # pool_dep is the zero-weighted read that keeps the ordering after
-                # softmax_pool (pooled_kv_pad is OUT_DIM wide).
-                pool_dep = pl.mul(pooled_kv_pad[0:1, 0:OUT_DIM], 0.0)
-                kv_state_flat[state_row : state_row + 1, 0:OUT_DIM] = pl.add(
-                    kv_proj_scratch[update_t : update_t + 1, 0:OUT_DIM],
-                    pool_dep,
-                )
-                score_state_flat[state_row : state_row + 1, 0:OUT_DIM] = pl.add(
-                    pl.add(
-                        score_proj_scratch[update_t : update_t + 1, 0:OUT_DIM],
-                        ape[ape_slot : ape_slot + 1, 0:OUT_DIM],
-                    ),
-                    pool_dep,
-                )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv_state = pl.reshape(kv_state_flat, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM])
