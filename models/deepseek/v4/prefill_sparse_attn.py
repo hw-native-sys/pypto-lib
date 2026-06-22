@@ -194,9 +194,10 @@ def _prefill_hca_sparse_from_gathered_kv(
                 [SPARSE_ATTN_TOKEN_TILE * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS, 1],
                 dtype=pl.FP32,
             )
-            prefill_blk_oi0 = pl.create_tensor([SPARSE_ATTN_TOKEN_TILE * SPARSE_MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
-            prefill_blk_oi1 = pl.create_tensor([SPARSE_ATTN_TOKEN_TILE * SPARSE_MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
-            prefill_blk_oi2 = pl.create_tensor([SPARSE_ATTN_TOKEN_TILE * SPARSE_MATMUL_ROW_PAD, HEAD_DIM], dtype=pl.FP32)
+            prefill_blk_oi = pl.create_tensor(
+                [SPARSE_ATTN_TOKEN_TILE * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS, HEAD_DIM],
+                dtype=pl.FP32,
+            )
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_qk_softmax_tile"):
                 for qk_dt in pl.range(SPARSE_ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
@@ -205,39 +206,40 @@ def _prefill_hca_sparse_from_gathered_kv(
                         qk_q_batch = q_flat[qk_head_row : qk_head_row + SPARSE_MATMUL_ROW_PAD, 0 : HEAD_DIM]
                         qk_kv_base = qk_t * SPARSE_PREFILL_SPARSE_PAD
 
+                        # All sparse blocks are processed unconditionally (decode parity):
+                        # invalid slots carry a -inf bias, so an all-invalid block gets
+                        # mi == -inf and is zeroed out by beta == 0 in the merge below.
                         for qk_sb in pl.range(SPARSE_PREFILL_ATTN_BLOCKS):
                             qk_tile_start = qk_sb * SPARSE_PREFILL_ATTN_TILE
-                            qk_tile_valid_raw = pl.read(cmp_sparse_indices, [qk_t, qk_tile_start])
-                            if qk_tile_valid_raw >= 0:
-                                qk_kv_tile = sparse_kv[
-                                    qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + SPARSE_PREFILL_ATTN_TILE,
-                                    0 : HEAD_DIM,
-                                ]
-                                qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
-                                qk_block_row = (
-                                    qk_dt * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS + qk_sb * SPARSE_MATMUL_ROW_PAD
+                            qk_kv_tile = sparse_kv[
+                                qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + SPARSE_PREFILL_ATTN_TILE,
+                                0 : HEAD_DIM,
+                            ]
+                            qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
+                            qk_block_row = (
+                                qk_dt * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS + qk_sb * SPARSE_MATMUL_ROW_PAD
+                            )
+                            qk_scaled_scores = pl.mul(qk_raw_scores, SOFTMAX_SCALE)
+                            qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_tile_start:qk_tile_start + SPARSE_PREFILL_ATTN_TILE]
+                            softmax_scores = pl.add(
+                                qk_scaled_scores,
+                                pl.col_expand(
+                                    pl.full(
+                                        [SPARSE_MATMUL_ROW_PAD, SPARSE_PREFILL_ATTN_TILE],
+                                        dtype=pl.FP32,
+                                        value=0.0,
+                                    ),
+                                    qk_bias_row,
                                 )
-                                qk_scaled_scores = pl.mul(qk_raw_scores, SOFTMAX_SCALE)
-                                qk_bias_row = sparse_bias[qk_t:qk_t + 1, qk_tile_start:qk_tile_start + SPARSE_PREFILL_ATTN_TILE]
-                                softmax_scores = pl.add(
-                                    qk_scaled_scores,
-                                    pl.col_expand(
-                                        pl.full(
-                                            [SPARSE_MATMUL_ROW_PAD, SPARSE_PREFILL_ATTN_TILE],
-                                            dtype=pl.FP32,
-                                            value=0.0,
-                                        ),
-                                        qk_bias_row,
-                                    )
-                                )
-                                softmax_mi = pl.row_max(softmax_scores)
-                                softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
-                                softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
-                                # li sums the FP32 exp (decode parity); only the PV matmul uses the BF16 cast.
-                                softmax_li = pl.row_sum(softmax_exp_scores)
-                                prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
-                                prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
-                                prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [qk_block_row, 0])
+                            )
+                            softmax_mi = pl.row_max(softmax_scores)
+                            softmax_exp_scores = pl.exp(pl.row_expand_sub(softmax_scores, softmax_mi))
+                            softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
+                            # li sums the FP32 exp (decode parity); only the PV matmul uses the BF16 cast.
+                            softmax_li = pl.row_sum(softmax_exp_scores)
+                            prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
+                            prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
+                            prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [qk_block_row, 0])
 
             for pv_h_delta in pl.parallel(0, SPARSE_MATMUL_ROW_PAD, SPARSE_PV_HEAD_TILE):
                 pv_h0 = h0 + pv_h_delta
@@ -251,29 +253,21 @@ def _prefill_hca_sparse_from_gathered_kv(
 
                             for pv_sb in pl.range(SPARSE_PREFILL_ATTN_BLOCKS):
                                 pv_tile_start = pv_sb * SPARSE_PREFILL_ATTN_TILE
-                                pv_tile_valid_raw = pl.read(cmp_sparse_indices, [pv_t, pv_tile_start])
-                                if pv_tile_valid_raw >= 0:
-                                    pv_kv_tile = sparse_kv[
-                                        pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + SPARSE_PREFILL_ATTN_TILE,
-                                        0 : HEAD_DIM,
-                                    ]
-                                    pv_block_row = (
-                                        pv_dt * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS
-                                        + pv_sb * SPARSE_MATMUL_ROW_PAD
-                                        + pv_h_local
-                                    )
-                                    pv_exp_scores = prefill_exp[
-                                        pv_block_row : pv_block_row + SPARSE_PV_HEAD_TILE,
-                                        0 : SPARSE_PREFILL_ATTN_TILE,
-                                    ]
-                                    pv_oi = pl.matmul(pv_exp_scores, pv_kv_tile, out_dtype=pl.FP32)
-                                    pv_head_row = pv_dt * SPARSE_MATMUL_ROW_PAD + pv_h_local
-                                    if pv_sb == 0:
-                                        prefill_blk_oi0 = pl.assemble(prefill_blk_oi0, pv_oi, [pv_head_row, 0])
-                                    if pv_sb == 1:
-                                        prefill_blk_oi1 = pl.assemble(prefill_blk_oi1, pv_oi, [pv_head_row, 0])
-                                    if pv_sb == 2:
-                                        prefill_blk_oi2 = pl.assemble(prefill_blk_oi2, pv_oi, [pv_head_row, 0])
+                                pv_kv_tile = sparse_kv[
+                                    pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + SPARSE_PREFILL_ATTN_TILE,
+                                    0 : HEAD_DIM,
+                                ]
+                                pv_block_row = (
+                                    pv_dt * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS
+                                    + pv_sb * SPARSE_MATMUL_ROW_PAD
+                                    + pv_h_local
+                                )
+                                pv_exp_scores = prefill_exp[
+                                    pv_block_row : pv_block_row + SPARSE_PV_HEAD_TILE,
+                                    0 : SPARSE_PREFILL_ATTN_TILE,
+                                ]
+                                pv_oi = pl.matmul(pv_exp_scores, pv_kv_tile, out_dtype=pl.FP32)
+                                prefill_blk_oi = pl.assemble(prefill_blk_oi, pv_oi, [pv_block_row, 0])
 
                 for merge_norm_t_delta in pl.parallel(0, SPARSE_ATTN_TOKEN_TILE, SPARSE_MERGE_NORM_TOKEN_TILE):
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_merge_norm_head_tile"):
@@ -283,7 +277,6 @@ def _prefill_hca_sparse_from_gathered_kv(
                             merge_norm_t = attn_t0 + merge_norm_t_delta + merge_norm_dt
                             merge_norm_t_local = merge_norm_t_delta + merge_norm_dt
                             merge_norm_head_row = merge_norm_t * H + pv_h0
-                            merge_norm_head_row_local = merge_norm_t_local * SPARSE_MATMUL_ROW_PAD + pv_h_local
                             if merge_norm_t < num_tokens:
                                 merge_norm_block_row0 = (
                                     merge_norm_t_local * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS + pv_h_local
@@ -296,78 +289,46 @@ def _prefill_hca_sparse_from_gathered_kv(
                                     merge_norm_block_row0 : merge_norm_block_row0 + SPARSE_PV_HEAD_TILE,
                                     0 : 1,
                                 ]
-                                merge_norm_oi = prefill_blk_oi0[
-                                    merge_norm_head_row_local : merge_norm_head_row_local + SPARSE_PV_HEAD_TILE,
+                                merge_norm_oi = prefill_blk_oi[
+                                    merge_norm_block_row0 : merge_norm_block_row0 + SPARSE_PV_HEAD_TILE,
                                     0 : HEAD_DIM,
                                 ]
 
-                                if SPARSE_PREFILL_ATTN_BLOCKS > 1:
-                                    merge_norm_tile_start1 = SPARSE_PREFILL_ATTN_TILE
-                                    merge_norm_block1_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start1])
-                                    if merge_norm_block1_raw >= 0:
-                                        merge_norm_block_row1 = (
-                                            merge_norm_t_local * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS
-                                            + SPARSE_MATMUL_ROW_PAD
-                                            + pv_h_local
-                                        )
-                                        merge_norm_cur_mi = prefill_blk_mi[
-                                            merge_norm_block_row1 : merge_norm_block_row1 + SPARSE_PV_HEAD_TILE,
-                                            0 : 1,
-                                        ]
-                                        merge_norm_cur_li = prefill_blk_li[
-                                            merge_norm_block_row1 : merge_norm_block_row1 + SPARSE_PV_HEAD_TILE,
-                                            0 : 1,
-                                        ]
-                                        merge_norm_cur_oi = prefill_blk_oi1[
-                                            merge_norm_head_row_local : merge_norm_head_row_local + SPARSE_PV_HEAD_TILE,
-                                            0 : HEAD_DIM,
-                                        ]
-                                        merge_norm_mi_new = pl.maximum(merge_norm_mi, merge_norm_cur_mi)
-                                        merge_norm_alpha = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new))
-                                        merge_norm_beta = pl.exp(pl.sub(merge_norm_cur_mi, merge_norm_mi_new))
-                                        merge_norm_li = pl.add(
-                                            pl.mul(merge_norm_alpha, merge_norm_li),
-                                            pl.mul(merge_norm_beta, merge_norm_cur_li),
-                                        )
-                                        merge_norm_oi = pl.add(
-                                            pl.row_expand_mul(merge_norm_oi, merge_norm_alpha),
-                                            pl.row_expand_mul(merge_norm_cur_oi, merge_norm_beta),
-                                        )
-                                        merge_norm_mi = merge_norm_mi_new
-
-                                if SPARSE_PREFILL_ATTN_BLOCKS > 2:
-                                    merge_norm_tile_start2 = 2 * SPARSE_PREFILL_ATTN_TILE
-                                    merge_norm_block2_raw = pl.read(cmp_sparse_indices, [merge_norm_t, merge_norm_tile_start2])
-                                    if merge_norm_block2_raw >= 0:
-                                        merge_norm_block_row2 = (
-                                            merge_norm_t_local * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS
-                                            + 2 * SPARSE_MATMUL_ROW_PAD
-                                            + pv_h_local
-                                        )
-                                        merge_norm_cur_mi2 = prefill_blk_mi[
-                                            merge_norm_block_row2 : merge_norm_block_row2 + SPARSE_PV_HEAD_TILE,
-                                            0 : 1,
-                                        ]
-                                        merge_norm_cur_li2 = prefill_blk_li[
-                                            merge_norm_block_row2 : merge_norm_block_row2 + SPARSE_PV_HEAD_TILE,
-                                            0 : 1,
-                                        ]
-                                        merge_norm_cur_oi2 = prefill_blk_oi2[
-                                            merge_norm_head_row_local : merge_norm_head_row_local + SPARSE_PV_HEAD_TILE,
-                                            0 : HEAD_DIM,
-                                        ]
-                                        merge_norm_mi_new2 = pl.maximum(merge_norm_mi, merge_norm_cur_mi2)
-                                        merge_norm_alpha2 = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new2))
-                                        merge_norm_beta2 = pl.exp(pl.sub(merge_norm_cur_mi2, merge_norm_mi_new2))
-                                        merge_norm_li = pl.add(
-                                            pl.mul(merge_norm_alpha2, merge_norm_li),
-                                            pl.mul(merge_norm_beta2, merge_norm_cur_li2),
-                                        )
-                                        merge_norm_oi = pl.add(
-                                            pl.row_expand_mul(merge_norm_oi, merge_norm_alpha2),
-                                            pl.row_expand_mul(merge_norm_cur_oi2, merge_norm_beta2),
-                                        )
-                                        merge_norm_mi = merge_norm_mi_new2
+                                # Online-softmax merge of the remaining sparse blocks,
+                                # unconditional (decode parity): an all-invalid block has
+                                # mi == -inf, so beta == 0 leaves li/oi unchanged. Updating the
+                                # carry every iteration avoids the pl.range conditional-carry
+                                # phi corruption that an `if valid` guard would trigger.
+                                for merge_norm_sb in pl.range(1, SPARSE_PREFILL_ATTN_BLOCKS):
+                                    merge_norm_sb_row = (
+                                        merge_norm_t_local * SPARSE_MATMUL_ROW_PAD * SPARSE_PREFILL_ATTN_BLOCKS
+                                        + merge_norm_sb * SPARSE_MATMUL_ROW_PAD
+                                        + pv_h_local
+                                    )
+                                    merge_norm_cur_mi = prefill_blk_mi[
+                                        merge_norm_sb_row : merge_norm_sb_row + SPARSE_PV_HEAD_TILE,
+                                        0 : 1,
+                                    ]
+                                    merge_norm_cur_li = prefill_blk_li[
+                                        merge_norm_sb_row : merge_norm_sb_row + SPARSE_PV_HEAD_TILE,
+                                        0 : 1,
+                                    ]
+                                    merge_norm_cur_oi = prefill_blk_oi[
+                                        merge_norm_sb_row : merge_norm_sb_row + SPARSE_PV_HEAD_TILE,
+                                        0 : HEAD_DIM,
+                                    ]
+                                    merge_norm_mi_new = pl.maximum(merge_norm_mi, merge_norm_cur_mi)
+                                    merge_norm_alpha = pl.exp(pl.sub(merge_norm_mi, merge_norm_mi_new))
+                                    merge_norm_beta = pl.exp(pl.sub(merge_norm_cur_mi, merge_norm_mi_new))
+                                    merge_norm_li = pl.add(
+                                        pl.mul(merge_norm_alpha, merge_norm_li),
+                                        pl.mul(merge_norm_beta, merge_norm_cur_li),
+                                    )
+                                    merge_norm_oi = pl.add(
+                                        pl.row_expand_mul(merge_norm_oi, merge_norm_alpha),
+                                        pl.row_expand_mul(merge_norm_cur_oi, merge_norm_beta),
+                                    )
+                                    merge_norm_mi = merge_norm_mi_new
 
                                 merge_norm_sink_bias = pl.reshape(attn_sink[pv_h0 : pv_h0 + SPARSE_PV_HEAD_TILE], [SPARSE_PV_HEAD_TILE, 1])
                                 merge_norm_sink_tile = pl.add(pl.sub(merge_norm_mi, merge_norm_mi), merge_norm_sink_bias)
