@@ -101,25 +101,32 @@ def prefill_compressor_ratio4(
         cmp4_kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         cmp4_score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
+    # Precompute write_i -> (position, dst cache row) once. Depends only on the slot-mapping and
+    # position inputs, so it overlaps the projection matmul, replacing the O(T) write-discovery
+    # scan that every later stage (pool / rmsnorm_rope / cache_write) otherwise repeats.
+    write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_write_map"):
+        write_pos_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
+        write_dst_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
+        map_seen = pl.cast(0, pl.INDEX)
+        for map_w in pl.range(T):
+            if map_w < num_tokens:
+                map_slot_raw = pl.read(cmp_slot_mapping, [map_w])
+                if map_slot_raw >= 0:
+                    pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_w]))
+                    pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                    map_seen = map_seen + 1
+
     for pool_idx in pl.spmd(PACKED_POOL_BLOCKS, name_hint="prefill_c4_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
         hb = pool_idx - write_i * HEAD_BLOCKS
         h0 = hb * HEAD_CHUNK
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
-        write_token = 0
-        write_slot_raw = pl.cast(-1, pl.INT64)
-        write_seen = pl.cast(0, pl.INDEX)
-        for scan_w in pl.range(T):
-            if scan_w < num_tokens:
-                scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                if scan_slot_raw >= 0:
-                    if write_seen == write_i:
-                        write_token = scan_w
-                        write_slot_raw = scan_slot_raw
-                    write_seen = write_seen + 1
+        write_slot_raw = pl.read(write_dst_map, [0, write_i])
         if write_slot_raw >= 0:
-            write_pos = pl.read(position_ids, [write_token])
+            write_pos = pl.read(write_pos_map, [0, write_i])
             cur_start = write_pos + 1 - COMPRESS_RATIO
             prev_start = cur_start - COMPRESS_RATIO
             for pool_s in pl.range(COMPRESS_RATIO):
@@ -237,19 +244,9 @@ def prefill_compressor_ratio4(
         sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
-            write_token = 0
-            write_slot_raw = pl.cast(-1, pl.INT64)
-            write_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if write_seen == final_i:
-                            write_token = scan_w
-                            write_slot_raw = scan_slot_raw
-                        write_seen = write_seen + 1
+            write_slot_raw = pl.read(write_dst_map, [0, final_i])
             if write_slot_raw >= 0:
-                write_pos = pl.read(position_ids, [write_token])
+                write_pos = pl.read(write_pos_map, [0, final_i])
                 cmp_pos = pl.cast(write_pos + 1 - COMPRESS_RATIO, pl.INDEX)
                 cos_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
                     freqs_cos[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
@@ -296,15 +293,7 @@ def prefill_compressor_ratio4(
         final_base = final_block * PACKED_RMS_TILE
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
-            dst_row_raw = pl.cast(-1, pl.INT64)
-            write_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if write_seen == final_i:
-                            dst_row_raw = scan_slot_raw
-                        write_seen = write_seen + 1
+            dst_row_raw = pl.read(write_dst_map, [0, final_i])
             if dst_row_raw >= 0:
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(

@@ -113,6 +113,23 @@ def prefill_compressor_ratio128(
         kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
+    # Precompute write_i -> (position, dst cache row) once (input-only deps -> overlaps the matmul),
+    # replacing the O(T) write-discovery scan in pool / rmsnorm_rope / kv_finalize. Sized to
+    # HCA_C128_RMS_TILE because rmsnorm_rope indexes padded rows beyond MAX_CMP_WRITES (rest stay -1).
+    write_pos_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
+    write_dst_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_write_map"):
+        write_pos_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=0)
+        write_dst_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=-1)
+        map_seen = pl.cast(0, pl.INDEX)
+        for map_w in pl.range(T):
+            if map_w < num_tokens:
+                map_slot_raw = pl.read(cmp_slot_mapping, [map_w])
+                if map_slot_raw >= 0:
+                    pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_w]))
+                    pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                    map_seen = map_seen + 1
+
     # State scatter (decode order): write every token's raw projection (+APE on score) into
     # paged kv_state/score_state BEFORE pooling, so softmax_pool reads its window straight from
     # state (no seed+overlay, no pool_dep ordering hack). pool depends on this via kv_state RAW.
@@ -135,19 +152,9 @@ def prefill_compressor_ratio128(
         h0 = hb * HEAD_TILE
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
-        write_token = 0
-        write_slot_raw = pl.cast(-1, pl.INT64)
-        write_seen = pl.cast(0, pl.INDEX)
-        for scan_w in pl.range(T):
-            if scan_w < num_tokens:
-                scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                if scan_slot_raw >= 0:
-                    if write_seen == write_i:
-                        write_token = scan_w
-                        write_slot_raw = scan_slot_raw
-                    write_seen = write_seen + 1
+        write_slot_raw = pl.read(write_dst_map, [0, write_i])
         if write_slot_raw >= 0:
-            write_pos = pl.read(position_ids, [write_token])
+            write_pos = pl.read(write_pos_map, [0, write_i])
             for pool_state_i in pl.range(STATE_LEN):
                 pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = pl.full(
                     [1, HEAD_TILE],
@@ -196,19 +203,9 @@ def prefill_compressor_ratio128(
         cos_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         for norm_i in pl.range(HCA_C128_RMS_TILE):
-            norm_write_token = 0
-            norm_slot_raw = pl.cast(-1, pl.INT64)
-            norm_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if norm_seen == norm_i:
-                            norm_write_token = scan_w
-                            norm_slot_raw = scan_slot_raw
-                        norm_seen = norm_seen + 1
+            norm_slot_raw = pl.read(write_dst_map, [0, norm_i])
             if norm_slot_raw >= 0:
-                norm_cmp_pos = pl.cast(pl.read(position_ids, [norm_write_token]) + 1 - COMPRESS_RATIO, pl.INDEX)
+                norm_cmp_pos = pl.cast(pl.read(write_pos_map, [0, norm_i]) + 1 - COMPRESS_RATIO, pl.INDEX)
                 cos_row = pl.cast(freqs_cos[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
                 sin_row = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
                 cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
@@ -250,15 +247,7 @@ def prefill_compressor_ratio128(
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):
-            final_cmp_row_raw = pl.cast(-1, pl.INT64)
-            final_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(cmp_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if final_seen == final_i:
-                            final_cmp_row_raw = scan_slot_raw
-                        final_seen = final_seen + 1
+            final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
             if final_cmp_row_raw >= 0:
                 final_cmp_row = pl.cast(final_cmp_row_raw, pl.INDEX)
                 for final_hb in pl.range(HEAD_BLOCKS):
