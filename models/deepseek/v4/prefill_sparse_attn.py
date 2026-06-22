@@ -181,10 +181,6 @@ def _prefill_hca_sparse_from_gathered_kv(
     # Stage 2: causal prefill attention, tiled across context rows.
     for attn_t0 in pl.parallel(0, T, SPARSE_ATTN_TOKEN_TILE):
         for h0 in pl.parallel(0, H, SPARSE_HEAD_TILE):
-            prefill_exp = pl.create_tensor(
-                [SPARSE_ATTN_TOKEN_TILE * SPARSE_HEAD_TILE * SPARSE_PREFILL_ATTN_BLOCKS, SPARSE_PREFILL_ATTN_TILE],
-                dtype=pl.BF16,
-            )
             prefill_blk_mi = pl.create_tensor(
                 [SPARSE_ATTN_TOKEN_TILE * SPARSE_HEAD_TILE * SPARSE_PREFILL_ATTN_BLOCKS, 1],
                 dtype=pl.FP32,
@@ -197,7 +193,7 @@ def _prefill_hca_sparse_from_gathered_kv(
                 [SPARSE_ATTN_TOKEN_TILE * SPARSE_HEAD_TILE * SPARSE_PREFILL_ATTN_BLOCKS, HEAD_DIM],
                 dtype=pl.FP32,
             )
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_qk_softmax_tile"):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_pv"):
                 for qk_dt in pl.range(SPARSE_ATTN_TOKEN_TILE):
                     qk_t = attn_t0 + qk_dt
                     if qk_t < num_tokens:
@@ -208,13 +204,21 @@ def _prefill_hca_sparse_from_gathered_kv(
                         # All sparse blocks are processed unconditionally (decode parity):
                         # invalid slots carry a -inf bias, so an all-invalid block gets
                         # mi == -inf and is zeroed out by beta == 0 in the merge below.
+                        # qk_kv_k / qk_kv_v are two views of the same KV tile so the QK
+                        # (b_trans=True) and PV (b_trans=False) loads do not collide on one
+                        # param (pypto#1532) -- this lets QK, softmax, and PV share one scope
+                        # with no prefill_exp GM round-trip.
                         for qk_sb in pl.range(SPARSE_PREFILL_ATTN_BLOCKS):
                             qk_tile_start = qk_sb * SPARSE_PREFILL_ATTN_TILE
-                            qk_kv_tile = sparse_kv[
+                            qk_kv_k = sparse_kv[
                                 qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + SPARSE_PREFILL_ATTN_TILE,
                                 0 : HEAD_DIM,
                             ]
-                            qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_tile, b_trans=True, out_dtype=pl.FP32)
+                            qk_kv_v = sparse_kv[
+                                qk_kv_base + qk_tile_start : qk_kv_base + qk_tile_start + SPARSE_PREFILL_ATTN_TILE,
+                                0 : HEAD_DIM,
+                            ]
+                            qk_raw_scores = pl.matmul(qk_q_batch, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                             qk_block_row = (
                                 qk_dt * SPARSE_HEAD_TILE * SPARSE_PREFILL_ATTN_BLOCKS + qk_sb * SPARSE_HEAD_TILE
                             )
@@ -236,33 +240,10 @@ def _prefill_hca_sparse_from_gathered_kv(
                             softmax_exp_scores_bf16 = pl.cast(softmax_exp_scores, target_type=pl.BF16, mode="rint")
                             # li sums the FP32 exp (decode parity); only the PV matmul uses the BF16 cast.
                             softmax_li = pl.row_sum(softmax_exp_scores)
+                            pv_oi = pl.matmul(softmax_exp_scores_bf16, qk_kv_v, out_dtype=pl.FP32)
                             prefill_blk_mi = pl.assemble(prefill_blk_mi, softmax_mi, [qk_block_row, 0])
                             prefill_blk_li = pl.assemble(prefill_blk_li, softmax_li, [qk_block_row, 0])
-                            prefill_exp = pl.assemble(prefill_exp, softmax_exp_scores_bf16, [qk_block_row, 0])
-
-
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_pv_head_tile"):
-                for pv_dt in pl.range(SPARSE_ATTN_TOKEN_TILE):
-                    pv_t = attn_t0 + pv_dt
-                    if pv_t < num_tokens:
-                        pv_kv_base = pv_t * SPARSE_PREFILL_SPARSE_PAD
-
-                        for pv_sb in pl.range(SPARSE_PREFILL_ATTN_BLOCKS):
-                            pv_tile_start = pv_sb * SPARSE_PREFILL_ATTN_TILE
-                            pv_kv_tile = sparse_kv[
-                                pv_kv_base + pv_tile_start : pv_kv_base + pv_tile_start + SPARSE_PREFILL_ATTN_TILE,
-                                0 : HEAD_DIM,
-                            ]
-                            pv_block_row = (
-                                pv_dt * SPARSE_HEAD_TILE * SPARSE_PREFILL_ATTN_BLOCKS
-                                + pv_sb * SPARSE_HEAD_TILE
-                            )
-                            pv_exp_scores = prefill_exp[
-                                pv_block_row : pv_block_row + SPARSE_HEAD_TILE,
-                                0 : SPARSE_PREFILL_ATTN_TILE,
-                            ]
-                            pv_oi = pl.matmul(pv_exp_scores, pv_kv_tile, out_dtype=pl.FP32)
-                            prefill_blk_oi = pl.assemble(prefill_blk_oi, pv_oi, [pv_block_row, 0])
+                            prefill_blk_oi = pl.assemble(prefill_blk_oi, pv_oi, [qk_block_row, 0])
 
             for merge_norm_t_delta in pl.parallel(0, SPARSE_ATTN_TOKEN_TILE, SPARSE_MERGE_NORM_TOKEN_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_attn_merge_norm_head_tile"):
