@@ -40,7 +40,7 @@ COMPRESS_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_MAX_BLOCKS = 65
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = 64
+CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
@@ -230,10 +230,8 @@ def compressor_ratio4(
                 if cache_row >= 0:
                     cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
-    compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
-    cmp_kv_cache = pl.reshape(cmp_kv_cache_flat, [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
-    return kv, compress_state, cmp_kv_cache
+    return kv
 
 
 @pl.jit
@@ -253,7 +251,7 @@ def compressor_test(
     cmp_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
-    kv, compress_state, cmp_kv_cache = compressor_ratio4(
+    kv = compressor_ratio4(
         x,
         kv,
         compress_state,

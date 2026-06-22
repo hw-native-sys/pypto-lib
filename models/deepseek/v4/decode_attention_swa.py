@@ -53,7 +53,7 @@ ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-SPARSE_CMP_MAX_BLOCKS = 64          # sparse_attn cmp pool size (unused by SWA but part of its contract)
+SPARSE_CMP_MAX_BLOCKS = 8           # sparse_attn cmp pool size (unused by SWA but part of its contract)
 
 # tiling
 SPARSE_ROPE_TILE = 16

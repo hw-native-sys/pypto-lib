@@ -53,7 +53,7 @@ COMPRESS_STATE_MAX_BLOCKS = 64
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = 64
+CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
@@ -233,10 +233,8 @@ def compressor_ratio128(
                 if cmp_row >= 0:
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
 
-    compress_state = pl.reshape(compress_state_flat, [compress_state_block_num, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     kv = pl.reshape(kv_flat, [b_dim, s_dim, HEAD_DIM])
-    cmp_kv_cache = pl.reshape(cmp_kv_cache_flat, [cmp_block_num, BLOCK_SIZE, 1, HEAD_DIM])
-    return kv, compress_state, cmp_kv_cache
+    return kv
 
 
 @pl.jit
@@ -273,7 +271,7 @@ def compressor_test(
     state_slot_mapping.bind_dynamic(0, B_DYN)
     state_slot_mapping.bind_dynamic(1, S_DYN)
 
-    kv, compress_state, cmp_kv_cache = compressor_ratio128(
+    kv = compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, cos, sin,
         cmp_kv_cache, position_ids, cmp_slot_mapping, state_slot_mapping,
     )

@@ -39,7 +39,7 @@ SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 4
 ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = 64  # paged-KV pool: compressed blocks per batch
+CMP_MAX_BLOCKS = 8   # paged-KV pool: compressed blocks per batch
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling

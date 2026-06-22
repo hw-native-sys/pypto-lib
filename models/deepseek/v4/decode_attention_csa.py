@@ -117,7 +117,7 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 ORI_MAX_BLOCKS = 1
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = 64
+CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 @pl.jit.inline
@@ -242,7 +242,7 @@ def attention_csa(
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
-    cmp_out, compress_state, cmp_kv = compressor_ratio4(
+    cmp_out = compressor_ratio4(
         x_normed,
         cmp_out,
         compress_state,
@@ -262,7 +262,7 @@ def attention_csa(
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    idx_score_unused, idx_kv_cache, idx_topk_full = indexer(
+    idx_score_unused, idx_topk_full = indexer(
         x_normed,
         qr,
         qr_scale,

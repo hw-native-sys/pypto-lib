@@ -63,7 +63,7 @@ COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS  # ori KV pool size (matches sparse_attn ORI_BLOCK_NUM)
-CMP_MAX_BLOCKS = 64                 # matches sparse_attn CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = 8                  # matches sparse_attn CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS  # cmp KV pool size (shared with the compressor's cmp_kv_cache)
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_MAX_BLOCKS = 64
@@ -188,7 +188,7 @@ def attention_hca(
     position_ids_bsd = pl.reshape(position_ids, [B, S])
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    cmp_kv_proj, compress_state, cmp_kv = compressor_ratio128(
+    cmp_kv_proj = compressor_ratio128(
         x_normed_bsd,
         cmp_kv_proj,
         compress_state,

@@ -236,10 +236,8 @@ def indexer_compressor(
                 if cache_row >= 0:
                     idx_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
-    compress_state = pl.reshape(compress_state_flat, [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
-    idx_kv_cache = pl.reshape(idx_kv_cache_flat, [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
-    return kv, compress_state, idx_kv_cache
+    return kv
 
 
 @pl.jit
@@ -260,7 +258,7 @@ def compressor_test(
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
-    kv, compress_state, idx_kv_cache = indexer_compressor(
+    kv = indexer_compressor(
         x,
         kv,
         compress_state,

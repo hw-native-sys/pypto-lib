@@ -192,7 +192,7 @@ def indexer(
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
-    inner_kv, inner_compress_state, idx_kv_cache = indexer_compressor(
+    inner_kv = indexer_compressor(
         x,
         inner_kv,
         inner_compress_state,
@@ -290,7 +290,7 @@ def indexer(
                 topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
                 topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
-    return score, idx_kv_cache, topk_idxs
+    return score, topk_idxs
 
 
 @pl.jit
@@ -321,7 +321,7 @@ def indexer_test(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
-    score, idx_kv_cache, topk_idxs = indexer(
+    score, topk_idxs = indexer(
         x,
         qr,
         qr_scale,
