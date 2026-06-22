@@ -45,8 +45,6 @@ from prefill_indexer_compressor import (
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
 from prefill_sparse_attn import (
-    HCA_CMP_BLOCK_NUM as SPARSE_HCA_CMP_BLOCK_NUM,
-    HCA_ORI_BLOCK_NUM as SPARSE_HCA_ORI_BLOCK_NUM,
     CMP_MAX_BLOCKS as SPARSE_CMP_MAX_BLOCKS,
     ORI_MAX_BLOCKS as SPARSE_ORI_MAX_BLOCKS,
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
@@ -96,8 +94,8 @@ Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 
 
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-CSA_ORI_BLOCK_NUM = SPARSE_HCA_ORI_BLOCK_NUM
-CSA_CMP_BLOCK_NUM = SPARSE_HCA_CMP_BLOCK_NUM
+CSA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS
+CSA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
 

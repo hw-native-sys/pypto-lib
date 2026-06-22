@@ -59,6 +59,8 @@ ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+# Single-request KV-cache block counts, re-exported for the prefill swa/hca/csa
+# attention, indexer, and compressor modules that share this op's cache layout.
 HCA_ORI_BLOCK_NUM = ORI_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = CMP_MAX_BLOCKS
 
@@ -86,10 +88,10 @@ PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 @pl.jit.inline
 def prefill_sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
@@ -111,8 +113,8 @@ def prefill_sparse_attn(
     [WIN + T, ...) compressed slot. HCA/CSA use all three sources; SWA passes dummy
     compressed tensors with compressed raw indices unreachable. cmp_sparse_lens is the
     usable prefix per row (pass TOPK when the rows are already -1 padded, e.g. CSA)."""
-    ori_kv_flat = pl.reshape(ori_kv, [HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     sparse_indices_eff = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.INT32)
 
@@ -161,11 +163,6 @@ def prefill_sparse_attn(
                         pl.write(sparse_indices_eff, [gather_t, gather_k0 + gather_ki], pl.cast(-1, pl.INT32))
                 sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
-    A_K_BLOCKS = O_GROUP_IN // A_K_TILE
-    A_N_BLOCKS = O_LORA // A_N_TILE
-    A_AMAX_BLOCKS = O_GROUPS * A_N_BLOCKS
-    B_K_BLOCKS = (O_GROUPS * O_LORA) // B_K_TILE
-    B_N_BLOCKS = D // B_N_TILE
 
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     # FP32 so the inverse rotation runs on the full-precision attention output
@@ -333,7 +330,7 @@ def prefill_sparse_attn(
 
     o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
-    o_r_amax_parts = pl.create_tensor([A_AMAX_BLOCKS, T], dtype=pl.FP32)
+    o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
     o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
 
     # Grouped BF16 projection o_packed @ wo_a^T, with per-row amax for the INT8 quant.
@@ -341,7 +338,7 @@ def prefill_sparse_attn(
         row_base_o = g * T
         out_col_g = g * O_LORA
 
-        for nb in pl.parallel(0, A_N_BLOCKS, 1):
+        for nb in pl.parallel(0, (O_LORA // A_N_TILE), 1):
             n0 = nb * A_N_TILE
 
             for proj_t0 in pl.parallel(0, T, PROJ_TOKEN_TILE):
@@ -349,7 +346,7 @@ def prefill_sparse_attn(
                     xa0_chunk = o_packed[row_base_o + proj_t0:row_base_o + proj_t0 + PROJ_TOKEN_TILE, 0:A_K_TILE]
                     wa0_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, 0:A_K_TILE]
                     acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, A_K_BLOCKS, stage=2):
+                    for kb in pl.pipeline(1, (O_GROUP_IN // A_K_TILE), stage=2):
                         k0 = kb * A_K_TILE
                         xa_k_chunk = o_packed[
                             row_base_o + proj_t0:row_base_o + proj_t0 + PROJ_TOKEN_TILE,
@@ -363,7 +360,7 @@ def prefill_sparse_attn(
                     o_r[proj_t0:proj_t0 + PROJ_TOKEN_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_a_2d
                     acc_a_abs = pl.maximum(acc_a_2d, pl.neg(acc_a_2d))
                     acc_a_amax = pl.reshape(pl.row_max(acc_a_abs), [1, PROJ_TOKEN_TILE])
-                    amax_part_row = g * A_N_BLOCKS + nb
+                    amax_part_row = g * (O_LORA // A_N_TILE) + nb
                     o_r_amax_parts[
                         amax_part_row:amax_part_row + 1,
                         proj_t0:proj_t0 + PROJ_TOKEN_TILE,
@@ -377,7 +374,7 @@ def prefill_sparse_attn(
         quant_k0 = quant_k_block * QUANT_K_TILE
 
         or_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for ab in pl.range(0, A_AMAX_BLOCKS, 1):
+        for ab in pl.range(0, O_GROUPS * (O_LORA // A_N_TILE), 1):
             or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + QUANT_TOKEN_TILE]
             or_amax = pl.maximum(or_amax, or_a_part)
         or_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
@@ -397,7 +394,7 @@ def prefill_sparse_attn(
             )
 
     # INT8 output projection, then dequant to BF16.
-    for nb in pl.parallel(0, B_N_BLOCKS, 1):
+    for nb in pl.parallel(0, (D // B_N_TILE), 1):
         n0 = nb * B_N_TILE
 
         for proj_t0 in pl.parallel(0, T, PROJ_TOKEN_TILE):
@@ -405,7 +402,7 @@ def prefill_sparse_attn(
                 xb0_chunk = o_r_i8[proj_t0:proj_t0 + PROJ_TOKEN_TILE, 0:B_K_TILE]
                 wb0_chunk = wo_b[n0:n0 + B_N_TILE, 0:B_K_TILE]
                 acc_b = pl.matmul(xb0_chunk, wb0_chunk, b_trans=True, out_dtype=pl.INT32)
-                for kb in pl.pipeline(1, B_K_BLOCKS, stage=2):
+                for kb in pl.pipeline(1, ((O_GROUPS * O_LORA) // B_K_TILE), stage=2):
                     k0 = kb * B_K_TILE
                     xb_k_chunk = o_r_i8[proj_t0:proj_t0 + PROJ_TOKEN_TILE, k0:k0 + B_K_TILE]
                     wb_k_chunk = wo_b[n0:n0 + B_N_TILE, k0:k0 + B_K_TILE]
@@ -427,10 +424,10 @@ def prefill_sparse_attn(
 @pl.jit
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
@@ -525,7 +522,7 @@ def golden_prefill_sparse_attn(tensors):
                     gathered.append(kv_overlay[overlay_t])
             else:
                 cmp_slot = raw - (WIN + T)
-                if cmp_slot < 0 or cmp_slot >= HCA_CMP_BLOCK_NUM * BLOCK_SIZE:
+                if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
                     continue
                 block_id = int(cmp_block_table[cmp_slot // BLOCK_SIZE].item())
                 intra = cmp_slot % BLOCK_SIZE
@@ -586,7 +583,7 @@ def get_prefill_cmp_valid(compress_ratio: int) -> int:
     if compress_ratio == 0:
         return 0
     if compress_ratio in (4, 128):
-        return min(IDX_TOPK, S // compress_ratio, HCA_CMP_BLOCK_NUM * BLOCK_SIZE)
+        return min(IDX_TOPK, S // compress_ratio, CMP_MAX_BLOCKS * BLOCK_SIZE)
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
@@ -607,7 +604,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_q():
         return ((torch.rand(T, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_kv():
-        return ((torch.rand(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return ((torch.rand(ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_block_table():
         table = torch.zeros(ORI_MAX_BLOCKS, dtype=torch.int32)
         for blk in range(ORI_MAX_BLOCKS):
@@ -616,7 +613,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_kv_overlay():
         return ((torch.rand(T, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
-        return ((torch.rand(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return ((torch.rand(CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_block_table():
         table = torch.zeros(CMP_MAX_BLOCKS, dtype=torch.int32)
         for blk in range(CMP_MAX_BLOCKS):
@@ -658,10 +655,10 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
 
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
-        TensorSpec("ori_kv", [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
+        TensorSpec("ori_kv", [ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("ori_block_table", [ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_kv_overlay),
-        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
