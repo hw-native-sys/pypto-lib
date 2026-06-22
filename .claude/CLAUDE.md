@@ -13,7 +13,7 @@ Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
 - `models/{qwen3,deepseek}/` — end-to-end LLM kernels by family
 - `golden/` — test harness: compile, run on device, validate against torch
 - `tests/` — lint checks and golden-fn unit tests
-- `docs/` — coding-style, compile/runtime workflow, performance-tuning, and debugging references
+- `docs/` — coding-style, compile/runtime workflow, performance-tuning, precision-tuning, and debugging references
 - `build_output/` — generated compilation artifacts (gitignored)
 
 Files ending in `_draft.py` are works-in-progress and excluded from CI.
@@ -21,10 +21,11 @@ Files ending in `_draft.py` are works-in-progress and excluded from CI.
 ## Key Documentation
 
 - `README.md` — project intro, quick start, dependencies
-- `docs/pypto-coding-style.md` — **canonical** coding style: the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` / `@pl.function`), `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops
+- `docs/pypto-coding-style.md` — **canonical** coding style: the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` / `@pl.function`), `pl.at` scopes, four loop constructs (`pl.range`/`pl.parallel`/`pl.pipeline`/`pl.spmd`), vector / cube / mte ops, dynamic B/S shapes
 - `docs/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → input gen → golden → runtime → validate)
-- `docs/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
 - `docs/debugging.md` — debugging playbook: pypto/ptoas errors, `golden_data` replay, `runtime_dir` reuse, runtime-hang device logs, dump-tensor / dep-gen
+- `docs/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
+- `docs/precision-tuning.md` — keeping a kernel numerically faithful: `pl.cast` rounding modes vs torch, dtype alignment, fp32 intermediates / no double-cast, quant schemes, the `error_distribution` threshold sweep, and real-weight testing
 
 ## External Dependencies
 

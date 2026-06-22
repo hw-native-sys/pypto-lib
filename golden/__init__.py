@@ -14,7 +14,13 @@ that compiles and executes PyPTO programs with golden reference comparison.
 
 from .runner import RunResult, run, run_jit
 from .spec import ScalarSpec, TensorSpec
-from .validation import ratio_allclose, ratio_reldiff, topk_pair_compare, validate_golden
+from .validation import (
+    error_distribution,
+    ratio_allclose,
+    ratio_reldiff,
+    topk_pair_compare,
+    validate_golden,
+)
 
 __all__ = [
     "TensorSpec",
@@ -22,6 +28,7 @@ __all__ = [
     "validate_golden",
     "ratio_allclose",
     "ratio_reldiff",
+    "error_distribution",
     "topk_pair_compare",
     "RunResult",
     "run",

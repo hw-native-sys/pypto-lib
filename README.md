@@ -61,6 +61,13 @@ See [docs/performance-tuning.md](docs/performance-tuning.md) for the L2
 (inter-kernel) and L1/L0 (intra-kernel) tuning workflow — L2 swimlane in
 Perfetto, PMU counters, and the per-kernel insight swimlane.
 
+## Precision tuning
+
+See [docs/precision-tuning.md](docs/precision-tuning.md) for keeping a kernel
+numerically faithful to its torch reference — `pl.cast` rounding modes vs
+torch, kernel/golden parity, dtype alignment, quantization schemes, the
+`error_distribution` threshold sweep, and real-weight testing.
+
 ## Dependencies
 
 | Repo | Role |

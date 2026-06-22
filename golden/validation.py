@@ -481,3 +481,98 @@ def ratio_reldiff(
         f"max_diff_hd={max_diff_hd})"
     )
     return cmp
+
+
+def error_distribution(
+    diff_thds: tuple[float, ...] = (1e-3, 3e-3, 5e-3, 1e-2, 3e-2, 5e-2),
+    quantiles: tuple[float, ...] = (0.5, 0.9, 0.99, 0.999, 0.9999, 1.0),
+    always_pass: bool = True,
+) -> Callable:
+    """Diagnostic comparator that prints an error-distribution report.
+
+    This is a *measurement* comparator, not a pass/fail gate: by default it
+    always returns ``True`` so a run never aborts on it, and the report is
+    printed to stdout. Use it to characterize where a kernel's error lives
+    before picking a real tolerance (``ratio_allclose`` / ``ratio_reldiff``).
+
+    For the named output it prints:
+
+    - overall rel-L2 (``||a - e|| / ||e||``) and cosine similarity — the right
+      whole-tensor metrics for quantized / low-magnitude outputs, where
+      per-element relative diff explodes on near-zero entries;
+    - a ``frac>thd`` table over ``diff_thds`` using the same floored
+      relative-diff rule as ``ratio_reldiff`` — read it as "what tolerance
+      level does this output actually need", i.e. the threshold at which the
+      bad-point fraction drops to your budget;
+    - percentiles of the plain per-element relative diff, the absolute diff,
+      and the golden magnitude — the magnitude row tells you whether a large
+      relative diff is just an output "pressed low" near zero.
+
+    Args:
+        diff_thds: Threshold levels for the ``frac>thd`` sweep.
+        quantiles: Quantile points for the percentile rows.
+        always_pass: When ``True`` (default) the comparator never fails the
+            run; set ``False`` to additionally hard-fail on NaN / Inf.
+
+    Example — measure a layer output's error shape, gate the cache strictly::
+
+        compare_fn = {
+            "x_next": error_distribution(),
+            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        }
+    """
+    qs = torch.tensor(list(quantiles))
+
+    def cmp(actual: torch.Tensor, expected: torch.Tensor, **_kw) -> tuple[bool, str]:
+        a = actual.cpu().to(torch.float32)
+        e = expected.cpu().to(torch.float32)
+
+        nan_count = int(torch.isnan(a).sum().item())
+        inf_count = int(torch.isinf(a).sum().item())
+        if nan_count or inf_count:
+            msg = f"    illegal values in actual: NaN={nan_count} Inf={inf_count}"
+            print(msg)
+            if not always_pass:
+                return False, msg
+
+        diff = (a - e).abs()
+        rel = (diff.norm() / e.norm().clamp_min(1e-12)).item()
+        cos = torch.nn.functional.cosine_similarity(
+            a.flatten(), e.flatten(), dim=0
+        ).item()
+        print(f"rel-L2 = {rel:.4%}  cosine = {cos:.7f}  numel={a.numel()}")
+
+        # frac>thd: floored relative diff, same rule as ratio_reldiff.
+        for thd in diff_thds:
+            floor = (1.0 / (1 << 14)) / thd
+            denom = torch.maximum(
+                torch.maximum(a.abs(), e.abs()), torch.full_like(a, floor)
+            ) + 1e-9
+            rdiff = torch.where(diff < thd, diff, diff / denom)
+            bad = rdiff > thd
+            ec = int(bad.sum().item())
+            worst = float(rdiff[bad].max().item()) if ec else 0.0
+            print(
+                f"  diff_thd={thd:.0e}  frac>thd={ec / a.numel():.4%}  worst={worst:.3g}"
+            )
+
+        def _pct(label: str, flat: torch.Tensor) -> None:
+            pv = torch.quantile(flat, qs)
+            print(
+                f"  {label}: "
+                + "  ".join(
+                    f"p{q * 100:g}={v:.3g}"
+                    for q, v in zip(quantiles, pv.tolist())
+                )
+            )
+
+        denom = torch.maximum(a.abs(), e.abs()).clamp_min(1e-6)
+        _pct("rel-diff percentiles", (diff / denom).flatten())
+        _pct("abs-diff percentiles", diff.flatten())
+        em = e.abs().flatten()
+        print(f"  |golden| mean={em.mean():.4g}")
+        _pct("|golden| percentiles", em)
+        return True, ""
+
+    cmp.__name__ = f"error_distribution(diff_thds={diff_thds})"
+    return cmp

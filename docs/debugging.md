@@ -3,9 +3,11 @@
 A practical guide to debugging pypto-lib kernels — from compile errors
 through runtime hangs to precision mismatches. It pairs with
 [compile-runtime-workflow.md](compile-runtime-workflow.md) (what each phase
-does) and [performance-tuning.md](performance-tuning.md) (perf). To locate
-*which pypto commit* introduced a precision regression, use the
-`bisect-precision` skill instead.
+does), [performance-tuning.md](performance-tuning.md) (perf), and
+[precision-tuning.md](precision-tuning.md) (numerical fidelity — cast modes,
+dtype alignment, the `error_distribution` sweep). To locate *which pypto
+commit* introduced a precision regression, use the `bisect-precision` skill
+instead.
 
 The harness exposes most of these as both a `run` / `run_jit` kwarg and a
 CLI flag; a typical model `__main__` wires them up like:
@@ -191,16 +193,11 @@ Pass the dump dir **explicitly** — with no argument the viewer looks under
 `./outputs/*/tensor_dump`, but `run_jit` writes to
 `build_output/<...>/dfx_outputs/tensor_dump`.
 
-To localize a precision bug:
-
-1. Reproduce on fixed data (§2) with the suspect tensors tagged, level `1`.
-2. Compute the matching torch intermediates stage by stage.
-3. Walk the dumped tensors in dependency order and find the **first** one
-   that diverges from its torch reference — the producing kernel is the
-   culprit.
-
-This narrows a multi-stage kernel (norm → matmul → dequant → activation) to
-the single stage where the error first appears.
+This section is the dump *mechanism*. For the end-to-end
+precision-localization *workflow* — pairing this dump with the
+`error_distribution` comparator to find the first stage whose distribution
+blows up, and the §1–§5 precision rules that stage likely violated — see
+[precision-tuning.md](precision-tuning.md) §7.
 
 ---
 

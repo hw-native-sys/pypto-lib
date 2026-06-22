@@ -536,3 +536,168 @@ for q0 in pl.parallel(0, hidden, Q_OUT_STEP):
 Larger fused regions (RMSNorm + projection + residual) follow the same
 shape: a `pl.pipeline` matmul reduction, then the vector epilogue, then
 `assemble` back to GM.
+
+---
+
+## 7. Dynamic Shapes (dynamic B / S)
+
+`@pl.jit` / `@pl.jit.inline` kernels support dynamic batch (B) and sequence
+(S) dimensions via `pl.dynamic` symbolic dims — a single kernel can serve both
+decode and prefill. Almost every rule below traces back to one constraint: the
+**JIT SSA renamer rewrites local Scalar references but not DynVar references
+embedded in IR type annotations**. So DynVars must stay in annotations, and any
+concrete shape math must go through named locals.
+
+### Declare DynVars at module level
+
+`pl.dynamic("name")` creates a `DynVar` (a `Scalar` subclass) for a symbolic
+dimension. Declare them as module-level constants, alongside the static
+constants you still need for tiling, golden, and test loops:
+
+```python
+B_DYN = pl.dynamic("B_DYN")
+S_DYN = pl.dynamic("S_DYN")
+T_DYN = pl.dynamic("T_DYN")   # T = B * S, for kernels on a flat token dim
+B = DECODE_BATCH              # static upper bound for golden / tiling
+```
+
+### DynVars only in annotations; extract runtime dims with `pl.tensor.dim`
+
+Use DynVars **exclusively** in `pl.Tensor[[...]]` parameter annotations. In the
+body, capture each dynamic dim into a local Scalar with `pl.tensor.dim()` and
+use the locals everywhere:
+
+```python
+@pl.jit.inline
+def compressor(x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16], ...):
+    b_dim = pl.tensor.dim(x, 0)        # ✅ local Scalar — renamer tracks it
+    s_dim = pl.tensor.dim(x, 1)
+    x_flat = pl.reshape(x, [b_dim * s_dim, D])
+    # ❌ pl.reshape(x, [B_DYN * S_DYN, D]) — DynVar math in body → SSA failure
+```
+
+### No composite expressions in shape annotations
+
+Shape annotations (`pl.create_tensor`, `pl.reshape`) must hold **single Scalar
+variables**, not composites — extract to a named local first:
+
+```python
+chunk_s = BATCH_CHUNK_0 * s_dim                       # ✅ compute first
+scratch = pl.create_tensor([chunk_s, OUT_DIM], dtype=pl.FP32)
+# ❌ pl.create_tensor([BATCH_CHUNK_0 * s_dim, OUT_DIM], ...)
+```
+
+When an inlined function writes through a reshaped view of a `pl.Out` tensor,
+the data is already in the output buffer — **skip the reshape-back** at the end
+(`return y`, not `pl.reshape(y_flat, ...)`). A trailing reshape-back carries a
+dynamic-shape SSA var that breaks the runtime tensor mapping when the inline is
+nested inside another `@pl.jit.inline`.
+
+### `bind_dynamic` at the `@pl.jit` entry
+
+In the `@pl.jit` wrapper, both annotate with DynVars **and** call
+`bind_dynamic()` for every dynamic dim, so the DynDim cascade propagates
+through inline dependencies:
+
+```python
+@pl.jit
+def compressor_test(x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16], ...):
+    x.bind_dynamic(0, B_DYN)
+    x.bind_dynamic(1, S_DYN)
+```
+
+### Dynamic loop bounds
+
+All four loop constructs accept dynamic bounds. `pl.spmd` accepts a single
+Scalar **or a composite dynamic expression** (`b_dim * HEAD_DIM // HEAD_TILE`)
+as the block count. When an SPMD loop folds several dims into one, **place the
+dynamic dim outermost** so every `//` and `%` divides by a compile-time
+constant — otherwise the hot loop needs a runtime division:
+
+```python
+BLOCKS_PER_OUTER = HEAD_COUNT * (D // D_CHUNK)        # compile-time
+for block in pl.spmd(t_dim * BLOCKS_PER_OUTER, name_hint="..."):
+    t     = block // BLOCKS_PER_OUTER                 # ÷ constant
+    local = block %  BLOCKS_PER_OUTER
+    ...
+```
+
+Keep tiling constants (pipeline depth, tile sizes, spmd block factors) static —
+they shape the generated IR and cannot depend on runtime dims. Runtime Scalar
+comparisons in conditionals (`if runtime_val + s_dim < THRESHOLD`) just work.
+
+### Golden / test and unified kernels
+
+Golden and test code runs on concrete torch tensors (no JIT). For a unified
+decode+prefill kernel, parameterize `build_tensor_specs(B, S)`, derive `T` from
+the actual tensor shape, and iterate modes via a `--mode` arg:
+
+```python
+def build_tensor_specs(B, S):
+    return [TensorSpec("x", [B * S, D], torch.bfloat16, ...)]
+
+MODES = {"decode": (DECODE_BATCH, DECODE_SEQ),
+         "prefill": (PREFILL_BATCH, PREFILL_SEQ)}
+```
+
+A single product DynVar `T_DYN` lets one `@pl.jit.inline` serve both modes: the
+caller reshapes `[B, S, ...] → [T, ...]` before the call and back after, and
+the old mode-specific wrapper is deleted.
+
+### Quick reference
+
+| Do | Don't |
+|----|-------|
+| `pl.Tensor[[B_DYN, S_DYN, ...]]` in annotations | `B_DYN * S_DYN` in annotations or body |
+| `pl.tensor.dim(x, 0)` → local Scalar | DynVar arithmetic in the body |
+| Compute composite to a local, then use it | `pl.create_tensor([C * s_dim, ...])` |
+| Skip reshape-back on `pl.Out` in nested inline | trailing `pl.reshape(y_flat, [dyn, ...])` |
+| Annotate **and** `bind_dynamic()` at `@pl.jit` | annotate only |
+| `pl.spmd(b_dim * STATIC)`, dynamic dim outermost | dynamic dim innermost (`% t_dim` in hot loop) |
+| Static tiling constants | tiling that depends on runtime dims |
+| `build_tensor_specs(B, S)` + `--mode` loop | hardcode B/S inside `build_tensor_specs` |
+
+---
+
+## 8. Naming and comment conventions
+
+### Name tile sizes, inline block counts
+
+Give a named constant to a **tiling parameter** — the tile / step size — but
+**not** to a derived block count (`K_BLOCKS`, `Q_BLOCKS`, `N_TILES`, …). Inline
+the block-count expression (`dim // TILE`) at the loop header instead, so the
+trip count and stride are visible right where the loop is — which is what you
+need to reason about parallelism and pipelining.
+
+```python
+# ❌ named block count hides the trip count behind a constant
+Q_BLOCKS = Q_HIDDEN // Q_OUT_STEP
+for q in pl.spmd(Q_BLOCKS, name_hint="q_proj"):
+
+# ✅ tile size named; block count inlined at the loop
+Q_OUT_STEP = 128                                   # tiling parameter
+for q in pl.spmd(Q_HIDDEN // Q_OUT_STEP, name_hint="q_proj"):
+```
+
+### Comments state what, not why
+
+A comment states *what* a non-obvious line or block does, tersely — or there
+is no comment. Do **not** explain *why* the code is written a certain way; the
+one exception is a pointer to an **unresolved issue / workaround** (a filed
+`pypto#NNNN` / `ptoas#NNNN` constraint), where the issue reference is the
+comment. Do not write structural narration — no `# Stage 1:` / `# Stage 2:`,
+`# Loop A:`, `# Bridge:` step labels; the loop and scope structure is already
+visible from the code.
+
+```python
+# ❌ structural narration / rationale
+# Stage 1: quant the activation so the cube can run int8 for speed
+x_i8 = pl.cast(pl.mul(x, inv_scale), pl.INT8, mode="rint")
+
+# ✅ no comment — the code is self-evident
+x_i8 = pl.cast(pl.mul(x, inv_scale), pl.INT8, mode="rint")
+
+# ✅ the allowed exception — an unresolved-issue workaround
+# pad to 32: ptoas rejects cube tiles whose cols aren't a multiple of 16
+w_pad = pl.slice(w, [K, 32], [0, 0], valid_shape=[K, MIX_HC])
+```
