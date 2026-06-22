@@ -103,6 +103,20 @@ PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
 assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
     f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"  # gather_kv bulk-zero
+# Region of the gathered-KV block that needs a standalone zero-fill in gather_kv:
+# only the window [0, WIN) when compressed slots are staged below (their
+# zero-initialized block stores fully rewrite [WIN, PADDED_TOPK)), else the whole
+# region in the SWA specialization where no compressed staging runs. Hoisted to
+# module scope because the kernel tracer rejects ternary (IfExp) in the body.
+GATHER_ZERO_END = WIN if TOPK > WIN else PADDED_TOPK
+# Compressed-staging fill-blocks per token. The compressed half of gather_kv runs
+# as a separate, finer SPMD of T * N_CMP_BLK units (vs the per-token T units) so
+# the gather fills the AIV cores more evenly across waves (e.g. 512 vs 128 on 48
+# cores -> ~1.1x vs 1.5x tail-wave imbalance). Only meaningful when TOPK > WIN.
+# WIN must tile by GATHER_FILL_TILE so the compressed region [WIN, PADDED_TOPK)
+# divides evenly into N_CMP_BLK fill-blocks (else the tail slots are silently dropped).
+assert WIN % GATHER_FILL_TILE == 0, f"WIN ({WIN}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"
+N_CMP_BLK = (PADDED_TOPK - WIN) // GATHER_FILL_TILE
 
 
 @pl.jit.inline
@@ -139,8 +153,10 @@ def sparse_attn(
     for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
         v_t0 = v_blk * VALID_TOKEN_TILE
         v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
-        v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
+        # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
+        # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
+        # 2 vector ops instead of the add/max/min/sub clamp chain.
+        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.minimum(v_idx_f, 0.0), -NEG_INF)
         if PADDED_TOPK > TOPK:
             sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
                 [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
@@ -153,12 +169,15 @@ def sparse_attn(
         g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
         ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
 
-        # Bulk-zero the token's whole packed-KV region up front via wide MTE
-        # stores, so invalid (-1) slots and the padding tail default to zero;
-        # valid slots below overwrite their rows. Finite (zero) invalid KV rows
-        # plus the NEG_INF softmax bias let qk_pv skip a per-block mask multiply.
+        # Bulk-zero only the window block [0, WIN): its invalid (-1) slots keep
+        # this fill (the per-row window path below writes valid slots only). The
+        # compressed blocks [WIN, PADDED_TOPK) are fully rewritten by the
+        # zero-initialized g_stage block stores further down, so a separate
+        # zero-fill there is a dead store; only the SWA case (no compressed
+        # staging) still needs the whole region zeroed. Finite (zero) invalid KV
+        # rows plus the NEG_INF softmax bias let qk_pv skip a per-block mask mul.
         zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_f in pl.range(0, PADDED_TOPK, GATHER_FILL_TILE):
+        for g_f in pl.range(0, GATHER_ZERO_END, GATHER_FILL_TILE):
             g_fill_row = g_kv_base + g_f
             sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
 
@@ -182,26 +201,34 @@ def sparse_attn(
                     g_overlay_row = g_overlay_base + (g_raw - WIN)
                     sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
 
-        # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-        # Guarded so the SWA (TOPK == WIN) specialization omits the loop entirely.
-        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
-        # wide MTE3 store: gives each scattered load its own tile row (no
-        # buffer-reuse WAR, so loads stream on MTE2 instead of ping-ponging with
-        # MTE3 per row) and coalesces the many 1-row stores into one block store.
-        if TOPK > WIN:
-            for g_cb in pl.range(WIN, PADDED_TOPK, GATHER_FILL_TILE):
-                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                for g_i in pl.range(GATHER_FILL_TILE):
-                    g_c = g_cb + g_i
-                    if g_c < TOPK:
-                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                        if g_raw >= 0:
-                            g_slot = g_raw - (WIN + S)
-                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                g_dst_blk = g_kv_base + g_cb
-                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
+    # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
+    # Run as a separate, finer SPMD over (token, fill-block) units so the gather
+    # fills the AIV cores evenly across waves (T*N_CMP_BLK vs the per-token T
+    # units of the window pass). Guarded so the SWA (TOPK == WIN) specialization
+    # omits it entirely (there the per-token bulk-zero covers the whole region).
+    # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
+    # wide MTE3 store: gives each scattered load its own tile row (no buffer-reuse
+    # WAR, so loads stream on MTE2 instead of ping-ponging with MTE3 per row) and
+    # coalesces the many 1-row stores into one block store. This block fully
+    # rewrites [WIN, PADDED_TOPK), which is why the window pass skips its bulk-zero.
+    if TOPK > WIN:
+        for g_cbk in pl.spmd(T * N_CMP_BLK, name_hint="gather_kv_cmp"):
+            g_t = g_cbk // N_CMP_BLK
+            g_b = g_t // S
+            g_kv_base = g_t * PADDED_TOPK
+            g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
+            g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for g_i in pl.range(GATHER_FILL_TILE):
+                g_c = g_cb + g_i
+                if g_c < TOPK:
+                    g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                    if g_raw >= 0:
+                        g_slot = g_raw - (WIN + S)
+                        g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                        g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                        g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+            g_dst_blk = g_kv_base + g_cb
+            sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -238,7 +265,9 @@ def sparse_attn(
                 qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
                 qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
+                # Broadcast-add the per-block bias directly (col_expand_add) instead
+                # of col_expand into a dead pl.full(0) base + a separate add.
+                qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
                 qk_mi = pl.row_max(qk_scores)
                 # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
                 # blocks die in the merge alpha/beta -- no mask multiply needed.
