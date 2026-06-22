@@ -120,7 +120,7 @@ def indexer(
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="qr_rope"):
         o0 = idx * ROPE_ROW_BLOCK
         batch_idx = idx
-        # A3 interleaved swap-gather (same form as q_head_rope_fused / kv_rope_fused),
+        # A3 interleaved swap-gather (same form as q_head_rms_nope_rope / kv_rms_norm_rope),
         # replacing de-interleave gather + rotate + re-interleave scatter. The rotation
         # indices/sign and the interleave-duplicated cos/sin are built ENTIRELY IN-KERNEL:
         # swap_idx (j^1), sign ([-1,+1,...]) and dup_idx (j>>1) from pl.arange, and
