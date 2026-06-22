@@ -170,32 +170,17 @@ def prefill_compressor_ratio128(
                             h0 : h0 + HEAD_TILE,
                         ]
                         pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_TILE] = pool_score
-            init_slot = STATE_LEN - 1
-            mi_buf = pl.create_tensor([1, HEAD_TILE], dtype=pl.FP32)
-            li_buf = pl.create_tensor([1, HEAD_TILE], dtype=pl.FP32)
-            oi_buf = pl.create_tensor([1, HEAD_TILE], dtype=pl.FP32)
-            mi_buf[0:1, 0:HEAD_TILE] = pool_score_tile[init_slot : init_slot + 1, 0:HEAD_TILE]
-            li_buf[0:1, 0:HEAD_TILE] = pl.exp(pl.sub(mi_buf[0:1, 0:HEAD_TILE], mi_buf[0:1, 0:HEAD_TILE]))
-            oi_buf[0:1, 0:HEAD_TILE] = pool_kv_tile[init_slot : init_slot + 1, 0:HEAD_TILE]
-            for pool_slot_i in pl.range(STATE_LEN - 1):
-                mi = mi_buf[0:1, 0:HEAD_TILE]
-                li = li_buf[0:1, 0:HEAD_TILE]
-                oi = oi_buf[0:1, 0:HEAD_TILE]
-                slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_TILE]
-                slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_TILE]
-                mi_next = pl.maximum(mi, slot_score)
-                alpha = pl.exp(pl.sub(mi, mi_next))
-                beta = pl.exp(pl.sub(slot_score, mi_next))
-                li_next = pl.add(pl.mul(alpha, li), beta)
-                oi_next = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-                mi_buf[0:1, 0:HEAD_TILE] = mi_next
-                li_buf[0:1, 0:HEAD_TILE] = li_next
-                oi_buf[0:1, 0:HEAD_TILE] = oi_next
-            pooled_chunk = pl.div(
-                oi_buf[0:1, 0:HEAD_TILE],
-                li_buf[0:1, 0:HEAD_TILE],
-            )
-            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_chunk
+            # Vectorized softmax over all STATE_LEN slots (matches decode128): transpose the
+            # assembled [STATE_LEN, HEAD_TILE] tile and do row_max/exp/sum/div + weighted sum,
+            # replacing the STATE_LEN-1 serial online-flash fold. Same result, no long chain.
+            pool_score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
+            pool_kv_t = pl.transpose(pool_kv_tile, axis1=0, axis2=1)
+            score_max = pl.row_max(pool_score_t)
+            score_exp = pl.exp(pl.row_expand_sub(pool_score_t, score_max))
+            score_sum = pl.row_sum(score_exp)
+            score_prob = pl.row_expand_div(score_exp, score_sum)
+            pooled_chunk_t = pl.row_sum(pl.mul(pool_kv_t, score_prob))
+            pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pl.reshape(pooled_chunk_t, [1, HEAD_TILE])
         else:
             pooled_kv_pad[write_i : write_i + 1, h0 : h0 + HEAD_TILE] = pooled_kv_pad[
                 write_i : write_i + 1,
@@ -243,22 +228,21 @@ def prefill_compressor_ratio128(
         kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
-        rope_even = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P0101)
-        rope_odd = pl.gather(rope_normed, mask_pattern=pl.tile.MaskPattern.P1010)
-        rope_rot_even = pl.sub(pl.mul(rope_even, cos_b), pl.mul(rope_odd, sin_b))
-        rope_rot_odd = pl.add(pl.mul(rope_even, sin_b), pl.mul(rope_odd, cos_b))
-        rope_buf = pl.full([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        rope_buf = pl.tensor.scatter(
-            rope_rot_even,
-            mask_pattern=pl.tile.MaskPattern.P0101,
-            dst=rope_buf,
-        )
-        rope_buf = pl.tensor.scatter(
-            rope_rot_odd,
-            mask_pattern=pl.tile.MaskPattern.P1010,
-            dst=rope_buf,
-        )
-        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_buf
+        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
+        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
+        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
+        rope_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
+        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
+        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
+        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):
