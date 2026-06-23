@@ -370,13 +370,24 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
             (f"__gm__ {p.cpp_type}* {p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
         )
         call = ", ".join(p.name for p in params)
+        # The AIV side of a mixed kernel may take extra trailing scalar args
+        # beyond the AIC launch ABI (e.g. block-partition offsets the runtime
+        # derives per AIV subblock). The synthesized single-core dispatcher has
+        # no such runtime, so we pass 0 for each extra arg — that profiles the
+        # first partition, and per-instruction cost is partition-independent.
+        aiv_call = call
+        m_aiv = re.search(rf"\bAICORE\s+void\s+{re.escape(name)}_aiv\s*\(([^)]*)\)", cpp_text)
+        if m_aiv:
+            n_extra = len(_split_params(m_aiv.group(1))) - len(params)
+            if n_extra > 0:
+                aiv_call = call + ", " + ", ".join(["0"] * n_extra)
         # extern "C" so the merged dispatcher's launch-ABI symbol matches the
         # non-mangled forward decl in launch.cpp (mirrors the ptoas pure-kernel
         # convention, which is always `extern "C" __global__`).
         out += (
             f'\n\nextern "C" __global__ AICORE void {name}({decl}) {{\n'
             f"#if defined(__DAV_CUBE__)\n  {name}_aic({call});\n#endif\n"
-            f"#if defined(__DAV_VEC__)\n  {name}_aiv({call});\n#endif\n}}\n"
+            f"#if defined(__DAV_VEC__)\n  {name}_aiv({aiv_call});\n#endif\n}}\n"
         )
     return out
 

@@ -49,7 +49,11 @@ T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 # tiling
 T_TILE = 16  # unified row-tile for the fused spmd
 RMS_K_TILE = 128
-LINEAR_K_TILE = 128
+# 256 (not 128/512): the matmul K-reduction is a serial matmul_acc dependency
+# chain (HC_DIM/LINEAR_K_TILE steps), each carrying fixed MTE/sync overhead.
+# Doubling the K-tile halves the chain length (−~29% on the matmul in the
+# multiscope variant); 512 overflows L0B for the FP32 weight (32x512x4=64KB).
+LINEAR_K_TILE = 256
 # 256 (not 512): in the single fused spmd the mix_x FP32 tiles share Vec UB with
 # the matmul / sinkhorn buffers; D_TILE=512 overflows the 192KB Vec limit.
 D_TILE = 256
