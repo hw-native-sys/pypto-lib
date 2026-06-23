@@ -81,6 +81,10 @@ def combine(
     combine_done: pld.DistributedTensor[[EP_WORLD_SIZE, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    # 1-based ordinal of this MoE call. combine_done is a monotonic per-source
+    # counter, so waiting for `moe_epoch` isolates serial MoE calls that reuse
+    # the same distributed window.
+    moe_epoch: pl.Scalar[pl.INT32],
 ):
     # Push recv_y rows to each peer's routed_y_buf, then a cross-rank barrier, in
     # one pl.at(CORE_GROUP) so the TPUT + notify/wait stay one atomic task. The
@@ -110,8 +114,9 @@ def combine(
                         shape=[1, D],
                     )
 
-        # combine_done barrier — per-src signal cells, AtomicAdd (mirrors the
-        # L3 reference protocol).
+        # combine_done barrier — per-src signal cells. Each MoE increments once;
+        # receivers wait for this call's epoch instead of a fixed value, so a
+        # completed earlier combine cannot release the current reduce.
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
@@ -126,7 +131,7 @@ def combine(
                 pld.system.wait(
                     signal=combine_done,
                     offsets=[src, 0],
-                    expected=1,
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 

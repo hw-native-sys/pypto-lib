@@ -120,6 +120,10 @@ def moe(
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    # Caller-maintained 1-based MoE invocation id for shared done windows.
+    # It is independent from `layer_id`: layer_id selects weights/routing, while
+    # moe_epoch orders the communication protocol over reused windows.
+    moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     # All non-output intermediates allocate locally so the convert pass sees
     # them in the same scope as their producer / consumer, mirroring the
@@ -156,12 +160,14 @@ def moe(
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+    # Pass the same epoch through dispatch and combine so their stage-specific
+    # done counters describe the same MoE invocation.
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
-        num_tokens, my_rank,
+        num_tokens, my_rank, moe_epoch,
     )
 
     recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
@@ -177,7 +183,7 @@ def moe(
         recv_y, recv_r_route_out, sh,
         ffn_out,
         pub_counts, routed_y_buf, combine_done,
-        num_tokens, my_rank,
+        num_tokens, my_rank, moe_epoch,
     )
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
@@ -223,6 +229,9 @@ def moe_test(
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    # Single-layer tests pass 1; multi-layer callers must pass a monotonically
+    # increasing MoE call id when they reuse the same done windows.
+    moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_next = moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -235,7 +244,7 @@ def moe_test(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        layer_id, pl.const(T, pl.INT32), my_rank,
+        layer_id, pl.const(T, pl.INT32), my_rank, moe_epoch,
     )
     return x_next
 
@@ -297,7 +306,7 @@ def l3_moe(
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
-            layer_id, r,
+            layer_id, r, pl.const(1, pl.INT32),
             device=r,
         )
 

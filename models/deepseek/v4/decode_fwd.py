@@ -75,9 +75,9 @@ from decode_layer import (
 )
 
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 7
-CSA_NUM_LAYERS = 3
-HCA_NUM_LAYERS = 2
+FWD_NUM_LAYERS = 15
+CSA_NUM_LAYERS = 7
+HCA_NUM_LAYERS = 6
 CSA_LAST_LAYER = CSA_NUM_LAYERS - 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
@@ -103,6 +103,16 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
     packed_shape = [spec.shape[0], layer_count * spec.shape[1], *spec.shape[2:]]
 
     def init_value():
+        if name == "tid2eid":
+            token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
+            topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
+            rows = []
+            for layer in range(layer_count):
+                layer_eids = (token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL
+                rows.append(layer_eids)
+            packed = torch.cat(rows, dim=0)
+            return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
         # This forward-only smoke path does not run a golden comparison. Avoid
         # generating random single-layer weights FWD_NUM_LAYERS times and then
         # stacking them; construct the packed tensor directly.
@@ -122,13 +132,125 @@ def _make_shared_spec(name, base_spec, out_name=None):
     return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
 
 
+def _make_forward_metadata_specs(base_specs, start_pos=None):
+    import torch
+    from golden import TensorSpec
+
+    seq_per_batch = T // B
+    win = MODEL_CONFIG.sliding_window
+
+    def ranked(init_single):
+        return torch.stack([init_single() for _ in range(N_RANKS)], dim=0)
+
+    def init_start_pos():
+        if start_pos is not None:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        pattern = torch.tensor([
+            10,
+            CSA_COMPRESS_RATIO - seq_per_batch,
+            CSA_COMPRESS_RATIO - 1,
+            CSA_COMPRESS_RATIO,
+            CSA_COMPRESS_RATIO * 2 - seq_per_batch,
+            CSA_COMPRESS_RATIO * 3 - 1,
+            win - seq_per_batch,
+            win - 1,
+            win,
+        ], dtype=torch.int32)
+        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+
+    def init_position_ids_single():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((T,), dtype=torch.int32)
+        for t in range(T):
+            b = t // seq_per_batch
+            s = t - b * seq_per_batch
+            positions[t] = starts[b] + s
+        return positions
+
+    def init_kv_seq_lens_single():
+        return (init_start_pos().to(torch.int64) + seq_per_batch).to(torch.int32)
+
+    def init_block_table_single(max_blocks):
+        tbl = torch.full((B, max_blocks), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(max_blocks):
+                tbl[b, j] = b * max_blocks + j
+        return tbl
+
+    def init_ori_slot_mapping_single():
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(ORI_MAX_BLOCKS).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            slot = pos % win
+            blk = int(block_table[b, slot // BLOCK_SIZE].item())
+            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
+        return mapping
+
+    def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(max_blocks).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            if (pos + 1) % compress_ratio == 0:
+                cache_col = pos // compress_ratio
+                logical_blk = cache_col // BLOCK_SIZE
+                intra = cache_col % BLOCK_SIZE
+                blk = int(block_table[b, logical_blk].item())
+                mapping[t] = blk * BLOCK_SIZE + intra
+        return mapping
+
+    def init_state_slot_mapping_single(max_blocks, block_size):
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(max_blocks).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            logical_blk = pos // block_size
+            intra = pos % block_size
+            blk = int(block_table[b, logical_blk].item())
+            mapping[t] = blk * block_size + intra
+        return mapping
+
+    init_by_name = {
+        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
+        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
+        "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
+        "hca_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS)),
+        "csa_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS)),
+        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_INNER_STATE_MAX_BLOCKS)),
+        "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
+        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
+        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
+        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
+        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE)),
+        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE)),
+        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE)),
+        "position_ids": lambda: ranked(init_position_ids_single),
+        "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
+    }
+
+    return {
+        name: TensorSpec(name, list(base_specs[name].shape), base_specs[name].dtype, init_value=init_value)
+        for name, init_value in init_by_name.items()
+    }
+
+
 def build_tensor_specs(start_pos=None):
     from golden import TensorSpec
     base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
+    metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
     ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids']
     specs = []
     for name in ordered_names:
-        if name in CSA_LAYER_STACKED_NAMES:
+        if name in metadata_specs:
+            specs.append(metadata_specs[name])
+        elif name in CSA_LAYER_STACKED_NAMES:
             specs.append(_make_layer_stacked_spec(name, base_specs, CSA_NUM_LAYERS))
         elif name in HCA_LAYER_STACKED_NAMES:
             specs.append(_make_layer_stacked_spec(name, base_specs, HCA_NUM_LAYERS))
@@ -326,7 +448,7 @@ def decode_fwd(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        pl.const(0, pl.INT32), pl.const(T, pl.INT32), my_rank,
+        pl.const(0, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
     )
     attention_swa(
         hidden,
@@ -351,11 +473,13 @@ def decode_fwd(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        pl.const(1, pl.INT32), pl.const(T, pl.INT32), my_rank,
+        pl.const(1, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(2, pl.INT32),
     )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = loop_i * 2 + 2
         hca_layer: pl.Scalar[pl.INT32] = loop_i * 2 + 3
+        csa_moe_epoch: pl.Scalar[pl.INT32] = loop_i * 2 + 3
+        hca_moe_epoch: pl.Scalar[pl.INT32] = loop_i * 2 + 4
         x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
@@ -439,7 +563,7 @@ def decode_fwd(
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
-            csa_layer, pl.const(T, pl.INT32), my_rank,
+            csa_layer, pl.const(T, pl.INT32), my_rank, csa_moe_epoch,
         )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -506,9 +630,10 @@ def decode_fwd(
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
-            hca_layer, pl.const(T, pl.INT32), my_rank,
+            hca_layer, pl.const(T, pl.INT32), my_rank, hca_moe_epoch,
         )
     csa_layer_last: pl.Scalar[pl.INT32] = pl.const(CSA_LAST_LAYER, pl.INT32)
+    last_moe_epoch: pl.Scalar[pl.INT32] = pl.const(2, pl.INT32) * HCA_NUM_LAYERS + 3
     x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     x_next: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     hc_attn_fn_last: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
@@ -591,7 +716,7 @@ def decode_fwd(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        csa_layer_last, pl.const(T, pl.INT32), my_rank,
+        csa_layer_last, pl.const(T, pl.INT32), my_rank, last_moe_epoch,
     )
     return x_next
 

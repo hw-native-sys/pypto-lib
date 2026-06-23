@@ -110,6 +110,10 @@ def dispatch(
     recv_r_route: pld.DistributedTensor[[N_LOCAL_EXPERTS * RECV_MAX, IDX_PAD], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    # 1-based ordinal of this MoE call within the current shared-window epoch.
+    # The done windows are monotonic counters, so waits use `>= moe_epoch`
+    # instead of a fixed `>= 1` and cannot be satisfied by a previous MoE call.
+    moe_epoch: pl.Scalar[pl.INT32],
 ):
     # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
     # so it stays a tensor view, not a tile.
@@ -137,28 +141,26 @@ def dispatch(
                 cur = send_counts[d * N_LOCAL_EXPERTS + e]
                 send_counts[d * N_LOCAL_EXPERTS + e] = cur + 1
 
-        # ---------- publish: TNOTIFY(AtomicAdd) ----------
+        # ---------- publish: overwrite this epoch's exact counts ----------
+        # `pub_counts` stores the current MoE's exact routing counts, not a
+        # monotonic counter. Publish all buckets, including zeros, so reusing the
+        # same window across serial MoE calls cannot leak stale counts.
         for peer in pl.range(EP_WORLD_SIZE):
             for d in pl.range(EP_WORLD_SIZE):
                 for e in pl.range(N_LOCAL_EXPERTS):
                     v = send_counts[d * N_LOCAL_EXPERTS + e]
-                    if v != 0:
-                        # AtomicAdd is the proven count protocol for the L3 EP
-                        # path. Active-only prefill keeps this protocol and
-                        # simply emits fewer nonzero route counts.
-                        pld.system.notify(
-                            target=pub_counts,
-                            peer=peer,
-                            offsets=[my_rank * EP_WORLD_SIZE + d, e],
-                            value=v,
-                            op=pld.NotifyOp.AtomicAdd,
-                        )
+                    pld.system.notify(
+                        target=pub_counts,
+                        peer=peer,
+                        offsets=[my_rank * EP_WORLD_SIZE + d, e],
+                        value=v,
+                        op=pld.NotifyOp.Set,
+                    )
 
         # ---------- count_done barrier ----------
-        # AtomicAdd, NOT Set: the same per-src cell is bumped again by the data
-        # phase below. A Set here can race with a faster peer's data-phase add
-        # (count Set lands after, overwrites 2 -> 1) and deadlock the data wait
-        # at world sizes > 2.
+        # count_done/data_done are separate per-stage monotonic counters. Each
+        # MoE bumps the local source cell once; receivers wait for this call's
+        # epoch so older stages from earlier MoE calls do not pass the barrier.
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
@@ -173,7 +175,7 @@ def dispatch(
                 pld.system.wait(
                     signal=count_done,
                     offsets=[src, 0],
-                    expected=1,
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
@@ -235,6 +237,8 @@ def dispatch(
                 pld.tile.remote_store(idx_tile, target=recv_r_route, peer=dst, offsets=[row, 0])
 
         # ---------- data_done barrier — per-src signal cells ----------
+        # Same epoch discipline as count_done: value is only a counter bump, and
+        # the phase meaning comes from the dedicated data_done window.
         for peer in pl.range(EP_WORLD_SIZE):
             if peer != my_rank:
                 pld.system.notify(
@@ -249,7 +253,7 @@ def dispatch(
                 pld.system.wait(
                     signal=data_done,
                     offsets=[src, 0],
-                    expected=1,
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
