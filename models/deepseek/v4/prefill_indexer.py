@@ -255,7 +255,7 @@ def prefill_indexer_test(
                         score[score_token : score_token + 1, 0:16],
                         pl.mul(score_dep, pl.full([1, 16], dtype=pl.FP32, value=0.0)),
                     )
-                for topk_col in pl.range(IDX_TOPK):
+                for topk_col in pl.range(INDEXER_TOPK_CAP):
                     topk_val = pl.read(cmp_topk_indices, [score_token, topk_col])
                     pl.write(topk_idxs, [score_token, topk_col], topk_val)
     return score, idx_kv_cache_out, topk_idxs
