@@ -60,7 +60,9 @@ W2_ACT_INNER = 8
 
 assert MOE_INTER % (MM_GATE_INNER * MM_INTER_TILE) == 0, "gate/up cube tiling must cover MOE_INTER"
 assert MOE_INTER % (ACT_GATE_INNER * ACT_INTER_TILE) == 0, "gate/up vector tiling must cover MOE_INTER"
-assert D % (W2_INNER * D_OUT_TILE) == 0, "w2 tiling must cover D"
+assert D % K_TILE == 0, "gate/up K-loop must cover D"
+assert D % (W2_INNER * D_OUT_TILE) == 0, "w2 cube tiling must cover D"
+assert D % (W2_ACT_INNER * D_OUT_TILE_ACT) == 0, "w2 vector tiling must cover D"
 
 
 @pl.jit.inline
@@ -107,12 +109,13 @@ def expert_routed(
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
                     n0 = n_base + ng * MM_INTER_TILE
-                    # Peel the first K iter (plain matmul seeds the accumulator,
-                    # avoiding the if-kb==0 carry that trips the TLOAD DN->NZ ISA
-                    # assertion, pypto#1540), then run the remaining K iters under
-                    # pl.pipeline so each tile's weight MTE2 load overlaps the previous
-                    # tile's cube compute. This cube is MTE2-bound, so the overlap fills
-                    # that gap; INT32 accumulation order is unchanged.
+                    # Seed the accumulator on the first K iter with a plain matmul
+                    # (matmul_acc from a zero-init carry trips the TLOAD DN->NZ ISA
+                    # assertion, pypto#1540). Keep that k0 == 0 conditional inside the
+                    # pl.pipeline loop rather than peeling it out as a prologue, so the
+                    # first chunk's weight MTE2 load overlaps the rest of the pipeline.
+                    # This cube is MTE2-bound, so the overlap fills that gap; INT32
+                    # accumulation order is unchanged.
                     gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                         x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
@@ -193,9 +196,10 @@ def expert_routed(
                 d_base = db_idx * (W2_INNER * D_OUT_TILE)
                 for dg in pl.range(W2_INNER):
                     d0 = d_base + dg * D_OUT_TILE
-                    # Peel the first K iter (pypto#1540, see exp_gate_up_mm), then
-                    # pipeline the rest so each weight MTE2 load overlaps the previous
-                    # tile's cube compute. INT32 accumulation order is unchanged.
+                    # Seed the accumulator on the first K iter with a plain matmul
+                    # (pypto#1540, see exp_gate_mm), keeping the k0 == 0 conditional
+                    # inside the pl.pipeline loop so each weight MTE2 load overlaps the
+                    # previous tile's cube compute. INT32 accumulation order is unchanged.
                     y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                         h_k = h_tile_i8[:, k0 : k0 + INTER_K]
