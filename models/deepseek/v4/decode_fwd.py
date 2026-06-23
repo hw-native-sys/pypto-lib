@@ -264,7 +264,7 @@ def build_tensor_specs(start_pos=None):
     return specs
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def decode_fwd(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -369,17 +369,18 @@ def decode_fwd(
     wo_b_scale_l0 = pl.slice(wo_b_scale, [D], [0 * D])
     cmp_kv_l0 = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [0 * CSA_CMP_BLOCK_NUM, 0, 0, 0])
     x_attn0 = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    attention_swa(
-        x_hc,
-        hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
-        attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
-        wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
-        kv_cache_l0, block_table,
-        ori_slot_mapping, position_ids,
-        cmp_kv_l0, cmp_block_table,
-        attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
-        x_attn0,
-    )
+    with pl.scope():
+        attention_swa(
+            x_hc,
+            hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
+            attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
+            wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
+            kv_cache_l0, block_table,
+            ori_slot_mapping, position_ids,
+            cmp_kv_l0, cmp_block_table,
+            attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
+            x_attn0,
+        )
 
     hc_ffn_fn_l0 = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_ffn_scale_l0 = pl.slice(hc_ffn_scale, [3], [0 * 3])
@@ -401,20 +402,21 @@ def decode_fwd(
     shared_w2_l0 = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
     shared_w2_scale_l0 = pl.slice(shared_w2_scale, [D], [0 * D])
     hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    hidden = moe(
-        x_attn0,
-        hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
-        norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
-        routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
-        routed_w2_l0, routed_w2_scale_l0,
-        shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
-        shared_w2_l0, shared_w2_scale_l0,
-        hidden,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        routed_y_buf, combine_done,
-        pl.const(0, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
-    )
+    with pl.scope():
+        hidden = moe(
+            x_attn0,
+            hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
+            norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
+            routed_w1_l0, routed_w1_scale_l0, routed_w3_l0, routed_w3_scale_l0,
+            routed_w2_l0, routed_w2_scale_l0,
+            shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
+            shared_w2_l0, shared_w2_scale_l0,
+            hidden,
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            routed_y_buf, combine_done,
+            pl.const(0, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        )
 
     hc_attn_fn_l1 = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
     hc_attn_scale_l1 = pl.slice(hc_attn_scale, [3], [1 * 3])
@@ -433,17 +435,18 @@ def decode_fwd(
     wo_b_scale_l1 = pl.slice(wo_b_scale, [D], [1 * D])
     cmp_kv_l1 = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [1 * CSA_CMP_BLOCK_NUM, 0, 0, 0])
     x_attn1 = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    attention_swa(
-        hidden,
-        hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
-        attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
-        wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
-        kv_cache_l1, block_table,
-        ori_slot_mapping, position_ids,
-        cmp_kv_l1, cmp_block_table,
-        attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
-        x_attn1,
-    )
+    with pl.scope():
+        attention_swa(
+            hidden,
+            hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
+            attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
+            wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
+            kv_cache_l1, block_table,
+            ori_slot_mapping, position_ids,
+            cmp_kv_l1, cmp_block_table,
+            attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
+            x_attn1,
+        )
 
     hc_ffn_fn_l1 = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
     hc_ffn_scale_l1 = pl.slice(hc_ffn_scale, [3], [1 * 3])
@@ -464,20 +467,21 @@ def decode_fwd(
     shared_w3_scale_l1 = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w2_l1 = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1 = pl.slice(shared_w2_scale, [D], [1 * D])
-    hidden = moe(
-        x_attn1,
-        hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
-        norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
-        routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
-        routed_w2_l1, routed_w2_scale_l1,
-        shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
-        shared_w2_l1, shared_w2_scale_l1,
-        hidden,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        routed_y_buf, combine_done,
-        pl.const(1, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(2, pl.INT32),
-    )
+    with pl.scope():
+        hidden = moe(
+            x_attn1,
+            hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
+            norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
+            routed_w1_l1, routed_w1_scale_l1, routed_w3_l1, routed_w3_scale_l1,
+            routed_w2_l1, routed_w2_scale_l1,
+            shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
+            shared_w2_l1, shared_w2_scale_l1,
+            hidden,
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            routed_y_buf, combine_done,
+            pl.const(1, pl.INT32), pl.const(T, pl.INT32), my_rank, pl.const(2, pl.INT32),
+        )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer = loop_i * 2 + 2
         hca_layer = loop_i * 2 + 3
@@ -516,24 +520,25 @@ def decode_fwd(
         csa_inner_compress_state_csa = pl.slice(csa_inner_compress_state, [CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], [loop_i * CSA_INNER_STATE_BLOCK_NUM, 0, 0])
         cmp_kv_csa = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer * CSA_CMP_BLOCK_NUM, 0, 0, 0])
         idx_kv_cache_csa = pl.slice(idx_kv_cache, [CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], [loop_i * CSA_IDX_CACHE_BLOCK_NUM, 0, 0, 0])
-        attention_csa(
-            hidden,
-            hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
-            attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
-            wkv_csa, gamma_cq_csa, gamma_ckv_csa, freqs_cos, freqs_sin,
-            csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
-            csa_compress_state_csa, csa_compress_state_block_table,
-            csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
-            csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
-            csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-            kv_cache_csa, block_table, cmp_kv_csa, cmp_block_table,
-            idx_kv_cache_csa, idx_block_table,
-            ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
-            csa_state_slot_mapping, csa_inner_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
-            x_attn_csa,
-        )
+        with pl.scope():
+            attention_csa(
+                hidden,
+                hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa,
+                attn_norm_w_csa, wq_a_csa, wq_b_csa, wq_b_scale_csa,
+                wkv_csa, gamma_cq_csa, gamma_ckv_csa, freqs_cos, freqs_sin,
+                csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
+                csa_compress_state_csa, csa_compress_state_block_table,
+                csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
+                csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
+                csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
+                kv_cache_csa, block_table, cmp_kv_csa, cmp_block_table,
+                idx_kv_cache_csa, idx_block_table,
+                ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+                csa_state_slot_mapping, csa_inner_state_slot_mapping,
+                position_ids, kv_seq_lens,
+                attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
+                x_attn_csa,
+            )
 
         hidden_mid = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         hc_ffn_fn_csa = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -555,20 +560,21 @@ def decode_fwd(
         shared_w3_scale_csa = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w2_csa = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa = pl.slice(shared_w2_scale, [D], [csa_layer * D])
-        hidden_mid = moe(
-            x_attn_csa,
-            hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
-            norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
-            routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
-            routed_w2_csa, routed_w2_scale_csa,
-            shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
-            shared_w2_csa, shared_w2_scale_csa,
-            hidden_mid,
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
-            csa_layer, pl.const(T, pl.INT32), my_rank, csa_moe_epoch,
-        )
+        with pl.scope():
+            hidden_mid = moe(
+                x_attn_csa,
+                hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
+                norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
+                routed_w1_csa, routed_w1_scale_csa, routed_w3_csa, routed_w3_scale_csa,
+                routed_w2_csa, routed_w2_scale_csa,
+                shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
+                shared_w2_csa, shared_w2_scale_csa,
+                hidden_mid,
+                pub_counts, count_done, data_done,
+                recv_x, recv_scale, recv_w, recv_r_route,
+                routed_y_buf, combine_done,
+                csa_layer, pl.const(T, pl.INT32), my_rank, csa_moe_epoch,
+            )
 
         x_attn_hca = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         hc_attn_fn_hca = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -592,19 +598,20 @@ def decode_fwd(
         hca_cmp_norm_w_hca = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [loop_i * HEAD_DIM])
         hca_compress_state_hca = pl.slice(hca_compress_state, [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [loop_i * HCA_COMPRESS_STATE_BLOCK_NUM, 0, 0])
         cmp_kv_hca = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * CSA_CMP_BLOCK_NUM, 0, 0, 0])
-        attention_hca(
-            hidden_mid,
-            hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
-            attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
-            wkv_hca, gamma_cq_hca, gamma_ckv_hca, freqs_cos, freqs_sin,
-            hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
-            hca_compress_state_hca, hca_compress_state_block_table,
-            kv_cache_hca, block_table, cmp_kv_hca, cmp_block_table,
-            ori_slot_mapping, hca_cmp_slot_mapping, hca_state_slot_mapping,
-            position_ids, kv_seq_lens,
-            attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
-            x_attn_hca,
-        )
+        with pl.scope():
+            attention_hca(
+                hidden_mid,
+                hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca,
+                attn_norm_w_hca, wq_a_hca, wq_b_hca, wq_b_scale_hca,
+                wkv_hca, gamma_cq_hca, gamma_ckv_hca, freqs_cos, freqs_sin,
+                hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
+                hca_compress_state_hca, hca_compress_state_block_table,
+                kv_cache_hca, block_table, cmp_kv_hca, cmp_block_table,
+                ori_slot_mapping, hca_cmp_slot_mapping, hca_state_slot_mapping,
+                position_ids, kv_seq_lens,
+                attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
+                x_attn_hca,
+            )
 
         hc_ffn_fn_hca = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_ffn_scale_hca = pl.slice(hc_ffn_scale, [3], [hca_layer * 3])
@@ -625,20 +632,21 @@ def decode_fwd(
         shared_w3_scale_hca = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w2_hca = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca = pl.slice(shared_w2_scale, [D], [hca_layer * D])
-        hidden = moe(
-            x_attn_hca,
-            hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
-            norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
-            routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
-            routed_w2_hca, routed_w2_scale_hca,
-            shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
-            shared_w2_hca, shared_w2_scale_hca,
-            hidden,
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
-            hca_layer, pl.const(T, pl.INT32), my_rank, hca_moe_epoch,
-        )
+        with pl.scope():
+            hidden = moe(
+                x_attn_hca,
+                hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
+                norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
+                routed_w1_hca, routed_w1_scale_hca, routed_w3_hca, routed_w3_scale_hca,
+                routed_w2_hca, routed_w2_scale_hca,
+                shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
+                shared_w2_hca, shared_w2_scale_hca,
+                hidden,
+                pub_counts, count_done, data_done,
+                recv_x, recv_scale, recv_w, recv_r_route,
+                routed_y_buf, combine_done,
+                hca_layer, pl.const(T, pl.INT32), my_rank, hca_moe_epoch,
+            )
     csa_layer_last = pl.const(CSA_LAST_LAYER, pl.INT32)
     last_moe_epoch: pl.Scalar[pl.INT32] = pl.const(2, pl.INT32) * HCA_NUM_LAYERS + 3
 
@@ -674,24 +682,25 @@ def decode_fwd(
     csa_inner_compress_state_last = pl.slice(csa_inner_compress_state, [CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM], [(CSA_NUM_LAYERS - 1) * CSA_INNER_STATE_BLOCK_NUM, 0, 0])
     cmp_kv_last = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer_last * CSA_CMP_BLOCK_NUM, 0, 0, 0])
     idx_kv_cache_last = pl.slice(idx_kv_cache, [CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], [(CSA_NUM_LAYERS - 1) * CSA_IDX_CACHE_BLOCK_NUM, 0, 0, 0])
-    attention_csa(
-        hidden,
-        hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
-        attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
-        wkv_last, gamma_cq_last, gamma_ckv_last, freqs_cos, freqs_sin,
-        csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
-        csa_compress_state_last, csa_compress_state_block_table,
-        csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
-        csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
-        csa_inner_compress_state_last, csa_inner_compress_state_block_table,
-        kv_cache_last, block_table, cmp_kv_last, cmp_block_table,
-        idx_kv_cache_last, idx_block_table,
-        ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
-        csa_state_slot_mapping, csa_inner_state_slot_mapping,
-        position_ids, kv_seq_lens,
-        attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
-        x_attn_last,
-    )
+    with pl.scope():
+        attention_csa(
+            hidden,
+            hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last,
+            attn_norm_w_last, wq_a_last, wq_b_last, wq_b_scale_last,
+            wkv_last, gamma_cq_last, gamma_ckv_last, freqs_cos, freqs_sin,
+            csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
+            csa_compress_state_last, csa_compress_state_block_table,
+            csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
+            csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
+            csa_inner_compress_state_last, csa_inner_compress_state_block_table,
+            kv_cache_last, block_table, cmp_kv_last, cmp_block_table,
+            idx_kv_cache_last, idx_block_table,
+            ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+            csa_state_slot_mapping, csa_inner_state_slot_mapping,
+            position_ids, kv_seq_lens,
+            attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
+            x_attn_last,
+        )
 
     x_next = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     hc_ffn_fn_last = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
@@ -713,20 +722,21 @@ def decode_fwd(
     shared_w3_scale_last = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
     shared_w2_last = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
     shared_w2_scale_last = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
-    x_next = moe(
-        x_attn_last,
-        hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
-        norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
-        routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
-        routed_w2_last, routed_w2_scale_last,
-        shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
-        shared_w2_last, shared_w2_scale_last,
-        x_next,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        routed_y_buf, combine_done,
-        csa_layer_last, pl.const(T, pl.INT32), my_rank, last_moe_epoch,
-    )
+    with pl.scope():
+        x_next = moe(
+            x_attn_last,
+            hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
+            norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
+            routed_w1_last, routed_w1_scale_last, routed_w3_last, routed_w3_scale_last,
+            routed_w2_last, routed_w2_scale_last,
+            shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
+            shared_w2_last, shared_w2_scale_last,
+            x_next,
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            routed_y_buf, combine_done,
+            csa_layer_last, pl.const(T, pl.INT32), my_rank, last_moe_epoch,
+        )
     return x_next
 
 
