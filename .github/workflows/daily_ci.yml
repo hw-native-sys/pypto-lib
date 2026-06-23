@@ -31,7 +31,13 @@ jobs:
       PIP_CACHE_DIR: /root/.cache/pip
     container:
       image: localhost:5001/ci-py310:latest
+      # GitHub Actions containers do not inherit the host's large /dev/shm; they
+      # use Docker's 64MB default. Distributed model kernels call torch
+      # share_memory_() and overflow it. --shm-size gives each container its own
+      # tmpfs (sized on demand, not pre-allocated), avoiding the --ipc=host name
+      # clashes between the concurrent cpu-1..4 runners.
       options: >-
+        --shm-size=128g
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip:/root/.cache/pip
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
