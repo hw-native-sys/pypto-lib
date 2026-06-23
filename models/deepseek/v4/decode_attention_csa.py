@@ -120,7 +120,7 @@ ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def attention_csa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -170,193 +170,154 @@ def attention_csa(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level tensors: written inside the scope below but read by sparse_attn /
+    # writeback / hc_post afterwards, so they stay in the function frame.
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post_t,
-        comb_t,
-    )
-
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            step_pos_b = pl.cast(first_pos_b, pl.INDEX)
-            for s in pl.range(S):
-                t = b * S + s
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16), [t, 0])
-                rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16), [t, 0])
-            step_cos = pl.assemble(step_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
-            step_sin = pl.assemble(step_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
-
-    cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos = pl.assemble(cmp_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
-            cmp_sin = pl.assemble(cmp_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
-
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed_t = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    q = qkv_proj_rope(
-        x_normed_t,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
-    )
-
-    x_normed = pl.reshape(x_normed_t, [B, S, D])
-    cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
-    cmp_out = compressor_ratio4(
-        x_normed,
-        cmp_out,
-        compress_state,
-        compress_state_block_table,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        cmp_cos,
-        cmp_sin,
-        cmp_kv,
-        position_ids_bsd,
-        cmp_slot_mapping_bsd,
-        state_slot_mapping_bsd,
-    )
-
-    idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
-    idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
-    idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    idx_score_unused, idx_topk_full = indexer(
-        x_normed,
-        qr,
-        qr_scale,
-        idx_wq_b,
-        idx_wq_b_scale,
-        weights_proj,
-        step_cos,
-        step_sin,
-        hadamard_idx,
-        idx_kv_unused,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_block_table,
-        idx_score_unused,
-        idx_topk_full,
-        position_ids_bsd,
-        idx_slot_mapping_bsd,
-        inner_state_slot_mapping_bsd,
-        kv_seq_lens,
-        WIN + S,
-    )
-
-    # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
-    # fixed metadata while the CSA path still composes indexer at runtime.
     cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
-    for topk_block in pl.spmd(CSA_TOPK_BLOCKS, name_hint="csa_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            if t_idx < T:
-                topk_b = t_idx // S
-                topk_s = t_idx - topk_b * S
-                topk_abs_pos = pl.read(position_ids, [t_idx])
 
-                if topk_abs_pos >= WIN - 1:
-                    topk_win_start = (topk_abs_pos % WIN) + 1
-                    for topk_k in pl.range(WIN):
-                        topk_val = (topk_win_start + topk_k) % WIN
-                        topk_out = topk_val
-                        for topk_os in pl.range(S):
-                            if topk_os <= topk_s:
-                                topk_overlay_t = topk_b * S + topk_os
-                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_val == topk_overlay_pos % WIN:
-                                    topk_out = WIN + topk_os
-                        pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
-                else:
-                    for topk_k in pl.range(WIN):
-                        if topk_k <= topk_abs_pos:
-                            topk_out = topk_k
+    # Pre-attention scope (hc_pre .. sparse-index build): its scratch is dead by
+    # sparse_attn, so scoping frees it at scope exit instead of pinning the frame.
+    with pl.scope():
+        # Outer-scope scratch: written inside an inner scope below but read by a
+        # later sub-phase, so it lives here rather than in an inner scope.
+        step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+        step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+        qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+        qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+        x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
+
+        # hc_pre .. rms_norm: x_mixed dies at rms_norm, so scope it to free here
+        # (the biggest short-lived scratch, freed before qkv / compressor / indexer).
+        with pl.scope():
+            x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+            hc_pre(
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                x_mixed, post_t, comb_t,
+            )
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
+                for b in pl.range(B):
+                    first_t = b * S
+                    first_pos_b = pl.read(position_ids, [first_t])
+                    step_pos_b = pl.cast(first_pos_b, pl.INDEX)
+                    for s in pl.range(S):
+                        t = b * S + s
+                        pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
+                        cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                        sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                        rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16), [t, 0])
+                        rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16), [t, 0])
+                    step_cos = pl.assemble(step_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
+                    step_sin = pl.assemble(step_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            rms_norm(x_mixed, attn_norm_w, x_normed_t)
+
+        # Sub-kernels write out-params in place; drop the returned handle (rebinding
+        # a frame tensor to a callee's dynamic-T return across the scope is rejected).
+        qkv_proj_rope(
+            x_normed_t,
+            wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale,
+        )
+
+        x_normed = pl.reshape(x_normed_t, [B, S, D])
+        position_ids_bsd = pl.reshape(position_ids, [B, S])
+        cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
+        idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
+        state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
+        inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
+
+        # csa_cmp_rope .. compressor: cmp_cos/sin and cmp_out die here (cmp_rope is
+        # params-only, moved next to its only consumer), so scope to free at exit.
+        with pl.scope():
+            cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+            cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+            cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
+                for b in pl.range(B):
+                    first_t = b * S
+                    first_pos_b = pl.read(position_ids, [first_t])
+                    cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
+                    cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
+                    cmp_cos = pl.assemble(cmp_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
+                    cmp_sin = pl.assemble(cmp_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            compressor_ratio4(
+                x_normed, cmp_out, compress_state, compress_state_block_table,
+                cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, cmp_cos, cmp_sin, cmp_kv,
+                position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
+            )
+
+        idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
+        idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
+        # Scope-local: written by indexer, read by idx_tile below, freed at scope exit.
+        idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
+        indexer(
+            x_normed, qr, qr_scale,
+            idx_wq_b, idx_wq_b_scale, weights_proj, step_cos, step_sin, hadamard_idx,
+            idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
+            inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+            idx_kv_cache, idx_block_table, idx_score_unused, idx_topk_full,
+            position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
+            kv_seq_lens, WIN + S,
+        )
+
+        idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
+        for topk_block in pl.spmd(CSA_TOPK_BLOCKS, name_hint="csa_sparse_idx_tile"):
+            topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
+            for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+                t_idx = topk_t0 + topk_dt
+                if t_idx < T:
+                    topk_b = t_idx // S
+                    topk_s = t_idx - topk_b * S
+                    topk_abs_pos = pl.read(position_ids, [t_idx])
+
+                    if topk_abs_pos >= WIN - 1:
+                        topk_win_start = (topk_abs_pos % WIN) + 1
+                        for topk_k in pl.range(WIN):
+                            topk_val = (topk_win_start + topk_k) % WIN
+                            topk_out = topk_val
                             for topk_os in pl.range(S):
                                 if topk_os <= topk_s:
                                     topk_overlay_t = topk_b * S + topk_os
                                     topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                    if topk_k == topk_overlay_pos % WIN:
+                                    if topk_val == topk_overlay_pos % WIN:
                                         topk_out = WIN + topk_os
                             pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
-                        else:
-                            pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
+                    else:
+                        for topk_k in pl.range(WIN):
+                            if topk_k <= topk_abs_pos:
+                                topk_out = topk_k
+                                for topk_os in pl.range(S):
+                                    if topk_os <= topk_s:
+                                        topk_overlay_t = topk_b * S + topk_os
+                                        topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                        if topk_k == topk_overlay_pos % WIN:
+                                            topk_out = WIN + topk_os
+                                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
+                            else:
+                                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
 
-                topk_cmp_valid = pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO)
-                for topk_ck in pl.range(IDX_TOPK):
-                    cmp_raw = pl.read(idx_topk_flat, [t_idx, topk_ck])
-                    if cmp_raw >= WIN + S:
-                        cmp_slot = cmp_raw - (WIN + S)
-                        if cmp_slot < topk_cmp_valid:
-                            pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(cmp_raw, pl.INT32))
+                    topk_cmp_valid = pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO)
+                    for topk_ck in pl.range(IDX_TOPK):
+                        cmp_raw = pl.read(idx_topk_flat, [t_idx, topk_ck])
+                        if cmp_raw >= WIN + S:
+                            cmp_slot = cmp_raw - (WIN + S)
+                            if cmp_slot < topk_cmp_valid:
+                                pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(cmp_raw, pl.INT32))
+                            else:
+                                pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
                         else:
                             pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
-                    else:
-                        pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = sparse_attn(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_indices,
-        attn_sink,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    sparse_attn(
+        q, kv_cache, ori_block_table, kv, cmp_kv, cmp_block_table,
+        cmp_sparse_indices, attn_sink, rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
 
     # Commit current MTP tokens only after sparse_attn has gathered the old cache
@@ -374,11 +335,11 @@ def attention_csa(
                 kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(pl.add(write_kv_head, write_zero), target_type=pl.BF16)
                 kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
-    x_out = hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def attention_csa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -429,53 +390,18 @@ def attention_csa_test(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
     x_out = attention_csa(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        freqs_cos,
-        freqs_sin,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        compress_state,
-        compress_state_block_table,
-        idx_wq_b,
-        idx_wq_b_scale,
-        weights_proj,
-        hadamard_idx,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        kv_cache,
-        ori_block_table,
-        cmp_kv,
-        cmp_block_table,
-        idx_kv_cache,
-        idx_block_table,
-        ori_slot_mapping,
-        cmp_slot_mapping,
-        idx_slot_mapping,
-        state_slot_mapping,
-        inner_state_slot_mapping,
-        position_ids,
-        kv_seq_lens,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        x_out,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w, compress_state, compress_state_block_table,
+        idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        inner_compress_state, inner_compress_state_block_table,
+        kv_cache, ori_block_table, cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
+        ori_slot_mapping, cmp_slot_mapping, idx_slot_mapping,
+        state_slot_mapping, inner_state_slot_mapping,
+        position_ids, kv_seq_lens, attn_sink,
+        wo_a, wo_b, wo_b_scale, x_out,
     )
     return x_out
 
@@ -1070,6 +996,9 @@ if __name__ == "__main__":
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--scope-stats", action="store_true", default=False,
+                        help="Collect per-scope occupancy stats (runtime DFX); writes "
+                             "<runtime_dir>/scope_stats/scope_stats.jsonl.")
     args = parser.parse_args()
 
     result = run_jit(
@@ -1080,6 +1009,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.scope_stats,
         ),
         rtol=1e-2,
         atol=1e-2,

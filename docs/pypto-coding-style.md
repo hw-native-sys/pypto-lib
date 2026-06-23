@@ -701,3 +701,26 @@ x_i8 = pl.cast(pl.mul(x, inv_scale), pl.INT8, mode="rint")
 # pad to 32: ptoas rejects cube tiles whose cols aren't a multiple of 16
 w_pad = pl.slice(w, [K, 32], [0, 0], valid_shape=[K, MIX_HC])
 ```
+
+### Declare scratch at first use
+
+Declare each `pl.create_tensor` / `pl.slice` / `pl.reshape` immediately before
+the first `pl.at` / `pl.spmd` / `pl.range` / `pl.scope` (or sub-kernel call) that
+uses it — not in a block at the top of the function. Tight placement keeps a
+tensor's live range minimal, which lets the scope / memory-reuse passes free it
+as early as possible. **Exception:** a tensor written *inside* a `pl.scope()` but
+read after it must be declared **before** that scope (the scope would otherwise
+free it at exit), so such scope-bridging tensors sit just before the enclosing
+scope. See `pl.scope` (§1) for how scoping bounds a tensor's lifetime.
+
+```python
+# ✅ each scratch declared just before the region that first writes it
+with pl.scope():
+    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    hc_pre(..., x_mixed)              # x_mixed dies here, freed at scope exit
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    rms_norm(x_mixed, ..., x_normed)
+# attn_out is first written by sparse_attn below (body level), so declare it here
+attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+sparse_attn(..., attn_out)
+```

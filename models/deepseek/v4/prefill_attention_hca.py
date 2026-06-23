@@ -83,7 +83,7 @@ assert SPARSE_CMP_BLOCK_NUM == B * SPARSE_CMP_MAX_BLOCKS
 assert PREFILL_COMPRESSED_LEN == 1
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def prefill_attention_hca(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -122,88 +122,55 @@ def prefill_attention_hca(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level: written inside the pre-attention scope below but read by
+    # sparse_attn / writeback / hc_post afterwards.
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post,
-        comb,
-    )
-
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = rms_norm(x_mixed, attn_norm_w, x_normed)
-
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-    )
-
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
-    )
 
-    cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio128(
-        x_normed,
-        cmp_kv_state,
-        cmp_score_state,
-        compress_state_block_table,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        freqs_cos,
-        freqs_sin,
-        cmp_kv,
-        position_ids,
-        num_tokens,
-        cmp_slot_mapping,
-        state_slot_mapping,
-    )
+    # Pre-attention scope (hc_pre .. compressor): scratch dead by sparse_attn,
+    # freed at scope exit. Sub-kernels write out-params in place (bare calls).
+    with pl.scope():
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            x_mixed, post, comb,
+        )
+
+        x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+        rms_norm(x_mixed, attn_norm_w, x_normed)
+
+        materialize_rope_rows(
+            freqs_cos, freqs_sin, position_ids, num_tokens,
+            rope_cos_t, rope_sin_t,
+        )
+
+        qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+        qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+        qkv_proj_rope(
+            x_normed,
+            wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale,
+        )
+
+        prefill_compressor_ratio128(
+            x_normed,
+            cmp_kv_state, cmp_score_state, compress_state_block_table,
+            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+            freqs_cos, freqs_sin, cmp_kv,
+            position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_indices,
-        cmp_sparse_lens,
-        attn_sink,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
+    prefill_sparse_attn(
+        q, kv_cache, ori_block_table, kv,
+        cmp_kv, cmp_block_table, cmp_sparse_indices, cmp_sparse_lens,
+        attn_sink, num_tokens, rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale,
         attn_out,
     )
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
@@ -221,17 +188,11 @@ def prefill_attention_hca(
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
 
-    x_out = hc_post(
-        attn_out,
-        x_hc,
-        post,
-        comb,
-        x_out,
-    )
+    hc_post(attn_out, x_hc, post, comb, x_out)
     return x_out
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_attention_hca_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -826,6 +787,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-tokens", type=int, default=T,
                         help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--scope-stats", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
     compare_tokens = args.num_tokens
@@ -841,6 +803,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.scope_stats,
             enable_dep_gen=args.enable_dep_gen,
         ),
         rtol=1e-2,

@@ -45,7 +45,7 @@ assert MOE_INTER % (GATE_INNER * INTER_TILE) == 0, "gate/up tiling must cover MO
 assert D % (W2_INNER * D_OUT_TILE) == 0, "w2 tiling must cover D"
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def expert_routed(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
@@ -68,123 +68,124 @@ def expert_routed(
         flat_base = local_i * RECV_MAX  # row offset in recv_y_flat
 
         for t in pl.parallel(n_tiles):
-            t0 = t * RECV_TILE
-            flat_t0 = flat_base + t0
+            with pl.scope():
+                t0 = t * RECV_TILE
+                flat_t0 = flat_base + t0
 
-            valid_rows = pl.min(RECV_TILE, n_rows - t0)
+                valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-            # Stage 1a: gate/up matmul + dequant + SwiGLU + routing-weight mul.
-            h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+                # Stage 1a: gate/up matmul + dequant + SwiGLU + routing-weight mul.
+                h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
 
-            for nb_idx in pl.spmd(MOE_INTER // (GATE_INNER * INTER_TILE), name_hint="exp_gate_up"):
-                n_base = nb_idx * (GATE_INNER * INTER_TILE)
-                for ng in pl.range(GATE_INNER):
-                    n0 = n_base + ng * INTER_TILE
-                    # Peel the first K iter (plain matmul seeds the accumulator,
-                    # avoiding the if-kb==0 carry that trips the TLOAD DN->NZ ISA
-                    # assertion, pypto#1540), then run the remaining K iters under
-                    # pl.pipeline so each tile's weight MTE2 load overlaps the
-                    # previous tile's cube compute. This cube is MTE2-bound (PMU:
-                    # ~80% MTE2, ~20% idle), so the overlap fills that gap; INT32
-                    # accumulation order is unchanged, so it is numerically identical.
-                    x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_TILE]
-                    w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
-                    w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
-                    gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
-                    up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
-                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
-                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
-                        w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
-                        gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
-                        up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
+                for nb_idx in pl.spmd(MOE_INTER // (GATE_INNER * INTER_TILE), name_hint="exp_gate_up"):
+                    n_base = nb_idx * (GATE_INNER * INTER_TILE)
+                    for ng in pl.range(GATE_INNER):
+                        n0 = n_base + ng * INTER_TILE
+                        # Peel the first K iter (plain matmul seeds the accumulator,
+                        # avoiding the if-kb==0 carry that trips the TLOAD DN->NZ ISA
+                        # assertion, pypto#1540), then run the remaining K iters under
+                        # pl.pipeline so each tile's weight MTE2 load overlaps the
+                        # previous tile's cube compute. This cube is MTE2-bound (PMU:
+                        # ~80% MTE2, ~20% idle), so the overlap fills that gap; INT32
+                        # accumulation order is unchanged, so it is numerically identical.
+                        x_init = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, 0 : K_TILE]
+                        w1_init = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
+                        w3_init = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, 0 : K_TILE]
+                        gate_acc = pl.matmul(x_init, w1_init, b_trans=True, out_dtype=pl.INT32)
+                        up_acc = pl.matmul(x_init, w3_init, b_trans=True, out_dtype=pl.INT32)
+                        for k0 in pl.pipeline(K_TILE, D, K_TILE, stage=2):
+                            x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                            w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
+                            w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + INTER_TILE, k0 : k0 + K_TILE]
+                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
+                            up_acc = pl.matmul_acc(up_acc, x_k, w3_k, b_trans=True)
 
-                    gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_TILE])
-                    up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_TILE])
-                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
-                    w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
-                    w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
-                    gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
-                    up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
-                    gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
-                    up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
-                    if SWIGLU_LIMIT > 0.0:
-                        gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
-                        up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
-                    silu = pl.mul(gate_2d, sigmoid)
-                    gated = pl.mul(silu, up_2d)
-                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
-                    gated_valid = pl.set_validshape(gated, valid_rows, INTER_TILE)
-                    gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
-                    h_tile_fp32[:, n0 : n0 + INTER_TILE] = gated_masked
+                        gate_2d_i32 = pl.reshape(gate_acc, [RECV_TILE, INTER_TILE])
+                        up_2d_i32 = pl.reshape(up_acc, [RECV_TILE, INTER_TILE])
+                        recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
+                        w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
+                        w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + INTER_TILE]
+                        gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
+                        up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
+                        gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
+                        up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
+                        if SWIGLU_LIMIT > 0.0:
+                            gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
+                            up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                        sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
+                        silu = pl.mul(gate_2d, sigmoid)
+                        gated = pl.mul(silu, up_2d)
+                        # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
+                        gated_valid = pl.set_validshape(gated, valid_rows, INTER_TILE)
+                        gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
+                        h_tile_fp32[:, n0 : n0 + INTER_TILE] = gated_masked
 
-            # Per-row A8 requant of h_tile (amax across full MOE_INTER row).
-            h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
-                eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.range(0, MOE_INTER, QUANT_TILE):
-                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
-                    eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
-                    eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
-                    eh_amax = pl.maximum(eh_amax, eh_a_max)
-                eh_sq_row = pl.div(
-                    pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
-                )
-                h_tile_scale_dq = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
-                eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                for k1 in pl.range(0, MOE_INTER, QUANT_TILE):
-                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
-                    eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
-                    eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
-                    eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                    h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
-
-            # Stage 1b: w2 matmul + dequant + routing-weight mul + write recv_y.
-            #
-            # The routing weight is applied row-wise here (vs. the legacy
-            # single-card path that applied it in combine's reduce). Multi-card
-            # combine then just sums the TOPK rows per token, saving one
-            # cross-rank weight channel.
-            for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2"):
-                d_base = db_idx * (W2_INNER * D_OUT_TILE)
-                # Fold the per-row h-dequant scale and the per-row routing
-                # weight into a single per-row scale, computed once per spmd
-                # block (instead of an extra row_expand_mul per d-tile) --
-                # algebraically identical, fewer vector ops on the hot path.
-                w_col_blk = pl.reshape(
-                    recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
-                    [RECV_TILE, 1],
-                )
-                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
-                for dg in pl.range(W2_INNER):
-                    d0 = d_base + dg * D_OUT_TILE
-                    # Peel-first-iter K loop (pypto#1540, see exp_gate_up). This w2
-                    # matmul is scalar/address-gen bound (PMU: scalar ~97%), not
-                    # MTE2-bound, so pipelining the K loop here buys nothing on
-                    # device and only adds simulator work -- keep it serial.
-                    h_init = h_tile_i8[:, 0 : INTER_K]
-                    w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, 0 : INTER_K]
-                    y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
-                    for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
-                        h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                        w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                        y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
-
-                    y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
-                    w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE]
-                    y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                    recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE] = pl.cast(
-                        y_2d, target_type=pl.BF16, mode="rint"
+                # Per-row A8 requant of h_tile (amax across full MOE_INTER row).
+                h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
+                    eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                    for k0 in pl.range(0, MOE_INTER, QUANT_TILE):
+                        eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
+                        eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
+                        eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
+                        eh_amax = pl.maximum(eh_amax, eh_a_max)
+                    eh_sq_row = pl.div(
+                        pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
                     )
+                    h_tile_scale_dq = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
+                    eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
+                    for k1 in pl.range(0, MOE_INTER, QUANT_TILE):
+                        eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
+                        eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
+                        eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
+                        eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
+                        h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
+
+                # Stage 1b: w2 matmul + dequant + routing-weight mul + write recv_y.
+                #
+                # The routing weight is applied row-wise here (vs. the legacy
+                # single-card path that applied it in combine's reduce). Multi-card
+                # combine then just sums the TOPK rows per token, saving one
+                # cross-rank weight channel.
+                for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2"):
+                    d_base = db_idx * (W2_INNER * D_OUT_TILE)
+                    # Fold the per-row h-dequant scale and the per-row routing
+                    # weight into a single per-row scale, computed once per spmd
+                    # block (instead of an extra row_expand_mul per d-tile) --
+                    # algebraically identical, fewer vector ops on the hot path.
+                    w_col_blk = pl.reshape(
+                        recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
+                        [RECV_TILE, 1],
+                    )
+                    row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                    for dg in pl.range(W2_INNER):
+                        d0 = d_base + dg * D_OUT_TILE
+                        # Peel-first-iter K loop (pypto#1540, see exp_gate_up). This w2
+                        # matmul is scalar/address-gen bound (PMU: scalar ~97%), not
+                        # MTE2-bound, so pipelining the K loop here buys nothing on
+                        # device and only adds simulator work -- keep it serial.
+                        h_init = h_tile_i8[:, 0 : INTER_K]
+                        w2_init = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, 0 : INTER_K]
+                        y_acc = pl.matmul(h_init, w2_init, b_trans=True, out_dtype=pl.INT32)
+                        for k0 in pl.range(INTER_K, MOE_INTER, INTER_K):
+                            h_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                            w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                            y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
+
+                        y_2d_i32 = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE]
+                        y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                        y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
+                        recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE] = pl.cast(
+                            y_2d, target_type=pl.BF16, mode="rint"
+                        )
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; recv_y is convenient because it's already pl.Out.
     return recv_y
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def expert_routed_test(
     recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
     recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
@@ -378,6 +379,7 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--scope-stats", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -388,6 +390,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.scope_stats,
         ),
         rtol=1e-3,
         atol=1e-3,
