@@ -59,7 +59,7 @@ SPARSE_CMP_MAX_BLOCKS = 8           # sparse_attn cmp pool size (unused by SWA b
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def attention_swa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     # hc_pre weights
@@ -96,101 +96,82 @@ def attention_swa(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level: written inside the pre-attention scope below but read by
+    # sparse_attn / writeback / hc_post afterwards.
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post_t,
-        comb_t,
-    )
-
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
-        for b in pl.parallel(B):
-            for s_idx in pl.range(S):
-                t = b * S + s_idx
-                pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
-                rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
-
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed_t = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    q = qkv_proj_rope(
-        x_normed_t,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
-    )
-
     sparse_topk = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_topk"):
-        for topk_b in pl.range(B):
-            for topk_s in pl.range(S):
-                topk_t = topk_b * S + topk_s
-                topk_abs_pos = pl.read(position_ids, [topk_t])
-                if topk_abs_pos >= WIN - 1:
-                    topk_win_start = (topk_abs_pos % WIN) + 1
-                    for topk_k in pl.range(WIN):
-                        topk_val = (topk_win_start + topk_k) % WIN
-                        topk_out = topk_val
-                        for topk_os in pl.range(S):
-                            if topk_os <= topk_s:
-                                topk_overlay_t = topk_b * S + topk_os
-                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_val == topk_overlay_pos % WIN:
-                                    topk_out = WIN + topk_os
-                        pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
-                else:
-                    for topk_k in pl.range(WIN):
-                        if topk_k <= topk_abs_pos:
-                            topk_out = topk_k
+
+    # Pre-attention scope (hc_pre .. overlay-topk): scratch dead by sparse_attn,
+    # freed at scope exit. Sub-kernels write out-params in place (bare calls).
+    with pl.scope():
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+            x_mixed, post_t, comb_t,
+        )
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_rope_step"):
+            for b in pl.parallel(B):
+                for s_idx in pl.range(S):
+                    t = b * S + s_idx
+                    pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
+                    cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                    sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
+                    rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
+                    rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
+
+        x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
+        rms_norm(x_mixed, attn_norm_w, x_normed_t)
+        qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+        qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+        qkv_proj_rope(
+            x_normed_t,
+            wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale,
+        )
+
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_overlay_topk"):
+            for topk_b in pl.range(B):
+                for topk_s in pl.range(S):
+                    topk_t = topk_b * S + topk_s
+                    topk_abs_pos = pl.read(position_ids, [topk_t])
+                    if topk_abs_pos >= WIN - 1:
+                        topk_win_start = (topk_abs_pos % WIN) + 1
+                        for topk_k in pl.range(WIN):
+                            topk_val = (topk_win_start + topk_k) % WIN
+                            topk_out = topk_val
                             for topk_os in pl.range(S):
                                 if topk_os <= topk_s:
                                     topk_overlay_t = topk_b * S + topk_os
                                     topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                    if topk_k == topk_overlay_pos % WIN:
+                                    if topk_val == topk_overlay_pos % WIN:
                                         topk_out = WIN + topk_os
                             pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
-                        else:
-                            pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
+                    else:
+                        for topk_k in pl.range(WIN):
+                            if topk_k <= topk_abs_pos:
+                                topk_out = topk_k
+                                for topk_os in pl.range(S):
+                                    if topk_os <= topk_s:
+                                        topk_overlay_t = topk_b * S + topk_os
+                                        topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                                        if topk_k == topk_overlay_pos % WIN:
+                                            topk_out = WIN + topk_os
+                                pl.write(sparse_topk, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
+                            else:
+                                pl.write(sparse_topk, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn_swa(
-        q,
-        kv_cache,
-        block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        sparse_topk,
-        attn_sink,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+        q, kv_cache, block_table, kv, cmp_kv, cmp_block_table,
+        sparse_topk, attn_sink, rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
 
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
@@ -206,17 +187,11 @@ def attention_swa(
             if write_row >= 0:
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_out = hc_post(
-        attn_out,
-        x_hc,
-        post_t,
-        comb_t,
-        x_out,
-    )
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def attention_swa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     # hc_pre weights
@@ -549,6 +524,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--scope-stats", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -561,6 +537,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.scope_stats,
         ),
         rtol=1e-2,
         atol=1e-2,
