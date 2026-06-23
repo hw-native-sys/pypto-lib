@@ -29,6 +29,7 @@ Scope 3:
 
 import pypto.language as pl
 from models.shared.rmsnorm import rmsnorm
+from models.shared.matmul import matmul_tiled
 from models.shared.silu import silu_activation
 
 
@@ -124,33 +125,26 @@ def build_qwen3_decode_program():
             # Q projection.
             for qi in pl.spmd(Q_OUT_BLOCKS, name_hint="q_proj"):
                 q0 = qi * Q_OUT_CHUNK
-                q_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
-                for kb in pl.pipeline(0, HIDDEN // Q_PROJ_K_CHUNK, stage=2):
-                    k0 = kb * Q_PROJ_K_CHUNK
-                    tile_a_i = normed_states[:, k0 : k0 + Q_PROJ_K_CHUNK]
-                    tile_b_i = wq[k0 : k0 + Q_PROJ_K_CHUNK, q0 : q0 + Q_OUT_CHUNK]
-                    if k0 == 0:
-                        q_acc = pl.matmul(tile_a_i, tile_b_i, out_dtype=pl.FP32)
-                    else:
-                        q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                q_acc = matmul_tiled(
+                    normed_states, wq, q0,
+                    m=BATCH, k_chunk=Q_PROJ_K_CHUNK, n_chunk=Q_OUT_CHUNK,
+                    k_blocks=HIDDEN // Q_PROJ_K_CHUNK, stages=2,
+                )
                 q_proj = pl.assemble(q_proj, q_acc, [0, q0])
 
             # K/V projection.
             for kvi in pl.spmd(KV_OUT_BLOCKS, name_hint="kv_proj"):
                 kv0 = kvi * KV_OUT_CHUNK
-                k_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
-                v_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
-                for kb in pl.pipeline(0, HIDDEN // KV_PROJ_K_CHUNK, stage=2):
-                    k0 = kb * KV_PROJ_K_CHUNK
-                    tile_a_i = normed_states[:, k0 : k0 + KV_PROJ_K_CHUNK]
-                    tile_wk_i = wk[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    tile_wv_i = wv[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    if k0 == 0:
-                        k_acc = pl.matmul(tile_a_i, tile_wk_i, out_dtype=pl.FP32)
-                        v_acc = pl.matmul(tile_a_i, tile_wv_i, out_dtype=pl.FP32)
-                    else:
-                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                k_acc = matmul_tiled(
+                    normed_states, wk, kv0,
+                    m=BATCH, k_chunk=KV_PROJ_K_CHUNK, n_chunk=KV_OUT_CHUNK,
+                    k_blocks=HIDDEN // KV_PROJ_K_CHUNK, stages=2,
+                )
+                v_acc = matmul_tiled(
+                    normed_states, wv, kv0,
+                    m=BATCH, k_chunk=KV_PROJ_K_CHUNK, n_chunk=KV_OUT_CHUNK,
+                    k_blocks=HIDDEN // KV_PROJ_K_CHUNK, stages=2,
+                )
                 k_proj = pl.assemble(k_proj, k_acc, [0, kv0])
                 v_proj = pl.assemble(v_proj, v_acc, [0, kv0])
 
@@ -329,15 +323,11 @@ def build_qwen3_decode_program():
                     for oi in pl.range(ob, ob + 2):
                         o0 = oi * Q_OUT_CHUNK
                         hidden_chunk = hidden_states[:, o0 : o0 + Q_OUT_CHUNK]
-                        o_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
-                        for kb in pl.pipeline(0, HIDDEN // OUT_PROJ_K_CHUNK, stage=2):
-                            k0 = kb * OUT_PROJ_K_CHUNK
-                            a_chunk = attn_out[:, k0 : k0 + OUT_PROJ_K_CHUNK]
-                            w_chunk = wo[k0 : k0 + OUT_PROJ_K_CHUNK, o0 : o0 + Q_OUT_CHUNK]
-                            if k0 == 0:
-                                o_acc = pl.matmul(a_chunk, w_chunk, out_dtype=pl.FP32)
-                            else:
-                                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
+                        o_acc = matmul_tiled(
+                            attn_out, wo, o0,
+                            m=BATCH, k_chunk=OUT_PROJ_K_CHUNK, n_chunk=Q_OUT_CHUNK,
+                            k_blocks=HIDDEN // OUT_PROJ_K_CHUNK, stages=2,
+                        )
                         resid = pl.cast(hidden_chunk, target_type=pl.FP32)
                         resid_sum = pl.add(o_acc, resid)
                         resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
@@ -372,16 +362,11 @@ def build_qwen3_decode_program():
                     post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                     post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
                     wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-
-                    wg_1 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                    gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
-
-                    for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
-                        k0 = kb * K_CHUNK
-                        post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+                    gate_acc = matmul_tiled(
+                        post_norm_tile, w_gate, o0,
+                        m=BATCH, k_chunk=K_CHUNK, n_chunk=MLP_OUT_CHUNK,
+                        k_blocks=HIDDEN_BLOCKS, stages=2,
+                    )
                     gate_group = pl.assemble(gate_group, gate_acc, [0, g0])
 
                 # Stage 5: up projection.
@@ -391,16 +376,11 @@ def build_qwen3_decode_program():
                     post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                     post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
                     wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-
-                    wu_1 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                    up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
-
-                    for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
-                        k0 = kb * K_CHUNK
-                        post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                    up_acc = matmul_tiled(
+                        post_norm_tile, w_up, o0,
+                        m=BATCH, k_chunk=K_CHUNK, n_chunk=MLP_OUT_CHUNK,
+                        k_blocks=HIDDEN_BLOCKS, stages=2,
+                    )
                     up_group = pl.assemble(up_group, up_acc, [0, g0])
 
                 # Stage 6: SiLU + gate/up fuse.
@@ -419,15 +399,11 @@ def build_qwen3_decode_program():
                     for di in pl.range(db, db + 2):
                         d0 = di * DOWN_N_CHUNK
                         resid1_tile_chunk = resid1_tile[:, d0 : d0 + DOWN_N_CHUNK]
-                        down_acc = pl.create_tensor([BATCH, DOWN_N_CHUNK], dtype=pl.FP32)
-                        for ob in pl.pipeline(0, INTERMEDIATE // DOWN_K_CHUNK, stage=2):
-                            o0 = ob * DOWN_K_CHUNK
-                            down_mlp_chunk = mlp_tile[:, o0 : o0 + DOWN_K_CHUNK]
-                            w_down_chunk = w_down[o0 : o0 + DOWN_K_CHUNK, d0 : d0 + DOWN_N_CHUNK]
-                            if o0 == 0:
-                                down_acc = pl.matmul(down_mlp_chunk, w_down_chunk, out_dtype=pl.FP32)
-                            else:
-                                down_acc = pl.matmul_acc(down_acc, down_mlp_chunk, w_down_chunk)
+                        down_acc = matmul_tiled(
+                            mlp_tile, w_down, d0,
+                            m=BATCH, k_chunk=DOWN_K_CHUNK, n_chunk=DOWN_N_CHUNK,
+                            k_blocks=INTERMEDIATE // DOWN_K_CHUNK, stages=2,
+                        )
                         out_chunk = pl.add(down_acc, resid1_tile_chunk)
                         out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [0, d0])
 
