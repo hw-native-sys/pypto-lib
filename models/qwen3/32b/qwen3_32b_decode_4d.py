@@ -28,6 +28,9 @@ Scope 3:
 """
 
 import pypto.language as pl
+from models.shared.silu import silu_activation
+from models.shared.matmul import matmul_tiled_4d
+from models.shared.golden_ref import golden_decode_scope1, golden_decode_scope2_4d, golden_rmsnorm, golden_swiglu
 
 
 BATCH = 16
@@ -129,35 +132,29 @@ def build_qwen3_decode_program():
             # Q projection.
             for qb in pl.parallel(Q_OUT_BLOCKS):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_proj"):
-                    tile_a0 = normed_states[0:1, :, :, :]
-                    tile_b0 = wq[0:1, qb : qb + 1, :, :]
-                    q_acc = pl.matmul(tile_a0, tile_b0, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
-                        tile_a_i = normed_states[kb : kb + 1, :, :, :]
-                        tile_b_i = wq[kb : kb + 1, qb : qb + 1, :, :]
-                        q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                    q_acc = matmul_tiled_4d(
+                        normed_states, wq, qb,
+                        batch=BATCH, k_chunk=Q_PROJ_K_CHUNK, n1_chunk=Q_OUT_CHUNK,
+                        k_blocks=HIDDEN_K_BLOCKS, stages=2,
+                    )
                     q_proj = pl.assemble(q_proj, q_acc, [qb, 0, 0, 0])
 
             # K/V projection.
             for kvb in pl.parallel(KV_OUT_BLOCKS):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_proj"):
-                    tile_a0 = normed_states[0:1, :, :, :]
-                    tile_wk0 = wk[0:1, kvb : kvb + 1, :, :]
-                    k_acc = pl.matmul(tile_a0, tile_wk0, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
-                        tile_a_i = normed_states[kb : kb + 1, :, :, :]
-                        tile_wk_i = wk[kb : kb + 1, kvb : kvb + 1, :, :]
-                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
+                    k_acc = matmul_tiled_4d(
+                        normed_states, wk, kvb,
+                        batch=BATCH, k_chunk=KV_PROJ_K_CHUNK, n1_chunk=KV_OUT_CHUNK,
+                        k_blocks=HIDDEN_K_BLOCKS, stages=2,
+                    )
                     k_proj = pl.assemble(k_proj, k_acc, [kvb, 0, 0, 0])
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_proj"):
-                    tile_a0 = normed_states[0:1, :, :, :]
-                    tile_wv0 = wv[0:1, kvb : kvb + 1, :, :]
-                    v_acc = pl.matmul(tile_a0, tile_wv0, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, HIDDEN_K_BLOCKS, stage=2):
-                        tile_a_i = normed_states[kb : kb + 1, :, :, :]
-                        tile_wv_i = wv[kb : kb + 1, kvb : kvb + 1, :, :]
-                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                    v_acc = matmul_tiled_4d(
+                        normed_states, wv, kvb,
+                        batch=BATCH, k_chunk=KV_PROJ_K_CHUNK, n1_chunk=KV_OUT_CHUNK,
+                        k_blocks=HIDDEN_K_BLOCKS, stages=2,
+                    )
                     v_proj = pl.assemble(v_proj, v_acc, [kvb, 0, 0, 0])
 
             # ── Scope 2: RoPE + KV cache update + grouped-query attention ──
@@ -419,26 +416,21 @@ def build_qwen3_decode_program():
             mlp_tile = pl.create_tensor([MLP_OUT_BLOCKS, 1, BATCH, MLP_OUT_CHUNK], dtype=pl.BF16)
             for mb in pl.parallel(MLP_OUT_BLOCKS):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj"):
-                    post0 = post_norm_tile[0:1, :, :, :]
-                    wg0 = w_gate[0:1, mb : mb + 1, :, :]
-                    gate_acc = pl.matmul(post0, wg0, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, K_BLOCKS, stage=2):
-                        post_chunk = post_norm_tile[kb : kb + 1, :, :, :]
-                        wg = w_gate[kb : kb + 1, mb : mb + 1, :, :]
-                        gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+                    gate_acc = matmul_tiled_4d(
+                        post_norm_tile, w_gate, mb,
+                        batch=BATCH, k_chunk=K_CHUNK, n1_chunk=MLP_OUT_CHUNK,
+                        k_blocks=K_BLOCKS, stages=2,
+                    )
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj"):
-                    post0 = post_norm_tile[0:1, :, :, :]
-                    wu0 = w_up[0:1, mb : mb + 1, :, :]
-                    up_acc = pl.matmul(post0, wu0, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, K_BLOCKS, stage=2):
-                        post_chunk = post_norm_tile[kb : kb + 1, :, :, :]
-                        wu = w_up[kb : kb + 1, mb : mb + 1, :, :]
-                        up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                    up_acc = matmul_tiled_4d(
+                        post_norm_tile, w_up, mb,
+                        batch=BATCH, k_chunk=K_CHUNK, n1_chunk=MLP_OUT_CHUNK,
+                        k_blocks=K_BLOCKS, stages=2,
+                    )
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="silu"):
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                    mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
+                    mlp_chunk = silu_activation(gate_acc, up_acc)
                     mlp_tile = pl.assemble(
                         mlp_tile,
                         pl.cast(mlp_chunk, target_type=pl.BF16),
@@ -546,12 +538,9 @@ def build_tensor_specs(use_max_seq: bool = False):
 
 
 def golden_qwen3_decode(tensors):
-    """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
     import math
 
-    import torch
-
-    hidden_states_chunked = tensors["hidden_states"]
+    hidden_states = tensors["hidden_states"]
     input_rms_weight_chunked = tensors["input_rms_weight"]
     wq_chunked = tensors["wq"]
     wk_chunked = tensors["wk"]
@@ -559,147 +548,60 @@ def golden_qwen3_decode(tensors):
     seq_lens = tensors["seq_lens"]
     rope_cos = tensors["rope_cos"]
     rope_sin = tensors["rope_sin"]
-    k_cache = tensors["k_cache"].clone()
-    v_cache = tensors["v_cache"].clone()
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
     wo_chunked = tensors["wo"]
     post_rms_weight_chunked = tensors["post_rms_weight"]
     w_gate_chunked = tensors["w_gate"]
     w_up_chunked = tensors["w_up"]
     w_down_chunked = tensors["w_down"]
+    out = tensors["out"]
 
-    hidden_states = hidden_states_chunked[:, 0, :, :].permute(1, 0, 2).reshape(BATCH, HIDDEN)
+    # Permute chunked weights to 2D
     input_rms_weight = input_rms_weight_chunked[:, 0, :, :].permute(1, 0, 2).reshape(1, HIDDEN)
     post_rms_weight = post_rms_weight_chunked[:, 0, :, :].permute(1, 0, 2).reshape(1, HIDDEN)
 
-    half = HEAD_DIM // 2
-    scale = 1.0 / math.sqrt(HEAD_DIM)
+    attn_scale = 1.0 / math.sqrt(HEAD_DIM)
 
-    # ── Scope 1 golden: RMSNorm + Q/K/V projection ──
-    x_tile = hidden_states.float()
-    sq_sum = (x_tile ** 2).sum(dim=-1, keepdim=True)
-    variance = sq_sum / HIDDEN + EPS
-    rms = torch.sqrt(variance)
-    normed = (x_tile / rms * input_rms_weight.float()).bfloat16()
+    # ── Scope 1: RMSNorm + Q/K/V projection ──
+    _, q_proj, k_proj, v_proj = golden_decode_scope1(
+        hidden_states, input_rms_weight,
+        wq_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, HIDDEN),
+        wk_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, KV_HIDDEN),
+        wv_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, KV_HIDDEN),
+        hidden=HIDDEN, eps=EPS,
+    )
 
-    wq = wq_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, HIDDEN)
-    wk = wk_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, KV_HIDDEN)
-    wv = wv_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, KV_HIDDEN)
-    q_proj = (normed.float() @ wq.float()).float()
-    k_proj = (normed.float() @ wk.float()).float()
-    v_proj = (normed.float() @ wv.float()).float()
+    # ── Scope 2: RoPE + 4D cache update + attention ──
+    attn_proj_tile = golden_decode_scope2_4d(
+        q_proj, k_proj, v_proj, k_cache, v_cache, seq_lens,
+        rope_cos, rope_sin,
+        batch=BATCH, num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, max_seq=MAX_SEQ, seq_tile=SEQ_TILE,
+        q_per_kv=Q_PER_KV, q_head_batch=Q_HEAD_BATCH,
+        attn_scale=attn_scale,
+        out_proj_k_blocks=OUT_PROJ_K_BLOCKS,
+        out_proj_k_chunk=OUT_PROJ_K_CHUNK,
+    )
 
-    # ── Scope 2 golden: RoPE + cache update + attention ──
-    attn_proj_tile = torch.zeros(OUT_PROJ_K_BLOCKS, BATCH, OUT_PROJ_K_CHUNK, dtype=torch.bfloat16)
-
-    for b in range(BATCH):
-        ctx_len = seq_lens[b, 0, 0, 0].item()
-        pos = ctx_len - 1
-        ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-
-        cos_row = rope_cos[pos, 0, :, :]
-        sin_row = rope_sin[pos, 0, :, :]
-        cos_lo, cos_hi = cos_row[:, :half], cos_row[:, half:]
-        sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
-
-        k_heads = k_proj[b].view(NUM_KV_HEADS, HEAD_DIM)
-        k_lo_h, k_hi_h = k_heads[:, :half], k_heads[:, half:]
-        k_rot = torch.cat([k_lo_h * cos_lo - k_hi_h * sin_lo, k_hi_h * cos_hi + k_lo_h * sin_hi], dim=-1)
-
-        for ki in range(NUM_KV_HEADS):
-            cache_idx = b * NUM_KV_HEADS + ki
-            pos_block = pos // SEQ_TILE
-            pos_offset = pos - pos_block * SEQ_TILE
-            k_cache[cache_idx, pos_block, pos_offset, :] = k_rot[ki].to(torch.bfloat16)
-            v_cache[cache_idx, pos_block, pos_offset, :] = v_proj[b, ki * HEAD_DIM : (ki + 1) * HEAD_DIM].to(torch.bfloat16)
-
-        q_heads = q_proj[b].view(NUM_HEADS, HEAD_DIM)
-        q_lo_h, q_hi_h = q_heads[:, :half], q_heads[:, half:]
-        q_rot = torch.cat([q_lo_h * cos_lo - q_hi_h * sin_lo, q_hi_h * cos_hi + q_lo_h * sin_hi], dim=-1)
-
-        for kvh in range(NUM_KV_HEADS):
-            for qg in range(Q_GROUPS):
-                q_base = kvh * Q_PER_KV + qg * Q_HEAD_BATCH
-                q_grp_bf16 = q_rot[q_base : q_base + Q_HEAD_BATCH, :].to(torch.bfloat16)
-
-                oi = torch.zeros(Q_HEAD_BATCH, HEAD_DIM, dtype=torch.float32)
-                li = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
-                mi = torch.zeros(Q_HEAD_BATCH, 1, dtype=torch.float32)
-
-                for sb in range(ctx_blocks):
-                    s0 = sb * SEQ_TILE
-                    valid_len = min(SEQ_TILE, ctx_len - s0)
-                    cache_idx = b * NUM_KV_HEADS + kvh
-                    k_tile = k_cache[cache_idx, sb, :, :]
-                    v_tile = v_cache[cache_idx, sb, :, :]
-
-                    raw_scores = q_grp_bf16.float() @ k_tile.float().T
-                    if valid_len < SEQ_TILE:
-                        raw_scores[:, valid_len:] = torch.finfo(torch.float32).min
-                    scores = raw_scores * scale
-
-                    cur_mi = scores.max(dim=-1, keepdim=True).values
-                    exp_scores = torch.exp(scores - cur_mi)
-                    exp_scores_bf16 = exp_scores.to(torch.bfloat16)
-                    cur_li = exp_scores_bf16.float().sum(dim=-1, keepdim=True)
-
-                    oi_tmp = exp_scores_bf16.float() @ v_tile.float()
-
-                    if sb == 0:
-                        oi = oi_tmp
-                        li = cur_li
-                        mi = cur_mi
-                    else:
-                        mi_new = torch.maximum(mi, cur_mi)
-                        alpha = torch.exp(mi - mi_new)
-                        beta = torch.exp(cur_mi - mi_new)
-                        li = alpha * li + beta * cur_li
-                        oi = oi * alpha + oi_tmp * beta
-                        mi = mi_new
-
-                ctx = oi / li
-                for qi in range(Q_HEAD_BATCH):
-                    qh = q_base + qi
-                    attn_proj_tile[qh, b, :] = ctx[qi].to(torch.bfloat16)
-
-    # ── Scope 3 golden: output projection + residual + post RMSNorm + MLP + residual ──
-    out_proj_chunks = []
-    for oi in range(OUT_PROJ_N_BLOCKS):
-        o_acc_lo = torch.matmul(attn_proj_tile[0].float(), wo_chunked[0, oi, :, :Q_OUT_CHUNK].float())
-        o_acc_hi = torch.matmul(attn_proj_tile[0].float(), wo_chunked[0, oi, :, Q_OUT_CHUNK:].float())
-        for kb in range(1, OUT_PROJ_K_BLOCKS):
-            o_acc_lo = o_acc_lo + torch.matmul(attn_proj_tile[kb].float(), wo_chunked[kb, oi, :, :Q_OUT_CHUNK].float())
-            o_acc_hi = o_acc_hi + torch.matmul(attn_proj_tile[kb].float(), wo_chunked[kb, oi, :, Q_OUT_CHUNK:].float())
-        out_proj_chunks.append(torch.cat([o_acc_lo, o_acc_hi], dim=-1))
-    o_proj = torch.cat(out_proj_chunks, dim=-1)
-    resid1 = o_proj + hidden_states.float()
-
-    variance = resid1.pow(2).mean(dim=-1, keepdim=True)
-    inv_rms = torch.rsqrt(variance + EPS)
-    normed_bf16 = (resid1 * inv_rms * post_rms_weight).bfloat16()
-
+    # ── Scope 3: output projection + residual + post RMSNorm + MLP + residual ──
+    wo = wo_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, HIDDEN)
     w_gate = w_gate_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, INTERMEDIATE)
     w_up = w_up_chunked.permute(0, 2, 1, 3).reshape(HIDDEN, INTERMEDIATE)
+    w_down = w_down_chunked.permute(0, 2, 1, 3).reshape(INTERMEDIATE, HIDDEN)
+
+    normed_bf16 = golden_rmsnorm(hidden_states, input_rms_weight, eps=EPS)
+
     gate = torch.matmul(normed_bf16.float(), w_gate.float())
     up = torch.matmul(normed_bf16.float(), w_up.float())
-    mlp_bf16 = (gate * torch.sigmoid(gate) * up).bfloat16()
-    mlp_blocks = mlp_bf16.reshape(BATCH, MLP_OUT_BLOCKS, MLP_OUT_CHUNK)
-    down_chunks = []
-    for di in range(DOWN_N_BLOCKS):
-        down_acc = None
-        for ob in range(DOWN_K_BLOCKS):
-            mlp_block = ob // (MLP_OUT_CHUNK // DOWN_K_CHUNK)
-            mlp_offset = (ob - mlp_block * (MLP_OUT_CHUNK // DOWN_K_CHUNK)) * DOWN_K_CHUNK
-            mlp_chunk = mlp_blocks[:, mlp_block, mlp_offset : mlp_offset + DOWN_K_CHUNK].float()
-            w_down_chunk = w_down_chunked[ob, di, :, :].float()
-            down_part = torch.matmul(mlp_chunk, w_down_chunk)
-            down_acc = down_part if down_acc is None else down_acc + down_part
-        down_chunks.append(down_acc)
-    down = torch.stack(down_chunks, dim=1).reshape(BATCH, HIDDEN)
+    mlp_bf16 = golden_swiglu(gate, up).bfloat16()
+    mlp_blocks = mlp_bf16.reshape(BATCH, MLP_OUT_BLOCKS, MLP_OUT_CHUNK).permute(1, 0, 2)
 
-    out_flat = (down + resid1).bfloat16()
-    tensors["out"][:] = out_flat.reshape(BATCH, DOWN_N_BLOCKS, DOWN_N_CHUNK).permute(1, 0, 2).unsqueeze(1)
+    attn_proj_blocks = attn_proj_tile  # [OUT_PROJ_K_BLOCKS, BATCH, OUT_PROJ_K_CHUNK]
+    down = torch.matmul(mlp_blocks.float().reshape(MLP_OUT_BLOCKS * BATCH, MLP_OUT_CHUNK), w_down.float()).reshape(MLP_OUT_BLOCKS, BATCH, DOWN_N_CHUNK).permute(1, 0, 2)
 
-
+    out_blocks = down + attn_proj_blocks.permute(1, 0, 2)
+    out[:] = out_blocks.bfloat16()
 if __name__ == "__main__":
     import argparse
     import torch
