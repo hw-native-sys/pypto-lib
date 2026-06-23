@@ -403,7 +403,7 @@ def decode_fwd(
     shared_w2_scale_l0 = pl.slice(shared_w2_scale, [D], [0 * D])
     hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     with pl.scope():
-        hidden = moe(
+        moe(
             x_attn0,
             hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
             norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
@@ -468,7 +468,7 @@ def decode_fwd(
     shared_w2_l1 = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1 = pl.slice(shared_w2_scale, [D], [1 * D])
     with pl.scope():
-        hidden = moe(
+        moe(
             x_attn1,
             hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
             norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
@@ -561,7 +561,7 @@ def decode_fwd(
         shared_w2_csa = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa = pl.slice(shared_w2_scale, [D], [csa_layer * D])
         with pl.scope():
-            hidden_mid = moe(
+            moe(
                 x_attn_csa,
                 hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
                 norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
@@ -633,7 +633,7 @@ def decode_fwd(
         shared_w2_hca = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca = pl.slice(shared_w2_scale, [D], [hca_layer * D])
         with pl.scope():
-            hidden = moe(
+            moe(
                 x_attn_hca,
                 hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
                 norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
@@ -723,7 +723,7 @@ def decode_fwd(
     shared_w2_last = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
     shared_w2_scale_last = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
     with pl.scope():
-        x_next = moe(
+        moe(
             x_attn_last,
             hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
             norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,
