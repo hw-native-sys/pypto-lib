@@ -28,6 +28,7 @@ Scope 3:
 """
 
 import pypto.language as pl
+from models.shared.silu import silu_activation
 
 
 BATCH = 16
@@ -415,8 +416,7 @@ def build_qwen3_decode_program():
                     g0 = ob * MLP_OUT_CHUNK
                     gate_acc = pl.slice(gate_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
                     up_acc = pl.slice(up_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                    mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
+                    mlp_chunk = silu_activation(gate_acc, up_acc)
                     mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                     mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
@@ -647,11 +647,29 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False)
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="compile-only (no device)")
     args = parser.parse_args()
+
+    specs = build_tensor_specs(use_max_seq=args.max_seq)
+
+    # Compile-only smoke.
+    if args.smoke:
+        result = run(
+            program=build_qwen3_decode_program(),
+            specs=specs,
+            compile_cfg=dict(dump_passes=True),
+            compile_only=True,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        raise SystemExit(0)
 
     result = run(
         program=build_qwen3_decode_program(),
-        specs=build_tensor_specs(use_max_seq=args.max_seq),
+        specs=specs,
         golden_fn=golden_qwen3_decode,
         compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(

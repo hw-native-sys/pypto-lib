@@ -94,6 +94,7 @@ from pypto.runtime import RunConfig
 
 from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
+from models.shared.silu import silu_activation
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Functional config — model architecture + workload.
@@ -1021,8 +1022,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     up_chunk = up_acc_all[:, silu_off : silu_off + MLP_OUT_CHUNK]
                     scaled_gate = pl.row_expand_mul(gate_chunk, inv_rms_chunk)
                     scaled_up = pl.row_expand_mul(up_chunk, inv_rms_chunk)
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(scaled_gate)), 1.0))
-                    mlp_chunk = pl.mul(pl.mul(scaled_gate, sigmoid), scaled_up)
+                    mlp_chunk = silu_activation(scaled_gate, scaled_up)
                     mlp_tile = pl.assemble(mlp_tile, pl.cast(mlp_chunk, target_type=pl.BF16), [0, silu_off])
             silu_tids[n_out] = silu_tid
 
