@@ -28,6 +28,7 @@ Scope 3:
 """
 
 import pypto.language as pl
+from models.shared.rmsnorm import rmsnorm
 from models.shared.silu import silu_activation
 
 
@@ -114,19 +115,11 @@ def build_qwen3_decode_program():
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
             normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
-                partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-                    k0 = kb * RMSNORM_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-                    partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]))
-                variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
-                inv_rms = pl.recip(pl.sqrt(variance))
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-                    k0 = kb * RMSNORM_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-                    gamma = input_rms_weight[:, k0 : k0 + RMSNORM_K_CHUNK]
-                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                    normed_states = pl.assemble(normed_states, pl.cast(normed, target_type=pl.BF16), [0, k0])
+                normed_states = rmsnorm(
+                    hidden_states, input_rms_weight, normed_states, 0,
+                    rows=BATCH, k_chunk=RMSNORM_K_CHUNK,
+                    eps=EPS, hidden=HIDDEN,
+                )
 
             # Q projection.
             for qi in pl.spmd(Q_OUT_BLOCKS, name_hint="q_proj"):

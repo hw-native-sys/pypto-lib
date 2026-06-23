@@ -11,6 +11,7 @@
 # pyright: reportUndefinedVariable=false
 
 import pypto.language as pl
+from models.shared.rmsnorm import rmsnorm
 
 from config import (
     BATCH,
@@ -18,7 +19,6 @@ from config import (
     EPS,
     FINAL_RMS_K_CHUNK,
     HIDDEN,
-    HIDDEN_INV,
     USER_BATCH_DYN,
     VOCAB,
 )
@@ -51,38 +51,11 @@ def rms_lm_head(
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
-            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
-                final_sq_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_sq_k0]),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)), [1, BATCH_TILE]),
-                )
-            inv_rms_final = pl.reshape(
-                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-                [BATCH_TILE, 1],
+            final_normed = rmsnorm(
+                hidden_states, final_norm_weight, final_normed, b0,
+                rows=BATCH_TILE, k_chunk=FINAL_RMS_K_CHUNK,
+                eps=EPS, hidden=HIDDEN,
             )
-
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
-                final_hidden_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_norm_k0]),
-                    target_type=pl.FP32,
-                )
-                final_gamma = pl.slice(final_norm_weight, [1, FINAL_RMS_K_CHUNK], [0, final_norm_k0])
-                final_normed_chunk = pl.col_expand_mul(
-                    pl.row_expand_mul(final_hidden_chunk, inv_rms_final),
-                    final_gamma,
-                )
-                final_normed = pl.assemble(
-                    final_normed,
-                    pl.cast(final_normed_chunk, target_type=pl.BF16),
-                    [b0, final_norm_k0],
-                )
 
     # LM-head matmul: ONE pl.spmd grid-stride over the VOCAB//VOCAB_CHUNK (792)
     # output chunks across LM_HEAD_CORES persistent blocks (see LM_HEAD_CORES above
@@ -146,38 +119,11 @@ def rms_only(
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
-            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
-                final_sq_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_sq_k0]),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)), [1, BATCH_TILE]),
-                )
-            inv_rms_final = pl.reshape(
-                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-                [BATCH_TILE, 1],
+            final_normed = rmsnorm(
+                hidden_states, final_norm_weight, final_normed, b0,
+                rows=BATCH_TILE, k_chunk=FINAL_RMS_K_CHUNK,
+                eps=EPS, hidden=HIDDEN,
             )
-
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
-                final_hidden_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_norm_k0]),
-                    target_type=pl.FP32,
-                )
-                final_gamma = pl.slice(final_norm_weight, [1, FINAL_RMS_K_CHUNK], [0, final_norm_k0])
-                final_normed_chunk = pl.col_expand_mul(
-                    pl.row_expand_mul(final_hidden_chunk, inv_rms_final),
-                    final_gamma,
-                )
-                final_normed = pl.assemble(
-                    final_normed,
-                    pl.cast(final_normed_chunk, target_type=pl.BF16),
-                    [b0, final_norm_k0],
-                )
 
     return out
 
@@ -198,38 +144,11 @@ def rms_lm_head_single_chunk(
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
-            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
-                final_sq_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_sq_k0]),
-                    target_type=pl.FP32,
-                )
-                sq_sum = pl.add(
-                    sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)), [1, BATCH_TILE]),
-                )
-            inv_rms_final = pl.reshape(
-                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
-                [BATCH_TILE, 1],
+            final_normed = rmsnorm(
+                hidden_states, final_norm_weight, final_normed, b0,
+                rows=BATCH_TILE, k_chunk=FINAL_RMS_K_CHUNK,
+                eps=EPS, hidden=HIDDEN,
             )
-
-            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
-                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
-                final_hidden_chunk = pl.cast(
-                    pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_norm_k0]),
-                    target_type=pl.FP32,
-                )
-                final_gamma = pl.slice(final_norm_weight, [1, FINAL_RMS_K_CHUNK], [0, final_norm_k0])
-                final_normed_chunk = pl.col_expand_mul(
-                    pl.row_expand_mul(final_hidden_chunk, inv_rms_final),
-                    final_gamma,
-                )
-                final_normed = pl.assemble(
-                    final_normed,
-                    pl.cast(final_normed_chunk, target_type=pl.BF16),
-                    [b0, final_norm_k0],
-                )
 
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
         lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)

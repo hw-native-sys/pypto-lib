@@ -94,6 +94,7 @@ from pypto.runtime import RunConfig
 
 from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
+from models.shared.rmsnorm import rmsnorm_recip
 from models.shared.silu import silu_activation
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -414,16 +415,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             name_hint="rms_recip",
             deps=[prev_out_tids[i] for i in range(DOWN_ON)],
         ) as rms_tid:
-            partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-            for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-                k0 = kb * RMSNORM_K_CHUNK
-                x_chunk = hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK]  # FP32 already (was cast from BF16)
-                partial_sq = pl.add(
-                    partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]),
-                )
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
-            inv_rms = pl.recip(pl.sqrt(variance))
+            inv_rms = rmsnorm_recip(hidden_states, rows=BATCH, k_chunk=RMSNORM_K_CHUNK,
+                                    eps=EPS, hidden=HIDDEN, stages=4,
+                                    cast_input=False)
             inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
 
         # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
