@@ -30,6 +30,8 @@ Scope 3:
 import pypto.language as pl
 from models.shared.rmsnorm import rmsnorm
 from models.shared.matmul import matmul_tiled
+from models.shared.specs import build_qwen3_decode_specs
+from models.shared.golden_ref import golden_decode_scope1, golden_decode_scope2, golden_decode_scope3
 from models.shared.silu import silu_activation
 
 
@@ -413,77 +415,56 @@ def build_qwen3_decode_program():
 
 
 def build_tensor_specs(use_max_seq: bool = False):
-    import torch
-    from golden import TensorSpec
-
-    def init_hidden_states():
-        return torch.rand(BATCH, HIDDEN) - 0.5
-
-    def init_rms_weight():
-        return torch.rand(1, HIDDEN) - 0.5
-
-    def init_wq():
-        return torch.rand(HIDDEN, HIDDEN) / HIDDEN ** 0.5
-
-    def init_wk():
-        return torch.rand(HIDDEN, KV_HIDDEN) / HIDDEN ** 0.5
-
-    def init_wv():
-        return torch.rand(HIDDEN, KV_HIDDEN) / HIDDEN ** 0.5
-
-    def init_seq_lens():
-        if use_max_seq:
-            return torch.full((BATCH,), MAX_SEQ, dtype=torch.int32)
-        return torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
-
-    def init_rope_cos():
-        return torch.rand(MAX_SEQ, HEAD_DIM) - 0.5
-
-    def init_rope_sin():
-        return torch.rand(MAX_SEQ, HEAD_DIM) - 0.5
-
-    def init_k_cache():
-        return torch.rand(CACHE_ROWS, HEAD_DIM) - 0.5
-
-    def init_v_cache():
-        return torch.rand(CACHE_ROWS, HEAD_DIM) - 0.5
-
-    def init_wo():
-        return (torch.rand(HIDDEN, HIDDEN) - 0.5) / HIDDEN ** 0.5
-
-    def init_post_rms_weight():
-        return torch.ones(1, HIDDEN)
-
-    def init_w_gate():
-        return (torch.rand(HIDDEN, INTERMEDIATE) - 0.5) / HIDDEN ** 0.5
-
-    def init_w_up():
-        return (torch.rand(HIDDEN, INTERMEDIATE) - 0.5) / HIDDEN ** 0.5
-
-    def init_w_down():
-        return (torch.rand(INTERMEDIATE, HIDDEN) - 0.5) / INTERMEDIATE ** 0.5
-
-    return [
-        TensorSpec("hidden_states", [BATCH, HIDDEN], torch.bfloat16, init_value=init_hidden_states),
-        TensorSpec("input_rms_weight", [1, HIDDEN], torch.float32, init_value=init_rms_weight),
-        TensorSpec("wq", [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_wq),
-        TensorSpec("wk", [HIDDEN, KV_HIDDEN], torch.bfloat16, init_value=init_wk),
-        TensorSpec("wv", [HIDDEN, KV_HIDDEN], torch.bfloat16, init_value=init_wv),
-        TensorSpec("seq_lens", [BATCH], torch.int32, init_value=init_seq_lens),
-        TensorSpec("rope_cos", [MAX_SEQ, HEAD_DIM], torch.float32, init_value=init_rope_cos),
-        TensorSpec("rope_sin", [MAX_SEQ, HEAD_DIM], torch.float32, init_value=init_rope_sin),
-        TensorSpec("k_cache", [CACHE_ROWS, HEAD_DIM], torch.bfloat16, init_value=init_k_cache),
-        TensorSpec("v_cache", [CACHE_ROWS, HEAD_DIM], torch.bfloat16, init_value=init_v_cache),
-        TensorSpec("wo", [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_wo),
-        TensorSpec("post_rms_weight", [1, HIDDEN], torch.float32, init_value=init_post_rms_weight),
-        TensorSpec("w_gate", [HIDDEN, INTERMEDIATE], torch.bfloat16, init_value=init_w_gate),
-        TensorSpec("w_up", [HIDDEN, INTERMEDIATE], torch.bfloat16, init_value=init_w_up),
-        TensorSpec("w_down", [INTERMEDIATE, HIDDEN], torch.bfloat16, init_value=init_w_down),
-        TensorSpec("out", [BATCH, HIDDEN], torch.bfloat16, is_output=True),
-    ]
+    return build_qwen3_decode_specs(
+        batch=BATCH, max_seq=MAX_SEQ, hidden=HIDDEN,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+        intermediate=INTERMEDIATE, use_max_seq=use_max_seq,
+    )
 
 
 def golden_qwen3_decode(tensors):
+    """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
+    import math
+
+    hidden_states = tensors["hidden_states"]
+    input_rms_weight = tensors["input_rms_weight"]
+    wq = tensors["wq"]
+    wk = tensors["wk"]
+    wv = tensors["wv"]
+    seq_lens = tensors["seq_lens"]
+    rope_cos = tensors["rope_cos"]
+    rope_sin = tensors["rope_sin"]
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
+    wo = tensors["wo"]
+    post_rms_weight = tensors["post_rms_weight"]
+    w_gate = tensors["w_gate"]
+    w_up = tensors["w_up"]
+    w_down = tensors["w_down"]
+
+    attn_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    # ── Scope 1: RMSNorm + Q/K/V projection ──
+    _, q_proj, k_proj, v_proj = golden_decode_scope1(
+        hidden_states, input_rms_weight, wq, wk, wv,
+        hidden=HIDDEN, eps=EPS,
+    )
+
+    # ── Scope 2: RoPE + cache update + attention ──
+    attn_out = golden_decode_scope2(
+        q_proj, k_proj, v_proj, k_cache, v_cache, seq_lens,
+        rope_cos, rope_sin,
+        batch=BATCH, num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, max_seq=MAX_SEQ, seq_tile=SEQ_TILE,
+        q_per_kv=Q_PER_KV, q_head_batch=Q_HEAD_BATCH,
+        attn_scale=attn_scale,
+    )
+
+    # ── Scope 3: output projection + residual + post RMSNorm + MLP + residual ──
+    tensors["out"][:] = golden_decode_scope3(
+        attn_out, hidden_states, wo, post_rms_weight, w_gate, w_up, w_down,
+        hidden=HIDDEN, eps=EPS,
+    )
     """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
     import math
 
