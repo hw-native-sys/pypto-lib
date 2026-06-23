@@ -104,7 +104,7 @@ CSA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def prefill_attention_csa(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -153,53 +153,52 @@ def prefill_attention_csa(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level tensors: bridges into sparse_attn / writeback / hc_post, plus
+    # x_normed which the frame-level compressor/indexer consume after the scope.
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post,
-        comb,
-    )
-
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = rms_norm(x_mixed, attn_norm_w, x_normed)
-
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-    )
-    q = qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
-    )
+    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
 
-    cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio4(
+    # Pre-attention scope (hc_pre .. qkv): frees the purely-dead scratch (x_mixed,
+    # qr, qr_scale). The compressor / indexer / sparse-idx build stay at the function
+    # frame -- they write the cache-state OUT-params this function RETURNS, and a
+    # returned param written by a bare call inside a scope can't bridge its SSA
+    # version out to the return.
+    with pl.scope():
+        # hc_pre .. rms_norm: x_mixed dies at rms_norm (the biggest short-lived
+        # scratch); post/comb/x_normed are frame-level and outlive the scope.
+        with pl.scope():
+            x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+            hc_pre(
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                x_mixed, post, comb,
+            )
+            rms_norm(x_mixed, attn_norm_w, x_normed)
+
+        materialize_rope_rows(
+            freqs_cos, freqs_sin, position_ids, num_tokens,
+            rope_cos_t, rope_sin_t,
+        )
+
+        # qr/qr_scale are qkv-only scratch (prefill_indexer takes neither), freed at
+        # scope exit; q/kv are frame-level and read by sparse_attn afterwards.
+        qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+        qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+        qkv_proj_rope(
+            x_normed,
+            wq_a, wq_b, wq_b_scale, wkv,
+            rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+            q, kv, qr, qr_scale,
+        )
+
+    # Frame-level: these write the OUT-params returned below (bare in-place).
+    prefill_compressor_ratio4(
         x_normed,
         cmp_kv_state,
         cmp_score_state,
@@ -216,8 +215,9 @@ def prefill_attention_csa(
         cmp_slot_mapping,
         state_slot_mapping,
     )
+
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_kv_cache, cmp_topk_indices = prefill_indexer(
+    prefill_indexer(
         x_normed,
         freqs_cos,
         freqs_sin,
@@ -240,7 +240,6 @@ def prefill_attention_csa(
 
     # Assemble the packed sparse-index rows (window ring + overlay + compressed
     # slots) inline; padding rows stay all -1 via the pl.full row template.
-    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     # Rows are fully -1 padded below, so expose the whole width to the shared kernel
     # via a constant lens == SPARSE_TOPK (the kernel's per-slot >= 0 check does the
     # masking). Build it through assemble (SSA-tracked) so the gather's read is ordered
@@ -248,10 +247,8 @@ def prefill_attention_csa(
     # Build it 2D ([1, T], assemble-friendly) inside a scope, then reshape to the
     # [T] the kernel expects -- assemble + reshape is SSA-tracked so the gather's read
     # is ordered after this write (a 1D in-place pl.write races the round-trip).
-    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_sparse_lens"):
         cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
-    cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
@@ -291,24 +288,12 @@ def prefill_attention_csa(
     # while external serving callers still use cmp_sparse_lens in
     # prefill_sparse_attn where lens == 0 means no valid sparse indices.
 
+    cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_work,
-        cmp_sparse_lens,
-        attn_sink,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    prefill_sparse_attn(
+        q, kv_cache, ori_block_table, kv, cmp_kv, cmp_block_table,
+        cmp_sparse_work, cmp_sparse_lens, attn_sink, num_tokens,
+        rope_cos_t, rope_sin_t, wo_a, wo_b, wo_b_scale, attn_out,
     )
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
     # history (the current tokens reach attention via the `kv` overlay).
@@ -324,12 +309,11 @@ def prefill_attention_csa(
                 if write_row_raw >= 0:
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
-
-    x_out = hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_attention_csa_test(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -1080,6 +1064,9 @@ if __name__ == "__main__":
                         help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
+    parser.add_argument("--scope-stats", action="store_true", default=False,
+                        help="Collect per-scope occupancy stats (runtime DFX); writes "
+                             "<runtime_dir>/scope_stats/scope_stats.jsonl.")
     args = parser.parse_args()
     compare_tokens = args.num_tokens
 
@@ -1095,6 +1082,7 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_dep_gen=args.enable_dep_gen,
+            enable_scope_stats=args.scope_stats,
         ),
         rtol=1e-2,
         atol=1e-2,

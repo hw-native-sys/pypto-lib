@@ -92,7 +92,7 @@ assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block siz
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_layer(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
@@ -190,60 +190,65 @@ def prefill_layer(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    if layer_id < 2:
-        prefill_attention_swa(
-            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            kv_cache, ori_block_table, ori_slot_mapping,
-            cmp_sparse_indices, cmp_sparse_lens, position_ids,
-            attn_sink, wo_a, wo_b, wo_b_scale,
-            x_attn, num_tokens,
+    # Attention (one variant per layer) — scope frees its scratch before MoE.
+    with pl.scope():
+        if layer_id < 2:
+            prefill_attention_swa(
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                freqs_cos, freqs_sin,
+                kv_cache, ori_block_table, ori_slot_mapping,
+                cmp_sparse_indices, cmp_sparse_lens, position_ids,
+                attn_sink, wo_a, wo_b, wo_b_scale,
+                x_attn, num_tokens,
+            )
+        elif layer_id % 2 == 1:
+            prefill_attention_hca(
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                freqs_cos, freqs_sin,
+                hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
+                hca_cmp_kv_state, hca_cmp_score_state, hca_compress_state_block_table,
+                kv_cache, ori_slot_mapping, ori_block_table,
+                cmp_kv, cmp_block_table, cmp_sparse_indices, cmp_sparse_lens,
+                position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
+                attn_sink, wo_a, wo_b, wo_b_scale,
+                x_attn, num_tokens,
+            )
+        else:
+            prefill_attention_csa(
+                x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
+                attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+                freqs_cos, freqs_sin,
+                csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
+                csa_cmp_kv_state, csa_cmp_score_state, csa_compress_state_block_table,
+                csa_hadamard_idx,
+                csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
+                csa_inner_kv_state, csa_inner_score_state, csa_inner_compress_state_block_table,
+                kv_cache, ori_block_table, ori_slot_mapping,
+                cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
+                position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+                csa_state_slot_mapping, csa_inner_state_slot_mapping,
+                attn_sink, wo_a, wo_b, wo_b_scale,
+                x_attn, num_tokens,
+            )
+
+    # MoE FFN — bare in-place into x_next (the out-param).
+    with pl.scope():
+        moe(
+            x_attn,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias, tid2eid, input_ids,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            x_next,
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            routed_y_buf, combine_done,
+            layer_id, num_tokens, my_rank, pl.const(1, pl.INT32),
         )
-    elif layer_id % 2 == 1:
-        prefill_attention_hca(
-            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
-            hca_cmp_kv_state, hca_cmp_score_state, hca_compress_state_block_table,
-            kv_cache, ori_slot_mapping, ori_block_table,
-            cmp_kv, cmp_block_table, cmp_sparse_indices, cmp_sparse_lens,
-            position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
-            attn_sink, wo_a, wo_b, wo_b_scale,
-            x_attn, num_tokens,
-        )
-    else:
-        prefill_attention_csa(
-            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
-            csa_cmp_kv_state, csa_cmp_score_state, csa_compress_state_block_table,
-            csa_hadamard_idx,
-            csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-            csa_inner_kv_state, csa_inner_score_state, csa_inner_compress_state_block_table,
-            kv_cache, ori_block_table, ori_slot_mapping,
-            cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
-            position_ids, csa_cmp_slot_mapping, csa_idx_slot_mapping,
-            csa_state_slot_mapping, csa_inner_state_slot_mapping,
-            attn_sink, wo_a, wo_b, wo_b_scale,
-            x_attn, num_tokens,
-        )
-    x_next = moe(
-        x_attn,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        x_next,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        routed_y_buf, combine_done,
-        layer_id, num_tokens, my_rank, pl.const(1, pl.INT32),
-    )
     return x_next
 
 
