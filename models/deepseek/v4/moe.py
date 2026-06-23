@@ -80,7 +80,7 @@ assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -125,29 +125,31 @@ def moe(
     # moe_epoch orders the communication protocol over reused windows.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    # All non-output intermediates allocate locally so the convert pass sees
-    # them in the same scope as their producer / consumer, mirroring the
-    # single-card moe_ep1 @pl.jit.inline composition.
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level (long-lived / wide-bridging): written inside a scope below but
+    # read by a later sub-phase, so they outlive it and stay in the function frame.
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
-    )
-
-    x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    gate(
-        x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale, indices, weights,
-    )
-
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+
+    # hc_pre + gate: x_mixed / x_norm die at gate, freed at scope exit.
+    with pl.scope():
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(
+            x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            x_mixed, post_ffn, comb_ffn,
+        )
+        gate(
+            x_mixed, norm_w, gate_w, gate_bias,
+            layer_id, tid2eid, input_ids,
+            x_norm, x_norm_i8, x_norm_scale, indices, weights,
+        )
+
     expert_shared(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -155,42 +157,42 @@ def moe(
         sh,
     )
 
-    recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
-    recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    # Pass the same epoch through dispatch and combine so their stage-specific
-    # done counters describe the same MoE invocation.
-    dispatch(
-        indices, x_norm_i8, x_norm_scale, weights,
-        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        num_tokens, my_rank, moe_epoch,
-    )
-
-    recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
-    expert_routed(
-        recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        recv_y,
-    )
-
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    combine(
-        recv_y, recv_r_route_out, sh,
-        ffn_out,
-        pub_counts, routed_y_buf, combine_done,
-        num_tokens, my_rank, moe_epoch,
-    )
+    # dispatch + expert_routed + combine: all recv_* / recv_y die by combine, so
+    # scope them here to free the big recv_x_out / recv_y before hc_post.
+    with pl.scope():
+        recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
+        recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
+        recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
+        recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
+        recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+        recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
+        # Pass the same epoch through dispatch and combine so their stage-specific
+        # done counters describe the same MoE invocation.
+        dispatch(
+            indices, x_norm_i8, x_norm_scale, weights,
+            recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
+            pub_counts, count_done, data_done,
+            recv_x, recv_scale, recv_w, recv_r_route,
+            num_tokens, my_rank, moe_epoch,
+        )
+        expert_routed(
+            recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            recv_y,
+        )
+        combine(
+            recv_y, recv_r_route_out, sh,
+            ffn_out,
+            pub_counts, routed_y_buf, combine_done,
+            num_tokens, my_rank, moe_epoch,
+        )
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def moe_test(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -708,7 +710,7 @@ def build_tensor_specs(layer_id=0):
 # router degenerates to local routing (every expert is owned here), so this is
 # the standalone single-card path composed against the same sub-kernels. __main__
 # dispatches to these *_ep1 defs directly when EP == 1.
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def moe_ep1(
     x_hc:            pl.Tensor[[T, HC_MULT, D],          pl.BF16],
     hc_ffn_fn:       pl.Tensor[[MIX_HC, HC_DIM],         pl.FP32],
@@ -734,23 +736,28 @@ def moe_ep1(
     x_next:          pl.Out[pl.Tensor[[T, HC_MULT, D],   pl.BF16]],
     layer_id:        pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+    # Frame-level (long-lived / wide-bridging): written inside a scope below but
+    # read by a later sub-phase, so they outlive it and stay in the function frame.
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
-
-    x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    gate(
-        x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale, indices, weights,
-    )
-
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+
+    # hc_pre + gate: x_mixed / x_norm die at gate, freed at scope exit.
+    with pl.scope():
+        x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
+        x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
+        hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
+        gate(
+            x_mixed, norm_w, gate_w, gate_bias,
+            layer_id, tid2eid, input_ids,
+            x_norm, x_norm_i8, x_norm_scale, indices, weights,
+        )
+
     expert_shared(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -758,32 +765,32 @@ def moe_ep1(
         sh,
     )
 
-    recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_dq = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_weights = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_token = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
-    recv_count = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    dispatch_ep1(
-        x_norm_i8, x_norm_scale, indices, weights,
-        recv_x, recv_scale_dq, recv_weights, recv_token, recv_count,
-    )
-
-    recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
-    expert_routed(
-        recv_x, recv_scale_dq, recv_weights, recv_count,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        recv_y,
-    )
-
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    combine_ep1(recv_y, recv_token, recv_count, sh, ffn_out)
+    # dispatch + expert_routed + combine: all recv_* / recv_y die by combine, so
+    # scope them here to free the big recv_x / recv_y before hc_post.
+    with pl.scope():
+        recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
+        recv_scale_dq = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
+        recv_weights = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
+        recv_token = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
+        recv_count = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+        recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
+        dispatch_ep1(
+            x_norm_i8, x_norm_scale, indices, weights,
+            recv_x, recv_scale_dq, recv_weights, recv_token, recv_count,
+        )
+        expert_routed(
+            recv_x, recv_scale_dq, recv_weights, recv_count,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            recv_y,
+        )
+        combine_ep1(recv_y, recv_token, recv_count, sh, ffn_out)
 
     x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def moe_ep1_test(
     x_hc:            pl.Tensor[[T, HC_MULT, D],          pl.BF16],
     hc_ffn_fn:       pl.Tensor[[MIX_HC, HC_DIM],         pl.FP32],
@@ -869,6 +876,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--scope-stats", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,
                         help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
@@ -895,6 +903,7 @@ if __name__ == "__main__":
                 platform=args.platform,
                 device_id=device_ids[0],
                 enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_scope_stats=args.scope_stats,
                 log_level=args.log_level,
             ),
             rtol=1e-3,
@@ -920,6 +929,7 @@ if __name__ == "__main__":
             runtime_cfg=dict(
                 platform=args.platform,
                 enable_l2_swimlane=args.enable_l2_swimlane,
+                enable_scope_stats=args.scope_stats,
                 log_level=args.log_level,
             ),
             rtol=1e-3,
