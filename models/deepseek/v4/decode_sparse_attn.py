@@ -119,7 +119,7 @@ assert WIN % GATHER_FILL_TILE == 0, f"WIN ({WIN}) must be divisible by GATHER_FI
 N_CMP_BLK = (PADDED_TOPK - WIN) // GATHER_FILL_TILE
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -150,325 +150,332 @@ def sparse_attn(
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
-        v_t0 = v_blk * VALID_TOKEN_TILE
-        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
-        # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
-        # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
-        # 2 vector ops instead of the add/max/min/sub clamp chain.
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.minimum(v_idx_f, 0.0), -NEG_INF)
-        if PADDED_TOPK > TOPK:
-            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+    with pl.scope():
+        for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
+            v_t0 = v_blk * VALID_TOKEN_TILE
+            v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
+            # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
+            # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
+            # 2 vector ops instead of the add/max/min/sub clamp chain.
+            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK] = pl.mul(pl.minimum(v_idx_f, 0.0), -NEG_INF)
+            if PADDED_TOPK > TOPK:
+                sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
+                    [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
-    for g_t in pl.spmd(T, name_hint="gather_kv"):
-        g_b = g_t // S
-        g_kv_base = g_t * PADDED_TOPK
-        # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
-        # gets a WAR edge against this read (pypto-lib#481).
-        g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
-
-        # Bulk-zero only the window block [0, WIN): its invalid (-1) slots keep
-        # this fill (the per-row window path below writes valid slots only). The
-        # compressed blocks [WIN, PADDED_TOPK) are fully rewritten by the
-        # zero-initialized g_stage block stores further down, so a separate
-        # zero-fill there is a dead store; only the SWA case (no compressed
-        # staging) still needs the whole region zeroed. Finite (zero) invalid KV
-        # rows plus the NEG_INF softmax bias let qk_pv skip a per-block mask mul.
-        zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_f in pl.range(0, GATHER_ZERO_END, GATHER_FILL_TILE):
-            g_fill_row = g_kv_base + g_f
-            sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
-
-        # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
-        # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
-        # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
-        g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
-        g_overlay_base = g_b * S
-
-        # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
-        # block k+1's load with block k's store.
-        for g_w in pl.pipeline(WIN, stage=4):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
-            if g_raw >= 0:
-                g_dst_row = g_kv_base + g_w
-                if g_raw < WIN:
-                    g_src_row = g_ori_base + g_raw
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                else:
-                    g_overlay_row = g_overlay_base + (g_raw - WIN)
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-
-    # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-    # Run as a separate, finer SPMD over (token, fill-block) units so the gather
-    # fills the AIV cores evenly across waves (T*N_CMP_BLK vs the per-token T
-    # units of the window pass). Guarded so the SWA (TOPK == WIN) specialization
-    # omits it entirely (there the per-token bulk-zero covers the whole region).
-    # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
-    # wide MTE3 store: gives each scattered load its own tile row (no buffer-reuse
-    # WAR, so loads stream on MTE2 instead of ping-ponging with MTE3 per row) and
-    # coalesces the many 1-row stores into one block store. This block fully
-    # rewrites [WIN, PADDED_TOPK), which is why the window pass skips its bulk-zero.
-    if TOPK > WIN:
-        for g_cbk in pl.spmd(T * N_CMP_BLK, name_hint="gather_kv_cmp"):
-            g_t = g_cbk // N_CMP_BLK
+        for g_t in pl.spmd(T, name_hint="gather_kv"):
             g_b = g_t // S
             g_kv_base = g_t * PADDED_TOPK
-            g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
-            g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for g_i in pl.range(GATHER_FILL_TILE):
-                g_c = g_cb + g_i
-                if g_c < TOPK:
-                    g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                    if g_raw >= 0:
-                        g_slot = g_raw - (WIN + S)
-                        g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                        g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                        g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-            g_dst_blk = g_kv_base + g_cb
-            sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
+            # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
+            # gets a WAR edge against this read (pypto-lib#481).
+            g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
+            ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
+
+            # Bulk-zero only the window block [0, WIN): its invalid (-1) slots keep
+            # this fill (the per-row window path below writes valid slots only). The
+            # compressed blocks [WIN, PADDED_TOPK) are fully rewritten by the
+            # zero-initialized g_stage block stores further down, so a separate
+            # zero-fill there is a dead store; only the SWA case (no compressed
+            # staging) still needs the whole region zeroed. Finite (zero) invalid KV
+            # rows plus the NEG_INF softmax bias let qk_pv skip a per-block mask mul.
+            zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            for g_f in pl.range(0, GATHER_ZERO_END, GATHER_FILL_TILE):
+                g_fill_row = g_kv_base + g_f
+                sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
+
+            # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
+            # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
+            # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
+            g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
+            g_overlay_base = g_b * S
+
+            # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
+            # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
+            # block k+1's load with block k's store.
+            for g_w in pl.pipeline(WIN, stage=4):
+                g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
+                if g_raw >= 0:
+                    g_dst_row = g_kv_base + g_w
+                    if g_raw < WIN:
+                        g_src_row = g_ori_base + g_raw
+                        sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                    else:
+                        g_overlay_row = g_overlay_base + (g_raw - WIN)
+                        sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
+
+        # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
+        # Run as a separate, finer SPMD over (token, fill-block) units so the gather
+        # fills the AIV cores evenly across waves (T*N_CMP_BLK vs the per-token T
+        # units of the window pass). Guarded so the SWA (TOPK == WIN) specialization
+        # omits it entirely (there the per-token bulk-zero covers the whole region).
+        # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
+        # wide MTE3 store: gives each scattered load its own tile row (no buffer-reuse
+        # WAR, so loads stream on MTE2 instead of ping-ponging with MTE3 per row) and
+        # coalesces the many 1-row stores into one block store. This block fully
+        # rewrites [WIN, PADDED_TOPK), which is why the window pass skips its bulk-zero.
+        if TOPK > WIN:
+            for g_cbk in pl.spmd(T * N_CMP_BLK, name_hint="gather_kv_cmp"):
+                g_t = g_cbk // N_CMP_BLK
+                g_b = g_t // S
+                g_kv_base = g_t * PADDED_TOPK
+                g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
+                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for g_i in pl.range(GATHER_FILL_TILE):
+                    g_c = g_cb + g_i
+                    if g_c < TOPK:
+                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                        if g_raw >= 0:
+                            g_slot = g_raw - (WIN + S)
+                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                g_dst_blk = g_kv_base + g_cb
+                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
-    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    # Cross-scope (S2 -> S3) buffers: written in merge_norm, read in rope/proj_a,
+    # so they must outlive S2 and stay at function level.
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
-    sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
-    sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    for qk_t in pl.spmd(T, name_hint="qk_pv"):
-        qk_kv_base = qk_t * PADDED_TOPK
-        qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
-        # on (token, sparse-block), so hoisting them above the head-tile loop lets
-        # one KV/bias load serve all head-tiles instead of re-loading per head.
-        for qk_sb in pl.range(SPARSE_BLOCKS):
-            qk_s0 = qk_sb * ATTN_K_TILE
-            qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-            qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-            qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+    with pl.scope():
+        # S2-internal scratch: qk_pv writes (mi, li, oi), merge_norm reads them back;
+        # nothing in S3 touches them, so allocate inside S2 to free at scope exit.
+        q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+        sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
+        sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
+        sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
+        for qk_t in pl.spmd(T, name_hint="qk_pv"):
+            qk_kv_base = qk_t * PADDED_TOPK
+            qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+            # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
+            # on (token, sparse-block), so hoisting them above the head-tile loop lets
+            # one KV/bias load serve all head-tiles instead of re-loading per head.
+            for qk_sb in pl.range(SPARSE_BLOCKS):
+                qk_s0 = qk_sb * ATTN_K_TILE
+                qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
+                qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
 
-            # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
-            # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
-            # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
-            # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
-            # stores at the SAME offsets as the per-head-tile path
-            # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
-            # sparse_blk_* layout and merge_norm are bit-identical.
-            for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
-                qk_h0 = qk_hb * QK_M_TILE
-                qk_head_row = qk_t * H + qk_h0
-                qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-                # Broadcast-add the per-block bias directly (col_expand_add) instead
-                # of col_expand into a dead pl.full(0) base + a separate add.
-                qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
-                qk_mi = pl.row_max(qk_scores)
-                # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
-                # blocks die in the merge alpha/beta -- no mask multiply needed.
-                qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
-                qk_li = pl.row_sum(qk_exp)
-                qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
-                for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
-                    qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
-                    qk_r0 = qk_sub * H_TILE
-                    qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
-                    qk_row = qk_blk_base + qk_sb * H_TILE
-                    sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
+                # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
+                # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
+                # (2x reuse at QK_M_TILE=32) instead of per head-tile. The
+                # [QK_M_TILE, ...] softmax result is sliced back into H_TILE-row
+                # stores at the SAME offsets as the per-head-tile path
+                # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
+                # sparse_blk_* layout and merge_norm are bit-identical.
+                for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                    qk_h0 = qk_hb * QK_M_TILE
+                    qk_head_row = qk_t * H + qk_h0
+                    qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
+                    qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                    # Broadcast-add the per-block bias directly (col_expand_add) instead
+                    # of col_expand into a dead pl.full(0) base + a separate add.
+                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
+                    qk_mi = pl.row_max(qk_scores)
+                    # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
+                    # blocks die in the merge alpha/beta -- no mask multiply needed.
+                    qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
+                    qk_li = pl.row_sum(qk_exp)
+                    qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
+                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                    for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
+                        qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
+                        qk_r0 = qk_sub * H_TILE
+                        qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
+                        qk_row = qk_blk_base + qk_sb * H_TILE
+                        sparse_blk_mi[qk_row : qk_row + H_TILE, 0 : 1] = qk_mi[qk_r0 : qk_r0 + H_TILE, 0 : 1]
+                        sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
+                        sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
-    # Online-softmax merge across sparse-K tiles, then sink-norm.
-    for m_t in pl.spmd(T, name_hint="merge_norm"):
-        m_token_base = m_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+        # Online-softmax merge across sparse-K tiles, then sink-norm.
+        for m_t in pl.spmd(T, name_hint="merge_norm"):
+            m_token_base = m_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
 
-        for m_h_idx in pl.range((H // H_TILE)):
-            m_h0 = m_h_idx * H_TILE
-            m_blk_base = m_token_base + m_h_idx * SPARSE_BLOCKS * H_TILE
-            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
+            for m_h_idx in pl.range((H // H_TILE)):
+                m_h0 = m_h_idx * H_TILE
+                m_blk_base = m_token_base + m_h_idx * SPARSE_BLOCKS * H_TILE
+                m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+                m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+                m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-            # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
-            # single block's stats directly instead of an empty merge loop.
-            if SPARSE_BLOCKS > 1:
-                for m_sb in pl.range(1, SPARSE_BLOCKS):
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                    m_mi = m_mi_new
+                # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
+                # single block's stats directly instead of an empty merge loop.
+                if SPARSE_BLOCKS > 1:
+                    for m_sb in pl.range(1, SPARSE_BLOCKS):
+                        m_row = m_blk_base + m_sb * H_TILE
+                        m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                        m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                        m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                        m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                        m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                        m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                        m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                        m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                        m_mi = m_mi_new
 
-            n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-            n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
-            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-            n_rope_row = m_t * H + m_h0
-            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+                n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+                n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+                n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+                n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
+                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+                n_rope_row = m_t * H + m_h0
+                attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
 
-            for n_hi in pl.range(H_TILE):
-                n_gh = m_h0 + n_hi
-                n_g = n_gh // HEADS_PER_GROUP
-                n_hh = n_gh - n_g * HEADS_PER_GROUP
-                n_pack_row = n_g * T + m_t
-                n_col = n_hh * HEAD_DIM
-                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
+                for n_hi in pl.range(H_TILE):
+                    n_gh = m_h0 + n_hi
+                    n_g = n_gh // HEADS_PER_GROUP
+                    n_hh = n_gh - n_g * HEADS_PER_GROUP
+                    n_pack_row = n_g * T + m_t
+                    n_col = n_hh * HEAD_DIM
+                    o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
     # same dup-gather H times on the bottleneck Vec engine. sign is folded into sin
     # (multiply by +/-1). The conjugate (inverse) rotation is:
     #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+    with pl.scope():
+        rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+        rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+        for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
+            cp_r0 = cp * ROPE_TILE
+            cp_c0 = 2 * cp_r0
+            cs_col = pl.col_expand_mul(
+                pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+                pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+            cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+            cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+            cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
+            cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+            rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+            rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
+                pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
-    # Inverse RoPE fused with the rope-column pack: each task rotates its heads'
-    # rope segments and stores them straight into o_packed's strided rope columns,
-    # dropping a separate rope_pack stage and GM round-trip. cos_il / sign*sin come
-    # from the pre-pass above; only swap_idx (j^1) is rebuilt per task.
-    attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
-    for rp_idx in pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope"):
-        rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
-        rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
-        rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
-        # Head-invariant swap index (j^1), built once and reused across the head
-        # group -- the only per-head input is this head's strided rope slice.
-        sp_col = pl.col_expand_mul(
-            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+        # Inverse RoPE fused with the rope-column pack: each task rotates its heads'
+        # rope segments and stores them straight into o_packed's strided rope columns,
+        # dropping a separate rope_pack stage and GM round-trip. cos_il / sign*sin come
+        # from the pre-pass above; only swap_idx (j^1) is rebuilt per task.
+        attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
+        for rp_idx in pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope"):
+            rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
+            rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
+            rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
+            # Head-invariant swap index (j^1), built once and reused across the head
+            # group -- the only per-head input is this head's strided rope slice.
+            sp_col = pl.col_expand_mul(
+                pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+                pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+            sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+            sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
+            sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
 
-        for rp_hl in pl.range(0, 4):
-            rp_gh = rp_hg * 4 + rp_hl
-            rp_g = rp_gh // HEADS_PER_GROUP
-            rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
-            rp_col = rp_hh * HEAD_DIM + NOPE_DIM
-            rp_o0 = rp_g * T + rp_t0
-            for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                c0 = 2 * r_r0
-                # This head's rope rows for this token tile (stride H).
-                r_tile_fp32 = pl.reshape(
-                    attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE],
-                    [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
-                r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
-                # Store BF16-rounded rotated values straight into o_packed's rope
-                # columns for this head (golden also rounds inverse-RoPE to bf16).
-                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-                o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
+            for rp_hl in pl.range(0, 4):
+                rp_gh = rp_hg * 4 + rp_hl
+                rp_g = rp_gh // HEADS_PER_GROUP
+                rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
+                rp_col = rp_hh * HEAD_DIM + NOPE_DIM
+                rp_o0 = rp_g * T + rp_t0
+                for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
+                    c0 = 2 * r_r0
+                    # This head's rope rows for this token tile (stride H).
+                    r_tile_fp32 = pl.reshape(
+                        attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE],
+                        [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
+                    r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                    r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+                    r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+                    r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
+                    # Store BF16-rounded rotated values straight into o_packed's rope
+                    # columns for this head (golden also rounds inverse-RoPE to bf16).
+                    r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
+                    o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
-    # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
-    # (BF16 store + per-row amax) is T-tiled to keep the fused AIV side from
-    # oversizing UB.
-    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
-    o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
-    for proj_a_block in pl.spmd(O_GROUPS * (O_LORA // A_N_TILE), name_hint="proj_a"):
-        # K-split BF16 matmul for one wo_a output tile, peel-first-iter form.
-        g = proj_a_block // (O_LORA // A_N_TILE)
-        nb = proj_a_block - g * (O_LORA // A_N_TILE)
-        row_base_o = g * T
-        out_col_g = g * O_LORA
-        n0 = nb * A_N_TILE
-        amax_part_row = g * (O_LORA // A_N_TILE) + nb
+        # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
+        # (BF16 store + per-row amax) is T-tiled to keep the fused AIV side from
+        # oversizing UB.
+        o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
+        o_r_amax_parts = pl.create_tensor([O_GROUPS * (O_LORA // A_N_TILE), T], dtype=pl.FP32)
+        for proj_a_block in pl.spmd(O_GROUPS * (O_LORA // A_N_TILE), name_hint="proj_a"):
+            # K-split BF16 matmul for one wo_a output tile, peel-first-iter form.
+            g = proj_a_block // (O_LORA // A_N_TILE)
+            nb = proj_a_block - g * (O_LORA // A_N_TILE)
+            row_base_o = g * T
+            out_col_g = g * O_LORA
+            n0 = nb * A_N_TILE
+            amax_part_row = g * (O_LORA // A_N_TILE) + nb
 
-        xa0_chunk = o_packed[row_base_o:row_base_o + T, 0:A_K_TILE]
-        wa0_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, 0:A_K_TILE]
-        acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-        for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
-            k0 = kb * A_K_TILE
-            xa_k_chunk = o_packed[row_base_o:row_base_o + T, k0:k0 + A_K_TILE]
-            wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, k0:k0 + A_K_TILE]
-            acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+            xa0_chunk = o_packed[row_base_o:row_base_o + T, 0:A_K_TILE]
+            wa0_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, 0:A_K_TILE]
+            acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
+            for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                k0 = kb * A_K_TILE
+                xa_k_chunk = o_packed[row_base_o:row_base_o + T, k0:k0 + A_K_TILE]
+                wa_k_chunk = wo_a[g:g + 1, n0:n0 + A_N_TILE, k0:k0 + A_K_TILE]
+                acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
 
-        acc_a_2d = pl.reshape(acc_a, [T, A_N_TILE])
-        for tb in pl.range(0, T, A_T_TILE):
-            acc_t = acc_a_2d[tb:tb + A_T_TILE, 0:A_N_TILE]
-            o_r[tb:tb + A_T_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_t
-            acc_t_abs = pl.maximum(acc_t, pl.neg(acc_t))
-            acc_t_amax = pl.reshape(pl.row_max(acc_t_abs), [1, A_T_TILE])
-            o_r_amax_parts[amax_part_row:amax_part_row + 1, tb:tb + A_T_TILE] = acc_t_amax
+            acc_a_2d = pl.reshape(acc_a, [T, A_N_TILE])
+            for tb in pl.range(0, T, A_T_TILE):
+                acc_t = acc_a_2d[tb:tb + A_T_TILE, 0:A_N_TILE]
+                o_r[tb:tb + A_T_TILE, out_col_g + n0:out_col_g + n0 + A_N_TILE] = acc_t
+                acc_t_abs = pl.maximum(acc_t, pl.neg(acc_t))
+                acc_t_amax = pl.reshape(pl.row_max(acc_t_abs), [1, A_T_TILE])
+                o_r_amax_parts[amax_part_row:amax_part_row + 1, tb:tb + A_T_TILE] = acc_t_amax
 
-    # Per-row symmetric INT8 quant of `o_r`, K-tiled as a second parallel axis.
-    o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
-    o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
-    for q_block in pl.spmd((T // QUANT_TOKEN_TILE) * ((O_GROUPS * O_LORA) // QUANT_K_TILE), name_hint="quant"):
-        qt_idx = q_block // ((O_GROUPS * O_LORA) // QUANT_K_TILE)
-        qk_idx = q_block - qt_idx * ((O_GROUPS * O_LORA) // QUANT_K_TILE)
-        quant_t0 = qt_idx * QUANT_TOKEN_TILE
-        k0 = qk_idx * QUANT_K_TILE
+        # Per-row symmetric INT8 quant of `o_r`, K-tiled as a second parallel axis.
+        o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
+        o_r_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
+        for q_block in pl.spmd((T // QUANT_TOKEN_TILE) * ((O_GROUPS * O_LORA) // QUANT_K_TILE), name_hint="quant"):
+            qt_idx = q_block // ((O_GROUPS * O_LORA) // QUANT_K_TILE)
+            qk_idx = q_block - qt_idx * ((O_GROUPS * O_LORA) // QUANT_K_TILE)
+            quant_t0 = qt_idx * QUANT_TOKEN_TILE
+            k0 = qk_idx * QUANT_K_TILE
 
-        or_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for ab in pl.range(0, O_GROUPS * (O_LORA // A_N_TILE), 1):
-            or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + QUANT_TOKEN_TILE]
-            or_amax = pl.maximum(or_amax, or_a_part)
-        or_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
-        or_scale_dq = pl.reshape(pl.recip(or_sq_row), [QUANT_TOKEN_TILE, 1])
-        o_r_scale_dq[quant_t0:quant_t0 + QUANT_TOKEN_TILE, 0:1] = or_scale_dq
-        or_sq_col = pl.reshape(or_sq_row, [QUANT_TOKEN_TILE, 1])
-        for k1 in pl.range(k0, k0 + QUANT_K_TILE, QUANT_TILE):
-            or_q_f32 = o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE]
-            or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
-            or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
-            or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
-            o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
+            or_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for ab in pl.range(0, O_GROUPS * (O_LORA // A_N_TILE), 1):
+                or_a_part = o_r_amax_parts[ab:ab + 1, quant_t0:quant_t0 + QUANT_TOKEN_TILE]
+                or_amax = pl.maximum(or_amax, or_a_part)
+            or_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), or_amax)
+            or_scale_dq = pl.reshape(pl.recip(or_sq_row), [QUANT_TOKEN_TILE, 1])
+            o_r_scale_dq[quant_t0:quant_t0 + QUANT_TOKEN_TILE, 0:1] = or_scale_dq
+            or_sq_col = pl.reshape(or_sq_row, [QUANT_TOKEN_TILE, 1])
+            for k1 in pl.range(k0, k0 + QUANT_K_TILE, QUANT_TILE):
+                or_q_f32 = o_r[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE]
+                or_q_scaled = pl.row_expand_mul(or_q_f32, or_sq_col)
+                or_q_i32 = pl.cast(or_q_scaled, target_type=pl.INT32, mode="rint")
+                or_q_half = pl.cast(or_q_i32, target_type=pl.FP16, mode="round")
+                o_r_i8[quant_t0:quant_t0 + QUANT_TOKEN_TILE, k1:k1 + QUANT_TILE] = pl.cast(or_q_half, target_type=pl.INT8, mode="trunc")
 
-    # INT8 projection `o_r_i8 @ wo_b^T`, then dequantize -> final BF16 output.
-    for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
-        # K-split INT8 GEMM + dequant in one scope; T-tiled vec post-process
-        # to keep the fused AIV side from oversizing UB (same as proj_a).
-        n0 = nb * B_N_TILE
-        acc_b = pl.create_tensor([T, B_N_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, (O_GROUPS * O_LORA) // B_K_TILE, stage=2):
-            k0 = kb * B_K_TILE
-            xb_k_chunk = o_r_i8[:, k0:k0 + B_K_TILE]
-            wb_k_chunk = wo_b[n0:n0 + B_N_TILE, k0:k0 + B_K_TILE]
-            if k0 == 0:
-                acc_b = pl.matmul(xb_k_chunk, wb_k_chunk, b_trans=True, out_dtype=pl.INT32)
-            else:
-                acc_b = pl.matmul_acc(acc_b, xb_k_chunk, wb_k_chunk, b_trans=True)
+        # INT8 projection `o_r_i8 @ wo_b^T`, then dequantize -> final BF16 output.
+        for nb in pl.spmd(D // B_N_TILE, name_hint="proj_b", optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
+            # K-split INT8 GEMM + dequant in one scope; T-tiled vec post-process
+            # to keep the fused AIV side from oversizing UB (same as proj_a).
+            n0 = nb * B_N_TILE
+            acc_b = pl.create_tensor([T, B_N_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, (O_GROUPS * O_LORA) // B_K_TILE, stage=2):
+                k0 = kb * B_K_TILE
+                xb_k_chunk = o_r_i8[:, k0:k0 + B_K_TILE]
+                wb_k_chunk = wo_b[n0:n0 + B_N_TILE, k0:k0 + B_K_TILE]
+                if k0 == 0:
+                    acc_b = pl.matmul(xb_k_chunk, wb_k_chunk, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    acc_b = pl.matmul_acc(acc_b, xb_k_chunk, wb_k_chunk, b_trans=True)
 
-        wb_scale_chunk = pl.reshape(wo_b_scale[n0:n0 + B_N_TILE], [1, B_N_TILE])
-        for b_tb in pl.range(0, T, B_T_TILE):
-            acc_b_t = acc_b[b_tb:b_tb + B_T_TILE, 0:B_N_TILE]
-            b_scale_t = o_r_scale_dq[b_tb:b_tb + B_T_TILE, 0:1]
-            attn_t = pl.cast(acc_b_t, target_type=pl.FP32, mode="none")
-            attn_t = pl.col_expand_mul(pl.row_expand_mul(attn_t, b_scale_t), wb_scale_chunk)
-            attn_out[b_tb:b_tb + B_T_TILE, n0:n0 + B_N_TILE] = pl.cast(attn_t, target_type=pl.BF16, mode="rint")
+            wb_scale_chunk = pl.reshape(wo_b_scale[n0:n0 + B_N_TILE], [1, B_N_TILE])
+            for b_tb in pl.range(0, T, B_T_TILE):
+                acc_b_t = acc_b[b_tb:b_tb + B_T_TILE, 0:B_N_TILE]
+                b_scale_t = o_r_scale_dq[b_tb:b_tb + B_T_TILE, 0:1]
+                attn_t = pl.cast(acc_b_t, target_type=pl.FP32, mode="none")
+                attn_t = pl.col_expand_mul(pl.row_expand_mul(attn_t, b_scale_t), wb_scale_chunk)
+                attn_out[b_tb:b_tb + B_T_TILE, n0:n0 + B_N_TILE] = pl.cast(attn_t, target_type=pl.BF16, mode="rint")
 
     return attn_out
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
@@ -804,6 +811,9 @@ if __name__ == "__main__":
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--scope-stats", action="store_true", default=False,
+                        help="Collect per-scope occupancy stats (runtime DFX); writes "
+                             "<runtime_dir>/scope_stats/scope_stats.jsonl.")
     args = parser.parse_args()
 
     compress_ratio = args.compress_ratio
@@ -827,6 +837,7 @@ if __name__ == "__main__":
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_dep_gen=args.enable_dep_gen,
             enable_pmu=args.enable_pmu,
+            enable_scope_stats=args.scope_stats,
         ),
         rtol=1e-3,
         atol=1e-3,
