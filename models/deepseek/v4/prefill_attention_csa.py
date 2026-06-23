@@ -162,8 +162,6 @@ def prefill_attention_csa(
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
 
     # Pre-attention scope (hc_pre .. qkv): frees the purely-dead scratch (x_mixed,
     # qr, qr_scale). The compressor / indexer / sparse-idx build stay at the function
@@ -247,6 +245,8 @@ def prefill_attention_csa(
     # Build it 2D ([1, T], assemble-friendly) inside a scope, then reshape to the
     # [T] the kernel expects -- assemble + reshape is SSA-tracked so the gather's read
     # is ordered after this write (a 1D in-place pl.write races the round-trip).
+    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_sparse_lens"):
         cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,

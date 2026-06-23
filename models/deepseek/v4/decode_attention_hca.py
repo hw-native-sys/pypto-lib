@@ -706,6 +706,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.scope_stats,
         ),
         atol=1e-2,
         compare_fn={

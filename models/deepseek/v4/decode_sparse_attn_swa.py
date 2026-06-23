@@ -204,10 +204,10 @@ def sparse_attn_swa(
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
-    q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     with pl.scope():
+        q_flat = pl.reshape(q, [T * H, HEAD_DIM])
         sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
         sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
         sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
