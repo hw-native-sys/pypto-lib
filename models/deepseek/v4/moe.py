@@ -133,8 +133,6 @@ def moe(
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
 
     # hc_pre + gate: x_mixed / x_norm die at gate, freed at scope exit.
     with pl.scope():
@@ -150,6 +148,7 @@ def moe(
             x_norm, x_norm_i8, x_norm_scale, indices, weights,
         )
 
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
     expert_shared(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -159,6 +158,7 @@ def moe(
 
     # dispatch + expert_routed + combine: all recv_* / recv_y die by combine, so
     # scope them here to free the big recv_x_out / recv_y before hc_post.
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
         recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
@@ -744,8 +744,6 @@ def moe_ep1(
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
 
     # hc_pre + gate: x_mixed / x_norm die at gate, freed at scope exit.
     with pl.scope():
@@ -758,6 +756,7 @@ def moe_ep1(
             x_norm, x_norm_i8, x_norm_scale, indices, weights,
         )
 
+    sh = pl.create_tensor([T, D], dtype=pl.BF16)
     expert_shared(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
@@ -767,6 +766,7 @@ def moe_ep1(
 
     # dispatch + expert_routed + combine: all recv_* / recv_y die by combine, so
     # scope them here to free the big recv_x / recv_y before hc_post.
+    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
         recv_scale_dq = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
