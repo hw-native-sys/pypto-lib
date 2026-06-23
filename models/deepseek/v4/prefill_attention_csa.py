@@ -34,7 +34,14 @@ from prefill_compressor_ratio4 import (
 )
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
-from prefill_indexer import IDX_CACHE_MAX_BLOCKS, INDEXER_TOPK_CAP, golden_prefill_indexer_core, prefill_indexer
+from prefill_indexer import (
+    IDX_CACHE_MAX_BLOCKS,
+    INDEXER_SCORE_CAP,
+    INDEXER_TOPK_CAP,
+    gen_shared_weight,
+    golden_prefill_indexer_core,
+    prefill_indexer,
+)
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
@@ -127,6 +134,9 @@ def prefill_attention_csa(
     cmp_score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    idx_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
@@ -216,9 +226,27 @@ def prefill_attention_csa(
         cmp_slot_mapping,
         state_slot_mapping,
     )
+    # Half-width FP32 cos/sin rows for the indexer Q-RoPE: gather freqs at each token's position
+    # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
+    idx_cos = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
+    idx_sin = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
+        for idx_t in pl.range(T):
+            idx_pos = pl.cast(pl.read(position_ids, [idx_t]), pl.INDEX)
+            idx_cos = pl.assemble(idx_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [idx_pos, 0]), target_type=pl.FP32), [idx_t, 0])
+            idx_sin = pl.assemble(idx_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [idx_pos, 0]), target_type=pl.FP32), [idx_t, 0])
+
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_kv_cache, cmp_topk_indices = prefill_indexer(
+    idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
+    idx_kv_cache, idx_score_unused, cmp_topk_indices = prefill_indexer(
         x_normed,
+        qr,
+        qr_scale,
+        idx_wq_b,
+        idx_wq_b_scale,
+        idx_weights_proj,
+        idx_cos,
+        idx_sin,
         freqs_cos,
         freqs_sin,
         hadamard_idx,
@@ -231,6 +259,7 @@ def prefill_attention_csa(
         inner_norm_w,
         idx_kv_cache,
         idx_block_table,
+        idx_score_unused,
         cmp_topk_indices,
         position_ids,
         num_tokens,
@@ -352,6 +381,9 @@ def prefill_attention_csa_test(
     cmp_score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
+    idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
+    idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
+    idx_weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
@@ -409,6 +441,9 @@ def prefill_attention_csa_test(
         cmp_score_state,
         compress_state_block_table,
         hadamard_idx,
+        idx_wq_b,
+        idx_wq_b_scale,
+        idx_weights_proj,
         inner_wkv,
         inner_wgate,
         inner_ape,
@@ -501,8 +536,17 @@ def golden_prefill_attention_csa(tensors):
         "cmp_slot_mapping": tensors["cmp_slot_mapping"],
         "state_slot_mapping": tensors["state_slot_mapping"],
     })
-    cmp_topk_indices = golden_prefill_indexer_core({
+    idx_cos = rope_cos_t[:, :HALF_ROPE].float().contiguous()
+    idx_sin = rope_sin_t[:, :HALF_ROPE].float().contiguous()
+    cmp_topk_indices, _idx_score = golden_prefill_indexer_core({
         "x": x_normed.view(T, D),
+        "qr": qr,
+        "qr_scale": qr_scale,
+        "wq_b": tensors["idx_wq_b"],
+        "wq_b_scale": tensors["idx_wq_b_scale"],
+        "weights_proj": tensors["idx_weights_proj"],
+        "cos": idx_cos,
+        "sin": idx_sin,
         "freqs_cos": tensors["freqs_cos"],
         "freqs_sin": tensors["freqs_sin"],
         "hadamard": tensors["hadamard_idx"],
@@ -621,6 +665,15 @@ def build_tensor_specs(
         raise ValueError(
             f"needs {max_visible_cmp} compressed slots; current cmp cache cap is "
             f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
+        )
+    # The real prefill indexer scores only PREFILL_COMPRESSED_LEN compressed slots (its inner
+    # compressor handles only the current chunk, no historical compressed context), which is a
+    # tighter bound than the sparse cmp-cache cap above. Reject suffix-prefill loudly here.
+    if max_visible_cmp > PREFILL_COMPRESSED_LEN:
+        raise ValueError(
+            f"the real prefill indexer scores only PREFILL_COMPRESSED_LEN={PREFILL_COMPRESSED_LEN} "
+            f"compressed slots, but context_len={context_len} + q_len={q_len} needs {max_visible_cmp}. "
+            f"Suffix-prefill is not yet supported by the indexer (full prefill / start_pos=0 only)."
         )
 
 
@@ -937,6 +990,9 @@ def build_tensor_specs(
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel_local(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
     wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    # Indexer Q up-proj + weights projection (mirrors the standalone prefill_indexer fixtures).
+    idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
+    idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()
 
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
@@ -970,6 +1026,9 @@ def build_tensor_specs(
         ),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
+        TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
+        TensorSpec("idx_wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: idx_wq_b_scale),
+        TensorSpec("idx_weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: (torch.randn(D, IDX_N_HEADS) * 0.2313).to(torch.bfloat16)),
         TensorSpec("inner_wkv", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
