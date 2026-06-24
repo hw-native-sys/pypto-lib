@@ -666,17 +666,6 @@ def build_tensor_specs(
             f"needs {max_visible_cmp} compressed slots; current cmp cache cap is "
             f"{SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE}"
         )
-    # The real prefill indexer scores only PREFILL_COMPRESSED_LEN compressed slots (its inner
-    # compressor handles only the current chunk, no historical compressed context), which is a
-    # tighter bound than the sparse cmp-cache cap above. Reject suffix-prefill loudly here.
-    if max_visible_cmp > PREFILL_COMPRESSED_LEN:
-        raise ValueError(
-            f"the real prefill indexer scores only PREFILL_COMPRESSED_LEN={PREFILL_COMPRESSED_LEN} "
-            f"compressed slots, but context_len={context_len} + q_len={q_len} needs {max_visible_cmp}. "
-            f"Suffix-prefill is not yet supported by the indexer (full prefill / start_pos=0 only)."
-        )
-
-
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
         # Padding rows keep their arange default; they are inactive.
@@ -1141,6 +1130,13 @@ if __name__ == "__main__":
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
     args = parser.parse_args()
     compare_tokens = args.num_tokens
+    x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1)
+    if args.start_pos:
+        # Suffix prefill exercises historical ring-cache rows in addition to current overlay and
+        # compressed-cache rows. The fused sparse-attn + INT8 output path stays close globally but
+        # has more BF16 per-element drift than the full-prefill fixture; keep this stricter than the
+        # end-to-end prefill-layer bar while avoiding a false failure on benign one-ULP tails.
+        x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=1e-2, pct_thd=0.01, max_diff_hd=3)
 
     result = run_jit(
         fn=prefill_attention_csa_test,
@@ -1159,7 +1155,7 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
+            "x_out": x_out_cmp,
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

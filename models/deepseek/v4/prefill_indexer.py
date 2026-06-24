@@ -56,10 +56,11 @@ S = 128
 T = B * S
 START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
-PREFILL_CACHE_BLOCKS = max(1, (PREFILL_COMPRESSED_LEN + CACHE_TILE - 1) // CACHE_TILE)  # valid compressed blocks to score (#505^)
+PREFILL_CACHE_BLOCKS = max(1, (PREFILL_COMPRESSED_LEN + CACHE_TILE - 1) // CACHE_TILE)
 TOPK_TILE = 16
 assert T % TOPK_TILE == 0
 INDEXER_SCORE_CAP = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
 INDEXER_OFFSET = WIN + T
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
@@ -184,15 +185,19 @@ def prefill_indexer(
             for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
                 qh_a_f32 = qh_acc[0 : QH_QUANT_ROW_TILE, h0 : h0 + HEAD_DIM_TILE]
                 qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
-                qh_amax = pl.maximum(qh_amax, pl.reshape(pl.row_max(qh_a_abs), [1, QH_QUANT_ROW_TILE]))
+                qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, QH_QUANT_ROW_TILE])
+                qh_amax = pl.maximum(qh_amax, qh_a_max)
             qh_scale_quant_row = pl.div(pl.full([1, QH_QUANT_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qh_amax)
-            qr_hadamard_scale_dq[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, :] = pl.reshape(pl.recip(qh_scale_quant_row), [QH_QUANT_ROW_TILE, 1])
+            qh_scale_dq = pl.reshape(pl.recip(qh_scale_quant_row), [QH_QUANT_ROW_TILE, 1])
+            qr_hadamard_scale_dq[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, :] = qh_scale_dq
             qh_scale_quant = pl.reshape(qh_scale_quant_row, [QH_QUANT_ROW_TILE, 1])
             for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                qh_q_scaled = pl.row_expand_mul(qh_acc[0 : QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE], qh_scale_quant)
+                qh_q_f32 = qh_acc[0 : QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE]
+                qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
                 qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
                 qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
-                qr_hadamard_i8[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
+                qh_i8 = pl.cast(qh_q_half, target_type=pl.INT8, mode="trunc")
+                qr_hadamard_i8[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
 
     # === weights projection: (x @ weights_proj) * WEIGHTS_SCALE ===
     weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
@@ -230,81 +235,69 @@ def prefill_indexer(
         inner_state_slot_mapping,
     )
 
-    # === score: lean W8A8C16 scoring over the packed paged cache, in three sequential CORE_GROUP
-    # stages that share one pl.parallel(cb) iteration -- quantize the block's KV to int8 once,
-    # int8 matmul-accumulate q.kv per token, then dequant + relu + per-head weight + sum. Keeping
-    # the stages in one iteration tracks the kv_tile_i8_g / score_acc_g write->read dependencies
-    # (splitting them across separate loops races on the scratch and 507018-faults). Only
-    # PREFILL_CACHE_BLOCKS blocks are scored; the rest of the SORT_LEN-wide sort scratch stays -inf. ===
+    # === score: decode-style W8A8C16 scoring over the packed paged cache. Each active cache block
+    # is quantized to INT8 locally, multiplied by the INT8 Hadamard Q tile with INT32 accumulation,
+    # then dequantized and reduced in FP32. Runtime guards skip blocks beyond the suffix context.
     kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
     score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
     score_wide = pl.create_tensor([T, SORT_LEN], dtype=pl.FP32)                                  # wide sort scratch
-    score_kv_scale = pl.create_tensor([PREFILL_CACHE_BLOCKS * CACHE_TILE, 1], dtype=pl.FP32)     # per-key dequant scale
-    kv_tile_i8_g = pl.create_tensor([PREFILL_CACHE_BLOCKS * CACHE_TILE, IDX_HEAD_DIM], dtype=pl.INT8)
-    score_acc_g = pl.create_tensor([PREFILL_CACHE_BLOCKS * T * CACHE_TILE, IDX_N_HEADS], dtype=pl.INT32)
 
     for si in pl.parallel(0, T, SCORE_INIT_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_init"):
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
-    for cb in pl.parallel(PREFILL_CACHE_BLOCKS):
-        cache0 = cb * CACHE_TILE
-        score_row0 = cb * CACHE_TILE
-
-        # Stage 1 -- quant this cache block's KV to INT8 once (full-128 amax). The paged-cache block
-        # lookup (a device read of idx_block_table) must live INSIDE the CORE_GROUP compute scope,
-        # not at the bare pl.parallel level (a device read there 507018-faults at runtime).
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_quant"):
-            idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
-            kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
-            kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-            for h0 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                kv_a_f32 = pl.cast(kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, h0 : h0 + HEAD_DIM_TILE], target_type=pl.FP32)
-                kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
-                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE]))
-            kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
-            kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
-            score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :] = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
-            for h1 in pl.range(0, IDX_HEAD_DIM, HEAD_DIM_TILE):
-                kv_q_f32 = pl.cast(kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, h1 : h1 + HEAD_DIM_TILE], target_type=pl.FP32)
-                kv_q_scaled = pl.row_expand_mul(kv_q_f32, kv_scale_quant)
-                kv_q_i8 = pl.cast(pl.cast(pl.cast(kv_q_scaled, target_type=pl.INT32, mode="rint"), target_type=pl.FP16, mode="round"), target_type=pl.INT8, mode="trunc")
-                kv_tile_i8_g[score_row0 : score_row0 + CACHE_TILE, h1 : h1 + HEAD_DIM_TILE] = kv_q_i8
-
-        # Stage 2 -- int8 matmul-accumulate q . kv per token (INT32 accumulator), read kv from the
-        # same iteration's quant output.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_accum"):
-            for t in pl.range(T):
-                q_s0 = t * IDX_N_HEADS
-                acc_row0 = (cb * T + t) * CACHE_TILE
-                qr_hadamard_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, :]
-                score_acc_g[acc_row0 : acc_row0 + CACHE_TILE, :] = pl.matmul(
-                    kv_tile_i8_g[score_row0 : score_row0 + CACHE_TILE, :], qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
-
-        # Stage 3 -- dequant (kv scale x per-head qh scale) + relu + per-head weighting + sum +
-        # per-token causal mask, all on the [keys, heads] tile read from score_acc_g (same cb
-        # iteration). row_sum reduces over the head axis directly, so no heads<->keys transpose is
-        # needed -- and a transpose here 507018-faults on device.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_reduce"):
-            kv_cache_scale_dq = score_kv_scale[score_row0 : score_row0 + CACHE_TILE, :]
-            for t in pl.range(T):
-                if t < num_tokens:
-                    q_s0 = t * IDX_N_HEADS
-                    acc_row0 = (cb * T + t) * CACHE_TILE
-                    qh_scale = pl.reshape(qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :], [1, IDX_N_HEADS])
-                    score_tile_s = pl.cast(score_acc_g[acc_row0 : acc_row0 + CACHE_TILE, :], target_type=pl.FP32, mode="none")
-                    score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale)
-                    relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
-                    weighted_score_s = pl.reshape(pl.row_sum(pl.col_expand_mul(relu_score_s, weights[t : t + 1, :])), [1, CACHE_TILE])
-                    pos = pl.read(position_ids, [t])
-                    visible_t = (pos + 1) // COMPRESS_RATIO
-                    if visible_t > cache0:
-                        valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
-                    else:
-                        valid_len_t = 0
-                    weighted_valid_t = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len_t), pad_value=pl.PadValue.min)
-                    weighted_valid_t = pl.maximum(weighted_valid_t, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
-                    score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score"):
+        last_pos = pl.read(position_ids, [num_tokens - 1])
+        max_visible = pl.min((last_pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
+        for cb in pl.range(INDEXER_SCORE_BLOCKS):
+            cache0 = cb * CACHE_TILE
+            if max_visible > cache0:
+                idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
+                kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
+                kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+                kv_a_tile0 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 0:HEAD_DIM_TILE]
+                kv_a_f320 = pl.cast(kv_a_tile0, target_type=pl.FP32)
+                kv_a_abs0 = pl.maximum(kv_a_f320, pl.neg(kv_a_f320))
+                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs0), [1, CACHE_TILE]))
+                kv_a_tile1 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, HEAD_DIM_TILE : 2 * HEAD_DIM_TILE]
+                kv_a_f321 = pl.cast(kv_a_tile1, target_type=pl.FP32)
+                kv_a_abs1 = pl.maximum(kv_a_f321, pl.neg(kv_a_f321))
+                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs1), [1, CACHE_TILE]))
+                kv_a_tile2 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 2 * HEAD_DIM_TILE : 3 * HEAD_DIM_TILE]
+                kv_a_f322 = pl.cast(kv_a_tile2, target_type=pl.FP32)
+                kv_a_abs2 = pl.maximum(kv_a_f322, pl.neg(kv_a_f322))
+                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs2), [1, CACHE_TILE]))
+                kv_a_tile3 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 3 * HEAD_DIM_TILE : IDX_HEAD_DIM]
+                kv_a_f323 = pl.cast(kv_a_tile3, target_type=pl.FP32)
+                kv_a_abs3 = pl.maximum(kv_a_f323, pl.neg(kv_a_f323))
+                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs3), [1, CACHE_TILE]))
+                kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
+                kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
+                kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
+                kv_q_full_f32 = pl.cast(kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 0 : IDX_HEAD_DIM], target_type=pl.FP32)
+                kv_q_full_scaled = pl.row_expand_mul(kv_q_full_f32, kv_scale_quant)
+                kv_q_full_i32 = pl.cast(kv_q_full_scaled, target_type=pl.INT32, mode="rint")
+                kv_q_full_half = pl.cast(kv_q_full_i32, target_type=pl.FP16, mode="round")
+                kv_q_i8_full = pl.cast(kv_q_full_half, target_type=pl.INT8, mode="trunc")
+                for t in pl.range(T):
+                    if t < num_tokens:
+                        q_s0 = t * IDX_N_HEADS
+                        qr_hadamard_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
+                        score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
+                        qh_scale_s = pl.reshape(qr_hadamard_scale_dq[q_s0 : q_s0 + IDX_N_HEADS, :], [1, IDX_N_HEADS])
+                        score_tile_s = pl.cast(score_acc_s, target_type=pl.FP32, mode="none")
+                        score_tile_s = pl.col_expand_mul(pl.row_expand_mul(score_tile_s, kv_cache_scale_dq), qh_scale_s)
+                        relu_score_s = pl.maximum(score_tile_s, pl.mul(score_tile_s, 0.0))
+                        weighted_score_s = pl.reshape(pl.row_sum(pl.col_expand_mul(relu_score_s, weights[t : t + 1, :])), [1, CACHE_TILE])
+                        pos = pl.read(position_ids, [t])
+                        visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
+                        if visible_t > cache0:
+                            valid_len_t = pl.min(CACHE_TILE, visible_t - cache0)
+                        else:
+                            valid_len_t = 0
+                        weighted_valid_t = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len_t), pad_value=pl.PadValue.min)
+                        weighted_valid_t = pl.maximum(weighted_valid_t, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=FP32_NEG_INF))
+                        score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
@@ -318,7 +311,7 @@ def prefill_indexer(
             cmp_topk_indices[t : t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             if t < num_tokens:
                 pos = pl.read(position_ids, [t])
-                visible_t = (pos + 1) // COMPRESS_RATIO
+                visible_t = pl.min((pos + 1) // COMPRESS_RATIO, INDEXER_SCORE_CAP)
                 if visible_t > 0:
                     # Sort the wide score row and gather the top-k indices (#505^'s exact wide+aligned
                     # sort: 2048 width, mrgsort 64/256/1024, topk_pairs = 2*IDX_TOPK proper prefix).
@@ -424,13 +417,16 @@ def golden_prefill_indexer_core(tensors):
     ]
     kv_view = torch.stack(kv_rows, dim=0)  # [max_visible, dim]
 
-    # W8A8C16 int8 score: per-row int8 quant on q and kv, int matmul, dequant by both scales.
+    # W8A8C16 int8 score, matching decode_indexer: per-row quantize q and KV, INT32 matmul,
+    # then dequantize by both scales before the FP32 head-weighted reduce.
     q_i8, q_sc = _int8_quant_per_row(q.reshape(T * IDX_N_HEADS, IDX_HEAD_DIM))
     kv_i8, kv_sc = _int8_quant_per_row(kv_view)
     q_i8 = q_i8.view(T, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
     q_sc = q_sc.view(T, IDX_N_HEADS, 1)
-    score_i32 = torch.einsum("thd,cd->thc", q_i8, kv_i8.to(torch.int32))
-    score = score_i32.float() * q_sc * kv_sc.view(1, 1, max_visible)
+    kv_i8 = kv_i8.to(torch.int32)
+    kv_sc = kv_sc.view(1, 1, max_visible)
+    score_i32 = torch.einsum("thd,cd->thc", q_i8, kv_i8)
+    score = score_i32.float() * q_sc * kv_sc
     score = (torch.relu(score) * weights.unsqueeze(-1)).sum(dim=1)  # [T, max_visible]
 
     # Per-token causal mask, then top-k over the visible compressed positions (+ raw-index offset).
@@ -559,16 +555,11 @@ def build_tensor_specs(start_pos: int = START_POS):
     num_tokens = T
     if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")
-    # The score loop covers only PREFILL_COMPRESSED_LEN compressed slots, and the inner compressor
-    # only compresses the current T tokens (no historical compressed context). So only full prefill
-    # (max_visible <= PREFILL_COMPRESSED_LEN) is supported; a larger start_pos would score fewer
-    # slots than the golden gathers. Suffix-prefill is a separate follow-up -- fail loudly here.
     max_visible = (start_pos + T) // COMPRESS_RATIO
-    if max_visible > PREFILL_COMPRESSED_LEN:
+    if max_visible > INDEXER_SCORE_CAP:
         raise ValueError(
-            f"prefill_indexer supports only full prefill: the score loop covers "
-            f"PREFILL_COMPRESSED_LEN={PREFILL_COMPRESSED_LEN} compressed slots, but start_pos={start_pos} "
-            f"needs max_visible={max_visible}. Suffix-prefill (historical compressed context) is not yet supported."
+            f"prefill_indexer needs max_visible={max_visible} compressed slots for start_pos={start_pos}, "
+            f"but the standalone score cap is INDEXER_SCORE_CAP={INDEXER_SCORE_CAP}."
         )
     write_count = sum(1 for t in range(num_tokens) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
     if write_count > MAX_CMP_WRITES:
@@ -617,7 +608,16 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_inner_norm_w():
         return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
     def init_idx_kv_cache():
-        return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.bfloat16)
+        cache = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.bfloat16)
+        cache_flat = cache.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        completed = start_pos // COMPRESS_RATIO
+        for cmp_slot in range(completed):
+            row = idx_row(cmp_slot)
+            if row >= PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE:
+                raise ValueError("fixture historical compressed slot exceeds standalone idx_kv_cache capacity")
+            if row >= 0:
+                cache_flat[row] = ((torch.rand(IDX_HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return cache
     def init_idx_block_table():
         table = torch.full((IDX_CACHE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(IDX_CACHE_MAX_BLOCKS):
