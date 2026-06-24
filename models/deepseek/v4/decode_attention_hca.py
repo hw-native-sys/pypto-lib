@@ -129,15 +129,7 @@ def attention_hca(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post_t,
-        comb_t,
-    )
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -161,26 +153,16 @@ def attention_hca(
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
 
+    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
+    rms_norm(x_mixed, attn_norm_w, x_normed)
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)        # unused on HCA path
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = rms_norm(x_mixed, attn_norm_w, x_normed)
-    q = qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
+    qkv_proj_rope(
+        x_normed, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
     )
 
     x_normed_bsd = pl.reshape(x_normed, [B, S, D])
@@ -188,21 +170,12 @@ def attention_hca(
     position_ids_bsd = pl.reshape(position_ids, [B, S])
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    cmp_kv_proj = compressor_ratio128(
-        x_normed_bsd,
-        cmp_kv_proj,
-        compress_state,
-        compress_state_block_table,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        cmp_cos,
-        cmp_sin,
-        cmp_kv,
-        position_ids_bsd,
-        cmp_slot_mapping_bsd,
-        state_slot_mapping_bsd,
+    compressor_ratio128(
+        x_normed_bsd, cmp_kv_proj,
+        compress_state, compress_state_block_table,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_cos, cmp_sin, cmp_kv,
+        position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
     )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -279,13 +252,7 @@ def attention_hca(
             if write_row >= 0:
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_out = hc_post(
-        attn_out,
-        x_hc,
-        post_t,
-        comb_t,
-        x_out,
-    )
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -325,7 +292,7 @@ def attention_hca_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
-    x_out = attention_hca(
+    attention_hca(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,

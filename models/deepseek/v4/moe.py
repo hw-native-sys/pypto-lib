@@ -186,7 +186,7 @@ def moe(
         num_tokens, my_rank, moe_epoch,
     )
 
-    x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
@@ -233,7 +233,7 @@ def moe_test(
     # increasing MoE call id when they reuse the same done windows.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    x_next = moe(
+    moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -779,7 +779,7 @@ def moe_ep1(
     ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     combine_ep1(recv_y, recv_token, recv_count, sh, ffn_out)
 
-    x_next = hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 

@@ -453,7 +453,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    attn_out = sparse_attn_swa(
+    sparse_attn_swa(
         q,
         ori_kv,
         ori_block_table,

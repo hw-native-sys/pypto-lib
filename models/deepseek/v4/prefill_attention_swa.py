@@ -124,18 +124,10 @@ def prefill_attention_swa(
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post,
-        comb,
-    )
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = rms_norm(x_mixed, attn_norm_w, x_normed)
+    rms_norm(x_mixed, attn_norm_w, x_normed)
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -153,45 +145,25 @@ def prefill_attention_swa(
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
+    qkv_proj_rope(
+        x_normed, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
     )
 
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
         for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
             pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
-    attn_out = prefill_sparse_attn(
-        q,
-        kv_cache,
-        block_table,
-        kv,
-        cmp_kv_dummy,
-        cmp_block_table_dummy,
-        cmp_sparse_indices,
-        cmp_sparse_lens,
-        attn_sink,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    prefill_sparse_attn(
+        q, kv_cache, block_table, kv,
+        cmp_kv_dummy, cmp_block_table_dummy,
+        cmp_sparse_indices, cmp_sparse_lens,
+        attn_sink, num_tokens,
+        rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
     # history (the current tokens reach attention via the `kv` overlay).
@@ -208,13 +180,7 @@ def prefill_attention_swa(
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
 
-    x_out = hc_post(
-        attn_out,
-        x_hc,
-        post,
-        comb,
-        x_out,
-    )
+    hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, x_out
 
 
@@ -246,32 +212,15 @@ def prefill_attention_swa_test(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    kv_cache, x_out = prefill_attention_swa(
+    prefill_attention_swa(
         x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        freqs_cos,
-        freqs_sin,
-        kv_cache,
-        block_table,
-        ori_slot_mapping,
-        cmp_sparse_indices,
-        cmp_sparse_lens,
-        position_ids,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        x_out,
-        num_tokens,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        kv_cache, block_table, ori_slot_mapping,
+        cmp_sparse_indices, cmp_sparse_lens, position_ids,
+        attn_sink, wo_a, wo_b, wo_b_scale,
+        x_out, num_tokens,
     )
     return kv_cache, x_out
 

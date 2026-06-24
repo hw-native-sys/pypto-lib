@@ -173,15 +173,7 @@ def attention_csa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post_t,
-        comb_t,
-    )
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -213,26 +205,16 @@ def attention_csa(
             cmp_cos = pl.assemble(cmp_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
             cmp_sin = pl.assemble(cmp_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
 
+    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
+    rms_norm(x_mixed, attn_norm_w, x_normed_t)
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed_t = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    q = qkv_proj_rope(
-        x_normed_t,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
+    qkv_proj_rope(
+        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
     )
 
     x_normed = pl.reshape(x_normed_t, [B, S, D])
@@ -242,52 +224,26 @@ def attention_csa(
     idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
-    cmp_out = compressor_ratio4(
-        x_normed,
-        cmp_out,
-        compress_state,
-        compress_state_block_table,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        cmp_cos,
-        cmp_sin,
-        cmp_kv,
-        position_ids_bsd,
-        cmp_slot_mapping_bsd,
-        state_slot_mapping_bsd,
+    compressor_ratio4(
+        x_normed, cmp_out,
+        compress_state, compress_state_block_table,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_cos, cmp_sin, cmp_kv,
+        position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
     )
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    idx_score_unused, idx_topk_full = indexer(
-        x_normed,
-        qr,
-        qr_scale,
-        idx_wq_b,
-        idx_wq_b_scale,
-        weights_proj,
-        step_cos,
-        step_sin,
-        hadamard_idx,
-        idx_kv_unused,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_block_table,
-        idx_score_unused,
-        idx_topk_full,
-        position_ids_bsd,
-        idx_slot_mapping_bsd,
-        inner_state_slot_mapping_bsd,
-        kv_seq_lens,
-        WIN + S,
+    indexer(
+        x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
+        weights_proj, step_cos, step_sin, hadamard_idx,
+        idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        idx_kv_cache, idx_block_table,
+        idx_score_unused, idx_topk_full,
+        position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
+        kv_seq_lens, WIN + S,
     )
 
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
@@ -342,21 +298,11 @@ def attention_csa(
                         pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = sparse_attn(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_indices,
-        attn_sink,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    sparse_attn(
+        q, kv_cache, ori_block_table, kv,
+        cmp_kv, cmp_block_table, cmp_sparse_indices,
+        attn_sink, rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
 
     # Commit current MTP tokens only after sparse_attn has gathered the old cache
@@ -374,7 +320,7 @@ def attention_csa(
                 kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(pl.add(write_kv_head, write_zero), target_type=pl.BF16)
                 kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
-    x_out = hc_post(attn_out, x_hc, post_t, comb_t, x_out)
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -428,53 +374,22 @@ def attention_csa_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
-    x_out = attention_csa(
+    attention_csa(
         x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        freqs_cos,
-        freqs_sin,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        compress_state,
-        compress_state_block_table,
-        idx_wq_b,
-        idx_wq_b_scale,
-        weights_proj,
-        hadamard_idx,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        kv_cache,
-        ori_block_table,
-        cmp_kv,
-        cmp_block_table,
-        idx_kv_cache,
-        idx_block_table,
-        ori_slot_mapping,
-        cmp_slot_mapping,
-        idx_slot_mapping,
-        state_slot_mapping,
-        inner_state_slot_mapping,
-        position_ids,
-        kv_seq_lens,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        compress_state, compress_state_block_table,
+        idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        inner_compress_state, inner_compress_state_block_table,
+        kv_cache, ori_block_table, cmp_kv, cmp_block_table,
+        idx_kv_cache, idx_block_table,
+        ori_slot_mapping, cmp_slot_mapping, idx_slot_mapping,
+        state_slot_mapping, inner_state_slot_mapping,
+        position_ids, kv_seq_lens,
+        attn_sink, wo_a, wo_b, wo_b_scale,
         x_out,
     )
     return x_out

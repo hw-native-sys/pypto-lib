@@ -409,7 +409,7 @@ def qkv_proj_rope_test(
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
 
-    q = qkv_proj_rope(
+    qkv_proj_rope(
         x,
         wq_a,
         wq_b,

@@ -75,7 +75,7 @@ def hc_post_test(
     comb.bind_dynamic(0, T_DYN)
     y.bind_dynamic(0, T_DYN)
 
-    y = hc_post(x, residual, post, comb, y)
+    hc_post(x, residual, post, comb, y)
     return y
 
 

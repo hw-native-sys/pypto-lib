@@ -99,15 +99,7 @@ def attention_swa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_t = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post_t,
-        comb_t,
-    )
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -121,26 +113,16 @@ def attention_swa(
                 rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16, mode="rint"), [t, 0])
                 rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16, mode="rint"), [t, 0])
 
+    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
+    rms_norm(x_mixed, attn_norm_w, x_normed_t)
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed_t = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    q = qkv_proj_rope(
-        x_normed_t,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
+    qkv_proj_rope(
+        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
     )
 
     sparse_topk = pl.create_tensor([T, WIN], dtype=pl.INT32)
@@ -206,13 +188,7 @@ def attention_swa(
             if write_row >= 0:
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_out = hc_post(
-        attn_out,
-        x_hc,
-        post_t,
-        comb_t,
-        x_out,
-    )
+    hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
 
 
@@ -249,7 +225,7 @@ def attention_swa_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
 ):
-    x_out = attention_swa(
+    attention_swa(
         x_hc,
         hc_attn_fn, hc_attn_scale, hc_attn_base,
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv,

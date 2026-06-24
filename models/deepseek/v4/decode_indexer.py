@@ -192,22 +192,12 @@ def indexer(
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
-    inner_kv = indexer_compressor(
-        x,
-        inner_kv,
-        inner_compress_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        cos,
-        sin,
-        hadamard,
-        idx_kv_cache,
-        position_ids,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
+    indexer_compressor(
+        x, inner_kv,
+        inner_compress_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        cos, sin, hadamard, idx_kv_cache,
+        position_ids, idx_slot_mapping, inner_state_slot_mapping,
     )
 
     kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
@@ -321,7 +311,7 @@ def indexer_test(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
-    score, topk_idxs = indexer(
+    indexer(
         x,
         qr,
         qr_scale,

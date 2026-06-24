@@ -394,7 +394,7 @@ def prefill_indexer_compressor_test(
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
-    idx_kv_cache, kv_state, score_state = prefill_indexer_compressor(
+    prefill_indexer_compressor(
         x, kv_state, score_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,

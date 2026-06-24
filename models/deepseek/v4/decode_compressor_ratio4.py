@@ -251,7 +251,7 @@ def compressor_test(
     cmp_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
-    kv = compressor_ratio4(
+    compressor_ratio4(
         x,
         kv,
         compress_state,

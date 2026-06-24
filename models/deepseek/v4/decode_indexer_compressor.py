@@ -258,7 +258,7 @@ def compressor_test(
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
-    kv = indexer_compressor(
+    indexer_compressor(
         x,
         kv,
         compress_state,

@@ -166,23 +166,11 @@ def prefill_attention_csa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    x_mixed = hc_pre(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        x_mixed,
-        post,
-        comb,
-    )
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_normed = rms_norm(x_mixed, attn_norm_w, x_normed)
+    rms_norm(x_mixed, attn_norm_w, x_normed)
 
-    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     materialize_rope_rows(
@@ -193,38 +181,21 @@ def prefill_attention_csa(
         rope_cos_t,
         rope_sin_t,
     )
-    q = qkv_proj_rope(
-        x_normed,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        rope_cos_t,
-        rope_sin_t,
-        gamma_cq,
-        gamma_ckv,
-        q,
-        kv,
-        qr,
-        qr_scale,
+    q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    qkv_proj_rope(
+        x_normed, wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
     )
 
-    cmp_kv, cmp_kv_state, cmp_score_state = prefill_compressor_ratio4(
-        x_normed,
-        cmp_kv_state,
-        cmp_score_state,
-        compress_state_block_table,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        freqs_cos,
-        freqs_sin,
-        cmp_kv,
-        position_ids,
-        num_tokens,
-        cmp_slot_mapping,
-        state_slot_mapping,
+    prefill_compressor_ratio4(
+        x_normed, cmp_kv_state, cmp_score_state, compress_state_block_table,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        freqs_cos, freqs_sin, cmp_kv,
+        position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
     )
     # Half-width FP32 cos/sin rows for the indexer Q-RoPE: gather freqs at each token's position
     # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
@@ -238,38 +209,20 @@ def prefill_attention_csa(
 
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    idx_kv_cache, idx_score_unused, cmp_topk_indices = prefill_indexer(
-        x_normed,
-        qr,
-        qr_scale,
-        idx_wq_b,
-        idx_wq_b_scale,
-        idx_weights_proj,
-        idx_cos,
-        idx_sin,
-        freqs_cos,
-        freqs_sin,
-        hadamard_idx,
-        inner_kv_state,
-        inner_score_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_block_table,
-        idx_score_unused,
-        cmp_topk_indices,
-        position_ids,
-        num_tokens,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
+    prefill_indexer(
+        x_normed, qr, qr_scale,
+        idx_wq_b, idx_wq_b_scale, idx_weights_proj,
+        idx_cos, idx_sin, freqs_cos, freqs_sin, hadamard_idx,
+        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        idx_kv_cache, idx_block_table,
+        idx_score_unused, cmp_topk_indices,
+        position_ids, num_tokens,
+        idx_slot_mapping, inner_state_slot_mapping,
     )
 
     # Assemble the packed sparse-index rows (window ring + overlay + compressed
     # slots) inline; padding rows stay all -1 via the pl.full row template.
-    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     # Rows are fully -1 padded below, so expose the whole width to the shared kernel
     # via a constant lens == SPARSE_TOPK (the kernel's per-slot >= 0 check does the
     # masking). Build it through assemble (SSA-tracked) so the gather's read is ordered
@@ -281,6 +234,7 @@ def prefill_attention_csa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_sparse_lens"):
         cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
     cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
+    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
@@ -321,23 +275,13 @@ def prefill_attention_csa(
     # prefill_sparse_attn where lens == 0 means no valid sparse indices.
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    attn_out = prefill_sparse_attn(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        cmp_sparse_work,
-        cmp_sparse_lens,
-        attn_sink,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+    prefill_sparse_attn(
+        q, kv_cache, ori_block_table, kv,
+        cmp_kv, cmp_block_table,
+        cmp_sparse_work, cmp_sparse_lens,
+        attn_sink, num_tokens,
+        rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
     # history (the current tokens reach attention via the `kv` overlay).
@@ -354,7 +298,7 @@ def prefill_attention_csa(
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
 
-    x_out = hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
 
 
@@ -410,65 +354,22 @@ def prefill_attention_csa_test(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    (
-        kv_cache,
-        cmp_kv,
-        cmp_kv_state,
-        cmp_score_state,
-        idx_kv_cache,
-        inner_kv_state,
-        inner_score_state,
-        x_out,
-    ) = prefill_attention_csa(
+    prefill_attention_csa(
         x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        freqs_cos,
-        freqs_sin,
-        cmp_wkv,
-        cmp_wgate,
-        cmp_ape,
-        cmp_norm_w,
-        cmp_kv_state,
-        cmp_score_state,
-        compress_state_block_table,
-        hadamard_idx,
-        idx_wq_b,
-        idx_wq_b_scale,
-        idx_weights_proj,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        inner_kv_state,
-        inner_score_state,
-        inner_compress_state_block_table,
-        kv_cache,
-        ori_block_table,
-        ori_slot_mapping,
-        cmp_kv,
-        cmp_block_table,
-        idx_kv_cache,
-        idx_block_table,
-        position_ids,
-        cmp_slot_mapping,
-        idx_slot_mapping,
-        state_slot_mapping,
-        inner_state_slot_mapping,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        x_out,
-        num_tokens,
+        hc_attn_fn, hc_attn_scale, hc_attn_base,
+        attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+        freqs_cos, freqs_sin,
+        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+        cmp_kv_state, cmp_score_state, compress_state_block_table,
+        hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        kv_cache, ori_block_table, ori_slot_mapping,
+        cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
+        position_ids, cmp_slot_mapping, idx_slot_mapping,
+        state_slot_mapping, inner_state_slot_mapping,
+        attn_sink, wo_a, wo_b, wo_b_scale,
+        x_out, num_tokens,
     )
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
 

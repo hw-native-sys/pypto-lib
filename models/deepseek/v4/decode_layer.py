@@ -237,7 +237,7 @@ def decode_layer(
             x_attn,
         )
 
-    x_next = moe(
+    moe(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,

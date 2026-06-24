@@ -210,24 +210,14 @@ def prefill_indexer(
         weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
 
     # === inner compressor: build the paged compressed index KV cache ===
-    idx_kv_cache, inner_kv_state, inner_score_state = prefill_indexer_compressor(
+    prefill_indexer_compressor(
         x,
-        inner_kv_state,
-        inner_score_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        freqs_cos,
-        freqs_sin,
-        hadamard,
-        idx_kv_cache,
-        idx_block_table,
-        position_ids,
-        num_tokens,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
+        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        freqs_cos, freqs_sin, hadamard,
+        idx_kv_cache, idx_block_table,
+        position_ids, num_tokens,
+        idx_slot_mapping, inner_state_slot_mapping,
     )
 
     # === score: lean W8A8C16 scoring over the packed paged cache, in three sequential CORE_GROUP
@@ -237,7 +227,6 @@ def prefill_indexer(
     # (splitting them across separate loops races on the scratch and 507018-faults). Only
     # PREFILL_CACHE_BLOCKS blocks are scored; the rest of the SORT_LEN-wide sort scratch stays -inf. ===
     kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
-    score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
     score_wide = pl.create_tensor([T, SORT_LEN], dtype=pl.FP32)                                  # wide sort scratch
     score_kv_scale = pl.create_tensor([PREFILL_CACHE_BLOCKS * CACHE_TILE, 1], dtype=pl.FP32)     # per-key dequant scale
     kv_tile_i8_g = pl.create_tensor([PREFILL_CACHE_BLOCKS * CACHE_TILE, IDX_HEAD_DIM], dtype=pl.INT8)
@@ -307,6 +296,7 @@ def prefill_indexer(
                     score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
+    score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
         score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
 
@@ -486,33 +476,15 @@ def prefill_indexer_test(
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_kv_cache_out, score_out, cmp_topk_indices = prefill_indexer(
-        x,
-        qr,
-        qr_scale,
-        wq_b,
-        wq_b_scale,
-        weights_proj,
-        cos,
-        sin,
-        freqs_cos,
-        freqs_sin,
-        hadamard,
-        inner_kv_state,
-        inner_score_state,
-        inner_compress_state_block_table,
-        inner_wkv,
-        inner_wgate,
-        inner_ape,
-        inner_norm_w,
-        idx_kv_cache,
-        idx_block_table,
-        score,
-        cmp_topk_indices,
-        position_ids,
-        num_tokens,
-        idx_slot_mapping,
-        inner_state_slot_mapping,
+    prefill_indexer(
+        x, qr, qr_scale, wq_b, wq_b_scale, weights_proj,
+        cos, sin, freqs_cos, freqs_sin, hadamard,
+        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
+        idx_kv_cache, idx_block_table,
+        score, cmp_topk_indices,
+        position_ids, num_tokens,
+        idx_slot_mapping, inner_state_slot_mapping,
     )
     # Expose the kernel's topk (first INDEXER_SCORE_CAP cols of cmp_topk_indices) as topk_idxs.
     for tb in pl.spmd(T // TOPK_TILE, name_hint="prefill_idx_topk_copy"):
@@ -520,7 +492,7 @@ def prefill_indexer_test(
         for ti in pl.range(TOPK_TILE):
             t = t0 + ti
             topk_idxs[t : t + 1, 0:INDEXER_SCORE_CAP] = cmp_topk_indices[t : t + 1, 0:INDEXER_SCORE_CAP]
-    return score_out, idx_kv_cache_out, topk_idxs
+    return score, idx_kv_cache, topk_idxs
 
 
 def gen_shared_weight(shape, dequant_std, chan_cv):

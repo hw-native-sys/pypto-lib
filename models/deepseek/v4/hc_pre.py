@@ -95,7 +95,7 @@ def hc_pre(
     # the part that needs pypto#1761.
     mixes_gm = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
 
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_1spmd"):
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="hc_pre"):
         t0 = ob * T_TILE
 
         # --- linear: RMS norm + hc_fn projection -> mixes_gm[t0] ---
@@ -256,7 +256,7 @@ def hc_pre_test(
     post.bind_dynamic(0, T_DYN)
     comb.bind_dynamic(0, T_DYN)
 
-    x_mixed = hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+    hc_pre(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
     return x_mixed
 
 

@@ -271,7 +271,7 @@ def compressor_test(
     state_slot_mapping.bind_dynamic(0, B_DYN)
     state_slot_mapping.bind_dynamic(1, S_DYN)
 
-    kv = compressor_ratio128(
+    compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, cos, sin,
         cmp_kv_cache, position_ids, cmp_slot_mapping, state_slot_mapping,
     )

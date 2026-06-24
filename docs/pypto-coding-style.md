@@ -701,3 +701,33 @@ x_i8 = pl.cast(pl.mul(x, inv_scale), pl.INT8, mode="rint")
 # pad to 32: ptoas rejects cube tiles whose cols aren't a multiple of 16
 w_pad = pl.slice(w, [K, 32], [0, 0], valid_shape=[K, MIX_HC])
 ```
+
+### Declare allocations and views near their first use
+
+Place `pl.create_tensor` and `pl.reshape` calls **immediately before the
+first `pl.spmd` / `pl.parallel` / `pl.range` / `pl.at` block that
+consumes the result** — do not hoist them to the top of a function or let
+them drift far from the consuming loop. Co-locating an allocation with its
+consumer makes the data-flow between orchestration and InCore easy to
+trace without scrolling.
+
+```python
+# ❌ hoisted far from first use
+kv_proj = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+score_proj = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+kv_flat = pl.reshape(kv, [T, HEAD_DIM])
+...                          # many lines of unrelated code
+for idx in pl.spmd(T * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"):
+    kv_proj[...] = ...
+
+# ✅ declared right above the consuming loop
+kv_proj = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+score_proj = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+kv_flat = pl.reshape(kv, [T, HEAD_DIM])
+for idx in pl.spmd(T * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"):
+    kv_proj[...] = ...
+```
+
+The same principle applies to inner-loop scratch tensors: allocate inside
+the loop body (or directly above the inner `pl.at`) rather than at the
+top of the outer loop.
