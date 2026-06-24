@@ -1634,6 +1634,8 @@ if __name__ == "__main__":
                              "-> logits) against a host chain reference, instead of the default "
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
+    parser.add_argument("--no-lm-head", action="store_true", default=False,
+                        help="under --validate-fwd: decode_fwd_layers (NO lm_head) layer-only swimlane")
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs + golden for replay (off: large fixtures)")
     args = parser.parse_args()
@@ -1734,6 +1736,12 @@ if __name__ == "__main__":
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
         ]
+        if args.no_lm_head:  # measurement-only: layer-only swimlane (no VOCAB lm_head)
+            _CHUNK_NLAYERS = N
+            nolm_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+            decode_fwd_layers(*stacked[:len(INPUT_NAMES)], nolm_out, config=run_cfg)
+            print(f"[stacked-fwd {N}L no-LMhead] swimlane perf run complete")
+            raise SystemExit(0)
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
         decode_fwd(*stacked, logits, config=run_cfg)
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
