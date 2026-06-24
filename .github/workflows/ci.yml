@@ -124,7 +124,7 @@ jobs:
       # clashes between the concurrent cpu-1..4 runners.
       options: >-
         --shm-size=128g
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip:/root/.cache/pip
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-sim:/root/.cache/pip
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
 
@@ -269,7 +269,10 @@ jobs:
       # Shared with the container-side sim job (root) via the same ci-cache dir;
       # 000 keeps cache files mutually writable across root and ci-runner.
       CCACHE_UMASK: '000'
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip
+      # Per-job pip dir: unlike ccache, pip has no shared-umask knob, so a shared
+      # pip cache would leave files owned by whichever job wrote first and block
+      # the other. The sim job uses ci-cache/pip-sim (see its bind mount).
+      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-a2a3
 
     steps:
       - name: Checkout pypto-lib
