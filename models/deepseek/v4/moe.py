@@ -11,6 +11,7 @@
 size: 1 runs single-card (in-card scatter), 2/4/8 run N-rank distributed; each
 rank keeps 32 experts."""
 
+#TEST
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
 # time, so read --ep from argv and override config before importing them below.
