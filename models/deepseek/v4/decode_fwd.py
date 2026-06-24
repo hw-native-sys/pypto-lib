@@ -78,7 +78,8 @@ MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 15
 CSA_NUM_LAYERS = 7
 HCA_NUM_LAYERS = 6
-CSA_LAST_LAYER = CSA_NUM_LAYERS - 1
+# FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
+FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
@@ -632,7 +633,9 @@ def decode_fwd(
             routed_y_buf, combine_done,
             hca_layer, pl.const(T, pl.INT32), my_rank, hca_moe_epoch,
         )
-    csa_layer_last: pl.Scalar[pl.INT32] = pl.const(CSA_LAST_LAYER, pl.INT32)
+    # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
+    # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
+    csa_layer_last: pl.Scalar[pl.INT32] = pl.const(FWD_LAST_LAYER, pl.INT32)
     last_moe_epoch: pl.Scalar[pl.INT32] = pl.const(2, pl.INT32) * HCA_NUM_LAYERS + 3
     x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     x_next: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
