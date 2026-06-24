@@ -11,6 +11,23 @@
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
+import pypto.language as pl
+
+USER_BATCH_DYN = pl.dynamic("USER_BATCH_DYN")
+PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
+PREFILL_ORI_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_ORI_BLOCK_TABLE_DYN")
+PREFILL_CMP_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_CMP_BLOCK_TABLE_DYN")
+PREFILL_IDX_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_IDX_BLOCK_TABLE_DYN")
+PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_ORI_CACHE_BLOCKS_DYN")
+PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_CMP_CACHE_BLOCKS_DYN")
+PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("PREFILL_IDX_CACHE_BLOCKS_DYN")
+PREFILL_HCA_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCKS_DYN")
+PREFILL_CSA_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCKS_DYN")
+PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCKS_DYN")
+PREFILL_HCA_STATE_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_TABLE_DYN")
+PREFILL_CSA_STATE_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_TABLE_DYN")
+PREFILL_INNER_STATE_BLOCK_TABLE_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_TABLE_DYN")
+
 
 @dataclass(frozen=True)
 class DeepSeekV4Config:
@@ -242,8 +259,13 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 DECODE_BATCH = 64                 # B: tokens per decode step
 DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
-PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
-PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
+PREFILL_BATCH = 2                 # request count for packed prefill fixtures
+PREFILL_SEQ = 256                 # per-request prefill sequence length/upper bound
+PREFILL_CHUNK_BATCH = 1           # one request per static child-kernel chunk
+PREFILL_CHUNK_SEQ = 128           # fixed chunk size consumed by attention/MoE
+PREFILL_CHUNK_TOKENS = PREFILL_CHUNK_BATCH * PREFILL_CHUNK_SEQ
+PREFILL_TOTAL_CAPACITY = PREFILL_BATCH * PREFILL_SEQ
+assert PREFILL_CHUNK_TOKENS == DECODE_TOKENS
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size

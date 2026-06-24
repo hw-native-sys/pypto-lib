@@ -21,8 +21,8 @@ from config import (
     BLOCK_SIZE,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
-    PREFILL_BATCH,
-    PREFILL_SEQ,
+    PREFILL_CHUNK_BATCH,
+    PREFILL_CHUNK_SEQ,
 )
 
 from prefill_compressor_ratio4 import (
@@ -55,8 +55,8 @@ from prefill_sparse_attn import (
     prefill_sparse_attn,
 )
 
-B = PREFILL_BATCH
-S = PREFILL_SEQ
+B = PREFILL_CHUNK_BATCH
+S = PREFILL_CHUNK_SEQ
 T = B * S
 D = M.hidden_size
 H = M.num_attention_heads

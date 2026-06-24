@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -34,8 +34,8 @@ PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_w
 IDX_CACHE_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 PREFILL_IDX_BLOCK_NUM = IDX_CACHE_MAX_BLOCKS
 
-B = 1
-S = 128
+B = PREFILL_CHUNK_BATCH
+S = PREFILL_CHUNK_SEQ
 START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 PREFILL_ROWS = B * PREFILL_COMPRESSED_LEN

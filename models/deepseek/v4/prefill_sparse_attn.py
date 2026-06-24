@@ -15,11 +15,11 @@ is the usable prefix length; --compress-ratio {0,4,128} is a standalone fixture 
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from config import BLOCK_SIZE, FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 
 # Prefill target shape. T is fixed at 128.
-B = PREFILL_BATCH
-S = PREFILL_SEQ
+B = PREFILL_CHUNK_BATCH
+S = PREFILL_CHUNK_SEQ
 T = B * S
 
 # Model config.

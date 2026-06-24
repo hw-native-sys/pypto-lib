@@ -16,7 +16,7 @@ window-ring sparse indices.
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
@@ -29,8 +29,8 @@ from prefill_sparse_attn import (
 
 
 # model config
-B = PREFILL_BATCH
-S = PREFILL_SEQ
+B = PREFILL_CHUNK_BATCH
+S = PREFILL_CHUNK_SEQ
 T = B * S
 EPS = M.rms_norm_eps
 D = M.hidden_size

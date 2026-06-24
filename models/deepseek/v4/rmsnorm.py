@@ -11,7 +11,7 @@ activations for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ, PREFILL_CHUNK_TOKENS
 
 
 # Dynamic shape variables.
@@ -27,7 +27,7 @@ D_TILE = 128
 T_TILE = 8
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
-assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert PREFILL_CHUNK_TOKENS % T_TILE == 0
 
 
 @pl.jit.inline
@@ -111,7 +111,7 @@ if __name__ == "__main__":
 
     MODES = {
         "decode":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+        "prefill": (PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ),
     }
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 attention RMSNorm validation.")

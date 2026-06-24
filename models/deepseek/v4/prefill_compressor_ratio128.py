@@ -15,11 +15,11 @@ tokens.
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, PREFILL_BATCH, PREFILL_SEQ
+from config import BLOCK_SIZE, FLASH as M, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 
 
-B = PREFILL_BATCH
-S = PREFILL_SEQ
+B = PREFILL_CHUNK_BATCH
+S = PREFILL_CHUNK_SEQ
 T = B * S
 EPS = M.rms_norm_eps
 D = M.hidden_size
