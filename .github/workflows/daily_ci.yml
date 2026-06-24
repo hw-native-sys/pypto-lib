@@ -22,7 +22,7 @@ jobs:
       PTOAS_VERSION: v0.45
       PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: 1ba8f54b950d296826d63d75f5dd79e20c495eae
+      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -175,7 +175,7 @@ jobs:
       PTOAS_VERSION: v0.45
       PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      PTO_ISA_COMMIT: 1ba8f54b950d296826d63d75f5dd79e20c495eae
+      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
