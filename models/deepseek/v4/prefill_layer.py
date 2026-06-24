@@ -93,8 +93,8 @@ assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block siz
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
-@pl.jit
-def prefill_layer(
+@pl.jit.inline
+def prefill_layer_core(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -192,6 +192,7 @@ def prefill_layer(
     num_tokens: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     if layer_id < 2:
@@ -247,7 +248,7 @@ def prefill_layer(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        layer_id, num_tokens, my_rank, pl.const(1, pl.INT32),
+        layer_id, num_tokens, my_rank, moe_epoch,
     )
     return x_next
 
@@ -362,7 +363,7 @@ def l3_prefill_layer(
         recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        prefill_layer(
+        prefill_layer_core(
             x_hc[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
@@ -395,7 +396,7 @@ def l3_prefill_layer(
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
-            num_tokens, layer_id, rank,
+            num_tokens, layer_id, rank, pl.const(1, pl.INT32),
             device=rank,
         )
 
