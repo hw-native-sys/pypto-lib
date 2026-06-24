@@ -27,7 +27,11 @@ jobs:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
       CCACHE_DIR: /root/.cache/ccache
-      CCACHE_MAXSIZE: 5G
+      CCACHE_MAXSIZE: 30G
+      # Shared with the host-side a2a3 job (ci-runner) via the ci-cache mount;
+      # 000 keeps every cache file group/world-writable so root (this container)
+      # and ci-runner can both update and LRU-evict each other's entries.
+      CCACHE_UMASK: '000'
       PIP_CACHE_DIR: /root/.cache/pip
     container:
       image: localhost:5001/ci-py310:latest
@@ -47,6 +51,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
+      # stale objects compiled against the old ISA headers (see issue #1139):
+      # a different commit hashes to a different key, forcing a real recompile.
+      - name: Scope ccache to pto-isa version
+        run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
 
       - name: Show ccache stats (before)
         run: ccache -s || true
@@ -179,9 +189,12 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/.cache/ccache
-      CCACHE_MAXSIZE: 5G
-      PIP_CACHE_DIR: /home/ci-runner/.cache/pip
+      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache
+      CCACHE_MAXSIZE: 30G
+      # Shared with the container-side sim job (root) via the same ci-cache dir;
+      # 000 keeps cache files mutually writable across root and ci-runner.
+      CCACHE_UMASK: '000'
+      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip
 
     steps:
       - name: Checkout pypto-lib
@@ -193,6 +206,11 @@ jobs:
       - name: Check NPU
         working-directory: .
         run: npu-smi info
+
+      # See the sim job: namespace the cache by pto-isa commit so an ISA bump
+      # forces a real recompile instead of reusing stale objects (issue #1139).
+      - name: Scope ccache to pto-isa version
+        run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
 
       - name: Clone pto-isa repository (pinned)
         run: |
