@@ -55,8 +55,6 @@ B = 1
 S = 128
 T = B * S
 START_POS = 0
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
-PREFILL_CACHE_BLOCKS = max(1, (PREFILL_COMPRESSED_LEN + CACHE_TILE - 1) // CACHE_TILE)
 TOPK_TILE = 16
 assert T % TOPK_TILE == 0
 INDEXER_SCORE_CAP = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
@@ -254,23 +252,14 @@ def prefill_indexer(
             if max_visible > cache0:
                 idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
                 kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
+                # Full-128 amax over the head dim, unrolled (HEAD_DIM_TILE chunks) so the cast chain
+                # stays inside the runtime `if` without a device-side loop.
                 kv_amax = pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                kv_a_tile0 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 0:HEAD_DIM_TILE]
-                kv_a_f320 = pl.cast(kv_a_tile0, target_type=pl.FP32)
-                kv_a_abs0 = pl.maximum(kv_a_f320, pl.neg(kv_a_f320))
-                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs0), [1, CACHE_TILE]))
-                kv_a_tile1 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, HEAD_DIM_TILE : 2 * HEAD_DIM_TILE]
-                kv_a_f321 = pl.cast(kv_a_tile1, target_type=pl.FP32)
-                kv_a_abs1 = pl.maximum(kv_a_f321, pl.neg(kv_a_f321))
-                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs1), [1, CACHE_TILE]))
-                kv_a_tile2 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 2 * HEAD_DIM_TILE : 3 * HEAD_DIM_TILE]
-                kv_a_f322 = pl.cast(kv_a_tile2, target_type=pl.FP32)
-                kv_a_abs2 = pl.maximum(kv_a_f322, pl.neg(kv_a_f322))
-                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs2), [1, CACHE_TILE]))
-                kv_a_tile3 = kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, 3 * HEAD_DIM_TILE : IDX_HEAD_DIM]
-                kv_a_f323 = pl.cast(kv_a_tile3, target_type=pl.FP32)
-                kv_a_abs3 = pl.maximum(kv_a_f323, pl.neg(kv_a_f323))
-                kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs3), [1, CACHE_TILE]))
+                for hc in pl.unroll(IDX_HEAD_DIM // HEAD_DIM_TILE):
+                    h0 = hc * HEAD_DIM_TILE
+                    kv_a_f32 = pl.cast(kv_cache_flat[kv_row0 : kv_row0 + CACHE_TILE, h0 : h0 + HEAD_DIM_TILE], target_type=pl.FP32)
+                    kv_a_abs = pl.maximum(kv_a_f32, pl.neg(kv_a_f32))
+                    kv_amax = pl.maximum(kv_amax, pl.reshape(pl.row_max(kv_a_abs), [1, CACHE_TILE]))
                 kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
                 kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
                 kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])

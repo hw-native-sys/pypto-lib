@@ -1132,11 +1132,14 @@ if __name__ == "__main__":
     compare_tokens = args.num_tokens
     x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1)
     if args.start_pos:
-        # Suffix prefill exercises historical ring-cache rows in addition to current overlay and
-        # compressed-cache rows. The fused sparse-attn + INT8 output path stays close globally but
-        # has more BF16 per-element drift than the full-prefill fixture; keep this stricter than the
-        # end-to-end prefill-layer bar while avoiding a false failure on benign one-ULP tails.
-        x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=1e-2, pct_thd=0.01, max_diff_hd=3)
+        # Suffix attends WIN + up-to-INDEXER_SCORE_CAP compressed rows. The sparse-attn PV matmul
+        # casts the softmax probabilities to BF16 (prefill_sparse_attn), so accumulating over more
+        # rows adds ~1 extra BF16 ULP of x_out drift vs full prefill -- the bad points cluster at
+        # ~2 BF16 ULP. Measured at start_pos=896 (the 8-block worst case) the bad fraction is only
+        # 0.058% at diff_thd=8e-3 (vs 0.5% at 1/128). So bump the per-point bar to 8e-3 (== kv_cache
+        # rtol = 2 BF16 ULP) and the single-point cap to 2 (worst rdiff 1.37, from benign near-zero
+        # elements), but keep the 0.5% fraction bar identical to full prefill.
+        x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=8e-3, pct_thd=0.005, max_diff_hd=2)
 
     result = run_jit(
         fn=prefill_attention_csa_test,
