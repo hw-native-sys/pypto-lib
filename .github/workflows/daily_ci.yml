@@ -1,9 +1,22 @@
 name: Daily CI
 
+# on:
+#   schedule:
+#     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
+#   workflow_dispatch:
+
 on:
   schedule:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   model-tests-sim:
