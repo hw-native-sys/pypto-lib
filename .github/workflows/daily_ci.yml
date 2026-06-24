@@ -353,14 +353,14 @@ jobs:
                 echo "::endgroup::"
                 return
               fi
-              ( export PTO2_RING_DEP_POOL=1048576 \
-                       PTO2_RING_TASK_WINDOW=1048576 \
-                       PTO2_RING_HEAP=4294967296
+              ( export PTO2_RING_DEP_POOL=131072 \
+                       PTO2_RING_TASK_WINDOW=131072 \
+                       PTO2_RING_HEAP=1073741824
                 timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" )
             else
-              ( export PTO2_RING_DEP_POOL=1048576 \
-                       PTO2_RING_TASK_WINDOW=1048576 \
-                       PTO2_RING_HEAP=4294967296
+              ( export PTO2_RING_DEP_POOL=131072 \
+                       PTO2_RING_TASK_WINDOW=131072 \
+                       PTO2_RING_HEAP=1073741824
                 timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" )
             fi
             if [ $? -ne 0 ]; then

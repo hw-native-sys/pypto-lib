@@ -14,6 +14,7 @@ import argparse
 import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run_jit
+from hc_head import hc_head
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from decode_layer import (
@@ -75,9 +76,9 @@ from decode_layer import (
 )
 
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 15
-CSA_NUM_LAYERS = 7
-HCA_NUM_LAYERS = 6
+FWD_NUM_LAYERS = 43
+CSA_NUM_LAYERS = 21
+HCA_NUM_LAYERS = 20
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
@@ -94,6 +95,7 @@ HCA_LAYER_STACKED_NAMES = [
 
 LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_b', 'wo_b_scale', 'wq_a', 'wq_b', 'wq_b_scale']
 SHARED_NAMES = ['x_hc', 'block_table', 'cmp_block_table', 'csa_cmp_slot_mapping', 'csa_compress_state_block_table', 'csa_idx_slot_mapping', 'csa_inner_compress_state_block_table', 'csa_inner_state_slot_mapping', 'csa_state_slot_mapping', 'freqs_cos', 'freqs_sin', 'hca_cmp_slot_mapping', 'hca_compress_state_block_table', 'hca_state_slot_mapping', 'idx_block_table', 'input_ids', 'kv_seq_lens', 'ori_slot_mapping', 'position_ids']
+HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 
 
 def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
@@ -131,6 +133,35 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
 def _make_shared_spec(name, base_spec, out_name=None):
     from golden import TensorSpec
     return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
+
+
+def _make_hc_head_spec(name):
+    import torch
+    from golden import TensorSpec
+
+    if name == "hc_head_fn":
+        return TensorSpec(
+            name,
+            [N_RANKS, HC_MULT, HC_DIM],
+            torch.float32,
+            init_value=lambda: torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519,
+        )
+    if name == "hc_head_scale":
+        return TensorSpec(
+            name,
+            [N_RANKS, 1],
+            torch.float32,
+            init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32),
+        )
+    if name == "hc_head_base":
+        base = [5.9166, -3.6223, -2.9324, -3.3124]
+        return TensorSpec(
+            name,
+            [N_RANKS, HC_MULT],
+            torch.float32,
+            init_value=lambda: torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous(),
+        )
+    raise ValueError(f"unclassified hc_head spec: {name}")
 
 
 def _make_forward_metadata_specs(base_specs, start_pos=None):
@@ -246,7 +277,7 @@ def build_tensor_specs(start_pos=None):
     from golden import TensorSpec
     base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
     metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids']
+    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base']
     specs = []
     for name in ordered_names:
         if name in metadata_specs:
@@ -259,9 +290,11 @@ def build_tensor_specs(start_pos=None):
             specs.append(_make_layer_stacked_spec(name, base_specs))
         elif name in SHARED_NAMES:
             specs.append(_make_shared_spec(name, base_specs[name]))
+        elif name in HC_HEAD_NAMES:
+            specs.append(_make_hc_head_spec(name))
         else:
             raise ValueError(f"unclassified decode_fwd spec: {name}")
-    specs.append(_make_shared_spec("x_next", base_specs["x_next"], out_name="x_out"))
+    specs.append(TensorSpec("x_out", [N_RANKS, T, D], base_specs["x_next"].dtype, is_output=True))
     return specs
 
 
@@ -341,7 +374,10 @@ def decode_fwd(
     cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[1], pl.FP32],
+    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
     count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
@@ -352,7 +388,7 @@ def decode_fwd(
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+) -> pl.Tensor[[T, D], pl.BF16]:
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -638,7 +674,7 @@ def decode_fwd(
     csa_layer_last: pl.Scalar[pl.INT32] = pl.const(FWD_LAST_LAYER, pl.INT32)
     last_moe_epoch: pl.Scalar[pl.INT32] = pl.const(2, pl.INT32) * HCA_NUM_LAYERS + 3
     x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_next: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_next_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     hc_attn_fn_last: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
     hc_attn_scale_last: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [csa_layer_last * 3])
     hc_attn_base_last: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [csa_layer_last * MIX_HC])
@@ -715,13 +751,14 @@ def decode_fwd(
         routed_w2_last, routed_w2_scale_last,
         shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
         shared_w2_last, shared_w2_scale_last,
-        x_next,
+        x_next_hc,
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
         csa_layer_last, pl.const(T, pl.INT32), my_rank, last_moe_epoch,
     )
-    return x_next
+    x_out = hc_head(x_next_hc, hc_head_fn, hc_head_scale, hc_head_base, x_out)
+    return x_out
 
 
 
@@ -801,7 +838,10 @@ def l3_decode_fwd(
     cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    x_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
+    hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
+    hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
     count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
@@ -898,6 +938,9 @@ def l3_decode_fwd(
             cmp_block_table[r],
             idx_block_table[r],
             input_ids[r],
+            hc_head_fn[r],
+            hc_head_scale[r],
+            hc_head_base[r],
             x_out[r],
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
@@ -917,6 +960,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=None, help="If set, use this single start_pos for all batches.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -938,7 +982,11 @@ if __name__ == "__main__":
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
         ),
-        runtime_cfg=dict(platform=args.platform, enable_l2_swimlane=args.enable_l2_swimlane),
+        runtime_cfg=dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.enable_scope_stats,
+        ),
     )
     if not result.passed:
         if result.error:

@@ -66,11 +66,11 @@ assert T % T_TILE == 0 and T % LINEAR_T_TILE == 0 and T % TRANSPOSE_T_TILE == 0,
 
 @pl.jit.inline
 def hc_head(
-    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Tensor[[B, S, D], pl.BF16],
+    y: pl.Tensor[[T, D], pl.BF16],
 ):
     x_flat = pl.reshape(x_hc, [T, HC_DIM])
     y_flat = pl.reshape(y, [T, D])
@@ -170,17 +170,17 @@ def hc_head(
                 )
                 y_flat[t0 : t0 + T_TILE, d0 : d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
 
-    y = pl.reshape(y_flat, [B, S, D])
+    y = pl.reshape(y_flat, [T, D])
     return y
 
 
 @pl.jit
 def hc_head_test(
-    x_hc: pl.Tensor[[B, S, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+    y: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     y = hc_head(x_hc, hc_head_fn, hc_head_scale, hc_head_base, y)
     return y
@@ -191,8 +191,7 @@ def golden_hc_head(tensors):
 
     x = tensors["x_hc"]
     shape = x.shape
-    x_flat = x.flatten(2)
-    x_flat_2d = x_flat.reshape(T, HC_DIM).float()
+    x_flat_2d = x.reshape(T, HC_DIM).float()
     hc_head_fn = tensors["hc_head_fn"].float()
 
     sq_sum = torch.zeros(T, 1, dtype=torch.float32)
@@ -209,22 +208,22 @@ def golden_hc_head(tensors):
             w_chunk = hc_head_fn[h:h + 1, k0:k0 + LINEAR_K_CHUNK]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1).reshape(B, S, HC_MULT)
+    mixes = torch.cat(mix_cols, dim=1).reshape(T, HC_MULT)
 
     pre = torch.sigmoid(mixes * tensors["hc_head_scale"].float() + tensors["hc_head_base"].float()) + HC_EPS
     x_view = x.float().view(shape)
     if HC_MULT == 4:
         y = (
-            x_view[:, :, 0, :] * pre[:, :, 0:1]
-            + x_view[:, :, 1, :] * pre[:, :, 1:2]
+            x_view[:, 0, :] * pre[:, 0:1]
+            + x_view[:, 1, :] * pre[:, 1:2]
         ) + (
-            x_view[:, :, 2, :] * pre[:, :, 2:3]
-            + x_view[:, :, 3, :] * pre[:, :, 3:4]
+            x_view[:, 2, :] * pre[:, 2:3]
+            + x_view[:, 3, :] * pre[:, 3:4]
         )
     else:
-        y = torch.zeros(B, S, D, dtype=torch.float32)
+        y = torch.zeros(T, D, dtype=torch.float32)
         for h in range(HC_MULT):
-            y += x_view[:, :, h, :] * pre[:, :, h:h + 1]
+            y += x_view[:, h, :] * pre[:, h:h + 1]
 
     def _to_device_bf16(value):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
@@ -238,19 +237,19 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_x_hc():
-        return torch.randn(B, S, HC_MULT, D) * 0.05
+        return torch.randn(T, HC_MULT, D) * 0.05
 
     def init_hc_head_fn():
         return torch.randn(HC_MULT, HC_DIM) * 0.0519
 
     return [
-        TensorSpec("x_hc", [B, S, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [1], torch.float32,
                    init_value=lambda: torch.tensor([0.076099])),
         TensorSpec("hc_head_base", [HC_MULT], torch.float32,
                    init_value=lambda: torch.tensor([5.9166, -3.6223, -2.9324, -3.3124])),
-        TensorSpec("y", [B, S, D], torch.bfloat16, is_output=True),
+        TensorSpec("y", [T, D], torch.bfloat16, is_output=True),
     ]
 
 
