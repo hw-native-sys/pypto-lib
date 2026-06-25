@@ -14,14 +14,19 @@ which runnable scripts CI should execute. A "runnable" file is one that has a
 
 Selection rules
 ---------------
-1. Changed source files under ``examples/`` or ``models/`` pull in not just
-   themselves but every file that (transitively) imports them. Model kernels
-   are split across many sibling modules (``config``, ``rmsnorm``,
-   ``qkv_proj_rope`` …) and a leaf change can break any downstream kernel, so
-   we walk the reverse-import graph and run every runnable dependent.
-2. A change under ``golden/`` (the shared validation harness) touches every
-   kernel's correctness check, so it selects *all* runnable ``examples/`` files
-   as a smoke test.
+1. A changed file under ``models/`` pulls in not just itself but every file
+   that (transitively) imports it. Model kernels are split across many sibling
+   modules (``config``, ``rmsnorm``, ``qkv_proj_rope`` …) and a leaf change can
+   break any downstream kernel, so we walk the reverse-import graph and run
+   every runnable dependent. Only ``models/`` needs this: any ``examples/``
+   change is already covered by rule 2's full-suite run.
+2. Any change **outside** ``models/`` selects *all* runnable ``examples/``
+   files as a smoke test. CI only watches ``examples/`` and ``models/`` and
+   runs files by their import graph, so a change to the shared validation
+   harness (``golden/``), the CI scripts (``.github/``), or any other
+   non-``models`` path would otherwise go completely unexercised. Running the
+   full ``examples/`` suite gives those changes real end-to-end coverage. A PR
+   confined to ``models/`` keeps the targeted reverse-import selection.
 
 Imports in this repo are bare module names (``from qkv_proj_rope import ...``)
 resolved against the running script's own directory, so the reverse-import
@@ -112,21 +117,26 @@ def closure(seeds, reverse):
 def main():
     changed = [line.strip() for line in sys.stdin if line.strip()]
 
-    golden_touched = any(c.startswith("golden/") for c in changed)
-    src_changed = [
+    # Any change outside models/ (golden harness, CI scripts, docs, examples
+    # infra, …) selects the whole examples/ suite as a smoke test; a models-only
+    # PR keeps the targeted reverse-import selection.
+    non_models_touched = any(not c.startswith("models/") for c in changed)
+    # Only models/ uses the reverse-import graph: a changed examples/ file is
+    # already covered by the full-suite run above, so it needs no closure here.
+    models_changed = [
         c
         for c in changed
         if c.endswith(".py")
         and "draft" not in os.path.basename(c)
-        and c.split("/", 1)[0] in SOURCE_ROOTS
+        and c.startswith("models/")
         and os.path.isfile(c)
     ]
 
     reverse = build_reverse_graph()
 
-    selected = closure(src_changed, reverse)
+    selected = closure(models_changed, reverse)
 
-    if golden_touched:
+    if non_models_touched:
         selected.update(
             f for f in _iter_source_files() if f.startswith("examples/")
         )

@@ -71,9 +71,10 @@ jobs:
             exit 0
           fi
           # Map the raw diff to the runnable scripts CI must exercise:
-          #  - a changed examples/models source file selects every runnable file
-          #    that (transitively) imports it, not just the file itself;
-          #  - a golden/ change selects all runnable examples.
+          #  - a changed models/ source file selects every runnable file that
+          #    (transitively) imports it, not just the file itself;
+          #  - any change outside models/ (golden/, .github/, docs, examples, …)
+          #    selects all runnable examples as a smoke test.
           # See .github/scripts/detect_changes.py for the rules.
           FILES=$(git diff --name-only \
             ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} \

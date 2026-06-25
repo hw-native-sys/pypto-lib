@@ -6,7 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
+# ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
+# ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
 """DeepSeek-V4 packed prefill multi-layer bring-up driver.
 
 This driver intentionally keeps the layer kernel in ``prefill_layer.py`` as the
@@ -1798,7 +1799,7 @@ def golden_prefill_fwd(tensors: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="DeepSeek-V4 synthetic packed prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+                        choices=["a2a3", "a5"])  # device-only: full multi-layer/-card forward, no *sim
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
                         help="EP world size. Import-time moe config must see this argv value.")
     parser.add_argument("-d", "--device", type=str,
