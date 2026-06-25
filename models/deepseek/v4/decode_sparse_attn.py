@@ -212,23 +212,25 @@ def sparse_attn(
     # coalesces the many 1-row stores into one block store. This block fully
     # rewrites [WIN, PADDED_TOPK), which is why the window pass skips its bulk-zero.
     if TOPK > WIN:
-        for g_cbk in pl.spmd(T * N_CMP_BLK, name_hint="gather_kv_cmp"):
-            g_t = g_cbk // N_CMP_BLK
-            g_b = g_t // S
-            g_kv_base = g_t * PADDED_TOPK
-            g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
-            g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for g_i in pl.range(GATHER_FILL_TILE):
-                g_c = g_cb + g_i
-                if g_c < TOPK:
-                    g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                    if g_raw >= 0:
-                        g_slot = g_raw - (WIN + S)
-                        g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                        g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                        g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-            g_dst_blk = g_kv_base + g_cb
-            sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
+        for g_task in pl.spmd(T * N_CMP_BLK // 8, name_hint="gather_kv_cmp"):
+            for g_u in pl.range(8):
+                g_cbk = g_task * 8 + g_u
+                g_t = g_cbk // N_CMP_BLK
+                g_b = g_t // S
+                g_kv_base = g_t * PADDED_TOPK
+                g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
+                g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for g_i in pl.range(GATHER_FILL_TILE):
+                    g_c = g_cb + g_i
+                    if g_c < TOPK:
+                        g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
+                        if g_raw >= 0:
+                            g_slot = g_raw - (WIN + S)
+                            g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
+                            g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
+                            g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
+                g_dst_blk = g_kv_base + g_cb
+                sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
