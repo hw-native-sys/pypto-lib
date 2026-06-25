@@ -107,8 +107,11 @@ IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 SPARSE_TOPK = WIN + IDX_TOPK
-CSA_TOPK_TOKEN_TILE = 2
-CSA_TOPK_BLOCKS = (T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
+CSA_TOPK_TOKEN_TILE = 8
+assert T % CSA_TOPK_TOKEN_TILE == 0, f"T ({T}) must tile by CSA_TOPK_TOKEN_TILE ({CSA_TOPK_TOKEN_TILE})"
+CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
+CSA_CMP_WIN_S_F = float(WIN + S)
+COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 WRITEBACK_GUARD_TILE = 16
 
 O_LORA = M.o_lora_rank
@@ -250,7 +253,8 @@ def attention_csa(
     # fixed metadata while the CSA path still composes indexer at runtime.
     cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
-    for topk_block in pl.spmd(CSA_TOPK_BLOCKS, name_hint="csa_sparse_idx_tile"):
+    position_ids_t1 = pl.reshape(position_ids, [T, 1])
+    for topk_block in pl.spmd(T // CSA_TOPK_TOKEN_TILE, name_hint="csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
             t_idx = topk_t0 + topk_dt
@@ -259,43 +263,34 @@ def attention_csa(
                 topk_s = t_idx - topk_b * S
                 topk_abs_pos = pl.read(position_ids, [t_idx])
 
-                if topk_abs_pos >= WIN - 1:
-                    topk_win_start = (topk_abs_pos % WIN) + 1
-                    for topk_k in pl.range(WIN):
-                        topk_val = (topk_win_start + topk_k) % WIN
-                        topk_out = topk_val
+                for topk_k in pl.range(WIN):
+                    if topk_k <= topk_abs_pos:
+                        topk_out = topk_k
                         for topk_os in pl.range(S):
                             if topk_os <= topk_s:
                                 topk_overlay_t = topk_b * S + topk_os
                                 topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_val == topk_overlay_pos % WIN:
+                                if topk_k == topk_overlay_pos % WIN:
                                     topk_out = WIN + topk_os
                         pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
-                else:
-                    for topk_k in pl.range(WIN):
-                        if topk_k <= topk_abs_pos:
-                            topk_out = topk_k
-                            for topk_os in pl.range(S):
-                                if topk_os <= topk_s:
-                                    topk_overlay_t = topk_b * S + topk_os
-                                    topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                    if topk_k == topk_overlay_pos % WIN:
-                                        topk_out = WIN + topk_os
-                            pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
-                        else:
-                            pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
-
-                topk_cmp_valid = pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO)
-                for topk_ck in pl.range(IDX_TOPK):
-                    cmp_raw = pl.read(idx_topk_flat, [t_idx, topk_ck])
-                    if cmp_raw >= WIN + S:
-                        cmp_slot = cmp_raw - (WIN + S)
-                        if cmp_slot < topk_cmp_valid:
-                            pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(cmp_raw, pl.INT32))
-                        else:
-                            pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
                     else:
-                        pl.write(cmp_sparse_indices, [t_idx, WIN + topk_ck], pl.cast(-1, pl.INT32))
+                        pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
+
+        # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy. Keep raw
+        # iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4) (== the original
+        # min(..., kvlen//4); pos + 1 <= kvlen holds), as out = mask * (raw + 1) - 1.
+        c_raw = pl.cast(idx_topk_flat[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, 0 : IDX_TOPK], target_type=pl.FP32)
+        c_pos = pl.cast(position_ids_t1[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, 0 : 1], target_type=pl.FP32)
+        c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        c_upper = pl.add(c_pos_q, CSA_CMP_WIN_S_F)
+        # row_expand to broadcast the per-token bound over IDX_TOPK cols (pl.sub
+        # does not broadcast a [ROW_TILE, 1] column).
+        c_upper_b = pl.row_expand_mul(pl.full([CSA_TOPK_TOKEN_TILE, IDX_TOPK], dtype=pl.FP32, value=1.0), c_upper)
+        c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
+        c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
+        c_mask = pl.mul(c_ge, c_lt)
+        c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
+        cmp_sparse_indices[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, WIN : WIN + IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
@@ -985,12 +980,16 @@ if __name__ == "__main__":
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--golden-data", type=str, default=None,
+                        help="Reuse a prior run's data/{in,out} (skips golden recompute); "
+                             "requires an unchanged spec set.")
     args = parser.parse_args()
 
     result = run_jit(
         fn=attention_csa_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_csa,
+        golden_data=args.golden_data,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
