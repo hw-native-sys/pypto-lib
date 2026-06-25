@@ -23,7 +23,7 @@ because the split=0 cube<->vec pipe ops were replayed into both AIV subblocks.
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 
 
 # Dynamic shape variables.
@@ -44,7 +44,7 @@ NORM_EPS = M.rms_norm_eps
 MIX_PAD = 32  # MIX_HC padded for vector ops
 HC_PAD = 8  # HC_MULT padded
 NEG_INF = -1e20
-T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
+T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_CHUNK_BATCH * PREFILL_CHUNK_SEQ)
 
 # tiling
 T_TILE = 16  # unified row-tile for the fused spmd
@@ -58,7 +58,7 @@ LINEAR_K_TILE = 256
 # the matmul / sinkhorn buffers; D_TILE=512 overflows the 192KB Vec limit.
 D_TILE = 256
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
-assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert (PREFILL_CHUNK_BATCH * PREFILL_CHUNK_SEQ) % T_TILE == 0
 # The fused pre-mix below is hand-unrolled for HC_MULT == 4: the four pre0..pre3
 # residual scales, the four mix_g0..mix_g3 / comb base loads, the comb_off =
 # HC_MULT * 2 offset and the in_h * HC_MULT column strides all assume it. Fail
@@ -352,7 +352,7 @@ if __name__ == "__main__":
 
     MODES = {
         "decode":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+        "prefill": (PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ),
     }
 
     parser = argparse.ArgumentParser()

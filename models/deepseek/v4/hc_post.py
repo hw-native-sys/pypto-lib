@@ -13,7 +13,7 @@ Supports both decode and prefill batch/sequence sizes via dynamic-shape tensors.
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ
 
 # Dynamic shape variables.
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -26,7 +26,7 @@ HC_DIM = M.hc_dim
 # tiling
 T_TILE = 16
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
-assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert (PREFILL_CHUNK_BATCH * PREFILL_CHUNK_SEQ) % T_TILE == 0
 
 
 @pl.jit.inline
@@ -130,7 +130,7 @@ if __name__ == "__main__":
 
     MODES = {
         "decode":  (DECODE_BATCH, DECODE_SEQ),
-        "prefill": (PREFILL_BATCH, PREFILL_SEQ),
+        "prefill": (PREFILL_CHUNK_BATCH, PREFILL_CHUNK_SEQ),
     }
 
     parser = argparse.ArgumentParser()
