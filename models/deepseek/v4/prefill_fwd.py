@@ -1779,8 +1779,19 @@ def golden_prefill_fwd(tensors: dict[str, Any]) -> None:
                 continue
             if name in tensors and isinstance(tensors[name], torch.Tensor):
                 target = tensors[name]
-                if target.ndim > 1 and target.shape[0] == N_RANKS and target.shape[1] == PREFILL_FWD_ACTIVE_LAYERS:
+                if name in FWD_RANK_SLICED_CACHE_NAMES:
                     target[:, layer_i] = value
+                elif name in hca_stride:
+                    hca_idx = FWD_HCA_INDEX_BY_LAYER[layer_i]
+                    stride = hca_stride[name]
+                    target[:, hca_idx * stride : (hca_idx + 1) * stride] = value
+                elif name in csa_stride:
+                    csa_idx = FWD_CSA_INDEX_BY_LAYER[layer_i]
+                    stride = csa_stride[name]
+                    target[:, csa_idx * stride : (csa_idx + 1) * stride] = value
+                elif name in layer_stride:
+                    stride = layer_stride[name]
+                    target[:, layer_i * stride : (layer_i + 1) * stride] = value
     tensors["x_out"][:] = x_hc
 
 
@@ -1799,6 +1810,8 @@ def main() -> None:
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--kernel-only", action="store_true", default=False,
                         help="Run compile/runtime only, skip golden generation and compare, then sanity-check x_out.")
+    parser.add_argument("--compare", action="store_true", default=False,
+                        help="Run golden generation and compare. By default this multi-layer bring-up uses kernel-only sanity.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -1818,6 +1831,7 @@ def main() -> None:
         f"x_out_rank{rank}": valid_ratio_reldiff(args.num_tokens, diff_thd=X_NEXT_DIFF_THD, pct_thd=X_NEXT_PCT_THD)
         for rank in range(N_RANKS)
     }
+    kernel_only = args.kernel_only or not args.compare
     result, runtime_tensors, golden_outputs = _run_jit_return_tensors(
         fn=l3_prefill_fwd_rank_specific,
         specs=specs,
@@ -1835,7 +1849,7 @@ def main() -> None:
         ),
         compare_fn=compare_fn,
         save_data=False,
-        kernel_only=args.kernel_only,
+        kernel_only=kernel_only,
         allow_mismatch=False,
     )
     if not result.passed:
