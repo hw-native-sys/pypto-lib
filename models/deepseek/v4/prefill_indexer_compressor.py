@@ -120,6 +120,28 @@ def prefill_indexer_compressor(
                     pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
 
+    # Pool reads current-window tokens from state, matching DeepSeek V4 decode.
+    # This requires every valid prefill token to have an inner state row.
+    for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_scatter_pre"):
+        update_ob = update_idx % PACKED_PROJ_BLOCKS
+        update_t = update_idx // PACKED_PROJ_BLOCKS
+        update_o0 = update_ob * OUT_TILE
+        if update_t < num_tokens:
+            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
+            if state_row_raw >= 0:
+                state_row = pl.cast(state_row_raw, pl.INDEX)
+                update_pos = pl.read(position_ids, [update_t])
+                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
+                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = kv_proj_scratch[
+                    update_t : update_t + 1,
+                    update_o0 : update_o0 + OUT_TILE,
+                ]
+                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                    score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
+                    ape_row,
+                )
+
     for pool_idx in pl.spmd(PACKED_POOL_BLOCKS, name_hint="prefill_idx_c4_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
         hb = pool_idx - write_i * HEAD_BLOCKS
@@ -186,43 +208,6 @@ def prefill_indexer_compressor(
                         cur_state_row : cur_state_row + 1,
                         HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
-
-            for pool_t in pl.range(T):
-                if pool_t < num_tokens:
-                    pool_pos = pl.read(position_ids, [pool_t])
-                    if pool_pos <= write_pos:
-                        if pool_pos >= prev_start:
-                            pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
-                            if pool_pos < cur_start:
-                                pool_slot = pl.cast(pool_pos - prev_start, pl.INDEX)
-                                pool_ape = ape[pool_ape_slot : pool_ape_slot + 1, h0 : h0 + HEAD_CHUNK]
-                                pool_score = pl.add(
-                                    score_proj_scratch[pool_t : pool_t + 1, h0 : h0 + HEAD_CHUNK],
-                                    pool_ape,
-                                )
-                                pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = kv_proj_scratch[
-                                    pool_t : pool_t + 1,
-                                    h0 : h0 + HEAD_CHUNK,
-                                ]
-                                pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = pool_score
-                            else:
-                                pool_slot = pl.cast(COMPRESS_RATIO + pool_pos - cur_start, pl.INDEX)
-                                pool_ape = ape[
-                                    pool_ape_slot : pool_ape_slot + 1,
-                                    HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                                ]
-                                pool_score = pl.add(
-                                    score_proj_scratch[
-                                        pool_t : pool_t + 1,
-                                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                                    ],
-                                    pool_ape,
-                                )
-                                pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = kv_proj_scratch[
-                                    pool_t : pool_t + 1,
-                                    HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                                ]
-                                pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = pool_score
 
             init_slot = STATE_LEN - 1
             mi_buf = pl.create_tensor([1, HEAD_CHUNK], dtype=pl.FP32)
@@ -339,33 +324,6 @@ def prefill_indexer_compressor(
                     keepalive_row : keepalive_row + 1,
                     0:HEAD_DIM,
                 ]
-
-    for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
-        update_ob = update_idx % PACKED_PROJ_BLOCKS
-        update_t = update_idx // PACKED_PROJ_BLOCKS
-        update_o0 = update_ob * OUT_TILE
-        if update_t < num_tokens:
-            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                    kv_proj_scratch[
-                        update_t : update_t + 1,
-                        update_o0 : update_o0 + OUT_TILE,
-                    ],
-                    pool_dep,
-                )
-                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                    pl.add(
-                        score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                        ape_row,
-                    ),
-                    pool_dep,
-                )
 
     idx_kv_cache = pl.reshape(idx_kv_cache_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     kv_state = pl.reshape(kv_state_flat, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM])
