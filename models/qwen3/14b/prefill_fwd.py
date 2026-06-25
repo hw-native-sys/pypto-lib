@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-sim    # CI marker: full multi-layer forward — device-only, skip on *sim
 """Qwen3-14B full-layer prefill forward.
 
 Each transformer layer runs the same fused prefill body: input RMSNorm,
@@ -1103,7 +1104,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"]
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"]
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("-b", "--batch", type=int, default=BATCH,

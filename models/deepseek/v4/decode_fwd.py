@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
+# ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
 """DeepSeek-V4 Flash decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
 
 import argparse
@@ -955,7 +956,7 @@ if __name__ == "__main__":
     from golden import run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=None, help="If set, use this single start_pos for all batches.")

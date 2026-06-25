@@ -224,6 +224,13 @@ jobs:
           failed=()
           for f in $FILES; do
             echo "::group::$f"
+            # Files marked `# ci: no-sim` (full multi-layer / multi-card
+            # forwards) are device-only and would just argparse-reject *sim.
+            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
+              echo "skip (no-sim): $f"
+              echo "::endgroup::"
+              continue
+            fi
             if ! python "$f" -p ${{ matrix.platform }}; then
               failed+=("$f")
               echo "::error file=${f}::FAIL"

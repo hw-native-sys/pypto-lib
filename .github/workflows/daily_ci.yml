@@ -125,9 +125,9 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 524288
-          PTO2_RING_TASK_WINDOW: 524288
-          PTO2_RING_HEAP: 2147483648
+          PTO2_RING_DEP_POOL: 131072
+          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
         run: |
@@ -145,8 +145,16 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          # Run every model file once with no extra args.
+          # Run every model file once with no extra args. Files marked
+          # `# ci: no-sim` (full multi-layer / multi-card forwards) are
+          # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+            if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
+              echo "::group::${f}"
+              echo "skip (no-sim): ${f}"
+              echo "::endgroup::"
+              continue
+            fi
             run_case "$f" "$f"
           done
           if [ ${#failed[@]} -ne 0 ]; then
