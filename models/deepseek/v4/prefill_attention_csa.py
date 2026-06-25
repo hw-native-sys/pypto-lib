@@ -235,6 +235,19 @@ def prefill_attention_csa(
         cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
     cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
     cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+
+    # abs-position -> token-index map. Position ids are unique per token
+    # (pos[t] = context_len + local_idx, holds for both full and suffix prefill),
+    # so this replaces the per-(token, slot) O(T) linear scan below with an O(1)
+    # lookup. Mirrors the write_pos_map precompute in prefill_compressor_ratio4.
+    pos_to_token = pl.create_tensor([1, MAX_SEQ_LEN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_pos_map"):
+        pos_to_token[0:1, 0:MAX_SEQ_LEN] = pl.full([1, MAX_SEQ_LEN], dtype=pl.INT32, value=-1)
+        for map_t in pl.range(T):
+            if map_t < num_tokens:
+                map_pos = pl.read(position_ids, [map_t])
+                pl.write(pos_to_token, [0, pl.cast(map_pos, pl.INDEX)], pl.cast(map_t, pl.INT32))
+
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
@@ -251,12 +264,12 @@ def prefill_attention_csa(
                     if sparse_col_i32 < window_valid:
                         key_abs = key_start_abs + sparse_col_i32
                         sparse_raw = pl.cast(key_abs % WIN, pl.INT32)
-                        for scan_t in pl.range(T):
-                            if scan_t < num_tokens:
-                                if scan_t <= t_idx:
-                                    scan_pos = pl.read(position_ids, [scan_t])
-                                    if scan_pos == key_abs:
-                                        sparse_raw = pl.cast(WIN + scan_t, pl.INT32)
+                        # Prefer the overlay row (WIN + token) when a token with
+                        # position == key_abs exists and is <= t_idx.
+                        overlay_t = pl.read(pos_to_token, [0, pl.cast(key_abs, pl.INDEX)])
+                        if overlay_t >= 0:
+                            if overlay_t <= t_idx:
+                                sparse_raw = pl.cast(WIN + overlay_t, pl.INT32)
                     else:
                         comp_start = window_valid
                         if sparse_col_i32 >= comp_start:
