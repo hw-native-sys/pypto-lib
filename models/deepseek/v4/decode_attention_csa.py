@@ -46,82 +46,59 @@ from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from decode_sparse_attn import sparse_attn
 
+# model config
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 EPS = M.rms_norm_eps
-
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
-NOPE_HEAD_DIM = M.nope_head_dim
 Q_LORA = M.q_lora_rank
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
 WIN = M.sliding_window
-
-QR_D_CHUNK = 512
-QR_D_BLOCKS = D // QR_D_CHUNK
-QR_CHUNK = 128
-QR_BLOCKS = Q_LORA // QR_CHUNK
-
+MAX_SEQ_LEN = M.max_position_embeddings
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
-
 IDX_N_HEADS = M.index_n_heads
 IDX_HEAD_DIM = M.index_head_dim
 IDX_TOPK = M.index_topk
-INDEXER_SCORE_LEN = M.max_position_embeddings // 4
-
-INNER_HEAD_DIM_INV = 1.0 / IDX_HEAD_DIM
-INNER_OUT_CHUNK = 64
-INNER_HEAD_CHUNK = 64
-INNER_HEAD_BLOCKS = IDX_HEAD_DIM // INNER_HEAD_CHUNK
-INNER_ROPE_CHUNK = 32
-INNER_NOPE_HEAD_DIM = IDX_HEAD_DIM - ROPE_HEAD_DIM
-
-MAX_SEQ_LEN = M.max_position_embeddings
-COMPRESS_RATIO = 4
-OVERLAP = COMPRESS_RATIO == 4
-COFF = 1 + int(OVERLAP)
-
-MAIN_OUT_DIM = COFF * HEAD_DIM
-MAIN_STATE_LEN = COFF * COMPRESS_RATIO
-MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-MAIN_STATE_MAX_BLOCKS = 65
-MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
-MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
-INNER_OUT_DIM = COFF * IDX_HEAD_DIM
-INNER_STATE_LEN = COFF * COMPRESS_RATIO
-INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_MAX_BLOCKS = 65
-INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
-INNER_STATE_DIM = 2 * INNER_OUT_DIM
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-IDX_CACHE_MAX_BLOCKS = 64
-IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
-
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
+INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
 SPARSE_TOPK = WIN + IDX_TOPK
-CSA_TOPK_TOKEN_TILE = 8
-assert T % CSA_TOPK_TOKEN_TILE == 0, f"T ({T}) must tile by CSA_TOPK_TOKEN_TILE ({CSA_TOPK_TOKEN_TILE})"
-CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
-CSA_CMP_WIN_S_F = float(WIN + S)
-COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
-WRITEBACK_GUARD_TILE = 16
-
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
+# kernel-local
+COMPRESS_RATIO = 4
+OVERLAP = COMPRESS_RATIO == 4
+COFF = 1 + int(OVERLAP)
+MAIN_OUT_DIM = COFF * HEAD_DIM
+MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
+MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+MAIN_STATE_MAX_BLOCKS = 65
+MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
+INNER_OUT_DIM = COFF * IDX_HEAD_DIM
+INNER_STATE_DIM = 2 * INNER_OUT_DIM
+INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
+INNER_STATE_MAX_BLOCKS = 65
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+IDX_CACHE_MAX_BLOCKS = 64
+IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
 ORI_MAX_BLOCKS = 1
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+
+# tiling
+CSA_TOPK_TOKEN_TILE = 8
+CSA_WB_TOKEN_TILE = T // 4
+WRITEBACK_GUARD_TILE = 16
+CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
+CSA_CMP_WIN_S_F = float(WIN + S)
+COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 
 @pl.jit.inline
 def attention_csa(
@@ -190,12 +167,12 @@ def attention_csa(
             for s in pl.range(S):
                 t = b * S + s
                 pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
-                cos_row = pl.cast(pl.slice(freqs_cos, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                sin_row = pl.cast(pl.slice(freqs_sin, [1, ROPE_HEAD_DIM], [pos_b, 0]), target_type=pl.FP32)
-                rope_cos_t = pl.assemble(rope_cos_t, pl.cast(cos_row, target_type=pl.BF16), [t, 0])
-                rope_sin_t = pl.assemble(rope_sin_t, pl.cast(sin_row, target_type=pl.BF16), [t, 0])
-            step_cos = pl.assemble(step_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
-            step_sin = pl.assemble(step_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [step_pos_b, 0]), target_type=pl.FP32), [b, 0])
+                cos_row = pl.cast(freqs_cos[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
+                rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16)
+                rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16)
+            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
@@ -205,8 +182,8 @@ def attention_csa(
             first_pos_b = pl.read(position_ids, [first_t])
             cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
             cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos = pl.assemble(cmp_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
-            cmp_sin = pl.assemble(cmp_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [cmp_pos_b, 0]), target_type=pl.FP32), [b, 0])
+            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
+            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_norm(x_mixed, attn_norm_w, x_normed_t)
@@ -303,10 +280,16 @@ def attention_csa(
     # Commit current MTP tokens only after sparse_attn has gathered the old cache
     # plus the explicit overlay, matching the SWA/HCA MTP contract.
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cache_writeback"):
-        kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
-        kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
-        for write_t in pl.range(T):
+    for wb_blk in pl.spmd(T // CSA_WB_TOKEN_TILE, name_hint="csa_cache_writeback"):
+        wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
+        # No-op self-copy marks kv_cache_flat add_inout for the WAR edge vs
+        # sparse_attn's read (pypto-lib#481); row 0 is only ever written by
+        # token 0, which lives in this same block, so no cross-block race.
+        if wb_blk == 0:
+            kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
+            kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
+        for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+            write_t = wb_t0 + write_dt
             write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
             if write_row >= 0:
                 write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
