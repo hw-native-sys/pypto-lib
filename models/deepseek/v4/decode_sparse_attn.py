@@ -44,7 +44,6 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 VALID_TOKEN_TILE = 16
-GATHER_FILL_TILE = 128
 ROPE_OUT_TOK_TILE = 64
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -101,22 +100,6 @@ TOPK = TOPK_FULL
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
-    f"PADDED_TOPK ({PADDED_TOPK}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"  # gather_kv bulk-zero
-# Region of the gathered-KV block that needs a standalone zero-fill in gather_kv:
-# only the window [0, WIN) when compressed slots are staged below (their
-# zero-initialized block stores fully rewrite [WIN, PADDED_TOPK)), else the whole
-# region in the SWA specialization where no compressed staging runs. Hoisted to
-# module scope because the kernel tracer rejects ternary (IfExp) in the body.
-GATHER_ZERO_END = WIN if TOPK > WIN else PADDED_TOPK
-# Compressed-staging fill-blocks per token. The compressed half of gather_kv runs
-# as a separate, finer SPMD of T * N_CMP_BLK units (vs the per-token T units) so
-# the gather fills the AIV cores more evenly across waves (e.g. 512 vs 128 on 48
-# cores -> ~1.1x vs 1.5x tail-wave imbalance). Only meaningful when TOPK > WIN.
-# WIN must tile by GATHER_FILL_TILE so the compressed region [WIN, PADDED_TOPK)
-# divides evenly into N_CMP_BLK fill-blocks (else the tail slots are silently dropped).
-assert WIN % GATHER_FILL_TILE == 0, f"WIN ({WIN}) must be divisible by GATHER_FILL_TILE ({GATHER_FILL_TILE})"
-N_CMP_BLK = (PADDED_TOPK - WIN) // GATHER_FILL_TILE
 
 
 @pl.jit.inline
@@ -145,7 +128,6 @@ def sparse_attn(
     #   [WIN + S, ...)  compressed KV slots
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    sparse_kv = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
@@ -161,78 +143,25 @@ def sparse_attn(
             sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
                 [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
-    for g_t in pl.spmd(T, name_hint="gather_kv"):
-        g_b = g_t // S
-        g_kv_base = g_t * PADDED_TOPK
-        # No-op self-copy: marks ori_kv add_inout so an in-place cache writeback
-        # gets a WAR edge against this read (pypto-lib#481).
-        g_self_touch = ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[g_t : g_t + 1, 0 : HEAD_DIM] = g_self_touch
+    # WAR marker (pypto-lib#481): the fused gather reads ori_kv inside qk_pv, but a
+    # scalar-driven gather_row does not by itself mark the param add_inout (and an
+    # in-qk_pv self-copy collides with the gather's tensor view). A separate per-token
+    # no-op self-copy -- same [g_t:g_t+1] granularity the old gather_kv used -- marks
+    # ori_kv add_inout before qk_pv, so the enclosing layer's in-place KV-cache
+    # writeback gets its WAR edge against the gather read.
+    for kvt_t in pl.spmd(T, name_hint="kv_touch"):
+        kvt_row = ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM]
+        ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM] = kvt_row
 
-        # Bulk-zero only the window block [0, WIN): its invalid (-1) slots keep
-        # this fill (the per-row window path below writes valid slots only). The
-        # compressed blocks [WIN, PADDED_TOPK) are fully rewritten by the
-        # zero-initialized g_stage block stores further down, so a separate
-        # zero-fill there is a dead store; only the SWA case (no compressed
-        # staging) still needs the whole region zeroed. Finite (zero) invalid KV
-        # rows plus the NEG_INF softmax bias let qk_pv skip a per-block mask mul.
-        zero_fill = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-        for g_f in pl.range(0, GATHER_ZERO_END, GATHER_FILL_TILE):
-            g_fill_row = g_kv_base + g_f
-            sparse_kv[g_fill_row : g_fill_row + GATHER_FILL_TILE, 0 : HEAD_DIM] = zero_fill
-
-        # Slot layout is fixed (window_topk in [0, WIN), compress_topk in
-        # [WIN, TOPK)), so split by range to drop the per-row 4-way branch. The
-        # window page base is invariant (WIN == BLOCK_SIZE, ORI_MAX_BLOCKS == 1).
-        g_ori_base = pl.cast(pl.read(ori_block_table, [g_b, 0]), pl.INDEX) * BLOCK_SIZE
-        g_overlay_base = g_b * S
-
-        # Window slots: ring KV, or the MTP overlay when raw in [WIN, WIN + S).
-        # Invalid (raw < 0) slots keep the bulk-zero fill. pl.pipeline overlaps
-        # block k+1's load with block k's store.
-        for g_w in pl.pipeline(WIN, stage=4):
-            g_raw = pl.read(cmp_sparse_indices, [g_t, g_w])
-            if g_raw >= 0:
-                g_dst_row = g_kv_base + g_w
-                if g_raw < WIN:
-                    g_src_row = g_ori_base + g_raw
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = ori_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-                else:
-                    g_overlay_row = g_overlay_base + (g_raw - WIN)
-                    sparse_kv[g_dst_row : g_dst_row + 1, 0 : HEAD_DIM] = mtp_kv_overlay[g_overlay_row : g_overlay_row + 1, 0 : HEAD_DIM]
-
-    # Compressed slots [WIN, TOPK): paged compressed cache; -1 keeps the fill.
-    # Run as a separate, finer SPMD over (token, fill-block) units so the gather
-    # fills the AIV cores evenly across waves (T*N_CMP_BLK vs the per-token T
-    # units of the window pass). Guarded so the SWA (TOPK == WIN) specialization
-    # omits it entirely (there the per-token bulk-zero covers the whole region).
-    # Each GATHER_FILL_TILE block is staged in a UB tile then flushed with one
-    # wide MTE3 store: gives each scattered load its own tile row (no buffer-reuse
-    # WAR, so loads stream on MTE2 instead of ping-ponging with MTE3 per row) and
-    # coalesces the many 1-row stores into one block store. This block fully
-    # rewrites [WIN, PADDED_TOPK), which is why the window pass skips its bulk-zero.
-    if TOPK > WIN:
-        for g_cbk in pl.spmd(T * N_CMP_BLK, name_hint="gather_kv_cmp"):
-            g_t = g_cbk // N_CMP_BLK
-            g_b = g_t // S
-            g_kv_base = g_t * PADDED_TOPK
-            g_cb = WIN + (g_cbk - g_t * N_CMP_BLK) * GATHER_FILL_TILE
-            g_stage = pl.full([GATHER_FILL_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
-            for g_i in pl.range(GATHER_FILL_TILE):
-                g_c = g_cb + g_i
-                if g_c < TOPK:
-                    g_raw = pl.read(cmp_sparse_indices, [g_t, g_c])
-                    if g_raw >= 0:
-                        g_slot = g_raw - (WIN + S)
-                        g_blk = pl.cast(pl.read(cmp_block_table, [g_b, g_slot // BLOCK_SIZE]), pl.INDEX)
-                        g_src_row = g_blk * BLOCK_SIZE + g_slot % BLOCK_SIZE
-                        g_stage[g_i : g_i + 1, 0 : HEAD_DIM] = cmp_kv_flat[g_src_row : g_src_row + 1, 0 : HEAD_DIM]
-            g_dst_blk = g_kv_base + g_cb
-            sparse_kv[g_dst_blk : g_dst_blk + GATHER_FILL_TILE, 0 : HEAD_DIM] = g_stage
-
-    # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
-    # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
-    # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
+    # Flash-fusion: the per-token KV gather is folded INTO qk_pv (below) -- each
+    # (token, sparse-block) gathers its ATTN_K_TILE rows straight into an L1 matmul
+    # operand via pl.gather_row (GM->L1, no tmov), so the sparse_kv GM staging
+    # tensor and the standalone gather_kv / gather_kv_cmp kernels are gone. The raw
+    # index -> physical row contract is unchanged (see line 138); invalid (raw < 0)
+    # slots gather ori_kv_flat[0] (a finite, in-range row) and are zeroed out by the
+    # NEG_INF softmax bias instead of by a zero KV row -- equivalent because the bias
+    # drives exp(score) to ~0, and an all-invalid block is annihilated in merge_norm
+    # by beta = exp(NEG_INF - m) = 0 regardless of its (finite) numerator.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
@@ -241,16 +170,37 @@ def sparse_attn(
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
     for qk_t in pl.spmd(T, name_hint="qk_pv"):
-        qk_kv_base = qk_t * PADDED_TOPK
+        qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        # Sparse-block OUTER / head-tile INNER: the KV tile and bias depend only
-        # on (token, sparse-block), so hoisting them above the head-tile loop lets
-        # one KV/bias load serve all head-tiles instead of re-loading per head.
+        qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
+        qk_overlay_base = qk_b * S
+        # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
+        # then both head-batches' QK (b_trans) and PV consume the SAME normal-layout
+        # tile -- one gather per (token, block), no GM staging.
         for qk_sb in pl.range(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
-            qk_kv_k = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
-            qk_kv_v = sparse_kv[qk_kv_base + qk_s0 : qk_kv_base + qk_s0 + ATTN_K_TILE, 0 : HEAD_DIM]
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
+            # Kernel-driven paged gather of this block's ATTN_K_TILE rows into an L1
+            # matmul operand. Raw-index -> physical-row contract is identical to the
+            # old gather_kv/gather_kv_cmp; invalid (raw < 0) gathers row 0 (finite,
+            # in-range) and the NEG_INF bias zeros its softmax weight.
+            qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
+            for qk_r in pl.range(ATTN_K_TILE):
+                qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_s0 + qk_r])
+                if qk_ridx >= 0:
+                    if qk_ridx < WIN:
+                        qk_src = qk_ori_base + qk_ridx
+                        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
+                    elif qk_ridx < WIN + S:
+                        qk_ov = qk_overlay_base + (qk_ridx - WIN)
+                        qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
+                    else:
+                        qk_slot = qk_ridx - (WIN + S)
+                        qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
+                        qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                        qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
+                else:
+                    qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
 
             # Cube-batch QK_M_TILE head rows per QK/PV matmul so the shared KV
             # tile is extracted L1->L0 once per QK_M_TILE/H_TILE head-tiles
@@ -263,7 +213,7 @@ def sparse_attn(
                 qk_h0 = qk_hb * QK_M_TILE
                 qk_head_row = qk_t * H + qk_h0
                 qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
+                qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
                 qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                 # Broadcast-add the per-block bias directly (col_expand_add) instead
                 # of col_expand into a dead pl.full(0) base + a separate add.
@@ -274,7 +224,7 @@ def sparse_attn(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
                 for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
                     qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
                     qk_r0 = qk_sub * H_TILE
