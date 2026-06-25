@@ -94,7 +94,7 @@ CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
 CSA_TOPK_TOKEN_TILE = 8
-CSA_WB_TOKEN_TILE = T // 4
+CSA_WB_TOKEN_TILE = 32
 WRITEBACK_GUARD_TILE = 16
 CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
 CSA_CMP_WIN_S_F = float(WIN + S)

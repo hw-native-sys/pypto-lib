@@ -80,6 +80,8 @@ HCA_SPARSE_TOPK = WIN + HCA_TOPK_LIMIT
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
+HCA_TOPK_TOKEN_TILE = 8   # tokens per overlay-topk SPMD block
+HCA_WB_TOKEN_TILE = 32  # tokens per cache-writeback SPMD block
 
 
 @pl.jit.inline
@@ -178,39 +180,34 @@ def attention_hca(
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
     )
 
+    # Sparse-index build fanned out over an SPMD (8 tokens/block) instead of one
+    # serial CORE_GROUP loop. The two window-slot abs_pos branches collapse into
+    # one: column k -> ring slot k, live iff k <= abs_pos. sparse_attn pairs each
+    # K/V by its stored raw value (order-agnostic), so the full-ring rotation is
+    # dead. The compressed-slot ramp is fused into the same block.
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     topk_all = pl.create_tensor([T, HCA_SPARSE_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_overlay_topk"):
-        for topk_b in pl.range(B):
-            for topk_s in pl.range(S):
-                topk_t = topk_b * S + topk_s
+    for topk_block in pl.spmd(T // HCA_TOPK_TOKEN_TILE, name_hint="hca_overlay_topk"):
+        topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
+        for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
+            topk_t = topk_t0 + topk_dt
+            if topk_t < T:
+                topk_b = topk_t // S
+                topk_s = topk_t - topk_b * S
                 topk_abs_pos = pl.read(position_ids, [topk_t])
 
-                if topk_abs_pos >= WIN - 1:
-                    topk_win_start = (topk_abs_pos % WIN) + 1
-                    for topk_k in pl.range(WIN):
-                        topk_val = (topk_win_start + topk_k) % WIN
-                        topk_out = topk_val
+                for topk_k in pl.range(WIN):
+                    if topk_k <= topk_abs_pos:
+                        topk_out = topk_k
                         for topk_os in pl.range(S):
                             if topk_os <= topk_s:
                                 topk_overlay_t = topk_b * S + topk_os
                                 topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_val == topk_overlay_pos % WIN:
+                                if topk_k == topk_overlay_pos % WIN:
                                     topk_out = WIN + topk_os
                         pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
-                else:
-                    for topk_k in pl.range(WIN):
-                        if topk_k <= topk_abs_pos:
-                            topk_out = topk_k
-                            for topk_os in pl.range(S):
-                                if topk_os <= topk_s:
-                                    topk_overlay_t = topk_b * S + topk_os
-                                    topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                    if topk_k == topk_overlay_pos % WIN:
-                                        topk_out = WIN + topk_os
-                            pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
-                        else:
-                            pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
+                    else:
+                        pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
                 topk_cmp_valid = pl.min(
                     HCA_TOPK_LIMIT,
@@ -223,31 +220,26 @@ def attention_hca(
                         pl.write(topk_all, [topk_t, WIN + topk_ck], pl.cast(-1, pl.INT32))
 
     sparse_attn_hca(
-        q,
-        kv_cache,
-        ori_block_table,
-        kv,
-        cmp_kv,
-        cmp_block_table,
-        topk_all,
-        attn_sink,
-        rope_cos_t,
-        rope_sin_t,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        attn_out,
+        q, kv_cache, ori_block_table, kv,
+        cmp_kv, cmp_block_table, topk_all,
+        attn_sink, rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
     )
 
     # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
     # history (the current token reaches attention via the `kv` overlay).
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_cache_writeback"):
-        # No-op self-copy: marks kv_cache add_inout so the runtime orders this
-        # write after the gather's read (WAR); see pypto-lib#481.
-        kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
-        kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
-        for write_t in pl.range(T):
+    for wb_blk in pl.spmd(T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback"):
+        wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
+        # No-op self-copy marks kv_cache_flat add_inout for the WAR edge vs
+        # sparse_attn's read (pypto-lib#481); row 0 is batch 0's intra-0 slot, only
+        # ever written by batch-0 tokens, which all live in this same block 0, so
+        # there is no cross-block race.
+        if wb_blk == 0:
+            kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
+            kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
+        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+            write_t = wb_t0 + write_dt
             write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
             if write_row >= 0:
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
@@ -697,7 +689,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     args = parser.parse_args()
 
     result = run_jit(
