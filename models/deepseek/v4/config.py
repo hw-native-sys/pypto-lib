@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 configuration"""
 
+import os
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
@@ -259,9 +260,11 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 # EP communication constants
 EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
 EP_RANK = 0
+DP_WORLD_SIZE = int(os.environ.get("DSV4_DP_WORLD_SIZE", "2"))
 RECV_SAFETY = 4
-RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
-            // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY
+_RECV_MAX_DEFAULT = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
+                     // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY * DP_WORLD_SIZE
+RECV_MAX = int(os.environ.get("DSV4_MOE_EP_RECV_MAX", str(_RECV_MAX_DEFAULT)))
 
 # When True, gate.py's N_EXPERTS uses the full global expert space
 # (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False

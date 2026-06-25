@@ -20,7 +20,7 @@ import argparse
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -98,6 +98,16 @@ class DeepSeekV4WeightStore:
     def shape_dtype(self, key: str) -> tuple[list[int], str]:
         view = self._handle(key).get_slice(key)
         return list(view.get_shape()), str(view.get_dtype())
+
+
+_STORE_CACHE: dict[Path, DeepSeekV4WeightStore] = {}
+
+
+def _get_store(root: str | Path) -> DeepSeekV4WeightStore:
+    root_path = Path(root)
+    if root_path not in _STORE_CACHE:
+        _STORE_CACHE[root_path] = DeepSeekV4WeightStore(root_path)
+    return _STORE_CACHE[root_path]
 
 
 def attention_kind_for_layer(layer_id: int) -> str:
@@ -195,6 +205,39 @@ def _load_routed_experts(store: DeepSeekV4WeightStore, layer_id: int) -> dict[st
         "routed_w2": w2,
         "routed_w2_scale": s2,
     }
+
+
+def _load_routed_expert_rank(
+    store: DeepSeekV4WeightStore,
+    layer_id: int,
+    rank: int,
+    name: str,
+) -> torch.Tensor | None:
+    base = f"layers.{layer_id}.ffn.experts"
+    global_start = rank * N_LOCAL
+    if name in {"routed_w1", "routed_w3"}:
+        tensor = torch.empty((N_LOCAL, MOE_INTER, D), dtype=torch.int8)
+        suffix = "w1" if name == "routed_w1" else "w3"
+    elif name == "routed_w2":
+        tensor = torch.empty((N_LOCAL, D, MOE_INTER), dtype=torch.int8)
+        suffix = "w2"
+    elif name in {"routed_w1_scale", "routed_w3_scale"}:
+        tensor = torch.empty((N_LOCAL, MOE_INTER), dtype=torch.float32)
+        suffix = "w1" if name == "routed_w1_scale" else "w3"
+    elif name == "routed_w2_scale":
+        tensor = torch.empty((N_LOCAL, D), dtype=torch.float32)
+        suffix = "w2"
+    else:
+        return None
+
+    for local_eid in range(N_LOCAL):
+        global_eid = global_start + local_eid
+        prefix = f"{base}.{global_eid}.{suffix}"
+        if name.endswith("_scale"):
+            tensor[local_eid] = _fp32(store.load(f"{prefix}.scale"))
+        else:
+            tensor[local_eid] = store.load(f"{prefix}.weight").contiguous().to(torch.int8)
+    return tensor
 
 
 def _load_common_attention(store: DeepSeekV4WeightStore, layer_id: int) -> dict[str, torch.Tensor]:
@@ -298,6 +341,190 @@ def _load_moe(store: DeepSeekV4WeightStore, layer_id: int) -> dict[str, torch.Te
         out["tid2eid"] = _ranked(_lower_tid2eid(store.load(tid2eid_key)))
     out.update(_load_routed_experts(store, layer_id))
     return out
+
+
+def load_layer_override_tensor_rank(
+    root: str | Path,
+    layer_id: int,
+    name: str,
+    rank: int,
+) -> torch.Tensor | None:
+    """Load one real-weight tensor for one EP rank.
+
+    The rank-specific prefill forward path uses this to avoid building an
+    intermediate ``[N_RANKS, ...]`` tensor and then slicing it back apart. Only
+    tensors backed by real model weights are handled here; runtime metadata,
+    caches, state tensors, and outputs return ``None`` so callers can keep their
+    synthetic fixture initializers.
+    """
+    store = _get_store(root)
+    base = f"layers.{layer_id}"
+    attn = f"{base}.attn"
+    ffn = f"{base}.ffn"
+    gate = f"{ffn}.gate"
+    kind = attention_kind_for_layer(layer_id)
+
+    common_attention = {
+        "hc_attn_fn": lambda: _fp32(store.load(f"{base}.hc_attn_fn")),
+        "hc_attn_scale": lambda: _fp32(store.load(f"{base}.hc_attn_scale")),
+        "hc_attn_base": lambda: _fp32(store.load(f"{base}.hc_attn_base")),
+        "attn_norm_w": lambda: _bf16(store.load(f"{base}.attn_norm.weight")),
+        "wq_a": lambda: _bf16_transpose(store.load(f"{attn}.wq_a.weight")),
+        "wq_b": lambda: _i8_transpose(store.load(f"{attn}.wq_b.weight")),
+        "wq_b_scale": lambda: _fp32(store.load(f"{attn}.wq_b.scale")),
+        "wkv": lambda: _bf16_transpose(store.load(f"{attn}.wkv.weight")),
+        "gamma_cq": lambda: _bf16(store.load(f"{attn}.q_norm.weight")),
+        "gamma_ckv": lambda: _bf16(store.load(f"{attn}.kv_norm.weight")),
+        "attn_sink": lambda: _fp32(store.load(f"{attn}.attn_sink")),
+        "wo_a": lambda: _reshape_wo_a(store.load(f"{attn}.wo_a.weight")),
+        "wo_b": lambda: store.load(f"{attn}.wo_b.weight").contiguous().to(torch.int8),
+        "wo_b_scale": lambda: _fp32(store.load(f"{attn}.wo_b.scale")),
+    }
+    if name in common_attention:
+        return common_attention[name]()
+    if name in {"freqs_cos", "freqs_sin"}:
+        cos, sin = _rope_tables_for_layer(layer_id)
+        return cos if name == "freqs_cos" else sin
+
+    if name.startswith("hca_") and kind == "hca":
+        prefix = f"{attn}.compressor"
+        hca = {
+            "hca_cmp_wkv": lambda: _bf16_transpose(store.load(f"{prefix}.wkv.weight")),
+            "hca_cmp_wgate": lambda: _bf16_transpose(store.load(f"{prefix}.wgate.weight")),
+            "hca_cmp_ape": lambda: _reshape_or_check(
+                f"{prefix}.ape",
+                _fp32(store.load(f"{prefix}.ape")),
+                (HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM),
+            ),
+            "hca_cmp_norm_w": lambda: _bf16(store.load(f"{prefix}.norm.weight")),
+        }
+        if name in hca:
+            return hca[name]()
+
+    if name.startswith("csa_") and kind == "csa":
+        cmp_prefix = f"{attn}.compressor"
+        idx_prefix = f"{attn}.indexer"
+        inner_prefix = f"{idx_prefix}.compressor"
+        csa = {
+            "csa_cmp_wkv": lambda: _bf16_transpose(store.load(f"{cmp_prefix}.wkv.weight")),
+            "csa_cmp_wgate": lambda: _bf16_transpose(store.load(f"{cmp_prefix}.wgate.weight")),
+            "csa_cmp_ape": lambda: _reshape_or_check(
+                f"{cmp_prefix}.ape",
+                _fp32(store.load(f"{cmp_prefix}.ape")),
+                (CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM),
+            ),
+            "csa_cmp_norm_w": lambda: _bf16(store.load(f"{cmp_prefix}.norm.weight")),
+            "csa_inner_wkv": lambda: _bf16_transpose(store.load(f"{inner_prefix}.wkv.weight")),
+            "csa_inner_wgate": lambda: _bf16_transpose(store.load(f"{inner_prefix}.wgate.weight")),
+            "csa_inner_ape": lambda: _reshape_or_check(
+                f"{inner_prefix}.ape",
+                _fp32(store.load(f"{inner_prefix}.ape")),
+                (CSA_COMPRESS_RATIO, INNER_OUT_DIM),
+            ),
+            "csa_inner_norm_w": lambda: _bf16(store.load(f"{inner_prefix}.norm.weight")),
+        }
+        if name in csa:
+            return csa[name]()
+        if name == "csa_hadamard_idx":
+            hadamard_key = f"{idx_prefix}.hadamard_idx"
+            if store.has(hadamard_key):
+                return _bf16(store.load(hadamard_key))
+            return None
+
+    moe = {
+        "hc_ffn_fn": lambda: _fp32(store.load(f"{base}.hc_ffn_fn")),
+        "hc_ffn_scale": lambda: _fp32(store.load(f"{base}.hc_ffn_scale")),
+        "hc_ffn_base": lambda: _fp32(store.load(f"{base}.hc_ffn_base")),
+        "norm_w": lambda: _bf16(store.load(f"{base}.ffn_norm.weight")),
+        "gate_w": lambda: _fp32(store.load(f"{gate}.weight")[:N_EXPERTS_GLOBAL]),
+        "gate_bias": lambda: (
+            _fp32(store.load(f"{gate}.bias")[:N_EXPERTS_GLOBAL])
+            if store.has(f"{gate}.bias")
+            else torch.zeros((N_EXPERTS_GLOBAL,), dtype=torch.float32)
+        ),
+        "shared_w1": lambda: store.load(f"{ffn}.shared_experts.w1.weight").contiguous().to(torch.int8),
+        "shared_w1_scale": lambda: _fp32(store.load(f"{ffn}.shared_experts.w1.scale")),
+        "shared_w3": lambda: store.load(f"{ffn}.shared_experts.w3.weight").contiguous().to(torch.int8),
+        "shared_w3_scale": lambda: _fp32(store.load(f"{ffn}.shared_experts.w3.scale")),
+        "shared_w2": lambda: store.load(f"{ffn}.shared_experts.w2.weight").contiguous().to(torch.int8),
+        "shared_w2_scale": lambda: _fp32(store.load(f"{ffn}.shared_experts.w2.scale")),
+    }
+    if name in moe:
+        return moe[name]()
+    if name == "tid2eid":
+        tid2eid_key = f"{gate}.tid2eid"
+        if store.has(tid2eid_key):
+            return _lower_tid2eid(store.load(tid2eid_key))
+        return None
+    routed = _load_routed_expert_rank(store, layer_id, rank, name)
+    if routed is not None:
+        return routed
+    return None
+
+
+RankFallback = Callable[[int, str, int], torch.Tensor]
+
+
+def _rank_layer_value(
+    *,
+    root: str | Path,
+    layer_id: int,
+    name: str,
+    rank: int,
+    fallback: RankFallback,
+) -> torch.Tensor:
+    real = load_layer_override_tensor_rank(root, layer_id, name, rank)
+    if real is not None:
+        return real.contiguous()
+    return fallback(layer_id, name, rank).contiguous()
+
+
+def make_rank_flat_init(
+    *,
+    root: str | Path,
+    layer_ids: list[int],
+    name: str,
+    rank: int,
+    fallback: RankFallback,
+) -> Callable[[], torch.Tensor]:
+    def init_value():
+        values = [
+            _rank_layer_value(
+                root=root,
+                layer_id=layer_id,
+                name=name,
+                rank=rank,
+                fallback=fallback,
+            )
+            for layer_id in layer_ids
+        ]
+        return torch.cat(values, dim=0).contiguous()
+
+    return init_value
+
+
+def make_rank_stacked_init(
+    *,
+    root: str | Path,
+    layer_ids: list[int],
+    name: str,
+    rank: int,
+    fallback: RankFallback,
+) -> Callable[[], torch.Tensor]:
+    def init_value():
+        values = [
+            _rank_layer_value(
+                root=root,
+                layer_id=layer_id,
+                name=name,
+                rank=rank,
+                fallback=fallback,
+            )
+            for layer_id in layer_ids
+        ]
+        return torch.stack(values, dim=0).contiguous()
+
+    return init_value
 
 
 def load_layer_overrides(root: str | Path, layer_id: int) -> dict[str, torch.Tensor]:

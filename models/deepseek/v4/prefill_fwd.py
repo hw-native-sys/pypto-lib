@@ -95,7 +95,47 @@ from prefill_layer import (
     prefill_layer_core,
     valid_ratio_reldiff,
 )
-from real_weight_loader import apply_real_weight_overrides, attention_kind_for_layer, layer_inventory
+try:
+    from real_weight_loader import (
+        apply_real_weight_overrides,
+        attention_kind_for_layer,
+        layer_inventory,
+        make_rank_flat_init,
+        make_rank_stacked_init,
+    )
+    _REAL_WEIGHT_LOADER_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - optional real-weight utility path.
+    _REAL_WEIGHT_LOADER_IMPORT_ERROR = exc
+
+    def attention_kind_for_layer(layer_id: int) -> str:
+        ratio = int(MODEL_CONFIG.compress_ratios[layer_id])
+        if ratio == 0:
+            return "swa"
+        if ratio == 4:
+            return "csa"
+        if ratio == 128:
+            return "hca"
+        raise ValueError(f"unsupported compress ratio {ratio} at layer {layer_id}")
+
+    def apply_real_weight_overrides(specs, weight_root: str, layer_id: int):
+        return specs
+
+    def layer_inventory(weight_root: str, layer_id: int):
+        raise RuntimeError(f"real_weight_loader is not available: {_REAL_WEIGHT_LOADER_IMPORT_ERROR}") from _REAL_WEIGHT_LOADER_IMPORT_ERROR
+
+    def make_rank_flat_init(*, root: str, layer_ids: list[int], name: str, rank: int, fallback):
+        def init_value():
+            values = [fallback(layer_id, name, rank).contiguous() for layer_id in layer_ids]
+            return torch.cat(values, dim=0).contiguous()
+
+        return init_value
+
+    def make_rank_stacked_init(*, root: str, layer_ids: list[int], name: str, rank: int, fallback):
+        def init_value():
+            values = [fallback(layer_id, name, rank).contiguous() for layer_id in layer_ids]
+            return torch.stack(values, dim=0).contiguous()
+
+        return init_value
 
 
 DEFAULT_WEIGHT_ROOT = os.environ.get("DSV4_WEIGHT_ROOT", "/data/models/dsv4-flash-w8a8")
@@ -2413,30 +2453,153 @@ def _build_prefill_fwd_rank_specific_specs(
     start_pos: int,
     num_tokens: int,
 ) -> list[TensorSpec | ScalarSpec]:
-    rank_leading_specs = _build_prefill_fwd_rank_local_specs(
-        weight_root=weight_root,
-        start_pos=start_pos,
-        num_tokens=num_tokens,
-    )
-    tensor_specs = [spec for spec in rank_leading_specs if isinstance(spec, TensorSpec)]
+    base_specs = {
+        spec.name: spec
+        for spec in build_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=0)
+        if isinstance(spec, TensorSpec)
+    }
+    fallback_specs_cache: dict[int, dict[str, TensorSpec]] = {}
+
+    def fast_fallback(layer_id: int, name: str) -> torch.Tensor | None:
+        if name not in base_specs:
+            return None
+        spec = base_specs[name]
+        if not spec.shape or int(spec.shape[0]) != N_RANKS:
+            return None
+        shape = list(spec.shape[1:])
+        dtype = spec.dtype
+        kind = attention_kind_for_layer(layer_id)
+        pos = torch.arange(start_pos, start_pos + T, dtype=torch.int64)
+
+        if name == "position_ids":
+            return pos.to(torch.int32)
+        if name == "input_ids":
+            return (torch.arange(T, dtype=torch.int64) % VOCAB).contiguous()
+        if name in {
+            "ori_block_table",
+            "cmp_block_table",
+            "idx_block_table",
+            "hca_compress_state_block_table",
+            "csa_compress_state_block_table",
+            "csa_inner_compress_state_block_table",
+        }:
+            return torch.zeros(shape, dtype=dtype)
+        if name == "ori_slot_mapping":
+            return (pos % BLOCK_SIZE).to(torch.int64)
+        if name in {"hca_state_slot_mapping", "csa_state_slot_mapping", "csa_inner_state_slot_mapping"}:
+            return pos.to(torch.int64)
+        if name in {"hca_cmp_slot_mapping", "csa_cmp_slot_mapping", "csa_idx_slot_mapping"}:
+            out = torch.full(shape, -1, dtype=torch.int64)
+            if kind == "hca" and name == "hca_cmp_slot_mapping":
+                mask = ((pos + 1) % HCA_COMPRESS_RATIO) == 0
+                out[mask] = ((pos[mask] + 1) // HCA_COMPRESS_RATIO) - 1
+            elif kind == "csa" and name in {"csa_cmp_slot_mapping", "csa_idx_slot_mapping"}:
+                mask = ((pos + 1) % CSA_COMPRESS_RATIO) == 0
+                out[mask] = ((pos[mask] + 1) // CSA_COMPRESS_RATIO) - 1
+            return out
+        if name == "cmp_sparse_lens":
+            return torch.clamp(torch.arange(1, T + 1, dtype=torch.int32), max=SPARSE_TOPK)
+        if name == "cmp_sparse_indices":
+            out = torch.full(shape, -1, dtype=torch.int32)
+            for t in range(T):
+                valid = min(t + 1, SPARSE_TOPK)
+                first = t + 1 - valid
+                for k in range(valid):
+                    out[t, k] = BLOCK_SIZE + first + k
+            return out
+        if name in FWD_RANK_SLICED_CACHE_NAMES or name in {
+            "hca_cmp_kv_state",
+            "hca_cmp_score_state",
+            "csa_cmp_kv_state",
+            "csa_cmp_score_state",
+            "csa_inner_kv_state",
+            "csa_inner_score_state",
+            "csa_hadamard_idx",
+        }:
+            return torch.zeros(shape, dtype=dtype)
+        return None
+
+    def fallback(layer_id: int, name: str, rank: int) -> torch.Tensor:
+        fast = fast_fallback(layer_id, name)
+        if fast is not None:
+            return fast.contiguous()
+        # Synthetic metadata/cache fixtures only need to match the attention
+        # kind. Building them through the standalone layer fixture is relatively
+        # expensive, so avoid repeating that work for every real layer.
+        kind = attention_kind_for_layer(layer_id)
+        fixture_layer_id = 0 if kind == "swa" else 2 if kind == "csa" else 3
+        if fixture_layer_id not in fallback_specs_cache:
+            fallback_specs_cache[fixture_layer_id] = {
+                spec.name: spec
+                for spec in build_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=fixture_layer_id)
+                if isinstance(spec, TensorSpec)
+            }
+        spec = fallback_specs_cache[fixture_layer_id][name]
+        value = spec.create_tensor()
+        if not value.shape or int(value.shape[0]) != N_RANKS:
+            raise ValueError(f"{name}: expected leading rank dimension {N_RANKS}, got {list(value.shape)}")
+        return value[rank].clone().contiguous()
+
     out: list[TensorSpec | ScalarSpec] = []
     for rank in range(N_RANKS):
-        for spec in tensor_specs:
-            if not spec.shape or int(spec.shape[0]) != N_RANKS:
-                raise ValueError(f"{spec.name}: expected leading rank dimension {N_RANKS}, got {spec.shape}")
+        for name in HOST_TENSOR_ORDER:
+            if name == "x_next":
+                continue
+            if name == "x_hc":
+                base = base_specs[name]
+                if not base.shape or int(base.shape[0]) != N_RANKS:
+                    raise ValueError(f"{name}: expected leading rank dimension {N_RANKS}, got {base.shape}")
 
-            def init_value(src=spec, rank_i=rank):
-                return src.create_tensor()[rank_i].clone().contiguous()
+                def init_x_hc(src=base, rank_i=rank):
+                    return src.create_tensor()[rank_i].clone().contiguous()
 
+                out.append(
+                    TensorSpec(
+                        f"{name}_rank{rank}",
+                        list(base.shape[1:]),
+                        base.dtype,
+                        init_value=init_x_hc,
+                        is_output=False,
+                    )
+                )
+                continue
+            if name in FWD_HCA_COMPACT_NAMES:
+                layer_ids = list(FWD_HCA_LAYER_IDS) or [0]
+            elif name in FWD_CSA_COMPACT_NAMES:
+                layer_ids = list(FWD_CSA_LAYER_IDS) or [0]
+            else:
+                layer_ids = list(range(PREFILL_FWD_ACTIVE_LAYERS))
+            base = base_specs[name]
+            if not base.shape or int(base.shape[0]) != N_RANKS:
+                raise ValueError(f"{name}: expected leading rank dimension {N_RANKS}, got {base.shape}")
+            if name in FWD_RANK_SLICED_CACHE_NAMES:
+                shape = [len(layer_ids), *base.shape[1:]]
+                init_value = make_rank_stacked_init(
+                    root=weight_root,
+                    layer_ids=layer_ids,
+                    name=name,
+                    rank=rank,
+                    fallback=fallback,
+                )
+            else:
+                shape = [len(layer_ids) * base.shape[1], *base.shape[2:]]
+                init_value = make_rank_flat_init(
+                    root=weight_root,
+                    layer_ids=layer_ids,
+                    name=name,
+                    rank=rank,
+                    fallback=fallback,
+                )
             out.append(
                 TensorSpec(
-                    f"{spec.name}_rank{rank}",
-                    list(spec.shape[1:]),
-                    spec.dtype,
+                    f"{name}_rank{rank}",
+                    shape,
+                    base.dtype,
                     init_value=init_value,
-                    is_output=spec.is_output,
+                    is_output=base.is_output,
                 )
             )
+        out.append(TensorSpec(f"x_out_rank{rank}", [T, HC_MULT, D], torch.bfloat16, is_output=True))
     out.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return out
 
