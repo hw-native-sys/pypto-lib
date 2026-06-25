@@ -554,7 +554,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # so global row = h*BATCH*Q_PER_KV + b*Q_PER_KV + j.
         q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-        k_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH, 1], dtype=pl.FP32)
 
         # inv_rms[b] as a [BATCH, 1] column — applied row-wise to q_proj / k_proj
         # BEFORE QK-norm in both sub-steps below (the control-experiment scale).
@@ -603,14 +602,17 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 q_proj_norm = pl.assemble(
                     q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
                 )
-                # K: same, read once.
+                # K: same, read once. Fold the qk-norm reciprocal (k_inv) into
+                # k_proj_norm HERE too — same as q_inv. RoPE is linear in this per-row
+                # scalar, so applying it in fp32 is bit-exact, and rope then reads
+                # k_proj_norm already fully normed (no k_inv read/mul, k_inv_states gone).
                 k0 = h * HEAD_DIM
                 k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
                 k_g = pl.col_expand_mul(k_chunk, k_norm_w)
-                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
                 k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
                 k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-                k_inv_states = pl.assemble(k_inv_states, k_inv, [h * BATCH, 0])
+                k_g = pl.row_expand_mul(k_g, k_inv)
+                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
             qk_tids[h] = qk_tid_h
 
         # rope GROUPED: NUM_ROPE_GROUPS grids of HEADS_PER_ROPE heads each, depping on
@@ -650,10 +652,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
 
                 kv_col = ki * HEAD_DIM
-                # K carries qk_norm gamma; the per-head qk_inv was folded into qk_norm,
-                # so K needs only k_inv_b here. inv_rms cancels inside qk_norm.
-                k_inv_b = pl.read(k_inv_states, [ki * BATCH + b, 0])
-                k_full = pl.mul(k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM], k_inv_b)
+                # K is already fully qk-normed (gamma + qk_inv folded into qk_norm), so
+                # rope just slices the row and rotates — no per-token scalar.
+                k_full = k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM]
                 k_lo = k_full[:, 0:HALF_DIM]
                 k_hi = k_full[:, HALF_DIM:HEAD_DIM]
                 rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
