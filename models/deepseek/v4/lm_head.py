@@ -20,6 +20,8 @@ routes that shard back to the owner so the owner has full-vocabulary logits for
 token selection.
 """
 
+import sys
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
@@ -28,9 +30,27 @@ from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE
 
 
 # Tensor shapes and loop trip counts are static in the frontend, so the TP
-# world size is a build-time constant. Deployment uses LM_HEAD_TP_SIZE=8; this
-# demo validates on 2 NPUs.
-TP_SIZE = 2
+# world size is a build-time constant. Read --tp at import time. When lm_head is
+# composed into decode_fwd, default to --ep so the EP and LM-head TP worlds match.
+_TP_CHOICES = (2, 4, 8)
+_TP_DEFAULT = 2
+
+
+def _parse_tp_argv():
+    for i, tok in enumerate(sys.argv):
+        if tok == "--tp" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if tok.startswith("--tp="):
+            return int(tok.split("=", 1)[1])
+    for i, tok in enumerate(sys.argv):
+        if tok == "--ep" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if tok.startswith("--ep="):
+            return int(tok.split("=", 1)[1])
+    return _TP_DEFAULT
+
+
+TP_SIZE = _parse_tp_argv()
 
 T = DECODE_TOKENS  # 128 decode tokens.
 D = M.hidden_size  # 4096 hidden size.
@@ -45,23 +65,22 @@ assert D % LM_HEAD_K_CHUNK == 0
 assert D % HIDDEN_COMM_CHUNK == 0
 assert T % T_TILE == 0
 assert VOCAB % TP_SIZE == 0
+assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert TP_SIZE <= LM_HEAD_TP_SIZE
 
 K_BLOCKS = D // LM_HEAD_K_CHUNK  # 32.
 HIDDEN_COMM_BLOCKS = D // HIDDEN_COMM_CHUNK  # 8.
-VOCAB_PER_TP = VOCAB // TP_SIZE  # 64640 when TP_SIZE=2.
-VOCAB_FULL_BLOCKS_PER_TP = VOCAB_PER_TP // VOCAB_CHUNK  # 126 when TP_SIZE=2.
-VOCAB_TAIL = VOCAB_PER_TP % VOCAB_CHUNK  # 128 when TP_SIZE=2.
-VOCAB_BLOCKS_PER_TP = VOCAB_FULL_BLOCKS_PER_TP + (1 if VOCAB_TAIL != 0 else 0)
-VOCAB_PADDED_PER_TP = VOCAB_BLOCKS_PER_TP * VOCAB_CHUNK  # Weight scratch shape.
+VOCAB_PER_TP = VOCAB // TP_SIZE
+VOCAB_FULL_BLOCKS_PER_TP = VOCAB_PER_TP // VOCAB_CHUNK
+VOCAB_TAIL = VOCAB_PER_TP % VOCAB_CHUNK
 
 
 @pl.jit.inline
 def lm_head(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PADDED_PER_TP, D], pl.BF16],
-    logits_shard: pl.Out[pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32]],
-) -> pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32]:
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logits_shard: pl.Out[pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]],
+) -> pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]:
     for t0 in pl.parallel(0, T, T_TILE):
         for ob in pl.parallel(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
@@ -158,7 +177,7 @@ def load_owner_hidden_step(
 
 @pl.jit.incore
 def route_logits_shard_step(
-    logits_shard: pl.Tensor[[T, VOCAB_PADDED_PER_TP], pl.FP32],
+    logits_shard: pl.Tensor[[T, VOCAB_PER_TP], pl.FP32],
     logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
     logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
     owner_rank: pl.Scalar[pl.INT32],
@@ -248,7 +267,7 @@ def finish_logits_step(
 @pl.jit
 def lm_head_tp(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[VOCAB_PADDED_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
@@ -261,7 +280,7 @@ def lm_head_tp(
     publish_hidden_step(hidden_states, hidden_window, hidden_done, my_rank)
 
     for owner_rank in pl.range(TP_SIZE):
-        logits_shard = pl.create_tensor([T, VOCAB_PADDED_PER_TP], dtype=pl.FP32)
+        logits_shard = pl.create_tensor([T, VOCAB_PER_TP], dtype=pl.FP32)
         if owner_rank == my_rank:
             logits_shard = lm_head(hidden_states, lm_head_weight, logits_shard)
             logits = route_logits_shard_step(
@@ -282,7 +301,7 @@ def lm_head_tp(
 @pl.jit.host
 def l3_lm_head(
     hidden_states: pl.Tensor[[TP_SIZE, T, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PADDED_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[TP_SIZE, T, VOCAB], pl.FP32]],
 ):
     hidden_window_buf = pld.alloc_window_buffer(TP_SIZE * T * D * 2)
@@ -317,7 +336,7 @@ def golden_lm_head(tensors):
     for owner_rank in range(hidden.shape[0]):
         shard_logits = []
         for tp_rank in range(weight.shape[0]):
-            shard_weight = weight[tp_rank, :VOCAB_PER_TP]
+            shard_weight = weight[tp_rank]
             shard_logits.append(torch.matmul(hidden[owner_rank], shard_weight.t()))
         full_logits.append(torch.cat(shard_logits, dim=-1))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
@@ -332,17 +351,13 @@ def build_tensor_specs():
         return torch.randn(TP_SIZE, T, D) * 0.1
 
     def init_lm_head_weight():
-        weight = torch.zeros(TP_SIZE, VOCAB_PADDED_PER_TP, D, dtype=torch.bfloat16)
-        weight[:, :VOCAB_PER_TP] = (
-            torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5
-        ).to(torch.bfloat16)
-        return weight
+        return (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
 
     return [
         TensorSpec("hidden_states", [TP_SIZE, T, D], torch.bfloat16, init_value=init_hidden_states),
         TensorSpec(
             "lm_head_weight",
-            [TP_SIZE, VOCAB_PADDED_PER_TP, D],
+            [TP_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
         ),
@@ -357,7 +372,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=str, default="0,1",
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
+                        help="LM-head tensor-parallel world size")
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(TP_SIZE)),
                         help=f"comma-separated device ids; need at least {TP_SIZE}")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
