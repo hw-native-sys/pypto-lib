@@ -58,7 +58,7 @@ D_TILE = 32
 WEIGHTS_ROW_TILE = 32
 B_TILE = 4
 TOPK_TILE = 4
-QH_QUANT_BLOCK = 256
+QH_QUANT_TILE = 256
 QH_QUANT_ROW_TILE = 64
 ROPE_ROW_BLOCK = S * IDX_N_HEADS  # 128 rows = one batch
 ROPE_ROW_TILE = 32
@@ -92,23 +92,24 @@ def indexer(
     offset: pl.Scalar[pl.INT32],
 ):
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
-            q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
-            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            if q0 == 0:
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-            else:
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
-        wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
-            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
-            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
+    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // (2 * Q_OUT_TILE), name_hint="qr_proj"):
+        for nt in pl.range(2):
+            o0 = (idx * 2 + nt) * Q_OUT_TILE
+            qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+                q0 = kb * Q_TILE
+                qr_tile = qr[:, q0 : q0 + Q_TILE]
+                wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+                if q0 == 0:
+                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+                else:
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
+            for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
+                acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+                scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+                qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
+                qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -148,9 +149,9 @@ def indexer(
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_BLOCK, name_hint="qr_hadamard_quant"):
-        o0 = idx * QH_QUANT_BLOCK
-        for ro in pl.range(0, QH_QUANT_BLOCK, QH_QUANT_ROW_TILE):
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant"):
+        o0 = idx * QH_QUANT_TILE
+        for ro in pl.range(0, QH_QUANT_TILE, QH_QUANT_ROW_TILE):
             qh_nope = pl.cast(
                 qr_proj_flat[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM],
                 target_type=pl.BF16,

@@ -962,7 +962,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--golden-data", type=str, default=None,
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
                              "requires an unchanged spec set.")
