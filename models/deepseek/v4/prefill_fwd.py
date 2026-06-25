@@ -117,8 +117,6 @@ def attention_kind_for_layer(layer_id: int) -> str:
 
 
 def _parse_num_layers_argv() -> int:
-    import sys
-
     for i, tok in enumerate(sys.argv):
         if tok == "--num-layers" and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])

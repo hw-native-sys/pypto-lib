@@ -540,8 +540,8 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
 
     # (layer_name, source_spec). Shared state is taken from the active kind (its
     # init is what the active attention + its golden both consume). The hca_/csa_
-    # compressor + indexer params are namespaced from their own kind; cmp_kv and
-    # the idx caches fall back to the owning kind when the active kind lacks them.
+    # compressor + indexer params are namespaced from their own kind; compressed
+    # KV specs prefer the active attention kind and fall back to CSA for SWA.
     attention_specs = [
         ("x_hc", active["x_hc"]),
         ("hc_attn_fn", active["hc_attn_fn"]),
@@ -584,8 +584,8 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
         ("kv_cache", active["kv_cache"]),
         ("ori_block_table", active.get("ori_block_table", swa.get("block_table"))),
         ("ori_slot_mapping", active["ori_slot_mapping"]),
-        ("cmp_kv", csa["cmp_kv"]),
-        ("cmp_block_table", csa["cmp_block_table"]),
+        ("cmp_kv", active.get("cmp_kv", csa["cmp_kv"])),
+        ("cmp_block_table", active.get("cmp_block_table", csa["cmp_block_table"])),
         ("cmp_sparse_indices", active.get("cmp_sparse_indices", swa["cmp_sparse_indices"])),
         ("cmp_sparse_lens", active.get("cmp_sparse_lens", swa["cmp_sparse_lens"])),
         ("idx_kv_cache", csa["idx_kv_cache"]),
