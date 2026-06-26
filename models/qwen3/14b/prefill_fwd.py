@@ -35,6 +35,7 @@ vec-to-vec textract trim machinery on the batch axis. The per-token
 already handles intra-batch sequence-length variation.
 """
 import pypto.language as pl
+from models.shared.specs import init_rand_half, init_proj_weight, init_down_weight, init_ones
 
 from config import (
     ATTN_SCALE,
@@ -718,8 +719,6 @@ def build_tensor_specs(
     if total_tokens <= 0:
         raise ValueError("chunked prefill requires at least one token in the current chunk")
 
-    def init_hidden_states():
-        return torch.rand(total_tokens, hidden_size) - 0.5
 
     def init_seq_lens():
         return seq_lens_values.clone()
@@ -730,17 +729,9 @@ def build_tensor_specs(
     def init_chunk_offsets():
         return chunk_offsets_values.clone()
 
-    def init_rms_weight():
-        return torch.rand(num_layers, hidden_size) - 0.5
 
-    def init_wq():
-        return (torch.rand(num_layers * hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
-    def init_wk():
-        return (torch.rand(num_layers * hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
-    def init_wv():
-        return (torch.rand(num_layers * hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
 
     def init_q_norm_weight():
         return torch.rand(num_layers, head_dim) - 0.5
@@ -748,11 +739,7 @@ def build_tensor_specs(
     def init_k_norm_weight():
         return torch.rand(num_layers, head_dim) - 0.5
 
-    def init_rope_cos():
-        return torch.rand(MAX_SEQ, head_dim) - 0.5
 
-    def init_rope_sin():
-        return torch.rand(MAX_SEQ, head_dim) - 0.5
 
     def init_block_table():
         return torch.arange(num_blocks, dtype=torch.int32)
@@ -773,77 +760,59 @@ def build_tensor_specs(
                 token_idx += 1
         return slots
 
-    def init_k_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
 
-    def init_v_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
 
-    def init_wo():
-        return (torch.rand(num_layers * hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
 
-    def init_post_rms_weight():
-        return torch.ones(num_layers, hidden_size)
 
-    def init_w_gate():
-        return (torch.rand(num_layers * hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
 
-    def init_w_up():
-        return (torch.rand(num_layers * hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
 
-    def init_w_down():
-        return (torch.rand(num_layers * intermediate_size, hidden_size) - 0.5) / intermediate_size ** 0.5
 
-    def init_final_norm_weight():
-        return torch.ones(1, hidden_size)
 
-    def init_lm_head_weight():
-        return (torch.rand(vocab, hidden_size) - 0.5) / hidden_size ** 0.5
 
     return [
         TensorSpec("hidden_states", [total_tokens, hidden_size], torch.bfloat16,
-                   init_value=init_hidden_states),
+                   init_value=init_rand_half(total_tokens, hidden_size)),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("chunk_lens", [batch], torch.int32, init_value=init_chunk_lens),
         TensorSpec("chunk_offsets", [batch], torch.int32, init_value=init_chunk_offsets),
         TensorSpec("input_rms_weight", [num_layers, hidden_size], torch.float32,
-                   init_value=init_rms_weight),
+                   init_value=init_rand_half(num_layers, hidden_size)),
         TensorSpec("wq", [num_layers * hidden_size, hidden_size], torch.bfloat16,
-                   init_value=init_wq),
+                   init_value=init_proj_weight(num_layers * hidden_size, hidden_size, hidden=hidden_size)),
         TensorSpec("wk", [num_layers * hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=init_wk),
+                   init_value=init_proj_weight(num_layers * hidden_size, kv_hidden, hidden=hidden_size)),
         TensorSpec("wv", [num_layers * hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=init_wv),
+                   init_value=init_proj_weight(num_layers * hidden_size, kv_hidden, hidden=hidden_size)),
         TensorSpec("q_norm_weight", [num_layers, head_dim], torch.float32,
                    init_value=init_q_norm_weight),
         TensorSpec("k_norm_weight", [num_layers, head_dim], torch.float32,
                    init_value=init_k_norm_weight),
         TensorSpec("rope_cos", [MAX_SEQ, head_dim], torch.float32,
-                   init_value=init_rope_cos),
+                   init_value=init_rand_half(MAX_SEQ, head_dim)),
         TensorSpec("rope_sin", [MAX_SEQ, head_dim], torch.float32,
-                   init_value=init_rope_sin),
+                   init_value=init_rand_half(MAX_SEQ, head_dim)),
         TensorSpec("block_table", [batch * max_blocks_per_seq], torch.int32,
                    init_value=init_block_table),
         TensorSpec("slot_mapping", [total_tokens], torch.int32,
                    init_value=init_slot_mapping),
         TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=init_k_cache),
+                   init_value=init_rand_half(cache_rows, head_dim)),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=init_v_cache),
+                   init_value=init_rand_half(cache_rows, head_dim)),
         TensorSpec("wo", [num_layers * hidden_size, hidden_size], torch.bfloat16,
-                   init_value=init_wo),
+                   init_value=init_proj_weight(num_layers * hidden_size, hidden_size, hidden=hidden_size)),
         TensorSpec("post_rms_weight", [num_layers, hidden_size], torch.float32,
-                   init_value=init_post_rms_weight),
+                   init_value=init_ones(num_layers, hidden_size)),
         TensorSpec("w_gate", [num_layers * hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=init_w_gate),
+                   init_value=init_proj_weight(num_layers * hidden_size, intermediate_size, hidden=hidden_size)),
         TensorSpec("w_up", [num_layers * hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=init_w_up),
+                   init_value=init_proj_weight(num_layers * hidden_size, intermediate_size, hidden=hidden_size)),
         TensorSpec("w_down", [num_layers * intermediate_size, hidden_size], torch.bfloat16,
-                   init_value=init_w_down),
+                   init_value=init_down_weight(num_layers * intermediate_size, hidden_size, intermediate=intermediate_size)),
         TensorSpec("final_norm_weight", [1, hidden_size], torch.float32,
-                   init_value=init_final_norm_weight),
+                   init_value=init_ones(1, hidden_size)),
         TensorSpec("lm_head_weight", [vocab, hidden_size], torch.bfloat16,
-                   init_value=init_lm_head_weight),
+                   init_value=init_proj_weight(vocab, hidden_size, hidden=hidden_size)),
         TensorSpec("out", [batch, vocab], torch.float32, is_output=True),
     ]
 

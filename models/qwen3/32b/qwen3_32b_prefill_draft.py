@@ -13,6 +13,7 @@ RoPE, KV cache update, causal attention, output projection, post-attention
 RMSNorm, SwiGLU MLP, and the final residual path.
 """
 import pypto.language as pl
+from models.shared.specs import init_rand_half, init_proj_weight, init_down_weight, init_ones
 
 
 # Qwen3-32B model dimensions.
@@ -468,13 +469,12 @@ def build_tensor_specs(
     use_max_seq: bool = False,
 ):
     import torch
-    from pypto.runtime import TensorSpec
+    from golden import TensorSpec
 
     kv_hidden = num_kv_heads * head_dim
     cache_rows = batch * num_kv_heads * max_seq
 
-    def init_hidden_states():
-        return torch.rand(batch, max_seq, hidden_size) - 0.5
+
 
     def init_seq_lens():
         if use_max_seq:
@@ -483,75 +483,36 @@ def build_tensor_specs(
         blocks = torch.randint(1, n_blocks + 1, (batch,), dtype=torch.int32)
         return blocks * TOK_TILE
 
-    def init_rms_weight():
-        return torch.rand(1, hidden_size) - 0.5
-
-    def init_wq():
-        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
-
-    def init_wk():
-        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
-
-    def init_wv():
-        return (torch.rand(hidden_size, kv_hidden) - 0.5) / hidden_size ** 0.5
-
-    def init_rope_cos():
-        return torch.rand(max_seq, head_dim) - 0.5
-
-    def init_rope_sin():
-        return torch.rand(max_seq, head_dim) - 0.5
-
-    def init_k_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
-
-    def init_v_cache():
-        return torch.rand(cache_rows, head_dim) - 0.5
-
-    def init_wo():
-        return (torch.rand(hidden_size, hidden_size) - 0.5) / hidden_size ** 0.5
-
-    def init_post_rms_weight():
-        return torch.ones(1, hidden_size)
-
-    def init_w_gate():
-        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
-
-    def init_w_up():
-        return (torch.rand(hidden_size, intermediate_size) - 0.5) / hidden_size ** 0.5
-
-    def init_w_down():
-        return (torch.rand(intermediate_size, hidden_size) - 0.5) / intermediate_size ** 0.5
-
     return [
         TensorSpec("hidden_states", [batch, max_seq, hidden_size], torch.bfloat16,
-                   init_value=init_hidden_states),
+                   init_value=init_rand_half(batch, max_seq, hidden_size)),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("input_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=init_rms_weight),
+                   init_value=init_rand_half(1, hidden_size)),
         TensorSpec("wq", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=init_wq),
+                   init_value=init_proj_weight(hidden_size, hidden_size, hidden=hidden_size)),
         TensorSpec("wk", [hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=init_wk),
+                   init_value=init_proj_weight(hidden_size, kv_hidden, hidden=hidden_size)),
         TensorSpec("wv", [hidden_size, kv_hidden], torch.bfloat16,
-                   init_value=init_wv),
+                   init_value=init_proj_weight(hidden_size, kv_hidden, hidden=hidden_size)),
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32,
-                   init_value=init_rope_cos),
+                   init_value=init_rand_half(max_seq, head_dim)),
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32,
-                   init_value=init_rope_sin),
+                   init_value=init_rand_half(max_seq, head_dim)),
         TensorSpec("k_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=init_k_cache),
+                   init_value=init_rand_half(cache_rows, head_dim)),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
-                   init_value=init_v_cache),
+                   init_value=init_rand_half(cache_rows, head_dim)),
         TensorSpec("wo", [hidden_size, hidden_size], torch.bfloat16,
-                   init_value=init_wo),
+                   init_value=init_proj_weight(hidden_size, hidden_size, hidden=hidden_size)),
         TensorSpec("post_rms_weight", [1, hidden_size], torch.float32,
-                   init_value=init_post_rms_weight),
+                   init_value=init_ones(1, hidden_size)),
         TensorSpec("w_gate", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=init_w_gate),
+                   init_value=init_proj_weight(hidden_size, intermediate_size, hidden=hidden_size)),
         TensorSpec("w_up", [hidden_size, intermediate_size], torch.bfloat16,
-                   init_value=init_w_up),
+                   init_value=init_proj_weight(hidden_size, intermediate_size, hidden=hidden_size)),
         TensorSpec("w_down", [intermediate_size, hidden_size], torch.bfloat16,
-                   init_value=init_w_down),
+                   init_value=init_down_weight(intermediate_size, hidden_size, intermediate=intermediate_size)),
         TensorSpec("out", [batch, max_seq, hidden_size], torch.bfloat16, is_output=True),
     ]
 
@@ -747,16 +708,34 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"]
+        "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5"]
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False, help="set all seq_lens to MAX_SEQ")
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="compile-only (no device); also the implicit behavior on *sim platforms.")
     args = parser.parse_args()
+
+    specs = build_tensor_specs(use_max_seq=args.max_seq)
+
+    # Compile-only smoke: explicit --smoke (not sim platform — sim runs full pipeline).
+    if args.smoke:
+        result = run(
+            program=build_prefill_scope123_program(),
+            specs=specs,
+            compile_cfg=dict(dump_passes=True),
+            compile_only=True,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        raise SystemExit(0)
 
     result = run(
         program=build_prefill_scope123_program(),
-        specs=build_tensor_specs(use_max_seq=args.max_seq),
+        specs=specs,
         golden_fn=golden_prefill_scope123,
         compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(

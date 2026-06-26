@@ -28,6 +28,11 @@ Scope 3:
 """
 
 import pypto.language as pl
+from models.shared.rmsnorm import rmsnorm
+from models.shared.matmul import matmul_tiled
+from models.shared.specs import build_qwen3_decode_specs
+from models.shared.golden_ref import golden_decode_scope1, golden_decode_scope2, golden_decode_scope3
+from models.shared.silu import silu_activation
 
 
 BATCH = 16
@@ -113,50 +118,35 @@ def build_qwen3_decode_program():
             # ── Scope 1: input RMSNorm + Q/K/V projection ──
             normed_states = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm"):
-                partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-                    k0 = kb * RMSNORM_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-                    partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]))
-                variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
-                inv_rms = pl.recip(pl.sqrt(variance))
-                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
-                    k0 = kb * RMSNORM_K_CHUNK
-                    x_chunk = pl.cast(hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK], target_type=pl.FP32)
-                    gamma = input_rms_weight[:, k0 : k0 + RMSNORM_K_CHUNK]
-                    normed = pl.col_expand_mul(pl.row_expand_mul(x_chunk, inv_rms), gamma)
-                    normed_states = pl.assemble(normed_states, pl.cast(normed, target_type=pl.BF16), [0, k0])
+                normed_states = rmsnorm(
+                    hidden_states, input_rms_weight, normed_states, 0,
+                    rows=BATCH, k_chunk=RMSNORM_K_CHUNK,
+                    eps=EPS, hidden=HIDDEN,
+                )
 
             # Q projection.
             for qi in pl.spmd(Q_OUT_BLOCKS, name_hint="q_proj"):
                 q0 = qi * Q_OUT_CHUNK
-                q_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
-                for kb in pl.pipeline(0, HIDDEN // Q_PROJ_K_CHUNK, stage=2):
-                    k0 = kb * Q_PROJ_K_CHUNK
-                    tile_a_i = normed_states[:, k0 : k0 + Q_PROJ_K_CHUNK]
-                    tile_b_i = wq[k0 : k0 + Q_PROJ_K_CHUNK, q0 : q0 + Q_OUT_CHUNK]
-                    if k0 == 0:
-                        q_acc = pl.matmul(tile_a_i, tile_b_i, out_dtype=pl.FP32)
-                    else:
-                        q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_b_i)
+                q_acc = matmul_tiled(
+                    normed_states, wq, q0,
+                    m=BATCH, k_chunk=Q_PROJ_K_CHUNK, n_chunk=Q_OUT_CHUNK,
+                    k_blocks=HIDDEN // Q_PROJ_K_CHUNK, stages=2,
+                )
                 q_proj = pl.assemble(q_proj, q_acc, [0, q0])
 
             # K/V projection.
             for kvi in pl.spmd(KV_OUT_BLOCKS, name_hint="kv_proj"):
                 kv0 = kvi * KV_OUT_CHUNK
-                k_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
-                v_acc = pl.create_tensor([BATCH, KV_OUT_CHUNK], dtype=pl.FP32)
-                for kb in pl.pipeline(0, HIDDEN // KV_PROJ_K_CHUNK, stage=2):
-                    k0 = kb * KV_PROJ_K_CHUNK
-                    tile_a_i = normed_states[:, k0 : k0 + KV_PROJ_K_CHUNK]
-                    tile_wk_i = wk[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    tile_wv_i = wv[k0 : k0 + KV_PROJ_K_CHUNK, kv0 : kv0 + KV_OUT_CHUNK]
-                    if k0 == 0:
-                        k_acc = pl.matmul(tile_a_i, tile_wk_i, out_dtype=pl.FP32)
-                        v_acc = pl.matmul(tile_a_i, tile_wv_i, out_dtype=pl.FP32)
-                    else:
-                        k_acc = pl.matmul_acc(k_acc, tile_a_i, tile_wk_i)
-                        v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
+                k_acc = matmul_tiled(
+                    normed_states, wk, kv0,
+                    m=BATCH, k_chunk=KV_PROJ_K_CHUNK, n_chunk=KV_OUT_CHUNK,
+                    k_blocks=HIDDEN // KV_PROJ_K_CHUNK, stages=2,
+                )
+                v_acc = matmul_tiled(
+                    normed_states, wv, kv0,
+                    m=BATCH, k_chunk=KV_PROJ_K_CHUNK, n_chunk=KV_OUT_CHUNK,
+                    k_blocks=HIDDEN // KV_PROJ_K_CHUNK, stages=2,
+                )
                 k_proj = pl.assemble(k_proj, k_acc, [0, kv0])
                 v_proj = pl.assemble(v_proj, v_acc, [0, kv0])
 
@@ -335,15 +325,11 @@ def build_qwen3_decode_program():
                     for oi in pl.range(ob, ob + 2):
                         o0 = oi * Q_OUT_CHUNK
                         hidden_chunk = hidden_states[:, o0 : o0 + Q_OUT_CHUNK]
-                        o_acc = pl.create_tensor([BATCH, Q_OUT_CHUNK], dtype=pl.FP32)
-                        for kb in pl.pipeline(0, HIDDEN // OUT_PROJ_K_CHUNK, stage=2):
-                            k0 = kb * OUT_PROJ_K_CHUNK
-                            a_chunk = attn_out[:, k0 : k0 + OUT_PROJ_K_CHUNK]
-                            w_chunk = wo[k0 : k0 + OUT_PROJ_K_CHUNK, o0 : o0 + Q_OUT_CHUNK]
-                            if k0 == 0:
-                                o_acc = pl.matmul(a_chunk, w_chunk, out_dtype=pl.FP32)
-                            else:
-                                o_acc = pl.matmul_acc(o_acc, a_chunk, w_chunk)
+                        o_acc = matmul_tiled(
+                            attn_out, wo, o0,
+                            m=BATCH, k_chunk=OUT_PROJ_K_CHUNK, n_chunk=Q_OUT_CHUNK,
+                            k_blocks=HIDDEN // OUT_PROJ_K_CHUNK, stages=2,
+                        )
                         resid = pl.cast(hidden_chunk, target_type=pl.FP32)
                         resid_sum = pl.add(o_acc, resid)
                         resid1_tile = pl.assemble(resid1_tile, resid_sum, [0, o0])
@@ -378,16 +364,11 @@ def build_qwen3_decode_program():
                     post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                     post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
                     wg_0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    gate_acc = pl.matmul(post_chunk_0, wg_0, out_dtype=pl.FP32)
-
-                    wg_1 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                    gate_acc = pl.matmul_acc(gate_acc, post_chunk_1, wg_1)
-
-                    for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
-                        k0 = kb * K_CHUNK
-                        post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        wg = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        gate_acc = pl.matmul_acc(gate_acc, post_chunk, wg)
+                    gate_acc = matmul_tiled(
+                        post_norm_tile, w_gate, o0,
+                        m=BATCH, k_chunk=K_CHUNK, n_chunk=MLP_OUT_CHUNK,
+                        k_blocks=HIDDEN_BLOCKS, stages=2,
+                    )
                     gate_group = pl.assemble(gate_group, gate_acc, [0, g0])
 
                 # Stage 5: up projection.
@@ -397,16 +378,11 @@ def build_qwen3_decode_program():
                     post_chunk_0 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, 0])
                     post_chunk_1 = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, K_CHUNK])
                     wu_0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [0, o0])
-                    up_acc = pl.matmul(post_chunk_0, wu_0, out_dtype=pl.FP32)
-
-                    wu_1 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [K_CHUNK, o0])
-                    up_acc = pl.matmul_acc(up_acc, post_chunk_1, wu_1)
-
-                    for kb in pl.pipeline(2, HIDDEN_BLOCKS, stage=2):
-                        k0 = kb * K_CHUNK
-                        post_chunk = pl.slice(post_norm_tile, [BATCH_TILE, K_CHUNK], [0, k0])
-                        wu = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [k0, o0])
-                        up_acc = pl.matmul_acc(up_acc, post_chunk, wu)
+                    up_acc = matmul_tiled(
+                        post_norm_tile, w_up, o0,
+                        m=BATCH, k_chunk=K_CHUNK, n_chunk=MLP_OUT_CHUNK,
+                        k_blocks=HIDDEN_BLOCKS, stages=2,
+                    )
                     up_group = pl.assemble(up_group, up_acc, [0, g0])
 
                 # Stage 6: SiLU + gate/up fuse.
@@ -415,8 +391,7 @@ def build_qwen3_decode_program():
                     g0 = ob * MLP_OUT_CHUNK
                     gate_acc = pl.slice(gate_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
                     up_acc = pl.slice(up_group, [BATCH_TILE, MLP_OUT_CHUNK], [0, g0])
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_acc)), 1.0))
-                    mlp_chunk = pl.mul(pl.mul(gate_acc, sigmoid), up_acc)
+                    mlp_chunk = silu_activation(gate_acc, up_acc)
                     mlp_chunk_bf16 = pl.cast(mlp_chunk, target_type=pl.BF16)
                     mlp_tile = pl.assemble(mlp_tile, mlp_chunk_bf16, [0, o0])
 
@@ -426,15 +401,11 @@ def build_qwen3_decode_program():
                     for di in pl.range(db, db + 2):
                         d0 = di * DOWN_N_CHUNK
                         resid1_tile_chunk = resid1_tile[:, d0 : d0 + DOWN_N_CHUNK]
-                        down_acc = pl.create_tensor([BATCH, DOWN_N_CHUNK], dtype=pl.FP32)
-                        for ob in pl.pipeline(0, INTERMEDIATE // DOWN_K_CHUNK, stage=2):
-                            o0 = ob * DOWN_K_CHUNK
-                            down_mlp_chunk = mlp_tile[:, o0 : o0 + DOWN_K_CHUNK]
-                            w_down_chunk = w_down[o0 : o0 + DOWN_K_CHUNK, d0 : d0 + DOWN_N_CHUNK]
-                            if o0 == 0:
-                                down_acc = pl.matmul(down_mlp_chunk, w_down_chunk, out_dtype=pl.FP32)
-                            else:
-                                down_acc = pl.matmul_acc(down_acc, down_mlp_chunk, w_down_chunk)
+                        down_acc = matmul_tiled(
+                            mlp_tile, w_down, d0,
+                            m=BATCH, k_chunk=DOWN_K_CHUNK, n_chunk=DOWN_N_CHUNK,
+                            k_blocks=INTERMEDIATE // DOWN_K_CHUNK, stages=2,
+                        )
                         out_chunk = pl.add(down_acc, resid1_tile_chunk)
                         out = pl.assemble(out, pl.cast(out_chunk, target_type=pl.BF16), [0, d0])
 
@@ -444,77 +415,56 @@ def build_qwen3_decode_program():
 
 
 def build_tensor_specs(use_max_seq: bool = False):
-    import torch
-    from golden import TensorSpec
-
-    def init_hidden_states():
-        return torch.rand(BATCH, HIDDEN) - 0.5
-
-    def init_rms_weight():
-        return torch.rand(1, HIDDEN) - 0.5
-
-    def init_wq():
-        return torch.rand(HIDDEN, HIDDEN) / HIDDEN ** 0.5
-
-    def init_wk():
-        return torch.rand(HIDDEN, KV_HIDDEN) / HIDDEN ** 0.5
-
-    def init_wv():
-        return torch.rand(HIDDEN, KV_HIDDEN) / HIDDEN ** 0.5
-
-    def init_seq_lens():
-        if use_max_seq:
-            return torch.full((BATCH,), MAX_SEQ, dtype=torch.int32)
-        return torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
-
-    def init_rope_cos():
-        return torch.rand(MAX_SEQ, HEAD_DIM) - 0.5
-
-    def init_rope_sin():
-        return torch.rand(MAX_SEQ, HEAD_DIM) - 0.5
-
-    def init_k_cache():
-        return torch.rand(CACHE_ROWS, HEAD_DIM) - 0.5
-
-    def init_v_cache():
-        return torch.rand(CACHE_ROWS, HEAD_DIM) - 0.5
-
-    def init_wo():
-        return (torch.rand(HIDDEN, HIDDEN) - 0.5) / HIDDEN ** 0.5
-
-    def init_post_rms_weight():
-        return torch.ones(1, HIDDEN)
-
-    def init_w_gate():
-        return (torch.rand(HIDDEN, INTERMEDIATE) - 0.5) / HIDDEN ** 0.5
-
-    def init_w_up():
-        return (torch.rand(HIDDEN, INTERMEDIATE) - 0.5) / HIDDEN ** 0.5
-
-    def init_w_down():
-        return (torch.rand(INTERMEDIATE, HIDDEN) - 0.5) / INTERMEDIATE ** 0.5
-
-    return [
-        TensorSpec("hidden_states", [BATCH, HIDDEN], torch.bfloat16, init_value=init_hidden_states),
-        TensorSpec("input_rms_weight", [1, HIDDEN], torch.float32, init_value=init_rms_weight),
-        TensorSpec("wq", [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_wq),
-        TensorSpec("wk", [HIDDEN, KV_HIDDEN], torch.bfloat16, init_value=init_wk),
-        TensorSpec("wv", [HIDDEN, KV_HIDDEN], torch.bfloat16, init_value=init_wv),
-        TensorSpec("seq_lens", [BATCH], torch.int32, init_value=init_seq_lens),
-        TensorSpec("rope_cos", [MAX_SEQ, HEAD_DIM], torch.float32, init_value=init_rope_cos),
-        TensorSpec("rope_sin", [MAX_SEQ, HEAD_DIM], torch.float32, init_value=init_rope_sin),
-        TensorSpec("k_cache", [CACHE_ROWS, HEAD_DIM], torch.bfloat16, init_value=init_k_cache),
-        TensorSpec("v_cache", [CACHE_ROWS, HEAD_DIM], torch.bfloat16, init_value=init_v_cache),
-        TensorSpec("wo", [HIDDEN, HIDDEN], torch.bfloat16, init_value=init_wo),
-        TensorSpec("post_rms_weight", [1, HIDDEN], torch.float32, init_value=init_post_rms_weight),
-        TensorSpec("w_gate", [HIDDEN, INTERMEDIATE], torch.bfloat16, init_value=init_w_gate),
-        TensorSpec("w_up", [HIDDEN, INTERMEDIATE], torch.bfloat16, init_value=init_w_up),
-        TensorSpec("w_down", [INTERMEDIATE, HIDDEN], torch.bfloat16, init_value=init_w_down),
-        TensorSpec("out", [BATCH, HIDDEN], torch.bfloat16, is_output=True),
-    ]
+    return build_qwen3_decode_specs(
+        batch=BATCH, max_seq=MAX_SEQ, hidden=HIDDEN,
+        num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
+        intermediate=INTERMEDIATE, use_max_seq=use_max_seq,
+    )
 
 
 def golden_qwen3_decode(tensors):
+    """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
+    import math
+
+    hidden_states = tensors["hidden_states"]
+    input_rms_weight = tensors["input_rms_weight"]
+    wq = tensors["wq"]
+    wk = tensors["wk"]
+    wv = tensors["wv"]
+    seq_lens = tensors["seq_lens"]
+    rope_cos = tensors["rope_cos"]
+    rope_sin = tensors["rope_sin"]
+    k_cache = tensors["k_cache"]
+    v_cache = tensors["v_cache"]
+    wo = tensors["wo"]
+    post_rms_weight = tensors["post_rms_weight"]
+    w_gate = tensors["w_gate"]
+    w_up = tensors["w_up"]
+    w_down = tensors["w_down"]
+
+    attn_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    # ── Scope 1: RMSNorm + Q/K/V projection ──
+    _, q_proj, k_proj, v_proj = golden_decode_scope1(
+        hidden_states, input_rms_weight, wq, wk, wv,
+        hidden=HIDDEN, eps=EPS,
+    )
+
+    # ── Scope 2: RoPE + cache update + attention ──
+    attn_out = golden_decode_scope2(
+        q_proj, k_proj, v_proj, k_cache, v_cache, seq_lens,
+        rope_cos, rope_sin,
+        batch=BATCH, num_heads=NUM_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM, max_seq=MAX_SEQ, seq_tile=SEQ_TILE,
+        q_per_kv=Q_PER_KV, q_head_batch=Q_HEAD_BATCH,
+        attn_scale=attn_scale,
+    )
+
+    # ── Scope 3: output projection + residual + post RMSNorm + MLP + residual ──
+    tensors["out"][:] = golden_decode_scope3(
+        attn_out, hidden_states, wo, post_rms_weight, w_gate, w_up, w_down,
+        hidden=HIDDEN, eps=EPS,
+    )
     """PyTorch reference: scope1 (RMSNorm + projection), scope2 (attention), scope3 (output + MLP)."""
     import math
 
@@ -647,11 +597,29 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--max-seq", action="store_true", default=False)
+    parser.add_argument("--smoke", action="store_true", default=False,
+                        help="compile-only (no device)")
     args = parser.parse_args()
+
+    specs = build_tensor_specs(use_max_seq=args.max_seq)
+
+    # Compile-only smoke.
+    if args.smoke:
+        result = run(
+            program=build_qwen3_decode_program(),
+            specs=specs,
+            compile_cfg=dict(dump_passes=True),
+            compile_only=True,
+        )
+        if not result.passed:
+            if result.error:
+                print(result.error)
+            raise SystemExit(1)
+        raise SystemExit(0)
 
     result = run(
         program=build_qwen3_decode_program(),
-        specs=build_tensor_specs(use_max_seq=args.max_seq),
+        specs=specs,
         golden_fn=golden_qwen3_decode,
         compile_cfg=dict(dump_passes=True),
         runtime_cfg=dict(
