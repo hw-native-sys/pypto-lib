@@ -19,10 +19,7 @@ jobs:
         platform: [a2a3sim, a5sim]
     env:
       PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTOAS_VERSION: v0.45
-      PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
-      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -52,6 +49,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve toolchain + clone pypto
+        # Clone the pypto we build against ONCE here (job-private /tmp — this CPU
+        # host runs the a2a3sim/a5sim matrix concurrently, so a shared tree would
+        # corrupt). The Build step below reuses this checkout, so the toolchain
+        # pins and the installed pypto are always the same revision. pypto owns
+        # ptoas (toolchain/versions.env) and pins pto-isa via its runtime submodule
+        # (runtime/pto_isa.pin); read both.
+        run: |
+          rm -rf /tmp/pypto
+          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
+          {
+            grep -E '^PTOAS_VERSION=' /tmp/pypto/toolchain/versions.env
+            echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' /tmp/pypto/toolchain/versions.env)"
+            echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < /tmp/pypto/runtime/pto_isa.pin)"
+          } >> "$GITHUB_ENV"
+
       # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
       # stale objects compiled against the old ISA headers (see issue #1139):
       # a different commit hashes to a different key, forcing a real recompile.
@@ -70,17 +83,11 @@ jobs:
           git checkout ${{ env.PTO_ISA_COMMIT }}
 
       - name: Build and install pypto and simpler
-        # Clone pypto fresh into the job-private /tmp rather than a shared cache
-        # dir: this CPU host runs several runners (cpu-1..4), so the
-        # [a2a3sim, a5sim] matrix lands two jobs here at once. A shared git tree
-        # would let them corrupt each other's checkout (and clash with the a2a3
-        # host job's ci-runner-owned pypto-src). The mounted, concurrency-safe
-        # ccache keeps the rebuild fast despite the re-clone.
+        # Reuses /tmp/pypto cloned by the resolve step above (same revision the
+        # toolchain pins were read from).
         run: |
           python -m pip install --upgrade pip
           pip install scikit-build-core nanobind cmake ninja
-          rm -rf /tmp/pypto
-          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
           pip install --no-build-isolation /tmp/pypto
           pip install --no-build-isolation /tmp/pypto/runtime
 
@@ -190,10 +197,7 @@ jobs:
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
-      PTOAS_VERSION: v0.45
-      PTOAS_SHA256: d5e4380df7edd4d3eeb23502d57f923e4c912345eccceb5a9a0ec1aac3b5e7d4
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      PTO_ISA_COMMIT: b9122ec586b5a7b4b686ca7498874a1c94b3573c
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -213,6 +217,31 @@ jobs:
         with:
           path: dist-checkout
           persist-credentials: false
+
+      - name: Resolve toolchain + sync pypto source
+        # Sync the cached pypto checkout ONCE here; the Build step below reuses it,
+        # so the toolchain pins and the installed pypto are always the same
+        # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
+        # its runtime submodule (runtime/pto_isa.pin); read both.
+        run: |
+          PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
+          if [ -d "$PYPTO_SRC/.git" ]; then
+            echo "Cache hit — updating pypto"
+            git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD
+            git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+            git -C "$PYPTO_SRC" clean -ffdx
+            git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+          else
+            echo "Cache miss — cloning pypto"
+            git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"
+          fi
+          git -C "$PYPTO_SRC" submodule update --init --recursive
+          rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+          {
+            grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
+            echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env")"
+            echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
+          } >> "$GITHUB_ENV"
 
       - name: Check NPU
         working-directory: .
@@ -253,29 +282,12 @@ jobs:
       - name: Show ccache stats (before)
         run: ccache -s || true
 
-      - name: Sync pypto source (local cache)
+      - name: Build and install pypto and simpler
+        # Reuses the pypto source synced by the resolve step above (same revision
+        # the toolchain pins were read from).
         run: |
           source activate.sh
           PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
-          if [ -d "$PYPTO_SRC/.git" ]; then
-            echo "Cache hit — updating pypto"
-            git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD
-            git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-            git -C "$PYPTO_SRC" clean -ffdx
-            git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-          else
-            echo "Cache miss — cloning pypto"
-            git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"
-          fi
-          git -C "$PYPTO_SRC" submodule update --init --recursive
-          rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild"
-          test ! -e "$PYPTO_SRC/build" && test ! -e "$PYPTO_SRC/_skbuild" \
-            && echo "OK: pypto build removed" \
-            || { echo "FAIL: pypto build dirs still exist"; exit 1; }
-          rm -rf "$PYPTO_SRC/runtime/build"
-          test ! -e "$PYPTO_SRC/runtime/build" \
-            && echo "OK: runtime build removed" \
-            || { echo "FAIL: runtime build dir still exists"; exit 1; }
           python -m pip install --upgrade pip
           pip install scikit-build-core nanobind cmake ninja
           pip install --no-build-isolation "$PYPTO_SRC"
