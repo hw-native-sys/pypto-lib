@@ -204,7 +204,7 @@ def qkv_proj_rope(
     q_proj_i32 = pl.create_tensor([t_dim, H * HEAD_DIM], dtype=pl.INT32)
     for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // QPROJ_MM_GROUP, name_hint="qproj_matmul"):
         hg = hg_idx * QPROJ_MM_GROUP
-        for h_inner in pl.pipeline(QPROJ_MM_GROUP, stage=2):
+        for h_inner in pl.range(QPROJ_MM_GROUP):
             w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
             for tc in pl.range(t_dim // QPROJ_M_TILE):
                 t0 = tc * QPROJ_M_TILE
@@ -220,7 +220,7 @@ def qkv_proj_rope(
 
     for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj_dequant"):
         hg = hg_idx * 16
-        for h_inner in pl.pipeline(16, stage=2):
+        for h_inner in pl.range(16):
             w_col0 = (hg + h_inner) * Q_PROJ_OUT_TILE
             w_scale = pl.reshape(wq_b_scale[w_col0 : w_col0 + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
             for tc in pl.pipeline(0, t_dim, DEQUANT_T_TILE, stage=2):
