@@ -549,6 +549,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -557,6 +558,7 @@ if __name__ == "__main__":
         golden_fn=golden_attention_swa,
         runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

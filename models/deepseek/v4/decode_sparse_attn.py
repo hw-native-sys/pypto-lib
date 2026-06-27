@@ -891,6 +891,7 @@ if __name__ == "__main__":
                         help="Capture PTO2 dependency edges (deps.json); the swimlane "
                              "converter draws fanout/fanin arrows from the sibling file.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     compress_ratio = args.compress_ratio
@@ -908,6 +909,7 @@ if __name__ == "__main__":
         ),
         golden_fn=golden_sparse_attn,
         golden_data=args.golden_data,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

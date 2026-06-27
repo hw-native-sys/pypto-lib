@@ -875,6 +875,7 @@ if __name__ == "__main__":
                              "instead of regenerating inputs + recomputing golden.")
     parser.add_argument("--log-level", type=str, default=None,
                         help="runtime log threshold: debug, v0..v9, info, warn, error, null")
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -891,6 +892,7 @@ if __name__ == "__main__":
             golden_data=golden_data,
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
+            compile_cfg=dict(dump_passes=args.dump_passes),
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=device_ids[0],
@@ -912,6 +914,7 @@ if __name__ == "__main__":
             compile_only=args.compile_only,
             runtime_dir=args.runtime_dir,
             compile_cfg=dict(
+                dump_passes=args.dump_passes,
                 distributed_config=DistributedConfig(
                     device_ids=device_ids,
                     num_sub_workers=0,

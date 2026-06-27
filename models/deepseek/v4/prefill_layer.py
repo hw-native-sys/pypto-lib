@@ -962,6 +962,7 @@ if __name__ == "__main__":
                         help="Fixture active token count (q_len), capped by T.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -973,6 +974,7 @@ if __name__ == "__main__":
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         compile_cfg=dict(
+            dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:N_RANKS],
                 num_sub_workers=0,

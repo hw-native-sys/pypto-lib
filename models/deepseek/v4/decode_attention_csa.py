@@ -966,6 +966,7 @@ if __name__ == "__main__":
     parser.add_argument("--golden-data", type=str, default=None,
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
                              "requires an unchanged spec set.")
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
@@ -973,6 +974,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_csa,
         golden_data=args.golden_data,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

@@ -379,6 +379,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     device_ids = [int(d) for d in args.device.split(",")]
@@ -393,6 +394,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
+            dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(
                 device_ids=device_ids[:TP_SIZE],
                 num_sub_workers=0,

@@ -272,6 +272,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
@@ -279,6 +280,7 @@ if __name__ == "__main__":
         fn=mtp_projection,
         specs=build_tensor_specs(),
         golden_fn=golden_mtp_projection,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

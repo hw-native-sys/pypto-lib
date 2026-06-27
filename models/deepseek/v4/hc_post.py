@@ -141,6 +141,7 @@ if __name__ == "__main__":
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
@@ -152,6 +153,7 @@ if __name__ == "__main__":
             fn=hc_post_test,
             specs=build_tensor_specs(B, S),
             golden_fn=golden_hc_post,
+            compile_cfg=dict(dump_passes=args.dump_passes),
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,

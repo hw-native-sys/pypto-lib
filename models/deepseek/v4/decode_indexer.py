@@ -650,6 +650,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     # topk_pair_compare expects a tensor whose [..., i] entry is the score paired
@@ -678,6 +679,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_indexer,
         runtime_dir=args.runtime_dir,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

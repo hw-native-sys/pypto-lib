@@ -266,6 +266,7 @@ if __name__ == "__main__":
     # Int mode (0=off; 1=timing only, most accurate; 2=timing + dep graph, two runs).
     # `nargs="?"` so a bare `--enable-l2-swimlane` -> mode 1 (int, not bool True).
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
@@ -274,7 +275,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(),
         golden_fn=golden_hc_head,
         compile_cfg=dict(
-            dump_passes=True,
+            dump_passes=args.dump_passes,
         ),
         runtime_cfg=dict(
             platform=args.platform,

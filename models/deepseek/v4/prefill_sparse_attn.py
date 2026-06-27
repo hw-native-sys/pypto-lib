@@ -635,12 +635,14 @@ if __name__ == "__main__":
                         choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--enable-l2-swimlane", nargs="?", const=4, default=0, type=int)
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio),
         golden_fn=golden_prefill_sparse_attn,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

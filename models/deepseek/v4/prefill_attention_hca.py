@@ -758,6 +758,7 @@ if __name__ == "__main__":
                         help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
     compare_tokens = args.num_tokens
 
@@ -768,6 +769,7 @@ if __name__ == "__main__":
             args.num_tokens,
         ),
         golden_fn=golden_prefill_attention_hca,
+        compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
