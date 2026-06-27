@@ -826,8 +826,9 @@ def l3_prefill_fwd(
 
 
 # ---------------------------------------------------------------------------
-# Fixtures (kernel-only smoke path: no golden).  Stacked weights are zeros;
-# only routing metadata, slot mappings and tid2eid carry meaningful values.
+# Fixtures (kernel-only smoke path: no golden).  Stacked weights reuse each
+# layer's standalone attention/moe init; routing metadata, slot mappings and
+# tid2eid carry meaningful values.
 # ---------------------------------------------------------------------------
 def _layer_count(name):
     if name in CSA_LAYER_STACKED_NAMES:
@@ -856,7 +857,8 @@ def _make_stacked_spec(name, base_specs):
                 rows.append((token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL)
             packed = torch.cat(rows, dim=0)
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-        return torch.zeros(packed_shape, dtype=spec.dtype)
+        base_init = spec.init_value
+        return torch.cat([base_init() for _ in range(count)], dim=1)
 
     return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value, is_output=False)
 
@@ -1039,7 +1041,7 @@ def main():
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
