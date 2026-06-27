@@ -22,7 +22,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn_swa import sparse_attn_swa, ATTN_K_TILE, PADDED_TOPK, TOPK, NEG_INF
+from decode_sparse_attn_swa import sparse_attn_swa, ATTN_K_TILE, PADDED_TOPK, NEG_INF
 
 
 # model config
