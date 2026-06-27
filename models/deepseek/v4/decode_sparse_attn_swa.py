@@ -154,11 +154,12 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
 
 # SWA sparse-K width: sliding window only.
 TOPK = WIN
-# SWA's sparse window (TOPK = WIN keys) fits a single ATTN_K_TILE block, so use
-# one block directly -- no all-invalid 2nd block and no cross-block softmax
-# merge. (Supersedes the old floor-to-2 single-block-miscompile workaround;
-# validated bit-exact across all decode fixtures.)
-SPARSE_BLOCKS = 1
+# ZERO-GATHER attends TWO blocks: block 0 = the ring page (historical sliding window),
+# block 1 = the mtp_kv_overlay tensor (current MTP tokens). Unlike the old gather path
+# (which folded the overlay INTO the single window block via gather_row), the page and
+# the overlay are separate physical GM slices, so they need separate blocks and a
+# cross-block online-softmax merge -- hence 2, not 1.
+SPARSE_BLOCKS = 2
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
 # ZERO-GATHER contract: qk_pv reads the ring page (block 0) and the whole mtp_kv_overlay
@@ -275,6 +276,23 @@ def sparse_attn_swa(
             m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
+
+            # ZERO-GATHER attends 2 blocks (ring page + overlay); online-merge block 1
+            # (the current-MTP overlay) into block 0 before the sink-norm. The
+            # single-block decode path dropped this loop; without it the overlay tokens
+            # are computed in qk_pv but never reach the output.
+            if SPARSE_BLOCKS > 1:
+                for m_sb in pl.range(1, SPARSE_BLOCKS):
+                    m_row = m_blk_base + m_sb * H_TILE
+                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                    m_mi = m_mi_new
 
             n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
             n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
