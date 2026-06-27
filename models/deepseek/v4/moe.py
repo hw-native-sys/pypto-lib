@@ -45,7 +45,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
+from config import FLASH as M, DECODE_TOKENS, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
@@ -55,9 +55,8 @@ from dispatch import dispatch, dispatch_ep1
 from combine import combine, combine_ep1
 
 
-B = DECODE_BATCH
-S = DECODE_SEQ
-T = B * S
+T = MOE_TOKENS
+T_DECODE = DECODE_TOKENS
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
@@ -75,6 +74,7 @@ N_ROUTES = T * TOPK
 # Padding widths required by tile vector ops (32 B minimum tile).
 W_PAD = 8   # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
+MOE_COPY_D_TILE = 256
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
@@ -187,6 +187,86 @@ def moe(
     )
 
     hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+    return x_next
+
+
+@pl.jit.inline
+def moe_decode(
+    # model inputs
+    x_hc: pl.Tensor[[T_DECODE, HC_MULT, D], pl.BF16],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T_DECODE], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    # final output
+    x_next: pl.Out[pl.Tensor[[T_DECODE, HC_MULT, D], pl.BF16]],
+    # windows
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    moe_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DECODE, HC_MULT, D], pl.BF16]:
+    x_hc_pad = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_hc_flat = pl.reshape(x_hc, [T_DECODE, HC_DIM])
+    x_hc_pad_flat = pl.reshape(x_hc_pad, [T, HC_DIM])
+    input_ids_pad = pl.create_tensor([T], dtype=pl.INT64)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_decode_pad"):
+        for pad_t in pl.range(T):
+            pl.write(input_ids_pad, [pad_t], pl.cast(0, pl.INT64))
+        for real_t in pl.range(T_DECODE):
+            pl.write(input_ids_pad, [real_t], pl.read(input_ids, [real_t]))
+        for k0 in pl.pipeline(0, HC_DIM, MOE_COPY_D_TILE, stage=2):
+            x_hc_pad_flat[0:T, k0:k0 + MOE_COPY_D_TILE] = pl.full(
+                [T, MOE_COPY_D_TILE], dtype=pl.BF16, value=0.0)
+            x_hc_pad_flat[0:T_DECODE, k0:k0 + MOE_COPY_D_TILE] = \
+                x_hc_flat[0:T_DECODE, k0:k0 + MOE_COPY_D_TILE]
+
+    x_next_pad = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    moe(
+        x_hc_pad, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+        norm_w, gate_w, gate_bias, tid2eid, input_ids_pad,
+        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+        routed_w2, routed_w2_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        x_next_pad,
+        pub_counts, count_done, data_done,
+        recv_x, recv_scale, recv_w, recv_r_route,
+        routed_y_buf, combine_done,
+        layer_id, num_tokens, my_rank, moe_epoch,
+    )
+    x_next_pad_flat = pl.reshape(x_next_pad, [T, HC_DIM])
+    x_next_flat = pl.reshape(x_next, [T_DECODE, HC_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_decode_slice"):
+        for k0 in pl.pipeline(0, HC_DIM, MOE_COPY_D_TILE, stage=2):
+            x_next_flat[0:T_DECODE, k0:k0 + MOE_COPY_D_TILE] = \
+                x_next_pad_flat[0:T_DECODE, k0:k0 + MOE_COPY_D_TILE]
     return x_next
 
 

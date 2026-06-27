@@ -12,14 +12,12 @@
 import pypto.language as pl
 
 import config as _cfg
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, FP32_NEG_INF, EP_WORLD_SIZE,
+from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF, EP_WORLD_SIZE,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
 # model config
-B = DECODE_BATCH
-S = DECODE_SEQ
-T = B * S
+T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
 # Routing space:
@@ -35,7 +33,9 @@ N_HASH_LAYERS = M.num_hash_layers
 
 # tiling
 T_TILE = 8
-GATE_T_TILE = 16
+GATE_T_TILE = 8
+GATE_M_TILE = 16
+T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 128
 GATE_D_TILE = 256
 QUANT_TILE = 32
@@ -59,9 +59,9 @@ def gate(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    x_norm_gate_buf = pl.create_tensor([T, D], dtype=pl.FP32)
-    route_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
-    biased_scores_buf = pl.create_tensor([T, SCORE_PAD], dtype=pl.FP32)
+    x_norm_gate_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
 
     for ob_n in pl.spmd(T // T_TILE, name_hint="ffn_norm"):
         t0 = ob_n * T_TILE
@@ -77,6 +77,14 @@ def gate(
             an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
             x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
             x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
+    if T_PAD > T:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_gate_pad"):
+            for pad_d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                x_norm_gate_buf[T:T_PAD, pad_d0:pad_d0 + D_TILE] = pl.full(
+                    [T_PAD - T, D_TILE],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
 
     # Per-token symmetric INT8 quant of x_norm.
     for ob_q in pl.spmd(T // T_TILE, name_hint="x_norm_quant"):
@@ -97,28 +105,28 @@ def gate(
             x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
     # Gate matmul + post: x_norm @ gate_w.T → sqrt(softplus(logits)) (+bias).
-    for ob_g in pl.spmd(T // GATE_T_TILE, name_hint="gate"):
-        t1 = ob_g * GATE_T_TILE
+    for ob_g in pl.spmd(T_PAD // GATE_M_TILE, name_hint="gate"):
+        t1 = ob_g * GATE_M_TILE
         gp_bias_row = pl.reshape(gate_bias, [1, N_EXPERTS])
-        gate_logits_tile = pl.create_tensor([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32)
+        gate_logits_tile = pl.create_tensor([GATE_M_TILE, N_EXPERTS], dtype=pl.FP32)
         for kb in pl.range(0, D // GATE_D_TILE):
             gd_kd = kb * GATE_D_TILE
-            gd_x = x_norm_gate_buf[t1 : t1 + GATE_T_TILE, gd_kd : gd_kd + GATE_D_TILE]
+            gd_x = x_norm_gate_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
             gd_w = gate_w[:, gd_kd : gd_kd + GATE_D_TILE]
             if gd_kd == 0:
                 gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
             else:
                 gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-        route_scores_buf[t1 : t1 + GATE_T_TILE, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
-        biased_scores_buf[t1 : t1 + GATE_T_TILE, :] = pl.full([GATE_T_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
+        route_scores_buf[t1 : t1 + GATE_M_TILE, :] = pl.full([GATE_M_TILE, SCORE_PAD], dtype=pl.FP32, value=0.0)
+        biased_scores_buf[t1 : t1 + GATE_M_TILE, :] = pl.full([GATE_M_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
         gp_relu = pl.maximum(gate_logits_tile, 0.0)
         gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
         gp_softplus = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
         gp_score = pl.sqrt(gp_softplus)
-        gp_bias = pl.col_expand_mul(pl.full([GATE_T_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
+        gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
         gp_biased = pl.add(gp_score, gp_bias)
-        route_scores_buf[t1 : t1 + GATE_T_TILE, 0:N_EXPERTS] = gp_score
-        biased_scores_buf[t1 : t1 + GATE_T_TILE, 0:N_EXPERTS] = gp_biased
+        route_scores_buf[t1 : t1 + GATE_M_TILE, 0:N_EXPERTS] = gp_score
+        biased_scores_buf[t1 : t1 + GATE_M_TILE, 0:N_EXPERTS] = gp_biased
 
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:

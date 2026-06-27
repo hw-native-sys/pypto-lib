@@ -42,36 +42,40 @@ Q_PROJ_TILE = 512       # qproj K-tile (Q_LORA reduction)
 # that (256B/line). It can't go wider without M-splitting: TM*TN*4 (L0C Acc) caps at
 # 128KB, so TN=512 forces TM=64, and the resulting weight re-load + TK<=256 cap measured
 # no faster end-to-end. Measured: qproj_matmul -17.5%, decode total -4.3% vs TN=128.
-QPROJ_MM_N_TILE = 256
+QPROJ_MM_N_TILE = 128
 QPROJ_MM_GROUP = 8      # qproj_matmul N-tiles per spmd task -> (H*HEAD_DIM/256)/8 = 16 tasks (1 wave)
 Q_LORA_TILE = 32        # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 32            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 32
 T_TILE = 8
+MATMUL_T_TILE = 16
+T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # Per-projection matmul tiles. Decoupled so each projection's M/N/K can be tuned
 # independently of one another AND of the downstream rms/rope granularity above
 # (e.g. the matmul N-tile is no longer chained to KV_TILE / Q_LORA_TILE, which the
 # NOPE_DIM=448 constraint caps at <=64).
-QR_M_TILE = 128         # qr_proj token (M) tile          | divides T
-QR_N_TILE = 256         # qr_proj Q_LORA (N) per matmul   | 256*bf16 = 512B = 1 L2 line
+QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
+QR_N_TILE = 128         # qr_proj Q_LORA (N) per matmul
 QR_K_TILE = 256         # qr_proj D (K) reduction tile    | divides QR_K_SLICE
 QR_OK = 2               # qr_proj split-K factor          | D//QR_OK cores share each N-group
 QR_K_SLICE = D // QR_OK # qr_proj K per split (=2048)     | QR_K_SLICE//QR_K_TILE inner chunks
-KV_M_TILE = 128         # kv_proj token (M) tile
-KV_N_TILE = 256         # kv_proj HEAD_DIM (N) per matmul | 256*bf16 = 512B = 1 L2 line
+KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
+KV_N_TILE = 128         # kv_proj HEAD_DIM (N) per matmul
 KV_K_TILE = 256         # kv_proj D (K) reduction tile    | divides KV_K_SLICE
 KV_OK = 4               # kv_proj split-K factor          | D//KV_OK cores share each N-group
 KV_K_SLICE = D // KV_OK # kv_proj K per split (=1024)     | KV_K_SLICE//KV_K_TILE inner chunks
-QPROJ_M_TILE = 128      # qproj token (M) tile
-DEQUANT_T_TILE = 128    # qproj_dequant token tile
-KV_RMS_T_TILE = 16      # kv rms-norm + rope fused token (T) tile
-Q_ROPE_T_TILE = 32
+QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real rows to 16
+DEQUANT_T_TILE = 8      # qproj_dequant token tile
+KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
+Q_ROPE_T_TILE = 8
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
-for _m_tile in (QR_M_TILE, KV_M_TILE, QPROJ_M_TILE, DEQUANT_T_TILE):
-    assert (DECODE_BATCH * DECODE_SEQ) % _m_tile == 0
+assert DECODE_BATCH * DECODE_SEQ <= MATMUL_T_TILE
+for _m_tile in (QR_M_TILE, KV_M_TILE, QPROJ_M_TILE):
     assert (PREFILL_BATCH * PREFILL_SEQ) % _m_tile == 0
+assert (DECODE_BATCH * DECODE_SEQ) % DEQUANT_T_TILE == 0
+assert (PREFILL_BATCH * PREFILL_SEQ) % DEQUANT_T_TILE == 0
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
 assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % QPROJ_MM_GROUP == 0
@@ -124,6 +128,22 @@ def qkv_proj_rope(
     kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
     qr_view = pl.reshape(qr, [t_dim, Q_LORA])
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
+    t_matmul = pl.max(t_dim, MATMUL_T_TILE)
+    x_matmul = pl.create_tensor([T_MAX, D], dtype=pl.BF16)
+    for pad_idx in pl.spmd(t_matmul // MATMUL_T_TILE, name_hint="qkv_x_matmul_pad"):
+        pad_t0 = pad_idx * MATMUL_T_TILE
+        pad_rows = pl.min(MATMUL_T_TILE, t_dim - pad_t0)
+        for pad_k0 in pl.range(0, D, Q_PROJ_TILE):
+            x_valid = pl.slice(
+                x_view,
+                [MATMUL_T_TILE, Q_PROJ_TILE],
+                [pad_t0, pad_k0],
+                valid_shape=[pad_rows, Q_PROJ_TILE],
+            )
+            x_matmul[pad_t0 : pad_t0 + MATMUL_T_TILE, pad_k0 : pad_k0 + Q_PROJ_TILE] = pl.fillpad(
+                x_valid,
+                pad_value=pl.PadValue.zero,
+            )
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). TN=256 makes each wq_a
     # row-read a full 512B L2 line (vs 128B sub-line at TN=64), but only leaves
@@ -131,9 +151,10 @@ def qkv_proj_rope(
     # slices dispatched as separate cores and atomic-add their partials into a
     # zero-seeded output. The seed loop must land before the adds; the auto-dep
     # on qr_fp32 (WAW: seed write -> atomic RMW) enforces that ordering.
-    qr_fp32 = pl.create_tensor([t_dim, Q_LORA], dtype=pl.FP32)
+    qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
+    qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
-        for tc in pl.range(t_dim // QR_M_TILE):
+        for tc in pl.range(t_matmul // QR_M_TILE):
             ts0 = tc * QR_M_TILE
             for nb in pl.range(Q_LORA // QR_N_TILE):
                 nseed0 = nb * QR_N_TILE
@@ -143,12 +164,12 @@ def qkv_proj_rope(
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul"):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
-        for tc in pl.range(t_dim // QR_M_TILE):
+        for tc in pl.range(t_matmul // QR_M_TILE):
             t0 = tc * QR_M_TILE
             q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
             for db in pl.pipeline(QR_K_SLICE // QR_K_TILE, stage=2):
                 qr_d0 = qr_k_base + db * QR_K_TILE
-                q_x_chunk_bf16 = x_view[t0 : t0 + QR_M_TILE, qr_d0 : qr_d0 + QR_K_TILE]
+                q_x_chunk_bf16 = x_matmul[t0 : t0 + QR_M_TILE, qr_d0 : qr_d0 + QR_K_TILE]
                 w_chunk = wq_a[qr_d0 : qr_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
                 if db == 0:
                     q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
@@ -194,26 +215,28 @@ def qkv_proj_rope(
             qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
             qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
-            qr_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
+            qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
+            qr_view[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
+            qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
 
     # UN-MIXED qproj: pure-matmul scope (cube, INT32 -> GM) + separate dequant scope (vec).
     # The fused form pinned the dequant (vec) right after each matmul, so its AIV work ran in
     # qproj's window and stole AIV cores from the critical qr_proj_aiv. Split so the scheduler
     # can defer the off-critical-path dequant (q has large downstream slack) to when AIV is free.
-    q_proj_fp32 = pl.create_tensor([t_dim, H * HEAD_DIM], dtype=pl.FP32)
-    q_proj_i32 = pl.create_tensor([t_dim, H * HEAD_DIM], dtype=pl.INT32)
+    q_proj_fp32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.FP32)
+    q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
     for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // QPROJ_MM_GROUP, name_hint="qproj_matmul"):
         hg = hg_idx * QPROJ_MM_GROUP
         for h_inner in pl.range(QPROJ_MM_GROUP):
             w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
-            for tc in pl.range(t_dim // QPROJ_M_TILE):
+            for tc in pl.range(t_matmul // QPROJ_M_TILE):
                 t0 = tc * QPROJ_M_TILE
-                qr_i8_chunk = qr_view[t0 : t0 + QPROJ_M_TILE, 0:Q_PROJ_TILE]
+                qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, 0:Q_PROJ_TILE]
                 wq_chunk = wq_b[0:Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
                 col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
                 for qb in pl.pipeline(1, Q_LORA // Q_PROJ_TILE, stage=2):
                     qr_proj_col0 = qb * Q_PROJ_TILE
-                    qr_i8_chunk = qr_view[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
+                    qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
                     wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
                     col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
@@ -298,9 +321,9 @@ def qkv_proj_rope(
     # into a zero-seeded output. (hint_l1_tile M=128,N=512,K=4096 suggests OK=8, but
     # KV_OK=4 keeps qr(8)+kv(8)=16 tasks under the 24 cores; kv is off the critical
     # path so a larger OK only adds atomic contention without shortening decode.)
-    kv_fp32 = pl.create_tensor([t_dim, HEAD_DIM], dtype=pl.FP32)
+    kv_fp32 = pl.create_tensor([T_MAX, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
-        for tc in pl.range(t_dim // KV_M_TILE):
+        for tc in pl.range(t_matmul // KV_M_TILE):
             kts0 = tc * KV_M_TILE
             for nb in pl.range(HEAD_DIM // KV_N_TILE):
                 kvseed0 = nb * KV_N_TILE
@@ -310,12 +333,12 @@ def qkv_proj_rope(
     for kbg in pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul"):
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE
-        for tc in pl.range(t_dim // KV_M_TILE):
+        for tc in pl.range(t_matmul // KV_M_TILE):
             t0 = tc * KV_M_TILE
             kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
             for db in pl.pipeline(KV_K_SLICE // KV_K_TILE, stage=2):
                 d0 = kv_k_base + db * KV_K_TILE
-                kv_x_chunk_bf16 = x_view[t0 : t0 + KV_M_TILE, d0 : d0 + KV_K_TILE]
+                kv_x_chunk_bf16 = x_matmul[t0 : t0 + KV_M_TILE, d0 : d0 + KV_K_TILE]
                 wkv_chunk = wkv[d0 : d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
                 if db == 0:
                     kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)

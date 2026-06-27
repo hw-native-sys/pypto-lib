@@ -11,12 +11,16 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+
+
+T_DYN = pl.dynamic("T_DYN")
 
 
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
+T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 D = M.hidden_size
 HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
@@ -26,8 +30,8 @@ HC_DIM_INV = 1.0 / HC_DIM
 
 HC_PAD = 16
 T_TILE = 8
-LINEAR_T_TILE = 64
-TRANSPOSE_T_TILE = 64  # device-swept: 64/stage=2 minimizes hc_head_pre_fused (Exec 3.7us)
+LINEAR_T_TILE = 16
+TRANSPOSE_T_TILE = 8
 RMS_K_CHUNK = 512
 LINEAR_K_CHUNK = 256  # cube K-fragment per matmul call; keeps Mat at 352KB (< 512KB L1)
 D_CHUNK = 512
@@ -51,44 +55,52 @@ LINEAR_OK = 8
 RMS_K_BLOCKS = HC_DIM // RMS_K_CHUNK
 LINEAR_K_BLOCKS = HC_DIM // LINEAR_K_CHUNK
 D_BLOCKS = D // D_CHUNK
-NUM_T_TILES = T // T_TILE
-NUM_LINEAR_T_TILES = T // LINEAR_T_TILE
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 assert HC_DIM % LINEAR_OK == 0 and LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
 # The 4-way reduce (pre0..pre3 / x_h0..x_h3) is hardcoded for HC_MULT == 4, and the
 # fixed-size token tiles must evenly divide T or tail rows are silently dropped.
 assert HC_MULT == 4, f"hc_head reduce is hardcoded for HC_MULT == 4, got {HC_MULT}"
-assert T % T_TILE == 0 and T % LINEAR_T_TILE == 0 and T % TRANSPOSE_T_TILE == 0, (
-    f"T ({T}) must be a multiple of T_TILE ({T_TILE}), LINEAR_T_TILE ({LINEAR_T_TILE}), "
-    f"and TRANSPOSE_T_TILE ({TRANSPOSE_T_TILE})"
-)
+assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0 and (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert (DECODE_BATCH * DECODE_SEQ) % TRANSPOSE_T_TILE == 0 and (PREFILL_BATCH * PREFILL_SEQ) % TRANSPOSE_T_TILE == 0
+assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
+assert T_MAX % LINEAR_T_TILE == 0
 
 @pl.jit.inline
 def hc_head(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    y: pl.Tensor[[T, D], pl.BF16],
+    y: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
-    x_flat = pl.reshape(x_hc, [T, HC_DIM])
-    y_flat = pl.reshape(y, [T, D])
-    inv_rms = pl.create_tensor([T, 1], dtype=pl.FP32)
-    x_fp32 = pl.create_tensor([T, HC_DIM], dtype=pl.FP32)  # FP32 activations, produced by the RMS scope
-    mixes_raw = pl.create_tensor([T, HC_PAD], dtype=pl.FP32)
-    pre_t = pl.create_tensor([HC_PAD, T], dtype=pl.FP32)
+    t_dim = pl.tensor.dim(x_hc, 0)
+    t_linear = pl.max(t_dim, LINEAR_T_TILE)
+    x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
+    y_flat = pl.reshape(y, [t_dim, D])
+    inv_rms = pl.create_tensor([T_MAX, 1], dtype=pl.FP32)
+    x_fp32 = pl.create_tensor([T_MAX, HC_DIM], dtype=pl.FP32)  # FP32 activations, produced by the RMS scope
+    mixes_raw = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
+    pre_t = pl.create_tensor([HC_PAD, T_MAX], dtype=pl.FP32)
     # Cast scope: stream x (BF16) -> x_fp32 (FP32) once. Both the head-projection
     # matmul (pure-AIC) and the inv_rms reduce below consume these FP32 activations.
-    for t in pl.spmd(NUM_T_TILES, name_hint="hc_head_cast", allow_early_resolve=True):
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_cast", allow_early_resolve=True):
         t0 = t * T_TILE
         for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
             k0 = kb * RMS_K_CHUNK
             x_chunk = pl.cast(x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK], target_type=pl.FP32)
             x_fp32[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK] = x_chunk
+    if t_linear > t_dim:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_x_pad", allow_early_resolve=True):
+            for k0 in pl.pipeline(0, HC_DIM, RMS_K_CHUNK, stage=4):
+                x_fp32[t_dim:t_linear, k0:k0 + RMS_K_CHUNK] = pl.full(
+                    [LINEAR_T_TILE - T_TILE, RMS_K_CHUNK],
+                    dtype=pl.FP32,
+                    value=0.0,
+                )
 
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
-    for t in pl.spmd(NUM_T_TILES, name_hint="hc_head_rms", allow_early_resolve=True):
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
@@ -106,13 +118,13 @@ def hc_head(
     # K-slice, reduces it, and atomic-adds its [T_TILE, HC_PAD] FP32 partial.
     # Token tiles touch disjoint rows, so only the LINEAR_OK tasks per row block
     # contend; the seed write -> atomic RMW WAW dependency orders seed first.
-    for tc in pl.spmd(NUM_T_TILES, name_hint="hc_head_seed", allow_early_resolve=True):
+    for tc in pl.spmd(t_linear // T_TILE, name_hint="hc_head_seed", allow_early_resolve=True):
         ts0 = tc * T_TILE
         mixes_raw[ts0 : ts0 + T_TILE, 0:HC_PAD] = pl.full(
             [T_TILE, HC_PAD], dtype=pl.FP32, value=0.0
         )
 
-    for task in pl.spmd(NUM_LINEAR_T_TILES * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
@@ -138,7 +150,7 @@ def hc_head(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_pre_fused", allow_early_resolve=True):
         scale = pl.read(hc_head_scale, [0])
         base = pl.reshape(pl.slice(hc_head_base, [HC_PAD], [0], valid_shape=[HC_MULT]), [1, HC_PAD])
-        for t0 in pl.pipeline(0, T, TRANSPOSE_T_TILE, stage=2):
+        for t0 in pl.pipeline(0, t_dim, TRANSPOSE_T_TILE, stage=2):
             scaled = pl.row_expand_mul(
                 mixes_raw[t0 : t0 + TRANSPOSE_T_TILE, 0:HC_PAD],
                 inv_rms[t0 : t0 + TRANSPOSE_T_TILE, 0:1],
@@ -150,7 +162,7 @@ def hc_head(
             pre_val = pl.add(pl.recip(pl.add(pl.exp(pl.neg(logits)), 1.0)), HC_EPS)
             pre_t[:, t0 : t0 + TRANSPOSE_T_TILE] = pl.transpose(pre_val, axis1=0, axis2=1)
 
-    for t0 in pl.parallel(0, T, T_TILE):
+    for t0 in pl.parallel(0, t_dim, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_reduce", allow_early_resolve=True):
             # Per head h, pre_t[h] is a contiguous row of per-token scales; slice it
             # and reshape [1, T_TILE] -> [T_TILE, 1] for the row-broadcast multiply.
@@ -170,7 +182,7 @@ def hc_head(
                 )
                 y_flat[t0 : t0 + T_TILE, d0 : d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
 
-    y = pl.reshape(y_flat, [T, D])
+    y = pl.reshape(y_flat, [t_dim, D])
     return y
 
 

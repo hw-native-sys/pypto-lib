@@ -15,13 +15,11 @@
 import pypto.language as pl
 import pypto.language.distributed as pld
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, EP_WORLD_SIZE, RECV_MAX
+from config import FLASH as M, MOE_TOKENS, EP_WORLD_SIZE, RECV_MAX
 
 
 # model config
-B = DECODE_BATCH
-S = DECODE_SEQ
-T = B * S
+T = MOE_TOKENS
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE

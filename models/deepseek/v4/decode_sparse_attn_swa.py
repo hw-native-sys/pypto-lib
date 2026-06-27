@@ -43,8 +43,9 @@ CMP_MAX_BLOCKS = 8  # paged-KV pool: compressed blocks per batch
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
-VALID_TOKEN_TILE = 16
-ROPE_OUT_TOK_TILE = 64
+VALID_TOKEN_TILE = 8
+GATHER_FILL_TILE = 128
+ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
 # per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
@@ -67,7 +68,9 @@ A_K_TILE = 256
 # scope below; the decouple frees the cube N-frag from any vector-side UB constraint.
 PROJ_A_MM_N_TILE = 128   # cube N frag; Mat/L0C have room but L0A/L0B are the wall at
                          # K=256, and a wider N raised cube exec without a TTT win (swept).
-B_T_TILE = 32   # proj_b_act token tile; a device sweep found it neutral over [16, 32]
+B_T_TILE = 8
+MM_T_TILE = 16
+T_PAD = ((T + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
 B_K_TILE = 256  # proj_b_mm cube K frag; the GEMM is not the proj_b bottleneck (see below),
                 # and a device sweep found growing it (512/1024) only re-streamed more weight
                 # for no TTT gain, so it stays at the cache-line-safe 256 (256 B per INT8 row).
@@ -113,12 +116,12 @@ PROJ_B_D_CHUNK = 1024
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # quant is split per (group, token-chunk) so the per-group amax+quant spreads over more
 # vector cores: O_GROUPS*NUM_QUANT_T_CHUNKS = 8*4 = 32 tasks.
-NUM_QUANT_T_CHUNKS = 4
+NUM_QUANT_T_CHUNKS = 1
 QUANT_T_CHUNK = T // NUM_QUANT_T_CHUNKS
 # proj_b_act is split per (D-region, token-block) so the O_GROUPS-way dequant+sum spreads
 # over more vector cores: (D//PROJ_B_ACT_N_TILE)*(T//PROJ_B_ACT_TBLK) = 8*4 = 32 tasks.
-PROJ_B_ACT_T_TILE = 16   # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate
-PROJ_B_ACT_TBLK = 32     # proj_b_act token block per task
+PROJ_B_ACT_T_TILE = 8    # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate
+PROJ_B_ACT_TBLK = 8      # proj_b_act token block per task
 PB_ACT_NREG = D // PROJ_B_ACT_N_TILE
 PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 NEG_INF = -1.0e20
@@ -162,11 +165,11 @@ TOPK = WIN
 SPARSE_BLOCKS = 2
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-# ZERO-GATHER contract: qk_pv reads the ring page (block 0) and the whole mtp_kv_overlay
-# tensor (block 1) directly as ATTN_K_TILE-row GM slices, so the window page must be exactly
-# one tile (WIN == ATTN_K_TILE) and the overlay must fit one tile (T == ATTN_K_TILE).
+# ZERO-GATHER contract: qk_pv reads the ring page (block 0) and a padded MTP overlay
+# block (block 1) directly as ATTN_K_TILE-row GM slices, so the window page must be
+# exactly one tile and the overlay token rows must fit in one tile.
 assert WIN == ATTN_K_TILE, f"SWA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
-assert T == ATTN_K_TILE, f"SWA zero-gather requires T ({T}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert T <= ATTN_K_TILE, f"SWA zero-gather requires T ({T}) <= ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline
@@ -202,6 +205,11 @@ def sparse_attn_swa(
     # directly and masks them with win_bias. cmp_sparse_indices is unused here (kept
     # only so the torch golden, which gathers per it, stays the reference).
     sparse_bias = win_bias
+    mtp_kv_overlay_pad = pl.create_tensor([ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16)
+    for pad_blk in pl.spmd(1, name_hint="pad_mtp_overlay"):
+        if pad_blk == 0:
+            mtp_kv_overlay_pad[0:ATTN_K_TILE, 0:HEAD_DIM] = pl.full([ATTN_K_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
+            mtp_kv_overlay_pad[0:T, 0:HEAD_DIM] = mtp_kv_overlay[0:T, 0:HEAD_DIM]
 
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
@@ -220,11 +228,11 @@ def sparse_attn_swa(
         qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
         # ZERO-GATHER: attend two contiguous KV operands directly, no gather/sparse_kv.
         #   block 0 = the ring page ori_kv[block_table[b,0]]  (physical rows 0..WIN-1)
-        #   block 1 = the whole mtp_kv_overlay tensor [T, HEAD_DIM] (physical rows 0..T-1)
+        #   block 1 = padded MTP overlay [ATTN_K_TILE, HEAD_DIM] (real rows 0..T-1)
         # The physical-order bias (build_valid) masks each block to the rows valid for
         # this token. merge_norm online-merges the two blocks exactly as before.
         qk_page = ori_kv_flat[qk_ori_base : qk_ori_base + ATTN_K_TILE, 0 : HEAD_DIM]
-        qk_overlay = mtp_kv_overlay[0 : ATTN_K_TILE, 0 : HEAD_DIM]
+        qk_overlay = mtp_kv_overlay_pad[0 : ATTN_K_TILE, 0 : HEAD_DIM]
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
@@ -393,8 +401,10 @@ def sparse_attn_swa(
     # accumulator; proj_b_act (auto region) applies the per-channel weight scale and
     # is the consolidated writer that registers attn_out's return tensormap edge.
     # ========================================================================
-    o_r = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.FP32)
+    o_packed_mm = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+    o_r_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
+    o_r_i8_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
     act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)   # [G, T] so each group's
                                                                      # per-row scale is a contiguous
                                                                      # row (column reads would be a
@@ -402,28 +412,45 @@ def sparse_attn_swa(
     # Per-group INT32 partials: proj_b_mm (pure cube) writes group g's contribution to
     # output channel n at partials[:, g*D + n]; proj_b_act (pure vector) sums the
     # O_GROUPS partials with their per-group act scales. No atomic-add -> no zero-seed.
-    partials = pl.create_tensor([T, O_GROUPS * D], dtype=pl.INT32)
+    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
+    pad_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS * NUM_QUANT_T_CHUNKS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DCHUNKS * O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T
+            row_base_pad = g * T_PAD
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_o_pad", deps=[merge_tid, rope_tid]) as pad_tid:
+                for k0 in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
+                    o_packed_mm[row_base_pad:row_base_pad + T, k0:k0 + A_K_TILE] = o_packed[
+                        row_base_o:row_base_o + T, k0:k0 + A_K_TILE
+                    ]
+                    if T_PAD > T:
+                        o_packed_mm[row_base_pad + T:row_base_pad + T_PAD, k0:k0 + A_K_TILE] = pl.full(
+                            [T_PAD - T, A_K_TILE],
+                            dtype=pl.BF16,
+                            value=0.0,
+                        )
+            pad_tids[g] = pad_tid
+
+        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
+        for g in pl.parallel(O_GROUPS):
+            row_base_o = g * T_PAD
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_mm", deps=[merge_tid, rope_tid]) as pa_tid:
-                    xa0_chunk = o_packed[row_base_o:row_base_o + T, 0:A_K_TILE]
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_mm", deps=[pad_tids[g]]) as pa_tid:
+                    xa0_chunk = o_packed_mm[row_base_o:row_base_o + MM_T_TILE, 0:A_K_TILE]
                     wa0_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
                     acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
                     for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
                         k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed[row_base_o:row_base_o + T, k0:k0 + A_K_TILE]
+                        xa_k_chunk = o_packed_mm[row_base_o:row_base_o + MM_T_TILE, k0:k0 + A_K_TILE]
                         wa_k_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, k0:k0 + A_K_TILE]
                         acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
-                    o_r = pl.assemble(o_r, pl.reshape(acc_a, [T, PROJ_A_MM_N_TILE]), [0, out_col_g + n0])
+                    o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
         # quant[g, tc]: PER-GROUP amax + symmetric INT8 quant of o_r[:, group g] over a
@@ -439,7 +466,7 @@ def sparse_attn_swa(
                            deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)]) as q_tid:
                     for qt in pl.pipeline(t_base, t_base + QUANT_T_CHUNK, QUANT_TOKEN_TILE, stage=2):
                         # amax pass: O_LORA fits one tile, so the whole group row is read at once.
-                        oc_amax = o_r[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
+                        oc_amax = o_r_pad[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
                         g_amax = pl.maximum(
                             pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
                             pl.reshape(pl.row_max(pl.maximum(oc_amax, pl.neg(oc_amax))), [1, QUANT_TOKEN_TILE]))
@@ -447,10 +474,20 @@ def sparse_attn_swa(
                         act_scale_dq = pl.assemble(act_scale_dq, pl.recip(g_sq_row), [g, qt])
                         g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
                         # quant pass: re-read o_r (the 2nd stream mostly hits L2) to keep UB small.
-                        oc_q = o_r[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
+                        oc_q = o_r_pad[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
                         oq_i32 = pl.cast(pl.row_expand_mul(oc_q, g_sq_col), target_type=pl.INT32, mode="rint")
                         oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
-                        o_r_i8 = pl.assemble(o_r_i8, pl.cast(oq_half, target_type=pl.INT8, mode="trunc"), [qt, col_g])
+                        oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
+                        o_r_i8 = pl.assemble(o_r_i8, oq_i8, [qt, col_g])
+                        o_r_i8_pad = pl.assemble(o_r_i8_pad, oq_i8, [qt, col_g])
+                        if T_PAD > T:
+                            zero_i32 = pl.full([T_PAD - T, O_LORA], dtype=pl.INT32, value=0)
+                            zero_half = pl.cast(zero_i32, target_type=pl.FP16, mode="round")
+                            o_r_i8_pad = pl.assemble(
+                                o_r_i8_pad,
+                                pl.cast(zero_half, target_type=pl.INT8, mode="trunc"),
+                                [T, col_g],
+                            )
                 quant_tids[g * NUM_QUANT_T_CHUNKS + tc] = q_tid
 
         # proj_b_mm[dc, g]: PURE-CUBE INT8 GEMM of group g's contribution to a
@@ -469,15 +506,15 @@ def sparse_attn_swa(
                            deps=[quant_tids[g * NUM_QUANT_T_CHUNKS + tc] for tc in range(NUM_QUANT_T_CHUNKS)]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_CHUNK // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        acc_b = pl.create_tensor([T, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        acc_b = pl.create_tensor([MM_T_TILE, PROJ_B_MM_N_TILE], dtype=pl.INT32)
                         for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                             k0 = col_g + kb * B_K_TILE
                             if kb == 0:
-                                acc_b = pl.matmul(o_r_i8[:, col_g:col_g + B_K_TILE],
+                                acc_b = pl.matmul(o_r_i8_pad[:, col_g:col_g + B_K_TILE],
                                           wo_b[n0:n0 + PROJ_B_MM_N_TILE, col_g:col_g + B_K_TILE],
                                           b_trans=True, out_dtype=pl.INT32)
                             else:
-                                acc_b = pl.matmul_acc(acc_b, o_r_i8[:, k0:k0 + B_K_TILE],
+                                acc_b = pl.matmul_acc(acc_b, o_r_i8_pad[:, k0:k0 + B_K_TILE],
                                                   wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE], b_trans=True)
                         partials = pl.assemble(partials, acc_b, [0, g * D + n0])
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
@@ -613,7 +650,12 @@ def golden_sparse_attn(tensors):
             continue
 
         page = ori_kv[blk_id, 0:ATTN_K_TILE, 0]      # [ATTN_K_TILE, HEAD_DIM] physical ring rows
-        overlay = mtp_kv_overlay[0:ATTN_K_TILE]       # [ATTN_K_TILE, HEAD_DIM] physical overlay rows
+        overlay = torch.zeros(
+            ATTN_K_TILE, HEAD_DIM,
+            dtype=mtp_kv_overlay.dtype,
+            device=mtp_kv_overlay.device,
+        )
+        overlay[:T] = mtp_kv_overlay[0:T]             # [ATTN_K_TILE, HEAD_DIM] physical overlay rows
         q_t = q[t]
 
         block_mi = []

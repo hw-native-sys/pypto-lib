@@ -78,6 +78,7 @@ from config import FLASH as MODEL_CONFIG
 from moe import (
     IDX_PAD,
     MOE_INTER,
+    T as MOE_TOKENS,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
@@ -88,11 +89,40 @@ from moe import (
     W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe,
-    moe,
+    moe_decode,
 )
 
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
+
+
+def _golden_moe_decode(moe_tensors):
+    import torch
+
+    padded = dict(moe_tensors)
+    x_hc = moe_tensors["x_hc"]
+    input_ids = moe_tensors["input_ids"]
+    x_next = moe_tensors["x_next"]
+    padded["x_hc"] = torch.zeros(
+        N_RANKS, MOE_TOKENS, HC_MULT, D,
+        dtype=x_hc.dtype,
+        device=x_hc.device,
+    )
+    padded["input_ids"] = torch.zeros(
+        N_RANKS, MOE_TOKENS,
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    padded["x_next"] = torch.zeros(
+        N_RANKS, MOE_TOKENS, HC_MULT, D,
+        dtype=x_next.dtype,
+        device=x_next.device,
+    )
+    padded["x_hc"][:, :T] = x_hc
+    padded["input_ids"][:, :T] = input_ids
+    padded["num_tokens"] = T
+    golden_moe(padded)
+    x_next[:] = padded["x_next"][:, :T]
 
 
 @pl.jit
@@ -237,7 +267,7 @@ def decode_layer(
             x_attn,
         )
 
-    moe(
+    moe_decode(
         x_attn,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -432,8 +462,7 @@ def golden_decode_layer(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
-    moe_tensors["num_tokens"] = T
-    golden_moe(moe_tensors)
+    _golden_moe_decode(moe_tensors)
 
 
 def golden_decode_layer_hca(tensors):
@@ -479,8 +508,7 @@ def golden_decode_layer_hca(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
-    moe_tensors["num_tokens"] = T
-    golden_moe(moe_tensors)
+    _golden_moe_decode(moe_tensors)
 
 
 def golden_decode_layer_csa(tensors):
@@ -540,8 +568,7 @@ def golden_decode_layer_csa(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
-    moe_tensors["num_tokens"] = T
-    golden_moe(moe_tensors)
+    _golden_moe_decode(moe_tensors)
 
 
 def golden_decode_layer_auto(tensors):

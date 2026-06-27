@@ -25,7 +25,9 @@ D = M.hidden_size
 EPS = M.rms_norm_eps
 D_INV = 1.0 / D
 
-T_TILE = 16
+T_TILE = 8
+LINEAR_T_TILE = 16
+T_PAD = ((T + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
 D_CHUNK = 128
 OUT_CHUNK = 128
 D_BLOCKS = D // D_CHUNK
@@ -51,14 +53,15 @@ def mtp_projection(
     out_flat = pl.reshape(hidden_states_out, [T, D])
     hidden_norm = pl.create_tensor([T, D], dtype=pl.BF16)
     prev_norm = pl.create_tensor([T, D], dtype=pl.BF16)
-    hidden_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
-    prev_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
+    hidden_i8 = pl.create_tensor([T_PAD, D], dtype=pl.INT8)
+    prev_i8 = pl.create_tensor([T_PAD, D], dtype=pl.INT8)
     hidden_inv_rms = pl.create_tensor([T, 1], dtype=pl.FP32)
     prev_inv_rms = pl.create_tensor([T, 1], dtype=pl.FP32)
     hidden_amax_parts = pl.create_tensor([D_BLOCKS, T], dtype=pl.FP32)
     prev_amax_parts = pl.create_tensor([D_BLOCKS, T], dtype=pl.FP32)
-    hidden_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
-    prev_scale_dq = pl.create_tensor([T, 1], dtype=pl.FP32)
+    hidden_scale_dq = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    prev_scale_dq = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    out_pad = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
 
     for t0 in pl.parallel(0, T, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_rms"):
@@ -132,21 +135,20 @@ def mtp_projection(
                 prev_q_half = pl.cast(prev_q_i32, target_type=pl.FP16, mode="round")
                 hidden_i8 = pl.assemble(hidden_i8, pl.cast(hidden_q_half, target_type=pl.INT8, mode="trunc"), [t0, k0])
                 prev_i8 = pl.assemble(prev_i8, pl.cast(prev_q_half, target_type=pl.INT8, mode="trunc"), [t0, k0])
-
-    for t0 in pl.parallel(0, T, T_TILE):
+    for t0 in pl.parallel(0, T_PAD, LINEAR_T_TILE):
         for nb in pl.parallel(0, OUT_BLOCKS, 1):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_linear"):
                 n0 = nb * OUT_CHUNK
-                hidden_a0 = hidden_i8[t0 : t0 + T_TILE, 0:D_CHUNK]
-                prev_a0 = prev_i8[t0 : t0 + T_TILE, 0:D_CHUNK]
+                hidden_a0 = hidden_i8[t0 : t0 + LINEAR_T_TILE, 0:D_CHUNK]
+                prev_a0 = prev_i8[t0 : t0 + LINEAR_T_TILE, 0:D_CHUNK]
                 e_w0 = e_proj_w[n0 : n0 + OUT_CHUNK, 0:D_CHUNK]
                 h_w0 = h_proj_w[n0 : n0 + OUT_CHUNK, 0:D_CHUNK]
                 hidden_acc = pl.matmul(hidden_a0, e_w0, b_trans=True, out_dtype=pl.INT32)
                 prev_acc = pl.matmul(prev_a0, h_w0, b_trans=True, out_dtype=pl.INT32)
                 for kb in pl.pipeline(1, D_BLOCKS, stage=2):
                     k0 = kb * D_CHUNK
-                    hidden_a = hidden_i8[t0 : t0 + T_TILE, k0 : k0 + D_CHUNK]
-                    prev_a = prev_i8[t0 : t0 + T_TILE, k0 : k0 + D_CHUNK]
+                    hidden_a = hidden_i8[t0 : t0 + LINEAR_T_TILE, k0 : k0 + D_CHUNK]
+                    prev_a = prev_i8[t0 : t0 + LINEAR_T_TILE, k0 : k0 + D_CHUNK]
                     e_w = e_proj_w[n0 : n0 + OUT_CHUNK, k0 : k0 + D_CHUNK]
                     h_w = h_proj_w[n0 : n0 + OUT_CHUNK, k0 : k0 + D_CHUNK]
                     hidden_acc = pl.matmul_acc(hidden_acc, hidden_a, e_w, b_trans=True)
@@ -154,15 +156,19 @@ def mtp_projection(
                 e_scale = pl.reshape(e_proj_w_scale[n0 : n0 + OUT_CHUNK], [1, OUT_CHUNK])
                 h_scale = pl.reshape(h_proj_w_scale[n0 : n0 + OUT_CHUNK], [1, OUT_CHUNK])
                 hidden_deq = pl.col_expand_mul(
-                    pl.row_expand_mul(pl.cast(hidden_acc, target_type=pl.FP32, mode="none"), hidden_scale_dq[t0 : t0 + T_TILE, 0:1]),
+                    pl.row_expand_mul(pl.cast(hidden_acc, target_type=pl.FP32, mode="none"), hidden_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1]),
                     e_scale,
                 )
                 prev_deq = pl.col_expand_mul(
-                    pl.row_expand_mul(pl.cast(prev_acc, target_type=pl.FP32, mode="none"), prev_scale_dq[t0 : t0 + T_TILE, 0:1]),
+                    pl.row_expand_mul(pl.cast(prev_acc, target_type=pl.FP32, mode="none"), prev_scale_dq[t0 : t0 + LINEAR_T_TILE, 0:1]),
                     h_scale,
                 )
                 acc = pl.add(hidden_deq, prev_deq)
-                out_flat = pl.assemble(out_flat, pl.cast(acc, target_type=pl.BF16, mode="rint"), [t0, n0])
+                out_pad = pl.assemble(out_pad, pl.cast(acc, target_type=pl.BF16, mode="rint"), [t0, n0])
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_output"):
+        for n0 in pl.pipeline(0, D, OUT_CHUNK, stage=2):
+            out_flat[:, n0:n0 + OUT_CHUNK] = out_pad[0:T, n0:n0 + OUT_CHUNK]
 
     hidden_states_out = pl.reshape(out_flat, [B, S, D])
     return hidden_states_out

@@ -24,7 +24,7 @@ HC_MULT = M.hc_mult
 HC_DIM = M.hc_dim
 
 # tiling
-T_TILE = 16
+T_TILE = 8
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 

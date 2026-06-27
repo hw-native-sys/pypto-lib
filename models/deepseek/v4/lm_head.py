@@ -26,7 +26,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE
+from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE, PREFILL_TOKENS
+
+
+T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
 
 # Tensor shapes and loop trip counts are static in the frontend, so the TP
@@ -52,18 +55,22 @@ def _parse_tp_argv():
 
 TP_SIZE = _parse_tp_argv()
 
-T = DECODE_TOKENS  # 128 decode tokens.
+T = DECODE_TOKENS
+T_MAX = max(DECODE_TOKENS, PREFILL_TOKENS)
 D = M.hidden_size  # 4096 hidden size.
 VOCAB = M.vocab_size  # 129280 vocabulary size.
 
 LM_HEAD_K_CHUNK = 128  # K tile width; D / 128 = 32 matmul accumulation blocks.
 HIDDEN_COMM_CHUNK = 512  # Hidden publish tile width; D / 512 = 8 copy blocks.
-VOCAB_CHUNK = 512  # Main vocab tile width; tail is handled separately.
-T_TILE = 16  # Token tile height; T / 16 = 8 token blocks.
+VOCAB_CHUNK = 256  # Main vocab tile width; tail is handled separately.
+T_TILE = 8  # Token tile height.
+MATMUL_T_TILE = 16
+DONE_VALUE = 1
 
 assert D % LM_HEAD_K_CHUNK == 0
 assert D % HIDDEN_COMM_CHUNK == 0
-assert T % T_TILE == 0
+assert DECODE_TOKENS % T_TILE == 0 and PREFILL_TOKENS % T_TILE == 0
+assert DECODE_TOKENS <= MATMUL_T_TILE and PREFILL_TOKENS % MATMUL_T_TILE == 0
 assert VOCAB % TP_SIZE == 0
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert TP_SIZE <= LM_HEAD_TP_SIZE
@@ -77,26 +84,43 @@ VOCAB_TAIL = VOCAB_PER_TP % VOCAB_CHUNK
 
 @pl.jit.inline
 def lm_head(
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logits_shard: pl.Out[pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]],
-) -> pl.Tensor[[T, VOCAB_PER_TP], pl.FP32]:
-    for t0 in pl.parallel(0, T, T_TILE):
+    logits_shard: pl.Out[pl.Tensor[[T_MAX, VOCAB_PER_TP], pl.FP32]],
+) -> pl.Tensor[[T_MAX, VOCAB_PER_TP], pl.FP32]:
+    t_dim = pl.tensor.dim(hidden_states, 0)
+    t_matmul = pl.max(t_dim, MATMUL_T_TILE)
+    hidden_pad = pl.create_tensor([T_MAX, D], dtype=pl.BF16)
+    logits_pad = pl.create_tensor([T_MAX, VOCAB_PER_TP], dtype=pl.FP32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_hidden_pad"):
+        for k0 in pl.pipeline(0, D, HIDDEN_COMM_CHUNK, stage=2):
+            for t0 in pl.range(0, t_dim, T_TILE):
+                hidden_pad[t0:t0 + T_TILE, k0:k0 + HIDDEN_COMM_CHUNK] = \
+                    hidden_states[t0:t0 + T_TILE, k0:k0 + HIDDEN_COMM_CHUNK]
+            if t_matmul > t_dim:
+                hidden_pad[t_dim:t_matmul, k0:k0 + HIDDEN_COMM_CHUNK] = pl.full(
+                    [MATMUL_T_TILE - T_TILE, HIDDEN_COMM_CHUNK],
+                    dtype=pl.BF16,
+                    value=0.0,
+                )
+
+    for t0 in pl.parallel(0, t_matmul, MATMUL_T_TILE):
         for ob in pl.parallel(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
                 # The peeled (kb==0) matmul tiles must use names distinct from the
                 # loop-body tiles below; reusing one name across the peel and the
                 # carry loop collides under SSA and corrupts the accumulation.
-                hidden0 = hidden_states[t0 : t0 + T_TILE, 0:LM_HEAD_K_CHUNK]
+                hidden0 = hidden_pad[t0 : t0 + MATMUL_T_TILE, 0:LM_HEAD_K_CHUNK]
                 weight0 = lm_head_weight[o0 : o0 + VOCAB_CHUNK, 0:LM_HEAD_K_CHUNK]
                 acc = pl.matmul(hidden0, weight0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_chunk = hidden_states[t0 : t0 + T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    hidden_chunk = hidden_pad[t0 : t0 + MATMUL_T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
                     weight_chunk = lm_head_weight[o0 : o0 + VOCAB_CHUNK, k0 : k0 + LM_HEAD_K_CHUNK]
                     acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
-                logits_shard[t0 : t0 + T_TILE, o0 : o0 + VOCAB_CHUNK] = acc
+                logits_pad[t0 : t0 + MATMUL_T_TILE, o0 : o0 + VOCAB_CHUNK] = acc
 
         if VOCAB_TAIL != 0:
             tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
@@ -105,39 +129,64 @@ def lm_head(
                 # block above: they live in the same inlined function scope, and a
                 # shared name carrying a different shape (e.g. VOCAB_TAIL vs
                 # VOCAB_CHUNK) collides under SSA and corrupts the result.
-                hidden_t0 = hidden_states[t0 : t0 + T_TILE, 0:LM_HEAD_K_CHUNK]
+                hidden_t0 = hidden_pad[t0 : t0 + MATMUL_T_TILE, 0:LM_HEAD_K_CHUNK]
                 weight_t0 = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, 0:LM_HEAD_K_CHUNK]
                 acc_tail = pl.matmul(hidden_t0, weight_t0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_tk = hidden_states[t0 : t0 + T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    hidden_tk = hidden_pad[t0 : t0 + MATMUL_T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
                     weight_tk = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, k0 : k0 + LM_HEAD_K_CHUNK]
                     acc_tail = pl.matmul_acc(acc_tail, hidden_tk, weight_tk, b_trans=True)
-                logits_shard[t0 : t0 + T_TILE, tail_o0 : tail_o0 + VOCAB_TAIL] = acc_tail
+                logits_pad[t0 : t0 + MATMUL_T_TILE, tail_o0 : tail_o0 + VOCAB_TAIL] = acc_tail
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_output"):
+        for t0 in pl.range(0, t_dim, T_TILE):
+            for ob in pl.pipeline(VOCAB_FULL_BLOCKS_PER_TP, stage=2):
+                o0 = ob * VOCAB_CHUNK
+                logits_shard[t0:t0 + T_TILE, o0:o0 + VOCAB_CHUNK] = \
+                    logits_pad[t0:t0 + T_TILE, o0:o0 + VOCAB_CHUNK]
+            if VOCAB_TAIL != 0:
+                tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+                logits_shard[t0:t0 + T_TILE, tail_o0:tail_o0 + VOCAB_TAIL] = \
+                    logits_pad[t0:t0 + T_TILE, tail_o0:tail_o0 + VOCAB_TAIL]
     return logits_shard
 
 
 @pl.jit.incore
 def publish_hidden_step(
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
-    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T_MAX, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
-    row_base = my_rank * T
+    t_dim = pl.tensor.dim(hidden_states, 0)
+    row_base = my_rank * T_MAX
 
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
-            for t0 in pl.range(0, T, T_TILE):
+            # Short decode publishes only one token tile, which can expose a
+            # remote-store visibility race before the peer observes hidden_done.
+            # Publish the full padded window so the data phase has the same
+            # communication depth as prefill; rows beyond t_dim are never read.
+            for t0 in pl.range(0, T_MAX, T_TILE):
                 for kb in pl.range(HIDDEN_COMM_BLOCKS):
                     k0 = kb * HIDDEN_COMM_CHUNK
-                    tile = pl.load(hidden_states, [t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
-                    pld.tile.remote_store(
-                        tile,
-                        target=hidden_window,
-                        peer=peer,
-                        offsets=[row_base + t0, k0],
-                    )
+                    if t0 < t_dim:
+                        hidden_tile = pl.load(hidden_states, [t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
+                        pld.tile.remote_store(
+                            hidden_tile,
+                            target=hidden_window,
+                            peer=peer,
+                            offsets=[row_base + t0, k0],
+                        )
+                    else:
+                        padding_tile = pl.load(hidden_states, [0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
+                        pld.tile.remote_store(
+                            padding_tile,
+                            target=hidden_window,
+                            peer=peer,
+                            offsets=[row_base + t0, k0],
+                        )
 
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
@@ -145,7 +194,7 @@ def publish_hidden_step(
                 target=hidden_done,
                 peer=peer,
                 offsets=[my_rank, 0],
-                value=1,
+                value=DONE_VALUE,
                 op=pld.NotifyOp.Set,
             )
 
@@ -154,20 +203,21 @@ def publish_hidden_step(
             pld.system.wait(
                 signal=hidden_done,
                 offsets=[src, 0],
-                expected=1,
+                expected=DONE_VALUE,
                 cmp=pld.WaitCmp.Ge,
             )
 
 
 @pl.jit.incore
 def load_owner_hidden_step(
-    owner_hidden: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    owner_hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T_MAX, D], pl.BF16],
     owner_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
-    row_base = owner_rank * T
+) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    t_dim = pl.tensor.dim(owner_hidden, 0)
+    row_base = owner_rank * T_MAX
 
-    for t0 in pl.range(0, T, T_TILE):
+    for t0 in pl.range(0, t_dim, T_TILE):
         for kb in pl.range(HIDDEN_COMM_BLOCKS):
             k0 = kb * HIDDEN_COMM_CHUNK
             tile = pl.load(hidden_window, [row_base + t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
@@ -177,15 +227,16 @@ def load_owner_hidden_step(
 
 @pl.jit.incore
 def route_logits_shard_step(
-    logits_shard: pl.Tensor[[T, VOCAB_PER_TP], pl.FP32],
-    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
-    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
+    logits_shard: pl.Tensor[[T_MAX, VOCAB_PER_TP], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
     owner_rank: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, VOCAB], pl.FP32]:
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(logits, 0)
     vocab_base = my_rank * VOCAB_PER_TP
 
-    for t0 in pl.range(0, T, T_TILE):
+    for t0 in pl.range(0, t_dim, T_TILE):
         for ob in pl.range(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
             tile = pl.load(logits_shard, [t0, o0], [T_TILE, VOCAB_CHUNK])
@@ -216,18 +267,19 @@ def route_logits_shard_step(
 
 @pl.jit.incore
 def finish_logits_step(
-    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
-    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, VOCAB], pl.FP32]:
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(logits, 0)
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
             pld.system.notify(
                 target=logits_done,
                 peer=peer,
                 offsets=[my_rank, 0],
-                value=1,
+                value=DONE_VALUE,
                 op=pld.NotifyOp.Set,
             )
 
@@ -236,11 +288,11 @@ def finish_logits_step(
             pld.system.wait(
                 signal=logits_done,
                 offsets=[src, 0],
-                expected=1,
+                expected=DONE_VALUE,
                 cmp=pld.WaitCmp.Ge,
             )
 
-    for t0 in pl.range(0, T, T_TILE):
+    for t0 in pl.range(0, t_dim, T_TILE):
         for src in pl.range(TP_SIZE):
             if src != my_rank:
                 src_vocab_base = src * VOCAB_PER_TP
@@ -266,34 +318,30 @@ def finish_logits_step(
 
 @pl.jit
 def lm_head_tp(
-    hidden_states: pl.Tensor[[T, D], pl.BF16],
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[T, VOCAB], pl.FP32]],
-    hidden_window: pld.DistributedTensor[[TP_SIZE * T, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    hidden_window: pld.DistributedTensor[[TP_SIZE * T_MAX, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     # scalars trailing — runtime TaskArgs requires all tensor args before any
     # scalar args (#1603-adjacent constraint).
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, VOCAB], pl.FP32]:
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(hidden_states, 0)
     publish_hidden_step(hidden_states, hidden_window, hidden_done, my_rank)
 
     for owner_rank in pl.range(TP_SIZE):
-        logits_shard = pl.create_tensor([T, VOCAB_PER_TP], dtype=pl.FP32)
+        logits_shard = pl.create_tensor([T_MAX, VOCAB_PER_TP], dtype=pl.FP32)
         if owner_rank == my_rank:
             logits_shard = lm_head(hidden_states, lm_head_weight, logits_shard)
-            logits = route_logits_shard_step(
-                logits_shard, logits, logits_window, owner_rank, my_rank
-            )
+            logits = route_logits_shard_step(logits_shard, logits, logits_window, owner_rank, my_rank)
         else:
-            owner_hidden = pl.create_tensor([T, D], dtype=pl.BF16)
+            owner_hidden = pl.create_tensor([t_dim, D], dtype=pl.BF16)
             owner_hidden = load_owner_hidden_step(owner_hidden, hidden_window, owner_rank)
             logits_shard = lm_head(owner_hidden, lm_head_weight, logits_shard)
-            logits = route_logits_shard_step(
-                logits_shard, logits, logits_window, owner_rank, my_rank
-            )
-
+            logits = route_logits_shard_step(logits_shard, logits, logits_window, owner_rank, my_rank)
     logits = finish_logits_step(logits, logits_window, logits_done, my_rank)
     return logits
 
@@ -304,15 +352,15 @@ def l3_lm_head(
     lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[TP_SIZE, T, VOCAB], pl.FP32]],
 ):
-    hidden_window_buf = pld.alloc_window_buffer(TP_SIZE * T * D * 2)
+    hidden_window_buf = pld.alloc_window_buffer(TP_SIZE * T_MAX * D * 2)
     hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-    logits_window_buf = pld.alloc_window_buffer(T * VOCAB * 4)
+    logits_window_buf = pld.alloc_window_buffer(T_MAX * VOCAB * 4)
     logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
 
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(hidden_window_buf, [TP_SIZE * T, D], dtype=pl.BF16)
+        hidden_window = pld.window(hidden_window_buf, [TP_SIZE * T_MAX, D], dtype=pl.BF16)
         hidden_done = pld.window(hidden_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(logits_window_buf, [T, VOCAB], dtype=pl.FP32)
+        logits_window = pld.window(logits_window_buf, [T_MAX, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         lm_head_tp(
             hidden_states[r],

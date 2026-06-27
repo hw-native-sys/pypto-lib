@@ -47,7 +47,9 @@ NEG_INF = -1e20
 T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # tiling
-T_TILE = 16  # unified row-tile for the fused spmd
+T_TILE = 8  # unified row-tile for the fused spmd
+LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
+MIX_RAW_ROWS = (T_MAX // T_TILE) * LINEAR_T_TILE
 RMS_K_TILE = 128
 # 256 (not 128/512): the matmul K-reduction is a serial matmul_acc dependency
 # chain (HC_DIM/LINEAR_K_TILE steps), each carrying fixed MTE/sync overhead.
@@ -59,6 +61,8 @@ LINEAR_K_TILE = 256
 D_TILE = 256
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
+assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
+assert T_MAX % LINEAR_T_TILE == 0
 # The fused pre-mix below is hand-unrolled for HC_MULT == 4: the four pre0..pre3
 # residual scales, the four mix_g0..mix_g3 / comb base loads, the comb_off =
 # HC_MULT * 2 offset and the in_h * HC_MULT column strides all assume it. Fail
@@ -94,27 +98,53 @@ def hc_pre(
     # MTE3->MTE2 fence orders the self-RAW correctly; the cube<->vec pipe sync is
     # the part that needs pypto#1761.
     mixes_gm = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
+    mix_raw_gm = pl.create_tensor([MIX_RAW_ROWS, MIX_PAD], dtype=pl.FP32)
+    t_matmul = pl.max(t_dim, LINEAR_T_TILE)
+    x_matmul = pl.create_tensor([T_MAX, HC_DIM], dtype=pl.BF16)
+    for pad_idx in pl.spmd(t_matmul // LINEAR_T_TILE, name_hint="hc_pre_x_matmul_pad"):
+        pad_t0 = pad_idx * LINEAR_T_TILE
+        pad_rows = pl.min(LINEAR_T_TILE, t_dim - pad_t0)
+        for pad_k0 in pl.range(0, HC_DIM, LINEAR_K_TILE):
+            x_valid = pl.slice(
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_TILE],
+                [pad_t0, pad_k0],
+                valid_shape=[pad_rows, LINEAR_K_TILE],
+            )
+            x_matmul[pad_t0:pad_t0 + LINEAR_T_TILE, pad_k0:pad_k0 + LINEAR_K_TILE] = pl.fillpad(
+                x_valid,
+                pad_value=pl.PadValue.zero,
+            )
 
     for ob in pl.spmd(t_dim // T_TILE, name_hint="hc_pre"):
         t0 = ob * T_TILE
+        linear_t0 = (t0 // LINEAR_T_TILE) * LINEAR_T_TILE
+        linear_row_off = t0 - linear_t0
+        mix_raw_t0 = ob * LINEAR_T_TILE
 
         # --- linear: RMS norm + hc_fn projection -> mixes_gm[t0] ---
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        mix_acc = pl.create_tensor([T_TILE, MIX_PAD], dtype=pl.FP32)
+        mix_acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):
             kl0 = kb * LINEAR_K_TILE
             x_lin = pl.cast(x_flat[t0:t0 + T_TILE, kl0:kl0 + LINEAR_K_TILE], target_type=pl.FP32)
+            x_lin_matmul = pl.cast(
+                x_matmul[linear_t0:linear_t0 + LINEAR_T_TILE, kl0:kl0 + LINEAR_K_TILE],
+                target_type=pl.FP32,
+            )
             x_sq = pl.mul(x_lin, x_lin)
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(x_sq), [1, T_TILE]))
             w_lin = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_TILE], [0, kl0], valid_shape=[MIX_HC, LINEAR_K_TILE])
             if kb == 0:
-                mix_acc = pl.matmul(x_lin, w_lin, b_trans=True, out_dtype=pl.FP32)
+                mix_acc = pl.matmul(x_lin_matmul, w_lin, b_trans=True, out_dtype=pl.FP32)
             else:
-                mix_acc = pl.matmul_acc(mix_acc, x_lin, w_lin, b_trans=True)
+                mix_acc = pl.matmul_acc(mix_acc, x_lin_matmul, w_lin, b_trans=True)
         mean_sq = pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS)
         inv_rms_val = pl.rsqrt(mean_sq, high_precision=True)
         inv_rms_col = pl.reshape(inv_rms_val, [T_TILE, 1])
-        mixes_gm[t0:t0 + T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc, inv_rms_col)
+        mix_raw_gm[mix_raw_t0:mix_raw_t0 + LINEAR_T_TILE, 0:MIX_PAD] = mix_acc
+        mix_acc_real = mix_raw_gm[mix_raw_t0 + linear_row_off:mix_raw_t0 + linear_row_off + T_TILE, 0:MIX_PAD]
+        mixes_gm[t0:t0 + T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc_real, inv_rms_col)
 
         # Bias bases as tiles (col_expand needs tile-level operands).
         pre_base = pl.load(hc_base_2d, [0, 0], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)

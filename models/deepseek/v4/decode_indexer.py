@@ -52,10 +52,12 @@ CACHE_TILE = 32
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
 Q_TILE = 128
 Q_OUT_TILE = 256
-QR_PROJ_ROW_TILE = 16
+QR_PROJ_ROW_TILE = 8
+MM_ROW_TILE = 16
+T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
 HEAD_DIM_TILE = 32
 D_TILE = 32
-WEIGHTS_ROW_TILE = 32
+WEIGHTS_ROW_TILE = 8
 B_TILE = 4
 TOPK_TILE = 4
 QH_QUANT_TILE = 256
@@ -91,22 +93,28 @@ def indexer(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
+    qr_matmul = pl.create_tensor([T_PAD, Q_LORA], dtype=pl.INT8)
+    qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_input_pad"):
+        for q0 in pl.pipeline(0, Q_LORA, Q_TILE, stage=2):
+            qr_matmul[0:T, q0:q0 + Q_TILE] = qr[:, q0:q0 + Q_TILE]
     for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // (2 * Q_OUT_TILE), name_hint="qr_proj"):
         for nt in pl.range(2):
             o0 = (idx * 2 + nt) * Q_OUT_TILE
-            qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+            qr_acc = pl.create_tensor([MM_ROW_TILE, Q_OUT_TILE], dtype=pl.INT32)
             for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
                 q0 = kb * Q_TILE
-                qr_tile = qr[:, q0 : q0 + Q_TILE]
+                qr_tile = qr_matmul[:, q0 : q0 + Q_TILE]
                 wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
                 if q0 == 0:
                     qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
                 else:
                     qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            qr_acc_pad[0:T_PAD, o0:o0 + Q_OUT_TILE] = qr_acc
             wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
             for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-                acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+                acc_fp32 = pl.cast(qr_acc_pad[r0 : r0 + QR_PROJ_ROW_TILE, o0:o0 + Q_OUT_TILE], target_type=pl.FP32, mode="none")
                 scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
                 qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
                 qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
@@ -179,19 +187,32 @@ def indexer(
                 qr_hadamard_i8[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
 
     x_flat = pl.reshape(x, [T, D])
+    x_matmul = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
+    weights_pad = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
-    for idx in pl.spmd(T // WEIGHTS_ROW_TILE, name_hint="weights_proj"):
-        wrow0 = idx * WEIGHTS_ROW_TILE
-        weights_acc = pl.create_tensor([WEIGHTS_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_input_pad"):
+        for d0 in pl.pipeline(0, D, D_TILE, stage=2):
+            x_matmul[0:T, d0:d0 + D_TILE] = x_flat[:, d0:d0 + D_TILE]
+            if T_PAD > T:
+                x_matmul[T:T_PAD, d0:d0 + D_TILE] = pl.full(
+                    [T_PAD - T, D_TILE],
+                    dtype=pl.BF16,
+                    value=0.0,
+                )
+    for idx in pl.spmd(T_PAD // MM_ROW_TILE, name_hint="weights_proj"):
+        wrow0 = idx * MM_ROW_TILE
+        weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
         for db in pl.pipeline(0, D // D_TILE, stage=2):
             d0 = db * D_TILE
-            x_tile = x_flat[wrow0 : wrow0 + WEIGHTS_ROW_TILE, d0 : d0 + D_TILE]
+            x_tile = x_matmul[wrow0 : wrow0 + MM_ROW_TILE, d0 : d0 + D_TILE]
             weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
             if d0 == 0:
                 weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
             else:
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
-        weights[wrow0 : wrow0 + WEIGHTS_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
+        weights_pad[wrow0 : wrow0 + MM_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_unpad"):
+        weights[:, :] = weights_pad[0:T, :]
 
     indexer_compressor(
         x, inner_kv,

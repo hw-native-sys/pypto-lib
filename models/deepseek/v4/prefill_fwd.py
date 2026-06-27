@@ -102,6 +102,7 @@ from hc_head import hc_head
 from rmsnorm import rms_norm
 from lm_head import (
     TP_SIZE as LM_HEAD_ACTIVE_TP_SIZE,
+    T_MAX as LM_HEAD_T_MAX,
     VOCAB_PER_TP,
     lm_head_tp,
 )
@@ -809,19 +810,19 @@ def l3_prefill_fwd(
             device=r,
         )
 
-    lm_hidden_window_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * T * D * 2)
+    lm_hidden_window_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX * D * 2)
     lm_hidden_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
-    lm_logits_window_buf = pld.alloc_window_buffer(T * VOCAB * 4)
+    lm_logits_window_buf = pld.alloc_window_buffer(LM_HEAD_T_MAX * VOCAB * 4)
     lm_logits_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
     for r in pl.range(pld.world_size()):
-        lm_hidden_window: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE * T, D], pl.BF16] = pld.window(
-            lm_hidden_window_buf, [LM_HEAD_ACTIVE_TP_SIZE * T, D], dtype=pl.BF16
+        lm_hidden_window: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], pl.BF16] = pld.window(
+            lm_hidden_window_buf, [LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], dtype=pl.BF16
         )
         lm_hidden_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
             lm_hidden_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32
         )
-        lm_logits_window: pld.DistributedTensor[[T, VOCAB], pl.FP32] = pld.window(
-            lm_logits_window_buf, [T, VOCAB], dtype=pl.FP32
+        lm_logits_window: pld.DistributedTensor[[LM_HEAD_T_MAX, VOCAB], pl.FP32] = pld.window(
+            lm_logits_window_buf, [LM_HEAD_T_MAX, VOCAB], dtype=pl.FP32
         )
         lm_logits_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
             lm_logits_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32

@@ -239,11 +239,13 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 64                 # B: tokens per decode step
+DECODE_BATCH = 4                  # B: requests per decode step
 DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
+PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
+MOE_TOKENS = PREFILL_TOKENS       # shared MoE interface rows; decode pads into this shape
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
@@ -260,8 +262,11 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
 EP_RANK = 0
 RECV_SAFETY = 4
-RECV_MAX = (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
-            // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY
+RECV_MAX = max(
+    64,
+    (DECODE_BATCH * DECODE_SEQ * FLASH.num_experts_per_tok
+     // (FLASH.n_routed_experts // EP_WORLD_SIZE)) * RECV_SAFETY,
+)
 
 # When True, gate.py's N_EXPERTS uses the full global expert space
 # (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
