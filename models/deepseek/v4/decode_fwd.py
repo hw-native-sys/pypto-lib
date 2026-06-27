@@ -127,10 +127,8 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
             packed = torch.cat(rows, dim=0)
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
-        # This forward-only smoke path does not run a golden comparison. Avoid
-        # generating random single-layer weights FWD_NUM_LAYERS times and then
-        # stacking them; construct the packed tensor directly.
-        return torch.zeros(packed_shape, dtype=spec.dtype)
+        base_init = spec.init_value
+        return torch.cat([base_init() for _ in range(layer_count)], dim=1)
 
     return TensorSpec(
         name,
@@ -1057,7 +1055,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=None, help="If set, use this single start_pos for all batches.")
     parser.add_argument("--num-tokens", type=int, default=T, help=f"Active token rows for MoE routing/combine; default is T={T}.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
