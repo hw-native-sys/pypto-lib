@@ -344,13 +344,15 @@ def _normalize_bench_cfg(benchmark: "bool | dict[str, Any] | None") -> dict[str,
 def _resolve_bench_cfg(benchmark: "bool | dict[str, Any] | None") -> dict[str, Any] | None:
     """Resolve the effective benchmark config from the arg, then the environment.
 
-    An explicit *benchmark* arg always wins. Otherwise, when the env var
-    ``PYPTO_LIB_BENCHMARK`` is set (the daily-CI a2a3 sweep enables it once for
-    the whole job), benchmark is turned on for *every* harness run with no
-    per-file flag, sized by ``PYPTO_LIB_BENCHMARK_ROUNDS`` /
-    ``PYPTO_LIB_BENCHMARK_WARMUP``. Returns the kwargs dict or None (disabled).
+    An explicit *benchmark* arg always wins, including an explicit ``False``
+    (which disables benchmarking even when the env var is set). Only a ``None``
+    arg falls back to the env var ``PYPTO_LIB_BENCHMARK`` (the daily-CI a2a3
+    sweep enables it once for the whole job), which turns benchmark on for
+    *every* harness run with no per-file flag, sized by
+    ``PYPTO_LIB_BENCHMARK_ROUNDS`` / ``PYPTO_LIB_BENCHMARK_WARMUP``. Returns the
+    kwargs dict or None (disabled).
     """
-    if benchmark:
+    if benchmark is not None:
         return _normalize_bench_cfg(benchmark)
     import os
 
@@ -405,7 +407,7 @@ def _run_benchmark(
     from pypto.runtime import benchmark as pypto_benchmark
 
     ordered: list[Any] = [
-        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_python()
+        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
         for s in specs
     ]
     stats = pypto_benchmark(

@@ -5,6 +5,11 @@ on:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
 
+# Least-privilege default: checkout reads the repo, artifact up/download use the
+# Actions runtime token. No job pushes, comments, or edits the repo.
+permissions:
+  contents: read
+
 jobs:
   model-tests-sim:
     # Simulator job: no device needed, so it runs on the CPU runner inside the
@@ -391,8 +396,11 @@ jobs:
               printf '%s\tfail\n' "$label" >> results.tsv
             else
               printf '%s\tpass\n' "$label" >> results.tsv
+              # Record perf only for passing cases (one marker per kernel; absent
+              # for multi-card / unbenchmarkable). A failed run's [RUN] benchmark
+              # line would pollute trend data, so it is collected only here.
+              grep -a '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
             fi
-            grep -a '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
             rm -f "$log"
             echo "::endgroup::"
           }
