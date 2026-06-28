@@ -132,8 +132,8 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
@@ -335,14 +335,11 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
-          # Enable the harness register-once benchmark for every a2a3 case (no
-          # per-file flag): after the normal validate run, time the same compiled
-          # kernel and emit a "[BENCH] ..." marker the collector below parses.
-          # Real on-NPU device_wall_us; only the real-device a2a3 job sets this
-          # (the sim jobs would report all-zero device time). Reuses the golden
-          # already computed for validation — no golden_data cache.
           PYPTO_LIB_BENCHMARK: '1'
           PYPTO_LIB_BENCHMARK_ROUNDS: '30'
         run: |
@@ -358,10 +355,6 @@ jobs:
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near the
-            # top. Multi-card uses HCCL, so avoid inheriting PTO2_RING_* from the
-            # runner's systemd and set the same explicit CI ring sizes used by
-            # single-card files. Each runs in its own subshell so env overrides do
-            # not leak across files.
             local log; log="$(mktemp)"
             local rc
             local ndev
@@ -386,18 +379,10 @@ jobs:
                 echo "::endgroup::"
                 return
               fi
-              # tee so the live log still streams while we capture the harness's
-              # "[BENCH] ..." perf marker; PIPESTATUS[0] is the python exit code.
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" ) 2>&1 | tee "$log"
+              timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" 2>&1 | tee "$log"
               rc=${PIPESTATUS[0]}
             else
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" ) 2>&1 | tee "$log"
+              timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" 2>&1 | tee "$log"
               rc=${PIPESTATUS[0]}
             fi
             if [ "$rc" -ne 0 ]; then
@@ -407,10 +392,7 @@ jobs:
             else
               printf '%s\tpass\n' "$label" >> results.tsv
             fi
-            # Collect any benchmark markers the harness emitted (one per kernel,
-            # only on the real-device a2a3 job). Prefix each with the case label;
-            # absent for multi-card / unbenchmarkable cases, so this is best-effort.
-            grep -a '^\[BENCH\] ' "$log" | sed "s|^\[BENCH\] |${label}\t|" >> perf.tsv
+            grep -a '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
             rm -f "$log"
             echo "::endgroup::"
           }

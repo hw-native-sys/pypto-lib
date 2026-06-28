@@ -416,26 +416,26 @@ def _run_benchmark(
         platform=runtime_cfg.get("platform"),
         device_id=runtime_cfg.get("device_id"),
     )
-    print(f"[RUN] benchmark: {stats}", flush=True)
-    # Stable, single-line, machine-readable marker for the daily-CI perf
-    # collector to grep ("^[BENCH] ..."). ``kernel`` is the compiled program's
-    # output-dir basename, so a file running several kernels emits one line each.
-    # Strip the per-run ``_YYYYMMDD_HHMMSS`` timestamp suffix so the report row
-    # is stable day-to-day (trend tracking joins on a constant kernel name).
+    # Single-line, machine-readable marker the daily-CI perf collector greps for.
+    # It is anchored on ``kernel=`` (not the bare "[RUN] benchmark" prefix) so it
+    # is unambiguous against the _Stage("benchmark") start/done lines and the
+    # "[RUN] benchmark skipped" warning. ``kernel`` is the compiled program's
+    # output-dir basename with the per-run ``_YYYYMMDD_HHMMSS`` timestamp stripped
+    # so the report row is stable day-to-day (trend tracking joins on a constant
+    # name); a file running several kernels emits one line each.
     import re
 
     kernel = Path(compiled.output_dir).name if getattr(compiled, "output_dir", None) else "unknown"
     kernel = re.sub(r"_\d{8}_\d{6}$", "", kernel)
     if stats.all_zero_device:
         print(
-            "[RUN] benchmark: device_wall_us all 0 — runtime built without PTO2_PROFILING; "
-            "rebuild the runtime with profiling for on-NPU timing",
+            f"[RUN] benchmark kernel={kernel} no_device_timing=1 rounds={stats.rounds} "
+            "(device_wall_us all 0 — runtime built without PTO2_PROFILING)",
             flush=True,
         )
-        print(f"[BENCH] kernel={kernel} no_device_timing=1 rounds={stats.rounds}", flush=True)
     else:
         print(
-            f"[BENCH] kernel={kernel} rounds={stats.rounds} "
+            f"[RUN] benchmark kernel={kernel} rounds={stats.rounds} "
             f"mean_us={stats.device_us_mean:.1f} "
             f"min_us={stats.device_us_min:.1f} "
             f"max_us={stats.device_us_max:.1f}",
