@@ -5,6 +5,11 @@ on:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
 
+# Least-privilege default: checkout reads the repo, artifact up/download use the
+# Actions runtime token. No job pushes, comments, or edits the repo.
+permissions:
+  contents: read
+
 jobs:
   model-tests-sim:
     # Simulator job: no device needed, so it runs on the CPU runner inside the
@@ -132,8 +137,8 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
@@ -335,8 +340,13 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
+          PYPTO_LIB_BENCHMARK: '1'
+          PYPTO_LIB_BENCHMARK_ROUNDS: '30'
         run: |
           source activate.sh
           # grep for the device marker returns non-zero on single-card files
@@ -344,15 +354,14 @@ jobs:
           # whole step on the first such file, so disable errexit for the loop.
           set +e
           : > results.tsv
+          : > perf.tsv
           failed=()
           run_case() {
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near the
-            # top. Multi-card uses HCCL, so avoid inheriting PTO2_RING_* from the
-            # runner's systemd and set the same explicit CI ring sizes used by
-            # single-card files. Each runs in its own subshell so env overrides do
-            # not leak across files.
+            local log; log="$(mktemp)"
+            local rc
             local ndev
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
@@ -361,6 +370,7 @@ jobs:
                 echo "::error file=${file}::needs $ndev devices but DEVICE_RANGE is unset"
                 failed+=("$label")
                 printf '%s\tfail\n' "$label" >> results.tsv
+                rm -f "$log"
                 echo "::endgroup::"
                 return
               fi
@@ -370,26 +380,30 @@ jobs:
                 echo "::error file=${file}::needs $ndev devices but DEVICE_RANGE only provides $actual_ndev ($DEVICE_RANGE)"
                 failed+=("$label")
                 printf '%s\tfail\n' "$label" >> results.tsv
+                rm -f "$log"
                 echo "::endgroup::"
                 return
               fi
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" )
+              timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" 2>&1 | tee "$log"
+              rc=${PIPESTATUS[0]}
             else
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" )
+              timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" 2>&1 | tee "$log"
+              rc=${PIPESTATUS[0]}
             fi
-            if [ $? -ne 0 ]; then
+            if [ "$rc" -ne 0 ]; then
               failed+=("$label")
               echo "::error file=${file}::FAIL (${label})"
               printf '%s\tfail\n' "$label" >> results.tsv
             else
               printf '%s\tpass\n' "$label" >> results.tsv
+              # Record perf only for passing cases. -m1 keeps a single row per
+              # file: multi-mode files (e.g. hc_pre runs decode+prefill) emit one
+              # marker each, so take the first. Absent for multi-card /
+              # unbenchmarkable cases. Collected only here so a failed run's
+              # [RUN] benchmark line cannot pollute trend data.
+              grep -a -m1 '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
             fi
+            rm -f "$log"
             echo "::endgroup::"
           }
           # Run every model file once with no extra args.
@@ -412,7 +426,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: results-a2a3
-          path: dist-checkout/results.tsv
+          path: |
+            dist-checkout/results.tsv
+            dist-checkout/perf.tsv
 
   summary:
     name: Aggregate results summary
@@ -447,11 +463,29 @@ jobs:
 
           all_cases = sorted({c for p in PLATFORMS for c in results[p]})
 
+          # a2a3 on-NPU mean device time (us), shown as one extra column to the
+          # right of the platform icons. Only the real-device a2a3 job carries a
+          # device_wall_us (sim jobs would be all-zero), so this is a2a3-only.
+          # Each perf.tsv line is "<case>\tkernel=.. rounds=.. mean_us=.. ..",
+          # one row per case (the collector keeps only the first marker).
+          perf_tsv = root / "results-a2a3" / "perf.tsv"
+          perf = {}  # case -> list of display strings
+          if perf_tsv.exists():
+              for line in perf_tsv.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  case, _, rest = line.partition("\t")
+                  fields = dict(kv.split("=", 1) for kv in rest.split() if "=" in kv)
+                  perf.setdefault(case, []).append(
+                      "n/a" if fields.get("no_device_timing") else fields.get("mean_us", "?")
+                  )
+
           print("## Daily CI Model Test Results")
           print()
-          print("| Case | " + " | ".join(PLATFORMS) + " |")
-          print("| ---- | " + " | ".join(["---"] * len(PLATFORMS)) + " |")
+          print("| Case | " + " | ".join(PLATFORMS) + " | a2a3 perf (us) |")
+          print("| ---- | " + " | ".join(["---"] * len(PLATFORMS)) + " | --- |")
           for case in all_cases:
               cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
-              print(f"| `{case}` | " + " | ".join(cells) + " |")
+              perf_cell = " / ".join(perf.get(case, [])) or ":heavy_minus_sign:"
+              print(f"| `{case}` | " + " | ".join(cells) + f" | {perf_cell} |")
           EOF

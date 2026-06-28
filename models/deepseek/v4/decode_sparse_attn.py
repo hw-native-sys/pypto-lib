@@ -892,6 +892,10 @@ if __name__ == "__main__":
                              "converter draws fanout/fanin arrows from the sibling file.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
+    parser.add_argument("--benchmark", action="store_true", default=False,
+                        help="After validation, register-once and time the kernel over "
+                             "100 launches (simpler scene_test --rounds mode); reports "
+                             "per-launch device_wall_us mean/min/max.")
     args = parser.parse_args()
 
     compress_ratio = args.compress_ratio
@@ -922,7 +926,11 @@ if __name__ == "__main__":
         compare_fn={
             "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
+        benchmark=(dict(rounds=100, warmup=3) if args.benchmark else None),
     )
+    if result.bench_stats is not None and not result.bench_stats.all_zero_device:
+        print(f"decode_sparse_attn device time: {result.bench_stats.device_us_mean:.0f} us (mean)",
+              flush=True)
     if not result.passed:
         if result.error:
             print(result.error)
