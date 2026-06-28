@@ -438,9 +438,9 @@ def _run_benchmark(
     else:
         print(
             f"[RUN] benchmark kernel={kernel} rounds={stats.rounds} "
-            f"mean_us={stats.device_us_mean:.1f} "
-            f"min_us={stats.device_us_min:.1f} "
-            f"max_us={stats.device_us_max:.1f}",
+            f"mean_us={stats.device_us_mean:.0f} "
+            f"min_us={stats.device_us_min:.0f} "
+            f"max_us={stats.device_us_max:.0f}",
             flush=True,
         )
     return stats

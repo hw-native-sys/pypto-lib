@@ -929,7 +929,7 @@ if __name__ == "__main__":
         benchmark=(dict(rounds=100, warmup=3) if args.benchmark else None),
     )
     if result.bench_stats is not None and not result.bench_stats.all_zero_device:
-        print(f"decode_sparse_attn device time: {result.bench_stats.device_us_mean:.1f} us (mean)",
+        print(f"decode_sparse_attn device time: {result.bench_stats.device_us_mean:.0f} us (mean)",
               flush=True)
     if not result.passed:
         if result.error:
