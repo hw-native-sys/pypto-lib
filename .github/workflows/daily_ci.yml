@@ -396,10 +396,12 @@ jobs:
               printf '%s\tfail\n' "$label" >> results.tsv
             else
               printf '%s\tpass\n' "$label" >> results.tsv
-              # Record perf only for passing cases (one marker per kernel; absent
-              # for multi-card / unbenchmarkable). A failed run's [RUN] benchmark
-              # line would pollute trend data, so it is collected only here.
-              grep -a '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
+              # Record perf only for passing cases. -m1 keeps a single row per
+              # file: multi-mode files (e.g. hc_pre runs decode+prefill) emit one
+              # marker each, so take the first. Absent for multi-card /
+              # unbenchmarkable cases. Collected only here so a failed run's
+              # [RUN] benchmark line cannot pollute trend data.
+              grep -a -m1 '^\[RUN\] benchmark kernel=' "$log" | sed "s|^\[RUN\] benchmark |${label}\t|" >> perf.tsv
             fi
             rm -f "$log"
             echo "::endgroup::"
@@ -464,8 +466,8 @@ jobs:
           # a2a3 on-NPU mean device time (us), shown as one extra column to the
           # right of the platform icons. Only the real-device a2a3 job carries a
           # device_wall_us (sim jobs would be all-zero), so this is a2a3-only.
-          # Each perf.tsv line is "<case>\tkernel=.. rounds=.. mean_us=.. ...";
-          # a case running several kernels contributes several values, joined " / ".
+          # Each perf.tsv line is "<case>\tkernel=.. rounds=.. mean_us=.. ..",
+          # one row per case (the collector keeps only the first marker).
           perf_tsv = root / "results-a2a3" / "perf.tsv"
           perf = {}  # case -> list of display strings
           if perf_tsv.exists():
