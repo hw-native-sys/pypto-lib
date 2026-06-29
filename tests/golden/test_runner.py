@@ -25,6 +25,7 @@ from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
     _backend_for_platform,
+    _compile_jit_with_compat,
     _format_stale_paths,
     _maybe_reload_l3,
     _save_tensors,
@@ -98,6 +99,84 @@ def _patch_compile_and_execute(
         patch("pypto.ir.compile", return_value=fake),
         patch("pypto.runtime.execute_compiled", side_effect=fake_execute),
     )
+
+
+class TestJitCompileCompat:
+    """`_compile_jit_with_compat` bridges JIT API differences."""
+
+    def test_prefers_public_compile(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fake = _FakeCompiled(compiled_dir)
+        seen: dict[str, object] = {}
+
+        class FakeJit:
+            def compile(self, *args, config=None):
+                seen["args"] = args
+                seen["config"] = config
+                return fake
+
+        result = _compile_jit_with_compat(
+            FakeJit(),
+            [torch.empty([4], dtype=torch.float32)],
+            {"platform": "a2a3sim", "dump_passes": True},
+        )
+
+        assert result is fake
+        assert len(seen["args"]) == 1
+        assert seen["config"].platform == "a2a3sim"
+        assert seen["config"].dump_passes is True
+
+    def test_falls_back_to_compile_to_program(self, tmp_path):
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fake = _FakeCompiled(compiled_dir)
+        program = object()
+        captured: dict[str, object] = {}
+        per_func_dyn = {"entry": set()}
+
+        class FakeJit:
+            def _bind_args(self, args, kwargs):
+                captured["bound_args"] = args
+                captured["bound_kwargs"] = kwargs
+                return ([], {}, {}, {}, {}, per_func_dyn)
+
+            def _compile_to_program(self, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn_arg, pl):
+                captured["compile_to_program"] = {
+                    "tensor_meta": tensor_meta,
+                    "scalar_values": scalar_values,
+                    "scalar_dtypes": scalar_dtypes,
+                    "per_func_dyn": per_func_dyn_arg,
+                    "pl": pl,
+                }
+                return program
+
+        with patch("pypto.ir.compile", return_value=fake) as mock_compile:
+            result = _compile_jit_with_compat(
+                FakeJit(),
+                [torch.empty([4], dtype=torch.float32)],
+                {"platform": "a2a3sim", "dump_passes": True, "compile_profiling": True},
+            )
+
+        assert result is fake
+        assert len(captured["bound_args"]) == 1
+        assert captured["bound_kwargs"] == {}
+        assert captured["compile_to_program"]["tensor_meta"] == {}
+        assert captured["compile_to_program"]["scalar_values"] == {}
+        assert captured["compile_to_program"]["scalar_dtypes"] == {}
+        assert captured["compile_to_program"]["per_func_dyn"] is per_func_dyn
+        mock_compile.assert_called_once()
+        assert mock_compile.call_args.args == (program,)
+        assert mock_compile.call_args.kwargs == {
+            "output_dir": None,
+            "strategy": mock_compile.call_args.kwargs["strategy"],
+            "backend_type": mock_compile.call_args.kwargs["backend_type"],
+            "dump_passes": True,
+            "diagnostic_phase": None,
+            "disabled_diagnostics": None,
+            "platform": "a2a3sim",
+            "profiling": True,
+        }
 
 
 class TestGoldenDataCacheHit:
