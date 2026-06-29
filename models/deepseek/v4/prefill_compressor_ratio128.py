@@ -67,8 +67,8 @@ def prefill_compressor_ratio128(
     kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
-    wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -102,14 +102,16 @@ def prefill_compressor_ratio128(
         for kb in pl.pipeline(0, K_BLOCKS, stage=2):
             k0 = kb * K_TILE
             x_tile = x_flat[0:T, k0 : k0 + K_TILE]
-            wkv_tile = wkv[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
-            wgate_tile = wgate[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
+            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
+            # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/decode-HCA.
+            wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+            wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
             else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
+                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
         kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
@@ -271,8 +273,8 @@ def prefill_compressor_ratio128_test(
     kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
-    wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -293,8 +295,8 @@ def golden_prefill_compressor_ratio128(tensors):
     import torch
 
     num_tokens = int(tensors["num_tokens"])
-    kv_proj = tensors["x"].float() @ tensors["wkv"].float()
-    score_proj = tensors["x"].float() @ tensors["wgate"].float()
+    kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()    # wkv stored [OUT_DIM, D] for b_trans
+    score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
     kv_state_flat = tensors["kv_state"].view(HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM)
     score_state_flat = tensors["score_state"].view(HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM)
     state_block_table = tensors["compress_state_block_table"]
@@ -391,9 +393,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
     # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_compressor_ratio128.
     def init_wkv():
-        return torch.randn(D, OUT_DIM) * 0.0246
+        return torch.randn(OUT_DIM, D) * 0.0246
     def init_wgate():
-        return torch.randn(D, OUT_DIM) * 0.0316
+        return torch.randn(OUT_DIM, D) * 0.0316
     def init_ape():
         return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.0340
     def init_norm_w():
@@ -424,8 +426,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("kv_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("score_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("wkv", [D, OUT_DIM], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [D, OUT_DIM], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
