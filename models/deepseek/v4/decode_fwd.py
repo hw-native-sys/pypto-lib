@@ -20,63 +20,80 @@ from hc_head import hc_head
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
 
-from decode_layer import (
+# decode_fwd is self-contained: it imports kernels, constants, and per-kind
+# spec builders directly from the leaf modules (no dependency on decode_layer).
+# Import order matches decode_layer: attention kinds, then config, then moe.
+from decode_attention_swa import (
     B,
     BLOCK_SIZE,
-    CSA_CMP_BLOCK_NUM,
-    CSA_CMP_MAX_BLOCKS,
-    CSA_COMPRESS_RATIO,
-    CSA_IDX_CACHE_BLOCK_NUM,
-    CSA_IDX_CACHE_MAX_BLOCKS,
-    CSA_IDX_HEAD_DIM,
-    CSA_IDX_N_HEADS,
-    CSA_INNER_OUT_DIM,
-    CSA_INNER_STATE_BLOCK_NUM,
-    CSA_INNER_STATE_BLOCK_SIZE,
-    CSA_INNER_STATE_DIM,
-    CSA_INNER_STATE_MAX_BLOCKS,
-    CSA_MAIN_OUT_DIM,
-    CSA_MAIN_STATE_BLOCK_NUM,
-    CSA_MAIN_STATE_BLOCK_SIZE,
-    CSA_MAIN_STATE_DIM,
-    CSA_MAIN_STATE_MAX_BLOCKS,
     D,
-    H,
-    HCA_COMPRESS_RATIO,
-    HCA_COMPRESS_STATE_BLOCK_NUM,
-    HCA_COMPRESS_STATE_BLOCK_SIZE,
-    HCA_COMPRESS_STATE_DIM,
-    HCA_COMPRESS_STATE_MAX_BLOCKS,
-    HCA_MAIN_OUT_DIM,
     HC_DIM,
     HC_MULT,
+    H,
     HEAD_DIM,
-    IDX_PAD,
     MAX_SEQ_LEN,
     MIX_HC,
-    MODEL_CONFIG,
+    O_GROUPS,
+    O_GROUP_IN,
+    O_LORA,
+    ORI_MAX_BLOCKS,
+    Q_LORA,
+    ROPE_HEAD_DIM,
+    T,
+    attention_swa,
+    build_tensor_specs as build_attention_tensor_specs,
+)
+from decode_attention_hca import (
+    CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
+    CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
+    COMPRESS_RATIO as HCA_COMPRESS_RATIO,
+    COMPRESS_STATE_BLOCK_NUM as HCA_COMPRESS_STATE_BLOCK_NUM,
+    COMPRESS_STATE_BLOCK_SIZE as HCA_COMPRESS_STATE_BLOCK_SIZE,
+    COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
+    COMPRESS_STATE_MAX_BLOCKS as HCA_COMPRESS_STATE_MAX_BLOCKS,
+    MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
+    attention_hca,
+    build_tensor_specs as build_hca_tensor_specs,
+)
+from decode_attention_csa import (
+    CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
+    CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
+    COMPRESS_RATIO as CSA_COMPRESS_RATIO,
+    IDX_CACHE_BLOCK_NUM as CSA_IDX_CACHE_BLOCK_NUM,
+    IDX_CACHE_MAX_BLOCKS as CSA_IDX_CACHE_MAX_BLOCKS,
+    IDX_HEAD_DIM as CSA_IDX_HEAD_DIM,
+    IDX_N_HEADS as CSA_IDX_N_HEADS,
+    INNER_OUT_DIM as CSA_INNER_OUT_DIM,
+    INNER_STATE_BLOCK_NUM as CSA_INNER_STATE_BLOCK_NUM,
+    INNER_STATE_BLOCK_SIZE as CSA_INNER_STATE_BLOCK_SIZE,
+    INNER_STATE_DIM as CSA_INNER_STATE_DIM,
+    INNER_STATE_MAX_BLOCKS as CSA_INNER_STATE_MAX_BLOCKS,
+    MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
+    MAIN_STATE_BLOCK_NUM as CSA_MAIN_STATE_BLOCK_NUM,
+    MAIN_STATE_BLOCK_SIZE as CSA_MAIN_STATE_BLOCK_SIZE,
+    MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
+    MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
+    attention_csa,
+    build_tensor_specs as build_csa_tensor_specs,
+)
+from config import FLASH as MODEL_CONFIG
+from moe import (
+    IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
     N_RANKS,
     N_ROUTES,
-    ORI_MAX_BLOCKS,
-    O_GROUPS,
-    O_GROUP_IN,
-    O_LORA,
-    Q_LORA,
     RECV_MAX,
-    ROPE_HEAD_DIM,
-    T,
     TOPK,
     VOCAB,
     W_PAD,
-    attention_csa,
-    attention_hca,
-    attention_swa,
-    build_tensor_specs as build_single_layer_tensor_specs,
+    build_tensor_specs as build_moe_tensor_specs,
     moe,
 )
+
+assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
+assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 from lm_head import (
     TP_SIZE as LM_HEAD_ACTIVE_TP_SIZE,
     VOCAB_PER_TP,
@@ -108,240 +125,18 @@ HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 LM_HEAD_NAMES = ["lm_head_weight"]
 
-
-def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
-    import torch
-    from golden import TensorSpec
-
-    spec = base_specs[name]
-    packed_shape = [spec.shape[0], layer_count * spec.shape[1], *spec.shape[2:]]
-
-    def init_value():
-        if name == "tid2eid":
-            token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
-            topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
-            rows = []
-            for layer in range(layer_count):
-                layer_eids = (token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL
-                rows.append(layer_eids)
-            packed = torch.cat(rows, dim=0)
-            return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-
-        base_init = spec.init_value
-        return torch.cat([base_init() for _ in range(layer_count)], dim=1)
-
-    return TensorSpec(
-        name,
-        packed_shape,
-        spec.dtype,
-        init_value=init_value,
-        is_output=False,
-    )
-
-
-def _make_shared_spec(name, base_spec, out_name=None):
-    from golden import TensorSpec
-    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
-
-
-def _make_hc_head_spec(name):
-    import torch
-    from golden import TensorSpec
-
-    if name == "hc_head_fn":
-        return TensorSpec(
-            name,
-            [N_RANKS, HC_MULT, HC_DIM],
-            torch.float32,
-            init_value=lambda: torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519,
-        )
-    if name == "hc_head_scale":
-        return TensorSpec(
-            name,
-            [N_RANKS, 1],
-            torch.float32,
-            init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32),
-        )
-    if name == "hc_head_base":
-        base = [5.9166, -3.6223, -2.9324, -3.3124]
-        return TensorSpec(
-            name,
-            [N_RANKS, HC_MULT],
-            torch.float32,
-            init_value=lambda: torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous(),
-        )
-    raise ValueError(f"unclassified hc_head spec: {name}")
-
-
-def _make_final_norm_spec(name):
-    import torch
-    from golden import TensorSpec
-
-    if name == "final_norm_w":
-        return TensorSpec(
-            name,
-            [N_RANKS, D],
-            torch.bfloat16,
-            init_value=lambda: (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16),
-        )
-    raise ValueError(f"unclassified final norm spec: {name}")
-
-
-def _make_lm_head_spec(name):
-    import torch
-    from golden import TensorSpec
-
-    if name == "lm_head_weight":
-        def init_lm_head_weight():
-            return (torch.randn(N_RANKS, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-
-        return TensorSpec(
-            name,
-            [N_RANKS, VOCAB_PER_TP, D],
-            torch.bfloat16,
-            init_value=init_lm_head_weight,
-        )
-    raise ValueError(f"unclassified lm_head spec: {name}")
-
-
-def _make_forward_metadata_specs(base_specs, start_pos=None):
-    import torch
-    from golden import TensorSpec
-
-    seq_per_batch = T // B
-    win = MODEL_CONFIG.sliding_window
-
-    def ranked(init_single):
-        return torch.stack([init_single() for _ in range(N_RANKS)], dim=0)
-
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
-        pattern = torch.tensor([
-            10,
-            CSA_COMPRESS_RATIO - seq_per_batch,
-            CSA_COMPRESS_RATIO - 1,
-            CSA_COMPRESS_RATIO,
-            CSA_COMPRESS_RATIO * 2 - seq_per_batch,
-            CSA_COMPRESS_RATIO * 3 - 1,
-            win - seq_per_batch,
-            win - 1,
-            win,
-        ], dtype=torch.int32)
-        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
-
-    def init_position_ids_single():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((T,), dtype=torch.int32)
-        for t in range(T):
-            b = t // seq_per_batch
-            s = t - b * seq_per_batch
-            positions[t] = starts[b] + s
-        return positions
-
-    def init_kv_seq_lens_single():
-        return (init_start_pos().to(torch.int64) + seq_per_batch).to(torch.int32)
-
-    def init_block_table_single(max_blocks):
-        tbl = torch.full((B, max_blocks), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(max_blocks):
-                tbl[b, j] = b * max_blocks + j
-        return tbl
-
-    def init_ori_slot_mapping_single():
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(ORI_MAX_BLOCKS).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            slot = pos % win
-            blk = int(block_table[b, slot // BLOCK_SIZE].item())
-            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
-        return mapping
-
-    def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(max_blocks).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            if (pos + 1) % compress_ratio == 0:
-                cache_col = pos // compress_ratio
-                logical_blk = cache_col // BLOCK_SIZE
-                intra = cache_col % BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[t] = blk * BLOCK_SIZE + intra
-        return mapping
-
-    def init_state_slot_mapping_single(max_blocks, block_size):
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(max_blocks).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            logical_blk = pos // block_size
-            intra = pos % block_size
-            blk = int(block_table[b, logical_blk].item())
-            mapping[t] = blk * block_size + intra
-        return mapping
-
-    init_by_name = {
-        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
-        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
-        "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS)),
-        "csa_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS)),
-        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_INNER_STATE_MAX_BLOCKS)),
-        "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
-        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
-        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
-        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE)),
-        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE)),
-        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE)),
-        "position_ids": lambda: ranked(init_position_ids_single),
-        "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
-    }
-
-    return {
-        name: TensorSpec(name, list(base_specs[name].shape), base_specs[name].dtype, init_value=init_value)
-        for name, init_value in init_by_name.items()
-    }
-
-
-def build_tensor_specs(start_pos=None, num_tokens=T):
-    import torch
-    from golden import ScalarSpec, TensorSpec
-    base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
-    metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w', 'lm_head_weight']
-    specs = []
-    for name in ordered_names:
-        if name in metadata_specs:
-            specs.append(metadata_specs[name])
-        elif name in CSA_LAYER_STACKED_NAMES:
-            specs.append(_make_layer_stacked_spec(name, base_specs, CSA_NUM_LAYERS))
-        elif name in HCA_LAYER_STACKED_NAMES:
-            specs.append(_make_layer_stacked_spec(name, base_specs, HCA_NUM_LAYERS))
-        elif name in LAYER_STACKED_NAMES:
-            specs.append(_make_layer_stacked_spec(name, base_specs))
-        elif name in SHARED_NAMES:
-            specs.append(_make_shared_spec(name, base_specs[name]))
-        elif name in HC_HEAD_NAMES:
-            specs.append(_make_hc_head_spec(name))
-        elif name in FINAL_NORM_NAMES:
-            specs.append(_make_final_norm_spec(name))
-        elif name in LM_HEAD_NAMES:
-            specs.append(_make_lm_head_spec(name))
-        else:
-            raise ValueError(f"unclassified decode_fwd spec: {name}")
-    specs.append(TensorSpec("logits", [N_RANKS, T, VOCAB], torch.float32, is_output=True))
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
-    return specs
+# Paged KV / compressor-state pools. These are sized for the full decode context
+# (B x per-request-max-blocks per FWD layer, tens of thousands of blocks), so
+# randn-ing every layer's pool independently dominates the "generate inputs"
+# stage. Their content is smoke-only (decode_fwd has no golden_fn), so we randn a
+# single layer's pool and tile it across layers instead: each layer keeps the
+# full per-block diversity its standalone attention init produces (the indexer's
+# top-k block selection still sees varied blocks) while the randn work drops
+# ~layer_count x. Weights / gate / routing metadata are unaffected.
+CACHE_POOL_NAMES = frozenset({
+    "kv_cache", "cmp_kv", "idx_kv_cache",
+    "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
+})
 
 
 @pl.jit(auto_scope=False)
@@ -1045,11 +840,448 @@ def l3_decode_fwd(
         )
 
 
-if __name__ == "__main__":
-    import argparse
-    from golden import run_jit
+# ---------------------------------------------------------------------------
+# Fixtures (kernel-only smoke path: no golden).  Stacked weights reuse each
+# layer's standalone attention/moe init; routing metadata, slot mappings and
+# tid2eid carry meaningful values.
+# ---------------------------------------------------------------------------
+def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
+    import torch
+    from golden import TensorSpec
 
-    parser = argparse.ArgumentParser()
+    spec = base_specs[name]
+    packed_shape = [spec.shape[0], layer_count * spec.shape[1], *spec.shape[2:]]
+
+    def init_value():
+        if name == "tid2eid":
+            token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
+            topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
+            rows = []
+            for layer in range(layer_count):
+                layer_eids = (token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL
+                rows.append(layer_eids)
+            packed = torch.cat(rows, dim=0)
+            return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+        base_init = spec.init_value
+        if name in CACHE_POOL_NAMES:
+            # Randn one layer's pool, then tile across layers along the block dim.
+            one_layer = base_init()
+            reps = [1, layer_count] + [1] * (one_layer.dim() - 2)
+            return one_layer.repeat(*reps)
+        return torch.cat([base_init() for _ in range(layer_count)], dim=1)
+
+    return TensorSpec(
+        name,
+        packed_shape,
+        spec.dtype,
+        init_value=init_value,
+        is_output=False,
+    )
+
+
+def _make_shared_spec(name, base_spec, out_name=None):
+    from golden import TensorSpec
+    return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
+
+
+def _make_hc_head_spec(name):
+    import torch
+    from golden import TensorSpec
+
+    if name == "hc_head_fn":
+        return TensorSpec(
+            name,
+            [N_RANKS, HC_MULT, HC_DIM],
+            torch.float32,
+            init_value=lambda: torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519,
+        )
+    if name == "hc_head_scale":
+        return TensorSpec(
+            name,
+            [N_RANKS, 1],
+            torch.float32,
+            init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32),
+        )
+    if name == "hc_head_base":
+        base = [5.9166, -3.6223, -2.9324, -3.3124]
+        return TensorSpec(
+            name,
+            [N_RANKS, HC_MULT],
+            torch.float32,
+            init_value=lambda: torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous(),
+        )
+    raise ValueError(f"unclassified hc_head spec: {name}")
+
+
+def _make_final_norm_spec(name):
+    import torch
+    from golden import TensorSpec
+
+    if name == "final_norm_w":
+        return TensorSpec(
+            name,
+            [N_RANKS, D],
+            torch.bfloat16,
+            init_value=lambda: (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16),
+        )
+    raise ValueError(f"unclassified final norm spec: {name}")
+
+
+def _make_lm_head_spec(name):
+    import torch
+    from golden import TensorSpec
+
+    if name == "lm_head_weight":
+        def init_lm_head_weight():
+            return (torch.randn(N_RANKS, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+
+        return TensorSpec(
+            name,
+            [N_RANKS, VOCAB_PER_TP, D],
+            torch.bfloat16,
+            init_value=init_lm_head_weight,
+        )
+    raise ValueError(f"unclassified lm_head spec: {name}")
+
+
+def _make_forward_metadata_specs(base_specs, start_pos=None):
+    import torch
+    from golden import TensorSpec
+
+    seq_per_batch = T // B
+    win = MODEL_CONFIG.sliding_window
+
+    def ranked(init_single):
+        return torch.stack([init_single() for _ in range(N_RANKS)], dim=0)
+
+    def init_start_pos():
+        if start_pos is not None:
+            return torch.full((B,), start_pos, dtype=torch.int32)
+        pattern = torch.tensor([
+            10,
+            CSA_COMPRESS_RATIO - seq_per_batch,
+            CSA_COMPRESS_RATIO - 1,
+            CSA_COMPRESS_RATIO,
+            CSA_COMPRESS_RATIO * 2 - seq_per_batch,
+            CSA_COMPRESS_RATIO * 3 - 1,
+            win - seq_per_batch,
+            win - 1,
+            win,
+        ], dtype=torch.int32)
+        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+
+    def init_position_ids_single():
+        starts = init_start_pos().to(torch.int64)
+        positions = torch.empty((T,), dtype=torch.int32)
+        for t in range(T):
+            b = t // seq_per_batch
+            s = t - b * seq_per_batch
+            positions[t] = starts[b] + s
+        return positions
+
+    def init_kv_seq_lens_single():
+        return (init_start_pos().to(torch.int64) + seq_per_batch).to(torch.int32)
+
+    def init_block_table_single(max_blocks):
+        tbl = torch.full((B, max_blocks), -1, dtype=torch.int32)
+        for b in range(B):
+            for j in range(max_blocks):
+                tbl[b, j] = b * max_blocks + j
+        return tbl
+
+    def init_ori_slot_mapping_single():
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(ORI_MAX_BLOCKS).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            slot = pos % win
+            blk = int(block_table[b, slot // BLOCK_SIZE].item())
+            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
+        return mapping
+
+    def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(max_blocks).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            if (pos + 1) % compress_ratio == 0:
+                cache_col = pos // compress_ratio
+                logical_blk = cache_col // BLOCK_SIZE
+                intra = cache_col % BLOCK_SIZE
+                blk = int(block_table[b, logical_blk].item())
+                mapping[t] = blk * BLOCK_SIZE + intra
+        return mapping
+
+    def init_state_slot_mapping_single(max_blocks, block_size):
+        positions = init_position_ids_single().to(torch.int64)
+        block_table = init_block_table_single(max_blocks).to(torch.int64)
+        mapping = torch.full((T,), -1, dtype=torch.int64)
+        for t in range(T):
+            b = t // seq_per_batch
+            pos = int(positions[t].item())
+            logical_blk = pos // block_size
+            intra = pos % block_size
+            blk = int(block_table[b, logical_blk].item())
+            mapping[t] = blk * block_size + intra
+        return mapping
+
+    init_by_name = {
+        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
+        "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
+        "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
+        "hca_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS)),
+        "csa_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS)),
+        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_INNER_STATE_MAX_BLOCKS)),
+        "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
+        "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
+        "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
+        "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
+        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE)),
+        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE)),
+        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE)),
+        "position_ids": lambda: ranked(init_position_ids_single),
+        "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
+    }
+
+    return {
+        name: TensorSpec(name, list(base_specs[name].shape), base_specs[name].dtype, init_value=init_value)
+        for name, init_value in init_by_name.items()
+    }
+
+
+def _ranked_init(single_spec, *, replicated=False):
+    import torch
+
+    def init():
+        if replicated:
+            value = single_spec.create_tensor()
+            return value.unsqueeze(0).expand(N_RANKS, *value.shape).contiguous()
+        return torch.stack([single_spec.create_tensor() for _ in range(N_RANKS)], dim=0)
+
+    return init
+
+
+def _validate_layer_id(layer_id):
+    if not 0 <= layer_id < MODEL_CONFIG.num_hidden_layers:
+        raise ValueError(
+            f"layer_id must be in [0, {MODEL_CONFIG.num_hidden_layers - 1}] "
+            f"for {MODEL_CONFIG.name} hidden layers, got {layer_id}"
+        )
+
+
+def _attention_kind_for_layer(layer_id):
+    _validate_layer_id(layer_id)
+    ratio = MODEL_CONFIG.compress_ratios[layer_id]
+    if ratio == 0:
+        return "swa"
+    if ratio == 128:
+        return "hca"
+    if ratio == 4:
+        return "csa"
+    raise ValueError(f"unsupported compress ratio {ratio} for layer_id={layer_id}")
+
+
+def build_single_layer_tensor_specs(start_pos=None, layer_id=10):
+    """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
+    build_tensor_specs restacks across the 43 forward layers."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    _validate_layer_id(layer_id)
+
+    swa_specs = {
+        spec.name: spec
+        for spec in build_attention_tensor_specs(start_pos)
+        if isinstance(spec, TensorSpec)
+    }
+    hca_specs = {
+        spec.name: spec
+        for spec in build_hca_tensor_specs(start_pos)
+        if isinstance(spec, TensorSpec)
+    }
+    csa_specs = {
+        spec.name: spec
+        for spec in build_csa_tensor_specs(start_pos)
+        if isinstance(spec, TensorSpec)
+    }
+    moe_specs = build_moe_tensor_specs(layer_id)
+    moe_tensor_specs = {spec.name: spec for spec in moe_specs if isinstance(spec, TensorSpec)}
+    attention_kind = _attention_kind_for_layer(layer_id)
+    active_specs = {
+        "swa": swa_specs,
+        "hca": hca_specs,
+        "csa": csa_specs,
+    }[attention_kind]
+
+    replicated_attention = {
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "attn_norm_w",
+        "wq_a",
+        "wq_b",
+        "wq_b_scale",
+        "wkv",
+        "gamma_cq",
+        "gamma_ckv",
+        "freqs_cos",
+        "freqs_sin",
+        "attn_sink",
+        "wo_a",
+        "wo_b",
+        "wo_b_scale",
+        "hca_cmp_wkv",
+        "hca_cmp_wgate",
+        "hca_cmp_ape",
+        "hca_cmp_norm_w",
+        "csa_cmp_wkv",
+        "csa_cmp_wgate",
+        "csa_cmp_ape",
+        "csa_cmp_norm_w",
+        "csa_idx_wq_b",
+        "csa_idx_wq_b_scale",
+        "csa_weights_proj",
+        "csa_hadamard_idx",
+        "csa_inner_wkv",
+        "csa_inner_wgate",
+        "csa_inner_ape",
+        "csa_inner_norm_w",
+    }
+    attention_specs = [
+        ("x_hc", swa_specs["x_hc"]),
+        ("hc_attn_fn", swa_specs["hc_attn_fn"]),
+        ("hc_attn_scale", swa_specs["hc_attn_scale"]),
+        ("hc_attn_base", swa_specs["hc_attn_base"]),
+        ("attn_norm_w", swa_specs["attn_norm_w"]),
+        ("wq_a", swa_specs["wq_a"]),
+        ("wq_b", swa_specs["wq_b"]),
+        ("wq_b_scale", swa_specs["wq_b_scale"]),
+        ("wkv", swa_specs["wkv"]),
+        ("gamma_cq", swa_specs["gamma_cq"]),
+        ("gamma_ckv", swa_specs["gamma_ckv"]),
+        ("freqs_cos", swa_specs["freqs_cos"]),
+        ("freqs_sin", swa_specs["freqs_sin"]),
+        ("kv_cache", swa_specs["kv_cache"]),
+        ("block_table", swa_specs["block_table"]),
+        ("ori_slot_mapping", active_specs["ori_slot_mapping"]),
+        ("hca_cmp_slot_mapping", hca_specs["cmp_slot_mapping"]),
+        ("hca_state_slot_mapping", hca_specs["state_slot_mapping"]),
+        ("csa_cmp_slot_mapping", csa_specs["cmp_slot_mapping"]),
+        ("csa_idx_slot_mapping", csa_specs["idx_slot_mapping"]),
+        ("csa_state_slot_mapping", csa_specs["state_slot_mapping"]),
+        ("csa_inner_state_slot_mapping", csa_specs["inner_state_slot_mapping"]),
+        ("position_ids", active_specs["position_ids"]),
+        ("kv_seq_lens", active_specs.get("kv_seq_lens", hca_specs["kv_seq_lens"])),
+        ("attn_sink", swa_specs["attn_sink"]),
+        ("wo_a", swa_specs["wo_a"]),
+        ("wo_b", swa_specs["wo_b"]),
+        ("wo_b_scale", swa_specs["wo_b_scale"]),
+        ("hca_cmp_wkv", hca_specs["cmp_wkv"]),
+        ("hca_cmp_wgate", hca_specs["cmp_wgate"]),
+        ("hca_cmp_ape", hca_specs["cmp_ape"]),
+        ("hca_cmp_norm_w", hca_specs["cmp_norm_w"]),
+        ("hca_compress_state", hca_specs["compress_state"]),
+        ("hca_compress_state_block_table", hca_specs["compress_state_block_table"]),
+        ("csa_cmp_wkv", csa_specs["cmp_wkv"]),
+        ("csa_cmp_wgate", csa_specs["cmp_wgate"]),
+        ("csa_cmp_ape", csa_specs["cmp_ape"]),
+        ("csa_cmp_norm_w", csa_specs["cmp_norm_w"]),
+        ("csa_compress_state", csa_specs["compress_state"]),
+        ("csa_compress_state_block_table", csa_specs["compress_state_block_table"]),
+        ("csa_idx_wq_b", csa_specs["idx_wq_b"]),
+        ("csa_idx_wq_b_scale", csa_specs["idx_wq_b_scale"]),
+        ("csa_weights_proj", csa_specs["weights_proj"]),
+        ("csa_hadamard_idx", csa_specs["hadamard_idx"]),
+        ("csa_inner_wkv", csa_specs["inner_wkv"]),
+        ("csa_inner_wgate", csa_specs["inner_wgate"]),
+        ("csa_inner_ape", csa_specs["inner_ape"]),
+        ("csa_inner_norm_w", csa_specs["inner_norm_w"]),
+        ("csa_inner_compress_state", csa_specs["inner_compress_state"]),
+        ("csa_inner_compress_state_block_table", csa_specs["inner_compress_state_block_table"]),
+        ("cmp_kv", csa_specs["cmp_kv"]),
+        ("cmp_block_table", csa_specs["cmp_block_table"]),
+        ("idx_kv_cache", csa_specs["idx_kv_cache"]),
+        ("idx_block_table", csa_specs["idx_block_table"]),
+    ]
+
+    specs = [
+        TensorSpec(
+            name,
+            [N_RANKS, *spec.shape],
+            spec.dtype,
+            init_value=_ranked_init(spec, replicated=name in replicated_attention),
+            is_output=name == "kv_cache",
+        )
+        for name, spec in attention_specs
+    ]
+
+    for spec in moe_specs:
+        if not isinstance(spec, TensorSpec):
+            continue
+        if spec.name in {"x_hc", "x_next"}:
+            continue
+        if spec.name == "tid2eid":
+            def init_tid2eid():
+                base = torch.arange(VOCAB, dtype=torch.int32).reshape(VOCAB, 1) * TOPK
+                offs = torch.arange(TOPK, dtype=torch.int32).reshape(1, TOPK)
+                table = (base + offs) % N_EXPERTS_GLOBAL
+                return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+            specs.append(TensorSpec("tid2eid", spec.shape, spec.dtype, init_value=init_tid2eid))
+        elif spec.name == "input_ids":
+            def init_input_ids():
+                ids = torch.arange(T, dtype=torch.int64)
+                return ids.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+            specs.append(TensorSpec("input_ids", spec.shape, spec.dtype, init_value=init_input_ids))
+        else:
+            specs.append(moe_tensor_specs[spec.name])
+
+    specs.extend([
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True),
+        ScalarSpec("layer_id", torch.int32, layer_id),
+    ])
+    return specs
+
+
+def build_tensor_specs(start_pos=None, num_tokens=T):
+    import torch
+    from golden import ScalarSpec, TensorSpec
+    base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
+    metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
+    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w', 'lm_head_weight']
+    specs = []
+    for name in ordered_names:
+        if name in metadata_specs:
+            specs.append(metadata_specs[name])
+        elif name in CSA_LAYER_STACKED_NAMES:
+            specs.append(_make_layer_stacked_spec(name, base_specs, CSA_NUM_LAYERS))
+        elif name in HCA_LAYER_STACKED_NAMES:
+            specs.append(_make_layer_stacked_spec(name, base_specs, HCA_NUM_LAYERS))
+        elif name in LAYER_STACKED_NAMES:
+            specs.append(_make_layer_stacked_spec(name, base_specs))
+        elif name in SHARED_NAMES:
+            specs.append(_make_shared_spec(name, base_specs[name]))
+        elif name in HC_HEAD_NAMES:
+            specs.append(_make_hc_head_spec(name))
+        elif name in FINAL_NORM_NAMES:
+            specs.append(_make_final_norm_spec(name))
+        elif name in LM_HEAD_NAMES:
+            specs.append(_make_lm_head_spec(name))
+        else:
+            raise ValueError(f"unclassified decode_fwd spec: {name}")
+    specs.append(TensorSpec("logits", [N_RANKS, T, VOCAB], torch.float32, is_output=True))
+    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    return specs
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
@@ -1088,3 +1320,7 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
