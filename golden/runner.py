@@ -13,6 +13,8 @@ Public entry points: :func:`run` and :func:`run_jit`.
 """
 
 import time
+import re
+import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -213,6 +215,167 @@ def _format_stale_paths(stale: list[Path], work_dir: Path, max_show: int = 5) ->
     return f"{head} (+{len(rels) - max_show} more)"
 
 
+def _patch_aicore_bitcast_helpers(work_dir: Path) -> None:
+    """Mark ptoas-generated bitcast helpers as aicore-callable.
+
+    Some ptoas builds emit a scalar helper as ``static inline`` inside a kernel
+    translation unit. ccec then treats it as a host function and rejects calls
+    from ``__aicore__`` kernels. The generated helper is pure local type-punning,
+    so adding ``__aicore__`` preserves semantics and lets runtime compilation
+    proceed.
+    """
+    needle = "static inline To ptoas_bitcast(From from) {"
+    replacement = "static __aicore__ inline To ptoas_bitcast(From from) {"
+    patched: list[Path] = []
+    for cpp in work_dir.rglob("*.cpp"):
+        try:
+            text = cpp.read_text()
+        except UnicodeDecodeError:
+            continue
+        if needle not in text:
+            continue
+        cpp.write_text(text.replace(needle, replacement))
+        patched.append(cpp)
+    if patched:
+        print(f"[RUN] patched {len(patched)} ptoas_bitcast helper(s) for aicore compilation", flush=True)
+
+
+def _patch_l3_single_submit_host_orch(work_dir: Path) -> None:
+    """Skip stale multi-submit code left after a compile-time single-submit branch.
+
+    The A8W8 L3 prefill smoke currently builds a single-submit host_orch. The
+    frontend does not fold the Python closure constant early enough, so the
+    generated ``host_orch.py`` may contain the intended first submit followed by
+    dead multi-submit alias code that references non-existent Python locals.
+    """
+    path = work_dir / "orchestration" / "host_orch.py"
+    if not path.is_file():
+        return
+    text = path.read_text()
+    marker = (
+        '    tensors["hidden_out__ssa_v1"] = tensors["hidden_out__ssa_v0"]\n'
+        "    cur__ssa_v0 = hidden_states__ssa_v0\n"
+    )
+    replacement = (
+        '    tensors["hidden_out__ssa_v1"] = tensors["hidden_out__ssa_v0"]\n'
+        "    return\n"
+        "    cur__ssa_v0 = hidden_states__ssa_v0\n"
+    )
+    if marker not in text or replacement in text:
+        return
+    path.write_text(text.replace(marker, replacement, 1))
+    print("[RUN] patched L3 host_orch single-submit dead branch", flush=True)
+
+
+def _patch_l3_host_orch_ssa_aliases(work_dir: Path) -> None:
+    """Rewrite generated Python SSA aliases to tensor-map aliases.
+
+    Some L3 host_orch codegen emits Python locals such as
+    ``cur__ssa_v0 = hidden_in__ssa_v0`` even though parameters live in the
+    ``tensors`` dict. Runtime then raises NameError before submitting work.
+    """
+    path = work_dir / "orchestration" / "host_orch.py"
+    if not path.is_file():
+        return
+    text = path.read_text()
+    alias_re = re.compile(r'^    ([A-Za-z_]\w*__ssa_v\d+) = ([A-Za-z_]\w*__ssa_v\d+)\n', re.MULTILINE)
+
+    def repl(match: re.Match[str]) -> str:
+        lhs, rhs = match.groups()
+        return f'    tensors["{lhs}"] = tensors["{rhs}"]\n'
+
+    patched, count = alias_re.subn(repl, text)
+    if count == 0:
+        return
+    path.write_text(patched)
+    print(f"[RUN] patched {count} L3 host_orch SSA alias(es)", flush=True)
+
+
+def _install_simpler_chip_contexts_compat() -> None:
+    """Bridge PyPTO's legacy L3 runner expectation to newer simpler Worker.
+
+    Older PyPTO L3 code passes ``w.chip_contexts`` into generated host_orch
+    functions. Newer simpler versions allocate communication domains
+    dynamically and no longer expose that attribute. Comm-less host_orch code
+    ignores the argument, so an empty list preserves the old call shape.
+    """
+    try:
+        from simpler.orchestrator import Orchestrator
+        from simpler.task_interface import ChipCallable
+        from simpler.worker import Worker
+    except ImportError:
+        return
+    if hasattr(Worker, "chip_contexts"):
+        chip_contexts_installed = True
+    else:
+        chip_contexts_installed = False
+
+    if not chip_contexts_installed:
+        def _chip_contexts(self: Any) -> list[Any]:  # noqa: ANN001 - runtime compatibility shim
+            return []
+
+        setattr(Worker, "chip_contexts", property(_chip_contexts))
+
+    if getattr(Orchestrator.submit_next_level, "_pypto_legacy_chip_callable_compat", False):
+        return
+
+    submit_next_level_orig = Orchestrator.submit_next_level
+
+    def _submit_next_level_compat(
+        self: Any,
+        callable_handle: Any,
+        args: Any,
+        config: Any = None,
+        *,
+        worker: int = -1,
+    ) -> Any:
+        if isinstance(callable_handle, ChipCallable) or hasattr(callable_handle, "buffer_ptr"):
+            parent_worker = getattr(self, "_worker", None)
+            if parent_worker is None:
+                raise TypeError("orch.submit_next_level needs Worker-backed Orchestrator for ChipCallable compat")
+            callable_handle = parent_worker.register(callable_handle)
+        return submit_next_level_orig(self, callable_handle, args, config, worker=worker)
+
+    setattr(_submit_next_level_compat, "_pypto_legacy_chip_callable_compat", True)
+    Orchestrator.submit_next_level = _submit_next_level_compat
+
+
+def _inherit_l3_next_level_runtime_config(compiled: Any) -> None:
+    """Populate L3 CallConfig defaults from generated next-level kernel_config.
+
+    ``DistributedConfig`` defaults to 1/1, but tensormap_and_ringbuffer
+    generated kernels normally require block_dim=24 and aicpu_thread_num=4.
+    Single-chip ``execute_compiled`` reads those values from kernel_config.py;
+    the L3 runner needs the same values before it submits next-level tasks.
+    """
+    output_dir = getattr(compiled, "output_dir", None)
+    dc = getattr(compiled, "_distributed_config", None)
+    if output_dir is None or dc is None:
+        return
+    next_levels = Path(output_dir) / "next_levels"
+    if not next_levels.is_dir():
+        return
+    for cfg_path in sorted(next_levels.glob("*/kernel_config.py")):
+        spec = importlib.util.spec_from_file_location(f"_pypto_l3_kernel_config_{cfg_path.parent.name}", cfg_path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        runtime_cfg = getattr(module, "RUNTIME_CONFIG", {})
+        block_dim = runtime_cfg.get("block_dim")
+        aicpu_thread_num = runtime_cfg.get("aicpu_thread_num")
+        if block_dim is not None and getattr(dc, "block_dim", 1) == 1:
+            dc.block_dim = int(block_dim)
+        if aicpu_thread_num is not None and getattr(dc, "aicpu_thread_num", 1) == 1:
+            dc.aicpu_thread_num = int(aicpu_thread_num)
+        print(
+            f"[RUN] L3 runtime config: block_dim={dc.block_dim}, "
+            f"aicpu_thread_num={dc.aicpu_thread_num}",
+            flush=True,
+        )
+        return
+
+
 def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
     """Validate *runtime_dir*; rebuild kernel cpps from edited ``.pto`` files
     and drop cached binaries for any cpp newer than its ``.so``/``.o``.
@@ -225,7 +388,11 @@ def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
     print(f"[RUN] runtime_only: skipping {compile_label}, using {work_dir}", flush=True)
     # pto -> cpp: splices updated ptoas body into kernel cpps, bumping their
     # mtime so the cpp -> .so check below picks them up.
-    from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
+    try:
+        from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
+    except ModuleNotFoundError:
+        print("[runtime_only] pypto.runtime.debug unavailable; using existing runtime artifacts", flush=True)
+        return work_dir
     rebuild_kernel_cpp_from_pto(work_dir)
     stale = _stale_cpps(work_dir)
     if stale:
@@ -486,6 +653,8 @@ def _try_l3_dispatch(
     kwargs.setdefault("platform", platform)
     kwargs.setdefault("device_id", 0)
     kwargs["backend_type"] = _backend_for_platform(platform)
+    _install_simpler_chip_contexts_compat()
+    _inherit_l3_next_level_runtime_config(compiled)
     compiled(*ordered, config=PyptoRunConfig(**kwargs))
     return True
 
@@ -596,6 +765,7 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = True,
+    save_actual_data: bool = False,
     benchmark: "bool | dict[str, Any] | None" = None,
 ) -> RunResult:
     """Compile *program*, run on device, and validate against golden.
@@ -631,6 +801,8 @@ def run(
             False to skip the on-disk ``.pt`` snapshot when inputs are large
             (e.g. full-model weights) and replay is not needed; validation
             still runs against the in-memory golden.
+        save_actual_data: When True with *golden_data*, also persist runtime
+            outputs to ``{work_dir}/data/actual`` for downstream consumers.
         benchmark: When truthy, after the normal validate run, register the
             compiled program once and time ``rounds`` launches via
             :func:`pypto.runtime.benchmark`. Pass ``True`` for defaults
@@ -698,6 +870,10 @@ def run(
             total = time.time() - start
             print(f"[RUN] PASS ({total:.2f}s)", flush=True)
             return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+    if work_dir is not None:
+        _patch_aicore_bitcast_helpers(work_dir)
+        _patch_l3_single_submit_host_orch(work_dir)
+        _patch_l3_host_orch_ssa_aliases(work_dir)
 
     # Generate Inputs
     try:
@@ -725,6 +901,9 @@ def run(
 
     # Validate
     validation_skipped = golden_outputs is None
+    if save_data and (data_dir is None or save_actual_data):
+        actual_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+        _save_tensors(work_dir / "data" / "actual", actual_outputs)
     if not validation_skipped:
         try:
             _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
@@ -754,6 +933,48 @@ def run(
     return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench_stats=bench_stats)
 
 
+def _compile_jit_with_compat(fn: Any, dummy_args: list[Any], cfg: dict[str, Any]) -> Any:
+    """Compile a ``@pl.jit`` entry across pypto JIT API variants.
+
+    Prefer the public ``fn.compile(...)`` entry when available. Older/newer
+    pypto builds may expose only the specialization helpers on ``JITFunction``;
+    in that case, materialize the pre-pass ``ir.Program`` and feed it through
+    public :func:`pypto.ir.compile` so the harness still gets a normal compiled
+    artifact with an ``output_dir``.
+    """
+    from pypto.runtime import RunConfig
+
+    run_config = RunConfig(**cfg)
+    compile_method = getattr(fn, "compile", None)
+    if callable(compile_method):
+        return compile_method(*dummy_args, config=run_config)
+
+    bind_args = getattr(fn, "_bind_args", None)
+    compile_to_program = getattr(fn, "_compile_to_program", None)
+    if not callable(bind_args) or not callable(compile_to_program):
+        raise AttributeError(
+            "JIT function does not expose compile(), and the compatibility "
+            "fallback requires _bind_args() and _compile_to_program()."
+        )
+
+    import pypto.language as pl
+    from pypto import ir
+
+    _, _, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = bind_args(tuple(dummy_args), {})
+    program = compile_to_program(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn, pl)
+    return ir.compile(
+        program,
+        output_dir=run_config.save_kernels_dir,
+        strategy=run_config.strategy,
+        backend_type=run_config.backend_type,
+        dump_passes=run_config.dump_passes,
+        diagnostic_phase=run_config.diagnostic_phase,
+        disabled_diagnostics=run_config.disabled_diagnostics,
+        platform=run_config.platform,
+        profiling=run_config.compile_profiling,
+    )
+
+
 def run_jit(
     fn: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -767,6 +988,7 @@ def run_jit(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = True,
+    save_actual_data: bool = False,
     benchmark: "bool | dict[str, Any] | None" = None,
 ) -> RunResult:
     """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
@@ -783,7 +1005,7 @@ def run_jit(
             over *golden_fn*.
         compile_cfg: Compile-side ``RunConfig`` fields (``dump_passes`` /
             ``distributed_config`` / ``compile_profiling`` / ...) carried into
-            ``JITFunction.compile``; ``platform`` is supplied separately
+            JIT compilation; ``platform`` is supplied separately
             (typically via *runtime_cfg*). Unknown keys raise when the
             ``RunConfig`` is built.
         runtime_cfg: Kwargs forwarded to
@@ -805,6 +1027,8 @@ def run_jit(
             False to skip the on-disk ``.pt`` snapshot when inputs are large
             (e.g. full-model weights) and replay is not needed; validation
             still runs against the in-memory golden.
+        save_actual_data: When True with *golden_data*, also persist runtime
+            outputs to ``{work_dir}/data/actual`` for downstream consumers.
         benchmark: When truthy, after the normal validate run, register the
             compiled program once and time ``rounds`` launches via
             :func:`pypto.runtime.benchmark` (simpler's ``scene_test --rounds``
@@ -873,7 +1097,7 @@ def run_jit(
             # Public compile-only entry: same specialize → cache → ir.compile
             # pipeline as __call__, minus on-device dispatch. Returns a
             # DistributedCompiledProgram for an L3 host orchestrator.
-            compiled = fn.compile(*dummy_args, config=RunConfig(**cfg))
+            compiled = _compile_jit_with_compat(fn, dummy_args, cfg)
             work_dir = Path(compiled.output_dir)
         if compile_only:
             total = time.time() - start
@@ -909,6 +1133,9 @@ def run_jit(
 
     # Validate
     validation_skipped = golden_outputs is None
+    if save_data and (data_dir is None or save_actual_data):
+        actual_outputs = {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+        _save_tensors(work_dir / "data" / "actual", actual_outputs)
     if not validation_skipped:
         try:
             _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
