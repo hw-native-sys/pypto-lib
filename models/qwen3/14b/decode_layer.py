@@ -92,7 +92,7 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
-from config import VOCAB  # vocab size for the fused decode_fwd LM head / logits
+from config import KV_CACHE_ROWS_DYN, VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -314,8 +314,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor,
-    v_cache: pl.Tensor,
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -554,6 +554,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # so global row = h*BATCH*Q_PER_KV + b*Q_PER_KV + j.
         q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
+        q_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH * Q_PER_KV, 1], dtype=pl.FP32)
+        k_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH, 1], dtype=pl.FP32)
 
         # inv_rms[b] as a [BATCH, 1] column — applied row-wise to q_proj / k_proj
         # BEFORE QK-norm in both sub-steps below (the control-experiment scale).
@@ -590,29 +592,20 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 )
                 q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
                 q_g = pl.col_expand_mul(q_chunk, q_norm_w)
-                # Fold the qk-norm reciprocal HERE (was deferred to rope as a per-head
-                # scalar mul). q_inv is a [BATCH*Q_PER_KV, 1] column (32B-aligned), and
-                # RoPE is linear in this per-row scalar, so applying it in fp32 here is
-                # bit-exact with the old path while letting rope load q_proj_norm as a
-                # fully-normed [Q_PER_KV, HEAD_DIM] block — no misaligned [Q_PER_KV, 1]
-                # column load (5*4B=20B is not 32B-aligned) and no deferred scalar.
-                q_ss = pl.row_sum(pl.mul(q_chunk, q_chunk))
-                q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-                q_g = pl.row_expand_mul(q_g, q_inv)
                 q_proj_norm = pl.assemble(
                     q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
                 )
-                # K: same, read once. Fold the qk-norm reciprocal (k_inv) into
-                # k_proj_norm HERE too — same as q_inv. RoPE is linear in this per-row
-                # scalar, so applying it in fp32 is bit-exact, and rope then reads
-                # k_proj_norm already fully normed (no k_inv read/mul, k_inv_states gone).
+                q_ss = pl.row_sum(pl.mul(q_chunk, q_chunk))
+                q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
+                q_inv_states = pl.assemble(q_inv_states, q_inv, [h * BATCH * Q_PER_KV, 0])
+                # K: same, read once.
                 k0 = h * HEAD_DIM
                 k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
                 k_g = pl.col_expand_mul(k_chunk, k_norm_w)
+                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
                 k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
                 k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-                k_g = pl.row_expand_mul(k_g, k_inv)
-                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
+                k_inv_states = pl.assemble(k_inv_states, k_inv, [h * BATCH, 0])
             qk_tids[h] = qk_tid_h
 
         # rope GROUPED: NUM_ROPE_GROUPS grids of HEADS_PER_ROPE heads each, depping on
@@ -622,7 +615,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.spmd(
             ROPE_CORES,
             name_hint="rope_qkv",
-            allow_early_resolve=True,
             deps=[
                 qk_tids[0], qk_tids[1], qk_tids[2], qk_tids[3],
                 qk_tids[4], qk_tids[5], qk_tids[6], qk_tids[7],
@@ -652,18 +644,17 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
 
                 kv_col = ki * HEAD_DIM
-                # K is already fully qk-normed (gamma + qk_inv folded into qk_norm), so
-                # rope just slices the row and rotates — no per-token scalar.
-                k_full = k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM]
+                # K carries qk_norm gamma (qk_gamma); fold the deferred per-head qk_inv
+                # scalar here. inv_rms cancels inside qk_norm, so no inv_rms factor on K.
+                k_inv_b = pl.read(k_inv_states, [ki * BATCH + b, 0])
+                k_full = pl.mul(k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM], k_inv_b)
                 k_lo = k_full[:, 0:HALF_DIM]
                 k_hi = k_full[:, HALF_DIM:HEAD_DIM]
                 rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
                 rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
                 cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
-                # Coalesce lo|hi into one [1, HEAD_DIM] row -> a single paged k_cache MTE3
-                # write instead of two half-width ones (the store tail bounds makespan).
-                rot = pl.concat(rot_lo, rot_hi)
-                k_cache = pl.assemble(k_cache, pl.cast(rot, target_type=pl.BF16), [cache_row, 0])
+                k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
+                k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
                 v_row_bf16 = pl.cast(
                     pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
                     target_type=pl.BF16,
@@ -672,32 +663,30 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
                 q_base = ki * Q_PER_KV
                 q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
-                # BATCHED Q heads: the Q_PER_KV heads of this (KV head, batch) are one
-                # contiguous q_proj_norm row-slab; reshape to [Q_PER_KV, HEAD_DIM] so ONE
-                # load + ONE set of (row-vec) RoPE ops + ONE store replace the old 5x
-                # per-head load/compute/store. q_proj_norm is already fully qk-normed
-                # (qk_inv folded into qk_norm); cos/sin [1, HALF_DIM] broadcast over rows.
-                q_heads = pl.reshape(
-                    q_proj_norm[
-                        b : b + 1, q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM
-                    ],
-                    [Q_PER_KV, HEAD_DIM],
-                )
-                q_lo = q_heads[:, 0:HALF_DIM]
-                q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
-                q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
-                # Coalesce lo|hi -> one [Q_PER_KV, HEAD_DIM] store.
-                q_rot = pl.concat(q_rot_lo, q_rot_hi)
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_rot, target_type=pl.BF16), [q_pad_row0, 0]
-                )
+                q_inv_base = ki * BATCH * Q_PER_KV + b * Q_PER_KV
+                for qj in pl.range(Q_PER_KV):
+                    q_inv_bj = pl.read(q_inv_states, [q_inv_base + qj, 0])
+                    q_head = pl.mul(
+                        q_proj_norm[
+                            b : b + 1, (q_base + qj) * HEAD_DIM : (q_base + qj + 1) * HEAD_DIM
+                        ],
+                        q_inv_bj,
+                    )
+                    q_lo = q_head[:, 0:HALF_DIM]
+                    q_hi = q_head[:, HALF_DIM:HEAD_DIM]
+                    q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
+                    q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_rot_lo, target_type=pl.BF16), [q_pad_row0 + qj, 0]
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_rot_hi, target_type=pl.BF16), [q_pad_row0 + qj, HALF_DIM]
+                    )
                 q_pad_zero = pl.cast(
                     pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0),
                     target_type=pl.BF16,
                 )
                 all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
-
         rope_grp_tids[0] = rope_tid
 
         # ── Scope 3b MLP-accumulator seeds, HOISTED between rope and attn. ──
@@ -1133,8 +1122,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor,
-    v_cache: pl.Tensor,
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1158,6 +1147,14 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     # placed after the MLP manual_scope and gated on the down_proj TaskIds) — without it,
     # the inline body's manual_scope partial writes do not register a tensormap edge to
     # the downstream reader and the fused output is garbage. See decode-fwd-dep-fix notes.
+    #
+    # The paged KV pool (k_cache / v_cache) is runtime-dynamic — its row count is the
+    # actual num_pages * layers * kv_heads * page_size, which varies with the device-side
+    # KV cache size (and the 1-page warm-up scratch). Bind dim-0 dynamic (mirroring
+    # prefill_fwd) so the compiled program does not bake a fixed shape and reject any
+    # non-batching-shaped pool.
+    k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+    v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
     # Cross-iteration carry-writer tids (see _decode_layer's prev_out_tids):
     # seeded with copy_hidden for layer 0, refilled per layer by the dcr writers.
@@ -1245,8 +1242,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
-    k_cache: pl.Tensor,
-    v_cache: pl.Tensor,
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -1645,8 +1642,6 @@ if __name__ == "__main__":
                              "-> logits) against a host chain reference, instead of the default "
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
-    parser.add_argument("--no-lm-head", action="store_true", default=False,
-                        help="under --validate-fwd: decode_fwd_layers (NO lm_head) layer-only swimlane")
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs + golden for replay (off: large fixtures)")
     args = parser.parse_args()
@@ -1747,15 +1742,6 @@ if __name__ == "__main__":
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
         ]
-        if args.no_lm_head:  # measurement-only: layer-only swimlane (no VOCAB lm_head)
-            _CHUNK_NLAYERS = N
-            nolm_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-            decode_fwd_layers(*stacked[:len(INPUT_NAMES)], nolm_out, config=run_cfg)
-            _t = getattr(decode_fwd_layers, "last_run_timing", None)
-            print(f"[perf] {N}-layer no-LMhead device_wall_us={getattr(_t, 'device_wall_us', None)} "
-                  f"host_wall_us={getattr(_t, 'host_wall_us', None)}")
-            print(f"[stacked-fwd {N}L no-LMhead] swimlane perf run complete")
-            raise SystemExit(0)
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
         decode_fwd(*stacked, logits, config=run_cfg)
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
