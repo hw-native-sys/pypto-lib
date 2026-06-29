@@ -58,7 +58,7 @@ QUANT_TOKEN_TILE = 8
 ROPE_OUT_TOK_TILE = T // 2
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
-A_K_TILE = 128
+A_K_TILE = 256                       # proj_a cube K-frag: K*2B = 512B = one a2a3 L2 line (128 wastes half)
 A_N_TILE = 128
 A_T_TILE = 32                        # token tile for the proj_a/proj_b vec post-process
 B_K_TILE = 256
@@ -189,8 +189,10 @@ def prefill_sparse_attn(
                     qk_head_row = qk_t * H + qk_hb * QK_M_TILE
                     qk_q_tile = q_flat[qk_head_row:qk_head_row + QK_M_TILE, :]
                     qk_raw = pl.matmul(qk_q_tile, qk_kv_k, b_trans=True, out_dtype=pl.FP32)
-                    zero_tile = pl.full([QK_M_TILE, PREFILL_ATTN_TILE], dtype=pl.FP32, value=0.0)
-                    qk_scores = pl.add(pl.mul(qk_raw, SOFTMAX_SCALE), pl.col_expand(zero_tile, qk_bias_row))
+                    # Broadcast-add the per-block bias directly (col_expand_add) instead of
+                    # col_expand into a dead pl.full(0) base + a separate add (mirrors decode).
+                    qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
+                    qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
                     qk_mi = pl.row_max(qk_scores)
                     qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                     # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
