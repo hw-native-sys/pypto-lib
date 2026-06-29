@@ -125,6 +125,19 @@ HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 LM_HEAD_NAMES = ["lm_head_weight"]
 
+# Paged KV / compressor-state pools. These are sized for the full decode context
+# (B x per-request-max-blocks per FWD layer, tens of thousands of blocks), so
+# randn-ing every layer's pool independently dominates the "generate inputs"
+# stage. Their content is smoke-only (decode_fwd has no golden_fn), so we randn a
+# single layer's pool and tile it across layers instead: each layer keeps the
+# full per-block diversity its standalone attention init produces (the indexer's
+# top-k block selection still sees varied blocks) while the randn work drops
+# ~layer_count x. Weights / gate / routing metadata are unaffected.
+CACHE_POOL_NAMES = frozenset({
+    "kv_cache", "cmp_kv", "idx_kv_cache",
+    "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
+})
+
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
@@ -851,6 +864,11 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
         base_init = spec.init_value
+        if name in CACHE_POOL_NAMES:
+            # Randn one layer's pool, then tile across layers along the block dim.
+            one_layer = base_init()
+            reps = [1, layer_count] + [1] * (one_layer.dim() - 2)
+            return one_layer.repeat(*reps)
         return torch.cat([base_init() for _ in range(layer_count)], dim=1)
 
     return TensorSpec(
