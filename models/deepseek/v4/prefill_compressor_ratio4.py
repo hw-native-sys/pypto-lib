@@ -63,8 +63,8 @@ def prefill_compressor_ratio4(
     kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
-    wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -90,14 +90,16 @@ def prefill_compressor_ratio4(
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             x_tile = x[0:T, k0 : k0 + K_TILE]
-            wkv_tile = wkv[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
-            wgate_tile = wgate[k0 : k0 + K_TILE, o0 : o0 + OUT_TILE]
+            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
+            # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/HCA layout.
+            wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+            wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32)
+                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
             else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile)
+                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
         cmp4_kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         cmp4_score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
@@ -362,8 +364,8 @@ def golden_prefill_compressor_ratio4(tensors):
     cache_rows = cmp_kv.view(cmp_kv.shape[0] * BLOCK_SIZE, 1, HEAD_DIM)[:, 0, :]
     position_ids = tensors["position_ids"]
 
-    kv_proj = x @ wkv
-    score_proj = x @ wgate
+    kv_proj = x @ wkv.t()    # wkv stored [OUT_DIM, D] for b_trans
+    score_proj = x @ wgate.t()
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -461,8 +463,8 @@ def prefill_compressor_ratio4_test(
     kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[D, OUT_DIM], pl.BF16],
-    wgate: pl.Tensor[[D, OUT_DIM], pl.BF16],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
@@ -515,9 +517,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
     # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_compressor_ratio4.
     def init_wkv():
-        return torch.randn(D, OUT_DIM) * 0.0245
+        return torch.randn(OUT_DIM, D) * 0.0245
     def init_wgate():
-        return torch.randn(D, OUT_DIM) * 0.0388
+        return torch.randn(OUT_DIM, D) * 0.0388
     def init_ape():
         return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1243
     def init_norm_w():
@@ -551,8 +553,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("kv_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("score_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec("wkv", [D, OUT_DIM], torch.bfloat16, init_value=init_wkv),
-        TensorSpec("wgate", [D, OUT_DIM], torch.bfloat16, init_value=init_wgate),
+        TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
+        TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
