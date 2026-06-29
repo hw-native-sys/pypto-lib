@@ -30,60 +30,74 @@ import pypto.language.distributed as pld
 from golden import run_jit
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from prefill_layer import (
-    BLOCK_SIZE,
-    CSA_CMP_BLOCK_NUM,
-    CSA_COMPRESS_RATIO,
-    CSA_MAIN_OUT_DIM,
-    CSA_ORI_BLOCK_NUM,
-    CSA_STATE_BLOCK_NUM,
-    CSA_STATE_BLOCK_SIZE,
-    CSA_STATE_MAX_BLOCKS,
+# prefill_fwd is self-contained: it imports kernels, constants, and per-kind
+# spec builders directly from the leaf modules (no dependency on prefill_layer).
+# Import moe first: it applies the EP/FLASH override before the attention modules
+# bake config-derived MoE shapes (matches prefill_layer's import order).
+from moe import (
     D,
-    H,
-    HEAD_DIM,
-    HCA_COMPRESS_RATIO,
-    HCA_MAIN_OUT_DIM,
-    HCA_STATE_BLOCK_NUM,
-    HCA_STATE_BLOCK_SIZE,
-    HCA_STATE_MAX_BLOCKS,
     HC_DIM,
     HC_MULT,
-    IDX_CACHE_MAX_BLOCKS,
-    IDX_HEAD_DIM,
-    IDX_N_HEADS,
     IDX_PAD,
-    INNER_OUT_DIM,
-    INNER_STATE_BLOCK_NUM,
-    INNER_STATE_BLOCK_SIZE,
-    INNER_STATE_MAX_BLOCKS,
-    MAX_SEQ_LEN,
     MIX_HC,
-    MODEL_CONFIG,
     MOE_INTER,
-    N_RANKS,
     N_EXPERTS_GLOBAL,
     N_LOCAL,
+    N_RANKS,
     N_ROUTES,
-    O_GROUP_IN,
-    O_GROUPS,
-    O_LORA,
-    Q_LORA,
     RECV_MAX,
-    ROPE_HEAD_DIM,
-    SPARSE_CMP_MAX_BLOCKS,
-    SPARSE_ORI_MAX_BLOCKS,
-    SPARSE_TOPK,
     T,
     TOPK,
     VOCAB,
     W_PAD,
-    build_tensor_specs as build_single_layer_tensor_specs,
+    build_tensor_specs as build_moe_tensor_specs,
+    moe,
 )
-from prefill_attention_swa import prefill_attention_swa
-from prefill_attention_hca import prefill_attention_hca
-from prefill_attention_csa import prefill_attention_csa
-from moe import moe
+from config import FLASH as MODEL_CONFIG
+from prefill_attention_swa import (
+    build_tensor_specs as build_swa_attention_tensor_specs,
+    prefill_attention_swa,
+)
+from prefill_attention_hca import (
+    COMPRESS_RATIO as HCA_COMPRESS_RATIO,
+    HCA_STATE_BLOCK_NUM,
+    HCA_STATE_BLOCK_SIZE,
+    HCA_STATE_MAX_BLOCKS,
+    MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
+    build_tensor_specs as build_hca_attention_tensor_specs,
+    prefill_attention_hca,
+)
+from prefill_attention_csa import (
+    BLOCK_SIZE,
+    COMPRESS_RATIO as CSA_COMPRESS_RATIO,
+    CSA_CMP_BLOCK_NUM,
+    CSA_ORI_BLOCK_NUM,
+    CSA_STATE_BLOCK_NUM,
+    CSA_STATE_BLOCK_SIZE,
+    CSA_STATE_MAX_BLOCKS,
+    H,
+    HEAD_DIM,
+    IDX_CACHE_MAX_BLOCKS,
+    IDX_HEAD_DIM,
+    IDX_N_HEADS,
+    INNER_OUT_DIM,
+    INNER_STATE_BLOCK_NUM,
+    INNER_STATE_BLOCK_SIZE,
+    INNER_STATE_MAX_BLOCKS,
+    MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
+    MAX_SEQ_LEN,
+    O_GROUPS,
+    O_GROUP_IN,
+    O_LORA,
+    Q_LORA,
+    ROPE_HEAD_DIM,
+    SPARSE_CMP_MAX_BLOCKS,
+    SPARSE_ORI_MAX_BLOCKS,
+    SPARSE_TOPK,
+    START_POS,
+    build_tensor_specs as build_csa_attention_tensor_specs,
+    prefill_attention_csa,
+)
 from hc_head import hc_head
 from rmsnorm import rms_norm
 from lm_head import (
@@ -966,6 +980,263 @@ def _make_lm_head_spec(name):
             init_value=init_lm_head_weight,
         )
     raise ValueError(f"unclassified lm_head spec: {name}")
+
+
+# Canonical host-tensor order for a single unified prefill layer.
+HOST_TENSOR_ORDER = (
+    "x_hc",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_attn_base",
+    "attn_norm_w",
+    "wq_a",
+    "wq_b",
+    "wq_b_scale",
+    "wkv",
+    "gamma_cq",
+    "gamma_ckv",
+    "freqs_cos",
+    "freqs_sin",
+    "hca_cmp_wkv",
+    "hca_cmp_wgate",
+    "hca_cmp_ape",
+    "hca_cmp_norm_w",
+    "hca_cmp_kv_state",
+    "hca_cmp_score_state",
+    "hca_compress_state_block_table",
+    "csa_cmp_wkv",
+    "csa_cmp_wgate",
+    "csa_cmp_ape",
+    "csa_cmp_norm_w",
+    "csa_cmp_kv_state",
+    "csa_cmp_score_state",
+    "csa_compress_state_block_table",
+    "csa_hadamard_idx",
+    "csa_idx_wq_b",
+    "csa_idx_wq_b_scale",
+    "csa_weights_proj",
+    "csa_inner_wkv",
+    "csa_inner_wgate",
+    "csa_inner_ape",
+    "csa_inner_norm_w",
+    "csa_inner_kv_state",
+    "csa_inner_score_state",
+    "csa_inner_compress_state_block_table",
+    "kv_cache",
+    "ori_block_table",
+    "ori_slot_mapping",
+    "cmp_kv",
+    "cmp_block_table",
+    "cmp_sparse_indices",
+    "cmp_sparse_lens",
+    "idx_kv_cache",
+    "idx_block_table",
+    "position_ids",
+    "hca_cmp_slot_mapping",
+    "hca_state_slot_mapping",
+    "csa_cmp_slot_mapping",
+    "csa_idx_slot_mapping",
+    "csa_state_slot_mapping",
+    "csa_inner_state_slot_mapping",
+    "attn_sink",
+    "wo_a",
+    "wo_b",
+    "wo_b_scale",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+    "hc_ffn_base",
+    "norm_w",
+    "gate_w",
+    "gate_bias",
+    "tid2eid",
+    "input_ids",
+    "routed_w1",
+    "routed_w1_scale",
+    "routed_w3",
+    "routed_w3_scale",
+    "routed_w2",
+    "routed_w2_scale",
+    "shared_w1",
+    "shared_w1_scale",
+    "shared_w3",
+    "shared_w3_scale",
+    "shared_w2",
+    "shared_w2_scale",
+    "x_next",
+)
+
+
+def _spec_value(spec, torch):
+    init_value = getattr(spec, "init_value", None)
+    if callable(init_value):
+        return init_value()
+    if init_value is not None:
+        return init_value.clone() if hasattr(init_value, "clone") else init_value
+    return torch.zeros(spec.shape, dtype=spec.dtype)
+
+
+def _ranked_init(spec, n_ranks, torch):
+    def init():
+        values = [_spec_value(spec, torch) for _ in range(n_ranks)]
+        return torch.stack(values, dim=0).contiguous()
+
+    return init
+
+
+def _ranked_x_hc_init(spec, n_ranks, active_tokens, torch):
+    def init():
+        values = [_spec_value(spec, torch) for _ in range(n_ranks)]
+        stacked = torch.stack(values, dim=0).contiguous()
+        active = min(active_tokens, stacked.shape[1])
+        if active < stacked.shape[1]:
+            inactive = torch.randn(stacked[:, active:].shape, dtype=torch.float32).to(stacked.dtype)
+            stacked[:, active:] = inactive / 10.0
+        return stacked
+
+    return init
+
+
+def _attention_kind_for_layer(layer_id):
+    ratio = MODEL_CONFIG.compress_ratios[layer_id]
+    if ratio == 0:
+        return "swa"
+    if ratio == 128:
+        return "hca"
+    if ratio == 4:
+        return "csa"
+    raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
+
+
+def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
+    """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
+    build_tensor_specs restacks across the forward layers."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    def kind_specs(build_fn):
+        return {s.name: s for s in build_fn(start_pos=start_pos, num_tokens=num_tokens) if isinstance(s, TensorSpec)}
+
+    swa = kind_specs(build_swa_attention_tensor_specs)
+    hca = kind_specs(build_hca_attention_tensor_specs)
+    csa = kind_specs(build_csa_attention_tensor_specs)
+    active_kind = _attention_kind_for_layer(layer_id)
+    active = {"swa": swa, "hca": hca, "csa": csa}[active_kind]
+    active_tokens = num_tokens
+
+    # (layer_name, source_spec). Shared state is taken from the active kind (its
+    # init is what the active attention + its golden both consume). The hca_/csa_
+    # compressor + indexer params are namespaced from their own kind; compressed
+    # KV specs prefer the active attention kind and fall back to CSA for SWA.
+    attention_specs = [
+        ("x_hc", active["x_hc"]),
+        ("hc_attn_fn", active["hc_attn_fn"]),
+        ("hc_attn_scale", active["hc_attn_scale"]),
+        ("hc_attn_base", active["hc_attn_base"]),
+        ("attn_norm_w", active["attn_norm_w"]),
+        ("wq_a", active["wq_a"]),
+        ("wq_b", active["wq_b"]),
+        ("wq_b_scale", active["wq_b_scale"]),
+        ("wkv", active["wkv"]),
+        ("gamma_cq", active["gamma_cq"]),
+        ("gamma_ckv", active["gamma_ckv"]),
+        ("freqs_cos", active["freqs_cos"]),
+        ("freqs_sin", active["freqs_sin"]),
+        ("hca_cmp_wkv", hca["cmp_wkv"]),
+        ("hca_cmp_wgate", hca["cmp_wgate"]),
+        ("hca_cmp_ape", hca["cmp_ape"]),
+        ("hca_cmp_norm_w", hca["cmp_norm_w"]),
+        ("hca_cmp_kv_state", hca["cmp_kv_state"]),
+        ("hca_cmp_score_state", hca["cmp_score_state"]),
+        ("hca_compress_state_block_table", hca["compress_state_block_table"]),
+        ("csa_cmp_wkv", csa["cmp_wkv"]),
+        ("csa_cmp_wgate", csa["cmp_wgate"]),
+        ("csa_cmp_ape", csa["cmp_ape"]),
+        ("csa_cmp_norm_w", csa["cmp_norm_w"]),
+        ("csa_cmp_kv_state", csa["cmp_kv_state"]),
+        ("csa_cmp_score_state", csa["cmp_score_state"]),
+        ("csa_compress_state_block_table", csa["compress_state_block_table"]),
+        ("csa_hadamard_idx", csa["hadamard_idx"]),
+        ("csa_idx_wq_b", csa["idx_wq_b"]),
+        ("csa_idx_wq_b_scale", csa["idx_wq_b_scale"]),
+        ("csa_weights_proj", csa["idx_weights_proj"]),
+        ("csa_inner_wkv", csa["inner_wkv"]),
+        ("csa_inner_wgate", csa["inner_wgate"]),
+        ("csa_inner_ape", csa["inner_ape"]),
+        ("csa_inner_norm_w", csa["inner_norm_w"]),
+        ("csa_inner_kv_state", csa["inner_kv_state"]),
+        ("csa_inner_score_state", csa["inner_score_state"]),
+        ("csa_inner_compress_state_block_table", csa["inner_compress_state_block_table"]),
+        ("kv_cache", active["kv_cache"]),
+        ("ori_block_table", active.get("ori_block_table", swa.get("block_table"))),
+        ("ori_slot_mapping", active["ori_slot_mapping"]),
+        ("cmp_kv", active.get("cmp_kv", csa["cmp_kv"])),
+        ("cmp_block_table", active.get("cmp_block_table", csa["cmp_block_table"])),
+        ("cmp_sparse_indices", active.get("cmp_sparse_indices", swa["cmp_sparse_indices"])),
+        ("cmp_sparse_lens", active.get("cmp_sparse_lens", swa["cmp_sparse_lens"])),
+        ("idx_kv_cache", csa["idx_kv_cache"]),
+        ("idx_block_table", csa["idx_block_table"]),
+        ("position_ids", active["position_ids"]),
+        ("hca_cmp_slot_mapping", hca["cmp_slot_mapping"]),
+        ("hca_state_slot_mapping", hca["state_slot_mapping"]),
+        ("csa_cmp_slot_mapping", csa["cmp_slot_mapping"]),
+        ("csa_idx_slot_mapping", csa["idx_slot_mapping"]),
+        ("csa_state_slot_mapping", csa["state_slot_mapping"]),
+        ("csa_inner_state_slot_mapping", csa["inner_state_slot_mapping"]),
+        ("attn_sink", active["attn_sink"]),
+        ("wo_a", active["wo_a"]),
+        ("wo_b", active["wo_b"]),
+        ("wo_b_scale", active["wo_b_scale"]),
+    ]
+
+    tensor_specs = [
+        TensorSpec(
+            name,
+            [N_RANKS, *src.shape],
+            src.dtype,
+            init_value=(_ranked_x_hc_init(src, N_RANKS, active_tokens, torch) if name == "x_hc"
+                        else _ranked_init(src, N_RANKS, torch)),
+            is_output=src.is_output,
+        )
+        for name, src in attention_specs
+    ]
+
+    for spec in build_moe_tensor_specs(layer_id=layer_id):
+        if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next"}:
+            continue
+        if spec.name == "tid2eid":
+            def init_tid2eid(spec=spec):
+                _, vocab, topk = spec.shape
+                ids = torch.arange(vocab, dtype=torch.int64).view(vocab, 1)
+                ks = torch.arange(topk, dtype=torch.int64).view(1, topk)
+                table = ((ids * topk + ks) % N_EXPERTS_GLOBAL).to(dtype=spec.dtype)
+                return table.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+
+            tensor_specs.append(TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_tid2eid))
+        elif spec.name == "input_ids":
+            def init_input_ids(spec=spec):
+                _, tokens = spec.shape
+                active = min(active_tokens, tokens)
+                rows = []
+                for rank in range(N_RANKS):
+                    row = torch.roll(torch.arange(tokens, dtype=spec.dtype), shifts=rank)
+                    if layer_id >= 3 and active < tokens:
+                        row[active:] = -1
+                    rows.append(row)
+                return torch.stack(rows, dim=0).contiguous()
+
+            tensor_specs.append(TensorSpec(spec.name, spec.shape, spec.dtype, init_value=init_input_ids))
+        else:
+            tensor_specs.append(spec)
+
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
+    tensor_by_name = {spec.name: spec for spec in tensor_specs}
+    missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
+    if missing:
+        raise ValueError(f"missing unified prefill layer tensor specs: {missing}")
+    return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + [
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+        ScalarSpec("layer_id", torch.int32, layer_id),
+    ]
 
 
 def build_tensor_specs(start_pos=0):
