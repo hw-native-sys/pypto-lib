@@ -273,8 +273,9 @@ def prefill_fwd(
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     my_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = pl.cast(T, pl.INT32)
+    nt: pl.Scalar[pl.INT32] = num_tokens
     hidden: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
 
     # ===================== layer 0 : swa =================================
@@ -758,6 +759,7 @@ def l3_prefill_fwd(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[N_RANKS, T, VOCAB], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
     count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
@@ -812,7 +814,7 @@ def l3_prefill_fwd(
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
-            r,
+            r, num_tokens,
             device=r,
         )
 
@@ -1246,13 +1248,13 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
     ]
 
 
-def build_tensor_specs(start_pos=0):
+def build_tensor_specs(start_pos=0, num_tokens=T):
     import torch
     from golden import TensorSpec
 
     base_specs = {
         spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=T, layer_id=0)
+        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=0)
         if isinstance(spec, TensorSpec)
     }
 
@@ -1308,6 +1310,8 @@ def build_tensor_specs(start_pos=0):
             specs.append(_make_stacked_spec(name, base_specs))
 
     specs.append(TensorSpec("logits", [N_RANKS, T, VOCAB], torch.float32, is_output=True))
+    from golden import ScalarSpec
+    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
 
@@ -1319,6 +1323,8 @@ def main():
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help=f"Active token rows for MoE routing/combine; default is T={T}.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1329,7 +1335,7 @@ def main():
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
 
-    specs = build_tensor_specs(start_pos=args.start_pos)
+    specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
 
     result = run_jit(
         fn=l3_prefill_fwd,
