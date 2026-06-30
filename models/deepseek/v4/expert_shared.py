@@ -34,9 +34,12 @@ SWIGLU_LIMIT = M.swiglu_limit
 T_TILE = 8
 SH_M_TILE = 16
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-# sh_gate_up boxes the SH_M_TILE token tile from a single block (ts0 == 0); decode
-# T fits in one tile. Fail loudly if a config makes T exceed it.
-assert T_PAD == SH_M_TILE, "expert_shared single-tile token block assumes decode T <= SH_M_TILE"
+# Decode (T <= SH_M_TILE, single partial block) or prefill (T a multiple of
+# SH_M_TILE, fully valid blocks); a T that is neither would need a dynamic
+# per-block row count the static valid_shape below can't express.
+assert T <= SH_M_TILE or T % SH_M_TILE == 0, \
+    "expert_shared needs T <= SH_M_TILE (decode) or T a multiple of SH_M_TILE (prefill)"
+SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
 K_TILE = 512
 INTER_K = 512
 SH_INTER_TILE = 64
@@ -66,17 +69,15 @@ def expert_shared(
         gu_nb = gu_block - gu_tb * (MOE_INTER // (8 * SH_INTER_TILE))
         ts0 = gu_tb * SH_M_TILE
         n_base = gu_nb * (8 * SH_INTER_TILE)
-        # ts0 == 0 (single token block: T <= SH_M_TILE, asserted at module level), so
-        # the per-row scale's static valid_shape [T,1] is correct; a dynamic valid_shape
-        # here perturbs the Vec row_expand_mul, so keep it static.
-        x_local_scale_dq_tile = pl.slice(x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[T, 1])
+        # Static valid_shape: a dynamic one perturbs the Vec row_expand_mul.
+        x_local_scale_dq_tile = pl.slice(x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[SH_VALID_M, 1])
         for ng in pl.range(8):
             n0 = n_base + ng * SH_INTER_TILE
             sh_gate_acc = pl.create_tensor([SH_M_TILE, SH_INTER_TILE], dtype=pl.INT32)
             sh_up_acc = pl.create_tensor([SH_M_TILE, SH_INTER_TILE], dtype=pl.INT32)
             for kb in pl.pipeline(0, D // K_TILE, stage=2):
                 k0 = kb * K_TILE
-                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[T, K_TILE])
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
                 sw1_k = shared_w1[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
                 sw3_k = shared_w3[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
