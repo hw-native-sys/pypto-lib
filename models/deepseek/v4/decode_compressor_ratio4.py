@@ -89,7 +89,8 @@ def compressor_ratio4(
         score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[B * S, K_TILE])
+            x_rows = pl.min(MM_B_TILE, B * S - global_row0)
+            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
             # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
             # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
             # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short

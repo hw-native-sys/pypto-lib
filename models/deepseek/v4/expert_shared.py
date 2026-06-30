@@ -34,6 +34,9 @@ SWIGLU_LIMIT = M.swiglu_limit
 T_TILE = 8
 SH_M_TILE = 16
 T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
+# sh_gate_up boxes the SH_M_TILE token tile from a single block (ts0 == 0); decode
+# T fits in one tile. Fail loudly if a config makes T exceed it.
+assert T_PAD == SH_M_TILE, "expert_shared single-tile token block assumes decode T <= SH_M_TILE"
 K_TILE = 512
 INTER_K = 512
 SH_INTER_TILE = 64
@@ -52,7 +55,6 @@ def expert_shared(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
-    num_tokens: pl.Scalar[pl.INT32],
 ):
     sh_tile_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
     sh_tile_i8 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.INT8)
@@ -64,6 +66,9 @@ def expert_shared(
         gu_nb = gu_block - gu_tb * (MOE_INTER // (8 * SH_INTER_TILE))
         ts0 = gu_tb * SH_M_TILE
         n_base = gu_nb * (8 * SH_INTER_TILE)
+        # ts0 == 0 (single token block: T <= SH_M_TILE, asserted at module level), so
+        # the per-row scale's static valid_shape [T,1] is correct; a dynamic valid_shape
+        # here perturbs the Vec row_expand_mul, so keep it static.
         x_local_scale_dq_tile = pl.slice(x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[T, 1])
         for ng in pl.range(8):
             n0 = n_base + ng * SH_INTER_TILE
@@ -154,13 +159,12 @@ def expert_shared_test(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
 ):
     expert_shared(
         x_local_i8, x_local_scale_dq,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh, num_tokens,
+        sh,
     )
     return sh
 
@@ -243,9 +247,9 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
-def build_tensor_specs(num_tokens=T):
+def build_tensor_specs():
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     # Pre-quantize x_local once so the i8 / scale specs see consistent values
     # (mirrors what gate produces in the full pipeline).
@@ -270,7 +274,6 @@ def build_tensor_specs(num_tokens=T):
         TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_s),
         TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
-        ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
 
 
@@ -282,14 +285,13 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=expert_shared_test,
-        specs=build_tensor_specs(num_tokens=args.num_tokens),
+        specs=build_tensor_specs(),
         golden_fn=golden_expert_shared,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(

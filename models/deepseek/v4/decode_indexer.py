@@ -55,6 +55,9 @@ Q_OUT_TILE = 256
 QR_PROJ_ROW_TILE = 8
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
+# weights_proj is a single-tile CORE_GROUP scope (one 16-row boxed matmul); decode
+# T fits in one tile. Fail loudly if a config makes T exceed it (would drop rows).
+assert T_PAD == MM_ROW_TILE, "weights_proj single-tile scope assumes decode T <= MM_ROW_TILE"
 HEAD_DIM_TILE = 32
 D_TILE = 512
 WEIGHTS_ROW_TILE = 8
@@ -182,7 +185,7 @@ def indexer(
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
         for db in pl.pipeline(0, D // D_TILE, stage=2):
             d0 = db * D_TILE
-            x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [0, d0], valid_shape=[T, D_TILE])
+            x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [0, d0], valid_shape=[pl.min(MM_ROW_TILE, T), D_TILE])
             weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
             if d0 == 0:
                 weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
