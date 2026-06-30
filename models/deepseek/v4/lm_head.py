@@ -164,29 +164,20 @@ def publish_hidden_step(
 
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
-            # Short decode publishes only one token tile, which can expose a
-            # remote-store visibility race before the peer observes hidden_done.
-            # Publish the full padded window so the data phase has the same
-            # communication depth as prefill; rows beyond t_dim are never read.
-            for t0 in pl.range(0, T_MAX, T_TILE):
+            # Use the communication-level put primitive for hidden publish.
+            # Tile remote_store lowers to a plain remote TSTORE and can expose
+            # a short-publish visibility window before the peer sees notify.
+            for t0 in pl.range(0, t_dim, T_TILE):
                 for kb in pl.range(HIDDEN_COMM_BLOCKS):
                     k0 = kb * HIDDEN_COMM_CHUNK
-                    if t0 < t_dim:
-                        hidden_tile = pl.load(hidden_states, [t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
-                        pld.tile.remote_store(
-                            hidden_tile,
-                            target=hidden_window,
-                            peer=peer,
-                            offsets=[row_base + t0, k0],
-                        )
-                    else:
-                        padding_tile = pl.load(hidden_states, [0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
-                        pld.tile.remote_store(
-                            padding_tile,
-                            target=hidden_window,
-                            peer=peer,
-                            offsets=[row_base + t0, k0],
-                        )
+                    pld.tensor.put(
+                        dst=hidden_window,
+                        peer=peer,
+                        src=hidden_states,
+                        dst_offsets=[row_base + t0, k0],
+                        src_offsets=[t0, k0],
+                        shape=[T_TILE, HIDDEN_COMM_CHUNK],
+                    )
 
     for peer in pl.range(TP_SIZE):
         if peer != my_rank:
