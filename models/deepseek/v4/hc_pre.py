@@ -176,7 +176,11 @@ def _hc_pre_decode(
     # sinkhorn scope. inv_rms is folded in per column-group (cheap on [T, <=16]).
     pre_val_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
     post_pad_store = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
-    comb_logits = pl.create_tensor([T_MAX, HC_MULT * HC_MULT], dtype=pl.FP32)
+    # MIX_PAD (not HC_MULT*HC_MULT=16): comb_sinkhorn loads each group HC_PAD-wide
+    # at offset k*HC_MULT, so group 3 reads cols [12:20] -- the 16-wide alloc made
+    # that load descriptor exceed the tensor even though valid_shapes bounds the
+    # real transfer to [12:16]. The 32-wide alloc keeps every descriptor in-bounds.
+    comb_logits = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
     for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
