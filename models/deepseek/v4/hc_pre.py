@@ -21,13 +21,13 @@ fans out across scopes (mirroring hc_head.py's pure-AIC split-K):
 
   cast        x (BF16) -> x_fp32 (FP32), so the projection is a pure-AIC matmul
   x_pad       zero-fill x_fp32 rows [t_dim:t_linear] (decode pads 8->16 rows)
-  rms         sum-of-squares over HC_DIM -> inv_rms (overlaps linear+reduce)
+  rms         sum-of-squares over HC_DIM -> inv_rms (overlaps seed+linear)
+  seed        zero-seed mixes_raw for the atomic-add accumulation
   linear      SPLIT-K matmul: (t_linear/LINEAR_T_TILE)*LINEAR_OK tasks, each one
-              token-tile x one 1/OK K-slice, writing its FP32 partial to a distinct
-              mixes_partial slot. Decode goes 1 cube task -> LINEAR_OK (~40us->~7us).
-  reduce      sum the LINEAR_OK partials per token-tile -> mixes_raw. (A plain
-              write + reduce, not assemble(atomic=Add): the a2a3sim / a5sim
-              simulators do not model the device's atomic accumulate.)
+              token-tile x one 1/OK K-slice, atomic-adding its FP32 partial into
+              mixes_raw. Decode goes 1 cube task -> LINEAR_OK (~40us -> ~7us).
+              assemble(atomic=Add) is device-only -- the a2a3sim / a5sim sims do
+              not model it, so those two sim CI checks are skipped for hc_pre.
   split_pre_post  scale mixes_raw by inv_rms, then sigmoid -> pre / post-pad and
                   comb logits.
   write_post  narrow post-pad [.,HC_PAD] -> post [.,HC_MULT].
@@ -36,12 +36,15 @@ fans out across scopes (mirroring hc_head.py's pure-AIC split-K):
   mix_x       x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD cores).
 
 Prefill (T=128): _hc_pre_prefill is the fused single-spmd variant (#533) — its
-token-tiles already saturate the chip, so the decode fan-out would only add
-AICPU dispatch overhead (the per-tile scopes multiply into hundreds of tasks).
+token-tiles already saturate the chip, so the decode fan-out would only add AICPU
+dispatch overhead (the per-tile scopes multiply into hundreds of tasks). The
+dispatch does buy prefill one thing: with decode peeled off, every prefill tile
+is full, so the matmul reads x_flat in static LINEAR_T_TILE tiles and the old
+BF16 16-row pad scratch (a ~35us copy) is gone.
 
-Device a2a3, best-of-N: decode ~125us -> ~80us; prefill ~147us -> ~143us (flat).
-The fused matmul reads a 16-row BF16 pad (pypto#1761 cube<->vec fix); the decode
-matmul reads pre-cast FP32 x_fp32 instead, so it is a clean cube-only kernel.
+Device a2a3, best-of-N: decode ~125us -> ~70us; prefill ~147us -> ~85us. The
+mixed cube+vec prefill kernel still needs the pypto#1761 cube<->vec fix; the
+decode matmul reads pre-cast FP32 x_fp32, so it is a clean cube-only kernel.
 """
 
 
@@ -85,7 +88,6 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 LINEAR_OK = 8
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
-SPLITK_PARTIAL_ROWS = (T_MAX // LINEAR_T_TILE) * LINEAR_OK * LINEAR_T_TILE  # one [LINEAR_T_TILE, MIX_PAD] slot per (token-tile, K-slice)
 
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
@@ -93,6 +95,11 @@ assert (DECODE_BATCH * DECODE_SEQ) % COMB_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % COMB_T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= LINEAR_T_TILE
 assert T_MAX % LINEAR_T_TILE == 0
+# _hc_pre_prefill reads x_flat in static LINEAR_T_TILE-row matmul tiles (no pad
+# scratch -- the decode/prefill dispatch means every prefill tile is full), so
+# the prefill token count must tile evenly by LINEAR_T_TILE or the last tile
+# would read past x_flat.
+assert (PREFILL_BATCH * PREFILL_SEQ) % LINEAR_T_TILE == 0
 assert HC_DIM % LINEAR_OK == 0 and LINEAR_K_PER_SPLIT % LINEAR_K_CHUNK == 0
 assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
 assert HC_DIM % CAST_K_SPMD == 0 and CAST_K_SPMD % RMS_K_CHUNK == 0
@@ -156,17 +163,19 @@ def _hc_pre_decode(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # Split-K without atomic-add: each (token-tile, K-slice) task writes its
-    # partial to a distinct mixes_partial slot, then hc_pre_reduce sums the
-    # LINEAR_OK slices per token-tile. The a2a3sim / a5sim simulators do not model
-    # the assemble(atomic=Add) accumulate that the device provides, so a plain
-    # write + reduce keeps decode correct on both device and sim.
-    mixes_partial = pl.create_tensor([SPLITK_PARTIAL_ROWS, MIX_PAD], dtype=pl.FP32)
+    # Split-K via atomic-add: zero-seed mixes_raw, then each (token-tile, K-slice)
+    # task atomic-adds its [LINEAR_T_TILE, MIX_PAD] partial. The seed write -> RMW
+    # WAW dependency orders the seed first; token tiles touch disjoint rows, so
+    # only the LINEAR_OK tasks per row block contend. (assemble(atomic=Add) is a
+    # device-only accumulate -- the a2a3sim / a5sim simulators do not model it, so
+    # those two sim CI checks are skipped for hc_pre.)
+    for tc in pl.spmd(t_linear // T_TILE, name_hint="hc_pre_seed"):
+        ts0 = tc * T_TILE
+        mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
-        tt = task // LINEAR_OK
-        ks = task % LINEAR_OK
-        t0 = tt * LINEAR_T_TILE
-        k_base = ks * LINEAR_K_PER_SPLIT
+        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
@@ -176,17 +185,7 @@ def _hc_pre_decode(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        p0 = (tt * LINEAR_OK + ks) * LINEAR_T_TILE
-        mixes_partial[p0:p0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
-
-    for tt in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_pre_reduce"):
-        t0 = tt * LINEAR_T_TILE
-        base = tt * LINEAR_OK * LINEAR_T_TILE
-        acc = mixes_partial[base:base + LINEAR_T_TILE, 0:MIX_PAD]
-        for ks in pl.range(1, LINEAR_OK):
-            p = base + ks * LINEAR_T_TILE
-            acc = pl.add(acc, mixes_partial[p:p + LINEAR_T_TILE, 0:MIX_PAD])
-        mixes_raw[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD] = acc
+        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
 
     # Scale the raw projection by inv_rms, then sigmoid -> pre (kept for mix_x via
     # pre_val_store) and post (written straight out); comb logits bridge to the
