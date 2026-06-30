@@ -11,6 +11,11 @@
 import pypto.language as pl
 
 from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+from compressor_common import (
+    build_prefill_write_map_128x32,
+    index_hadamard16_bf16_to_fp32,
+    rmsnorm_rope_index16_bf16,
+)
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -103,22 +108,15 @@ def prefill_indexer_compressor(
         kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
 
-    # Precompute write_i -> (position, dst cache row) once. Input-only deps, so it overlaps the
-    # projection matmul, replacing the O(T) write-discovery scan repeated in pool / rmsnorm_rope /
-    # cache_write.
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_write_map"):
-        write_pos_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
-        write_dst_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
-        map_seen = pl.cast(0, pl.INDEX)
-        for map_w in pl.range(T):
-            if map_w < num_tokens:
-                map_slot_raw = pl.read(idx_slot_mapping, [map_w])
-                if map_slot_raw >= 0:
-                    pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_w]))
-                    pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
-                    map_seen = map_seen + 1
+    write_pos_map = build_prefill_write_map_128x32(
+        position_ids,
+        idx_slot_mapping,
+        num_tokens,
+        write_pos_map,
+        write_dst_map,
+    )
 
     for pool_idx in pl.spmd(PACKED_POOL_BLOCKS, name_hint="prefill_idx_c4_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
@@ -253,11 +251,12 @@ def prefill_indexer_compressor(
         else:
             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_CHUNK] = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
 
-    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_rmsnorm_rope"):
         final_base = final_block * PACKED_RMS_TILE
-        cos_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        cos_b = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        sin_b = pl.create_tensor([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        cos_b[0:PACKED_RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        sin_b[0:PACKED_RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
             write_slot_raw = pl.read(write_dst_map, [0, final_i])
@@ -272,54 +271,18 @@ def prefill_indexer_compressor(
                     freqs_sin[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
-        partial_sq = pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=0.0)
-        for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
-            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-            partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, PACKED_RMS_TILE]))
-        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [PACKED_RMS_TILE, 1])
-        inv_rms = pl.recip(pl.sqrt(variance))
-        for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
-            gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
-                normed_chunk,
-                target_type=pl.BF16,
-                mode="rint",
-            )
-        kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
-        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
-        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
-        rope_ones = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
-            rope_rot,
-            target_type=pl.BF16,
-            mode="rint",
+        normed_kv = rmsnorm_rope_index16_bf16(
+            pooled_kv,
+            norm_w,
+            cos_b,
+            sin_b,
+            normed_kv,
+            final_base,
         )
 
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_hadamard"):
         final_base = final_block * PACKED_RMS_TILE
-        for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
-            final_acc = pl.matmul(
-                normed_kv[final_base : final_base + PACKED_RMS_TILE, 0:HEAD_DIM],
-                hadamard[0:HEAD_DIM, o0 : o0 + OUT_TILE],
-                out_dtype=pl.FP32,
-            )
-            final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
+        final_kv = index_hadamard16_bf16_to_fp32(normed_kv, hadamard, final_kv, final_base)
 
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write"):
         final_base = final_block * PACKED_RMS_TILE

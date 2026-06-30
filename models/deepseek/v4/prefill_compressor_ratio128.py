@@ -16,6 +16,7 @@ tokens.
 import pypto.language as pl
 
 from config import BLOCK_SIZE, FLASH as M, PREFILL_BATCH, PREFILL_SEQ
+from compressor_common import rmsnorm_rope_main8_fp32
 
 
 B = PREFILL_BATCH
@@ -200,10 +201,11 @@ def prefill_compressor_ratio128(
                 h0 : h0 + HEAD_TILE,
             ]
 
-    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rmsnorm_rope"):
-        cos_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        cos_b = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32)
+        sin_b = pl.create_tensor([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32)
+        cos_b[0:HCA_C128_RMS_TILE, 0:ROPE_HALF] = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        sin_b[0:HCA_C128_RMS_TILE, 0:ROPE_HALF] = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         for norm_i in pl.range(HCA_C128_RMS_TILE):
             norm_slot_raw = pl.read(write_dst_map, [0, norm_i])
             if norm_slot_raw >= 0:
@@ -212,40 +214,14 @@ def prefill_compressor_ratio128(
                 sin_row = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
                 cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
                 sin_b[norm_i : norm_i + 1, 0:ROPE_HALF] = sin_row
-        partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
-        for rms_kb in pl.pipeline(HEAD_BLOCKS, stage=2):
-            rms_h0 = rms_kb * HEAD_TILE
-            kv_rms_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, rms_h0 : rms_h0 + HEAD_TILE]
-            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-            partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, HCA_C128_RMS_TILE]))
-
-        variance = pl.reshape(pl.add(pl.mul(partial_sq, 1.0 / HEAD_DIM), EPS), [HCA_C128_RMS_TILE, 1])
-        inv_rms = pl.recip(pl.sqrt(variance))
-        for norm_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
-            norm_h0 = norm_kb * HEAD_TILE
-            kv_norm_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE]
-            gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
-
-        kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
-        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
-        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
-        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
-        rope_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
+        normed_kv_pad = rmsnorm_rope_main8_fp32(
+            pooled_kv_pad,
+            norm_w,
+            cos_b,
+            sin_b,
+            normed_kv_pad,
+            pl.cast(0, pl.INDEX),
+        )
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):

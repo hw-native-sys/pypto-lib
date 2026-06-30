@@ -14,6 +14,7 @@ Softmax+pool over all slots. No state shift needed."""
 import pypto.language as pl
 
 from config import FLASH as M, BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
+from compressor_common import rmsnorm_rope_main16_fp32
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")
@@ -236,56 +237,26 @@ def compressor_ratio128(
             pooled_chunk = pl.col_sum(pl.mul(softmax_kv_state, score_prob))
             pooled_kv[pad_idx : pad_idx + 1, h0 : h0 + POOL_HEAD_TILE] = pooled_chunk
 
-    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
     with pl.spmd(b_dim // RMS_TILE, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
         batch_base_idx = pl.tile.get_block_idx()
         batch_base = batch_base_idx * RMS_TILE
         pad_base = batch_base_idx * RMS_PAD_TILE
-        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        cos_b = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        sin_b = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+        cos_b[0:RMS_PAD_TILE, 0 : ROPE_HEAD_DIM // 2] = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        sin_b[0:RMS_PAD_TILE, 0 : ROPE_HEAD_DIM // 2] = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         cos_b[0:RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
         sin_b[0:RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-        partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
-        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
-            rms_h0 = rms_kb * HEAD_TILE
-            kv_rms_chunk = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, rms_h0 : rms_h0 + HEAD_TILE]
-            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
-            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
-
-        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_PAD_TILE, 1])
-        inv_rms = pl.recip(pl.sqrt(variance))
-        for rms_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
-            norm_h0 = rms_kb * HEAD_TILE
-            kv_norm_chunk = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE]
-            gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[pad_base : pad_base + RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
-
-        kv_rope_norm = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
-        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
-        # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
-        # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
-        # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
-        # carries gamma[j^1]; inv_rms is per-row so it commutes. swap_idx (j^1), sign
-        # ([-1,+1,...]) and dup_idx (j>>1) are built IN-KERNEL from pl.arange; cos_il/sin_il
-        # are dup-gathered from the per-batch cos/sin rows. normed_kv is FP32 -> write directly.
-        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
-        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[pad_base : pad_base + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
+        normed_kv = rmsnorm_rope_main16_fp32(
+            pooled_kv,
+            norm_w,
+            cos_b,
+            sin_b,
+            normed_kv,
+            pad_base,
+        )
 
     kv_flat = pl.reshape(kv, [bs, HEAD_DIM])
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
