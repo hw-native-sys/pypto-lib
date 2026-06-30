@@ -44,7 +44,7 @@ from hc_pre import hc_pre
 from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn import sparse_attn
+from decode_sparse_attn import sparse_attn, ATTN_K_TILE, SPARSE_BLOCKS
 
 # model config
 B = DECODE_BATCH
@@ -229,6 +229,7 @@ def attention_csa(
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
     # fixed metadata while the CSA path still composes indexer at runtime.
     cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
     for topk_block in pl.spmd(T // CSA_TOPK_TOKEN_TILE, name_hint="csa_sparse_idx_tile"):
@@ -252,6 +253,7 @@ def attention_csa(
                         pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
                     else:
                         pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
+                pl.write(valid_block_mask, [t_idx, 0], pl.cast(1, pl.INT32))
 
         # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy. Keep raw
         # iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4) (== the original
@@ -268,11 +270,19 @@ def attention_csa(
         c_mask = pl.mul(c_ge, c_lt)
         c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
         cmp_sparse_indices[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, WIN : WIN + IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        for c_sb in pl.range(1, SPARSE_BLOCKS):
+            c_s0 = (c_sb - 1) * ATTN_K_TILE
+            c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
+            for c_dt in pl.range(CSA_TOPK_TOKEN_TILE):
+                c_t = topk_t0 + c_dt
+                if c_t < T:
+                    c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
+                    pl.write(valid_block_mask, [c_t, c_sb], c_valid)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, ori_block_table, kv,
-        cmp_kv, cmp_block_table, cmp_sparse_indices,
+        cmp_kv, cmp_block_table, cmp_sparse_indices, valid_block_mask,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
