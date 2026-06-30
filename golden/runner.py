@@ -32,7 +32,6 @@ class RunResult:
     error: str | None = None
     execution_time: float | None = None
     work_dir: Path | None = None
-    bench_stats: Any = None  # pypto BenchmarkStats when benchmark=... was requested
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time is not None else ""
@@ -324,128 +323,6 @@ def _execute_via_runner(
     execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
 
 
-def _normalize_bench_cfg(benchmark: "bool | dict[str, Any] | None") -> dict[str, Any] | None:
-    """Coerce the user-facing ``benchmark`` arg into a kwargs dict (or None).
-
-    Accepts ``True`` (defaults), a kwargs dict (``rounds`` / ``warmup``), or a
-    falsy value (benchmark disabled). Rejects unknown keys up-front so a typo
-    surfaces here instead of as a confusing ``benchmark()`` TypeError.
-    """
-    if not benchmark:
-        return None
-    cfg = {} if benchmark is True else dict(benchmark)
-    allowed = {"rounds", "warmup"}
-    unknown = set(cfg) - allowed
-    if unknown:
-        raise ValueError(f"benchmark config has unknown keys {sorted(unknown)}; allowed: {sorted(allowed)}")
-    return cfg
-
-
-def _resolve_bench_cfg(benchmark: "bool | dict[str, Any] | None") -> dict[str, Any] | None:
-    """Resolve the effective benchmark config from the arg, then the environment.
-
-    An explicit *benchmark* arg always wins, including an explicit ``False``
-    (which disables benchmarking even when the env var is set). Only a ``None``
-    arg falls back to the env var ``PYPTO_LIB_BENCHMARK`` (the daily-CI a2a3
-    sweep enables it once for the whole job), which turns benchmark on for
-    *every* harness run with no per-file flag, sized by
-    ``PYPTO_LIB_BENCHMARK_ROUNDS`` / ``PYPTO_LIB_BENCHMARK_WARMUP``. Returns the
-    kwargs dict or None (disabled).
-    """
-    if benchmark is not None:
-        return _normalize_bench_cfg(benchmark)
-    import os
-
-    if os.environ.get("PYPTO_LIB_BENCHMARK"):
-        return {
-            "rounds": int(os.environ.get("PYPTO_LIB_BENCHMARK_ROUNDS", "100")),
-            "warmup": int(os.environ.get("PYPTO_LIB_BENCHMARK_WARMUP", "3")),
-        }
-    return None
-
-
-def _run_benchmark(
-    compiled: Any,
-    specs: list[TensorSpec | ScalarSpec],
-    tensors: dict[str, torch.Tensor],
-    scalar_specs_eff: dict[str, ScalarSpec],
-    runtime_cfg: dict[str, Any],
-    bench_cfg: dict[str, Any],
-) -> Any:
-    """Register *compiled* once and time ``rounds`` launches via pypto's helper.
-
-    Mirrors simpler's ``scene_test --rounds`` mode: a single
-    :func:`pypto.runtime.benchmark` registers the program once and dispatches
-    ``warmup + rounds`` cheap launches, returning per-launch ``device_wall_us``
-    samples (the on-NPU orchestrator wall). The dispatch args are the full
-    positional list in orchestration param order — identical to what
-    :func:`_execute_via_runner` hands ``execute_compiled`` — so the in-place
-    (non-return) calling convention is preserved.
-
-    Returns a ``BenchmarkStats``. Raises ``ValueError`` if *compiled* is None
-    (e.g. an L2 ``runtime_dir`` replay, where no live compiled object exists).
-    """
-    if compiled is None:
-        raise ValueError(
-            "benchmark requires a freshly compiled program; it is unsupported on the "
-            "L2 runtime_dir replay path (no live CompiledProgram to register)"
-        )
-    # pypto's benchmark() is built on ChipWorker.run_timed, which is L2
-    # single-chip only: the base Worker.run_timed raises for L3, because an L3
-    # (multi-card) DAG run does not aggregate device_wall_us (it would be 0).
-    # Reject an L3 DistributedCompiledProgram up-front with a clear message
-    # rather than letting ChipWorker.register fail with an opaque error.
-    try:
-        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
-    except ImportError:
-        DistributedCompiledProgram = ()  # type: ignore[assignment]
-    if isinstance(compiled, DistributedCompiledProgram):
-        raise ValueError(
-            "benchmark is unsupported for L3 distributed (multi-card) programs: "
-            "run_timed exposes a device wall only on ChipWorker (L2 single-chip)"
-        )
-    from pypto.runtime import benchmark as pypto_benchmark
-
-    ordered: list[Any] = [
-        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
-        for s in specs
-    ]
-    stats = pypto_benchmark(
-        compiled,
-        ordered,
-        rounds=int(bench_cfg.get("rounds", 100)),
-        warmup=int(bench_cfg.get("warmup", 3)),
-        platform=runtime_cfg.get("platform"),
-        device_id=runtime_cfg.get("device_id"),
-    )
-    # Single-line, machine-readable marker the daily-CI perf collector greps for.
-    # It is anchored on ``kernel=`` (not the bare "[RUN] benchmark" prefix) so it
-    # is unambiguous against the _Stage("benchmark") start/done lines and the
-    # "[RUN] benchmark skipped" warning. ``kernel`` is the compiled program's
-    # output-dir basename with the per-run ``_YYYYMMDD_HHMMSS`` timestamp stripped
-    # so the report row is stable day-to-day (trend tracking joins on a constant
-    # name); a file running several kernels emits one line each.
-    import re
-
-    kernel = Path(compiled.output_dir).name if getattr(compiled, "output_dir", None) else "unknown"
-    kernel = re.sub(r"_\d{8}_\d{6}$", "", kernel)
-    if stats.all_zero_device:
-        print(
-            f"[RUN] benchmark kernel={kernel} no_device_timing=1 rounds={stats.rounds} "
-            "(device_wall_us all 0 — runtime built without PTO2_PROFILING)",
-            flush=True,
-        )
-    else:
-        print(
-            f"[RUN] benchmark kernel={kernel} rounds={stats.rounds} "
-            f"mean_us={stats.device_us_mean:.0f} "
-            f"min_us={stats.device_us_min:.0f} "
-            f"max_us={stats.device_us_max:.0f}",
-            flush=True,
-        )
-    return stats
-
-
 def _try_l3_dispatch(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -596,7 +473,6 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = True,
-    benchmark: "bool | dict[str, Any] | None" = None,
 ) -> RunResult:
     """Compile *program*, run on device, and validate against golden.
 
@@ -631,11 +507,6 @@ def run(
             False to skip the on-disk ``.pt`` snapshot when inputs are large
             (e.g. full-model weights) and replay is not needed; validation
             still runs against the in-memory golden.
-        benchmark: When truthy, after the normal validate run, register the
-            compiled program once and time ``rounds`` launches via
-            :func:`pypto.runtime.benchmark`. Pass ``True`` for defaults
-            (100 rounds / 3 warmup) or a kwargs dict
-            (``{"rounds": N, "warmup": M}``); see :func:`run_jit`.
 
     Returns:
         :class:`RunResult`.
@@ -650,10 +521,6 @@ def run(
 
     if compile_only and runtime_dir is not None:
         return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
-    try:
-        bench_cfg = _resolve_bench_cfg(benchmark)
-    except ValueError as e:
-        return RunResult(passed=False, error=str(e))
 
     data_dir = Path(golden_data) if golden_data is not None else None
     tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
@@ -724,34 +591,18 @@ def run(
             _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
     # Validate
-    validation_skipped = golden_outputs is None
-    if not validation_skipped:
-        try:
-            _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
-        except AssertionError as e:
-            return _fail(str(e))
-
-    # Benchmark (register-once, rounds timing). Runs after validation so the
-    # timed kernel is the one we just proved correct. It is a measurement
-    # add-on, never a correctness gate: a benchmark failure (e.g. an L3
-    # distributed program, which run_timed does not support) must not flip a
-    # validated-correct run to FAIL, so swallow it with a warning.
-    bench_stats = None
-    if bench_cfg is not None:
-        try:
-            with _Stage("benchmark"):
-                bench_stats = _run_benchmark(
-                    compiled, specs, tensors, scalar_specs_eff, runtime_cfg, bench_cfg,
-                )
-        except Exception as e:  # noqa: BLE001 — benchmark is never a correctness gate
-            # Any benchmark failure (L3 unsupported, device hiccup, ...) must not
-            # flip a validated-correct run to FAIL; warn and keep the verdict.
-            print(f"[RUN] benchmark skipped: {type(e).__name__}: {e}", flush=True)
+    if golden_outputs is None:
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+    try:
+        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+    except AssertionError as e:
+        return _fail(str(e))
 
     total = time.time() - start
-    skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
-    print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench_stats=bench_stats)
+    print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
 
 
 def run_jit(
@@ -767,7 +618,6 @@ def run_jit(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = True,
-    benchmark: "bool | dict[str, Any] | None" = None,
 ) -> RunResult:
     """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
 
@@ -805,14 +655,6 @@ def run_jit(
             False to skip the on-disk ``.pt`` snapshot when inputs are large
             (e.g. full-model weights) and replay is not needed; validation
             still runs against the in-memory golden.
-        benchmark: When truthy, after the normal validate run, register the
-            compiled program once and time ``rounds`` launches via
-            :func:`pypto.runtime.benchmark` (simpler's ``scene_test --rounds``
-            mode). Pass ``True`` for defaults (100 rounds / 3 warmup) or a
-            kwargs dict (``{"rounds": N, "warmup": M}``). The aggregated
-            ``BenchmarkStats`` is attached to :attr:`RunResult.bench_stats`.
-            Unsupported on the L2 ``runtime_dir`` replay path (no live
-            CompiledProgram to register).
 
     Returns:
         :class:`RunResult`.
@@ -825,10 +667,6 @@ def run_jit(
 
     if compile_only and runtime_dir is not None:
         return RunResult(passed=False, error="runtime_dir is incompatible with compile_only")
-    try:
-        bench_cfg = _resolve_bench_cfg(benchmark)
-    except ValueError as e:
-        return RunResult(passed=False, error=str(e))
 
     data_dir = Path(golden_data) if golden_data is not None else None
     tensor_specs = [s for s in specs if isinstance(s, TensorSpec)]
@@ -908,31 +746,15 @@ def run_jit(
             _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
     # Validate
-    validation_skipped = golden_outputs is None
-    if not validation_skipped:
-        try:
-            _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
-        except AssertionError as e:
-            return _fail(str(e))
-
-    # Benchmark (register-once, rounds timing). Runs after validation so the
-    # timed kernel is the one we just proved correct. It is a measurement
-    # add-on, never a correctness gate: a benchmark failure (e.g. an L3
-    # distributed program, which run_timed does not support) must not flip a
-    # validated-correct run to FAIL, so swallow it with a warning.
-    bench_stats = None
-    if bench_cfg is not None:
-        try:
-            with _Stage("benchmark"):
-                bench_stats = _run_benchmark(
-                    compiled, specs, tensors, scalar_specs_eff, runtime_cfg, bench_cfg,
-                )
-        except Exception as e:  # noqa: BLE001 — benchmark is never a correctness gate
-            # Any benchmark failure (L3 unsupported, device hiccup, ...) must not
-            # flip a validated-correct run to FAIL; warn and keep the verdict.
-            print(f"[RUN] benchmark skipped: {type(e).__name__}: {e}", flush=True)
+    if golden_outputs is None:
+        total = time.time() - start
+        print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+    try:
+        _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+    except AssertionError as e:
+        return _fail(str(e))
 
     total = time.time() - start
-    skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
-    print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench_stats=bench_stats)
+    print(f"[RUN] PASS ({total:.2f}s)", flush=True)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
