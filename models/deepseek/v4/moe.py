@@ -141,7 +141,7 @@ def moe(
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
     gate(
         x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, tid2eid, input_ids,
+        layer_id, num_tokens, tid2eid, input_ids,
         x_norm, x_norm_i8, x_norm_scale, indices, weights,
     )
 
@@ -150,7 +150,7 @@ def moe(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh,
+        sh, num_tokens,
     )
 
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -228,6 +228,7 @@ def moe_test(
     combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     # Single-layer tests pass 1; multi-layer callers must pass a monotonically
     # increasing MoE call id when they reuse the same done windows.
@@ -244,9 +245,7 @@ def moe_test(
         pub_counts, count_done, data_done,
         recv_x, recv_scale, recv_w, recv_r_route,
         routed_y_buf, combine_done,
-        # Route the full pipeline width (T = MOE_TOKENS): decode by default,
-        # prefill when the entry script overrides MOE_TOKENS.
-        layer_id, pl.const(T, pl.INT32), my_rank, moe_epoch,
+        layer_id, num_tokens, my_rank, moe_epoch,
     )
     return x_next
 
@@ -276,6 +275,7 @@ def l3_moe(
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
     layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
     count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
@@ -308,7 +308,7 @@ def l3_moe(
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
-            layer_id, r, pl.const(1, pl.INT32),
+            layer_id, num_tokens, r, pl.const(1, pl.INT32),
             device=r,
         )
 
@@ -356,6 +356,7 @@ def golden_moe(tensors):
             "gate_w":       tensors["gate_w"][r],
             "gate_bias":    tensors["gate_bias"][r],
             "layer_id":     tensors["layer_id"],
+            "num_tokens":   tensors["num_tokens"],
             "tid2eid":      tensors["tid2eid"][r],
             "input_ids":    tensors["input_ids"][r],
             "x_norm":       x_norm,
@@ -370,6 +371,7 @@ def golden_moe(tensors):
         golden_expert_shared({
             "x_local_i8":       x_norm_i8,
             "x_local_scale_dq": x_norm_scale,
+            "num_tokens":       tensors["num_tokens"],
             "shared_w1":        tensors["shared_w1"][r],
             "shared_w1_scale":  tensors["shared_w1_scale"][r],
             "shared_w3":        tensors["shared_w3"][r],
@@ -418,6 +420,7 @@ def golden_moe(tensors):
                 "gate_w":       tensors["gate_w"][src],
                 "gate_bias":    tensors["gate_bias"][src],
                 "layer_id":     tensors["layer_id"],
+                "num_tokens":   tensors["num_tokens"],
                 "tid2eid":      tensors["tid2eid"][src],
                 "input_ids":    tensors["input_ids"][src],
                 "x_norm":       src_x_norm,
@@ -579,7 +582,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next_out
 
 
-def build_tensor_specs(layer_id=0):
+def build_tensor_specs(layer_id=0, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_weight
@@ -702,6 +705,7 @@ def build_tensor_specs(layer_id=0):
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
         TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.bfloat16, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
+        ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
 
 
@@ -735,6 +739,7 @@ def moe_ep1(
     shared_w2_scale: pl.Tensor[[D],                      pl.FP32],
     x_next:          pl.Out[pl.Tensor[[T, HC_MULT, D],   pl.BF16]],
     layer_id:        pl.Scalar[pl.INT32],
+    num_tokens:      pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
@@ -748,7 +753,7 @@ def moe_ep1(
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
     gate(
         x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, tid2eid, input_ids,
+        layer_id, num_tokens, tid2eid, input_ids,
         x_norm, x_norm_i8, x_norm_scale, indices, weights,
     )
 
@@ -757,7 +762,7 @@ def moe_ep1(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh,
+        sh, num_tokens,
     )
 
     recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -810,6 +815,7 @@ def moe_ep1_test(
     shared_w2_scale: pl.Tensor[[D],                      pl.FP32],
     x_next:          pl.Out[pl.Tensor[[T, HC_MULT, D],   pl.BF16]],
     layer_id:        pl.Scalar[pl.INT32],
+    num_tokens:      pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     x_next = moe_ep1(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -819,7 +825,7 @@ def moe_ep1_test(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next,
-        layer_id,
+        layer_id, num_tokens,
     )
     return x_next
 
@@ -838,12 +844,12 @@ def golden_moe_ep1(tensors):
     tensors["x_next"][:] = wrapped["x_next"][0]
 
 
-def build_tensor_specs_ep1(layer_id=0):
+def build_tensor_specs_ep1(layer_id=0, num_tokens=T):
     """EP1 fixtures = the distributed specs with the rank-0 leading dim dropped."""
     from golden import ScalarSpec, TensorSpec
 
     flat = []
-    for s in build_tensor_specs(layer_id=layer_id):
+    for s in build_tensor_specs(layer_id=layer_id, num_tokens=num_tokens):
         if isinstance(s, ScalarSpec):
             flat.append(s)
         elif s.is_output:
@@ -869,6 +875,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
+    parser.add_argument("--num-tokens", type=int, default=T,
+                        help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -889,7 +897,7 @@ if __name__ == "__main__":
         # One rank: plain single-card run (no DistributedConfig / HCCL windows).
         result = run_jit(
             fn=moe_ep1_test,
-            specs=build_tensor_specs_ep1(layer_id=args.layer_id),
+            specs=build_tensor_specs_ep1(layer_id=args.layer_id, num_tokens=args.num_tokens),
             golden_fn=golden_moe_ep1,
             golden_data=golden_data,
             compile_only=args.compile_only,
@@ -910,7 +918,7 @@ if __name__ == "__main__":
     else:
         result = run_jit(
             fn=l3_moe,
-            specs=build_tensor_specs(layer_id=args.layer_id),
+            specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
             golden_fn=golden_moe,
             golden_data=golden_data,
             compile_only=args.compile_only,
