@@ -432,6 +432,7 @@ def golden_decode_layer(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe(moe_tensors)
 
 
@@ -478,6 +479,7 @@ def golden_decode_layer_hca(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe(moe_tensors)
 
 
@@ -538,6 +540,7 @@ def golden_decode_layer_csa(tensors):
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
+    moe_tensors["num_tokens"] = T
     golden_moe(moe_tensors)
 
 
