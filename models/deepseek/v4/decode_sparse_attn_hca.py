@@ -226,7 +226,6 @@ def sparse_attn_hca(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
-    attn_rope_stage = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.FP32)
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
@@ -304,56 +303,13 @@ def sparse_attn_hca(
                     sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                     sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
 
-    # Online-softmax merge across sparse-K tiles, then sink-norm.
-    # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
-    # the manual-scope proj_a tasks below (which read merge_norm's o_packed NOPE cols).
-    with pl.spmd(T, name_hint="merge_norm") as merge_tid:
-        m_t = pl.tile.get_block_idx()
-        m_token_base = m_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-
-        for m_h_idx in pl.range((H // H_TILE)):
-            m_h0 = m_h_idx * H_TILE
-            m_blk_base = m_token_base + m_h_idx * SPARSE_BLOCKS * H_TILE
-            m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
-            m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
-
-            # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
-            # single block's stats directly instead of an empty merge loop.
-            if SPARSE_BLOCKS > 1:
-                for m_sb in pl.range(1, SPARSE_BLOCKS):
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                    m_mi = m_mi_new
-
-            n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
-            n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
-            n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-            n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
-            n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
-            n_rope_row = m_t * H + m_h0
-            attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
-
-            for n_hi in pl.range(H_TILE):
-                n_gh = m_h0 + n_hi
-                n_g = n_gh // HEADS_PER_GROUP
-                n_hh = n_gh - n_g * HEADS_PER_GROUP
-                n_pack_row = n_g * T + m_t
-                n_col = n_hh * HEAD_DIM
-                o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
-
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
     # same dup-gather H times on the bottleneck Vec engine. sign is folded into sin
     # (multiply by +/-1). The conjugate (inverse) rotation is:
     #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
+    # Hoisted ABOVE merge_norm (which now fuses the rotation): independent of qk_pv,
+    # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
@@ -372,47 +328,70 @@ def sparse_attn_hca(
         rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
             pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
-    # Inverse RoPE fused with the rope-column pack: each task rotates its heads'
-    # rope segments and stores them straight into o_packed's strided rope columns,
-    # dropping a separate rope_pack stage and GM round-trip. cos_il / sign*sin come
-    # from the pre-pass above; only swap_idx (j^1) is rebuilt per task.
-    attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
-    # with-form spmd so the dispatch TaskId (rope_tid) can be an explicit dep of the
-    # manual-scope proj_a tasks below (which read rope's o_packed rope cols).
-    with pl.spmd((H // 4) * (T // ROPE_OUT_TOK_TILE), name_hint="rope") as rope_tid:
-        rp_idx = pl.tile.get_block_idx()
-        rp_hg = rp_idx // (T // ROPE_OUT_TOK_TILE)
-        rp_tt = rp_idx - rp_hg * (T // ROPE_OUT_TOK_TILE)
-        rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
-        # Head-invariant swap index (j^1), built once and reused across the head
-        # group -- the only per-head input is this head's strided rope slice.
-        sp_col = pl.col_expand_mul(
-            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+    # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
+    # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
+    # fans out over that many AIVs instead of T blocks each running a serial head-tile
+    # loop. The inverse-RoPE rotation + rope-column pack is fused in (was a separate
+    # "rope" spmd reading an attn_rope_stage GM round-trip): the head-tile's fp32 rope
+    # segment is rotated in UB and packed straight into o_packed's rope columns.
+    # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
+    # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+        m_idx = pl.tile.get_block_idx()
+        m_t = m_idx // (H // H_TILE)
+        m_h_idx = m_idx - m_t * (H // H_TILE)
+        m_h0 = m_h_idx * H_TILE
+        m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
+        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
+        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-        for rp_hl in pl.range(0, 4):
-            rp_gh = rp_hg * 4 + rp_hl
-            rp_g = rp_gh // HEADS_PER_GROUP
-            rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
-            rp_col = rp_hh * HEAD_DIM + NOPE_DIM
-            rp_o0 = rp_g * T + rp_t0
-            for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                c0 = 2 * r_r0
-                # This head's rope rows for this token tile (stride H).
-                r_tile_fp32 = pl.reshape(
-                    attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE],
-                    [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE])
-                r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
-                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
-                # Store BF16-rounded rotated values straight into o_packed's rope
-                # columns for this head (golden also rounds inverse-RoPE to bf16).
-                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-                o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
+        # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
+        # single block's stats directly instead of an empty merge loop.
+        if SPARSE_BLOCKS > 1:
+            for m_sb in pl.range(1, SPARSE_BLOCKS):
+                m_row = m_blk_base + m_sb * H_TILE
+                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+                m_mi_new = pl.maximum(m_mi, m_cur_mi)
+                m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+                m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+                m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+                m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+                m_mi = m_mi_new
+
+        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
+        n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
+        n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
+        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+
+        # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
+        # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
+        # swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16 (golden
+        # also rounds inverse-RoPE to bf16) and packed into o_packed's rope columns.
+        m_col = pl.col_expand_mul(
+            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        m_dup_f = pl.cast(pl.cast(pl.mul(m_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        m_lane = pl.sub(m_col, pl.mul(m_dup_f, 2.0))                                              # j%2
+        m_swap_idx = pl.cast(pl.sub(pl.add(m_col, 1.0), pl.mul(m_lane, 2.0)), target_type=pl.INT32)  # j^1
+        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+        m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
+        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
+        m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
+        m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
+        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+
+        for n_hi in pl.range(H_TILE):
+            n_gh = m_h0 + n_hi
+            n_g = n_gh // HEADS_PER_GROUP
+            n_hh = n_gh - n_g * HEADS_PER_GROUP
+            n_pack_row = n_g * T + m_t
+            n_col = n_hh * HEAD_DIM
+            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
+            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM]
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
@@ -425,7 +404,8 @@ def sparse_attn_hca(
     # groups are still in flight (a genuine proj_a<->proj_b back-to-back GEMM).
     #
     # manual_scope SUPPRESSES auto-dep, so every edge is explicit: proj_a reads
-    # o_packed (auto region) -> deps=[merge_tid, rope_tid]; quant[g] deps on group
+    # o_packed (auto region) -> deps=[merge_tid] (merge_norm now writes both the NOPE
+    # and the fused-RoPE columns); quant[g] deps on group
     # g's proj_a tasks; proj_b deps on [seed, quant[g]]. Each proj_b group-slab
     # dequantizes its INT32 partial by the group's per-row act scale (the per-group
     # scale cannot factor out of the K-sum) and FP32 atomic-adds into a zero-seeded
@@ -453,7 +433,7 @@ def sparse_attn_hca(
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T
             row_base_pad = g * T_PAD
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_o_pad", deps=[merge_tid, rope_tid]) as pad_tid:
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_o_pad", deps=[merge_tid]) as pad_tid:
                 for k0 in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
                     o_packed_mm[row_base_pad:row_base_pad + T, k0:k0 + A_K_TILE] = o_packed[
                         row_base_o:row_base_o + T, k0:k0 + A_K_TILE
