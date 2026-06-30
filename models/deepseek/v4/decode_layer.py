@@ -798,7 +798,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="If set, use this single start_pos for all batches.")
     parser.add_argument("--layer-id", type=int, default=10)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
