@@ -268,6 +268,7 @@ RECV_SAFETY = 4
 # bake different depths; default to decode, prefill overrides to PREFILL_RECV_MAX.
 DECODE_RECV_MAX = max(16, DECODE_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
 PREFILL_RECV_MAX = max(16, PREFILL_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
+PREFILL_RECV_MAX = 1024  # real routing skews past the RECV_SAFETY=4 uniform bound; size for the observed peak
 RECV_MAX = DECODE_RECV_MAX
 
 # When True, gate.py's N_EXPERTS uses the full global expert space
