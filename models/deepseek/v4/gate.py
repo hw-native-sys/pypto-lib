@@ -129,7 +129,10 @@ def gate(
                 pl.full([GATE_M_TILE, SCORE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
             gp_relu = pl.maximum(gate_logits_tile, 0.0)
             gp_abs = pl.maximum(gate_logits_tile, pl.neg(gate_logits_tile))
-            gp_softplus = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+            gp_softplus_log = pl.add(gp_relu, pl.log(pl.add(pl.exp(pl.neg(gp_abs)), 1.0)))
+            gp_neg_floor_mask = pl.minimum(pl.maximum(pl.sub(pl.neg(gate_logits_tile), 10.0), 0.0), 1.0)
+            gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
+            gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
             gp_score = pl.sqrt(gp_softplus)
             gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, N_EXPERTS], dtype=pl.FP32, value=1.0), gp_bias_row)
             gp_biased = pl.add(gp_score, gp_bias)
@@ -251,6 +254,7 @@ def _per_token_int8_quant(x_bf16):
 
 def golden_gate_core(tensors):
     import torch
+
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
     # FFN RMSNorm.
@@ -263,13 +267,15 @@ def golden_gate_core(tensors):
 
     # Per-token symmetric INT8 quant of bf16(x_norm).
     x_norm_i8, x_norm_scale = _per_token_int8_quant(x_flat)
-    # Gate matmul + numerically stable softplus(x) = relu(x) + log(exp(-|x|)+1).
+
+    # Gate matmul + sqrtsoftplus router score. Use the log1p stable form, which
+    # equals F.softplus while keeping the negative-logit tail alive: the naive
+    # log(exp(-|x|)+1) rounds 1+tiny back to 1.0 in fp32 and zeros the tail for
+    # logits below ~-16.
     gate_w = tensors["gate_w"].float()
     gate_bias = tensors["gate_bias"].float()
     logits = x_flat.float() @ gate_w.T
-    relu_logits = torch.maximum(logits, torch.zeros_like(logits))
-    abs_logits = torch.maximum(logits, -logits)
-    softplus = relu_logits + torch.log(torch.exp(-abs_logits) + 1.0)
+    softplus = logits.clamp(min=0) + torch.log1p(torch.exp(-logits.abs()))
     scores = softplus.sqrt()
     biased = scores + gate_bias.view(1, -1)
 
