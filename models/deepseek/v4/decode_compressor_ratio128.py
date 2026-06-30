@@ -101,26 +101,8 @@ def compressor_ratio128(
 
     x_flat = pl.reshape(x, [bs, D])
     t_matmul = pl.max(bs, MM_B_TILE)
-    x_matmul = pl.create_tensor([BS_PAD, D], dtype=pl.BF16)
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    kv_proj_scratch = pl.create_tensor([bs, OUT_DIM], dtype=pl.FP32)
-    score_proj_scratch = pl.create_tensor([bs, OUT_DIM], dtype=pl.FP32)
-
-    for pad_idx in pl.spmd(t_matmul // MM_B_TILE, name_hint="kv_score_x_pad"):
-        pad_row0 = pad_idx * MM_B_TILE
-        pad_rows = pl.min(MM_B_TILE, bs - pad_row0)
-        for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-            x_valid = pl.slice(
-                x_flat,
-                [MM_B_TILE, K_TILE],
-                [pad_row0, k0],
-                valid_shape=[pad_rows, K_TILE],
-            )
-            x_matmul[pad_row0:pad_row0 + MM_B_TILE, k0:k0 + K_TILE] = pl.fillpad(
-                x_valid,
-                pad_value=pl.PadValue.zero,
-            )
 
     for idx in pl.spmd(t_matmul * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj"):
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
@@ -129,7 +111,8 @@ def compressor_ratio128(
         score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x_matmul[global_row0 : global_row0 + MM_B_TILE, k0 : k0 + K_TILE]
+            x_rows = pl.min(MM_B_TILE, bs - global_row0)
+            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
             # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
             # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
             # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short
@@ -146,21 +129,13 @@ def compressor_ratio128(
         kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_unpad"):
-        for o0 in pl.pipeline(0, OUT_DIM, OUT_TILE, stage=2):
-            for row in pl.range(bs):
-                kv_proj_scratch[row:row + 1, o0:o0 + OUT_TILE] = kv_proj_pad[row:row + 1, o0:o0 + OUT_TILE]
-                score_proj_scratch[row:row + 1, o0:o0 + OUT_TILE] = score_proj_pad[row:row + 1, o0:o0 + OUT_TILE]
-
-    s_out = s_dim * OUT_DIM
-    kv_proj_by_batch = pl.reshape(kv_proj_scratch, [b_dim, s_out])
-    score_proj_by_batch = pl.reshape(score_proj_scratch, [b_dim, s_out])
     compress_state_flat = pl.reshape(compress_state, [compress_state_block_num, COMPRESS_STATE_BLOCK_SIZE * COMPRESS_STATE_DIM])
 
+    # state scatter reads the padded proj tensors directly by flat token row (no unpad pass).
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_pre") as scatter_tid:
         for global_c_idx in pl.range(b_dim):
             for s in pl.pipeline(s_dim, stage=2):
-                proj_col0 = s * OUT_DIM
+                proj_row = global_c_idx * s_dim + s
                 token_pos = pl.read(position_ids, [global_c_idx, s])
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
                 state_row = pl.cast(pl.read(state_slot_mapping, [global_c_idx, s]), target_type=pl.INDEX)
@@ -169,8 +144,8 @@ def compressor_ratio128(
                     state_intra = state_row % COMPRESS_STATE_BLOCK_SIZE
                     slot_col0_s = state_intra * COMPRESS_STATE_DIM
                     ape_row = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
-                    kv_row = kv_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                    score_row = score_proj_by_batch[global_c_idx : global_c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    kv_row = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    score_row = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
                     score_row = pl.add(score_row, ape_row)
                     compress_state_flat[state_blk_id : state_blk_id + 1, slot_col0_s : slot_col0_s + OUT_DIM] = kv_row
                     compress_state_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row

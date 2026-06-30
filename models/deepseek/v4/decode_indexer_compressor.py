@@ -73,24 +73,11 @@ def indexer_compressor(
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
     x_flat = pl.reshape(x, [B * S, D])
-    x_matmul = pl.create_tensor([BS_PAD, D], dtype=pl.BF16)
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
-    kv_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
-    score_proj_scratch = pl.create_tensor([B * S, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(compress_state, [COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_x_pad"):
-        for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-            x_matmul[0:B * S, k0:k0 + K_TILE] = x_flat[:, k0:k0 + K_TILE]
-            if BS_PAD > B * S:
-                x_matmul[B * S:BS_PAD, k0:k0 + K_TILE] = pl.full(
-                    [BS_PAD - B * S, K_TILE],
-                    dtype=pl.BF16,
-                    value=0.0,
-                )
 
     for idx in pl.spmd(BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj"):
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
@@ -99,7 +86,7 @@ def indexer_compressor(
         score_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x_matmul[global_row0 : global_row0 + MM_B_TILE, k0 : k0 + K_TILE]
+            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[B * S, K_TILE])
             # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
             # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
             # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short
@@ -117,24 +104,17 @@ def indexer_compressor(
         kv_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = kv_acc
         score_proj_pad[global_row0 : global_row0 + MM_B_TILE, o0 : o0 + OUT_TILE] = score_acc
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_score_unpad"):
-        for o0 in pl.pipeline(0, OUT_DIM, OUT_TILE, stage=2):
-            kv_proj_scratch[:, o0:o0 + OUT_TILE] = kv_proj_pad[0:B * S, o0:o0 + OUT_TILE]
-            score_proj_scratch[:, o0:o0 + OUT_TILE] = score_proj_pad[0:B * S, o0:o0 + OUT_TILE]
-
-    kv_proj_by_batch = pl.reshape(kv_proj_scratch, [B, S * OUT_DIM])
-    score_proj_by_batch = pl.reshape(score_proj_scratch, [B, S * OUT_DIM])
-
+    # state scatter reads the padded proj tensors directly by flat token row (no unpad pass).
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_scatter_paged") as scatter_tid:
         for c_idx in pl.range(B):
             for s in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s])
                 state_row = pl.cast(pl.read(inner_state_slot_mapping, [c_idx, s]), pl.INDEX)
-                proj_col0 = s * OUT_DIM
+                proj_row = c_idx * S + s
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
                 if state_row >= 0:
-                    kv_tile = kv_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
-                    score_tile = score_proj_by_batch[c_idx : c_idx + 1, proj_col0 : proj_col0 + OUT_DIM]
+                    kv_tile = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    score_tile = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
                     ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
                     score_tile = pl.add(score_tile, ape_tile)
                     compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile

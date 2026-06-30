@@ -90,15 +90,7 @@ def hc_head(
             k0 = kb * RMS_K_CHUNK
             x_chunk = pl.cast(x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK], target_type=pl.FP32)
             x_fp32[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK] = x_chunk
-    if t_linear > t_dim:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_head_x_pad", allow_early_resolve=True):
-            for k0 in pl.pipeline(0, HC_DIM, RMS_K_CHUNK, stage=4):
-                x_fp32[t_dim:t_linear, k0:k0 + RMS_K_CHUNK] = pl.full(
-                    [LINEAR_T_TILE - T_TILE, RMS_K_CHUNK],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-
+            
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = t * T_TILE

@@ -87,14 +87,6 @@ def gate(
                 an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
                 x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
                 x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
-    if T_PAD > T:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_gate_pad"):
-            for pad_d0 in pl.pipeline(0, D, D_TILE, stage=2):
-                x_norm_gate_buf[T:T_PAD, pad_d0:pad_d0 + D_TILE] = pl.full(
-                    [T_PAD - T, D_TILE],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
 
     # Per-token symmetric INT8 quant of x_norm.
     for t0 in pl.parallel(0, active_gate_tokens, T_TILE):

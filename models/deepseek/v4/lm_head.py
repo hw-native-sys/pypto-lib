@@ -90,34 +90,22 @@ def lm_head(
 ) -> pl.Tensor[[T_MAX, VOCAB_PER_TP], pl.FP32]:
     t_dim = pl.tensor.dim(hidden_states, 0)
     t_matmul = pl.max(t_dim, MATMUL_T_TILE)
-    hidden_pad = pl.create_tensor([T_MAX, D], dtype=pl.BF16)
     logits_pad = pl.create_tensor([T_MAX, VOCAB_PER_TP], dtype=pl.FP32)
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_hidden_pad"):
-        for k0 in pl.pipeline(0, D, HIDDEN_COMM_CHUNK, stage=2):
-            for t0 in pl.range(0, t_dim, T_TILE):
-                hidden_pad[t0:t0 + T_TILE, k0:k0 + HIDDEN_COMM_CHUNK] = \
-                    hidden_states[t0:t0 + T_TILE, k0:k0 + HIDDEN_COMM_CHUNK]
-            if t_matmul > t_dim:
-                hidden_pad[t_dim:t_matmul, k0:k0 + HIDDEN_COMM_CHUNK] = pl.full(
-                    [MATMUL_T_TILE - T_TILE, HIDDEN_COMM_CHUNK],
-                    dtype=pl.BF16,
-                    value=0.0,
-                )
-
     for t0 in pl.parallel(0, t_matmul, MATMUL_T_TILE):
+        hid_rows = pl.min(MATMUL_T_TILE, t_dim - t0)
         for ob in pl.parallel(VOCAB_FULL_BLOCKS_PER_TP):
             o0 = ob * VOCAB_CHUNK
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):
                 # The peeled (kb==0) matmul tiles must use names distinct from the
                 # loop-body tiles below; reusing one name across the peel and the
                 # carry loop collides under SSA and corrupts the accumulation.
-                hidden0 = hidden_pad[t0 : t0 + MATMUL_T_TILE, 0:LM_HEAD_K_CHUNK]
+                hidden0 = pl.slice(hidden_states, [MATMUL_T_TILE, LM_HEAD_K_CHUNK], [t0, 0], valid_shape=[hid_rows, LM_HEAD_K_CHUNK])
                 weight0 = lm_head_weight[o0 : o0 + VOCAB_CHUNK, 0:LM_HEAD_K_CHUNK]
                 acc = pl.matmul(hidden0, weight0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_chunk = hidden_pad[t0 : t0 + MATMUL_T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    hidden_chunk = pl.slice(hidden_states, [MATMUL_T_TILE, LM_HEAD_K_CHUNK], [t0, k0], valid_shape=[hid_rows, LM_HEAD_K_CHUNK])
                     weight_chunk = lm_head_weight[o0 : o0 + VOCAB_CHUNK, k0 : k0 + LM_HEAD_K_CHUNK]
                     acc = pl.matmul_acc(acc, hidden_chunk, weight_chunk, b_trans=True)
                 logits_pad[t0 : t0 + MATMUL_T_TILE, o0 : o0 + VOCAB_CHUNK] = acc
@@ -129,12 +117,12 @@ def lm_head(
                 # block above: they live in the same inlined function scope, and a
                 # shared name carrying a different shape (e.g. VOCAB_TAIL vs
                 # VOCAB_CHUNK) collides under SSA and corrupts the result.
-                hidden_t0 = hidden_pad[t0 : t0 + MATMUL_T_TILE, 0:LM_HEAD_K_CHUNK]
+                hidden_t0 = pl.slice(hidden_states, [MATMUL_T_TILE, LM_HEAD_K_CHUNK], [t0, 0], valid_shape=[hid_rows, LM_HEAD_K_CHUNK])
                 weight_t0 = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, 0:LM_HEAD_K_CHUNK]
                 acc_tail = pl.matmul(hidden_t0, weight_t0, b_trans=True, out_dtype=pl.FP32)
                 for kb in pl.range(1, K_BLOCKS):
                     k0 = kb * LM_HEAD_K_CHUNK
-                    hidden_tk = hidden_pad[t0 : t0 + MATMUL_T_TILE, k0 : k0 + LM_HEAD_K_CHUNK]
+                    hidden_tk = pl.slice(hidden_states, [MATMUL_T_TILE, LM_HEAD_K_CHUNK], [t0, k0], valid_shape=[hid_rows, LM_HEAD_K_CHUNK])
                     weight_tk = lm_head_weight[tail_o0 : tail_o0 + VOCAB_TAIL, k0 : k0 + LM_HEAD_K_CHUNK]
                     acc_tail = pl.matmul_acc(acc_tail, hidden_tk, weight_tk, b_trans=True)
                 logits_pad[t0 : t0 + MATMUL_T_TILE, tail_o0 : tail_o0 + VOCAB_TAIL] = acc_tail

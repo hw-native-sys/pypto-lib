@@ -129,21 +129,6 @@ def qkv_proj_rope(
     qr_view = pl.reshape(qr, [t_dim, Q_LORA])
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
     t_matmul = pl.max(t_dim, MATMUL_T_TILE)
-    x_matmul = pl.create_tensor([T_MAX, D], dtype=pl.BF16)
-    for pad_idx in pl.spmd(t_matmul // MATMUL_T_TILE, name_hint="qkv_x_matmul_pad"):
-        pad_t0 = pad_idx * MATMUL_T_TILE
-        pad_rows = pl.min(MATMUL_T_TILE, t_dim - pad_t0)
-        for pad_k0 in pl.range(0, D, Q_PROJ_TILE):
-            x_valid = pl.slice(
-                x_view,
-                [MATMUL_T_TILE, Q_PROJ_TILE],
-                [pad_t0, pad_k0],
-                valid_shape=[pad_rows, Q_PROJ_TILE],
-            )
-            x_matmul[pad_t0 : pad_t0 + MATMUL_T_TILE, pad_k0 : pad_k0 + Q_PROJ_TILE] = pl.fillpad(
-                x_valid,
-                pad_value=pl.PadValue.zero,
-            )
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). TN=256 makes each wq_a
     # row-read a full 512B L2 line (vs 128B sub-line at TN=64), but only leaves
@@ -169,7 +154,8 @@ def qkv_proj_rope(
             q_acc = pl.create_tensor([QR_M_TILE, QR_N_TILE], dtype=pl.FP32)
             for db in pl.pipeline(QR_K_SLICE // QR_K_TILE, stage=2):
                 qr_d0 = qr_k_base + db * QR_K_TILE
-                q_x_chunk_bf16 = x_matmul[t0 : t0 + QR_M_TILE, qr_d0 : qr_d0 + QR_K_TILE]
+                qr_rows = pl.min(QR_M_TILE, t_dim - t0)
+                q_x_chunk_bf16 = pl.slice(x_view, [QR_M_TILE, QR_K_TILE], [t0, qr_d0], valid_shape=[qr_rows, QR_K_TILE])
                 w_chunk = wq_a[qr_d0 : qr_d0 + QR_K_TILE, q_a_col0 : q_a_col0 + QR_N_TILE]
                 if db == 0:
                     q_acc = pl.matmul(q_x_chunk_bf16, w_chunk, out_dtype=pl.FP32)
@@ -338,7 +324,8 @@ def qkv_proj_rope(
             kv_acc = pl.create_tensor([KV_M_TILE, KV_N_TILE], dtype=pl.FP32)
             for db in pl.pipeline(KV_K_SLICE // KV_K_TILE, stage=2):
                 d0 = kv_k_base + db * KV_K_TILE
-                kv_x_chunk_bf16 = x_matmul[t0 : t0 + KV_M_TILE, d0 : d0 + KV_K_TILE]
+                kv_rows = pl.min(KV_M_TILE, t_dim - t0)
+                kv_x_chunk_bf16 = pl.slice(x_view, [KV_M_TILE, KV_K_TILE], [t0, d0], valid_shape=[kv_rows, KV_K_TILE])
                 wkv_chunk = wkv[d0 : d0 + KV_K_TILE, kv_col0 : kv_col0 + KV_N_TILE]
                 if db == 0:
                     kv_acc = pl.matmul(kv_x_chunk_bf16, wkv_chunk, out_dtype=pl.FP32)

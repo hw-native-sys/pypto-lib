@@ -54,32 +54,24 @@ def expert_shared(
     sh: pl.Tensor[[T, D], pl.BF16],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    x_local_i8_pad = pl.create_tensor([T_PAD, D], dtype=pl.INT8)
-    x_local_scale_dq_pad = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     sh_tile_fp32 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.FP32)
     sh_tile_i8 = pl.create_tensor([T_PAD, MOE_INTER], dtype=pl.INT8)
     sh_tile_scale_dq = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
     sh_pad = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_input_pad"):
-        for tt in pl.range(T):
-            pl.write(x_local_scale_dq_pad, [tt, 0], pl.read(x_local_scale_dq, [tt, 0]))
-        for d0 in pl.pipeline(0, D, K_TILE, stage=2):
-            x_local_i8_pad[0:T, d0:d0 + K_TILE] = x_local_i8[:, d0:d0 + K_TILE]
 
     for gu_block in pl.spmd((T_PAD // SH_M_TILE) * (MOE_INTER // (8 * SH_INTER_TILE)), name_hint="sh_gate_up"):
         gu_tb = gu_block // (MOE_INTER // (8 * SH_INTER_TILE))
         gu_nb = gu_block - gu_tb * (MOE_INTER // (8 * SH_INTER_TILE))
         ts0 = gu_tb * SH_M_TILE
         n_base = gu_nb * (8 * SH_INTER_TILE)
-        x_local_scale_dq_tile = x_local_scale_dq_pad[ts0 : ts0 + SH_M_TILE, 0:1]
+        x_local_scale_dq_tile = pl.slice(x_local_scale_dq, [SH_M_TILE, 1], [ts0, 0], valid_shape=[T, 1])
         for ng in pl.range(8):
             n0 = n_base + ng * SH_INTER_TILE
             sh_gate_acc = pl.create_tensor([SH_M_TILE, SH_INTER_TILE], dtype=pl.INT32)
             sh_up_acc = pl.create_tensor([SH_M_TILE, SH_INTER_TILE], dtype=pl.INT32)
             for kb in pl.pipeline(0, D // K_TILE, stage=2):
                 k0 = kb * K_TILE
-                xs_k = x_local_i8_pad[ts0 : ts0 + SH_M_TILE, k0 : k0 + K_TILE]
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[T, K_TILE])
                 sw1_k = shared_w1[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
                 sw3_k = shared_w3[n0 : n0 + SH_INTER_TILE, k0 : k0 + K_TILE]
                 if k0 == 0:
