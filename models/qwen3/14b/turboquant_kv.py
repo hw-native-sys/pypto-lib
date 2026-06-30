@@ -139,36 +139,64 @@ _b8, _b9, _b10, _b11, _b12, _b13, _b14 = [
 
 @pl.jit.inline
 def turboquant_kv_dequant_chunk(
-    quant_indices: pl.Tensor[[CMP_CHUNK, HEAD_DIM], pl.UINT8],
+    quant_indices: pl.Tensor[[CMP_CHUNK, HALF_DIM], pl.UINT8],
     quant_scales: pl.Tensor[[CMP_CHUNK, 1], pl.FP32],
     tq_codebook: pl.Tensor[[CMP_CHUNK, N_LEVELS], pl.FP32],
     rot_slice: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     out_bf16: pl.Tensor[[CMP_CHUNK, HEAD_DIM], pl.BF16],
 ):
-    """Dequantize one CMP_CHUNK of INT4 KV cache: gather → renormalize → scale → unrotate.
+    """Dequantize one CMP_CHUNK of packed-INT4 KV cache: unpack → gather → renormalize → scale → unrotate.
 
-    Caller must wrap this call in a pl.at scope.  Caller slices a CMP_CHUNK of
-    UINT8 indices + FP32 scales from the quant cache, creates a BF16 output buffer,
+    Indices are nibble-packed (two 4-bit indices per UINT8) in the half/half
+    layout: byte c holds (idx[c + HALF_DIM] << 4) | idx[c].  Caller must wrap
+    this call in a pl.at scope.  Caller slices a CMP_CHUNK of packed UINT8
+    indices + FP32 scales from the quant cache, creates a BF16 output buffer,
     and assembles the result into a larger buffer.
 
     Steps (all inlined into the caller's scope):
-      1. Gather: UINT8 → FP16 → INT32 → pl.gather(codebook) → FP32 centroids
-      2. Renormalize + scale: rsqrt(row_sum(sq) + EPS) normalize, then ×L2 scales
-      3. Unrotate: matmul(BF16, rot_slice^T) → back to original space → cast BF16
+      1. Unpack: UINT8 → FP16 → FP32, split into lo (fmods 16) / hi (div 16, trunc)
+      2. Gather: pl.gather(codebook) per half (kept separate; no concat/assemble)
+      3. Renormalize + scale: rsqrt(Σlo²+Σhi² + EPS), then ×L2 scales (each half)
+      4. Unrotate: lo@rot[:,0:HALF]^T + hi@rot[:,HALF:]^T (split matmul) → cast BF16
     """
-    # UINT8 → FP16 → INT32 → gather(codebook) → FP32.
-    idx_f16 = pl.cast(quant_indices, target_type=pl.FP16)
-    idx_i32 = pl.cast(idx_f16, target_type=pl.INT32)
-    dec = pl.gather(tq_codebook, dim=-1, index=idx_i32)  # [CMP_CHUNK, HEAD_DIM] FP32
+    # Unpack nibbles (half/half layout): byte c -> idx[c]=lo (mod 16),
+    # idx[c+HALF_DIM]=hi (floor(/16)).  Arithmetic via unified div/fmods
+    # (ands/shrs are tile-only and reject GM-slice tensors).  idx/16 is exact
+    # in FP (16 = 2^4), so trunc cast gives the exact floor.  The two halves are
+    # kept SEPARATE through renorm/scale/unrotate — no concat/assemble of gather
+    # results (codegen's tmov rejects assembling gather sub-tiles, and concat
+    # deadlocks the runtime).  Linearity makes the split exact:
+    #   ||dec||² = Σlo² + Σhi² ;  dec @ rot^T = lo @ rot[:,0:HALF_DIM]^T
+    #                                 + hi @ rot[:,HALF_DIM:]^T.
+    idx_fp32 = pl.cast(pl.cast(quant_indices, target_type=pl.FP16), target_type=pl.FP32)
+    lo_idx = pl.cast(pl.fmods(idx_fp32, 16.0), target_type=pl.INT32, mode="trunc")  # 0..15
+    hi_idx = pl.cast(pl.div(idx_fp32, 16.0), target_type=pl.INT32, mode="trunc")    # 0..15
+    centroids_lo = pl.gather(tq_codebook, dim=-1, index=lo_idx)  # [CMP_CHUNK, HALF_DIM] FP32
+    centroids_hi = pl.gather(tq_codebook, dim=-1, index=hi_idx)  # [CMP_CHUNK, HALF_DIM] FP32
 
-    # Renormalize to unit sphere + rescale by stored L2 norms.
-    dec_sq = pl.reshape(pl.row_sum(pl.mul(dec, dec)), [CMP_CHUNK, 1])
-    dec_unit = pl.row_expand_mul(dec, pl.rsqrt(pl.add(dec_sq, EPS)))
-    dec_scaled = pl.row_expand_mul(dec_unit, quant_scales)
+    # Renormalize to unit sphere (||dec||² = Σlo² + Σhi²) + rescale by L2 norms.
+    dec_sq = pl.reshape(
+        pl.add(
+            pl.row_sum(pl.mul(centroids_lo, centroids_lo)),
+            pl.row_sum(pl.mul(centroids_hi, centroids_hi)),
+        ),
+        [CMP_CHUNK, 1],
+    )
+    inv_norm = pl.rsqrt(pl.add(dec_sq, EPS))
+    lo_scaled = pl.row_expand_mul(
+        pl.row_expand_mul(centroids_lo, inv_norm), quant_scales,
+    )
+    hi_scaled = pl.row_expand_mul(
+        pl.row_expand_mul(centroids_hi, inv_norm), quant_scales,
+    )
 
-    # Unrotate from compressed space back to original space, output BF16.
-    dec_bf16 = pl.cast(dec_scaled, target_type=pl.BF16)
-    dec_unrot = pl.matmul(dec_bf16, rot_slice, b_trans=True, out_dtype=pl.FP32)
+    # Unrotate: dec @ rot^T = lo @ rot_lo^T + hi @ rot_hi^T, output BF16.
+    rot_lo = pl.slice(rot_slice, [HEAD_DIM, HALF_DIM], [0, 0])
+    rot_hi = pl.slice(rot_slice, [HEAD_DIM, HALF_DIM], [0, HALF_DIM])
+    dec_unrot = pl.add(
+        pl.matmul(pl.cast(lo_scaled, target_type=pl.BF16), rot_lo, b_trans=True, out_dtype=pl.FP32),
+        pl.matmul(pl.cast(hi_scaled, target_type=pl.BF16), rot_hi, b_trans=True, out_dtype=pl.FP32),
+    )
     out_bf16 = pl.assemble(out_bf16, pl.cast(dec_unrot, target_type=pl.BF16), [0, 0])
 
 
@@ -187,9 +215,10 @@ def turboquant_kv_quantize(
     cos_hi_all: pl.Tensor[[TOK_TILE, HALF_DIM], pl.FP32],
     sin_lo_all: pl.Tensor[[TOK_TILE, HALF_DIM], pl.FP32],
     sin_hi_all: pl.Tensor[[TOK_TILE, HALF_DIM], pl.FP32],
-    # Outputs (caller creates, callee fills via pl.assemble).
-    quant_k_temp: pl.Tensor[[TOK_TILE, KV_HIDDEN], pl.UINT8],
-    quant_v_temp: pl.Tensor[[TOK_TILE, KV_HIDDEN], pl.UINT8],
+    # Outputs (caller creates, callee fills via pl.assemble). Index temps are
+    # nibble-packed: [TOK_TILE, KV_HIDDEN // 2] (two 4-bit indices per UINT8).
+    quant_k_temp: pl.Tensor[[TOK_TILE, KV_HIDDEN // 2], pl.UINT8],
+    quant_v_temp: pl.Tensor[[TOK_TILE, KV_HIDDEN // 2], pl.UINT8],
     k_scales_buf: pl.Tensor[[TOK_TILE, NUM_KV_HEADS], pl.FP32],
     v_scales_buf: pl.Tensor[[TOK_TILE, NUM_KV_HEADS], pl.FP32],
 ):
@@ -284,11 +313,19 @@ def turboquant_kv_quantize(
                 k_idx = pl.add(k_idx, pl.cmp(k_rot, _b12, cmp_type=5))
                 k_idx = pl.add(k_idx, pl.cmp(k_rot, _b13, cmp_type=5))
                 k_idx = pl.add(k_idx, pl.cmp(k_rot, _b14, cmp_type=5))
+                # Pack two 4-bit indices per UINT8 (half/half layout):
+                # byte c = idx[c+HALF_DIM]*16 + idx[c], c in 0..HALF_DIM-1.
+                # Arithmetic (not bitwise): shls/and_/or_ are tile-only ops and
+                # reject GM-slice tensors; unified mul/add accept them.
+                k_lo = pl.slice(k_idx, [TOK_TILE, HALF_DIM], [0, 0])
+                k_hi = pl.slice(k_idx, [TOK_TILE, HALF_DIM], [0, HALF_DIM])
+                k_packed = pl.add(pl.mul(k_hi, 16.0), k_lo)            # FP32, 0..255 (exact)
                 # FP32 -> INT32 -> FP16 -> UINT8 (pypto cast 4->1 byte workaround)
-                k_idx_i32 = pl.cast(k_idx, pl.INT32, mode="trunc")
-                k_idx_f16 = pl.cast(k_idx_i32, pl.FP16, mode="round")
-                qk_lo = pl.cast(k_idx_f16, pl.UINT8, mode="trunc")
-                quant_k_temp = pl.assemble(quant_k_temp, qk_lo, [0, kv_col])
+                k_packed_u8 = pl.cast(
+                    pl.cast(pl.cast(k_packed, pl.INT32, mode="trunc"), pl.FP16, mode="round"),
+                    pl.UINT8, mode="trunc",
+                )
+                quant_k_temp = pl.assemble(quant_k_temp, k_packed_u8, [0, ki * HALF_DIM])
 
         # Scope C: V L2 norm + normalize.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_norm"):
@@ -336,10 +373,14 @@ def turboquant_kv_quantize(
                 v_idx = pl.add(v_idx, pl.cmp(v_rot, _b12, cmp_type=5))
                 v_idx = pl.add(v_idx, pl.cmp(v_rot, _b13, cmp_type=5))
                 v_idx = pl.add(v_idx, pl.cmp(v_rot, _b14, cmp_type=5))
-                # FP32 -> INT32 -> FP16 -> UINT8 (pypto cast 4->1 byte workaround)
-                v_idx_i32 = pl.cast(v_idx, pl.INT32, mode="trunc")
-                v_idx_f16 = pl.cast(v_idx_i32, pl.FP16, mode="round")
-                qv = pl.cast(v_idx_f16, pl.UINT8, mode="trunc")
-                quant_v_temp = pl.assemble(quant_v_temp, qv, [0, kv_col])
+                # Pack two 4-bit indices per UINT8 (half/half layout, see Scope B).
+                v_lo = pl.slice(v_idx, [TOK_TILE, HALF_DIM], [0, 0])
+                v_hi = pl.slice(v_idx, [TOK_TILE, HALF_DIM], [0, HALF_DIM])
+                v_packed = pl.add(pl.mul(v_hi, 16.0), v_lo)
+                v_packed_u8 = pl.cast(
+                    pl.cast(pl.cast(v_packed, pl.INT32, mode="trunc"), pl.FP16, mode="round"),
+                    pl.UINT8, mode="trunc",
+                )
+                quant_v_temp = pl.assemble(quant_v_temp, v_packed_u8, [0, ki * HALF_DIM])
 
 

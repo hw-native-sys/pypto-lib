@@ -114,8 +114,8 @@ def prefill_layer_tq(
         block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
         slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
         # TQ compressed KV cache (written for decode).
-        quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
-        quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
+        quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
+        quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
         quant_k_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
         quant_v_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
         # Per-layer rotation matrix slice [HEAD_DIM, HEAD_DIM].
@@ -277,8 +277,8 @@ def prefill_layer_tq(
                         k_proj_tile = pl.assemble(k_proj_tile, k_normed, [0, k_col])
 
             # ── Scope 2a: Batched K/V RoPE + inline quantization ──
-            quant_k_temp = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.UINT8)
-            quant_v_temp = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.UINT8)
+            quant_k_temp = pl.create_tensor([TOK_TILE, KV_HIDDEN // 2], dtype=pl.UINT8)
+            quant_v_temp = pl.create_tensor([TOK_TILE, KV_HIDDEN // 2], dtype=pl.UINT8)
             k_scales_buf = pl.create_tensor(
                 [TOK_TILE, NUM_KV_HEADS], dtype=pl.FP32,
             )
@@ -329,18 +329,19 @@ def prefill_layer_tq(
                                 (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE
                                 + cache_slot_offset
                         )
-                        kv_col = ki * HEAD_DIM
+                        kv_col = ki * HALF_DIM
 
                         # Quantized K/V: scatter to quant cache (absolute offset).
                         # Attention reads dequantized K/V from this cache (no FP path).
+                        # Index temps are nibble-packed, so each head is HALF_DIM wide.
                         cache_row = layer_cache_base + fp_cache_row
-                        quant_k_row = pl.slice(quant_k_temp, [1, HEAD_DIM], [ti, kv_col])
+                        quant_k_row = pl.slice(quant_k_temp, [1, HALF_DIM], [ti, kv_col])
                         quant_k_cache = pl.assemble(
                             quant_k_cache, quant_k_row, [cache_row, 0],
                         )
                         k_scale = pl.read(k_scales_buf, [ti, ki])
                         quant_k_scales = pl.write(quant_k_scales, [cache_row, 0], k_scale)
-                        quant_v_row = pl.slice(quant_v_temp, [1, HEAD_DIM], [ti, kv_col])
+                        quant_v_row = pl.slice(quant_v_temp, [1, HALF_DIM], [ti, kv_col])
                         quant_v_cache = pl.assemble(
                             quant_v_cache, quant_v_row, [cache_row, 0],
                         )
@@ -427,7 +428,7 @@ def prefill_layer_tq(
                             k_scales_full = pl.slice(quant_k_scales, [SEQ_TILE, 1], [cmp_row_base, 0])
                             for k_sub in pl.range(SEQ_TILE // CMP_CHUNK):
                                 sub_row = k_sub * CMP_CHUNK
-                                k_indices = pl.slice(quant_k_cache, [CMP_CHUNK, HEAD_DIM], [cmp_row_base + sub_row, 0])
+                                k_indices = pl.slice(quant_k_cache, [CMP_CHUNK, HALF_DIM], [cmp_row_base + sub_row, 0])
                                 k_scales_sub = pl.slice(k_scales_full, [CMP_CHUNK, 1], [sub_row, 0])
                                 chunk_out = pl.create_tensor([CMP_CHUNK, HEAD_DIM], dtype=pl.BF16)
                                 turboquant_kv_dequant_chunk(k_indices, k_scales_sub, tq_codebook, rot_matrix, chunk_out)
@@ -472,7 +473,7 @@ def prefill_layer_tq(
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_dequant"):
                             for v_sub in pl.range(SEQ_TILE // CMP_CHUNK):
                                 v_sub_row = cmp_row_base + v_sub * CMP_CHUNK
-                                v_indices = pl.slice(quant_v_cache, [CMP_CHUNK, HEAD_DIM], [v_sub_row, 0])
+                                v_indices = pl.slice(quant_v_cache, [CMP_CHUNK, HALF_DIM], [v_sub_row, 0])
                                 v_scales_sub = pl.slice(quant_v_scales, [CMP_CHUNK, 1], [v_sub_row, 0])
                                 chunk_out = pl.create_tensor([CMP_CHUNK, HEAD_DIM], dtype=pl.BF16)
                                 turboquant_kv_dequant_chunk(v_indices, v_scales_sub, tq_codebook, rot_matrix, chunk_out)
@@ -684,8 +685,8 @@ def prefill_fwd_tq(
         rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
         block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
         slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-        quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
-        quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
+        quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
+        quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
         quant_k_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
         quant_v_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
         rot_matrices: pl.Tensor[[LAYER_ROT_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -873,10 +874,10 @@ def build_tensor_specs(
         return slots
 
     def init_quant_k_cache():
-        return torch.full((cache_rows, head_dim), 0, dtype=torch.uint8)
+        return torch.full((cache_rows, head_dim // 2), 0, dtype=torch.uint8)
 
     def init_quant_v_cache():
-        return torch.full((cache_rows, head_dim), 0, dtype=torch.uint8)
+        return torch.full((cache_rows, head_dim // 2), 0, dtype=torch.uint8)
 
     def init_quant_k_scales():
         return torch.full((cache_rows, 1), 0.0, dtype=torch.float32)
@@ -942,9 +943,9 @@ def build_tensor_specs(
                    init_value=init_block_table),
         TensorSpec("slot_mapping", [total_tokens], torch.int32,
                    init_value=init_slot_mapping),
-        TensorSpec("quant_k_cache", [cache_rows, head_dim], torch.uint8,
+        TensorSpec("quant_k_cache", [cache_rows, head_dim // 2], torch.uint8,
                    init_value=init_quant_k_cache),
-        TensorSpec("quant_v_cache", [cache_rows, head_dim], torch.uint8,
+        TensorSpec("quant_v_cache", [cache_rows, head_dim // 2], torch.uint8,
                    init_value=init_quant_v_cache),
         TensorSpec("quant_k_scales", [cache_rows, 1], torch.float32,
                    init_value=init_quant_k_scales),
@@ -1062,8 +1063,11 @@ def golden_qwen3_14b_prefill_tq(tensors):
         indices = torch.zeros(x_rot.shape, dtype=torch.int32)
         for bval in boundaries:
             indices += (x_rot >= bval).to(torch.int32)
-        indices_u8 = indices.to(torch.int32).to(torch.float16).to(torch.uint8)
-        return indices_u8, l2.float(), x_rot
+        # Pack two 4-bit indices per UINT8 (half/half layout), matching the kernel:
+        # byte c = (idx[c+half] << 4) | idx[c].  Cast mirrors kernel INT32->FP16->UINT8.
+        packed = (indices[:, half:] << 4) | indices[:, :half]            # [N, half] int32
+        packed_u8 = packed.to(torch.float16).to(torch.uint8)
+        return packed_u8, l2.float(), x_rot
 
     def tq_dequant(indices, scales, rot_matrix_f):
         """Dequantize: centroid gather -> renormalize -> rescale (rotated) -> unrotate.
@@ -1074,8 +1078,13 @@ def golden_qwen3_14b_prefill_tq(tensors):
         commutes through the linear unrotate, but matching the kernel's op
         order keeps the rounding points aligned.
         """
-        idx_int32 = indices.to(torch.float16).to(torch.int32)
-        y_hat = centroids[idx_int32.long()]  # [N, HEAD_DIM] in rotated space
+        # Unpack nibbles (half/half layout, matching the kernel): byte c -> idx[c] (lo),
+        # idx[c+half] (hi).  Cast mirrors kernel UINT8->FP16->INT32.
+        idx_int32 = indices.to(torch.float16).to(torch.int32)        # [N, half]
+        lo = (idx_int32 & 0xF).long()                                # [N, half]
+        hi = (idx_int32 >> 4).long()                                 # [N, half]
+        full = torch.cat([lo, hi], dim=-1)                           # [N, head_dim]
+        y_hat = centroids[full]  # [N, HEAD_DIM] in rotated space
 
         # Renormalize to unit sphere (rsqrt == kernel's qk_renorm).
         y_norms_sq = y_hat.float().pow(2).sum(dim=-1, keepdim=True)
@@ -1153,7 +1162,7 @@ def golden_qwen3_14b_prefill_tq(tensors):
             k_rope = torch.cat([k_rot_lo, k_rot_hi], dim=-1)  # [S, num_kv_heads, head_dim]
 
             # TQ quantize K (per head) — pure PolarQuant, no QJL.
-            quant_k_all = torch.zeros(S, num_kv_heads, head_dim, dtype=torch.uint8)
+            quant_k_all = torch.zeros(S, num_kv_heads, half, dtype=torch.uint8)
             k_scales_all = torch.zeros(S, num_kv_heads, 1, dtype=torch.float32)
             for h in range(num_kv_heads):
                 qk, ks, _ = tq_quantize(k_rope[:, h, :].reshape(-1, head_dim), rot_matrix_f)
@@ -1163,7 +1172,7 @@ def golden_qwen3_14b_prefill_tq(tensors):
 
             # TQ quantize V (per head, no RoPE).
             v_view = v_proj_f.view(S, num_kv_heads, head_dim)
-            quant_v_all = torch.zeros(S, num_kv_heads, head_dim, dtype=torch.uint8)
+            quant_v_all = torch.zeros(S, num_kv_heads, half, dtype=torch.uint8)
             v_scales_all = torch.zeros(S, num_kv_heads, 1, dtype=torch.float32)
             for h in range(num_kv_heads):
                 qv, vs, _ = tq_quantize(v_view[:, h, :].reshape(-1, head_dim), rot_matrix_f)

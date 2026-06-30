@@ -108,8 +108,8 @@ def decode_layer_tq(
     slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor[[ROPE_SEQ_DYN, HEAD_DIM], pl.FP32],
     rope_sin: pl.Tensor[[ROPE_SEQ_DYN, HEAD_DIM], pl.FP32],
-    quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
-    quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
+    quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
+    quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
     quant_k_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
     quant_v_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
     rot_matrices: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -276,8 +276,8 @@ def decode_layer_tq(
         cos_hi_all = pl.create_tensor([16, HALF_DIM], dtype=pl.FP32)
         sin_lo_all = pl.create_tensor([16, HALF_DIM], dtype=pl.FP32)
         sin_hi_all = pl.create_tensor([16, HALF_DIM], dtype=pl.FP32)
-        quant_k_temp = pl.create_tensor([16, KV_HIDDEN], dtype=pl.UINT8)
-        quant_v_temp = pl.create_tensor([16, KV_HIDDEN], dtype=pl.UINT8)
+        quant_k_temp = pl.create_tensor([16, KV_HIDDEN // 2], dtype=pl.UINT8)
+        quant_v_temp = pl.create_tensor([16, KV_HIDDEN // 2], dtype=pl.UINT8)
         k_scales_buf = pl.create_tensor([16, NUM_KV_HEADS], dtype=pl.FP32)
         v_scales_buf = pl.create_tensor([16, NUM_KV_HEADS], dtype=pl.FP32)
 
@@ -314,17 +314,18 @@ def decode_layer_tq(
         # Scatter row 0 results to per-head cache positions.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
             for ki in pl.range(NUM_KV_HEADS):
-                kv_col = ki * HEAD_DIM
+                kv_col = ki * HALF_DIM
                 quant_cache_row = layer_cmp_base + (slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + slot_offset
 
                 # K: extract row 0, scatter to quantized cache + scale.
-                k_idx_u8 = pl.slice(quant_k_temp, [1, HEAD_DIM], [0, kv_col])
+                # Index temps are nibble-packed, so each head is HALF_DIM wide.
+                k_idx_u8 = pl.slice(quant_k_temp, [1, HALF_DIM], [0, kv_col])
                 quant_k_cache = pl.assemble(quant_k_cache, k_idx_u8, [quant_cache_row, 0])
                 k_scale = pl.read(k_scales_buf, [0, ki])
                 quant_k_scales = pl.write(quant_k_scales, [quant_cache_row, 0], k_scale)
 
                 # V: extract row 0, scatter to quantized cache + scale.
-                v_idx_u8 = pl.slice(quant_v_temp, [1, HEAD_DIM], [0, kv_col])
+                v_idx_u8 = pl.slice(quant_v_temp, [1, HALF_DIM], [0, kv_col])
                 quant_v_cache = pl.assemble(quant_v_cache, v_idx_u8, [quant_cache_row, 0])
                 v_scale = pl.read(v_scales_buf, [0, ki])
                 quant_v_scales = pl.write(quant_v_scales, [quant_cache_row, 0], v_scale)
@@ -409,7 +410,7 @@ def decode_layer_tq(
                     k_scales_full = pl.slice(quant_k_scales, [BLOCK_SIZE, 1], [row_base, 0])
                     for k_sub in pl.range(BLOCK_SIZE // CMP_CHUNK):
                         sub_row = k_sub * CMP_CHUNK
-                        k_indices = pl.slice(quant_k_cache, [CMP_CHUNK, HEAD_DIM], [row_base + sub_row, 0])
+                        k_indices = pl.slice(quant_k_cache, [CMP_CHUNK, HALF_DIM], [row_base + sub_row, 0])
                         k_scales_sub = pl.slice(k_scales_full, [CMP_CHUNK, 1], [sub_row, 0])
                         chunk_out = pl.create_tensor([CMP_CHUNK, HEAD_DIM], dtype=pl.BF16)
                         turboquant_kv_dequant_chunk(k_indices, k_scales_sub, tq_codebook, rot_slice, chunk_out)
@@ -451,7 +452,7 @@ def decode_layer_tq(
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_dequant"):
                     for v_sub in pl.range(BLOCK_SIZE // CMP_CHUNK):
                         v_sub_row = row_base + v_sub * CMP_CHUNK
-                        v_indices = pl.slice(quant_v_cache, [CMP_CHUNK, HEAD_DIM], [v_sub_row, 0])
+                        v_indices = pl.slice(quant_v_cache, [CMP_CHUNK, HALF_DIM], [v_sub_row, 0])
                         v_scales = pl.slice(quant_v_scales, [CMP_CHUNK, 1], [v_sub_row, 0])
                         chunk_out = pl.create_tensor([CMP_CHUNK, HEAD_DIM], dtype=pl.BF16)
                         turboquant_kv_dequant_chunk(v_indices, v_scales, tq_codebook, rot_slice, chunk_out)
@@ -579,8 +580,8 @@ def decode_fwd_tq(
     slot_mapping: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor[[ROPE_SEQ_DYN, HEAD_DIM], pl.FP32],
     rope_sin: pl.Tensor[[ROPE_SEQ_DYN, HEAD_DIM], pl.FP32],
-    quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
-    quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HEAD_DIM], pl.UINT8],
+    quant_k_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
+    quant_v_cache: pl.Tensor[[QUANT_CACHE_ROWS_DYN, HALF_DIM], pl.UINT8],
     quant_k_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
     quant_v_scales: pl.Tensor[[QUANT_CACHE_ROWS_DYN, 1], pl.FP32],
     rot_matrices: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -750,10 +751,10 @@ def build_tensor_specs(
         return torch.rand(max_seq, head_dim) - 0.5
 
     def init_quant_k_cache():
-        return torch.zeros(cmp_cache_rows, head_dim, dtype=torch.uint8)
+        return torch.zeros(cmp_cache_rows, head_dim // 2, dtype=torch.uint8)
 
     def init_quant_v_cache():
-        return torch.zeros(cmp_cache_rows, head_dim, dtype=torch.uint8)
+        return torch.zeros(cmp_cache_rows, head_dim // 2, dtype=torch.uint8)
 
     def init_quant_k_scales():
         return torch.zeros(cmp_cache_rows, 1, dtype=torch.float32)
@@ -813,8 +814,8 @@ def build_tensor_specs(
         TensorSpec("rope_cos", [max_seq, head_dim], torch.float32, init_value=init_rope_cos),
         TensorSpec("rope_sin", [max_seq, head_dim], torch.float32, init_value=init_rope_sin),
         # TQ quantized KV cache.
-        TensorSpec("quant_k_cache", [cmp_cache_rows, head_dim], torch.uint8, init_value=init_quant_k_cache),
-        TensorSpec("quant_v_cache", [cmp_cache_rows, head_dim], torch.uint8, init_value=init_quant_v_cache),
+        TensorSpec("quant_k_cache", [cmp_cache_rows, head_dim // 2], torch.uint8, init_value=init_quant_k_cache),
+        TensorSpec("quant_v_cache", [cmp_cache_rows, head_dim // 2], torch.uint8, init_value=init_quant_v_cache),
         TensorSpec("quant_k_scales", [cmp_cache_rows, 1], torch.float32, init_value=init_quant_k_scales),
         TensorSpec("quant_v_scales", [cmp_cache_rows, 1], torch.float32, init_value=init_quant_v_scales),
         TensorSpec("rot_matrices", [num_layers * head_dim, head_dim], torch.bfloat16, init_value=init_rot_matrices),
@@ -905,7 +906,10 @@ def golden_decode_fwd_tq(tensors):
         indices = torch.zeros(rotated.shape, dtype=torch.long)
         for bi, bval in enumerate(boundaries):
             indices += (rotated >= bval).long()
-        return indices.to(torch.uint8), l2, rotated
+        # Pack two 4-bit indices per UINT8 (half/half layout), matching the kernel:
+        # byte c = (idx[c+half] << 4) | idx[c].  Cast mirrors kernel INT32->FP16->UINT8.
+        packed = (indices[half:] << 4) | indices[:half]              # [half] long
+        return packed.to(torch.float16).to(torch.uint8), l2, rotated
 
     def _dequant_block(cache_rows_slice, scales_rows_slice, rot_mat):
         """Dequantize compressed cache rows: centroid lookup + renormalize + scale (rotated) + unrotate.
@@ -914,9 +918,13 @@ def golden_decode_fwd_tq(tensors):
         qk_renorm / sv_dequant.  Scale is applied in the rotated domain before
         unrotate.  Index cast goes through UINT8→FP16→INT32.
         """
-        # Index cast matches the kernel: UINT8 -> FP16 -> INT32.
-        indices = cache_rows_slice.to(torch.float16).to(torch.int32)  # [rows, head_dim]
-        dec = torch.zeros(cache_rows_slice.shape, dtype=torch.float32)
+        # Unpack nibbles (half/half layout, matching the kernel): byte c -> idx[c]
+        # (lo), idx[c+half] (hi).  Cast mirrors kernel UINT8->FP16->INT32.
+        packed = cache_rows_slice.to(torch.float16).to(torch.int32)  # [rows, half]
+        lo = packed & 0xF                                            # [rows, half]
+        hi = packed >> 4                                             # [rows, half]
+        indices = torch.cat([lo, hi], dim=-1)                        # [rows, head_dim]
+        dec = torch.zeros(indices.shape, dtype=torch.float32)
         for ci in range(len(centroids)):
             dec += (indices == ci).float() * centroids[ci]
         # Renormalize to unit sphere (rsqrt == kernel's qk_renorm).
