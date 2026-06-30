@@ -13,6 +13,12 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
+# The prefill path routes PREFILL_TOKENS tokens, so size the per-expert recv
+# buffers from the prefill formula. config.RECV_MAX defaults to the decode value;
+# override it before importing moe (which freezes the recv shapes at import).
+import config
+config.MOE_TOKENS = config.PREFILL_TOKENS
+config.RECV_MAX = config.PREFILL_RECV_MAX
 # Import moe first. It applies the EP2 FLASH override before dependent
 # modules bake config-derived MoE shapes.
 from moe import (

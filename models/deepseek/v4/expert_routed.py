@@ -32,37 +32,20 @@ N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 EXPERTS_START_IDX = EP_RANK * N_LOCAL_EXPERTS
 
 # tiling
-# Sized for the large-batch / decode-batch target of ~24 rows/expert. RECV_TILE=32
-# runs one row-tile per expert at that occupancy (no weight re-stream); the <=8-row
-# pure-decode path can drop it to 16 (which re-streams the weight above 16 rows).
-# RECV_TILE must divide RECV_MAX (per-expert row buffer) to avoid over-read.
-RECV_TILE = 32
-# K_TILE=512 (not 1024): each split gate/up cube task holds ONE weight L1 tile of
-# MM_INTER_TILE*K_TILE, double-buffered, so Mat ~= MM_INTER_TILE*K_TILE*1*2(buf). At
-# K_TILE=512 that lets MM_INTER_TILE reach 256 (256*512*2 = 256KB, fits the 512KB Mat);
-# K_TILE=1024 would need 512KB and cap N at 128. Both N and K stay >= the 512B
-# B-cache-line (B is K-contiguous under b_trans) so MTE2 stays efficient.
+RECV_TILE = 16
 K_TILE = 512
 INTER_K = 512
-# gate/up N-tiling is split across the decoupled cube (AIC) and vector (AIV) scopes,
-# meeting only through the gate_i32/up_i32 GM buffer, so each sizes its N-frag to its
-# own bottleneck -- the cube frag to L1/Mat (see K_TILE above), the vector frag to UB.
-MM_INTER_TILE = 256   # cube N frag; L1/Mat bound: MM_INTER_TILE*K_TILE*1(split weight)*2(buf) <= 512KB
+MM_INTER_TILE = 256
 MM_GATE_INNER = 4
-ACT_INTER_TILE = 128   # vector N frag; UB bound, independent of the cube frag
+ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
-D_OUT_TILE = 256   # w2 N frag; UB bound. The decoupled vector scope frees the room the
-                   # fused form lacked; 512 overflows AllocateMemoryAddr.
+D_OUT_TILE = 256
 QUANT_TILE = 256
 D_OUT_TILE_ACT = 512
-W2_INNER = 4       # keeps w2 spmd N-block count D//(W2_INNER*D_OUT_TILE)=4 with D_OUT_TILE=256
+W2_INNER = 4
 W2_ACT_INNER = 8
 
-assert MOE_INTER % (MM_GATE_INNER * MM_INTER_TILE) == 0, "gate/up cube tiling must cover MOE_INTER"
-assert MOE_INTER % (ACT_GATE_INNER * ACT_INTER_TILE) == 0, "gate/up vector tiling must cover MOE_INTER"
-assert D % K_TILE == 0, "gate/up K-loop must cover D"
-assert D % (W2_INNER * D_OUT_TILE) == 0, "w2 cube tiling must cover D"
-assert D % (W2_ACT_INNER * D_OUT_TILE_ACT) == 0, "w2 vector tiling must cover D"
+assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
 
 
 @pl.jit.inline
@@ -93,14 +76,7 @@ def expert_routed(
 
             valid_rows = pl.min(RECV_TILE, n_rows - t0)
 
-            # Stage 1a: gate/up. Decoupled from the vector epilogue (cf. the un-mixed
-            # qproj in qkv_proj_rope.py): a pure-cube matmul scope writes INT32
-            # accumulators to GM, then a separate vector scope does dequant + SwiGLU +
-            # routing-weight mul. The cube is split again into a gate (w1) task and an
-            # up (w3) task so each holds only ONE weight L1 tile -- that halves Mat
-            # (MM_INTER_TILE*K_TILE*1*2buf), letting MM_INTER_TILE reach 256 at the
-            # cache-line-safe K_TILE=512; the fused form held w1+w3 and so capped N at
-            # 128. Costs one extra recv_x L1 reload per task (x is tiny vs the weights).
+            # gate (w1) and up (w3) cube matmul -> INT32 GM accumulators.
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
             gate_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
             up_i32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT32)
@@ -109,13 +85,6 @@ def expert_routed(
                 n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
                 for ng in pl.range(MM_GATE_INNER):
                     n0 = n_base + ng * MM_INTER_TILE
-                    # Seed the accumulator on the first K iter with a plain matmul
-                    # (matmul_acc from a zero-init carry trips the TLOAD DN->NZ ISA
-                    # assertion, pypto#1540). Keep that k0 == 0 conditional inside the
-                    # pl.pipeline loop rather than peeling it out as a prologue, so the
-                    # first chunk's weight MTE2 load overlaps the rest of the pipeline.
-                    # This cube is MTE2-bound, so the overlap fills that gap; INT32
-                    # accumulation order is unchanged.
                     gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
                         x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
@@ -159,7 +128,7 @@ def expert_routed(
                     sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
                     silu = pl.mul(gate_2d, sigmoid)
                     gated = pl.mul(silu, up_2d)
-                    # Zero rows >= valid_rows so dirty recv_x tail rows don't leak into recv_y.
+                    # Zero rows >= valid_rows.
                     gated_valid = pl.set_validshape(gated, valid_rows, ACT_INTER_TILE)
                     gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
                     h_tile_fp32[:, n0 : n0 + ACT_INTER_TILE] = gated_masked
@@ -185,21 +154,13 @@ def expert_routed(
                     eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
-            # Stage 1b: w2. Decoupled like gate/up -- pure-cube matmul scope
-            # (INT32 -> GM) then a separate vector scope (dequant + routing-weight
-            # mul + BF16 write). The routing weight is applied row-wise here (vs.
-            # the legacy single-card path that applied it in combine's reduce);
-            # multi-card combine then just sums the TOPK rows per token.
+            # w2 cube matmul -> INT32 GM accumulators.
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
 
             for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
                 d_base = db_idx * (W2_INNER * D_OUT_TILE)
                 for dg in pl.range(W2_INNER):
                     d0 = d_base + dg * D_OUT_TILE
-                    # Seed the accumulator on the first K iter with a plain matmul
-                    # (pypto#1540, see exp_gate_mm), keeping the k0 == 0 conditional
-                    # inside the pl.pipeline loop so each weight MTE2 load overlaps the
-                    # previous tile's cube compute. INT32 accumulation order is unchanged.
                     y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                         h_k = h_tile_i8[:, k0 : k0 + INTER_K]
@@ -212,9 +173,7 @@ def expert_routed(
 
             for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
                 d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-                # Fold the per-row h-dequant scale and the per-row routing weight
-                # into a single per-row scale, computed once per spmd block
-                # (instead of an extra row_expand_mul per d-tile).
+                # Per-row scale = h-dequant scale * routing weight.
                 w_col_blk = pl.reshape(
                     recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
                     [RECV_TILE, 1],
@@ -230,8 +189,6 @@ def expert_routed(
                         y_2d, target_type=pl.BF16, mode="rint"
                     )
 
-    # The @pl.inline parser requires inline call expressions to have a return
-    # value; recv_y is convenient because it's already pl.Out.
     return recv_y
 
 
@@ -428,7 +385,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 

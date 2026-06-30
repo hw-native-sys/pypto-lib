@@ -89,7 +89,7 @@ from moe import (
     VOCAB,
     W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
-    moe_decode,
+    moe,
 )
 
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
@@ -319,7 +319,7 @@ def decode_fwd(
             x_attn0,
         )
     with pl.scope():
-        moe_decode(
+        moe(
             x_attn0,
             hc_ffn_fn_l0, hc_ffn_scale_l0, hc_ffn_base_l0,
             norm_w_l0, gate_w_l0, gate_bias_l0, tid2eid_l0, input_ids,
@@ -346,7 +346,7 @@ def decode_fwd(
             x_attn1,
         )
     with pl.scope():
-        moe_decode(
+        moe(
             x_attn1,
             hc_ffn_fn_l1, hc_ffn_scale_l1, hc_ffn_base_l1,
             norm_w_l1, gate_w_l1, gate_bias_l1, tid2eid_l1, input_ids,
@@ -438,7 +438,7 @@ def decode_fwd(
                 x_attn_csa,
             )
         with pl.scope():
-            moe_decode(
+            moe(
                 x_attn_csa,
                 hc_ffn_fn_csa, hc_ffn_scale_csa, hc_ffn_base_csa,
                 norm_w_csa, gate_w_csa, gate_bias_csa, tid2eid_csa, input_ids,
@@ -507,7 +507,7 @@ def decode_fwd(
                 x_attn_hca,
             )
         with pl.scope():
-            moe_decode(
+            moe(
                 x_attn_hca,
                 hc_ffn_fn_hca, hc_ffn_scale_hca, hc_ffn_base_hca,
                 norm_w_hca, gate_w_hca, gate_bias_hca, tid2eid_hca, input_ids,
@@ -597,7 +597,7 @@ def decode_fwd(
             x_attn_last,
         )
     with pl.scope():
-        moe_decode(
+        moe(
             x_attn_last,
             hc_ffn_fn_last, hc_ffn_scale_last, hc_ffn_base_last,
             norm_w_last, gate_w_last, gate_bias_last, tid2eid_last, input_ids,

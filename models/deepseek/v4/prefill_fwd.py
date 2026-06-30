@@ -32,6 +32,12 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 # prefill_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on prefill_layer).
+# The prefill path runs PREFILL_TOKENS tokens. MOE_TOKENS (pipeline width) and
+# RECV_MAX (recv depth) default to decode; override both to prefill before importing
+# moe, which freezes those shapes at import.
+import config
+config.MOE_TOKENS = config.PREFILL_TOKENS
+config.RECV_MAX = config.PREFILL_RECV_MAX
 # Import moe first: it applies the EP/FLASH override before the attention modules
 # bake config-derived MoE shapes (matches prefill_layer's import order).
 from moe import (
