@@ -381,7 +381,6 @@ def sparse_attn_swa(
     # accumulator; proj_b_act (auto region) applies the per-channel weight scale and
     # is the consolidated writer that registers attn_out's return tensormap edge.
     # ========================================================================
-    o_packed_mm = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
     o_r_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8 = pl.create_tensor([T, O_GROUPS * O_LORA], dtype=pl.INT8)
     o_r_i8_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
@@ -393,41 +392,24 @@ def sparse_attn_swa(
     # output channel n at partials[:, g*D + n]; proj_b_act (pure vector) sums the
     # O_GROUPS partials with their per-group act scales. No atomic-add -> no zero-seed.
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    pad_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     proj_a_tids = pl.array.create(O_GROUPS * PA_NFRAGS, pl.TASK_ID)
     quant_tids = pl.array.create(O_GROUPS * NUM_QUANT_T_CHUNKS, pl.TASK_ID)
     proj_b_tids = pl.array.create(PB_DCHUNKS * O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
-        for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T
-            row_base_pad = g * T_PAD
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_o_pad", deps=[merge_tid]) as pad_tid:
-                for k0 in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
-                    o_packed_mm[row_base_pad:row_base_pad + T, k0:k0 + A_K_TILE] = o_packed[
-                        row_base_o:row_base_o + T, k0:k0 + A_K_TILE
-                    ]
-                    if T_PAD > T:
-                        o_packed_mm[row_base_pad + T:row_base_pad + T_PAD, k0:k0 + A_K_TILE] = pl.full(
-                            [T_PAD - T, A_K_TILE],
-                            dtype=pl.BF16,
-                            value=0.0,
-                        )
-            pad_tids[g] = pad_tid
-
         # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
         for g in pl.parallel(O_GROUPS):
-            row_base_o = g * T_PAD
+            row_base_o = g * T
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_mm", deps=[pad_tids[g]]) as pa_tid:
-                    xa0_chunk = o_packed_mm[row_base_o:row_base_o + MM_T_TILE, 0:A_K_TILE]
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_mm", deps=[merge_tid]) as pa_tid:
+                    xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
                     wa0_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
                     acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
                     for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
                         k0 = kb * A_K_TILE
-                        xa_k_chunk = o_packed_mm[row_base_o:row_base_o + MM_T_TILE, k0:k0 + A_K_TILE]
+                        xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
                         wa_k_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, k0:k0 + A_K_TILE]
                         acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
                     o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])

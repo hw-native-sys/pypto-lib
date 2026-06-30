@@ -213,8 +213,8 @@ def prefill_fwd(
     csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * D, INNER_OUT_DIM], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * D, INNER_OUT_DIM], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
     csa_inner_kv_state: pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
@@ -432,8 +432,8 @@ def prefill_fwd(
         csa_idx_wq_b_csa: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8] = pl.slice(csa_idx_wq_b, [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], [loop_i * Q_LORA, 0])
         csa_idx_wq_b_scale_csa: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32] = pl.slice(csa_idx_wq_b_scale, [IDX_N_HEADS * IDX_HEAD_DIM], [loop_i * IDX_N_HEADS * IDX_HEAD_DIM])
         csa_weights_proj_csa: pl.Tensor[[D, IDX_N_HEADS], pl.BF16] = pl.slice(csa_weights_proj, [D, IDX_N_HEADS], [loop_i * D, 0])
-        csa_inner_wkv_csa: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16] = pl.slice(csa_inner_wkv, [D, INNER_OUT_DIM], [loop_i * D, 0])
-        csa_inner_wgate_csa: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16] = pl.slice(csa_inner_wgate, [D, INNER_OUT_DIM], [loop_i * D, 0])
+        csa_inner_wkv_csa: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16] = pl.slice(csa_inner_wkv, [INNER_OUT_DIM, D], [loop_i * INNER_OUT_DIM, 0])
+        csa_inner_wgate_csa: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16] = pl.slice(csa_inner_wgate, [INNER_OUT_DIM, D], [loop_i * INNER_OUT_DIM, 0])
         csa_inner_ape_csa: pl.Tensor[[CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_ape, [CSA_COMPRESS_RATIO, INNER_OUT_DIM], [loop_i * CSA_COMPRESS_RATIO, 0])
         csa_inner_norm_w_csa: pl.Tensor[[IDX_HEAD_DIM], pl.BF16] = pl.slice(csa_inner_norm_w, [IDX_HEAD_DIM], [loop_i * IDX_HEAD_DIM])
         csa_inner_kv_state_csa: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_kv_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], [loop_i * INNER_STATE_BLOCK_NUM, 0, 0])
@@ -598,8 +598,8 @@ def prefill_fwd(
     csa_idx_wq_b_last: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8] = pl.slice(csa_idx_wq_b, [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], [csa_order_last * Q_LORA, 0])
     csa_idx_wq_b_scale_last: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32] = pl.slice(csa_idx_wq_b_scale, [IDX_N_HEADS * IDX_HEAD_DIM], [csa_order_last * IDX_N_HEADS * IDX_HEAD_DIM])
     csa_weights_proj_last: pl.Tensor[[D, IDX_N_HEADS], pl.BF16] = pl.slice(csa_weights_proj, [D, IDX_N_HEADS], [csa_order_last * D, 0])
-    csa_inner_wkv_last: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16] = pl.slice(csa_inner_wkv, [D, INNER_OUT_DIM], [csa_order_last * D, 0])
-    csa_inner_wgate_last: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16] = pl.slice(csa_inner_wgate, [D, INNER_OUT_DIM], [csa_order_last * D, 0])
+    csa_inner_wkv_last: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16] = pl.slice(csa_inner_wkv, [INNER_OUT_DIM, D], [csa_order_last * INNER_OUT_DIM, 0])
+    csa_inner_wgate_last: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16] = pl.slice(csa_inner_wgate, [INNER_OUT_DIM, D], [csa_order_last * INNER_OUT_DIM, 0])
     csa_inner_ape_last: pl.Tensor[[CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_ape, [CSA_COMPRESS_RATIO, INNER_OUT_DIM], [csa_order_last * CSA_COMPRESS_RATIO, 0])
     csa_inner_norm_w_last: pl.Tensor[[IDX_HEAD_DIM], pl.BF16] = pl.slice(csa_inner_norm_w, [IDX_HEAD_DIM], [csa_order_last * IDX_HEAD_DIM])
     csa_inner_kv_state_last: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_kv_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], [csa_order_last * INNER_STATE_BLOCK_NUM, 0, 0])
@@ -708,8 +708,8 @@ def l3_prefill_fwd(
     csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * D, INNER_OUT_DIM], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * D, INNER_OUT_DIM], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
     csa_inner_kv_state: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],

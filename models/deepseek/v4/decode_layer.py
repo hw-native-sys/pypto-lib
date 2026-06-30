@@ -144,8 +144,8 @@ def decode_layer(
     csa_idx_wq_b_scale: pl.Tensor[[CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[D, CSA_IDX_N_HEADS], pl.BF16],
     csa_hadamard_idx: pl.Tensor[[CSA_IDX_HEAD_DIM, CSA_IDX_HEAD_DIM], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[D, CSA_INNER_OUT_DIM], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[D, CSA_INNER_OUT_DIM], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[CSA_INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[CSA_INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
@@ -307,8 +307,8 @@ def l3_decode_layer(
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.FP32],
     csa_weights_proj: pl.Tensor[[N_RANKS, D, CSA_IDX_N_HEADS], pl.BF16],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, CSA_IDX_HEAD_DIM, CSA_IDX_HEAD_DIM], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[N_RANKS, D, CSA_INNER_OUT_DIM], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[N_RANKS, D, CSA_INNER_OUT_DIM], pl.BF16],
+    csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_INNER_OUT_DIM, D], pl.BF16],
+    csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
@@ -798,7 +798,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="If set, use this single start_pos for all batches.")
     parser.add_argument("--layer-id", type=int, default=10)
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)

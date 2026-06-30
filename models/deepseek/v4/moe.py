@@ -150,7 +150,7 @@ def moe(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh, num_tokens,
+        sh,
     )
 
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -762,7 +762,7 @@ def moe_ep1(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
-        sh, num_tokens,
+        sh,
     )
 
     recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -877,7 +877,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,

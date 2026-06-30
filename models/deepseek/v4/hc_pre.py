@@ -99,22 +99,6 @@ def hc_pre(
     # the part that needs pypto#1761.
     mixes_gm = pl.create_tensor([T_MAX, MIX_PAD], dtype=pl.FP32)
     mix_raw_gm = pl.create_tensor([MIX_RAW_ROWS, MIX_PAD], dtype=pl.FP32)
-    t_matmul = pl.max(t_dim, LINEAR_T_TILE)
-    x_matmul = pl.create_tensor([T_MAX, HC_DIM], dtype=pl.BF16)
-    for pad_idx in pl.spmd(t_matmul // LINEAR_T_TILE, name_hint="hc_pre_x_matmul_pad"):
-        pad_t0 = pad_idx * LINEAR_T_TILE
-        pad_rows = pl.min(LINEAR_T_TILE, t_dim - pad_t0)
-        for pad_k0 in pl.range(0, HC_DIM, LINEAR_K_TILE):
-            x_valid = pl.slice(
-                x_flat,
-                [LINEAR_T_TILE, LINEAR_K_TILE],
-                [pad_t0, pad_k0],
-                valid_shape=[pad_rows, LINEAR_K_TILE],
-            )
-            x_matmul[pad_t0:pad_t0 + LINEAR_T_TILE, pad_k0:pad_k0 + LINEAR_K_TILE] = pl.fillpad(
-                x_valid,
-                pad_value=pl.PadValue.zero,
-            )
 
     for ob in pl.spmd(t_dim // T_TILE, name_hint="hc_pre"):
         t0 = ob * T_TILE
@@ -123,13 +107,20 @@ def hc_pre(
         mix_raw_t0 = ob * LINEAR_T_TILE
 
         # --- linear: RMS norm + hc_fn projection -> mixes_gm[t0] ---
+        lin_rows = pl.min(LINEAR_T_TILE, t_dim - linear_t0)
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         mix_acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, HC_DIM // LINEAR_K_TILE, stage=2):
             kl0 = kb * LINEAR_K_TILE
             x_lin = pl.cast(x_flat[t0:t0 + T_TILE, kl0:kl0 + LINEAR_K_TILE], target_type=pl.FP32)
+            x_lin_src = pl.slice(
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_TILE],
+                [linear_t0, kl0],
+                valid_shape=[lin_rows, LINEAR_K_TILE],
+            )
             x_lin_matmul = pl.cast(
-                x_matmul[linear_t0:linear_t0 + LINEAR_T_TILE, kl0:kl0 + LINEAR_K_TILE],
+                pl.fillpad(x_lin_src, pad_value=pl.PadValue.zero),
                 target_type=pl.FP32,
             )
             x_sq = pl.mul(x_lin, x_lin)
