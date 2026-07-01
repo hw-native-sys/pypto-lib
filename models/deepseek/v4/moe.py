@@ -8,8 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI marker: run on >=2 NPUs via $DEVICE_RANGE instead of single $DEVICE_ID
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 1 runs single-card (in-card scatter), 2/4/8 run N-rank distributed; each
-rank keeps 32 experts."""
+size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
@@ -19,7 +18,7 @@ import sys
 
 import config
 
-_EP_CHOICES = (1, 2, 4, 8)
+_EP_CHOICES = (2, 4, 8)
 _EP_DEFAULT = 2
 
 
@@ -33,12 +32,7 @@ def _parse_ep_argv():
 
 
 EP = _parse_ep_argv()
-# EP==1 is a single-card degenerate world: routing is global-but-local (one rank
-# owns every expert), so the cross-rank HCCL dispatch/combine collapse to in-card
-# scatter/gather. That path uses the local dispatch/combine and a plain single-card
-# run instead of the @pl.jit.host distributed orchestration (the *_ep1 defs below).
 config.EP_WORLD_SIZE = EP
-config.EP_ROUTING_GLOBAL = True
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)  # 32 experts/rank
 
 import pypto.language as pl
@@ -51,8 +45,6 @@ from hc_post import hc_post
 from gate import gate
 from expert_shared import expert_shared
 from expert_routed import expert_routed
-from dispatch import dispatch, dispatch_ep1
-from combine import combine, combine_ep1
 
 
 T = MOE_TOKENS
@@ -73,9 +65,291 @@ N_ROUTES = T * TOPK
 # Padding widths required by tile vector ops (32 B minimum tile).
 W_PAD = 8   # FP32 weight/scale tile width
 IDX_PAD = 8  # INT32 r_route tile width
+X_STAGE_ROWS = 8  # recv_x stage chunk rows (8 x D INT8 = 32KB UB tile)
 
 assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
 assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
+
+
+# === Packed dispatch =========================================================
+# Route + push + stage_out: scatter token-major router outputs to each peer's
+# per-local-expert recv layout consumed by expert_routed. The INT8 quant of
+# x_norm already happened in gate; this only moves pre-quantized rows + dequant
+# scales across ranks over the HCCL windows.
+@pl.jit.inline
+def dispatch(
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    recv_x_out: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.INT8],
+    recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
+    recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
+    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
+    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based ordinal of this MoE call within the current shared-window epoch.
+    # The done windows are monotonic counters, so waits use `>= moe_epoch`
+    # instead of a fixed `>= 1` and cannot be satisfied by a previous MoE call.
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    # Flat 2-D view for the stage_out row stores; reshape kept outside the scope
+    # so it stays a tensor view, not a tile.
+    recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
+
+    # Route + push + stage_out in one pl.at(CORE_GROUP) (= InCore) so the scalar
+    # histogram/prefix-sum, notify/wait barriers and remote_store run as one task.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch"):
+        active_tokens = pl.cast(num_tokens, pl.INDEX)
+        if active_tokens < 0:
+            active_tokens = pl.cast(0, pl.INDEX)
+        if active_tokens > T:
+            active_tokens = pl.cast(T, pl.INDEX)
+        # ---------- histogram: scalar histogram on indices ----------
+        send_counts = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+        for d in pl.range(N_RANKS):
+            for e in pl.range(N_LOCAL):
+                send_counts[d * N_LOCAL + e] = 0
+
+        for t in pl.range(active_tokens):
+            for k in pl.range(TOPK):
+                eid = pl.read(indices, [t, k])
+                d = eid // N_LOCAL
+                e = eid - d * N_LOCAL
+                cur = send_counts[d * N_LOCAL + e]
+                send_counts[d * N_LOCAL + e] = cur + 1
+
+        # ---------- publish: overwrite this epoch's exact counts ----------
+        # `pub_counts` stores the current MoE's exact routing counts, not a
+        # monotonic counter. Publish all buckets, including zeros, so reusing the
+        # same window across serial MoE calls cannot leak stale counts.
+        for peer in pl.range(N_RANKS):
+            for d in pl.range(N_RANKS):
+                for e in pl.range(N_LOCAL):
+                    v = send_counts[d * N_LOCAL + e]
+                    pld.system.notify(
+                        target=pub_counts,
+                        peer=peer,
+                        offsets=[my_rank * N_RANKS + d, e],
+                        value=v,
+                        op=pld.NotifyOp.Set,
+                    )
+
+        # ---------- count_done barrier ----------
+        # count_done/data_done are separate per-stage monotonic counters. Each
+        # MoE bumps the local source cell once; receivers wait for this call's
+        # epoch so older stages from earlier MoE calls do not pass the barrier.
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=count_done,
+                    peer=peer,
+                    offsets=[my_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=count_done,
+                    offsets=[src, 0],
+                    expected=moe_epoch,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+        # ---------- prefix_sum: my slot offset + total recv_count ----------
+        my_slot_at_dst = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+        for d in pl.range(N_RANKS):
+            for e in pl.range(N_LOCAL):
+                acc = pl.const(0, pl.INT32)
+                for s in pl.range(N_RANKS):
+                    if s < my_rank:
+                        acc = acc + pl.read(pub_counts, [s * N_RANKS + d, e])
+                my_slot_at_dst[d * N_LOCAL + e] = acc
+
+        for e in pl.range(N_LOCAL):
+            acc = pl.const(0, pl.INT32)
+            for s in pl.range(N_RANKS):
+                acc = acc + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+            pl.write(recv_count_out, [e, 0], acc)
+
+        # ---------- payload_push: 4 channels per (t, k) ----------
+        cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+        for d in pl.range(N_RANKS):
+            for e in pl.range(N_LOCAL):
+                cursor[d * N_LOCAL + e] = 0
+
+        # Pad tiles, zero-initialised once; only column 0 is overwritten per
+        # push (UB tile + remote_store is the proven path for runtime-computed
+        # scalars — a GM pack table written by scalar pl.write corrupts).
+        scale_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
+        w_tile = pl.tile.full([1, W_PAD], dtype=pl.FP32, value=0.0)
+        idx_tile = pl.tile.full([1, IDX_PAD], dtype=pl.INT32, value=0)
+
+        for t in pl.range(active_tokens):
+            for k in pl.range(TOPK):
+                eid = pl.read(indices, [t, k])
+                dst = eid // N_LOCAL
+                loc_e = eid - dst * N_LOCAL
+                bucket = dst * N_LOCAL + loc_e
+                cur_val = cursor[bucket]
+                slot_off = my_slot_at_dst[bucket]
+                slot = slot_off + cur_val
+                row = loc_e * RECV_MAX + slot
+                cursor[bucket] = cur_val + 1
+                r_route = t * TOPK + k
+
+                pld.tensor.put(
+                    dst=recv_x,
+                    peer=dst,
+                    src=x_norm_i8,
+                    dst_offsets=[row, 0],
+                    src_offsets=[t, 0],
+                    shape=[1, D],
+                )
+                pl.tile.write(scale_tile, [0, 0], pl.read(x_norm_scale, [t, 0]))
+                pld.tile.remote_store(scale_tile, target=recv_scale, peer=dst, offsets=[row, 0])
+                pl.tile.write(w_tile, [0, 0], pl.read(weights, [t, k]))
+                pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
+                pl.tile.write(idx_tile, [0, 0], pl.cast(r_route, pl.INT32))
+                pld.tile.remote_store(idx_tile, target=recv_r_route, peer=dst, offsets=[row, 0])
+
+        # ---------- data_done barrier — per-src signal cells ----------
+        # Same epoch discipline as count_done: value is only a counter bump, and
+        # the phase meaning comes from the dedicated data_done window.
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=data_done,
+                    peer=peer,
+                    offsets=[my_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=data_done,
+                    offsets=[src, 0],
+                    expected=moe_epoch,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+        # stage_out: copy the windows the push filled into the host outputs.
+        # recv_x: INT8 window copied in X_STAGE_ROWS-row chunks through the
+        # flat view (per-row copies cost ~16x more MTE transfers).
+        for row in pl.range(0, N_LOCAL * RECV_MAX, X_STAGE_ROWS):
+            recv_x_out_flat[row:row + X_STAGE_ROWS, :] = recv_x[row:row + X_STAGE_ROWS, :]
+
+        # scale / w / r_route: scalar copy of window column 0, bounded to the
+        # valid rows (downstream consumers are count-bounded, so tail slots
+        # carry no contract).
+        # WORKAROUND pypto#1693: writing these via tile pl.store made them
+        # add_inout and the orchestration scrambled their post-write SSA aliases;
+        # scalar pl.write keeps them add_output.
+        for e in pl.range(N_LOCAL):
+            n_rows = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
+            for slot in pl.range(n_rows):
+                row = e * RECV_MAX + slot
+                pl.write(recv_scale_out, [e, slot], pl.read(recv_scale, [row, 0]))
+                pl.write(recv_w_out, [e, slot], pl.read(recv_w, [row, 0]))
+                pl.write(recv_r_route_out, [e, slot], pl.read(recv_r_route, [row, 0]))
+
+
+# === Packed combine ==========================================================
+# Push recv_y rows back to each origin rank's routed_y_buf (keyed by r_route),
+# barrier, then a dense reduce ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k].
+@pl.jit.inline
+def combine(
+    recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
+    recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    ffn_out: pl.Tensor[[T, D], pl.BF16],
+    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
+    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    # 1-based ordinal of this MoE call. combine_done is a monotonic per-source
+    # counter, so waiting for `moe_epoch` isolates serial MoE calls that reuse
+    # the same distributed window.
+    moe_epoch: pl.Scalar[pl.INT32],
+):
+    # Push recv_y rows to each peer's routed_y_buf, then a cross-rank barrier, in
+    # one pl.at(CORE_GROUP) so the TPUT + notify/wait stay one atomic task. The
+    # flat 2-D view is only a put src (GM-to-peer-GM); needs pypto#1732 (put dst
+    # window declared add_output) for the RAW edge into combine_reduce.
+    recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
+        # Each (dst, e) block of n rows landed at slots [src_off, src_off+n) on
+        # dst.
+        for dst in pl.range(N_RANKS):
+            for e in pl.range(N_LOCAL):
+                n = pl.cast(pl.read(pub_counts, [dst * N_RANKS + my_rank, e]), pl.INDEX)
+                src_off = pl.const(0, pl.INT32)
+                for s in pl.range(N_RANKS):
+                    if s < dst:
+                        src_off = src_off + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
+                src_off_idx = pl.cast(src_off, pl.INDEX)
+                for row in pl.range(n):
+                    slot = src_off_idx + row
+                    r_route = pl.cast(pl.read(recv_r_route_out, [e, slot]), pl.INDEX)
+                    pld.tensor.put(
+                        dst=routed_y_buf,
+                        peer=dst,
+                        src=recv_y_flat,
+                        dst_offsets=[r_route, 0],
+                        src_offsets=[e * RECV_MAX + slot, 0],
+                        shape=[1, D],
+                    )
+
+        # combine_done barrier — per-src signal cells. Each MoE increments once;
+        # receivers wait for this call's epoch instead of a fixed value, so a
+        # completed earlier combine cannot release the current reduce.
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=combine_done,
+                    peer=peer,
+                    offsets=[my_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=combine_done,
+                    offsets=[src, 0],
+                    expected=moe_epoch,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+    # reduce: ffn_out[t] = sh[t] + Σ_k routed_y_buf[t*TOPK+k]. Separate pl.spmd
+    # scope (ordered after the push via the window write->read dep).
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
+        for tt in pl.range(4):
+            t = tb * 4 + tt
+            if t < active_tokens:
+                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+                for k in pl.range(TOPK):
+                    r = t * TOPK + k
+                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            else:
+                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
 
 
 @pl.jit.inline
@@ -124,8 +398,7 @@ def moe(
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
     # All non-output intermediates allocate locally so the convert pass sees
-    # them in the same scope as their producer / consumer, mirroring the
-    # single-card moe_ep1 @pl.jit.inline composition.
+    # them in the same scope as their producer / consumer.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -637,7 +910,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
 
     def init_tid2eid():
         # Distinct experts per token (sample without replacement) like real top-k,
-        # so token-keyed combine_ep1 == route-keyed distributed combine.
+        # so the route-keyed distributed combine stays unambiguous.
         x = torch.argsort(torch.rand(VOCAB, N_EXPERTS_GLOBAL), dim=1)[:, :TOPK].to(torch.int32)
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
@@ -709,159 +982,6 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     ]
 
 
-# === Single-card (EP=1) path ================================================
-# Local scatter dispatch/combine, no HCCL windows. With one rank the global
-# router degenerates to local routing (every expert is owned here), so this is
-# the standalone single-card path composed against the same sub-kernels. __main__
-# dispatches to these *_ep1 defs directly when EP == 1.
-@pl.jit.inline
-def moe_ep1(
-    x_hc:            pl.Tensor[[T, HC_MULT, D],          pl.BF16],
-    hc_ffn_fn:       pl.Tensor[[MIX_HC, HC_DIM],         pl.FP32],
-    hc_ffn_scale:    pl.Tensor[[3],                      pl.FP32],
-    hc_ffn_base:     pl.Tensor[[MIX_HC],                 pl.FP32],
-    norm_w:          pl.Tensor[[D],                      pl.BF16],
-    gate_w:          pl.Tensor[[N_EXPERTS_GLOBAL, D],    pl.FP32],
-    gate_bias:       pl.Tensor[[N_EXPERTS_GLOBAL],       pl.FP32],
-    tid2eid:         pl.Tensor[[VOCAB, TOPK],            pl.INT32],
-    input_ids:       pl.Tensor[[T],                      pl.INT64],
-    routed_w1:       pl.Tensor[[N_LOCAL, MOE_INTER, D],  pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER],     pl.FP32],
-    routed_w3:       pl.Tensor[[N_LOCAL, MOE_INTER, D],  pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER],     pl.FP32],
-    routed_w2:       pl.Tensor[[N_LOCAL, D, MOE_INTER],  pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL, D],             pl.FP32],
-    shared_w1:       pl.Tensor[[MOE_INTER, D],           pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER],              pl.FP32],
-    shared_w3:       pl.Tensor[[MOE_INTER, D],           pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER],              pl.FP32],
-    shared_w2:       pl.Tensor[[D, MOE_INTER],           pl.INT8],
-    shared_w2_scale: pl.Tensor[[D],                      pl.FP32],
-    x_next:          pl.Out[pl.Tensor[[T, HC_MULT, D],   pl.BF16]],
-    layer_id:        pl.Scalar[pl.INT32],
-    num_tokens:      pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
-    comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, x_mixed, post_ffn, comb_ffn)
-
-    x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
-    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
-    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
-    weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    gate(
-        x_mixed, norm_w, gate_w, gate_bias,
-        layer_id, num_tokens, tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale, indices, weights,
-    )
-
-    sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared(
-        x_norm_i8, x_norm_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        sh,
-    )
-
-    recv_x = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_dq = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_weights = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_token = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
-    recv_count = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
-    dispatch_ep1(
-        x_norm_i8, x_norm_scale, indices, weights,
-        recv_x, recv_scale_dq, recv_weights, recv_token, recv_count,
-    )
-
-    recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
-    expert_routed(
-        recv_x, recv_scale_dq, recv_weights, recv_count,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        recv_y,
-    )
-
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    combine_ep1(recv_y, recv_token, recv_count, sh, ffn_out)
-
-    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
-    return x_next
-
-
-@pl.jit
-def moe_ep1_test(
-    x_hc:            pl.Tensor[[T, HC_MULT, D],          pl.BF16],
-    hc_ffn_fn:       pl.Tensor[[MIX_HC, HC_DIM],         pl.FP32],
-    hc_ffn_scale:    pl.Tensor[[3],                      pl.FP32],
-    hc_ffn_base:     pl.Tensor[[MIX_HC],                 pl.FP32],
-    norm_w:          pl.Tensor[[D],                      pl.BF16],
-    gate_w:          pl.Tensor[[N_EXPERTS_GLOBAL, D],    pl.FP32],
-    gate_bias:       pl.Tensor[[N_EXPERTS_GLOBAL],       pl.FP32],
-    tid2eid:         pl.Tensor[[VOCAB, TOPK],            pl.INT32],
-    input_ids:       pl.Tensor[[T],                      pl.INT64],
-    routed_w1:       pl.Tensor[[N_LOCAL, MOE_INTER, D],  pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER],     pl.FP32],
-    routed_w3:       pl.Tensor[[N_LOCAL, MOE_INTER, D],  pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER],     pl.FP32],
-    routed_w2:       pl.Tensor[[N_LOCAL, D, MOE_INTER],  pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL, D],             pl.FP32],
-    shared_w1:       pl.Tensor[[MOE_INTER, D],           pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER],              pl.FP32],
-    shared_w3:       pl.Tensor[[MOE_INTER, D],           pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER],              pl.FP32],
-    shared_w2:       pl.Tensor[[D, MOE_INTER],           pl.INT8],
-    shared_w2_scale: pl.Tensor[[D],                      pl.FP32],
-    x_next:          pl.Out[pl.Tensor[[T, HC_MULT, D],   pl.BF16]],
-    layer_id:        pl.Scalar[pl.INT32],
-    num_tokens:      pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    x_next = moe_ep1(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        x_next,
-        layer_id, num_tokens,
-    )
-    return x_next
-
-
-# EP1 golden/fixtures reuse the distributed builders: build_tensor_specs_ep1 projects
-# the rank-0 slice; golden_moe_ep1 wraps a rank-0 axis and replays golden_moe.
-def golden_moe_ep1(tensors):
-    """EP1 golden = the 1-rank distributed reference, wrapped/unwrapped on the rank axis."""
-    import torch
-
-    wrapped = {
-        k: (v.unsqueeze(0) if isinstance(v, torch.Tensor) and v.ndim >= 1 else v)
-        for k, v in tensors.items()
-    }
-    golden_moe(wrapped)
-    tensors["x_next"][:] = wrapped["x_next"][0]
-
-
-def build_tensor_specs_ep1(layer_id=0, num_tokens=T):
-    """EP1 fixtures = the distributed specs with the rank-0 leading dim dropped."""
-    from golden import ScalarSpec, TensorSpec
-
-    flat = []
-    for s in build_tensor_specs(layer_id=layer_id, num_tokens=num_tokens):
-        if isinstance(s, ScalarSpec):
-            flat.append(s)
-        elif s.is_output:
-            flat.append(TensorSpec(s.name, s.shape[1:], s.dtype, is_output=True))
-        else:
-            flat.append(TensorSpec(
-                s.name, s.shape[1:], s.dtype,
-                init_value=(lambda iv: (lambda: iv()[0]))(s.init_value),
-            ))
-    return flat
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -893,57 +1013,34 @@ if __name__ == "__main__":
 
     golden_data = args.golden_data
 
-    if EP == 1:
-        # One rank: plain single-card run (no DistributedConfig / HCCL windows).
-        result = run_jit(
-            fn=moe_ep1_test,
-            specs=build_tensor_specs_ep1(layer_id=args.layer_id, num_tokens=args.num_tokens),
-            golden_fn=golden_moe_ep1,
-            golden_data=golden_data,
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
-                device_id=device_ids[0],
-                enable_l2_swimlane=args.enable_l2_swimlane,
-                log_level=args.log_level,
+    result = run_jit(
+        fn=l3_moe,
+        specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
+        golden_fn=golden_moe,
+        golden_data=golden_data,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        compile_cfg=dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids,
+                num_sub_workers=0,
             ),
-            rtol=1e-3,
-            atol=1e-3,
-            # BF16 x_next, same FFN floor as the distributed path. 3e-3 with the real
-            # layer-0 hc_ffn gate; no max_diff_hd (near-zero cancellations blow up relatively).
-            compare_fn={"x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05)},
-        )
-    else:
-        result = run_jit(
-            fn=l3_moe,
-            specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
-            golden_fn=golden_moe,
-            golden_data=golden_data,
-            compile_only=args.compile_only,
-            runtime_dir=args.runtime_dir,
-            compile_cfg=dict(
-                dump_passes=args.dump_passes,
-                distributed_config=DistributedConfig(
-                    device_ids=device_ids,
-                    num_sub_workers=0,
-                ),
-            ),
-            runtime_cfg=dict(
-                platform=args.platform,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-                log_level=args.log_level,
-            ),
-            rtol=1e-3,
-            atol=1e-3,
-            compare_fn={
-                # BF16 x_next, same FFN floor as the single-card path. Tightened 5e-3 -> 3e-3 with
-                # the real layer-0 hc_ffn gate (~2.1% of points > 3e-3). No max_diff_hd
-                # (near-zero residual/FFN cancellations blow up relatively).
-                "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
-            },
-        )
+        ),
+        runtime_cfg=dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+            log_level=args.log_level,
+        ),
+        rtol=1e-3,
+        atol=1e-3,
+        compare_fn={
+            # BF16 x_next. Tightened 5e-3 -> 3e-3 with the real layer-0 hc_ffn
+            # gate (~2.1% of points > 3e-3). No max_diff_hd (near-zero
+            # residual/FFN cancellations blow up relatively).
+            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
+        },
+    )
     if not result.passed:
         if result.error:
             print(result.error)

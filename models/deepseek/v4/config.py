@@ -260,7 +260,6 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 
 # EP communication constants
 EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
-EP_RANK = 0
 RECV_SAFETY = 4
 
 # Per-expert recv-buffer depth: peak rows one local expert receives
@@ -269,9 +268,3 @@ RECV_SAFETY = 4
 DECODE_RECV_MAX = max(16, DECODE_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
 PREFILL_RECV_MAX = max(16, PREFILL_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
 RECV_MAX = DECODE_RECV_MAX
-
-# When True, gate.py's N_EXPERTS uses the full global expert space
-# (M.n_routed_experts) so indices cover [0, N_EXPERTS_GLOBAL). Default False
-# keeps the legacy single-card behavior where each rank only routes over its
-# own shard. moe.py flips this before importing gate.
-EP_ROUTING_GLOBAL = False
