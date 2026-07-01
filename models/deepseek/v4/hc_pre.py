@@ -85,7 +85,7 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 # partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
 # cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
 # decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 8
+LINEAR_OK = 16
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -110,7 +110,7 @@ assert HC_MULT == 4, (
 # --- fused-path tiling (large T / prefill): one mixed cube+vec task per token-tile ---
 MIX_RAW_ROWS = (T_MAX // T_TILE) * LINEAR_T_TILE
 LINEAR_K_TILE = 256  # fused matmul K-fragment (32x256x4 FP32 weight fits L0B; 512 overflows)
-D_TILE = 256  # fused mix_x D-fragment (shares Vec UB with sinkhorn; 512 overflows 192KB)
+D_TILE = 512  # fused mix_x D-fragment; halves the D-loop trip count versus 256
 
 
 @pl.jit.inline
@@ -379,25 +379,23 @@ def _hc_pre_prefill(
         mix_acc_real = mix_raw_gm[mix_raw_t0 + linear_row_off:mix_raw_t0 + linear_row_off + T_TILE, 0:MIX_PAD]
         mixes_gm[t0:t0 + T_TILE, 0:MIX_PAD] = pl.row_expand_mul(mix_acc_real, inv_rms_col)
 
-        # Bias bases as tiles (col_expand needs tile-level operands).
-        pre_base = pl.load(hc_base_2d, [0, 0], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
-        post_base = pl.load(hc_base_2d, [0, HC_MULT], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
-
-        # --- pre = sigmoid(mixes[:, :hc]*s0 + base) + eps. Kept in Vec, consumed
-        # by mix_x below in the SAME scope (no GM round-trip). ---
-        pre_in = pl.load(mixes_gm, [t0, 0], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
-        pre_scaled = pl.mul(pre_in, scale0)
-        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
-        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
-        pre_eps = pl.add(pre_sig, HC_EPS)
-
         # --- post = 2*sigmoid(mixes[:, hc:2hc]*s1 + base) -> store ---
+        post_base = pl.load(hc_base_2d, [0, HC_MULT], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
         post_in = pl.load(mixes_gm, [t0, HC_MULT], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
         post_scaled = pl.mul(post_in, scale1)
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_tile = pl.set_validshape(pl.mul(post_sig, 2.0), T_TILE, HC_MULT)
         pl.store(post_tile, [t0, 0], post)
+
+        # --- pre = sigmoid(mixes[:, :hc]*s0 + base) + eps. Kept in Vec, consumed
+        # by mix_x below in the SAME scope (no GM round-trip). ---
+        pre_base = pl.load(hc_base_2d, [0, 0], [1, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        pre_in = pl.load(mixes_gm, [t0, 0], [T_TILE, HC_PAD], target_memory=pl.MemorySpace.Vec)
+        pre_scaled = pl.mul(pre_in, scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+        pre_eps = pl.add(pre_sig, HC_EPS)
 
         # --- mix_x = sum_h pre[:, h] * x[:, h, :]. Transpose so each head is a
         # 32B-aligned row, then materialize each [T_TILE,1] scale into its own
