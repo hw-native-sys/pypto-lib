@@ -559,16 +559,27 @@ def prefill_layer(
                                     pl.slice(q_proj_tile, [1, Q_HEAD_BATCH * HEAD_DIM], [ti, q_base * HEAD_DIM]),
                                     [Q_HEAD_BATCH, HEAD_DIM],
                                 )
-                                q_lo = pl.slice(q_block, [Q_HEAD_BATCH, HALF_DIM], [0, 0])
-                                q_hi = pl.slice(q_block, [Q_HEAD_BATCH, HALF_DIM], [0, HALF_DIM])
-                                q_rot_lo = pl.sub(
-                                    pl.col_expand_mul(q_lo, cos_lo),
-                                    pl.col_expand_mul(q_hi, sin_lo),
-                                )
-                                q_rot_hi = pl.add(
-                                    pl.col_expand_mul(q_hi, cos_hi),
-                                    pl.col_expand_mul(q_lo, sin_hi),
-                                )
+                                q_rot_lo = pl.create_tensor([Q_HEAD_BATCH, HALF_DIM], dtype=pl.FP32)
+                                q_rot_hi = pl.create_tensor([Q_HEAD_BATCH, HALF_DIM], dtype=pl.FP32)
+                                for qi in pl.range(Q_HEAD_BATCH):
+                                    q_lo = pl.slice(q_block, [1, HALF_DIM], [qi, 0])
+                                    q_hi = pl.slice(q_block, [1, HALF_DIM], [qi, HALF_DIM])
+                                    q_rot_lo = pl.assemble(
+                                        q_rot_lo,
+                                        pl.sub(
+                                            pl.col_expand_mul(q_lo, cos_lo),
+                                            pl.col_expand_mul(q_hi, sin_lo),
+                                        ),
+                                        [qi, 0],
+                                    )
+                                    q_rot_hi = pl.assemble(
+                                        q_rot_hi,
+                                        pl.add(
+                                            pl.col_expand_mul(q_hi, cos_hi),
+                                            pl.col_expand_mul(q_lo, sin_hi),
+                                        ),
+                                        [qi, 0],
+                                    )
                                 q_pad_row0 = q_block_row0 + ki * Q_HEAD_PAD
                                 all_q_padded_tile = pl.assemble(
                                     all_q_padded_tile,
