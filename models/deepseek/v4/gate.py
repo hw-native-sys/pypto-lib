@@ -11,8 +11,7 @@
 
 import pypto.language as pl
 
-import config as _cfg
-from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF, EP_WORLD_SIZE,
+from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
@@ -20,12 +19,10 @@ from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF, EP_WORLD_SIZE,
 T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
-# Routing space:
-#   EP_ROUTING_GLOBAL=False (default, legacy single-card): each rank only routes
-#     over its own [n_routed_experts // EP_WORLD_SIZE] shard.
-#   EP_ROUTING_GLOBAL=True (used by moe.py): every rank routes over the full
-#     global expert set so dispatch can fan tokens across ranks.
-N_EXPERTS = M.n_routed_experts if _cfg.EP_ROUTING_GLOBAL else M.n_routed_experts // EP_WORLD_SIZE
+# Routing space: every rank routes over the full global expert set so dispatch
+# can fan tokens across ranks. moe.py shrinks config.FLASH.n_routed_experts to
+# 32*EP before importing this module, so N_EXPERTS follows the active EP world.
+N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
 ROUTE_SCALE = M.routed_scaling_factor
 VOCAB = M.vocab_size
