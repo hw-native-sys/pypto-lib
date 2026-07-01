@@ -97,6 +97,8 @@ HIDDEN_BLOCKS = HIDDEN // K_CHUNK
 Q_OUT_BLOCKS = HIDDEN // Q_OUT_CHUNK
 KV_OUT_BLOCKS = KV_HIDDEN // KV_OUT_CHUNK
 MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
+MLP_PROJ_BANDS = 2
+MLP_BAND_BLOCKS = MLP_OUT_BLOCKS // MLP_PROJ_BANDS
 DOWN_PART_BLOCKS = (MLP_OUT_BLOCKS + DOWN_K_PARTS - 1) // DOWN_K_PARTS
 DOWN_PART_WORK_ITEMS = HIDDEN_BLOCKS * DOWN_K_PARTS
 RMSNORM_TOK_GROUP = 8
@@ -420,7 +422,7 @@ def prefill_layer(
                         tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                         tile_w = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, q0])
                         q_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_w_i = pl.slice(wq, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, q0])
@@ -437,7 +439,7 @@ def prefill_layer(
                         tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                         tile_wk = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
                         k_acc = pl.matmul(tile_a, tile_wk, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_wk_i = pl.slice(wk, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k0, kv0])
@@ -447,7 +449,7 @@ def prefill_layer(
                         tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
                         tile_wv = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base, kv0])
                         v_acc = pl.matmul(tile_a, tile_wv, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k0, kv0])
@@ -978,7 +980,7 @@ def prefill_layer(
                         tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
                         tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
                         o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
+                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
                             k0 = kb * K_CHUNK
                             tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
                             tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
@@ -1034,31 +1036,35 @@ def prefill_layer(
                 gate_acc_tile = pl.create_tensor([TOK_TILE, INTERMEDIATE], dtype=pl.FP32)
                 up_acc_tile = pl.create_tensor([TOK_TILE, INTERMEDIATE], dtype=pl.FP32)
                 mlp_silu_tile = pl.create_tensor([TOK_TILE, INTERMEDIATE], dtype=pl.BF16)
-                for gate_core in pl.spmd(GATE_PROJ_SPMD_BLOCKS, name_hint="gate_proj_spmd"):
-                    for ob in pl.range(gate_core, MLP_OUT_BLOCKS, GATE_PROJ_SPMD_BLOCKS):
-                        o0 = ob * MLP_OUT_CHUNK
-                        pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                        gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                            wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                            gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
-                        gate_acc_tile = pl.assemble(gate_acc_tile, gate_acc, [0, o0])
+                for mlp_band in pl.range(MLP_PROJ_BANDS):
+                    band_ob0 = mlp_band * MLP_BAND_BLOCKS
+                    for gate_core in pl.spmd(GATE_PROJ_SPMD_BLOCKS, name_hint="gate_proj_spmd"):
+                        for rel_ob in pl.range(gate_core, MLP_BAND_BLOCKS, GATE_PROJ_SPMD_BLOCKS):
+                            ob = band_ob0 + rel_ob
+                            o0 = ob * MLP_OUT_CHUNK
+                            pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                            wg0 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                            gate_acc = pl.matmul(pc0, wg0, out_dtype=pl.FP32)
+                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                k0 = kb * K_CHUNK
+                                pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                wgi = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                                gate_acc = pl.matmul_acc(gate_acc, pci, wgi)
+                            gate_acc_tile = pl.assemble(gate_acc_tile, gate_acc, [0, o0])
 
-                for up_core in pl.spmd(UP_PROJ_SPMD_BLOCKS, name_hint="up_proj_spmd"):
-                    for ob in pl.range(up_core, MLP_OUT_BLOCKS, UP_PROJ_SPMD_BLOCKS):
-                        o0 = ob * MLP_OUT_CHUNK
-                        pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
-                        up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
-                        for kb in pl.range(1, HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                            wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                            up_acc = pl.matmul_acc(up_acc, pci, wui)
-                        up_acc_tile = pl.assemble(up_acc_tile, up_acc, [0, o0])
+                    for up_core in pl.spmd(UP_PROJ_SPMD_BLOCKS, name_hint="up_proj_spmd"):
+                        for rel_ob in pl.range(up_core, MLP_BAND_BLOCKS, UP_PROJ_SPMD_BLOCKS):
+                            ob = band_ob0 + rel_ob
+                            o0 = ob * MLP_OUT_CHUNK
+                            pc0 = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                            wu0 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base, o0])
+                            up_acc = pl.matmul(pc0, wu0, out_dtype=pl.FP32)
+                            for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                                k0 = kb * K_CHUNK
+                                pci = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                                wui = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                                up_acc = pl.matmul_acc(up_acc, pci, wui)
+                            up_acc_tile = pl.assemble(up_acc_tile, up_acc, [0, o0])
 
                 for silu_core in pl.spmd(SILU_SPMD_BLOCKS, name_hint="silu_spmd"):
                     for ob in pl.range(silu_core, MLP_OUT_BLOCKS, SILU_SPMD_BLOCKS):
@@ -1083,7 +1089,7 @@ def prefill_layer(
                         mlp_chunk_0 = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0_start])
                         w_down_chunk_0 = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + o0_start, d0])
                         down_acc = pl.matmul(mlp_chunk_0, w_down_chunk_0, out_dtype=pl.FP32)
-                        for ob in pl.range(ob_start + 1, ob_end):
+                        for ob in pl.pipeline(ob_start + 1, ob_end, stage=2):
                             o0 = ob * MLP_OUT_CHUNK
                             mlp_chunk_i = pl.slice(mlp_silu_tile, [TOK_TILE, MLP_OUT_CHUNK], [0, o0])
                             w_down_chunk_i = pl.slice(
