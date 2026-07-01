@@ -12,6 +12,7 @@
 Public entry points: :func:`run` and :func:`run_jit`.
 """
 
+import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ class RunResult:
     error: str | None = None
     execution_time: float | None = None
     work_dir: Path | None = None
+    bench: Any = None  # BenchmarkStats when benchmark=True; None otherwise
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time is not None else ""
@@ -323,6 +325,120 @@ def _execute_via_runner(
     execute_compiled(work_dir, ordered, **_execute_compiled_kwargs(runtime_cfg))
 
 
+def _is_l3(compiled: Any) -> bool:
+    """True if *compiled* is an L3 ``DistributedCompiledProgram`` (not L2 single-chip).
+
+    Benchmark's register-once loop uses ``pypto.runtime.benchmark`` /
+    ``ChipWorker``, which only accept a single-chip ``CompiledProgram``. L3
+    programs must be skipped (no perf number).
+    """
+    try:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    except ImportError:
+        return False
+    return isinstance(compiled, DistributedCompiledProgram)
+
+
+# Fixed benchmark loop sizes — enough rounds to stabilise the median without
+# bloating daily-CI wall time (each round is a sub-ms register-once dispatch).
+_BENCH_ROUNDS = 100
+_BENCH_WARMUP = 5
+
+
+def _bench_enabled() -> bool:
+    """True when ``PYPTO_BENCH`` is set truthy.
+
+    Benchmarking is entirely env-driven so no model file needs a ``--benchmark``
+    flag and ``run_jit`` needs no extra parameters: daily CI's a2a3 job sets
+    ``PYPTO_BENCH=1`` and every ``run_jit`` call then times the kernel over
+    :data:`_BENCH_ROUNDS` rounds (:data:`_BENCH_WARMUP` warmup, discarded).
+    """
+    import os
+
+    return os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+
+
+def _run_benchmark(
+    compiled: Any,
+    specs: list[TensorSpec | ScalarSpec],
+    tensors: dict[str, torch.Tensor],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    runtime_cfg: dict[str, Any],
+    rounds: int,
+    warmup: int,
+) -> Any:
+    """Register *compiled* once and time *rounds* on-device launches.
+
+    L2 single-chip only: delegates to :func:`pypto.runtime.benchmark`, which
+    opens one :class:`~pypto.runtime.ChipWorker`, registers *compiled* once, and
+    reads each launch's on-NPU ``device_wall_us`` from the runtime's
+    ``[STRACE]`` markers (simpler PR #1177). Args are reordered to the
+    orchestration parameter order exactly as :func:`_execute_via_runner` does.
+    Returns the :class:`~pypto.runtime.BenchmarkStats`, or ``None`` when the
+    runtime emits no markers (built without ``SIMPLER_PROFILING``).
+    """
+    from pypto.runtime import benchmark
+
+    def _effective_us(inv: Any) -> float | None:
+        """One launch's Effective window (µs): the orch∪sched merged span.
+
+        Mirrors simpler ``strace_timing._round_metrics``:
+        ``max(orch_end, sched_end) - min(orch_start, sched_start)`` over the
+        device-domain ``orch``/``sched`` spans — the real post-graph-build
+        execution window (the old device-log "Total"), excluding preamble /
+        graph_build / post_orch. Returns ``None`` when neither span is present.
+        """
+        named = inv.by_name()
+        base = "run_prepared.runner_run.device_wall"
+        windows = [s for s in (named.get(f"{base}.orch"), named.get(f"{base}.sched")) if s is not None]
+        if not windows:
+            return None
+        return (max(s.ts + s.dur for s in windows) - min(s.ts for s in windows)) / 1000.0
+
+    ordered: list[Any] = [
+        tensors[s.name] if isinstance(s, TensorSpec) else scalar_specs_eff[s.name].to_ctypes()
+        for s in specs
+    ]
+    platform = runtime_cfg.get("platform")
+    device_id = runtime_cfg.get("device_id")
+    stats = None
+    with _Stage("benchmark"):
+        try:
+            stats = benchmark(
+                compiled, ordered,
+                rounds=rounds, warmup=warmup,
+                platform=platform, device_id=device_id,
+            )
+        except RuntimeError as e:
+            # No [STRACE] markers: runtime not built with SIMPLER_PROFILING.
+            print(f"[RUN]   benchmark unavailable: {e}", flush=True)
+            stats = None
+    if stats is None:
+        return None
+    # Effective = orch∪sched merged window (simpler's per-round "Effective"
+    # column, old device-log "Total") — the real post-graph-build execution
+    # window, excluding preamble / graph_build / post_orch. Each value is one
+    # launch; the aggregate is over the measured rounds (warmup excluded).
+    if stats.all_zero_device:
+        print(
+            "[RUN]   effective_us unavailable: device_wall all 0 "
+            "(sim platform or non-profiling build)",
+            flush=True,
+        )
+        return stats
+    eff = [e for e in (_effective_us(inv) for inv in stats.invocations) if e is not None]
+    if eff:
+        print(
+            f"[RUN]   effective_us ({len(eff)} rounds) "
+            f"min={min(eff):.1f} median={statistics.median(eff):.1f} "
+            f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
+            flush=True,
+        )
+    else:
+        print("[RUN]   effective_us unavailable: no orch/sched spans captured", flush=True)
+    return stats
+
+
 def _try_l3_dispatch(
     compiled: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -590,11 +706,27 @@ def run(
         ):
             _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
+    # Benchmark (L2 single-chip only). Runs after the correctness dispatch so
+    # validation still reflects a fresh run; needs the live CompiledProgram, so
+    # a ``runtime_dir`` replay (compiled is None for L2) cannot benchmark.
+    # Entirely env-gated via PYPTO_BENCH=1 (daily CI) — no per-call parameter.
+    bench = None
+    if _bench_enabled():
+        if compiled is None:
+            print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
+        elif _is_l3(compiled):
+            print("[RUN]   benchmark skipped: L3 distributed program (L2 single-chip only)", flush=True)
+        else:
+            bench = _run_benchmark(
+                compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
+                _BENCH_ROUNDS, _BENCH_WARMUP,
+            )
+
     # Validate
     if golden_outputs is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
     try:
         _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
     except AssertionError as e:
@@ -602,7 +734,7 @@ def run(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
 
 
 def run_jit(
@@ -745,11 +877,27 @@ def run_jit(
         ):
             _execute_via_runner(work_dir, specs, tensors, scalar_specs_eff, runtime_cfg)
 
+    # Benchmark (L2 single-chip only). Runs after the correctness dispatch so
+    # validation still reflects a fresh run; needs the live CompiledProgram, so
+    # a ``runtime_dir`` replay (compiled is None for L2) cannot benchmark.
+    # Entirely env-gated via PYPTO_BENCH=1 (daily CI) — no per-call parameter.
+    bench = None
+    if _bench_enabled():
+        if compiled is None:
+            print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
+        elif _is_l3(compiled):
+            print("[RUN]   benchmark skipped: L3 distributed program (L2 single-chip only)", flush=True)
+        else:
+            bench = _run_benchmark(
+                compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
+                _BENCH_ROUNDS, _BENCH_WARMUP,
+            )
+
     # Validate
     if golden_outputs is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
     try:
         _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
     except AssertionError as e:
@@ -757,4 +905,4 @@ def run_jit(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir)
+    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)

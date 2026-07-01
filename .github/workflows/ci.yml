@@ -215,8 +215,8 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}
-          PTO2_RING_DEP_POOL: 131072
-          PTO2_RING_TASK_WINDOW: 131072
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
         run: |
           set +e
@@ -340,8 +340,6 @@ jobs:
         # enter the env with a single `source activate.sh`. set_env.sh wires up
         # the Ascend/HCCL host environment; LD_LIBRARY_PATH is prepended with
         # $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
-        # PTO2_RING_* (set by the runner's systemd) are handled per-file in the
-        # run step — they break HCCL, so multi-card files unset them there.
         run: |
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
           conda activate py310-lib
@@ -410,6 +408,9 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
           set +e
@@ -425,10 +426,8 @@ jobs:
           failed=()
           for f in $FILES; do
             echo "::group::$f"
-            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near the
-            # top. Multi-card uses HCCL, so avoid inheriting PTO2_RING_* from the
-            # runner's systemd and set explicit CI ring sizes. Each file runs in
-            # its own subshell so env overrides do not leak across files.
+            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
+            # the top; ring sizes come from the step env: above.
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
             ndev=${ndev:-1}
             if [ "$ndev" -gt 1 ]; then
@@ -445,15 +444,9 @@ jobs:
                 echo "::endgroup::"
                 continue
               fi
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                python "$f" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" )
+              python "$f" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")"
             else
-              ( export PTO2_RING_DEP_POOL=131072 \
-                       PTO2_RING_TASK_WINDOW=131072 \
-                       PTO2_RING_HEAP=1073741824
-                python "$f" -p a2a3 -d "$DEVICE_ID" )
+              python "$f" -p a2a3 -d "$DEVICE_ID"
             fi
             if [ $? -ne 0 ]; then
               failed+=("$f")
