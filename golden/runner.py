@@ -483,6 +483,201 @@ def _try_l3_dispatch(
     return True
 
 
+def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
+    """Make every tensor shared-memory in place (required by the prepared L3 worker).
+
+    A prepared :class:`~pypto.runtime.distributed_runner.DistributedWorker` reads
+    per-call IO and resident-weight upload sources through the shared mapping the
+    forked chip worker inherits at ``prepare()``, so each buffer must be CPU,
+    contiguous and ``share_memory_()`` *before* the fork. Replaces any
+    non-contiguous / non-shared tensor with a contiguous shared copy in the same
+    dict, so the caller's later :func:`_validate` reads the device-written
+    outputs back from these same buffers.
+    """
+    for name, t in list(tensors.items()):
+        if t.is_shared() and t.is_contiguous():
+            continue
+        tensors[name] = t.contiguous().share_memory_()
+
+
+def _l3_ordered_names(compiled: Any) -> list[str]:
+    """Parameter names in orchestration order (SSA suffix ``orig__ssa_vN`` -> ``orig``)."""
+    param_infos, _, _ = compiled._get_metadata()
+    return [p.name.split("__ssa_")[0] for p in param_infos]
+
+
+def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
+    """Build the per-dispatch ``RunConfig`` for an L3 resident dispatch.
+
+    Mirrors :func:`_try_l3_dispatch`: keep only the keys that are ``RunConfig``
+    fields (DFX flags / ring sizing pass through), then pin platform / device /
+    backend.
+    """
+    import dataclasses
+
+    from pypto.runtime import RunConfig as PyptoRunConfig
+
+    platform = runtime_cfg.get("platform", "a2a3")
+    allowed = {f.name for f in dataclasses.fields(PyptoRunConfig)}
+    kwargs = {k: v for k, v in runtime_cfg.items() if k in allowed}
+    kwargs.setdefault("platform", platform)
+    kwargs.setdefault("device_id", 0)
+    kwargs["backend_type"] = _backend_for_platform(platform)
+    return PyptoRunConfig(**kwargs)
+
+
+def _benchmark_l3_resident(
+    rt: Any,
+    compiled: Any,
+    ordered: list[Any],
+    run_config: Any,
+    rounds: int,
+    warmup: int,
+) -> Any:
+    """Time ``rounds`` reuse dispatches on a prepared L3 worker (host wall).
+
+    L3 multi-card DAGs expose no on-NPU ``device_wall_us`` (it aggregates to 0),
+    so this reports the **host** dispatch wall — exactly the cost resident
+    weights shrink (no per-round H2D/D2H of the weights). Returns a
+    :class:`~pypto.runtime.bench.BenchmarkStats` carrying the host-wall samples
+    and emits the ``kernel=...`` marker the daily-CI perf collector greps, tagged
+    ``l3_resident=1``.
+    """
+    import re
+
+    from pypto.runtime.bench import BenchmarkStats
+
+    for _ in range(warmup):
+        rt(*ordered, config=run_config)
+    host_us: list[float] = []
+    for _ in range(rounds):
+        rt(*ordered, config=run_config)
+        timing = rt.last_run_timing
+        host_us.append(float(getattr(timing, "host_wall_us", 0.0) or 0.0))
+
+    stats = BenchmarkStats(device_wall_us=[], host_wall_us=host_us, rounds=rounds, warmup=warmup)
+    kernel = Path(compiled.output_dir).name if getattr(compiled, "output_dir", None) else "unknown"
+    kernel = re.sub(r"_\d{8}_\d{6}$", "", kernel)
+    if host_us:
+        print(
+            f"[RUN] benchmark kernel={kernel} l3_resident=1 rounds={rounds} "
+            f"host_mean_us={statistics.fmean(host_us):.0f} "
+            f"host_min_us={min(host_us):.0f} "
+            f"host_max_us={max(host_us):.0f}",
+            flush=True,
+        )
+    return stats
+
+
+def _run_l3_resident(
+    compiled: Any,
+    tensor_specs: list[TensorSpec],
+    tensors: dict[str, torch.Tensor],
+    scalar_specs_eff: dict[str, ScalarSpec],
+    runtime_cfg: dict[str, Any],
+    golden_outputs: dict[str, torch.Tensor] | None,
+    rtol: float,
+    atol: float,
+    compare_fn: dict[str, Callable],
+) -> Any:
+    """Dispatch an L3 program keeping resident weights device-resident.
+
+    Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
+    that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
+    Each resident spec is uploaded once via ``rt.alloc_tensor(init=...)`` and
+    reused across the validation dispatch and every benchmark round, so its
+    weight is never re-uploaded (H2D) or read back (D2H); per-call IO stays
+    shared-memory host tensors reused in place.
+
+    Validation runs between the first dispatch and the benchmark loop (so the
+    proven outputs are compared before benchmark rounds overwrite them). When
+    :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused for
+    :data:`_BENCH_ROUNDS` host-wall timed rounds. Returns a :class:`BenchmarkStats`
+    (host-wall samples) or ``None``. Raises ``AssertionError`` if validation
+    fails; a benchmark failure is swallowed with a warning (never a correctness
+    gate).
+    """
+    try:
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
+    except ImportError as e:
+        raise ValueError(
+            "resident specs require L3 distributed execution, but "
+            "DistributedCompiledProgram could not be imported."
+        ) from e
+    if not isinstance(compiled, DistributedCompiledProgram):
+        raise ValueError(
+            "resident is only supported for L3 distributed programs "
+            "(a @pl.jit.host kernel compiled with distributed_config)."
+        )
+
+    # Per-call IO + resident upload sources must be shared memory before prepare().
+    _share_in_place(tensors)
+
+    ordered_names = _l3_ordered_names(compiled)
+    run_config = _l3_run_config(runtime_cfg)
+    resident_specs = [s for s in tensor_specs if s.is_resident]
+
+    with compiled.prepare() as rt:
+        # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
+        # free below; worker_id is the card a whole-tensor buffer was allocated on.
+        resident_handles: list[tuple[str, Any, bool, int]] = []
+        try:
+            for s in resident_specs:
+                if s.resident == "stacked":
+                    # Leading-dim sharded: shard i of a [world_size, *tail] weight
+                    # uploaded to card i (identity worker_ids), matching a
+                    # ``for r: child(x[r], device=r)`` orchestrator.
+                    if not hasattr(rt, "alloc_stacked_tensor"):
+                        raise ValueError(
+                            f"TensorSpec {s.name!r}: resident=\"stacked\" needs a pypto runtime "
+                            f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
+                        )
+                    handle = rt.alloc_stacked_tensor(tensors[s.name])
+                    resident_handles.append((s.name, handle, True, 0))
+                else:
+                    # Whole-tensor resident on a single card: resident is the int
+                    # worker id (0, 1, ...) the consuming kernel is dispatched to.
+                    wid = int(s.resident)
+                    handle = rt.alloc_tensor(
+                        tuple(s.shape), s.dtype, init=tensors[s.name], worker_id=wid
+                    )
+                    resident_handles.append((s.name, handle, False, wid))
+            resident_args = {name: handle for name, handle, _, _ in resident_handles}
+
+            def _arg(name: str) -> Any:
+                if name in resident_args:
+                    return resident_args[name]  # resident weight (Device/StackedDeviceTensor)
+                if name in tensors:
+                    return tensors[name]  # per-call IO (shared host tensor)
+                return scalar_specs_eff[name].value  # scalar (0-dim tensor)
+
+            ordered = [_arg(n) for n in ordered_names]
+
+            # 1) Validation dispatch (resident weights uploaded above, reused here).
+            rt(*ordered, config=run_config)
+            if golden_outputs is not None:
+                _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
+
+            # 2) Optional benchmark (env-gated): reuse the resident weights across
+            #    rounds. L3 has no device wall, so this reports host wall — the
+            #    dispatch cost resident weights shrink.
+            if not _bench_enabled():
+                return None
+            try:
+                return _benchmark_l3_resident(
+                    rt, compiled, ordered, run_config, _BENCH_ROUNDS, _BENCH_WARMUP
+                )
+            except Exception as e:  # noqa: BLE001 — benchmark is never a correctness gate
+                print(f"[RUN] benchmark skipped: {type(e).__name__}: {e}", flush=True)
+                return None
+        finally:
+            for name, handle, is_stacked, wid in resident_handles:
+                if is_stacked:
+                    rt.free_stacked_tensor(handle)
+                else:
+                    rt.free_tensor(handle, worker_id=wid)
+
+
 def _maybe_reload_l3(
     work_dir: Path,
     runtime_cfg: dict[str, Any],
@@ -699,6 +894,24 @@ def run(
             work_dir, data_dir, golden_fn, save_data,
         )
 
+    # Resident-weight path: keep resident specs device-resident across
+    # the validation dispatch and any benchmark rounds via the L3 prepare()
+    # worker (validation + benchmark are handled inside; return early).
+    if any(s.is_resident for s in tensor_specs):
+        with _Stage("runtime"):
+            try:
+                bench = _run_l3_resident(
+                    compiled, tensor_specs, tensors, scalar_specs_eff,
+                    runtime_cfg, golden_outputs, rtol, atol, compare_fn,
+                )
+            except (AssertionError, ValueError) as e:
+                return _fail(str(e))
+        validation_skipped = golden_outputs is None
+        total = time.time() - start
+        skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
+        print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+
     # Runtime
     with _Stage("runtime"):
         if compiled is None or not _try_l3_dispatch(
@@ -866,6 +1079,24 @@ def run_jit(
             specs, tensor_specs, scalar_specs_eff, input_snapshot,
             work_dir, data_dir, golden_fn, save_data,
         )
+
+    # Resident-weight path: keep resident specs device-resident across
+    # the validation dispatch and any benchmark rounds via the L3 prepare()
+    # worker (validation + benchmark are handled inside; return early).
+    if any(s.is_resident for s in tensor_specs):
+        with _Stage("runtime"):
+            try:
+                bench = _run_l3_resident(
+                    compiled, tensor_specs, tensors, scalar_specs_eff,
+                    runtime_cfg, golden_outputs, rtol, atol, compare_fn,
+                )
+            except (AssertionError, ValueError) as e:
+                return _fail(str(e))
+        validation_skipped = golden_outputs is None
+        total = time.time() - start
+        skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
+        print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
+        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
 
     # Runtime
     with _Stage("runtime"):

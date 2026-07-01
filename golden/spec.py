@@ -47,11 +47,34 @@ class TensorSpec:
               that will be called with ``(shape, dtype=dtype)``.
         is_output: If ``True``, the tensor is an output to be validated against the
             golden reference.
+        resident: Keep this tensor device-resident (``child_memory``): the harness
+            uploads it once and reuses it across the validation dispatch and every
+            benchmark round, skipping the per-dispatch host→device upload and
+            device→host readback. Only supported for L3 distributed programs and
+            only for inputs — combining a resident mode with ``is_output=True``
+            raises ``ValueError``. Values:
+
+            - ``None`` / ``False`` — not resident (default).
+            - an ``int`` worker id (``0``, ``1``, …) — whole-tensor resident on
+              that card (via ``alloc_tensor``). The id MUST be the worker whose
+              kernel consumes this parameter (the ``device=`` it is dispatched
+              to). Use for a parameter consumed as a whole on one card (e.g. a
+              replicated weight only rank ``k`` reads, or single-card / EP-1 L3).
+              ``resident=0`` explicitly means "whole-tensor on card 0".
+            - ``"stacked"`` — leading-dim sharded per rank (via
+              ``alloc_stacked_tensor``): shard ``i`` of a ``[world_size, *tail]``
+              parameter is uploaded to card ``i``. Use for the canonical
+              ``for r in range(world_size): child(x[r], device=r)`` program, where
+              each rank's slice must reside on the card that consumes it.
+
+            ``True`` is rejected as ambiguous — pass an int worker id instead.
 
     Example:
         >>> import torch
         >>> TensorSpec("query", [32, 128], torch.bfloat16, init_value=torch.randn)
         >>> TensorSpec("out", [32, 128], torch.float32, is_output=True)
+        >>> TensorSpec("wq_a", [2, 4096, 1536], torch.bfloat16, init_value=torch.randn, resident="stacked")
+        >>> TensorSpec("bias", [128], torch.float32, init_value=torch.randn, resident=1)  # whole on card 1
     """
 
     name: str
@@ -59,6 +82,42 @@ class TensorSpec:
     dtype: torch.dtype
     init_value: int | float | torch.Tensor | Callable | None = field(default=None)
     is_output: bool = False
+    resident: int | str | bool | None = None
+
+    def __post_init__(self) -> None:
+        r = self.resident
+        if r is None or r is False:
+            resident_on = False
+        elif r == "stacked":
+            resident_on = True
+        elif isinstance(r, bool):  # r is True — bool is an int subclass, check before int
+            raise ValueError(
+                f"TensorSpec {self.name!r}: resident=True is ambiguous; pass an int worker id "
+                f'(e.g. resident=0 for whole-tensor on card 0) or resident="stacked".'
+            )
+        elif isinstance(r, int):
+            if r < 0:
+                raise ValueError(
+                    f"TensorSpec {self.name!r}: resident worker id must be >= 0, got {r}."
+                )
+            resident_on = True
+        else:
+            raise ValueError(
+                f"TensorSpec {self.name!r}: resident must be None/False (off), an int worker id "
+                f'(whole-tensor resident on that card), or "stacked" (leading-dim sharded); '
+                f"got {r!r}."
+            )
+        if resident_on and self.is_output:
+            raise ValueError(
+                f"TensorSpec {self.name!r}: resident is only valid for inputs "
+                f"(a resident weight stays device-resident across dispatches); it "
+                f"cannot be combined with is_output=True."
+            )
+
+    @property
+    def is_resident(self) -> bool:
+        """True if this spec is device-resident in any mode (int worker id or ``"stacked"``)."""
+        return self.resident is not None and self.resident is not False
 
     def create_tensor(self) -> torch.Tensor:
         """Create and return a ``torch.Tensor`` based on this specification.

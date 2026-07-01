@@ -27,8 +27,10 @@ from golden.runner import (
     _backend_for_platform,
     _format_stale_paths,
     _maybe_reload_l3,
+    _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
+    _share_in_place,
     _stale_cpps,
 )
 
@@ -1189,6 +1191,162 @@ class TestMaybeReloadL3:
         ):
             with pytest.raises(ImportError, match="L3 build detected"):
                 _maybe_reload_l3(tmp_path, {"platform": "a2a3"}, {})
+
+
+class TestShareInPlace:
+    """``_share_in_place`` prepares per-call IO buffers for the prepared L3 worker."""
+
+    def test_makes_shared_and_contiguous(self):
+        a = torch.zeros((4, 4), dtype=torch.float32)
+        b = torch.zeros((4, 4), dtype=torch.float32).t()  # non-contiguous view
+        tensors = {"a": a, "b": b}
+        _share_in_place(tensors)
+        assert tensors["a"].is_shared() and tensors["a"].is_contiguous()
+        assert tensors["b"].is_shared() and tensors["b"].is_contiguous()
+        # An already-shared+contiguous tensor is left as the same object.
+        assert tensors["a"] is a
+
+
+class TestResidentPath:
+    """resident specs route through the L3 prepare() worker."""
+
+    def _resident_specs(self):
+        return [
+            TensorSpec("x", [4], torch.float32, init_value=torch.randn),     # per-call input
+            TensorSpec("w", [4], torch.float32, init_value=torch.ones,       # whole-tensor resident
+                       resident=0),
+            TensorSpec("y", [4], torch.float32, is_output=True),             # output
+        ]
+
+    def test_resident_routes_to_l3_resident_not_single_chip(self, tmp_path):
+        """A resident spec dispatches via _run_l3_resident; execute_compiled never runs."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fake = _FakeCompiled(compiled_dir)
+
+        with (
+            patch("pypto.ir.compile", return_value=fake),
+            patch(
+                "pypto.runtime.execute_compiled",
+                side_effect=lambda *a, **k: pytest.fail("single-chip path must not run for resident"),
+            ),
+            patch("golden.runner._run_l3_resident", return_value=None) as l3res,
+        ):
+            r = run(program=object(), specs=self._resident_specs())
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        l3res.assert_called_once()
+
+    @staticmethod
+    def _fake_dcp_module():
+        """A stub ``pypto.ir.distributed_compiled_program`` module exposing a
+        ``DistributedCompiledProgram`` class, so the isinstance branch in
+        ``_run_l3_resident`` is exercised deterministically even where the real
+        (heavy) submodule is not importable."""
+        mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        class _DCP:  # noqa: N801 — mirror the real class name for isinstance
+            pass
+        mod.DistributedCompiledProgram = _DCP
+        return mod
+
+    def test_resident_on_non_l3_fails_cleanly(self, tmp_path):
+        """A resident spec against a non-L3 compiled program fails via RunResult."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+        fake = _FakeCompiled(compiled_dir)  # not a DistributedCompiledProgram
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"pypto.ir.distributed_compiled_program": self._fake_dcp_module()},
+            ),
+            patch("pypto.ir.compile", return_value=fake),
+        ):
+            r = run(program=object(), specs=self._resident_specs())
+
+        assert not r.passed
+        assert "only supported for L3" in (r.error or "")
+
+    def test_run_l3_resident_stacked_uses_alloc_stacked(self, monkeypatch):
+        """A resident="stacked" spec uploads via alloc_stacked_tensor and frees via free_stacked_tensor."""
+        import golden.runner as R
+
+        calls = {"stacked": [], "freed": 0, "dispatched": 0}
+
+        class _FakeRT:
+            last_run_timing = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def alloc_stacked_tensor(self, host, worker_ids=None):
+                calls["stacked"].append((tuple(host.shape), worker_ids))
+                return ("stacked_handle", tuple(host.shape))
+
+            def alloc_tensor(self, *_a, **_k):
+                raise AssertionError('resident="stacked" must not use alloc_tensor')
+
+            def free_stacked_tensor(self, _h):
+                calls["freed"] += 1
+
+            def free_tensor(self, _h):
+                raise AssertionError("stacked handle must be freed via free_stacked_tensor")
+
+            def __call__(self, *_args, config=None):
+                calls["dispatched"] += 1
+
+        class _FakeDCP:
+            def prepare(self):
+                return _FakeRT()
+
+        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_mod.DistributedCompiledProgram = _FakeDCP
+
+        specs = [TensorSpec("w", [2, 4], torch.float32, init_value=torch.ones, resident="stacked")]
+        tensors = {"w": torch.ones(2, 4)}
+        # Avoid real pypto.runtime / backend by stubbing the metadata + config helpers.
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["w"])
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
+            out = R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=specs,
+                tensors=tensors,
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=None,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert out is None
+        assert calls["dispatched"] == 1
+        assert calls["stacked"] == [((2, 4), None)]  # identity worker_ids
+        assert calls["freed"] == 1
+
+    def test_run_l3_resident_rejects_non_l3(self):
+        """The helper itself raises ValueError for a non-L3 compiled object."""
+        with patch.dict(
+            sys.modules,
+            {"pypto.ir.distributed_compiled_program": self._fake_dcp_module()},
+        ):
+            with pytest.raises(ValueError, match="only supported for L3"):
+                _run_l3_resident(
+                    compiled=object(),
+                    tensor_specs=[TensorSpec("w", [4], torch.float32, resident=0)],
+                    tensors={"w": torch.ones(4)},
+                    scalar_specs_eff={},
+                    runtime_cfg={"platform": "a2a3"},
+                    golden_outputs=None,
+                    rtol=1e-5,
+                    atol=1e-5,
+                    compare_fn={},
+                )
 
 
 if __name__ == "__main__":

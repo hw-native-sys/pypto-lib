@@ -72,6 +72,54 @@ class TestTensorSpecCreateTensor:
         assert spec_in.is_output is False
         assert spec_out.is_output is True
 
+    def test_resident_defaults_off(self):
+        """resident defaults to None (off) and is_resident is False."""
+        spec = TensorSpec("a", [4], torch.float32)
+        assert spec.resident is None
+        assert spec.is_resident is False
+
+    def test_resident_false_is_off(self):
+        """resident=False is an accepted alias for off."""
+        spec = TensorSpec("a", [4], torch.float32, resident=False)
+        assert spec.is_resident is False
+
+    def test_resident_worker_id_int(self):
+        """An int resident is a whole-tensor buffer on that card; 0 is a valid card."""
+        s1 = TensorSpec("bias", [128], torch.float32, resident=1)
+        assert s1.resident == 1 and s1.is_resident is True
+        s0 = TensorSpec("bias", [128], torch.float32, resident=0)
+        assert s0.resident == 0 and s0.is_resident is True  # 0 == card 0, still resident
+
+    def test_resident_stacked_accepted(self):
+        """resident="stacked" is a valid mode (leading-dim sharded per rank)."""
+        spec = TensorSpec("w", [2, 4], torch.float32, resident="stacked")
+        assert spec.resident == "stacked"
+        assert spec.is_resident is True
+
+    def test_resident_true_rejected_as_ambiguous(self):
+        """resident=True is rejected — an int worker id must be given instead."""
+        with pytest.raises(ValueError, match="resident=True is ambiguous"):
+            TensorSpec("bad", [4], torch.float32, resident=True)
+
+    def test_resident_invalid_string_rejected(self):
+        """A resident string other than "stacked" is rejected."""
+        with pytest.raises(ValueError, match='resident must be None/False'):
+            TensorSpec("bad", [2, 4], torch.float32, resident="whole")
+
+    def test_resident_negative_worker_rejected(self):
+        with pytest.raises(ValueError, match="resident worker id must be >= 0"):
+            TensorSpec("w", [4], torch.float32, resident=-1)
+
+    def test_resident_output_rejected(self):
+        """A resident input combined with is_output=True is rejected."""
+        with pytest.raises(ValueError, match="resident is only valid for inputs"):
+            TensorSpec("bad", [4], torch.float32, is_output=True, resident=0)
+
+    def test_resident_stacked_output_rejected(self):
+        """resident="stacked" with is_output=True is also rejected."""
+        with pytest.raises(ValueError, match="resident is only valid for inputs"):
+            TensorSpec("bad", [2, 4], torch.float32, is_output=True, resident="stacked")
+
     def test_tensor_init_ignores_spec_shape(self):
         """Pin current behavior: when init_value is a Tensor, spec.shape is NOT enforced.
 
