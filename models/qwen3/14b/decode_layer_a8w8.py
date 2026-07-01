@@ -126,6 +126,7 @@ MLP_SPLITK_ATOMIC = os.environ.get("QWEN_A8W8_MLP_SPLITK_ATOMIC", "0") == "1"
 DOWN_SPLITK_ATOMIC = os.environ.get("QWEN_A8W8_DOWN_SPLITK_ATOMIC", "0") == "1"
 FUSED_QKV_DEQUANT = os.environ.get("QWEN_A8W8_FUSED_QKV_DEQUANT", "0") == "1"
 FUSED_QK_NORM = os.environ.get("QWEN_A8W8_FUSED_QK_NORM", "0") == "1"
+Q_ROPE_BATCH_EXPLICIT = os.environ.get("QWEN_A8W8_Q_ROPE_BATCH_EXPLICIT", "0") == "1"
 ACC_DEQUANT_OP = os.environ.get("QWEN_A8W8_ACC_DEQUANT_OP", "0") == "1"
 SKIP_QK_ACT_SCALE = os.environ.get("QWEN_A8W8_SKIP_QK_ACT_SCALE", "0") == "1"
 QKV_SPLITK_ATOMIC = os.environ.get("QWEN_A8W8_QKV_SPLITK_ATOMIC", "0") == "1"
@@ -1168,7 +1169,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             # too small for the 32B col-major tile-alloc constraint; per-head
             # pl.read scalars sidestep it). inv_rms cancels inside qk_norm, so no
             # inv_rms factor on Q either.
-            if FUSED_QK_NORM:
+            if FUSED_QK_NORM and Q_ROPE_BATCH_EXPLICIT:
                 q_heads = pl.reshape(
                     q_proj_norm[
                         b : b + 1, q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM
@@ -1177,14 +1178,38 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 )
                 q_lo = q_heads[:, 0:HALF_DIM]
                 q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
-                q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
+
+                cos_lo_full = pl.full([Q_PER_KV, HALF_DIM], dtype=pl.FP32, value=0.0)
+                cos_hi_full = pl.full([Q_PER_KV, HALF_DIM], dtype=pl.FP32, value=0.0)
+                sin_lo_full = pl.full([Q_PER_KV, HALF_DIM], dtype=pl.FP32, value=0.0)
+                sin_hi_full = pl.full([Q_PER_KV, HALF_DIM], dtype=pl.FP32, value=0.0)
+                for qj in pl.unroll(Q_PER_KV):
+                    cos_lo_full = pl.assemble(cos_lo_full, cos_lo, [qj, 0])
+                    cos_hi_full = pl.assemble(cos_hi_full, cos_hi, [qj, 0])
+                    sin_lo_full = pl.assemble(sin_lo_full, sin_lo, [qj, 0])
+                    sin_hi_full = pl.assemble(sin_hi_full, sin_hi, [qj, 0])
+
+                q_rot_lo = pl.sub(pl.mul(q_lo, cos_lo_full), pl.mul(q_hi, sin_lo_full))
+                q_rot_hi = pl.add(pl.mul(q_hi, cos_hi_full), pl.mul(q_lo, sin_hi_full))
+                q_rot = pl.concat(q_rot_lo, q_rot_hi)
                 all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_rot_lo, target_type=pl.BF16), [q_pad_row0, 0]
+                    all_q_padded, pl.cast(q_rot, target_type=pl.BF16), [q_pad_row0, 0]
                 )
-                all_q_padded = pl.assemble(
-                    all_q_padded, pl.cast(q_rot_hi, target_type=pl.BF16), [q_pad_row0, HALF_DIM]
-                )
+            elif FUSED_QK_NORM:
+                for qj in pl.range(Q_PER_KV):
+                    q_head = q_proj_norm[
+                        b : b + 1, (q_base + qj) * HEAD_DIM : (q_base + qj + 1) * HEAD_DIM
+                    ]
+                    q_one_lo = q_head[:, 0:HALF_DIM]
+                    q_one_hi = q_head[:, HALF_DIM:HEAD_DIM]
+                    q_one_rot_lo = pl.sub(pl.mul(q_one_lo, cos_lo), pl.mul(q_one_hi, sin_lo))
+                    q_one_rot_hi = pl.add(pl.mul(q_one_hi, cos_hi), pl.mul(q_one_lo, sin_hi))
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_one_rot_lo, target_type=pl.BF16), [q_pad_row0 + qj, 0]
+                    )
+                    all_q_padded = pl.assemble(
+                        all_q_padded, pl.cast(q_one_rot_hi, target_type=pl.BF16), [q_pad_row0 + qj, HALF_DIM]
+                    )
             else:
                 q_inv_base = ki * BATCH * Q_PER_KV + b * Q_PER_KV
                 for qj in pl.range(Q_PER_KV):
