@@ -90,7 +90,6 @@ KV_OUT_BLOCKS = KV_HIDDEN // KV_OUT_CHUNK
 MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
 MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE
 
-
 @pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
@@ -604,7 +603,7 @@ def prefill_fwd(
 
     for layer_idx in pl.range(num_layers_actual):
         with pl.scope():
-            next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
+            layer_next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
             hidden_states = prefill_layer(
                 hidden_states,
                 seq_lens,
@@ -627,7 +626,7 @@ def prefill_fwd(
                 w_gate,
                 w_up,
                 w_down,
-                next_hidden,
+                layer_next_hidden,
                 layer_idx,
             )
 

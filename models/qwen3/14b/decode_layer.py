@@ -92,7 +92,7 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
-from config import KV_CACHE_ROWS_DYN, VOCAB  # vocab size for the fused decode_fwd LM head / logits
+from config import KV_CACHE_ROWS_DYN, REAL_VOCAB, VOCAB  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,6 +121,21 @@ HALF_DIM = HEAD_DIM // 2  # 64 (RoPE rotates lo/hi halves)
 ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
 HIDDEN_INV = 1.0 / HIDDEN
 HEAD_DIM_INV = 1.0 / HEAD_DIM  # per-head QK-norm RMSNorm denominator
+
+EMBED_HIDDEN_CHUNK = 256
+SAMPLE_VOCAB_CHUNK = 512
+SAMPLE_CHUNK_PAD = 512
+SAMPLE_TOPK = 16
+SAMPLED_IDS_PAD = 8
+SAMPLE_NUM_VOCAB_CHUNKS = VOCAB // SAMPLE_VOCAB_CHUNK
+SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // SAMPLE_VOCAB_CHUNK
+SAMPLE_REAL_VOCAB_TAIL = REAL_VOCAB % SAMPLE_VOCAB_CHUNK
+SAMPLE_REAL_NUM_VOCAB_CHUNKS = SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS + (1 if SAMPLE_REAL_VOCAB_TAIL != 0 else 0)
+
+assert HIDDEN % EMBED_HIDDEN_CHUNK == 0
+assert VOCAB % SAMPLE_VOCAB_CHUNK == 0
+assert SAMPLE_NUM_VOCAB_CHUNKS <= SAMPLE_CHUNK_PAD
+assert REAL_VOCAB <= VOCAB
 
 # Attention head grouping. Q_HEAD_BATCH = Q_PER_KV (one attn lane per KV head).
 Q_HEAD_BATCH = Q_PER_KV  # 5: Q heads bundled per attention task
@@ -1104,6 +1119,99 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     return out
 
 
+@pl.jit.inline
+def _token_embed_inline(
+    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
+    for b in pl.parallel(0, BATCH, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
+            token_id = pl.read(sampled_ids, [b, 0])
+            token_row = pl.cast(token_id, target_type=pl.INDEX)
+            for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                hidden_chunk = pl.slice(embed_weight, [1, EMBED_HIDDEN_CHUNK], [token_row, k0])
+                next_hidden = pl.assemble(next_hidden, hidden_chunk, [b, k0])
+    return next_hidden
+
+
+@pl.jit.inline
+def _greedy_sample_inline(
+    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
+    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
+) -> pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]:
+    for b in pl.parallel(BATCH):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_sample"):
+            idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
+            chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
+            chunk_vals[:, :] = pl.full([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32, value=-3.402823e38)
+            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+                c0 = c * SAMPLE_VOCAB_CHUNK
+                local_scores = logits[b : b + 1, c0 : c0 + SAMPLE_VOCAB_CHUNK]
+                if SAMPLE_REAL_VOCAB_TAIL != 0:
+                    if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
+                        local_scores_valid = pl.set_validshape(local_scores, 1, SAMPLE_REAL_VOCAB_TAIL)
+                        local_scores_padded = pl.fillpad(local_scores_valid, pad_value=pl.PadValue.min)
+                        sorted_pairs = pl.sort32(local_scores_padded, idx_init)
+                    else:
+                        sorted_pairs = pl.sort32(local_scores, idx_init)
+                else:
+                    sorted_pairs = pl.sort32(local_scores, idx_init)
+                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
+                top_pairs = sorted_pairs[:, 0 : 2 * SAMPLE_TOPK]
+                top_vals = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                best_val = pl.read(top_vals, [0, 0])
+                pl.write(chunk_vals, [0, c], best_val)
+
+            chunk_sorted = pl.sort32(chunk_vals, idx_init)
+            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=64)
+            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=256)
+            chunk_top_pairs = chunk_sorted[:, 0 : 2 * SAMPLE_TOPK]
+            chunk_top_vals = pl.gather(chunk_top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+            best_val = pl.read(chunk_top_vals, [0, 0])
+            chunk_i32 = pl.cast(0, pl.INT32)
+            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+                scan_c = (SAMPLE_REAL_NUM_VOCAB_CHUNKS - 1) - c
+                val = pl.read(chunk_vals, [0, scan_c])
+                if val == best_val:
+                    chunk_i32 = pl.cast(scan_c, pl.INT32)
+
+            local_token = pl.cast(0, pl.INT32)
+            chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
+            chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
+            winning_logits = pl.slice(logits, [1, SAMPLE_VOCAB_CHUNK], [pl.cast(b, pl.INDEX), chunk_base_idx])
+            if SAMPLE_REAL_VOCAB_TAIL != 0:
+                if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
+                    winning_logits_valid = pl.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
+                    winning_logits_padded = pl.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
+                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                        val = pl.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
+                        if val == best_val:
+                            local_token = pl.cast(scan_t, pl.INT32)
+                else:
+                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                        val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
+                        if val == best_val:
+                            local_token = pl.cast(scan_t, pl.INT32)
+            else:
+                for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                    scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                    val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
+                    if val == best_val:
+                        local_token = pl.cast(scan_t, pl.INT32)
+            token_id = chunk_base + local_token
+            if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
+                token_id = pl.cast(0, pl.INT32)
+            token_out = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+            token_out[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+            pl.write(token_out, [0, 0], token_id)
+            sampled_ids[b : b + 1, :] = token_out
+    return sampled_ids
+
+
 NUM_LAYERS = 40  # full Qwen3-14B depth, for the fused decode_fwd loop
 _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
 
@@ -1132,16 +1240,20 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
+    embed_weight: pl.Tensor,
+    sampled_ids_in: pl.Tensor,
+    sampled_ids_out: pl.Out[pl.Tensor],
+    next_hidden: pl.Out[pl.Tensor],
 ):
-    # Device-side fused decode: loop the inline body over all _FWD_NLAYERS layers,
-    # slicing each layer's weights / KV-cache region by layer_idx, then run the LM
-    # head. Weights are STACKED [_FWD_NLAYERS*HIDDEN, ...] / [_FWD_NLAYERS*INTERMEDIATE,
-    # ...]; k_cache / v_cache cover [_FWD_NLAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out
-    # is logits [BATCH, VOCAB]. _FWD_NLAYERS defaults to NUM_LAYERS (40) and is settable
-    # for layer-count tests.
+    # Device-side fused decode: embed the previous sampled token id, loop the inline
+    # body over all _FWD_NLAYERS layers, run the LM head, then sample the next token
+    # id. Weights are STACKED [_FWD_NLAYERS*HIDDEN, ...] /
+    # [_FWD_NLAYERS*INTERMEDIATE, ...]; k_cache / v_cache cover
+    # [_FWD_NLAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out is logits [BATCH, VOCAB].
+    # _FWD_NLAYERS defaults to NUM_LAYERS (40) and is settable for layer-count tests.
     #
-    # The loop-carried `cur` is seeded from hidden_states via a create_tensor + tiled
-    # copy (copy_hidden, a single full-tensor pl.at writer). Each layer's output is made
+    # The loop-carried `cur` is seeded from next_hidden after embedding the previous
+    # sampled token id. Each layer's output is made
     # visible to the next layer / the LM head by _decode_layer's CONSOLIDATED
     # `down_cast_residual` writer (a single full-tensor writer in the auto-dep region,
     # placed after the MLP manual_scope and gated on the down_proj TaskIds) — without it,
@@ -1155,6 +1267,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     # non-batching-shaped pool.
     k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+    next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
+
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
     # Cross-iteration carry-writer tids (see _decode_layer's prev_out_tids):
     # seeded with copy_hidden for layer 0, refilled per layer by the dcr writers.
@@ -1168,7 +1282,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                 cur = pl.assemble(
                     cur,
                     pl.cast(
-                        pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
+                        pl.slice(next_hidden, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
                         target_type=pl.FP32,
                     ),
                     [cb0, ck0],
@@ -1196,13 +1310,13 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
             carry_normed_tids[xg_n] = xg0_tid
 
     for layer_idx in pl.range(_FWD_NLAYERS):
-        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 layer output
+        layer_next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 layer output
         next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
         next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
-            post_rms_weight, next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
+            post_rms_weight, layer_next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
             carry_tids, carry_normed_tids,
         )
         normed = next_normed
@@ -1222,7 +1336,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                     [lb0, lk0],
                 )
     out = rms_lm_head(cur_bf16, final_norm_weight, lm_head_weight, seq_lens, out)
-    return out
+    sampled_ids_out = _greedy_sample_inline(out, sampled_ids_out)
+    return out, sampled_ids_out, next_hidden
 
 
 _CHUNK_NLAYERS = 8  # layers per decode_fwd_layers dispatch (chunked fused decode)
@@ -1701,7 +1816,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # ── --validate-fwd: pre-generated stacked-fwd inputs from --data-dir. ──
-    inputs = load_inputs(args.data_dir / "in")
+    data_input_dir = args.data_dir / "in"
+    if data_input_dir.is_dir():
+        inputs = load_inputs(data_input_dir)
+    else:
+        random_values = random_inputs(full_seq=args.max_seq, seed=args.seed)
+        inputs = [random_values[name] for name in INPUT_NAMES]
     # dep_gen is force-disabled here: --validate-fwd runs two on-device programs in
     # one process (decode_fwd, then the host-ref loop's decode_fwd_layers), and the
     # dep_gen collector cannot register host buffers for the second program
@@ -1743,7 +1863,22 @@ if __name__ == "__main__":
             final_norm_w, lm_head_w,
         ]
         logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
-        decode_fwd(*stacked, logits, config=run_cfg)
+        embed_weight = torch.zeros(VOCAB, HIDDEN, dtype=torch.bfloat16)
+        sampled_ids_in = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
+        for b in range(BATCH):
+            sampled_ids_in[b, 0] = b
+            embed_weight[b] = hs[b]
+        sampled_ids_out = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
+        next_hidden = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        decode_fwd(
+            *stacked,
+            logits,
+            embed_weight,
+            sampled_ids_in,
+            sampled_ids_out,
+            next_hidden,
+            config=run_cfg,
+        )
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
         # second on-device program in the same process (the host-ref call below would
         # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
@@ -1767,9 +1902,13 @@ if __name__ == "__main__":
         a = logits.cpu(); e = ref_logits.cpu()
         # compare argmax (the actual generation signal) + value closeness
         amax_k = a.argmax(-1); amax_r = e.argmax(-1)
+        sample_k = sampled_ids_out[:, 0].cpu()
         argmax_match = int((amax_k == amax_r).sum())
+        sample_match = int((sample_k == amax_k).sum())
         close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
         print(f"[stacked-fwd {N}L+LMhead] argmax match {argmax_match}/{BATCH} | "
+              f"sample match {sample_match}/{BATCH} | "
               f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
-              f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} ref_argmax={amax_r.tolist()}")
-        raise SystemExit(0 if argmax_match == BATCH else 1)
+              f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} "
+              f"sampled={sample_k.tolist()} ref_argmax={amax_r.tolist()}")
+        raise SystemExit(0 if argmax_match == BATCH and sample_match == BATCH else 1)
