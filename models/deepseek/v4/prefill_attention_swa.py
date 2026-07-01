@@ -199,7 +199,7 @@ def prefill_attention_swa_test(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],

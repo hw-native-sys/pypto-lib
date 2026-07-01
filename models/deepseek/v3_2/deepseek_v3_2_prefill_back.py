@@ -69,7 +69,7 @@ def build_deepseek_v3_2_prefill_back_program(
             w_gate: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.BF16],
             w_up: pl.Tensor[[HIDDEN_CFG, INTER_CFG], pl.BF16],
             w_down: pl.Tensor[[INTER_CFG, HIDDEN_CFG], pl.BF16],
-            out: pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16],
+            out: pl.Out[pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16]],
         ) -> pl.Tensor[[BATCH_CFG, MAX_SEQ_CFG, HIDDEN_CFG], pl.BF16]:
             for b in pl.parallel(0, BATCH_CFG, 1):
                 seq_len_b = pl.tensor.read(seq_lens, [b])

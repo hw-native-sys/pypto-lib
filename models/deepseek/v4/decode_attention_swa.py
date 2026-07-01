@@ -234,7 +234,7 @@ def attention_swa_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     # KV cache (sliding-window only: [0, WIN) ori; no cmp portion)
-    kv_cache: pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],

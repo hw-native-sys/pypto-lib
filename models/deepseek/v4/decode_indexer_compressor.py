@@ -282,7 +282,7 @@ def indexer_compressor(
 def compressor_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[B, S, HEAD_DIM], pl.FP32]],
-    compress_state: pl.Out[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -291,7 +291,7 @@ def compressor_test(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],

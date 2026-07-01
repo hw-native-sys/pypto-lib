@@ -270,8 +270,8 @@ def prefill_compressor_ratio128(
 @pl.jit
 def prefill_compressor_ratio128_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    kv_state: pl.InOut[pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
+    score_state: pl.InOut[pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -279,7 +279,7 @@ def prefill_compressor_ratio128_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],

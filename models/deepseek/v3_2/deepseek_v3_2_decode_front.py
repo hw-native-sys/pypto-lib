@@ -106,10 +106,10 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             layer_id_t: pl.Tensor[[1], pl.INT32],
             w_q_nope_to_latent: pl.Tensor[[NUM_HEADS, QK_NOPE_HEAD_DIM, KV_LORA_RANK], pl.BF16],
             w_latent_to_v: pl.Tensor[[NUM_HEADS, KV_LORA_RANK, V_HEAD_DIM], pl.BF16],
-            kv_cache: pl.Tensor[[CACHE_ROWS, KV_LORA_RANK], pl.BF16],
-            pe_cache: pl.Tensor[[CACHE_ROWS, QK_ROPE_HEAD_DIM], pl.BF16],
-            k_cache_idx: pl.Tensor[[CACHE_ROWS, INDEX_HEAD_DIM], pl.BF16],
-            dispatch_buf: pl.Tensor[[EP_NODES, BATCH, ATTN_OUT], pl.BF16],
+            kv_cache: pl.InOut[pl.Tensor[[CACHE_ROWS, KV_LORA_RANK], pl.BF16]],
+            pe_cache: pl.InOut[pl.Tensor[[CACHE_ROWS, QK_ROPE_HEAD_DIM], pl.BF16]],
+            k_cache_idx: pl.InOut[pl.Tensor[[CACHE_ROWS, INDEX_HEAD_DIM], pl.BF16]],
+            dispatch_buf: pl.InOut[pl.Tensor[[EP_NODES, BATCH, ATTN_OUT], pl.BF16]],
         ) -> pl.Tensor[[EP_NODES, BATCH, ATTN_OUT], pl.BF16]:
             # ===== scope1: MLA front path (RMSNorm + Q/KV projection + RoPE + cache writeback) =====
             # Outputs:

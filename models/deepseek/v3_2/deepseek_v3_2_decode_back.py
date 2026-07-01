@@ -70,7 +70,7 @@ def build_deepseek_v3_2_decode_back_program(
             w_gate: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
             w_up: pl.Tensor[[HIDDEN_SIZE, INTER_SIZE], pl.BF16],
             w_down: pl.Tensor[[INTER_SIZE, HIDDEN_SIZE], pl.BF16],
-            out: pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16],
+            out: pl.Out[pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16]],
         ) -> pl.Tensor[[BATCH_SIZE, HIDDEN_SIZE], pl.BF16]:
             # Scope: output projection + residual + post-rms + MLP + residual.
             node_id = pl.cast(pl.tensor.read(node_id_t, [0]), pl.INDEX)

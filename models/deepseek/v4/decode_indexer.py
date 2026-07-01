@@ -300,7 +300,7 @@ def indexer_test(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],

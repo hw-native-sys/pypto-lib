@@ -290,7 +290,7 @@ def compressor_ratio128(
 def compressor_test(
     x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[B_DYN, S_DYN, HEAD_DIM], pl.FP32]],
-    compress_state: pl.Out[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
+    compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -298,7 +298,7 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_kv_cache: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv_cache: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[B_DYN, S_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
