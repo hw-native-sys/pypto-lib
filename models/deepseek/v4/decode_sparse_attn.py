@@ -11,7 +11,18 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    BLOCK_SIZE,
+    DECODE_CMP_BLOCK_NUM,
+    DECODE_ORI_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_MAX_BLOCKS,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+)
 
 
 # model config
@@ -37,10 +48,10 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 4
-ORI_MAX_BLOCKS = 1  # paged-KV pool: ori (sliding-window) blocks per batch
-ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = 8   # paged-KV pool: compressed blocks per batch
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 VALID_TOKEN_TILE = 8

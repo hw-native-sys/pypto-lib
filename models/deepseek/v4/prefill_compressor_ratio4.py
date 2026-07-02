@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF, PREFILL_CMP_BLOCK_NUM
 
 # model config (mirrors decode_compressor_ratio4)
 EPS = M.rms_norm_eps
@@ -27,11 +27,6 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-
-# Compressed-KV cache pool consumed by prefill_sparse_attn: one BLOCK_SIZE page
-# per PREFILL_MAX_COMPRESSED compressed entries (S=128 needs PREFILL_CMP_BLOCK_NUM pages).
-PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_window // 2))
-PREFILL_CMP_BLOCK_NUM = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
 B = 1
 S = 128

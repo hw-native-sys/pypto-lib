@@ -13,7 +13,15 @@ Softmax+pool over all slots. No state shift needed."""
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, C128_COMPRESSOR_BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ
+from config import (
+    FLASH as M,
+    BLOCK_SIZE,
+    C128_COMPRESSOR_BLOCK_SIZE,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    DECODE_CMP_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+)
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")
@@ -53,8 +61,8 @@ COMPRESS_STATE_MAX_BLOCKS = 64
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-CMP_MAX_BLOCKS = 8
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 

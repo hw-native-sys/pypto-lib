@@ -13,7 +13,18 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, C4A_COMPRESSOR_BLOCK_SIZE, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    BLOCK_SIZE,
+    C4A_COMPRESSOR_BLOCK_SIZE,
+    DECODE_IDX_BLOCK_NUM,
+    IDX_CACHE_MAX_BLOCKS,
+    FP32_NEG_INF,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+)
 from decode_indexer_compressor import indexer_compressor
 
 # model config
@@ -43,8 +54,7 @@ INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-IDX_CACHE_MAX_BLOCKS = 64
-IDX_CACHE_BLOCK_NUM = B * IDX_CACHE_MAX_BLOCKS
+IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
 SCORE_LEN = IDX_KV_LEN
 
 # tiling

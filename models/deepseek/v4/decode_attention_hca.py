@@ -22,6 +22,10 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
+    DECODE_CMP_BLOCK_NUM,
+    DECODE_ORI_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -61,10 +65,10 @@ COMPRESS_RATIO = 128  # HCA
 OVERLAP = COMPRESS_RATIO == 4   # always False for HCA
 COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
-ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
-ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS  # ori KV pool size (matches sparse_attn ORI_BLOCK_NUM)
-CMP_MAX_BLOCKS = 8                  # matches sparse_attn CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS  # cmp KV pool size (shared with the compressor's cmp_kv_cache)
+ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 # Main compressor state pool (kv + score channels merged into one paged FP32 buffer).
 COMPRESS_STATE_MAX_BLOCKS = 64
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS

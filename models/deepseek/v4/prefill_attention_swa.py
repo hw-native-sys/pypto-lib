@@ -16,7 +16,18 @@ window-ring sparse indices.
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from config import (
+    BLOCK_SIZE,
+    FLASH as M,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    PREFILL_BATCH,
+    PREFILL_CMP_BLOCK_NUM,
+    PREFILL_CMP_MAX_BLOCKS,
+    PREFILL_ORI_BLOCK_NUM,
+    PREFILL_ORI_MAX_BLOCKS,
+    PREFILL_SEQ,
+)
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
@@ -60,15 +71,16 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # SWA cache/topk contract. The ratio-0 path has only the sliding-window cache:
 # single request, one window page, so the cache block count, the block_table
 # length, and the per-request ori-window block count all collapse to 1.
-BLOCK_NUM = 1
+BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 START_POS = 0
 
 # prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
 SPARSE_TOPK = WIN + IDX_TOPK
-SPARSE_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_ORI_BLOCK_NUM = B * SPARSE_ORI_MAX_BLOCKS
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
@@ -155,7 +167,7 @@ def prefill_attention_swa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
         for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
             pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
-    cmp_kv_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     prefill_sparse_attn(
         q, kv_cache, block_table, kv,
@@ -290,7 +302,7 @@ def golden_prefill_attention_swa(tensors):
         "ori_kv": kv_cache_in,
         "ori_block_table": tensors["block_table"],
         "kv_overlay": kv,
-        "cmp_kv": torch.zeros(SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
+        "cmp_kv": torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
         "cmp_block_table": torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
         "cmp_sparse_indices": tensors["cmp_sparse_indices"],
         "cmp_sparse_lens": tensors["cmp_sparse_lens"],

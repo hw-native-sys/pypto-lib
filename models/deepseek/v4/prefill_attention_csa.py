@@ -22,6 +22,10 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
+    PREFILL_CMP_BLOCK_NUM,
+    PREFILL_CMP_MAX_BLOCKS,
+    PREFILL_IDX_BLOCK_NUM,
+    PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
 
@@ -85,10 +89,10 @@ MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
-ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = max(1, (PREFILL_COMPRESSED_LEN + BLOCK_SIZE - 1) // BLOCK_SIZE)
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 SPARSE_ROPE_CHUNK = 16
 SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
 Q_PROJ_OUT_CHUNK = 128
@@ -98,8 +102,8 @@ CSA_TOPK_TOKEN_TILE = 2
 
 # prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
-SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
+SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
 PREFILL_SPARSE_TOPK = min(SPARSE_TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
 PREFILL_ATTN_TILE = 128
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
@@ -107,7 +111,7 @@ SPARSE_PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS
-CSA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
+CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
 
@@ -149,7 +153,7 @@ def prefill_attention_csa(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -353,7 +357,7 @@ def prefill_attention_csa_test(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -766,8 +770,8 @@ def build_tensor_specs(
                 flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_idx_kv_cache():
-        cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
-        cache_flat = cache.view(CSA_CMP_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        cache = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+        cache_flat = cache.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
         table = init_idx_block_table()
         completed = context_len // COMPRESS_RATIO
         for cmp_slot in range(completed):
@@ -965,7 +969,7 @@ def build_tensor_specs(
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
             "idx_kv_cache",
-            [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
+            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.bfloat16,
             init_value=init_idx_kv_cache,
         ),

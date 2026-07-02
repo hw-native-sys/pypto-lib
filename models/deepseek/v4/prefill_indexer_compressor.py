@@ -10,7 +10,7 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF
+from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF, PREFILL_IDX_BLOCK_NUM, PREFILL_IDX_MAX_BLOCKS
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -28,11 +28,7 @@ COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 
-# Index-KV cache pool consumed by prefill_indexer: one BLOCK_SIZE page per
-# PREFILL_MAX_COMPRESSED compressed entries.
-PREFILL_MAX_COMPRESSED = max(1, min(M.index_topk, M.sliding_window + M.sliding_window // 2))
-IDX_CACHE_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
-PREFILL_IDX_BLOCK_NUM = IDX_CACHE_MAX_BLOCKS
+IDX_CACHE_MAX_BLOCKS = PREFILL_IDX_MAX_BLOCKS
 
 B = 1
 S = 128

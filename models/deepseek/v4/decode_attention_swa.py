@@ -17,7 +17,16 @@ Companion files: attention_csa_draft.py (ratio=4)
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, BLOCK_SIZE, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    BLOCK_SIZE,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_MAX_BLOCKS,
+)
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
@@ -49,11 +58,11 @@ O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 # kernel-local (SWA: ratio-0, no compressor/indexer)
-ORI_MAX_BLOCKS = 1                  # WIN==BLOCK_SIZE → 1 ori block per batch
+ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 TOPK = WIN                          # SWA: sparse_attn topk = window only
 SPARSE_IDX_TOPK = M.index_topk      # sparse_attn module's IDX_TOPK (static shape contract)
 SPARSE_TOPK = WIN + SPARSE_IDX_TOPK
-SPARSE_CMP_MAX_BLOCKS = 8           # sparse_attn cmp pool size (unused by SWA but part of its contract)
+SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 
 # tiling
 SPARSE_ROPE_TILE = 16
