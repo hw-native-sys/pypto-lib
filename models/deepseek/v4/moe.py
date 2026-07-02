@@ -352,7 +352,7 @@ def combine(
                 ffn_out[t:t + 1, :] = sh[t:t + 1, :]
 
 
-@pl.jit.inline
+@pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
@@ -441,23 +441,24 @@ def moe(
         num_tokens, my_rank, moe_epoch,
     )
 
-    recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
-    expert_routed(
-        recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        recv_y,
-    )
+    with pl.scope():
+        recv_y = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.BF16)
+        expert_routed(
+            recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            recv_y,
+        )
 
-    ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    combine(
-        recv_y, recv_r_route_out, sh,
-        ffn_out,
-        pub_counts, routed_y_buf, combine_done,
-        num_tokens, my_rank, moe_epoch,
-    )
+        ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+        combine(
+            recv_y, recv_r_route_out, sh,
+            ffn_out,
+            pub_counts, routed_y_buf, combine_done,
+            num_tokens, my_rank, moe_epoch,
+        )
 
-    hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
+        hc_post(ffn_out, x_hc, post_ffn, comb_ffn, x_next)
     return x_next
 
 
