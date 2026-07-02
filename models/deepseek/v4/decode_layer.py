@@ -14,6 +14,29 @@ The resulting per-rank hidden states feed the N-rank EP MoE path. The EP world
 size is chosen with --ep (2/4/8, default 2), inherited from moe; see __main__.
 """
 
+# =============================================================================
+# SERVING WEIGHT-LAYOUT CONTRACT   (serving-side; grep tag: [WEIGHT-PERMUTE])
+# -----------------------------------------------------------------------------
+# Some kernels reached from this layer require a weight in a NON-obvious on-device
+# layout for cube efficiency. The serving framework's weight loader/quantizer --
+# which lives OUTSIDE this repo and must NOT be edited here -- is responsible for
+# materializing these permutes. This block is the single source of truth it should
+# consult (mirrored verbatim in prefill_layer.py). Add every new permute here and
+# keep the [WEIGHT-PERMUTE] tag so `grep -rn WEIGHT-PERMUTE models/` lists the whole
+# contract in one shot.
+#
+# [WEIGHT-PERMUTE] wq_b  (q_b_proj: Q-LoRA up-projection to heads; INT8 W8A8)
+#   natural  : [Q_LORA, H*HEAD_DIM]              # HF/checkpoint order (K=Q_LORA, N=H*HEAD_DIM)
+#   REQUIRED : [H*HEAD_DIM, Q_LORA]   (transpose)# qproj consumes it via pl.matmul(..., b_trans=True)
+#   why      : K-contiguous (DN2ZN) weight load -> fewer/longer MTE2 bursts; see
+#              qkv_proj_rope.py for the measurement.
+#   scale    : wq_b_scale [H*HEAD_DIM]  UNCHANGED (per-output-channel N; transpose-invariant).
+#   stacking : layers stack on axis 0, so the fwd-level weight is
+#              [FWD_NUM_LAYERS * H*HEAD_DIM, Q_LORA]  (layer L at row offset L*H*HEAD_DIM);
+#              the TP-sharded fwd entry prepends a leading [N_RANKS, ...] axis.
+#   ref      : qkv_proj_rope.py (qproj_matmul, b_trans=True) and the signatures below.
+# =============================================================================
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
@@ -103,7 +126,7 @@ def decode_layer(
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[H * HEAD_DIM, Q_LORA], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
@@ -263,7 +286,7 @@ def l3_decode_layer(
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
     attn_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[N_RANKS, H * HEAD_DIM, Q_LORA], pl.INT8],
     wq_b_scale: pl.Tensor[[N_RANKS, H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[N_RANKS, D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, Q_LORA], pl.BF16],
