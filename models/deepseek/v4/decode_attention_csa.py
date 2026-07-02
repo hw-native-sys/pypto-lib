@@ -93,7 +93,6 @@ CMP_MAX_BLOCKS = 8
 CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
 
 # tiling
-CSA_TOPK_TOKEN_TILE = 8
 CSA_WB_TOKEN_TILE = 8
 WRITEBACK_GUARD_TILE = 16
 CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
@@ -232,52 +231,49 @@ def attention_csa(
     valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
-    for topk_block in pl.spmd(T // CSA_TOPK_TOKEN_TILE, name_hint="csa_sparse_idx_tile"):
-        topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
-        for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-            t_idx = topk_t0 + topk_dt
-            if t_idx < T:
-                topk_b = t_idx // S
-                topk_s = t_idx - topk_b * S
-                topk_abs_pos = pl.read(position_ids, [t_idx])
+    # Overlay build, one token per SPMD core.
+    for t_idx in pl.spmd(T, name_hint="csa_sparse_idx_tile"):
+        topk_b = t_idx // S
+        topk_s = t_idx - topk_b * S
+        topk_abs_pos = pl.read(position_ids, [t_idx])
+        for topk_k in pl.range(WIN):
+            if topk_k <= topk_abs_pos:
+                topk_out = topk_k
+                for topk_os in pl.range(S):
+                    if topk_os <= topk_s:
+                        topk_overlay_t = topk_b * S + topk_os
+                        topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
+                        if topk_k == topk_overlay_pos % WIN:
+                            topk_out = WIN + topk_os
+                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
+            else:
+                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
 
-                for topk_k in pl.range(WIN):
-                    if topk_k <= topk_abs_pos:
-                        topk_out = topk_k
-                        for topk_os in pl.range(S):
-                            if topk_os <= topk_s:
-                                topk_overlay_t = topk_b * S + topk_os
-                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_k == topk_overlay_pos % WIN:
-                                    topk_out = WIN + topk_os
-                        pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
-                    else:
-                        pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
-                pl.write(valid_block_mask, [t_idx, 0], pl.cast(1, pl.INT32))
-
-        # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy. Keep raw
-        # iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4) (== the original
-        # min(..., kvlen//4); pos + 1 <= kvlen holds), as out = mask * (raw + 1) - 1.
-        c_raw = pl.cast(idx_topk_flat[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, 0 : IDX_TOPK], target_type=pl.FP32)
-        c_pos = pl.cast(position_ids_t1[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, 0 : 1], target_type=pl.FP32)
+    # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy over all T rows,
+    # keeping raw iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4), as
+    # out = mask * (raw + 1) - 1.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_compressed_slots", allow_early_resolve=True):
+        c_raw = pl.cast(idx_topk_flat[0 : T, 0 : IDX_TOPK], target_type=pl.FP32)
+        c_pos = pl.cast(position_ids_t1[0 : T, 0 : 1], target_type=pl.FP32)
         c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         c_upper = pl.add(c_pos_q, CSA_CMP_WIN_S_F)
-        # row_expand to broadcast the per-token bound over IDX_TOPK cols (pl.sub
-        # does not broadcast a [ROW_TILE, 1] column).
-        c_upper_b = pl.row_expand_mul(pl.full([CSA_TOPK_TOKEN_TILE, IDX_TOPK], dtype=pl.FP32, value=1.0), c_upper)
+        # Broadcast the per-token bound over IDX_TOPK cols.
+        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_upper)
         c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
         c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
         c_mask = pl.mul(c_ge, c_lt)
         c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
-        cmp_sparse_indices[topk_t0 : topk_t0 + CSA_TOPK_TOKEN_TILE, WIN : WIN + IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        cmp_sparse_indices[0 : T, WIN : WIN + IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        # Block 0 (sliding-window / overlay) is always live; write all of
+        # valid_block_mask from this single scope.
+        for c_t0 in pl.range(T):
+            pl.write(valid_block_mask, [c_t0, 0], pl.cast(1, pl.INT32))
         for c_sb in pl.range(1, SPARSE_BLOCKS):
             c_s0 = (c_sb - 1) * ATTN_K_TILE
             c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
-            for c_dt in pl.range(CSA_TOPK_TOKEN_TILE):
-                c_t = topk_t0 + c_dt
-                if c_t < T:
-                    c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
-                    pl.write(valid_block_mask, [c_t, c_sb], c_valid)
+            for c_dt in pl.range(T):
+                c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
+                pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(

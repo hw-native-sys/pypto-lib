@@ -249,7 +249,7 @@ def qkv_proj_rope(
     # of the rotation and is folded into the writeback.
     #   out[j] = inv_rms * (x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j])
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope"):
+    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope", allow_early_resolve=True):
         hg = hg_idx * 2
         # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
         q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
@@ -266,29 +266,27 @@ def qkv_proj_rope(
             for h_inner in pl.range(2):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
-                # Pass 1: per-row sum of squares over the full HEAD_DIM -> inv_rms (no gamma).
-                q_head_sq_sum = pl.full([1, Q_ROPE_T_TILE], dtype=pl.FP32, value=0.0)
-                for db in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
-                    d0 = h0 + db * HEAD_TILE
-                    q_head_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, d0 : d0 + HEAD_TILE]
-                    q_head_sq_sum = pl.add(
-                        q_head_sq_sum,
-                        pl.reshape(pl.row_sum(pl.mul(q_head_chunk, q_head_chunk)), [1, Q_ROPE_T_TILE]),
-                    )
+                # Load each head's NOPE + RoPE columns once (fp32), reused for both the
+                # inv_rms reduction and the writeback.
+                q_nope_full = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 : h0 + NOPE_DIM]
+                q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + HEAD_DIM]
+
+                # Pass 1: per-row sum of squares over the full HEAD_DIM = NOPE part + RoPE
+                # part -> inv_rms (no gamma).
+                q_head_sq_sum = pl.add(
+                    pl.reshape(pl.row_sum(pl.mul(q_nope_full, q_nope_full)), [1, Q_ROPE_T_TILE]),
+                    pl.reshape(pl.row_sum(pl.mul(q_rope_chunk, q_rope_chunk)), [1, Q_ROPE_T_TILE]),
+                )
                 q_head_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM), EPS)))
                 q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [Q_ROPE_T_TILE, 1])
 
                 # NOPE writeback: rms-normalize columns [h0:h0+NOPE_DIM) (no gamma).
-                for nb in pl.pipeline(NOPE_DIM // HEAD_TILE, stage=2):
-                    n0 = nb * HEAD_TILE
-                    q_nope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + n0 : h0 + n0 + HEAD_TILE]
-                    q_normed = pl.row_expand_mul(q_nope_chunk, q_head_inv_rms_t)
-                    q_flat[tg : tg + Q_ROPE_T_TILE, h0 + n0 : h0 + n0 + HEAD_TILE] = pl.cast(
-                        q_normed, target_type=pl.BF16, mode="rint"
-                    )
+                q_normed = pl.row_expand_mul(q_nope_full, q_head_inv_rms_t)
+                q_flat[tg : tg + Q_ROPE_T_TILE, h0 : h0 + NOPE_DIM] = pl.cast(
+                    q_normed, target_type=pl.BF16, mode="rint"
+                )
 
                 # RoPE writeback on columns [h0+NOPE_DIM:h0+HEAD_DIM), inv_rms folded after.
-                q_rope_chunk = q_proj_fp32[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM]
                 q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
                 q_rope_rot = pl.add(pl.mul(q_rope_chunk, q_cos_il), pl.mul(pl.mul(q_rope_swapped, q_sign), q_sin_il))
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
@@ -567,7 +565,9 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2], default=0,
+                        help="L2 swimlane level: 0=off, 1=per-kernel AICore timing "
+                             "(prints the per-function Task Statistics table), 2=+AICPU timing.")
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
