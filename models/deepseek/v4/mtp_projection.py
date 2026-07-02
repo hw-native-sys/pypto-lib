@@ -34,8 +34,8 @@ D_BLOCKS = D // D_CHUNK
 OUT_BLOCKS = D // OUT_CHUNK
 QUANT_CHUNK = 128
 
-@pl.jit
-def mtp_projection(
+@pl.jit.inline
+def mtp_projection_impl(
     hidden_states: pl.Tensor[[B, S, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[B, S, D], pl.BF16],
     enorm_w: pl.Tensor[[D], pl.FP32],
@@ -171,6 +171,36 @@ def mtp_projection(
             out_flat[:, n0:n0 + OUT_CHUNK] = out_pad[0:T, n0:n0 + OUT_CHUNK]
 
     hidden_states_out = pl.reshape(out_flat, [B, S, D])
+    return hidden_states_out
+
+
+@pl.jit
+def mtp_projection(
+    hidden_states: pl.Tensor[[B, S, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[B, S, D], pl.BF16],
+    enorm_w: pl.Tensor[[D], pl.FP32],
+    hnorm_w: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    e_proj_smooth: pl.Tensor[[D], pl.FP32],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    hidden_states_out: pl.Out[pl.Tensor[[B, S, D], pl.BF16]],
+):
+    hidden_states_out = mtp_projection_impl(
+        hidden_states,
+        prev_hidden_states,
+        enorm_w,
+        hnorm_w,
+        e_proj_w,
+        e_proj_w_scale,
+        e_proj_smooth,
+        h_proj_w,
+        h_proj_w_scale,
+        h_proj_smooth,
+        hidden_states_out,
+    )
     return hidden_states_out
 
 
