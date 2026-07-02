@@ -96,15 +96,13 @@ assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv betwe
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 from lm_head import (
     TP_SIZE as LM_HEAD_ACTIVE_TP_SIZE,
-    T_MAX as LM_HEAD_T_MAX,
     VOCAB_PER_TP,
-    lm_head_tp,
 )
 
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 43
-CSA_NUM_LAYERS = 21
-HCA_NUM_LAYERS = 20
+FWD_NUM_LAYERS = 7
+CSA_NUM_LAYERS = 3
+HCA_NUM_LAYERS = 2
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
@@ -699,8 +697,7 @@ def l3_decode_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[N_RANKS, T, VOCAB], pl.FP32]],
+    hidden_norm: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
@@ -712,7 +709,6 @@ def l3_decode_fwd(
     recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
     combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    hidden_norm = pl.create_tensor([N_RANKS, T, D], dtype=pl.BF16)
 
     for r in pl.range(pld.world_size()):
         pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32] = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -808,35 +804,6 @@ def l3_decode_fwd(
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
             r, num_tokens,
-            device=r,
-        )
-
-    lm_hidden_window_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX * D * 2)
-    lm_hidden_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
-    lm_logits_window_buf = pld.alloc_window_buffer(LM_HEAD_T_MAX * VOCAB * 4)
-    lm_logits_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
-    for r in pl.range(pld.world_size()):
-        lm_hidden_window: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], pl.BF16] = pld.window(
-            lm_hidden_window_buf, [LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], dtype=pl.BF16
-        )
-        lm_hidden_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
-            lm_hidden_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32
-        )
-        lm_logits_window: pld.DistributedTensor[[LM_HEAD_T_MAX, VOCAB], pl.FP32] = pld.window(
-            lm_logits_window_buf, [LM_HEAD_T_MAX, VOCAB], dtype=pl.FP32
-        )
-        lm_logits_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
-            lm_logits_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32
-        )
-        lm_head_tp(
-            hidden_norm[r],
-            lm_head_weight[r],
-            logits[r],
-            lm_hidden_window,
-            lm_hidden_done,
-            lm_logits_window,
-            lm_logits_done,
-            r,
             device=r,
         )
 
@@ -1255,7 +1222,7 @@ def build_tensor_specs(start_pos=None, num_tokens=T):
     from golden import ScalarSpec, TensorSpec
     base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
     metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w', 'lm_head_weight']
+    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
         if name in metadata_specs:
@@ -1272,11 +1239,9 @@ def build_tensor_specs(start_pos=None, num_tokens=T):
             specs.append(_make_hc_head_spec(name))
         elif name in FINAL_NORM_NAMES:
             specs.append(_make_final_norm_spec(name))
-        elif name in LM_HEAD_NAMES:
-            specs.append(_make_lm_head_spec(name))
         else:
             raise ValueError(f"unclassified decode_fwd spec: {name}")
-    specs.append(TensorSpec("logits", [N_RANKS, T, VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec("hidden_norm", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
