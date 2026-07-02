@@ -53,21 +53,20 @@ Q_LORA_INV = 1.0 / Q_LORA_RANK
 # Scope1 tiles
 RMSNORM_K = 512
 PROJ_K = 512
-Q_OUT_CHUNK = 64
-KV_OUT_CHUNK = 64
-LORA_CHUNK = 64
+Q_OUT_TILE = 64
+KV_OUT_TILE = 64
+LORA_TILE = 64
 
 # Scope2 tiles
-K_CHUNK = 128
-IDX_OUT_CHUNK = 128
-KIDX_OUT_CHUNK = 64
-QREDUCE_OUT_CHUNK = 64
+K_TILE = 128
+IDX_OUT_TILE = 128
+KIDX_OUT_TILE = 64
+QREDUCE_OUT_TILE = 64
 QREDUCE_BATCH_TILE = 16
-WEIGHTS_OUT_CHUNK = 16
+WEIGHTS_OUT_TILE = 16
 
 # Scope3 tiles
 SEQ_TILE = 64
-MAX_SEQ_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE
 Q_VALID = 1
 Q_PAD = 16
 SORT_LEN = 8192
@@ -75,8 +74,8 @@ FP32_NEG_INF = -3.4028234663852886e38
 
 # Scope4 tiles
 ATTN_SCALE = 1.0 / (QK_HEAD_DIM**0.5)
-Q_LATENT_CHUNK = 128
-V_OUT_CHUNK = 32
+Q_LATENT_TILE = 128
+V_OUT_TILE = 32
 MATMUL_ROW_PAD = 16
 
 
@@ -136,14 +135,14 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
             # Stage 1.2: Project qr = normed @ wq_a.
             qr_fp32 = pl.create_tensor([BATCH, Q_LORA_RANK], dtype=pl.FP32)
-            for q0 in pl.parallel(0, Q_LORA_RANK, LORA_CHUNK):
+            for q0 in pl.parallel(0, Q_LORA_RANK, LORA_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_lora_proj"):
                     q_tile_a = normed_states[:, 0 : PROJ_K]
-                    q_tile_b = wq_a[0 : PROJ_K, q0 : q0 + LORA_CHUNK]
+                    q_tile_b = wq_a[0 : PROJ_K, q0 : q0 + LORA_TILE]
                     q_acc = pl.matmul(q_tile_a, q_tile_b, out_dtype=pl.FP32)
                     for k0 in pl.range(PROJ_K, HIDDEN, PROJ_K):
                         q_tile_a_i = normed_states[:, k0 : k0 + PROJ_K]
-                        q_tile_b_i = wq_a[k0 : k0 + PROJ_K, q0 : q0 + LORA_CHUNK]
+                        q_tile_b_i = wq_a[k0 : k0 + PROJ_K, q0 : q0 + LORA_TILE]
                         q_acc = pl.matmul_acc(q_acc, q_tile_a_i, q_tile_b_i)
                     qr_fp32 = pl.assemble(qr_fp32, q_acc, [0, q0])
 
@@ -151,29 +150,29 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             qr_out = pl.create_tensor([BATCH, Q_LORA_RANK], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_lora_rmsnorm"):
                 q_partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
-                for k0 in pl.range(0, Q_LORA_RANK, LORA_CHUNK):
-                    qr_chunk_fp32 = qr_fp32[:, k0 : k0 + LORA_CHUNK]
+                for k0 in pl.range(0, Q_LORA_RANK, LORA_TILE):
+                    qr_chunk_fp32 = qr_fp32[:, k0 : k0 + LORA_TILE]
                     q_partial = pl.reshape(pl.row_sum(pl.mul(qr_chunk_fp32, qr_chunk_fp32)), [1, BATCH])
                     q_partial_sq = pl.add(q_partial_sq, q_partial)
                 q_variance = pl.reshape(pl.add(pl.mul(q_partial_sq, Q_LORA_INV), EPS), [BATCH, 1])
                 q_inv_rms = pl.recip(pl.sqrt(q_variance))
-                for k0 in pl.range(0, Q_LORA_RANK, LORA_CHUNK):
-                    qr_chunk_bf16 = pl.cast(qr_fp32[:, k0 : k0 + LORA_CHUNK], target_type=pl.BF16)
+                for k0 in pl.range(0, Q_LORA_RANK, LORA_TILE):
+                    qr_chunk_bf16 = pl.cast(qr_fp32[:, k0 : k0 + LORA_TILE], target_type=pl.BF16)
                     qr_chunk_fp32 = pl.cast(qr_chunk_bf16, target_type=pl.FP32)
-                    q_gamma = q_norm_weight[:, k0 : k0 + LORA_CHUNK]
+                    q_gamma = q_norm_weight[:, k0 : k0 + LORA_TILE]
                     q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk_fp32, q_inv_rms), q_gamma)
                     qr_out = pl.assemble(qr_out, pl.cast(q_normed, target_type=pl.BF16), [0, k0])
 
             # Stage 1.4: Project q_proj = qr @ wq_b.
             q_proj = pl.create_tensor([BATCH, NUM_HEADS * QK_HEAD_DIM], dtype=pl.BF16)
-            for q0 in pl.parallel(0, NUM_HEADS * QK_HEAD_DIM, Q_OUT_CHUNK):
+            for q0 in pl.parallel(0, NUM_HEADS * QK_HEAD_DIM, Q_OUT_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_head_proj"):
-                    q_chunk_init = qr_out[:, 0 : LORA_CHUNK]
-                    wq_b_init = wq_b[0 : LORA_CHUNK, q0 : q0 + Q_OUT_CHUNK]
+                    q_chunk_init = qr_out[:, 0 : LORA_TILE]
+                    wq_b_init = wq_b[0 : LORA_TILE, q0 : q0 + Q_OUT_TILE]
                     q_out_acc = pl.matmul(q_chunk_init, wq_b_init, out_dtype=pl.FP32)
-                    for k0 in pl.range(LORA_CHUNK, Q_LORA_RANK, LORA_CHUNK):
-                        q_chunk = qr_out[:, k0 : k0 + LORA_CHUNK]
-                        wq_b_chunk = wq_b[k0 : k0 + LORA_CHUNK, q0 : q0 + Q_OUT_CHUNK]
+                    for k0 in pl.range(LORA_TILE, Q_LORA_RANK, LORA_TILE):
+                        q_chunk = qr_out[:, k0 : k0 + LORA_TILE]
+                        wq_b_chunk = wq_b[k0 : k0 + LORA_TILE, q0 : q0 + Q_OUT_TILE]
                         q_out_acc = pl.matmul_acc(q_out_acc, q_chunk, wq_b_chunk)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_head_proj_write"):
@@ -181,14 +180,14 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
             # Stage 1.5: Project kv_a = normed @ wkv_a.
             kv_a_out = pl.create_tensor([BATCH, KV_A_OUT], dtype=pl.BF16)
-            for kv0 in pl.parallel(0, KV_A_OUT, KV_OUT_CHUNK):
+            for kv0 in pl.parallel(0, KV_A_OUT, KV_OUT_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_a_proj"):
                     kv_tile_a = normed_states[:, 0 : PROJ_K]
-                    kv_tile_b = wkv_a[0 : PROJ_K, kv0 : kv0 + KV_OUT_CHUNK]
+                    kv_tile_b = wkv_a[0 : PROJ_K, kv0 : kv0 + KV_OUT_TILE]
                     kv_acc = pl.matmul(kv_tile_a, kv_tile_b, out_dtype=pl.FP32)
                     for k0 in pl.range(PROJ_K, HIDDEN, PROJ_K):
                         kv_tile_a_i = normed_states[:, k0 : k0 + PROJ_K]
-                        kv_tile_b_i = wkv_a[k0 : k0 + PROJ_K, kv0 : kv0 + KV_OUT_CHUNK]
+                        kv_tile_b_i = wkv_a[k0 : k0 + PROJ_K, kv0 : kv0 + KV_OUT_TILE]
                         kv_acc = pl.matmul_acc(kv_acc, kv_tile_a_i, kv_tile_b_i)
 
                 # Stage 1.6: Final KV output cast.
@@ -257,14 +256,14 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
             # Stage 2.1: q_idx_full = wq_b_idx(qr_out).
             q_idx_full = pl.create_tensor([BATCH, INDEX_Q_OUT], dtype=pl.BF16)
-            for q0 in pl.parallel(0, INDEX_Q_OUT, IDX_OUT_CHUNK):
+            for q0 in pl.parallel(0, INDEX_Q_OUT, IDX_OUT_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_idx_proj"):
-                    s2_q_chunk_init = qr_out[:, 0 : LORA_CHUNK]
-                    s2_wq_chunk_init = wq_b_idx[0 : LORA_CHUNK, q0 : q0 + IDX_OUT_CHUNK]
+                    s2_q_chunk_init = qr_out[:, 0 : LORA_TILE]
+                    s2_wq_chunk_init = wq_b_idx[0 : LORA_TILE, q0 : q0 + IDX_OUT_TILE]
                     s2_q_acc = pl.matmul(s2_q_chunk_init, s2_wq_chunk_init, out_dtype=pl.FP32)
-                    for k0 in pl.range(LORA_CHUNK, Q_LORA_RANK, LORA_CHUNK):
-                        qr_chunk = qr_out[:, k0 : k0 + LORA_CHUNK]
-                        wq_chunk = wq_b_idx[k0 : k0 + LORA_CHUNK, q0 : q0 + IDX_OUT_CHUNK]
+                    for k0 in pl.range(LORA_TILE, Q_LORA_RANK, LORA_TILE):
+                        qr_chunk = qr_out[:, k0 : k0 + LORA_TILE]
+                        wq_chunk = wq_b_idx[k0 : k0 + LORA_TILE, q0 : q0 + IDX_OUT_TILE]
                         s2_q_acc = pl.matmul_acc(s2_q_acc, qr_chunk, wq_chunk)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_idx_proj_write"):
@@ -272,14 +271,14 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
 
             # Stage 2.2: k_idx = wk_idx(hidden_states).
             k_idx = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
-            for k1 in pl.parallel(0, INDEX_HEAD_DIM, KIDX_OUT_CHUNK):
+            for k1 in pl.parallel(0, INDEX_HEAD_DIM, KIDX_OUT_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_idx_proj"):
-                    s2_x_init = hidden_states[:, 0 : K_CHUNK]
-                    wk_init = wk_idx[0 : K_CHUNK, k1 : k1 + KIDX_OUT_CHUNK]
+                    s2_x_init = hidden_states[:, 0 : K_TILE]
+                    wk_init = wk_idx[0 : K_TILE, k1 : k1 + KIDX_OUT_TILE]
                     s2_k_acc = pl.matmul(s2_x_init, wk_init, out_dtype=pl.FP32)
-                    for k0 in pl.range(K_CHUNK, HIDDEN, K_CHUNK):
-                        s2_x_chunk = hidden_states[:, k0 : k0 + K_CHUNK]
-                        wk_chunk = wk_idx[k0 : k0 + K_CHUNK, k1 : k1 + KIDX_OUT_CHUNK]
+                    for k0 in pl.range(K_TILE, HIDDEN, K_TILE):
+                        s2_x_chunk = hidden_states[:, k0 : k0 + K_TILE]
+                        wk_chunk = wk_idx[k0 : k0 + K_TILE, k1 : k1 + KIDX_OUT_TILE]
                         s2_k_acc = pl.matmul_acc(s2_k_acc, s2_x_chunk, wk_chunk)
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_k_idx_proj_write"):
@@ -343,19 +342,19 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Stage 2.6: weights = weights_proj(hidden_states) * n_heads^-0.5 * head_dim^-0.5.
             weights_proj_bf16 = pl.create_tensor([HIDDEN, INDEX_HEADS], dtype=pl.BF16)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_weights_proj_bf16"):
-                for k0 in pl.range(0, HIDDEN, K_CHUNK):
-                    wp_tile = pl.cast(weights_proj[k0 : k0 + K_CHUNK, :], target_type=pl.BF16)
+                for k0 in pl.range(0, HIDDEN, K_TILE):
+                    wp_tile = pl.cast(weights_proj[k0 : k0 + K_TILE, :], target_type=pl.BF16)
                     weights_proj_bf16 = pl.assemble(weights_proj_bf16, wp_tile, [k0, 0])
 
             weights = pl.create_tensor([BATCH, INDEX_HEADS], dtype=pl.FP32)
-            for w0 in pl.parallel(0, INDEX_HEADS, WEIGHTS_OUT_CHUNK):
+            for w0 in pl.parallel(0, INDEX_HEADS, WEIGHTS_OUT_TILE):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_weights_matmul"):
-                    s2_x_init = hidden_states[:, 0 : K_CHUNK]
-                    wp_init = weights_proj_bf16[0 : K_CHUNK, w0 : w0 + WEIGHTS_OUT_CHUNK]
+                    s2_x_init = hidden_states[:, 0 : K_TILE]
+                    wp_init = weights_proj_bf16[0 : K_TILE, w0 : w0 + WEIGHTS_OUT_TILE]
                     s2_w_acc = pl.matmul(s2_x_init, wp_init, out_dtype=pl.FP32)
-                    for k0 in pl.range(K_CHUNK, HIDDEN, K_CHUNK):
-                        s2_x_chunk = hidden_states[:, k0 : k0 + K_CHUNK]
-                        wp_chunk = weights_proj_bf16[k0 : k0 + K_CHUNK, w0 : w0 + WEIGHTS_OUT_CHUNK]
+                    for k0 in pl.range(K_TILE, HIDDEN, K_TILE):
+                        s2_x_chunk = hidden_states[:, k0 : k0 + K_TILE]
+                        wp_chunk = weights_proj_bf16[k0 : k0 + K_TILE, w0 : w0 + WEIGHTS_OUT_TILE]
                         s2_w_acc = pl.matmul_acc(s2_w_acc, s2_x_chunk, wp_chunk)
                     weights = pl.assemble(weights, s2_w_acc, [0, w0])
 
@@ -372,13 +371,13 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             # Stage 2.8: Reduce q_idx_full across heads with weights to get q_idx_out.
             q_idx_out = pl.create_tensor([BATCH, INDEX_HEAD_DIM], dtype=pl.BF16)
             weights_flat = pl.reshape(weights, [BATCH * INDEX_HEADS])
-            with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk], name_hint="s2_q_reduce"):
-                for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_CHUNK):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="s2_q_reduce"):
+                for d0 in pl.parallel(0, INDEX_HEAD_DIM, QREDUCE_OUT_TILE):
                     for b in pl.range(BATCH):
-                        s2_acc_b = pl.full([1, QREDUCE_OUT_CHUNK], dtype=pl.FP32, value=0.0)
+                        s2_acc_b = pl.full([1, QREDUCE_OUT_TILE], dtype=pl.FP32, value=0.0)
                         for h in pl.range(INDEX_HEADS):
                             s2_q_h_b = pl.cast(
-                                pl.slice(q_idx_full, [1, QREDUCE_OUT_CHUNK], [b, h * INDEX_HEAD_DIM + d0]),
+                                pl.slice(q_idx_full, [1, QREDUCE_OUT_TILE], [b, h * INDEX_HEAD_DIM + d0]),
                                 target_type=pl.FP32,
                             )
                             s2_w_h_b = pl.read(weights_flat, [b * INDEX_HEADS + h])
@@ -399,7 +398,7 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
             s3_q_padded = pl.create_tensor([BATCH * Q_PAD, INDEX_HEAD_DIM], dtype=pl.BF16)
 
             for b in pl.parallel(BATCH):
-                s3_score_tiles = pl.create_tensor([MAX_SEQ_BLOCKS * Q_PAD, SEQ_TILE], dtype=pl.FP32)
+                s3_score_tiles = pl.create_tensor([(MAX_SEQ // SEQ_TILE) * Q_PAD, SEQ_TILE], dtype=pl.FP32)
 
                 # Stage 3.0: Pad q_idx_out and pre-fill scores.
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="s3_init"):
@@ -488,8 +487,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     # Stage 4.2: Project q_nope to latent space chunk-by-chunk.
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_q_nope_latent_proj"):
                         q_w_row = h * QK_NOPE_HEAD_DIM
-                        for q0 in pl.range(0, KV_LORA_RANK, Q_LATENT_CHUNK):
-                            w_qn_h_chunk = w_q_nope_to_latent_2d[q_w_row : q_w_row + QK_NOPE_HEAD_DIM, q0 : q0 + Q_LATENT_CHUNK]
+                        for q0 in pl.range(0, KV_LORA_RANK, Q_LATENT_TILE):
+                            w_qn_h_chunk = w_q_nope_to_latent_2d[q_w_row : q_w_row + QK_NOPE_HEAD_DIM, q0 : q0 + Q_LATENT_TILE]
                             q_nope_latent_part = pl.matmul(q_nope_padded, w_qn_h_chunk, out_dtype=pl.FP32)
                             q_nope_latent_batch = pl.assemble(q_nope_latent_batch, q_nope_latent_part, [0, q0])
 
@@ -537,8 +536,8 @@ def build_deepseek_v3_2_decode_front_scope1234_program():
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="s4_v_proj"):
                         ctx_v_batch = pl.full([MATMUL_ROW_PAD, V_HEAD_DIM], dtype=pl.FP32, value=0.0)
                         v_w_row = h * KV_LORA_RANK
-                        for v0 in pl.range(0, V_HEAD_DIM, V_OUT_CHUNK):
-                            wv_tile_chunk = w_latent_to_v_2d[v_w_row : v_w_row + KV_LORA_RANK, v0 : v0 + V_OUT_CHUNK]
+                        for v0 in pl.range(0, V_HEAD_DIM, V_OUT_TILE):
+                            wv_tile_chunk = w_latent_to_v_2d[v_w_row : v_w_row + KV_LORA_RANK, v0 : v0 + V_OUT_TILE]
                             v_part_batch = pl.matmul(ctx_latent_bf16_batch, wv_tile_chunk, out_dtype=pl.FP32)
                             ctx_v_batch = pl.assemble(ctx_v_batch, v_part_batch, [0, v0])
 
