@@ -15,7 +15,19 @@ is the usable prefix length; --compress-ratio {0,4,128} is a standalone fixture 
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, FP32_NEG_INF, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from config import (
+    BLOCK_SIZE,
+    FLASH as M,
+    FP32_NEG_INF,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    PREFILL_BATCH,
+    PREFILL_CMP_BLOCK_NUM,
+    PREFILL_CMP_MAX_BLOCKS,
+    PREFILL_ORI_BLOCK_NUM,
+    PREFILL_ORI_MAX_BLOCKS,
+    PREFILL_SEQ,
+)
 
 # Prefill target shape. T is fixed at 128.
 B = PREFILL_BATCH
@@ -44,10 +56,10 @@ SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 4
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 PREFILL_SPARSE_TOPK = min(TOPK, min(WIN, S) + PREFILL_MAX_COMPRESSED)
-ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
-ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
-CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
-CMP_BLOCK_NUM = B * CMP_MAX_BLOCKS
+ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 # Kernel tiling (mirrors decode sparse-attn).
 HEAD_TILE = 16                       # head-tile granularity for storage / merge
@@ -102,7 +114,7 @@ def prefill_sparse_attn(
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
@@ -128,7 +140,7 @@ def prefill_sparse_attn(
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
     # single wide MTE3 store. cmp_sparse_lens clamps the usable prefix.
     ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
     for gather_block in pl.spmd(((T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE) * PREFILL_ATTN_BLOCKS, name_hint="gather_kv"):
         gather_token_block = gather_block // PREFILL_ATTN_BLOCKS
@@ -440,7 +452,7 @@ def prefill_sparse_attn_test(
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
     kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
@@ -632,7 +644,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     def init_kv_overlay():
         return ((torch.rand(T, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
-        return ((torch.rand(CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
+        return ((torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_block_table():
         table = torch.zeros(CMP_MAX_BLOCKS, dtype=torch.int32)
         for blk in range(CMP_MAX_BLOCKS):
@@ -677,7 +689,7 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         TensorSpec("ori_kv", [ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
         TensorSpec("ori_block_table", [ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_kv_overlay),
-        TensorSpec("cmp_kv", [CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
+        TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
         TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),

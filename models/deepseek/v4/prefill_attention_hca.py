@@ -17,7 +17,17 @@ indices.
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ
+from config import (
+    BLOCK_SIZE,
+    FLASH as M,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    PREFILL_BATCH,
+    PREFILL_CMP_BLOCK_NUM,
+    PREFILL_CMP_MAX_BLOCKS,
+    PREFILL_ORI_MAX_BLOCKS,
+    PREFILL_SEQ,
+)
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
@@ -62,11 +72,11 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
 SPARSE_TOPK = WIN + IDX_TOPK
-SPARSE_ORI_MAX_BLOCKS = (S + BLOCK_SIZE - 1) // BLOCK_SIZE
+SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_ORI_BLOCK_NUM = B * SPARSE_ORI_MAX_BLOCKS
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
-SPARSE_CMP_BLOCK_NUM = B * SPARSE_CMP_MAX_BLOCKS
+SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+SPARSE_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 
 COMPRESS_RATIO = 128
 MAIN_OUT_DIM = HEAD_DIM
@@ -74,12 +84,13 @@ MAIN_STATE_LEN = COMPRESS_RATIO
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 START_POS = 0
 HCA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS
-HCA_CMP_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
+HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 
 assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
 assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
-assert SPARSE_ORI_BLOCK_NUM == B * SPARSE_ORI_MAX_BLOCKS
-assert SPARSE_CMP_BLOCK_NUM == B * SPARSE_CMP_MAX_BLOCKS
+assert SPARSE_ORI_MAX_BLOCKS * BLOCK_SIZE >= S, "prefill HCA ori cache pool is too small"
+assert SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE >= PREFILL_MAX_COMPRESSED, "prefill HCA cmp table is too small"
+assert SPARSE_CMP_BLOCK_NUM >= SPARSE_CMP_MAX_BLOCKS, "prefill HCA cmp physical pool is too small"
 assert PREFILL_COMPRESSED_LEN == 1
 
 

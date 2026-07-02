@@ -14,12 +14,19 @@ indices consumed by packed CSA prefill sparse attention.
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import (
+    FLASH as M,
+    BLOCK_SIZE,
+    FP32_NEG_INF,
+    IDX_CACHE_MAX_BLOCKS,
+    INT8_SCALE_MAX,
+    INT8_AMAX_EPS,
+    PREFILL_IDX_BLOCK_NUM,
+)
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
-    IDX_CACHE_MAX_BLOCKS,
     STATE_LEN as INNER_STATE_LEN,
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
@@ -45,11 +52,12 @@ INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 CACHE_TILE = 32
 
-# Compressed index-KV cache pool consumed by prefill_sparse_attn: one BLOCK_SIZE
-# page per PREFILL_MAX_COMPRESSED compressed entries.
-PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_CMP_MAX_BLOCKS = max(1, (PREFILL_MAX_COMPRESSED + BLOCK_SIZE - 1) // BLOCK_SIZE)
-PREFILL_IDX_BLOCK_NUM = SPARSE_CMP_MAX_BLOCKS
+# Index cache table width mirrors decode. The physical idx_kv_cache pool is
+# sized separately by PREFILL_IDX_BLOCK_NUM; keep the current score output cap
+# at 256 rows because prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP]
+# in one Vec scope.
+SPARSE_CMP_MAX_BLOCKS = 8
+INDEXER_SCORE_MAX_BLOCKS = 2
 
 B = 1
 S = 128
@@ -57,7 +65,8 @@ T = B * S
 START_POS = 0
 TOPK_TILE = 16
 assert T % TOPK_TILE == 0
-INDEXER_SCORE_CAP = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
+INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
+assert INDEXER_SCORE_CAP == 256, "INDEXER_SCORE_CAP must stay at 256 rows"
 INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
 INDEXER_OFFSET = WIN + T

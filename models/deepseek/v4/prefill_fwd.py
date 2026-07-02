@@ -95,6 +95,7 @@ from prefill_attention_csa import (
     O_GROUPS,
     O_GROUP_IN,
     O_LORA,
+    PREFILL_IDX_BLOCK_NUM,
     Q_LORA,
     ROPE_HEAD_DIM,
     SPARSE_CMP_MAX_BLOCKS,
@@ -106,12 +107,6 @@ from prefill_attention_csa import (
 )
 from hc_head import hc_head
 from rmsnorm import rms_norm
-from lm_head import (
-    TP_SIZE as LM_HEAD_ACTIVE_TP_SIZE,
-    T_MAX as LM_HEAD_T_MAX,
-    VOCAB_PER_TP,
-    lm_head_tp,
-)
 
 # ---------------------------------------------------------------------------
 # Model layer schedule (DeepSeek-V4 Flash, 43 hidden layers):
@@ -129,13 +124,11 @@ FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
-assert N_RANKS == LM_HEAD_ACTIVE_TP_SIZE, "prefill_fwd with lm_head currently supports --ep 2 / TP=2 only"
 
-# Replicated head weights (per-rank, not layer-stacked): hc_head projection, the
-# final RMSNorm gamma, and the TP-sharded lm_head matrix — mirrors decode_fwd.
+# Replicated head weights (per-rank, not layer-stacked): hc_head projection and
+# the final RMSNorm gamma — mirrors decode_fwd.
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
-LM_HEAD_NAMES = ["lm_head_weight"]
 
 # Per-FWD-layer stacked weights (sliced by the FWD layer index 0..42).
 FWD_LAYER_STACKED_NAMES = [
@@ -219,7 +212,7 @@ def prefill_fwd(
     csa_inner_norm_w: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
     csa_inner_kv_state: pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     csa_inner_score_state: pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    idx_kv_cache: pl.Tensor[[CSA_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
     hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
@@ -440,7 +433,7 @@ def prefill_fwd(
         csa_inner_score_state_csa: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_score_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], [loop_i * INNER_STATE_BLOCK_NUM, 0, 0])
         kv_cache_csa: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(kv_cache, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer * CSA_ORI_BLOCK_NUM, 0, 0, 0])
         cmp_kv_csa: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer * CSA_CMP_BLOCK_NUM, 0, 0, 0])
-        idx_kv_cache_csa: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16] = pl.slice(idx_kv_cache, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], [loop_i * CSA_CMP_BLOCK_NUM, 0, 0, 0])
+        idx_kv_cache_csa: pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16] = pl.slice(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], [loop_i * PREFILL_IDX_BLOCK_NUM, 0, 0, 0])
         attn_sink_csa: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer * H])
         wo_a_csa: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer * O_GROUPS, 0, 0])
         wo_b_csa: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [csa_layer * D, 0])
@@ -606,7 +599,7 @@ def prefill_fwd(
     csa_inner_score_state_last: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32] = pl.slice(csa_inner_score_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], [csa_order_last * INNER_STATE_BLOCK_NUM, 0, 0])
     kv_cache_last: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(kv_cache, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer_last * CSA_ORI_BLOCK_NUM, 0, 0, 0])
     cmp_kv_last: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [csa_layer_last * CSA_CMP_BLOCK_NUM, 0, 0, 0])
-    idx_kv_cache_last: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16] = pl.slice(idx_kv_cache, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], [csa_order_last * CSA_CMP_BLOCK_NUM, 0, 0, 0])
+    idx_kv_cache_last: pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16] = pl.slice(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], [csa_order_last * PREFILL_IDX_BLOCK_NUM, 0, 0, 0])
     attn_sink_last: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [csa_layer_last * H])
     wo_a_last: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [csa_layer_last * O_GROUPS, 0, 0])
     wo_b_last: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [csa_layer_last * D, 0])
@@ -714,7 +707,7 @@ def l3_prefill_fwd(
     csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
     csa_inner_kv_state: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     csa_inner_score_state: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    idx_kv_cache: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
@@ -757,8 +750,7 @@ def l3_prefill_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    logits: pl.Out[pl.Tensor[[N_RANKS, T, VOCAB], pl.FP32]],
+    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
@@ -770,7 +762,6 @@ def l3_prefill_fwd(
     recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
     combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    hidden_norm = pl.create_tensor([N_RANKS, T, D], dtype=pl.BF16)
 
     for r in pl.range(pld.world_size()):
         pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32] = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -804,7 +795,7 @@ def l3_prefill_fwd(
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
             cmp_sparse_indices[r], cmp_sparse_lens[r],
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
-            hidden_norm[r],
+            hidden_out[r],
             pub_counts, count_done, data_done,
             recv_x, recv_scale, recv_w, recv_r_route,
             routed_y_buf, combine_done,
@@ -815,35 +806,6 @@ def l3_prefill_fwd(
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
             r, num_tokens,
-            device=r,
-        )
-
-    lm_hidden_window_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX * D * 2)
-    lm_hidden_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
-    lm_logits_window_buf = pld.alloc_window_buffer(LM_HEAD_T_MAX * VOCAB * 4)
-    lm_logits_done_buf = pld.alloc_window_buffer(LM_HEAD_ACTIVE_TP_SIZE * 4)
-    for r in pl.range(pld.world_size()):
-        lm_hidden_window: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], pl.BF16] = pld.window(
-            lm_hidden_window_buf, [LM_HEAD_ACTIVE_TP_SIZE * LM_HEAD_T_MAX, D], dtype=pl.BF16
-        )
-        lm_hidden_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
-            lm_hidden_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32
-        )
-        lm_logits_window: pld.DistributedTensor[[LM_HEAD_T_MAX, VOCAB], pl.FP32] = pld.window(
-            lm_logits_window_buf, [LM_HEAD_T_MAX, VOCAB], dtype=pl.FP32
-        )
-        lm_logits_done: pld.DistributedTensor[[LM_HEAD_ACTIVE_TP_SIZE, 1], pl.INT32] = pld.window(
-            lm_logits_done_buf, [LM_HEAD_ACTIVE_TP_SIZE, 1], dtype=pl.INT32
-        )
-        lm_head_tp(
-            hidden_norm[r],
-            lm_head_weight[r],
-            logits[r],
-            lm_hidden_window,
-            lm_hidden_done,
-            lm_logits_window,
-            lm_logits_done,
-            r,
             device=r,
         )
 
@@ -972,23 +934,6 @@ def _make_final_norm_spec(name):
             init_value=lambda: (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16),
         )
     raise ValueError(f"unclassified final norm spec: {name}")
-
-
-def _make_lm_head_spec(name):
-    import torch
-    from golden import TensorSpec
-
-    if name == "lm_head_weight":
-        def init_lm_head_weight():
-            return (torch.randn(N_RANKS, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-
-        return TensorSpec(
-            name,
-            [N_RANKS, VOCAB_PER_TP, D],
-            torch.bfloat16,
-            init_value=init_lm_head_weight,
-        )
-    raise ValueError(f"unclassified lm_head spec: {name}")
 
 
 # Canonical host-tensor order for a single unified prefill layer.
@@ -1286,7 +1231,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
         "hc_head_fn", "hc_head_scale", "hc_head_base",
-        "final_norm_w", "lm_head_weight",
+        "final_norm_w",
     ]
 
     specs = []
@@ -1304,12 +1249,10 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             specs.append(_make_hc_head_spec(name))
         elif name in FINAL_NORM_NAMES:
             specs.append(_make_final_norm_spec(name))
-        elif name in LM_HEAD_NAMES:
-            specs.append(_make_lm_head_spec(name))
         else:
             specs.append(_make_stacked_spec(name, base_specs))
 
-    specs.append(TensorSpec("logits", [N_RANKS, T, VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     from golden import ScalarSpec
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs

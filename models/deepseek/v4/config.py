@@ -253,6 +253,22 @@ C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 LM_HEAD_TP_SIZE = 8
 
+# Static paged-cache pools shared by decode and prefill kernels. Prefill uses a
+# decode-batch-sized physical pool because serving slot ids address the shared
+# decode KV-cache layout even when a prefill kernel handles one request at a time.
+KV_ORI_MAX_BLOCKS = 1
+KV_CMP_MAX_BLOCKS = 8
+IDX_CACHE_MAX_BLOCKS = 64
+DECODE_ORI_BLOCK_NUM = DECODE_BATCH * KV_ORI_MAX_BLOCKS
+DECODE_CMP_BLOCK_NUM = DECODE_BATCH * KV_CMP_MAX_BLOCKS
+DECODE_IDX_BLOCK_NUM = DECODE_BATCH * IDX_CACHE_MAX_BLOCKS
+PREFILL_ORI_MAX_BLOCKS = (PREFILL_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
+PREFILL_ORI_BLOCK_NUM = PREFILL_BATCH * PREFILL_ORI_MAX_BLOCKS
+PREFILL_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+PREFILL_CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM  # shared decode-batch physical pool
+PREFILL_IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
+PREFILL_IDX_BLOCK_NUM = DECODE_IDX_BLOCK_NUM  # shared decode-batch physical pool
+
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127
 INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero rows
@@ -261,10 +277,18 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 # EP communication constants
 EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
 RECV_SAFETY = 4
+RECV_BUFFER_FLOOR = 1024
 
 # Per-expert recv-buffer depth: peak rows one local expert receives
-# (tokens * topk / expert-shard) * RECV_SAFETY, floored at 16. Decode and prefill
-# bake different depths; default to decode, prefill overrides to PREFILL_RECV_MAX.
-DECODE_RECV_MAX = max(16, DECODE_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
-PREFILL_RECV_MAX = max(16, PREFILL_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE))
+# (tokens * topk / expert-shard) * RECV_SAFETY, floored at 1024 rows for the
+# current fixed-window distributed MoE layout. Decode and prefill bake different
+# depths; default to decode, prefill overrides to PREFILL_RECV_MAX.
+DECODE_RECV_MAX = max(
+    RECV_BUFFER_FLOOR,
+    DECODE_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE),
+)
+PREFILL_RECV_MAX = max(
+    RECV_BUFFER_FLOOR,
+    PREFILL_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE),
+)
 RECV_MAX = DECODE_RECV_MAX
