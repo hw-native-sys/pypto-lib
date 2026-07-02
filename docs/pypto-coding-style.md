@@ -85,6 +85,38 @@ class Qwen3Decode:
 | `Orchestration` | Top-level entry that sequences other methods (host / AICPU control flow, cross-rank dispatch). |
 | `InCore` | A single InCore region authored directly — `pl.spmd` / `pl.parallel` / `pl.pipeline` and scalar loops, no surrounding `pl.at`. |
 
+### Output parameter direction: `pl.Out` / `pl.InOut`
+
+Every tensor the golden test compares **must** declare an explicit direction on
+the **orchestration entry** — the `@pl.jit` entry, its `@pl.jit.host` driver, or
+the `@pl.function(type=Opaque)` / `Orchestration` method. A plain `pl.Tensor` is
+treated as `In`: the runtime skips its device→host copy-back, so the tensor
+**reads back as all-zeros on the host** and golden silently fails. The direction
+is decided by the tensor's `TensorSpec`:
+
+| `TensorSpec` | meaning | annotation |
+|--------------|---------|------------|
+| `is_output=True`, no `init_value` | pure output (write-only) | `pl.Out[pl.Tensor[...]]` |
+| `is_output=True` **and** `init_value` | inout — read-modify-write (e.g. a paged KV cache the kernel reads history from and appends to; recurrent state) | `pl.InOut[pl.Tensor[...]]` |
+
+Annotate the **entry only**. `@pl.jit.inline` sub-kernels keep bare `pl.Tensor`:
+they are spliced at the call site before SSA conversion, so a parameter is
+already an in-place alias of the caller's variable and the direction tag carries
+no information — a `pl.Out` / `pl.InOut` wrapper on an inline param is stripped
+and raises a `DeprecationWarning`. Entry `pl.InOut` paired with a bare-`pl.Tensor`
+inline is the correct combination.
+
+```python
+@pl.jit
+def attention_csa_test(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],          # In — plain
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, ...], pl.BF16]],  # read old tokens + append new
+    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],          # pure output
+):
+    attention_csa(x_hc, ..., kv_cache, x_out)           # inline params stay bare pl.Tensor
+    return x_out
+```
+
 ### `pl.at` scopes
 
 | Parameter | Required | Purpose |
