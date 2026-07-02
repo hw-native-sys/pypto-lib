@@ -720,6 +720,8 @@ if __name__ == "__main__":
                         help="Fixture-only compatibility seed for position_ids and slot mappings; "
                              "otherwise use the default per-batch coverage pattern.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -727,6 +729,8 @@ if __name__ == "__main__":
         fn=attention_hca_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_hca,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,

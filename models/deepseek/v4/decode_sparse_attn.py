@@ -211,7 +211,7 @@ def sparse_attn(
 
     # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
     # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid"):
+    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid", allow_early_resolve=True):
         v_t0 = v_blk * VALID_TOKEN_TILE
         v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : TOPK], target_type=pl.FP32)
         # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)

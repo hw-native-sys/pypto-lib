@@ -249,7 +249,7 @@ def qkv_proj_rope(
     # of the rotation and is folded into the writeback.
     #   out[j] = inv_rms * (x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j])
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope"):
+    for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope", allow_early_resolve=True):
         hg = hg_idx * 2
         # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
         q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
