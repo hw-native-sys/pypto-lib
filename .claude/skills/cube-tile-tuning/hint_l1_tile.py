@@ -64,16 +64,23 @@ Acc fit (must be ≤ acc_buffer_bytes; the L0C accumulator buffer, default 128 K
 
 DMA cost (no inter-task reuse; per-tile load/store, summed across iterations):
   Each load's innermost-row stride is rounded up to `cache_line_bytes`
-  (default 512 B on Ascend 910B L2). A tile with TN*bb = 256 B per row still
-  pulls 512 B per row from DDR, doubling its B-load cost. Sub-cache-line
-  tiles are allowed but charged the full cache line.
+  (default 512 B on Ascend 910B L2). A row shorter than a cache line still
+  pulls a full line from DDR, wasting the remainder. Sub-cache-line tiles are
+  allowed but charged the full line.
 
-  row_a_eff = max(TK*ba, cache_line)            # bytes per A row
-  row_b_eff = max(TN*bb, cache_line)            # bytes per B row
-  row_c_eff = max(TN*bc, cache_line)            # bytes per C row
+  The weight (B) contiguous axis depends on its storage layout (transpose lever):
+    b_trans=False (default): B stored [K, N], N-contiguous -> B row = TN elems.
+    b_trans=True:            B stored [N, K], K-contiguous -> B row = TK elems
+                             (pl.matmul(a, w, b_trans=True); the long-K case gives
+                             longer bursts / fewer MTE2 transactions).
+  A is [M, K] (K-contiguous) and C is [M, N] (N-contiguous) regardless.
+
+  row_a_eff = max(TK*ba, cache_line)                        # bytes per A row
+  row_b_eff = max((TK if b_trans else TN)*bb, cache_line)   # bytes per B row
+  row_c_eff = max(TN*bc, cache_line)                        # bytes per C row
 
   A_tile_eff = TM * row_a_eff
-  B_tile_eff = TK * row_b_eff
+  B_tile_eff = (TN if b_trans else TK) * row_b_eff          # rows-in-tile flips with layout
   C_tile_eff = TM * row_c_eff
 
   DMA(A) = num_tasks * (LM*LK if pin A else LM*LN*LK) * A_tile_eff
@@ -232,14 +239,20 @@ def _dma_bytes(
     ba: int, bb: int, bc: int,
     pin: PinSet,
     cache_line: int,
+    b_trans: bool = False,
 ) -> int:
     """Total DMA across all outer tasks; per-tile innermost row stride is
-    rounded up to ``cache_line`` (sub-cache-line loads pay the full line)."""
+    rounded up to ``cache_line`` (sub-cache-line loads pay the full line).
+
+    ``b_trans`` selects the weight (B) layout: False -> [K, N] N-contiguous
+    (B row = TN elems); True -> [N, K] K-contiguous (B row = TK elems). The
+    tile byte count TK*TN*bb is identical either way; only the cache-line
+    rounding of the contiguous row differs."""
     row_a_eff = max(TK * ba, cache_line)
-    row_b_eff = max(TN * bb, cache_line)
+    row_b_eff = max((TK if b_trans else TN) * bb, cache_line)
     row_c_eff = max(TN * bc, cache_line)
     a_tile = TM * row_a_eff
-    b_tile = TK * row_b_eff
+    b_tile = (TN if b_trans else TK) * row_b_eff
     c_tile = TM * row_c_eff
 
     num_tasks = OM * ON * OK
@@ -271,6 +284,7 @@ def hint_l1_tile(
     cache_line_bytes: int = 512,
     max_waves: int = 3,
     wave_considered: bool = True,
+    b_trans: bool = False,
 ) -> list[TileCandidate]:
     """Sweep (TM, TN, TK, OM, ON, OK, pin) and return all feasible candidates.
 
@@ -301,8 +315,15 @@ def hint_l1_tile(
     if max_waves <= 0:
         raise ValueError(f"max_waves must be > 0, got {max_waves}")
 
-    perf_min_n = max(1, _ceil_div(min_contig_bytes, bytes_b))
-    perf_min_k = max(1, _ceil_div(min_contig_bytes, bytes_a))
+    # Search floors: only the *contiguous* axes have a min-contig-bytes floor.
+    # b_trans=False: B is N-contiguous (floor N by bytes_b), A is K-contiguous.
+    # b_trans=True : B is K-contiguous (floor K by bytes_b too); N is strided -> no floor.
+    if b_trans:
+        perf_min_n = 1
+        perf_min_k = max(1, _ceil_div(min_contig_bytes, min(bytes_a, bytes_b)))
+    else:
+        perf_min_n = max(1, _ceil_div(min_contig_bytes, bytes_b))
+        perf_min_k = max(1, _ceil_div(min_contig_bytes, bytes_a))
     perf_min_m = max(1, m_min)
 
     # Pad each dim up to the next multiple of `tile_multiple`; tile sizes are
@@ -365,7 +386,7 @@ def hint_l1_tile(
                                 dma_total = _dma_bytes(
                                     TM, TN, TK, OM, ON, OK, LM, LN, LK,
                                     bytes_a, bytes_b, bytes_c, pin,
-                                    cache_line_bytes)
+                                    cache_line_bytes, b_trans)
                                 dma_per_task = dma_total // num_tasks
                                 dma_seq = dma_per_task * num_waves
                                 candidates.append(TileCandidate(
@@ -405,11 +426,12 @@ def _fmt_bytes(b: int) -> str:
 
 def _print(M: int, N: int, K: int, l1: int, acc: int, cores: int,
            cands: list[TileCandidate], top_n: int,
-           wave_considered: bool) -> None:
+           wave_considered: bool, b_trans: bool = False) -> None:
     mode = "wave-considered" if wave_considered else "non-wave-considered"
     rank_metric = "sequential DMA" if wave_considered else "total DMA"
+    layout = "weight [N,K] K-contig (b_trans)" if b_trans else "weight [K,N] N-contig"
     print(f"\nMatmul (M={M}, N={N}, K={K}), L1 budget {_fmt_bytes(l1)} (A+B), "
-          f"Acc budget {_fmt_bytes(acc)} (C), per core, {cores} cores [{mode}]")
+          f"Acc budget {_fmt_bytes(acc)} (C), per core, {cores} cores [{mode}; {layout}]")
     print(
         "  Notation: each axis decomposes as dim = O * L * T:\n"
         "    T (Tile)  = L1-resident fragment per load/store\n"
@@ -543,6 +565,15 @@ def _main() -> None:
     )
     p.set_defaults(wave_considered=True)
     p.add_argument(
+        "--b-trans",
+        dest="b_trans",
+        action="store_true",
+        help="Weight (B) stored [N, K] K-contiguous (pl.matmul b_trans=True): the "
+             "B DMA row is TK elems, not TN. Default (off) models [K, N] "
+             "N-contiguous weights, the common PyPTO layout.",
+    )
+    p.set_defaults(b_trans=False)
+    p.add_argument(
         "--tile-multiple",
         type=int,
         default=16,
@@ -574,9 +605,10 @@ def _main() -> None:
         cache_line_bytes=args.cache_line,
         max_waves=args.max_waves,
         wave_considered=args.wave_considered,
+        b_trans=args.b_trans,
     )
     _print(args.M, args.N, args.K, args.l1_bytes, args.acc_bytes, args.cores,
-           cands, args.top, args.wave_considered)
+           cands, args.top, args.wave_considered, args.b_trans)
 
 
 if __name__ == "__main__":

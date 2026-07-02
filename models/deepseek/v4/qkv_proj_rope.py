@@ -35,14 +35,31 @@ ROPE_TILE = 64
 ROPE_PAIR_TILE = 32
 HEAD_TILE = 64
 Q_PROJ_OUT_TILE = 128   # qproj_dequant N-tile (128 INT32 = 512B = 1 full L2 line)
-Q_PROJ_TILE = 512       # qproj K-tile (Q_LORA reduction)
-# qproj_matmul output N-tile, DECOUPLED from the dequant N-tile above. wq_b is INT8
-# with N innermost, so a B-row is TN bytes: at the old TN=128 each 128B row still pulls
-# a full 512B L2 line -> 4x weight over-fetch on this MTE2-bound matmul. TN=256 halves
-# that (256B/line). It can't go wider without M-splitting: TM*TN*4 (L0C Acc) caps at
-# 128KB, so TN=512 forces TM=64, and the resulting weight re-load + TK<=256 cap measured
-# no faster end-to-end. Measured: qproj_matmul -17.5%, decode total -4.3% vs TN=128.
+Q_PROJ_TILE = 512       # qproj K-tile (Q_LORA reduction). wq_b is stored TRANSPOSED and
+                        # consumed via b_trans=True, so K is the DMA-contiguous axis and TK
+                        # must be >= a full 512B L2 line: TK=512 (INT8) = 1 exact line.
+# qproj_matmul output N-tile, DECOUPLED from the dequant N-tile above. wq_b is stored
+# TRANSPOSED as [H*HEAD_DIM, Q_LORA] = [N, K] (K innermost) and consumed via b_trans=True,
+# so the MTE2 weight stream is K-contiguous (DN2ZN load path): longer, fewer bursts than
+# the old [K,N] N-contiguous form and measurably more MTE2-efficient here. Because N is now
+# the *strided* axis it is free of the cache-line floor, so TN=256 (was pinned at 512 in
+# the non-transposed form). Mat/L1: weight N*TK*2 double-buffered = 256*512*2 = 256KB <
+# 512KB; L0C Acc = TM*TN*4 = 16KB. TN=512 here would force TK<=256 (sub-line on the now-
+# contiguous K -> defeats the transpose); TN=128/TK=1024 measured slower. Measured vs the
+# non-transposed [K,N] TN=512/TK=256 form at a matched 16 tasks: qproj_matmul 39.5->31.9us
+# (-20% scope), decode total_span 175->163us (-7%); vs the original GROUP=8 [K,N] baseline,
+# 193->163us (-15%). NB: transposing wq_b is a WEIGHT-LAYOUT CONTRACT -- the quant/loader
+# that produces wq_b must emit [N, K] (the golden here does the .t() to match).
 QPROJ_MM_N_TILE = 256
+# qproj_matmul spmd grouping: N-tiles handled serially per spmd task. Total N-tiles =
+# (H*HEAD_DIM)//QPROJ_MM_N_TILE = 128; task count = 128 // QPROJ_N_GROUP. Smaller group =>
+# more parallel tasks => the MTE2-bound weight stream spreads over more cube cores (fewer
+# serial N-tiles/core), at the cost of more dispatch + concurrent-scope core contention.
+# Swept task counts {8,16,32,64} on a2a3 decode (8 real tokens, 3 runs/pt): 16 tasks
+# (GROUP=8) is the sweet spot -- it fills the ~16 cube cores free during qproj's window in
+# one clean wave; 32 tasks ties within noise, 64 and <=8 are worse. (Same 16-task optimum
+# as the non-transposed form, reached at GROUP=8 because TN=256 doubles the N-tile count.)
+QPROJ_N_GROUP = 8
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 256
@@ -55,9 +72,9 @@ T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 # (e.g. the matmul N-tile is no longer chained to KV_TILE / Q_LORA_TILE, which the
 # NOPE_DIM=448 constraint caps at <=64).
 QR_M_TILE = MATMUL_T_TILE  # qr_proj token (M) tile; cube rows must be a 16-row boxed tile
-QR_N_TILE = 128         # qr_proj Q_LORA (N) per matmul
+QR_N_TILE = 256         # qr_proj Q_LORA (N) per matmul; TN=256 (full 512B line) -> ON=Q_LORA/256=4
 QR_K_TILE = 256         # qr_proj D (K) reduction tile    | divides QR_K_SLICE
-QR_OK = 2               # qr_proj split-K factor          | D//QR_OK cores share each N-group
+QR_OK = 2               # qr_proj split-K; ON(4)*OK(2)=8 spmd tasks -> 8 cube cores (save-cores; see below)
 QR_K_SLICE = D // QR_OK # qr_proj K per split (=2048)     | QR_K_SLICE//QR_K_TILE inner chunks
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_N_TILE = 128         # kv_proj HEAD_DIM (N) per matmul
@@ -77,7 +94,7 @@ assert (DECODE_BATCH * DECODE_SEQ) % DEQUANT_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % DEQUANT_T_TILE == 0
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
-assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 8 == 0
+assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % QPROJ_N_GROUP == 0
 assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % KV_RMS_T_TILE == 0
@@ -108,7 +125,7 @@ def materialize_rope_rows(
 def qkv_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[H * HEAD_DIM, Q_LORA], pl.INT8],  # stored transposed [N, K] for b_trans=True
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -129,12 +146,15 @@ def qkv_proj_rope(
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
     t_matmul = pl.max(t_dim, MATMUL_T_TILE)
 
-    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). TN=256 makes each wq_a
-    # row-read a full 512B L2 line (vs 128B sub-line at TN=64), but only leaves
-    # Q_LORA//256=4 N-groups -> too few to fill 24 cores. So split K into QR_OK
-    # slices dispatched as separate cores and atomic-add their partials into a
-    # zero-seeded output. The seed loop must land before the adds; the auto-dep
-    # on qr_fp32 (WAW: seed write -> atomic RMW) enforces that ordering.
+    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024), sized to DELIBERATELY use only
+    # 8 cube cores to free hardware for other work. TN=256 -> ON=Q_LORA/256=4 full-512B-line
+    # N-groups; QR_OK=2 splits K into 2 slices -> ON*OK=8 spmd tasks, atomic-added into a
+    # zero-seeded output. Measured tradeoff on the isolated qkv leaf (decode a2a3, seeded,
+    # median of 7): the 16-task TN=128/OK=2 form = 161.5us vs this 8-task form = 167.1us
+    # (+5.6us); a 16-task TN=256/OK=4 form is full-line and ~wall-neutral but frees no cores.
+    # Chosen to prioritize core headroom over qkv-leaf wall time (cube-tile-tuning sweep,
+    # 2026-07). The seed loop must land before the adds; the auto-dep on qr_fp32 (WAW: seed
+    # write -> atomic RMW) enforces that ordering.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
@@ -205,20 +225,29 @@ def qkv_proj_rope(
     # can defer the off-critical-path dequant (q has large downstream slack) to when AIV is free.
     q_proj_fp32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.FP32)
     q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
-    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 8, name_hint="qproj_matmul"):
-        hg = hg_idx * 8
-        for h_inner in pl.range(8):
+    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // QPROJ_N_GROUP, name_hint="qproj_matmul"):
+        hg = hg_idx * QPROJ_N_GROUP
+        for h_inner in pl.range(QPROJ_N_GROUP):
             w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
             for tc in pl.range(t_matmul // QPROJ_M_TILE):
                 t0 = tc * QPROJ_M_TILE
-                qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, 0:Q_PROJ_TILE]
-                wq_chunk = wq_b[0:Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                for qb in pl.pipeline(1, Q_LORA // Q_PROJ_TILE, stage=2):
-                    qr_proj_col0 = qb * Q_PROJ_TILE
+                # Fold the whole K reduction (Q_LORA) into ONE stage=2 pipeline with an
+                # if-first branch, rather than a bare first matmul + pipeline over the rest.
+                # Keeping chunk 0 inside the pipeline lets its stage=2 prologue prefetch the
+                # next chunk's operands while chunk 0's matmul runs, so this MTE2-bound cube
+                # keeps the pipe busy from the first iteration. Measured -14% qproj_matmul
+                # (548 -> 472us aggregate exec, 6 runs/form, disjoint ranges) vs the
+                # first-matmul-outside form.
+                col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+                for qr_proj_col0 in pl.pipeline(0, Q_LORA, Q_PROJ_TILE, stage=2):
                     qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
-                    wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+                    # wq_b is stored transposed [N, K] (K-contiguous): slice [TN, TK] and
+                    # consume via b_trans=True. Same product as the old [K,N] form.
+                    wq_chunk = wq_b[w_col0 : w_col0 + QPROJ_MM_N_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
+                    if qr_proj_col0 == 0:
+                        col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32, b_trans=True)
+                    else:
+                        col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk, b_trans=True)
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
     for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj_dequant"):
@@ -385,7 +414,7 @@ def qkv_proj_rope(
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b: pl.Tensor[[H * HEAD_DIM, Q_LORA], pl.INT8],  # stored transposed [N, K] for b_trans=True
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
     wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
     rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
@@ -477,7 +506,7 @@ def golden_qkv_proj_rope(tensors):
     # W8A8C16: wq_b W8 per-output-channel int8; qr_out A8 per-token int8.
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
     qr_i8, qr_scale = int8_quant_per_row(qr_out.float())
-    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
+    q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32).t())  # wq_b stored [N, K] transposed
     q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, H, HEAD_DIM)
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
     q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
@@ -534,11 +563,14 @@ def build_tensor_specs(B, S):
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = quant_w_per_output_channel(wq_b_bf16)
     wq_b_scale = wq_b_scale.view(H * HEAD_DIM)
+    # qproj consumes wq_b via b_trans=True, so materialize it transposed [N, K].
+    # (per-output-channel quant/scale are along N and unchanged by the transpose.)
+    wq_b_i8 = wq_b_i8.t().contiguous()
 
     return [
         TensorSpec("x",         [T, D],                 torch.bfloat16, init_value=init_x),
         TensorSpec("wq_a",      [D, Q_LORA],            torch.bfloat16, init_value=init_wq_a),
-        TensorSpec("wq_b",      [Q_LORA, H * HEAD_DIM], torch.int8,     init_value=lambda: wq_b_i8),
+        TensorSpec("wq_b",      [H * HEAD_DIM, Q_LORA], torch.int8,     init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("wkv",       [D, HEAD_DIM],          torch.bfloat16, init_value=init_wkv),
         TensorSpec("rope_cos",  [T, ROPE_DIM],          torch.bfloat16, init_value=init_cos),
