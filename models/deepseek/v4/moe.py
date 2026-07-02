@@ -269,17 +269,15 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    for tb in pl.spmd(T // 4, name_hint="shared_routed"):
-        for tt in pl.range(4):
-            t = tb * 4 + tt
-            if t < active_tokens:
-                acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-                for k in pl.range(TOPK):
-                    r = t * TOPK + k
-                    acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-                ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-            else:
-                ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+    for t in pl.spmd(T, name_hint="shared_routed"):
+        if t < active_tokens:
+            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+            for k in pl.range(TOPK):
+                r = t * TOPK + k
+                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+        else:
+            ffn_out[t:t + 1, :] = sh[t:t + 1, :]
 
 
 @pl.jit.inline(auto_scope=False)
