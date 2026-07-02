@@ -430,14 +430,6 @@ jobs:
             # the top; ring sizes come from the step env: above.
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$f" | head -1)
             ndev=${ndev:-1}
-            # Files whose kernel uses a full-occupancy `pl.system.syncall` barrier
-            # declare `# ci: no-dep-gen`: dep_gen (DFX) instrumentation perturbs
-            # core occupancy and trips the syncall full-occupancy contract
-            # (AICore timeout 507018 — pypto#1931). Run those with dep_gen off.
-            depgen_args=()
-            if grep -qE '^#\s*ci:\s*no-dep-gen' "$f"; then
-              depgen_args+=(--no-dep-gen)
-            fi
             if [ "$ndev" -gt 1 ]; then
               if [ -z "$DEVICE_RANGE" ]; then
                 echo "::error file=${f}::needs $ndev devices but DEVICE_RANGE is unset"
@@ -452,9 +444,9 @@ jobs:
                 echo "::endgroup::"
                 continue
               fi
-              python "$f" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "${depgen_args[@]}"
+              python "$f" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")"
             else
-              python "$f" -p a2a3 -d "$DEVICE_ID" "${depgen_args[@]}"
+              python "$f" -p a2a3 -d "$DEVICE_ID"
             fi
             if [ $? -ne 0 ]; then
               failed+=("$f")

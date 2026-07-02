@@ -645,7 +645,7 @@ if __name__ == "__main__":
         program=build_qwen3_decode_program(),
         specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_qwen3_decode,
-        compile_cfg=dict(dump_passes=True),
+        compile_cfg=dict(dump_passes=False),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
