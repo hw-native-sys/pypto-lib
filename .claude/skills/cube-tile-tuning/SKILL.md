@@ -43,10 +43,18 @@ python .claude/skills/cube-tile-tuning/hint_l1_tile.py --M <M> --N <N> --K <K> \
 # Constraint check for a chosen tile — --weights = weight operands held at once
 # (a two-weight fused scope = 2, a single-weight scope = 1; --accum defaults to it)
 python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --weights <n>
+
+# Transposed weight (b_trans=True: weight stored [N,K], K-contiguous) — add --b-trans
+# to BOTH tools so the cache-line floor binds on K instead of N (see "The transpose lever")
+python .claude/skills/cube-tile-tuning/hint_l1_tile.py --M <M> --N <N> --K <K> \
+    --bytes-a 1 --bytes-b 1 --bytes-c 4 --b-trans
+python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --weights <n> --b-trans
 ```
 
 `tile_budget.py` defaults to 910B (a2a3). For a5/950 pass `--platform a5` (L0C is
-256 KB there). Override budgets with `--mat-bytes` / `--acc-bytes`.
+256 KB there). Override budgets with `--mat-bytes` / `--acc-bytes`. Both tools default
+to the **non-transposed** weight layout (`[K,N]`, N-contiguous — the common PyPTO
+layout); pass `--b-trans` for `[N,K]` K-contiguous weights.
 
 ## The method
 
@@ -97,12 +105,15 @@ python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --
    value is freeing each task's tile — and that is also what makes the per-task sweep
    tractable, since independent knobs are independent axes.*
 
-7. **Grow N; when Mat-walled, trade K down.** A bigger cube N-frag cuts the
-   matmul-setup count (wins for scalar/address-gen-bound cubes) and A reloads. When N
-   hits the Mat wall, **shrink the K tile to buy the room** — but keep
-   `K·bytes_in ≥ 512 B` (the cache-line floor; B is K-contiguous under `b_trans`, so a
-   short K wastes the DMA line). A wider N that forces a sub-cache-line K can be net
-   negative. `tile_budget.py` prints the exact `N≤… / K≤…` trade.
+7. **Grow N; when Mat-walled, trade the *strided* axis down.** A bigger cube N-frag
+   cuts the matmul-setup count (wins for scalar/address-gen-bound cubes) and A reloads.
+   When N hits the Mat wall, **shrink the K tile to buy the room** — but keep the
+   *contiguous* axis ≥ 512 B (the cache-line floor). Which axis is contiguous depends on
+   the weight layout: with the default `[K,N]` N-contiguous weight the floor is on **N**
+   (`N·bytes_in ≥ 512 B`), so K is the free axis to trade; under `--b-trans` (`[N,K]`
+   K-contiguous) the floor is on **K**, so N is the free axis. A tile that forces the
+   *contiguous* axis sub-line can be net-negative. `tile_budget.py` prints the exact
+   `N≤… / K≤…` trade for the layout you pass — see "The transpose lever" for choosing it.
 
 8. **Empirical sweep — the truth.** Profile candidates with
    `python <kernel>.py -p a2a3 -d <dev> --enable-l2-swimlane`; the headline is
@@ -112,6 +123,44 @@ python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --
 9. **Land the simplest winner.** Within the noise band, take the fewest-knob config.
    Record *why each tile is what it is* — the wall it sits under — in the constant's
    comment, so the next person doesn't re-derive it.
+
+## The transpose lever (weight layout)
+
+The weight/B operand can be stored two ways, and the choice sets **which axis is
+GM-contiguous** — hence which axis the cache-line floor binds and how long each MTE2
+burst is:
+
+| layout | flag | storage | contiguous axis | cache-line floor | matmul call |
+|--------|------|---------|-----------------|------------------|-------------|
+| non-transposed | *(default)* | `[K, N]` | **N** | `N·bytes_in ≥ 512 B` | `pl.matmul(a, w)` |
+| transposed | `--b-trans` | `[N, K]` | **K** | `K·bytes_in ≥ 512 B` | `pl.matmul(a, w, b_trans=True)` |
+
+Transposing does **not** change the Mat/L1 footprint (`N·K·bytes` either way) or the
+total weight bytes — it only moves the cache-line floor between N and K and changes the
+L1→L0B load path. Reach for `--b-trans` when:
+
+- **The natural contiguous axis is sub-line.** If the weight is `[K,N]` with a small N
+  (e.g. an output projection where `N·bytes_in < 512 B`), every weight row under-fills a
+  line. Storing it `[N,K]` makes the long contraction axis K contiguous → full-line
+  bursts. Several DSV4 compressor kernels do exactly this ("weights stored transposed
+  `[OUT_DIM, D]` + `b_trans=True` → K-contiguous bursts", cutting transaction-bound MTE2
+  ~14% busy).
+- **The cube is MTE2-transaction-bound**, not byte-bound: longer K-contiguous bursts
+  mean fewer, larger transactions even when both layouts clear the 512 B floor.
+
+Caveats:
+
+- **The L1→L0B transpose-on-load cost is not modeled** by either tool (they score DMA
+  bytes and buffer fit only). A layout that looks ~equal on `hint_l1_tile` can differ on
+  device — so **the transpose is always an empirical A/B**, run both layouts in the sweep.
+- **Transposing is a weight-layout *contract* change**, not a local kernel edit: the
+  checkpoint/loader must now materialize `[N,K]`, and the golden reference must match
+  (`w.t()`). Flag it explicitly when proposing it — it is not free the way a tile-size
+  change is.
+- When N is already a clean multiple of the cache line (large-N projections), the
+  non-transposed layout is usually already full-line and 0% waste; transpose then wins
+  *only* if the un-modeled transaction effect is real. Confirm before paying the
+  layout-contract cost.
 
 ## Sweep recipe
 
@@ -187,8 +236,12 @@ next round's variants (e.g. an L1/Mat overflow when pushing N says "trade K", no
 - **A shared tile constant couples unrelated tasks.** If two tasks reuse one tiling
   name, the tighter-constrained one silently caps the other. Split the knob per task
   (step 6) *before* sweeping, or the sweep can't reach the better config at all.
-- **Cache-line floor is real.** `K·bytes_in < 512 B` quietly wastes MTE2 DMA; a bigger
-  N that needs a sub-line K can be net-negative.
+- **Cache-line floor is real — and layout-dependent.** A sub-line *contiguous* row
+  quietly wastes MTE2 DMA. The contiguous axis is **N** for the default `[K,N]` weight
+  (`N·bytes_in ≥ 512 B`) and **K** under `--b-trans` (`[N,K]`). Pass the matching layout
+  to both tools, or the floor is checked on the wrong axis (the classic false alarm:
+  flagging K on an N-contiguous weight). A tile that drives the contiguous axis sub-line
+  to grow the other can be net-negative.
 - **Bound-pipe matters.** Weight/MTE2-bound cubes barely move on tile (the weight-byte
   floor is fixed); scalar/address-gen-bound cubes (lots of tiny matmuls) win most from
   fewer, larger tiles. Check the PMU/swimlane before sweeping blindly.
