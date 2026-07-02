@@ -252,7 +252,7 @@ def attention_csa(
     # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy over all T rows,
     # keeping raw iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4), as
     # out = mask * (raw + 1) - 1.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_compressed_slots"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_compressed_slots", allow_early_resolve=True):
         c_raw = pl.cast(idx_topk_flat[0 : T, 0 : IDX_TOPK], target_type=pl.FP32)
         c_pos = pl.cast(position_ids_t1[0 : T, 0 : 1], target_type=pl.FP32)
         c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
