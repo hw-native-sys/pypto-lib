@@ -123,6 +123,69 @@ def rms_lm_head(
 
 
 @pl.jit.inline
+def rms_lm_head_fp32(
+    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
+) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
+    user_batch = pl.tensor.dim(seq_lens, 0)
+
+    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
+            sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
+            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
+                final_sq_k0 = kb * FINAL_RMS_K_CHUNK
+                final_sq_chunk = pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_sq_k0])
+                sq_sum = pl.add(
+                    sq_sum,
+                    pl.reshape(pl.row_sum(pl.mul(final_sq_chunk, final_sq_chunk)), [1, BATCH_TILE]),
+                )
+            inv_rms_final = pl.reshape(
+                pl.rsqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)),
+                [BATCH_TILE, 1],
+            )
+
+            for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
+                final_norm_k0 = kb * FINAL_RMS_K_CHUNK
+                final_hidden_chunk = pl.slice(hidden_states, [BATCH_TILE, FINAL_RMS_K_CHUNK], [b0, final_norm_k0])
+                final_gamma = pl.slice(final_norm_weight, [1, FINAL_RMS_K_CHUNK], [0, final_norm_k0])
+                final_normed_chunk = pl.col_expand_mul(
+                    pl.row_expand_mul(final_hidden_chunk, inv_rms_final),
+                    final_gamma,
+                )
+                final_normed = pl.assemble(
+                    final_normed,
+                    pl.cast(final_normed_chunk, target_type=pl.BF16),
+                    [b0, final_norm_k0],
+                )
+
+    for lm_core in pl.spmd(LM_HEAD_CORES, name_hint="lm_head"):
+        for b0 in pl.range(0, BATCH, BATCH_TILE):
+            lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
+            for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
+                lm_o0 = ob * VOCAB_CHUNK
+                lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
+                lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
+                lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
+                for kb in pl.pipeline(1, HIDDEN // LM_HEAD_K_CHUNK, stage=2):
+                    lm_k0 = kb * LM_HEAD_K_CHUNK
+                    lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, lm_k0])
+                    lm_weight_chunk = pl.slice(
+                        lm_head_weight,
+                        [VOCAB_CHUNK, LM_HEAD_K_CHUNK],
+                        [lm_o0, lm_k0],
+                    )
+                    lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
+                lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
+                out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
+
+    return out
+
+
+@pl.jit.inline
 def rms_only(
     hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
