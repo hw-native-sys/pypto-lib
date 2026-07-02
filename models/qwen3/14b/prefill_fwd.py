@@ -80,7 +80,7 @@ Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 TOK_TILE = 64
 ROPE_TOK_BATCH = 7
-ROPE_SPMD_BLOCKS = 16
+ROPE_SPMD_BLOCKS = 32
 ATTN_TOK_GROUP = 7
 ATTN_GI_GROUP = 4
 FINALIZE_SPMD_BLOCKS = 48
@@ -1027,8 +1027,21 @@ def prefill_layer(
                             )
                 # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                 # Stage 3.1: Output projection + first residual.
+                out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
                 resid1_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
-                for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_spmd"):
+                for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_aic_spmd"):
+                    for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
+                        o0 = ob * Q_OUT_CHUNK
+                        tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
+                        tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
+                        o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
+                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
+                            k0 = kb * K_CHUNK
+                            tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
+                            tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
+                            o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
+                        out_proj_tile = pl.assemble(out_proj_tile, o_acc, [0, o0])
+                for out_core in pl.spmd(OUT_PROJ_SPMD_BLOCKS, name_hint="out_proj_aiv_spmd"):
                     for ob in pl.range(out_core, Q_OUT_BLOCKS, OUT_PROJ_SPMD_BLOCKS):
                         o0 = ob * Q_OUT_CHUNK
                         resid_chunk = pl.cast(
@@ -1040,15 +1053,8 @@ def prefill_layer(
                             ),
                             target_type=pl.FP32,
                         )
-                        tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                        tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
-                        o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                        for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-                            k0 = kb * K_CHUNK
-                            tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                            tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                            o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
-                        resid1_tile = pl.assemble(resid1_tile, pl.add(o_acc, resid_chunk), [0, o0])
+                        out_proj_chunk = pl.slice(out_proj_tile, [TOK_TILE, Q_OUT_CHUNK], [0, o0])
+                        resid1_tile = pl.assemble(resid1_tile, pl.add(out_proj_chunk, resid_chunk), [0, o0])
 
                 # Stage 3.2: Post-attention RMSNorm.
                 post_norm_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
