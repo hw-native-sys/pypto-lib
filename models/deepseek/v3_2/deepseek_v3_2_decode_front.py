@@ -873,7 +873,7 @@ if __name__ == "__main__":
         program=build_deepseek_v3_2_decode_front_scope1234_program(),
         specs=build_tensor_specs(),
         golden_fn=golden_decode_front_scope1234,
-        compile_cfg=dict(dump_passes=True),
+        compile_cfg=dict(dump_passes=False),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

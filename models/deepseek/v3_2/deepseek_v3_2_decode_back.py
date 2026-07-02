@@ -293,7 +293,7 @@ if __name__ == "__main__":
         program=build_deepseek_v3_2_decode_back_program(),
         specs=build_tensor_specs(),
         golden_fn=golden_deepseek_v3_2_decode_back,
-        compile_cfg=dict(dump_passes=True),
+        compile_cfg=dict(dump_passes=False),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,

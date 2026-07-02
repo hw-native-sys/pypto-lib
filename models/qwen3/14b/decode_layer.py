@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-dep-gen  # CI marker: full-occupancy pl.system.syncall -> dep_gen (DFX) trips 507018 (pypto#1931)
 """Qwen3-14B decode kernel — FP32 inter-layer carry + fused layer output.
 
 The inter-layer hidden (hidden_states / out / cur / post_norm_partial) is carried
@@ -1723,10 +1722,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
-    parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="deprecated no-op: dep_gen is already forced off for this kernel "
-                             "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
-                             "kept for CLI / CI back-compat.")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
                         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
                              "-> logits) against a host chain reference, instead of the default "
@@ -1773,15 +1768,14 @@ if __name__ == "__main__":
             fn=decode_fwd_layers,
             specs=specs,
             golden_fn=golden_decode_layer,
-            compile_cfg=dict(dump_passes=True),
+            compile_cfg=dict(dump_passes=False),
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
                 # dep_gen forced OFF: this kernel's full-occupancy pl.system.syncall
                 # is incompatible with dep_gen — the DFX instrumentation perturbs core
-                # occupancy and trips AICore timeout 507018 (pypto#1931). --no-dep-gen
-                # is kept as an accepted no-op for CLI / CI back-compat.
+                # occupancy and trips AICore timeout 507018 (pypto#1931).
                 enable_dep_gen=False,
             ),
             rtol=3e-3,
@@ -1814,7 +1808,7 @@ if __name__ == "__main__":
         backend_type=_backend_type(args.platform),
         enable_l2_swimlane=args.enable_l2_swimlane,
         enable_dep_gen=False,
-        dump_passes=True,
+        dump_passes=False,
     )
 
     # Full fused decode_fwd validation: N stacked layers + on-device LM head -> logits,

@@ -758,7 +758,7 @@ if __name__ == "__main__":
         program=build_prefill_scope123_program(),
         specs=build_tensor_specs(use_max_seq=args.max_seq),
         golden_fn=golden_prefill_scope123,
-        compile_cfg=dict(dump_passes=True),
+        compile_cfg=dict(dump_passes=False),
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
