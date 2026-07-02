@@ -1724,7 +1724,9 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="disable dep_gen (avoids 'register failed: 8' overflow on big graphs)")
+                        help="deprecated no-op: dep_gen is already forced off for this kernel "
+                             "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
+                             "kept for CLI / CI back-compat.")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
                         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
                              "-> logits) against a host chain reference, instead of the default "
@@ -1776,7 +1778,11 @@ if __name__ == "__main__":
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
-                enable_dep_gen=not args.no_dep_gen,
+                # dep_gen forced OFF: this kernel's full-occupancy pl.system.syncall
+                # is incompatible with dep_gen — the DFX instrumentation perturbs core
+                # occupancy and trips AICore timeout 507018 (pypto#1931). --no-dep-gen
+                # is kept as an accepted no-op for CLI / CI back-compat.
+                enable_dep_gen=False,
             ),
             rtol=3e-3,
             atol=3e-3,
