@@ -855,13 +855,10 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
 
     def init_value():
         if name == "tid2eid":
-            token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
-            topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
-            rows = []
-            for layer in range(layer_count):
-                layer_eids = (token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL
-                rows.append(layer_eids)
-            packed = torch.cat(rows, dim=0)
+            token_ids = torch.arange(VOCAB, dtype=torch.int32).view(1, VOCAB, 1)
+            topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, 1, TOPK)
+            layer_ids = torch.arange(layer_count, dtype=torch.int32).view(layer_count, 1, 1)
+            packed = ((token_ids * TOPK + topk_ids + layer_ids * TOPK) % N_EXPERTS_GLOBAL).view(-1, TOPK)
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
         base_init = spec.init_value
@@ -973,63 +970,45 @@ def _make_forward_metadata_specs(base_specs, start_pos=None):
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
 
     def init_position_ids_single():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((T,), dtype=torch.int32)
-        for t in range(T):
-            b = t // seq_per_batch
-            s = t - b * seq_per_batch
-            positions[t] = starts[b] + s
-        return positions
+        starts = init_start_pos()
+        seq_offsets = torch.arange(seq_per_batch, dtype=torch.int32)
+        return (starts.unsqueeze(1) + seq_offsets).reshape(-1)
 
     def init_kv_seq_lens_single():
         return (init_start_pos().to(torch.int64) + seq_per_batch).to(torch.int32)
 
     def init_block_table_single(max_blocks):
-        tbl = torch.full((B, max_blocks), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(max_blocks):
-                tbl[b, j] = b * max_blocks + j
-        return tbl
+        return torch.arange(B * max_blocks, dtype=torch.int32).view(B, max_blocks)
 
     def init_ori_slot_mapping_single():
         positions = init_position_ids_single().to(torch.int64)
         block_table = init_block_table_single(ORI_MAX_BLOCKS).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            slot = pos % win
-            blk = int(block_table[b, slot // BLOCK_SIZE].item())
-            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
-        return mapping
+        batch_ids = torch.arange(T, dtype=torch.int64) // seq_per_batch
+        slot = positions % win
+        blk = block_table[batch_ids, slot // BLOCK_SIZE]
+        return blk * BLOCK_SIZE + slot % BLOCK_SIZE
 
     def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
         positions = init_position_ids_single().to(torch.int64)
         block_table = init_block_table_single(max_blocks).to(torch.int64)
+        batch_ids = torch.arange(T, dtype=torch.int64) // seq_per_batch
+        mask = (positions + 1) % compress_ratio == 0
+        cache_col = positions // compress_ratio
+        logical_blk = cache_col // BLOCK_SIZE
+        intra = cache_col % BLOCK_SIZE
         mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            if (pos + 1) % compress_ratio == 0:
-                cache_col = pos // compress_ratio
-                logical_blk = cache_col // BLOCK_SIZE
-                intra = cache_col % BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[t] = blk * BLOCK_SIZE + intra
+        blk = block_table[batch_ids[mask], logical_blk[mask]]
+        mapping[mask] = blk * BLOCK_SIZE + intra[mask]
         return mapping
 
     def init_state_slot_mapping_single(max_blocks, block_size):
         positions = init_position_ids_single().to(torch.int64)
         block_table = init_block_table_single(max_blocks).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            logical_blk = pos // block_size
-            intra = pos % block_size
-            blk = int(block_table[b, logical_blk].item())
-            mapping[t] = blk * block_size + intra
-        return mapping
+        batch_ids = torch.arange(T, dtype=torch.int64) // seq_per_batch
+        logical_blk = positions // block_size
+        intra = positions % block_size
+        blk = block_table[batch_ids, logical_blk]
+        return blk * block_size + intra
 
     init_by_name = {
         "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
