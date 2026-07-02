@@ -72,43 +72,43 @@ def gate(
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
 
-    for tn_idx in pl.spmd(active_gate_tokens // T_TILE, name_hint="ffn_norm"):
-        t0 = tn_idx * T_TILE
-        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_d0 in pl.pipeline(0, D, D_TILE, stage=2):
-            rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_TILE], pl.FP32)
-            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
-        inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
-        for an_d0 in pl.pipeline(0, D, D_TILE, stage=2):
-            an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE], pl.FP32)
-            an_w = pl.cast(pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE]), pl.FP32)
-            an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
-            an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
-            x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
-            x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
+    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="ffn_norm"):
+            sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+            for rms_d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                rms_x = pl.cast(x_mixed[t0 : t0 + T_TILE, rms_d0 : rms_d0 + D_TILE], pl.FP32)
+                sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x, rms_x)), [1, T_TILE]))
+            inv_rms = pl.reshape(pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS))), [T_TILE, 1])
+            for an_d0 in pl.pipeline(0, D, D_TILE, stage=2):
+                an_x = pl.cast(x_mixed[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE], pl.FP32)
+                an_w = pl.cast(pl.reshape(norm_w[an_d0 : an_d0 + D_TILE], [1, D_TILE]), pl.FP32)
+                an_normed = pl.col_expand_mul(pl.row_expand_mul(an_x, inv_rms), an_w)
+                an_bf16 = pl.cast(an_normed, pl.BF16, mode="rint")
+                x_norm_gate_buf[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = pl.cast(an_bf16, pl.FP32)
+                x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
 
     # Per-token symmetric INT8 quant of x_norm (read the bf16 output directly;
     # x_norm_gate_buf holds the same bf16 values widened to fp32).
-    for tq_idx in pl.spmd(active_gate_tokens // T_TILE, name_hint="x_norm_quant"):
-        t0 = tq_idx * T_TILE
-        xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        for xq_a_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-            xn_a_f32 = pl.cast(x_norm[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_TILE], pl.FP32)
-            xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
-            xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
-            xn_amax = pl.maximum(xn_amax, xn_a_max)
-        xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
-        x_norm_scale[t0 : t0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
-        xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
-        for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
-            xn_q_scaled = pl.row_expand_mul(
-                pl.cast(x_norm[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE], pl.FP32),
-                xn_sq_col,
-            )
-            xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
-            xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
-            x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
-                pl.cast(xn_q_half, pl.INT8, mode="trunc")
+    for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
+            xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for xq_a_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_TILE]
+                xn_a_abs = pl.maximum(xn_a_f32, pl.neg(xn_a_f32))
+                xn_a_max = pl.reshape(pl.row_max(xn_a_abs), [1, T_TILE])
+                xn_amax = pl.maximum(xn_amax, xn_a_max)
+            xn_sq_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), xn_amax)
+            x_norm_scale[t0 : t0 + T_TILE, 0:1] = pl.reshape(pl.recip(xn_sq_row), [T_TILE, 1])
+            xn_sq_col = pl.reshape(xn_sq_row, [T_TILE, 1])
+            for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
+                xn_q_scaled = pl.row_expand_mul(
+                    x_norm_gate_buf[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE],
+                    xn_sq_col,
+                )
+                xn_q_i32 = pl.cast(xn_q_scaled, pl.INT32, mode="rint")
+                xn_q_half = pl.cast(xn_q_i32, pl.FP16, mode="round")
+                x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
+                    pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
     # Pad columns [N_EXPERTS, SCORE_PAD) never see a matmul; zero the routed
     # score and NEG_INF the biased score so sort keeps them last. Done here (not
