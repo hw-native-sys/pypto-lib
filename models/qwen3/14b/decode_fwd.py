@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: no-dep-gen  # CI marker: full-occupancy pl.system.syncall -> dep_gen (DFX) trips 507018 (pypto#1931)
 """Qwen3-14B decode kernel — FP32 inter-layer carry + fused layer output.
 
 The inter-layer hidden (hidden_states / out / cur / post_norm_partial) is carried
@@ -250,6 +251,24 @@ ROPE_CORES = 32
 ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
 assert (NUM_KV_HEADS * BATCH) % ROPE_CORES == 0
 
+# Fused rope_qkv dependency layout: rope (QK-norm + RoPE) reads ALL of q/k/v_proj +
+# inv_rms_states, so it gates on every q/k/v projection tile writer plus rms_tid,
+# gathered into one TASK_ID array (rope_dep_tids). Offsets must be module-level Python
+# ints (in-function int locals get traced as Scalars, which pl.array.create rejects).
+K_TID_BASE = Q_ON * QKV_OK  # 50 — q tiles occupy [0, K_TID_BASE)
+V_TID_BASE = K_TID_BASE + KV_ON * QKV_OK  # 60 — k tiles in [K_TID_BASE, V_TID_BASE)
+RMS_TID_IDX = V_TID_BASE + KV_ON * QKV_OK  # 70 — v tiles in [V_TID_BASE, RMS_TID_IDX); rms_tid last
+ROPE_NDEPS = RMS_TID_IDX + 1  # 71
+FA_NDEPS = ROPE_NDEPS + 1  # rope deps + work_tid (fa_fused folds in rope as phase 0)
+
+# Fused QK-norm reduction alignment. The per-(KV head, batch) sum-of-squares emits a
+# col-major [rows, 1] tile; ptoas requires its column byte size (rows * sizeof(FP32))
+# to be 32B-aligned, i.e. rows a multiple of 8. Q already pads to Q_HEAD_PAD (16) rows;
+# K's single real row is zero-padded to K_RED_ROWS for the reduction (then row 0 kept).
+K_RED_ROWS = 8
+assert (Q_HEAD_PAD * 4) % 32 == 0, "Q QK-norm reduction rows (Q_HEAD_PAD) must be 32B-aligned"
+assert (K_RED_ROWS * 4) % 32 == 0, "K QK-norm reduction rows (K_RED_ROWS) must be 32B-aligned"
+
 # ── Scope 3a · out_proj (split-K × split-N, atomic-add into attn_proj_fp32) ──
 K_SPLITS_OUT = 5
 N_SPLITS_OUT = 10
@@ -376,11 +395,11 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # (deps=[down_tids[k] for k in range(DOWN_ON * K_SPLITS)] — list-comprehension
     # per-index fence works for large N; whole-array deps=[down_tids] does not).
     down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
-    q_tile_tids = pl.array.create(Q_ON * QKV_OK, pl.TASK_ID)
-    k_tile_tids = pl.array.create(KV_ON * QKV_OK, pl.TASK_ID)
-    v_tile_tids = pl.array.create(KV_ON * QKV_OK, pl.TASK_ID)
-    qk_tids = pl.array.create(NUM_KV_HEADS, pl.TASK_ID)  # fused qk_norm (gamma+recip)
-    rope_grp_tids = pl.array.create(NUM_ROPE_GROUPS, pl.TASK_ID)
+    # The fused rope_qkv (QK-norm + RoPE) gates on ALL q/k/v projection tile writers
+    # plus rms_tid, collected in ONE TASK_ID array so the spmd deps= can be a single
+    # comprehension (the frontend requires deps to be one list/tuple/comprehension, not
+    # a concatenation). Layout (offsets module-level): [q tiles | k tiles | v tiles | rms_tid].
+    rope_dep_tids = pl.array.create(FA_NDEPS, pl.TASK_ID)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
@@ -439,9 +458,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
             inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
+        rope_dep_tids[RMS_TID_IDX] = rms_tid  # fused rope reads inv_rms_states
 
         # ── Scope 1: Q projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed") as q_seed_tid:  # no explicit dep: runtime q_proj WAR hazard orders it after prev qk_norm
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed") as q_seed_tid:  # no explicit dep: runtime q_proj WAR hazard orders it after prev rope_qkv (now the q_proj reader)
             for snb in pl.pipeline(Q_ON, stage=2):
                 q_proj = pl.assemble(
                     q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
@@ -468,7 +488,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                                 q_acc, normed_in[:, kk : kk + TK], wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                             )
                         q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
-                q_tile_tids[q_nt * QKV_OK + q_ks] = q_tid
+                rope_dep_tids[q_nt * QKV_OK + q_ks] = q_tid
 
         # ── Scope 1: K projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="k_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as k_seed_tid:
@@ -495,7 +515,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                                 k_acc, normed_in[:, kk : kk + TK], wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                             )
                         k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
-                k_tile_tids[k_nt * QKV_OK + k_ks] = k_tid
+                rope_dep_tids[K_TID_BASE + k_nt * QKV_OK + k_ks] = k_tid
 
         # ── Scope 1: V projection — SPLIT-K + inner N/K tiling, SPMD (seed + atomic). ──
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as v_seed_tid:
@@ -522,7 +542,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                                 v_acc, normed_in[:, kk : kk + TK], wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN]
                             )
                         v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
-                v_tile_tids[v_nt * QKV_OK + v_ks] = v_tid
+                rope_dep_tids[V_TID_BASE + v_nt * QKV_OK + v_ks] = v_tid
 
         # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
         # Inputs are external (seq_lens) — no deps.
@@ -540,169 +560,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 cursor = cursor + wb_ctx
             pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
 
-        # ── Scope 2: per-head Qwen3 QK-norm, SPLIT into two INDEPENDENT steps. ──
-        # Same trick as the input RMSNorm above. QKnorm(x)_head = (x * qk_inv_head) *
-        # gamma, where qk_inv_head[b,h] = 1/sqrt(mean_d x^2 + eps) is a per-(row, head)
-        # SCALAR. RoPE is linear within a head, so qk_inv commutes through it. We
-        # therefore (a) apply ONLY the elementwise `* gamma` here — q_proj_norm /
-        # k_proj_norm no longer wait on the reduction — and (b) DEFER the per-head
-        # qk_inv reciprocal past RoPE, folding it into rope_qkv as one scalar mul per
-        # head-row. The two steps read q_proj / k_proj independently, so `qk_recip`
-        # (the sum-of-squares reduction) overlaps `qk_gamma` instead of serializing
-        # after it.
-        #
-        # CONTROL EXPERIMENT: the deferred input-RMSNorm inv_rms is a POSITIVE per-row
-        # scalar and QK-norm is scale-invariant, so it CANCELS inside this QK-norm and
-        # the optimized path omits it on Q/K. Here we instead APPLY it explicitly — we
-        # scale q_proj / k_proj by inv_rms[b] BEFORE the QK-norm in BOTH sub-steps
-        # (qk_gamma AND qk_recip). Because the reciprocal step sees inv_rms*x its
-        # denominator picks up a 1/inv_rms factor that exactly undoes the inv_rms in
-        # the gamma step, so q_out / k_out are bit-for-bit the SAME as the optimized
-        # path (RoPE folds the two together). This makes the full mathematical chain
-        # input-RMSNorm -> proj -> QK-norm visible in the code, at the cost of two
-        # redundant row-scales. Must be in BOTH steps; applying it to only one would
-        # NOT cancel and would change the result.
-        #
-        # qk_inv layout is (head, batch[, q-in-group]) so rope_qkv can slice a
-        # contiguous per-(KV head, batch) column. Per head h, the q reduction yields
-        # [BATCH * Q_PER_KV, 1] rows ordered (b, j); we stack the NUM_KV_HEADS blocks,
-        # so global row = h*BATCH*Q_PER_KV + b*Q_PER_KV + j.
-        q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        k_proj_norm = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-        q_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH * Q_PER_KV, 1], dtype=pl.FP32)
-        k_inv_states = pl.create_tensor([NUM_KV_HEADS * BATCH, 1], dtype=pl.FP32)
-
-        # inv_rms[b] as a [BATCH, 1] column — applied row-wise to q_proj / k_proj
-        # BEFORE QK-norm in both sub-steps below (the control-experiment scale).
-        inv_rms_col = inv_rms_states[:, 0:1]
-
-        # FUSED qk_norm PER KV-HEAD: gamma (q/k_proj_norm) AND the 1/rms reduction
-        # (q/k_inv) in ONE task, reading each q/k tile from GM ONCE (qk_gamma + qk_recip
-        # used to read the same data twice). Halves qk-stage GM reads and the qk task
-        # count (16 -> 8). q_chunk/k_chunk (= inv_rms-scaled input) feed BOTH the gamma
-        # assemble and the sum-of-squares. Each head gates on its 2 straddled q tiles +
-        # 1 k tile. (recip is still deferred — folded into rope as a per-head scalar mul.)
-        for h in pl.unroll(NUM_KV_HEADS):
-            qt0 = (h * Q_PER_KV * HEAD_DIM) // QKV_N_TILE
-            kt = (h * HEAD_DIM) // QKV_N_TILE
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="qk_norm",
-                deps=[
-                    q_tile_tids[qt0 * QKV_OK + 0], q_tile_tids[qt0 * QKV_OK + 1],
-                    q_tile_tids[qt0 * QKV_OK + 2], q_tile_tids[qt0 * QKV_OK + 3],
-                    q_tile_tids[qt0 * QKV_OK + 4], q_tile_tids[qt0 * QKV_OK + 5],
-                    q_tile_tids[qt0 * QKV_OK + 6], q_tile_tids[qt0 * QKV_OK + 7],
-                    q_tile_tids[qt0 * QKV_OK + 8], q_tile_tids[qt0 * QKV_OK + 9],
-                    k_tile_tids[kt * QKV_OK + 0], k_tile_tids[kt * QKV_OK + 1],
-                    k_tile_tids[kt * QKV_OK + 2], k_tile_tids[kt * QKV_OK + 3],
-                    k_tile_tids[kt * QKV_OK + 4],
-                    rms_tid,
-                ],
-            ) as qk_tid_h:
-                q0 = h * Q_PER_KV * HEAD_DIM
-                # Read q_proj[h] ONCE, scale by inv_rms -> q_chunk; feed both gamma + recip.
-                q_slice = pl.row_expand_mul(
-                    pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0]), inv_rms_col
-                )
-                q_chunk = pl.reshape(q_slice, [BATCH * Q_PER_KV, HEAD_DIM])
-                q_g = pl.col_expand_mul(q_chunk, q_norm_w)
-                q_proj_norm = pl.assemble(
-                    q_proj_norm, pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]), [0, q0]
-                )
-                q_ss = pl.row_sum(pl.mul(q_chunk, q_chunk))
-                q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-                q_inv_states = pl.assemble(q_inv_states, q_inv, [h * BATCH * Q_PER_KV, 0])
-                # K: same, read once.
-                k0 = h * HEAD_DIM
-                k_chunk = pl.row_expand_mul(pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0]), inv_rms_col)
-                k_g = pl.col_expand_mul(k_chunk, k_norm_w)
-                k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
-                k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
-                k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-                k_inv_states = pl.assemble(k_inv_states, k_inv, [h * BATCH, 0])
-            qk_tids[h] = qk_tid_h
-
-        # rope GROUPED: NUM_ROPE_GROUPS grids of HEADS_PER_ROPE heads each, depping on
-        # the group's qk + v tile (re-test @ swimlane level 2 to remove per-task overhead).
-        # rope SINGLE spmd grid over ALL NUM_KV_HEADS*BATCH items — one launch (was 2
-        # grouped grids = 2x per-grid scheduler overhead). Deps on all qk + v (rope follows).
-        with pl.spmd(
-            ROPE_CORES,
-            name_hint="rope_qkv",
-            deps=[
-                qk_tids[0], qk_tids[1], qk_tids[2], qk_tids[3],
-                qk_tids[4], qk_tids[5], qk_tids[6], qk_tids[7],
-                rms_tid,
-                v_tile_tids[0], v_tile_tids[1], v_tile_tids[2], v_tile_tids[3],
-                v_tile_tids[4], v_tile_tids[5], v_tile_tids[6], v_tile_tids[7],
-                v_tile_tids[8], v_tile_tids[9],
-            ],
-        ) as rope_tid:
-            rope_core = pl.get_block_idx()
-            for it in pl.pipeline(ROPE_GROUP_ITEMS_PER_CORE, stage=2):
-                g_idx = rope_core * ROPE_ITEMS_PER_CORE + it
-                ki = g_idx // BATCH
-                b = g_idx % BATCH
-                ctx_len = pl.read(seq_lens, [b])
-                inv_rms_b = pl.read(inv_rms_states, [b, 0])
-                pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
-                # Paged write target for this row's current token: slot_mapping[b]
-                # decomposes into (physical page, in-page offset). Same scheme prefill
-                # uses; one physical page == one SEQ_TILE/BLOCK_SIZE band of the pool.
-                wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
-                wr_slot_block = wr_slot // BLOCK_SIZE
-                wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
-                cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
-                cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
-                sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
-                sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
-
-                kv_col = ki * HEAD_DIM
-                # K carries qk_norm gamma (qk_gamma); fold the deferred per-head qk_inv
-                # scalar here. inv_rms cancels inside qk_norm, so no inv_rms factor on K.
-                k_inv_b = pl.read(k_inv_states, [ki * BATCH + b, 0])
-                k_full = pl.mul(k_proj_norm[b : b + 1, kv_col : kv_col + HEAD_DIM], k_inv_b)
-                k_lo = k_full[:, 0:HALF_DIM]
-                k_hi = k_full[:, HALF_DIM:HEAD_DIM]
-                rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
-                rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-                cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
-                k_cache = pl.assemble(k_cache, pl.cast(rot_lo, target_type=pl.BF16), [cache_row, 0])
-                k_cache = pl.assemble(k_cache, pl.cast(rot_hi, target_type=pl.BF16), [cache_row, HALF_DIM])
-                v_row_bf16 = pl.cast(
-                    pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
-                    target_type=pl.BF16,
-                )
-                v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
-
-                q_base = ki * Q_PER_KV
-                q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
-                q_inv_base = ki * BATCH * Q_PER_KV + b * Q_PER_KV
-                for qj in pl.range(Q_PER_KV):
-                    q_inv_bj = pl.read(q_inv_states, [q_inv_base + qj, 0])
-                    q_head = pl.mul(
-                        q_proj_norm[
-                            b : b + 1, (q_base + qj) * HEAD_DIM : (q_base + qj + 1) * HEAD_DIM
-                        ],
-                        q_inv_bj,
-                    )
-                    q_lo = q_head[:, 0:HALF_DIM]
-                    q_hi = q_head[:, HALF_DIM:HEAD_DIM]
-                    q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                    q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(q_rot_lo, target_type=pl.BF16), [q_pad_row0 + qj, 0]
-                    )
-                    all_q_padded = pl.assemble(
-                        all_q_padded, pl.cast(q_rot_hi, target_type=pl.BF16), [q_pad_row0 + qj, HALF_DIM]
-                    )
-                q_pad_zero = pl.cast(
-                    pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                    target_type=pl.BF16,
-                )
-                all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
-        rope_grp_tids[0] = rope_tid
+        rope_dep_tids[ROPE_NDEPS] = work_tid  # fa_fused (now folds in rope) also waits on fa_work_build
 
         # ── Scope 3b MLP-accumulator seeds, HOISTED between rope and attn. ──
         # gate/up/down accumulators are zeroed for the later split-K atomic-add
@@ -743,10 +601,121 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.spmd(
             NUM_CORES,
             name_hint="fa_fused",
-            optimizations=[pl.split(pl.SplitMode.UP_DOWN)],
-            deps=[work_tid, rope_grp_tids[0]],  # single rope grid now
-        ) as fa_tid:
+            # NOTE: no function-level UP_DOWN split here. Phase-1 (attn) and phase-2
+            # (online-softmax) are split PER-REGION instead (pl.split_aiv): phase-1 is a
+            # data-parallel UP_DOWN region (the compiler inserts aiv_shard / aic_gather,
+            # halving the 16-row softmax across both AIV lanes), phase-2 a task-parallel
+            # NONE region (both lanes, disjoint (b, kvh) work). A function-level pl.split
+            # cannot express this — it would also try to halve phase-2's un-halvable
+            # [5, 128] / [1, 640] reduction tiles ("even split dimension").
+            deps=[rope_dep_tids[i] for i in range(FA_NDEPS)],  # rope deps + work_tid (rope folded into fa_fused phase 0)
+        ) as attn_done_tid:  # now also runs phase-2 softmax (writes attn_out) after the syncall
             fa_core = pl.get_block_idx()
+            # ── Phase 0: QK-norm + RoPE, folded in (was the standalone rope_qkv grid).
+            # Pure in-kernel HBM sync: the syncall below publishes k_cache / v_cache /
+            # all_q_padded to every core before phase-1 reads them, replacing the old
+            # rope->fa dispatch + dep edge (one fewer grid dispatch -> less schedule
+            # overhead). 32 of the 48 AIV lanes run the UNCHANGED per-(KV head, batch)
+            # rope pipeline (identical tiles + pl.pipeline stage=2); lanes 32..47 idle.
+            # The conditional GM write relies on pypto's cross-half phi base-param repoint
+            # (ExpandMixedKernel, branch fix/split-aiv-gm-cross-half-view / PR #1894).
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                rope_lane = fa_core * 2 + aiv_id  # 0..47
+                if rope_lane < ROPE_CORES:        # lanes 0..31 carry the 4-item rope pipeline
+                    # Zero column-pads that grow one (KV head, batch) q/k row-slab up to a
+                    # 32B-aligned reduction row count (see K_RED_ROWS comment). Constant per item.
+                    q_red_pad = pl.full([1, (Q_HEAD_PAD - Q_PER_KV) * HEAD_DIM], dtype=pl.FP32, value=0.0)
+                    k_red_pad = pl.full([1, (K_RED_ROWS - 1) * HEAD_DIM], dtype=pl.FP32, value=0.0)
+                    for it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
+                        g_idx = rope_lane * ROPE_ITEMS_PER_CORE + it
+                        ki = g_idx // BATCH
+                        b = g_idx % BATCH
+                        ctx_len = pl.read(seq_lens, [b])
+                        inv_rms_b = pl.read(inv_rms_states, [b, 0])
+                        pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
+                        # Paged write target for this row's current token: slot_mapping[b]
+                        # decomposes into (physical page, in-page offset). Same scheme prefill
+                        # uses; one physical page == one SEQ_TILE/BLOCK_SIZE band of the pool.
+                        wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+                        wr_slot_block = wr_slot // BLOCK_SIZE
+                        wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
+                        cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
+                        cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
+                        sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
+                        sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
+
+                        kv_col = ki * HEAD_DIM
+                        # FUSED QK-norm (K): read the raw k_proj row, scale by inv_rms[b], apply
+                        # gamma, fold in the per-row qk_inv reciprocal — all in-register — so
+                        # k_full is fully normed without a q/k_proj_norm GM round-trip. inv_rms
+                        # cancels (control experiment): it scales k_raw before BOTH the gamma mul
+                        # and the sum-of-squares, so the recip undoes it. RoPE then just rotates.
+                        # The single real row is column-padded to K_RED_ROWS so the col-major
+                        # sum-of-squares tile is 32B-aligned; the zero rows reduce to 0 (finite
+                        # recip, 0 after gamma) and are dropped — only row 0 (the head) is kept.
+                        k_raw = pl.mul(
+                            pl.reshape(
+                                pl.concat(k_proj[b : b + 1, kv_col : kv_col + HEAD_DIM], k_red_pad),
+                                [K_RED_ROWS, HEAD_DIM],
+                            ),
+                            inv_rms_b,
+                        )
+                        k_ss = pl.row_sum(pl.mul(k_raw, k_raw))
+                        k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
+                        k_normed = pl.row_expand_mul(pl.col_expand_mul(k_raw, k_norm_w), k_inv)
+                        k_full = k_normed[0:1, :]
+                        k_lo = k_full[:, 0:HALF_DIM]
+                        k_hi = k_full[:, HALF_DIM:HEAD_DIM]
+                        rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
+                        rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
+                        cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
+                        # Coalesce lo|hi into one [1, HEAD_DIM] row -> a single paged k_cache MTE3
+                        # write instead of two half-width ones (the store tail bounds makespan).
+                        rot = pl.concat(rot_lo, rot_hi)
+                        k_cache = pl.assemble(k_cache, pl.cast(rot, target_type=pl.BF16), [cache_row, 0])
+                        v_row_bf16 = pl.cast(
+                            pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
+                            target_type=pl.BF16,
+                        )
+                        v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
+
+                        q_base = ki * Q_PER_KV
+                        q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
+                        # FUSED QK-norm (Q) + BATCHED heads + free zero-pad. The Q_PER_KV heads of
+                        # this (KV head, batch) are one contiguous q_proj row-slab; column-pad it
+                        # with zeros up to the Q_HEAD_PAD physical rows of all_q_padded and reshape
+                        # to [Q_HEAD_PAD, HEAD_DIM]. Running the QK-norm (inv_rms scale + gamma +
+                        # the per-row qk_inv reciprocal) and RoPE over ALL Q_HEAD_PAD rows then:
+                        #   * keeps the col-major sum-of-squares tile 32B-aligned (Q_HEAD_PAD*4B);
+                        #     a [Q_PER_KV, 1]=20B reduction is not 32B-aligned and ptoas rejects it;
+                        #   * leaves rows Q_PER_KV.. as 0 (0 -> finite recip -> 0 after gamma; RoPE
+                        #     of 0 = 0), so ONE [Q_HEAD_PAD, HEAD_DIM] store replaces the old real +
+                        #     separate q_pad_zero stores.
+                        # qk_inv is a per-row reduction (each head row normed independently);
+                        # cos/sin [1, HALF_DIM] broadcast over rows.
+                        q_raw = pl.mul(
+                            pl.reshape(
+                                pl.concat(
+                                    q_proj[b : b + 1, q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM],
+                                    q_red_pad,
+                                ),
+                                [Q_HEAD_PAD, HEAD_DIM],
+                            ),
+                            inv_rms_b,
+                        )
+                        q_ss = pl.row_sum(pl.mul(q_raw, q_raw))
+                        q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
+                        q_heads = pl.row_expand_mul(pl.col_expand_mul(q_raw, q_norm_w), q_inv)
+                        q_lo = q_heads[:, 0:HALF_DIM]
+                        q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
+                        q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
+                        q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
+                        # Coalesce lo|hi -> one [Q_HEAD_PAD, HEAD_DIM] store (real rows + zero pad).
+                        q_rot = pl.concat(q_rot_lo, q_rot_hi)
+                        all_q_padded = pl.assemble(
+                            all_q_padded, pl.cast(q_rot, target_type=pl.BF16), [q_pad_row0, 0]
+                        )
+            pl.system.syncall(core_type="mix")
             # Read the device-computed block count ON-DEVICE (inside the kernel) so
             # `fa_total` enters fa_fused as an INPUT and the normal task auto-dep
             # orders it after the `fa_work_build` producer. Reading it at
@@ -756,115 +725,119 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             fa_total_blocks = pl.cast(pl.read(fa_total, [0, 0]), target_type=pl.INDEX)
             # Grid-stride over the dense real-block list: core fa_core owns table
             # entries fa_core, fa_core+NUM_CORES, … < fa_total_blocks.
+            # Phase-1 attn: cube QK/SV OUTSIDE a PER-HEAD split_aiv region; vector softmax
+            # on the UP_DOWN half via EXPLICIT aiv_shard (C->V, shards the QK Acc tile
+            # directly) + aic_gather (V->C, halves -> full for the SV cube). Region sits
+            # INSIDE the gp pipeline so each head's shard->softmax->gather overlaps cube work.
             for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
                 fa_enc = pl.cast(pl.read(fa_work_table, [fa_w, 0]), target_type=pl.INDEX)
                 fa_b = fa_enc // MAX_CTX_BLOCKS
                 fa_p = fa_enc % MAX_CTX_BLOCKS
                 fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
                 fa_ctx_len = pl.read(seq_lens, [fa_b])
-                # Table holds only real blocks → exactly one block per entry, at fa_p.
-                sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
+                sb = fa_p
                 s0 = sb * SEQ_TILE
                 valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
-                # Paged read: map logical block sb -> physical page via this request's
-                # block_table row. SEQ_TILE == page_size, so one page is exactly one
-                # contiguous SEQ_TILE-row slice of the pool (shared by all GP_SIZE heads
-                # of this (b, block) work item below).
                 fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
 
-                # Declarative software pipeline over the per-head gp loop: instead of
-                # manually unrolling and reordering (QK0,QK1 -> softmax0,softmax1 ->
-                # SV0,SV1), let pl.pipeline stage=2 overlap iteration i+1's QK (AIC)
-                # with iteration i's softmax (AIV) through the C2V/V2C pipe.
-                for gp in pl.pipeline(GP_SIZE, stage=2):
+                for gp in pl.pipeline(GP_SIZE, stage=3):
                     gi = fa_hg * GP_SIZE + gp
-                    kvh = gi  # Q_GROUPS=1
+                    kvh = gi
                     q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
                     q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
                     g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
                     cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
 
-                    # QK matmul (cube) -> C2V boundary move (first vec consumer).
+                    # QK matmul (cube) — OUTSIDE the split_aiv region.
                     k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
                     raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
-                    scores_scaled = pl.mul(raw_scores, ATTN_SCALE)
-                    # Mark only the Q_HEAD_BATCH (5) real rows valid (tile stays 16):
-                    # the vec softmax and the cur_mi / cur_li GM stores then touch 5
-                    # rows, not the padded 16. NOTE: this cannot shrink the AIC<->AIV
-                    # C2V/V2C transfer — tpush/tpop always carry the full 16-row tile
-                    # box (matmul M fractal).
-                    scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
-                    scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                    cur_mi = pl.row_max(scores)
-                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                    cur_li = pl.row_sum(exp_scores)
-                    exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
 
-                    # SV matmul (cube) reads exp directly -> V2C boundary move.
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        scores_h = pl.aiv_shard(raw_scores)  # tensor-level C->V half
+                        scores_scaled = pl.mul(scores_h, ATTN_SCALE)
+                        scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
+                        scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                        cur_mi = pl.row_max(scores)
+                        exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                        cur_li = pl.row_sum(exp_scores)
+                        exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                        mi_row = g_base + sb * Q_HEAD_PAD + aiv_id * (Q_HEAD_PAD // 2)
+                        all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [mi_row, 0])
+                        all_cur_li = pl.assemble(all_cur_li, cur_li, [mi_row, 0])
+                        exp_full = pl.aic_gather(exp_scores_bf16)  # tensor-level V->C full
+
                     v_tile = v_cache[cache_row : cache_row + SEQ_TILE, :]
-                    oi_tmp = pl.matmul(exp_scores_bf16, v_tile, out_dtype=pl.FP32)
-                    # The SV-matmul output spans the full padded 16 rows but only
-                    # the first Q_HEAD_BATCH are real — mark 5 valid (tile stays 16)
-                    # so the (dominant) all_oi_tmp GM write stores 5 rows instead of 16.
+                    oi_tmp = pl.matmul(exp_full, v_tile, out_dtype=pl.FP32)
                     oi_tmp = pl.set_validshape(oi_tmp, Q_HEAD_BATCH, HEAD_DIM)
-
                     all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
-                    all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + sb * Q_HEAD_PAD, 0])
-                    all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + sb * Q_HEAD_PAD, 0])
 
-        # online_softmax: flat top-level spmd, writes attn_out directly. Reduces
-        # per-block partials across ALL blocks of a lane (hence across the KV
-        # partitions that produced them); auto-dep on the scratch serializes it
-        # after every contributing fa_fused partition. Captured as `attn_done_tid`
-        # (the dispatch's producer TaskId via the `with pl.spmd(...) as tid` form)
-        # so the manual_scope out_proj tasks can take it as an explicit `deps=`
-        # edge — auto-dep (tensormap) is suppressed inside manual_scope, so the
-        # cross-boundary attn->out_proj order needs the TaskId. (This previously
-        # required a dummy `attn_fence` pl.at task that read attn_out only to mint
-        # the TaskId; capturing the spmd dispatch tid directly removes it.)
-        with pl.spmd(
-            NUM_CORES * 2, name_hint="online_softmax", deps=[fa_tid]
-        ) as attn_done_tid:
-            os_core = pl.get_block_idx()
-            # Grid-stride over online_softmax work items (one per (b, kvh) lane).
-            for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
-                os_b = os_spmd_idx // NUM_KV_HEADS
-                os_gi = os_spmd_idx % NUM_KV_HEADS
-                os_ctx_len = pl.read(seq_lens, [os_b])
-                os_ctx_blocks = (os_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                os_kvh = os_gi  # Q_GROUPS=1
-                os_q_base = os_kvh * Q_PER_KV
-                os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
+            # ── Phase 2: online-softmax cross-block reduction, FUSED in-kernel ──
+            # The per-block partials (all_oi_tmp / all_cur_mi / all_cur_li) of a
+            # (b, kvh) lane are produced by DIFFERENT cores — the dense work table
+            # spreads a lane's blocks across cores for load balance — so reducing a
+            # lane needs every core's phase-1 writes visible first. A hard cross-core
+            # barrier (pto::SYNCALL) provides exactly that: every participant must
+            # arrive before any proceeds.
+            #
+            # FULL-OCCUPANCY CONTRACT: the hard/FFTS form waits for ALL physical cores
+            # of the participant set. NUM_CORES (24) group blocks == 24 AIC + 48 AIV ==
+            # every 910B core, so the launch is full-occupancy; a partial launch (or a
+            # retune of NUM_CORES off the physical AIC count) leaves cores unreached and
+            # the wait never completes (AICore timeout 507018). core_type="mix" syncs
+            # both the AIC SV output (oi) and the AIV softmax output (mi/li).
+            #
+            # A2/A3 NOTE: partials still transit GM (cross-core data has no on-chip path
+            # on 910B), so this only removes the separate online_softmax dispatch + the
+            # fa->os dep edge — it does NOT save the partials' round-trip (that needs the
+            # A5 L2-resident path).
+            pl.system.syncall(core_type="mix")
+            # Phase-2 online_softmax as a TASK-PARALLEL dual-AIV region. pl.split_aiv
+            # with mode=NONE dispatches BOTH AIV lanes of every group block (no halving,
+            # no aiv_shard / aic_gather): each lane owns disjoint (b, kvh) work items via
+            # os_aiv = fa_core*2 + aiv_id, restoring the pre-fusion 48-way reduction
+            # parallelism (24 group blocks x 2 AIV) that the fused 24-way single-spmd loop
+            # gave up — without UP_DOWN's un-halvable [5,128] / [1,640] reduction tiles.
+            # The hard syncall above fences phase-1 (non-split attn) from phase-2.
+            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+                os_aiv = fa_core * 2 + aiv_id  # 0..47 global AIV-lane id
+                for os_spmd_idx in pl.range(os_aiv, OS_WORK, NUM_CORES * 2):
+                    os_b = os_spmd_idx // NUM_KV_HEADS
+                    os_gi = os_spmd_idx % NUM_KV_HEADS
+                    os_ctx_len = pl.read(seq_lens, [os_b])
+                    os_ctx_blocks = (os_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                    os_kvh = os_gi  # Q_GROUPS=1
+                    os_q_base = os_kvh * Q_PER_KV
+                    os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
 
-                # Loop-carried accumulators: full Q_HEAD_PAD (16) rows. They can't be
-                # valid-shaped because the recurrence (add / maximum) drops valid_shape,
-                # which would break loop-carry type consistency. Only the per-block GM
-                # reads below are trimmed to the 5 real rows via pl.slice valid_shape.
-                oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                mi = all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
-                    rec = os_g_base + sb * Q_HEAD_PAD
-                    # Partial load: tile stays Q_HEAD_PAD (16) rows, GM transfer = the 5
-                    # real rows (valid_shape on the slice → tile.load valid_shapes).
-                    oi_tmp_valid = pl.slice(
-                        all_oi_tmp, [Q_HEAD_PAD, HEAD_DIM], [rec, 0], valid_shape=[Q_HEAD_BATCH, HEAD_DIM]
+                    # Loop-carried accumulators: full Q_HEAD_PAD (16) rows. They can't be
+                    # valid-shaped because the recurrence (add / maximum) drops valid_shape,
+                    # which would break loop-carry type consistency. Only the per-block GM
+                    # reads below are trimmed to the 5 real rows via pl.slice valid_shape.
+                    oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                    mi = all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                    li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
+                    for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
+                        rec = os_g_base + sb * Q_HEAD_PAD
+                        # Partial load: tile stays Q_HEAD_PAD (16) rows, GM transfer = the 5
+                        # real rows (valid_shape on the slice → tile.load valid_shapes).
+                        oi_tmp_valid = pl.slice(
+                            all_oi_tmp, [Q_HEAD_PAD, HEAD_DIM], [rec, 0], valid_shape=[Q_HEAD_BATCH, HEAD_DIM]
+                        )
+                        online_cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
+                        online_cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
+                        mi_new = pl.maximum(mi, online_cur_mi)
+                        alpha = pl.exp(pl.sub(mi, mi_new))
+                        beta = pl.exp(pl.sub(online_cur_mi, mi_new))
+                        li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
+                        oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
+                        mi = mi_new
+
+                    ctx = pl.row_expand_div(oi, li)
+                    ctx_valid = ctx[0:Q_HEAD_BATCH, :]
+                    ctx_flat_bf16 = pl.cast(
+                        pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16
                     )
-                    online_cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                    online_cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                    mi_new = pl.maximum(mi, online_cur_mi)
-                    alpha = pl.exp(pl.sub(mi, mi_new))
-                    beta = pl.exp(pl.sub(online_cur_mi, mi_new))
-                    li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
-                    oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
-                    mi = mi_new
-
-                ctx = pl.row_expand_div(oi, li)
-                ctx_valid = ctx[0:Q_HEAD_BATCH, :]
-                ctx_flat_bf16 = pl.cast(
-                    pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16
-                )
-                attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
+                    attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
 
         # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all are created
         # earlier, alongside their hoisted seed tasks between rope and attn.)
@@ -1733,7 +1706,9 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="disable dep_gen (avoids 'register failed: 8' overflow on big graphs)")
+                        help="deprecated no-op: dep_gen is already forced off for this kernel "
+                             "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
+                             "kept for CLI / CI back-compat.")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
                         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
                              "-> logits) against a host chain reference, instead of the default "
@@ -1780,11 +1755,16 @@ if __name__ == "__main__":
             fn=decode_fwd_layers,
             specs=specs,
             golden_fn=golden_decode_layer,
+            compile_cfg=dict(dump_passes=False),
             runtime_cfg=dict(
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
-                enable_dep_gen=not args.no_dep_gen,
+                # dep_gen forced OFF: this kernel's full-occupancy pl.system.syncall
+                # is incompatible with dep_gen — the DFX instrumentation perturbs core
+                # occupancy and trips AICore timeout 507018 (pypto#1931). --no-dep-gen
+                # is kept as an accepted no-op for CLI / CI back-compat.
+                enable_dep_gen=False,
             ),
             rtol=3e-3,
             atol=3e-3,
