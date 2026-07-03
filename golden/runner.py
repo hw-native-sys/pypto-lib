@@ -497,7 +497,7 @@ def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
     for name, t in list(tensors.items()):
         if t.is_shared() and t.is_contiguous():
             continue
-        tensors[name] = t.contiguous().share_memory_()
+        tensors[name] = t.cpu().contiguous().share_memory_()
 
 
 def _l3_ordered_names(compiled: Any) -> list[str]:
@@ -671,11 +671,18 @@ def _run_l3_resident(
                 print(f"[RUN] benchmark skipped: {type(e).__name__}: {e}", flush=True)
                 return None
         finally:
+            # Free every resident tensor; a failure on one must not leak the rest.
             for name, handle, is_stacked, wid in resident_handles:
-                if is_stacked:
-                    rt.free_stacked_tensor(handle)
-                else:
-                    rt.free_tensor(handle, worker_id=wid)
+                try:
+                    if is_stacked:
+                        rt.free_stacked_tensor(handle)
+                    else:
+                        rt.free_tensor(handle, worker_id=wid)
+                except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                    print(
+                        f"[RUN] warning: failed to free resident tensor {name}: {e}",
+                        flush=True,
+                    )
 
 
 def _maybe_reload_l3(
