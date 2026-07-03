@@ -89,7 +89,7 @@ Detect ptoas installation and version:
 "$PTOAS_ROOT/ptoas" --version 2>/dev/null || echo "not found"
 ```
 
-If ptoas is **not found** or `PTOAS_ROOT` is not set, install it following the version pinned in the **pypto** repo's CI configuration (`$PYPTO_ROOT/.github/workflows/ci.yml`, look for `PTOAS_VERSION=...`). After installation, re-run the version check.
+If ptoas is **not found** or `PTOAS_ROOT` is not set, install it following the version pinned in the **pypto** checkout's `toolchain/versions.env` (`$PYPTO_ROOT/toolchain/versions.env`, look for `PTOAS_VERSION=...`; pto-isa is pinned separately in `$PYPTO_ROOT/runtime/pto_isa.pin`). See the `/setup_env` skill for the full install. After installation, re-run the version check.
 
 Record the detected ptoas version for use in the Environment table.
 

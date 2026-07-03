@@ -36,28 +36,41 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu   # sim
 pip install torch                                                     # device
 ```
 
-## Step 3: Install pypto
+## Step 3: Install pypto (single source of truth for the toolchain)
+
+pypto is the **single source of truth**: the pypto revision transitively pins
+everything downstream — the runtime (its `runtime/` submodule), ptoas (via
+`toolchain/versions.env`), and pto-isa (via `runtime/pto_isa.pin`). Clone pypto
+**first**, then derive the ptoas and pto-isa pins from it (Steps 4–5). Never read
+these pins from `pypto-lib`'s `.github/workflows/ci.yml` — that file no longer
+declares them inline; CI itself reads them out of the pypto checkout.
 
 ```bash
 WORKSPACE_DIR="$(cd .. && pwd)"
 git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$WORKSPACE_DIR/pypto"
 pip install -v "$WORKSPACE_DIR/pypto"
+export PYPTO_ROOT="$WORKSPACE_DIR/pypto"
 ```
 
-If pypto is already installed and up to date, skip this step.
+If pypto is already installed and up to date, skip the install but still set
+`PYPTO_ROOT` to the checkout so Steps 4–5 can read its pins.
 
 ## Step 4: Install ptoas
 
-The pinned version is read from `.github/workflows/ci.yml` (`PTOAS_VERSION`).
-Do not hardcode a version here — always derive it from the CI config so this
-skill stays in sync when CI is bumped.
+The pinned version + per-arch sha256 are read from the pypto checkout's
+`toolchain/versions.env` (keys `PTOAS_VERSION`, `PTOAS_SHA256_AARCH64`,
+`PTOAS_SHA256_X86_64`). Always derive them from pypto so this skill stays in
+sync with whatever pypto revision you cloned in Step 3.
 
 ```bash
-PTOAS_VERSION=$(grep -m1 'PTOAS_VERSION:' .github/workflows/ci.yml | awk '{print $2}')
 ARCH=$(uname -m)   # x86_64 or aarch64
+source "$PYPTO_ROOT/toolchain/versions.env"   # KEY=value, shell-sourceable
+if [ "$ARCH" = "aarch64" ]; then PTOAS_SHA256="$PTOAS_SHA256_AARCH64"; else PTOAS_SHA256="$PTOAS_SHA256_X86_64"; fi
+
 curl --fail --location --retry 3 --retry-all-errors \
   -o /tmp/ptoas-bin-${ARCH}.tar.gz \
   https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${ARCH}.tar.gz
+echo "${PTOAS_SHA256}  /tmp/ptoas-bin-${ARCH}.tar.gz" | sha256sum -c -   # must print OK
 mkdir -p "$WORKSPACE_DIR/ptoas-bin"
 tar -xzf /tmp/ptoas-bin-${ARCH}.tar.gz -C "$WORKSPACE_DIR/ptoas-bin"
 chmod +x "$WORKSPACE_DIR/ptoas-bin/ptoas" "$WORKSPACE_DIR/ptoas-bin/bin/ptoas"
@@ -69,22 +82,25 @@ download from GitHub releases to `~/Downloads`, then extract from there.
 
 ## Step 5: Clone pto-isa
 
-The pinned commit is read from `.github/workflows/ci.yml` (`PTO_ISA_COMMIT`).
+pto-isa is **not** declared in `versions.env`. The runtime is its source of truth
+(build == run), so the pinned commit lives in the pypto checkout's
+`runtime/pto_isa.pin`. Bumping the pypto `runtime/` submodule moves pto-isa in
+lockstep.
 
 ```bash
-PTO_ISA_COMMIT=$(grep -m1 'PTO_ISA_COMMIT:' .github/workflows/ci.yml | awk '{print $2}')
+PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_ROOT/runtime/pto_isa.pin")
 git clone https://github.com/hw-native-sys/pto-isa.git "$WORKSPACE_DIR/pto-isa"
 git -C "$WORKSPACE_DIR/pto-isa" checkout "$PTO_ISA_COMMIT"
 export PTO_ISA_ROOT="$WORKSPACE_DIR/pto-isa"
 ```
 
-## Step 6: Install simpler (bundled in pypto submodule)
+## Step 6: Install simpler / runtime (bundled in pypto submodule)
 
-simpler is now a git submodule of pypto at `runtime/`. After cloning pypto
-in Step 3, install it directly:
+simpler is the pypto runtime, a git submodule of pypto at `runtime/`. After
+cloning pypto in Step 3, install it directly:
 
 ```bash
-pip install "$WORKSPACE_DIR/pypto/runtime"
+pip install "$PYPTO_ROOT/runtime"
 ```
 
 ## Environment Variables
