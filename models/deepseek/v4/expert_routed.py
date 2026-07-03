@@ -63,23 +63,25 @@ def expert_routed(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-    w2_act_tids = pl.array.create(N_LOCAL_EXPERTS * TILES_PER_EXPERT, pl.TASK_ID)
+    w2_tids = pl.array.create(N_LOCAL_EXPERTS * TILES_PER_EXPERT, pl.TASK_ID)
 
     # Each local expert owns a disjoint recv_y row slab. Keep the routed stages in
-    # manual scope so the runtime does not conservatively serialize those dynamic
-    # writes across experts; the following auto-scope no-ops re-register recv_y
-    # for downstream combine, only for non-empty expert tiles.
-    with pl.manual_scope():
-        for local_i in pl.parallel(N_LOCAL_EXPERTS):
-            n_rows = pl.read(recv_expert_count, [local_i, 0])
-            n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-            flat_base = local_i * RECV_MAX
+    # manual scope so the runtime does not conservatively serialize intermediate
+    # writes across experts. The final w2 epilogue stays in auto scope and
+    # assembles each static channel block into recv_y, replacing the marker task
+    # bridge.
+    for local_i in pl.parallel(N_LOCAL_EXPERTS):
+        n_rows = pl.read(recv_expert_count, [local_i, 0])
+        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
+        flat_base = local_i * RECV_MAX
 
-            for t in pl.parallel(n_tiles):
-                tile_idx = local_i * TILES_PER_EXPERT + t
-                t0 = t * RECV_TILE
-                flat_t0 = flat_base + t0
-                valid_rows = pl.min(RECV_TILE, n_rows - t0)
+        for t in pl.parallel(n_tiles):
+            tile_idx = local_i * TILES_PER_EXPERT + t
+            t0 = t * RECV_TILE
+            flat_t0 = flat_base + t0
+            valid_rows = pl.min(RECV_TILE, n_rows - t0)
+
+            with pl.manual_scope():
 
                 # gate (w1) and up (w3) cube matmul -> INT32 GM accumulators.
                 h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32, manual_dep=True)
@@ -179,38 +181,28 @@ def expert_routed(
                             else:
                                 y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
                         y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
+                w2_tids[tile_idx] = w2_tid
 
-                with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act", deps=[w2_tid]) as w2_act_tid:
-                    db_idx = pl.tile.get_block_idx()
-                    d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+            for db_idx in pl.parallel(D // (W2_ACT_INNER * D_OUT_TILE_ACT)):
+                act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+                recv_y_block = pl.create_tensor([RECV_TILE, W2_ACT_INNER * D_OUT_TILE_ACT], dtype=pl.BF16)
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_w2_act", deps=[w2_tids[tile_idx]]):
                     w_col_blk = pl.reshape(
                         recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
                         [RECV_TILE, 1],
                     )
                     row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
                     for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                        d0 = d_base + dg * D_OUT_TILE_ACT
-                        y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
-                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, d0 : d0 + D_OUT_TILE_ACT]
+                        act_d0 = act_d_base + dg * D_OUT_TILE_ACT
+                        block_d0 = dg * D_OUT_TILE_ACT
+                        y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
                         y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                         y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                        recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(
+                        recv_y_block[:, block_d0 : block_d0 + D_OUT_TILE_ACT] = pl.cast(
                             y_2d, target_type=pl.BF16, mode="rint"
                         )
-                w2_act_tids[tile_idx] = w2_act_tid
-
-    for local_i in pl.parallel(N_LOCAL_EXPERTS):
-        n_rows = pl.read(recv_expert_count, [local_i, 0])
-        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-        flat_base = local_i * RECV_MAX
-
-        for t in pl.parallel(n_tiles):
-            tile_idx = local_i * TILES_PER_EXPERT + t
-            flat_t0 = flat_base + t * RECV_TILE
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_routed_tile_done", deps=[w2_act_tids[tile_idx]]):
-                recv_y_flat[flat_t0 : flat_t0 + RECV_TILE, 0:16] = recv_y_flat[
-                    flat_t0 : flat_t0 + RECV_TILE, 0:16
-                ]
+                recv_y_flat = pl.assemble(recv_y_flat, recv_y_block, [flat_t0, act_d_base])
 
     return recv_y
 
