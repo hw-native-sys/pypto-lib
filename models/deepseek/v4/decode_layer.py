@@ -768,6 +768,28 @@ def build_tensor_specs(start_pos=None, layer_id=10):
         else:
             specs.append(moe_tensor_specs[spec.name])
 
+    # Keep the static weight parameters device-resident (child_memory), sharded
+    # per rank: each shard is uploaded to its card once and reused across
+    # dispatches, skipping the per-dispatch H2D/D2H. The attention weights are
+    # exactly ``replicated_attention`` (every attention param that is not a
+    # KV/state cache or per-step metadata); the MoE set adds the FFN/gate/expert
+    # weights and the static tid2eid route table. NOT resident: the KV/state
+    # caches (kv_cache, cmp_kv, idx_kv_cache, *_compress_state), the per-step slot
+    # mappings / block tables / ids / position_ids / kv_seq_lens, the input
+    # activation (x_hc), and the output (x_next). All resident names are inputs
+    # (is_output=False), so the flag is always valid.
+    RESIDENT_WEIGHT_NAMES = replicated_attention | {
+        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+        "gate_w", "gate_bias", "tid2eid",
+        "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+        "routed_w2", "routed_w2_scale",
+        "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+        "shared_w2", "shared_w2_scale",
+    }
+    for spec in specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
+
     specs.extend([
         TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True),
         ScalarSpec("layer_id", torch.int32, layer_id),

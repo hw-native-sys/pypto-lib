@@ -382,11 +382,16 @@ def build_tensor_specs():
 
     return [
         TensorSpec("hidden_states", [TP_SIZE, T, D], torch.bfloat16, init_value=init_hidden_states),
+        # Static LM-head weight, sharded per TP rank (leading dim TP_SIZE). Kept
+        # device-resident (child_memory): each shard uploaded to its card once and
+        # reused across dispatches, skipping the per-dispatch H2D/D2H. Resident is
+        # input-only, which this weight is (is_output=False).
         TensorSpec(
             "lm_head_weight",
             [TP_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
+            resident="stacked",
         ),
         TensorSpec("logits", [TP_SIZE, T, VOCAB], torch.float32, is_output=True),
     ]
