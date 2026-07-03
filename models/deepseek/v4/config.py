@@ -276,19 +276,9 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 
 # EP communication constants
 EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
-RECV_SAFETY = 4
-RECV_BUFFER_FLOOR = 1024
 
-# Per-expert recv-buffer depth: peak rows one local expert receives
-# (tokens * topk / expert-shard) * RECV_SAFETY, floored at 1024 rows for the
-# current fixed-window distributed MoE layout. Decode and prefill bake different
-# depths; default to decode, prefill overrides to PREFILL_RECV_MAX.
-DECODE_RECV_MAX = max(
-    RECV_BUFFER_FLOOR,
-    DECODE_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE),
-)
-PREFILL_RECV_MAX = max(
-    RECV_BUFFER_FLOOR,
-    PREFILL_TOKENS * FLASH.num_experts_per_tok * RECV_SAFETY // (FLASH.n_routed_experts // EP_WORLD_SIZE),
-)
+# Recv-buffer depth = N_RANKS lanes of MAX_PER_SRC = T rows (distinct top-k, so a
+# source sends at most T rows to a local expert). Recomputed per --ep at import.
+DECODE_RECV_MAX = EP_WORLD_SIZE * DECODE_TOKENS
+PREFILL_RECV_MAX = EP_WORLD_SIZE * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX

@@ -78,6 +78,7 @@ from decode_attention_csa import (
 )
 from config import FLASH as MODEL_CONFIG
 from moe import (
+    AUX_PAD,
     IDX_PAD,
     MOE_INTER,
     N_EXPERTS_GLOBAL,
@@ -87,7 +88,6 @@ from moe import (
     RECV_MAX,
     TOPK,
     VOCAB,
-    W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
     moe,
 )
@@ -213,15 +213,13 @@ def decode_fwd(
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
     x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
-    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
@@ -320,9 +318,8 @@ def decode_fwd(
             shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
             shared_w2_l0, shared_w2_scale_l0,
             hidden,
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
+            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            routed_y_buf, combine_arrived,
             pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
@@ -347,9 +344,8 @@ def decode_fwd(
             shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
             shared_w2_l1, shared_w2_scale_l1,
             hidden,
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
+            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
@@ -439,9 +435,8 @@ def decode_fwd(
                 shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                 shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
-                pub_counts, count_done, data_done,
-                recv_x, recv_scale, recv_w, recv_r_route,
-                routed_y_buf, combine_done,
+                recv_meta, recv_x, recv_aux, recv_route, arrived,
+                routed_y_buf, combine_arrived,
                 csa_layer, num_tokens, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
@@ -508,9 +503,8 @@ def decode_fwd(
                 shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                 shared_w2_hca, shared_w2_scale_hca,
                 hidden,
-                pub_counts, count_done, data_done,
-                recv_x, recv_scale, recv_w, recv_r_route,
-                routed_y_buf, combine_done,
+                recv_meta, recv_x, recv_aux, recv_route, arrived,
+                routed_y_buf, combine_arrived,
                 hca_layer, num_tokens, my_rank, hca_moe_epoch,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
@@ -598,9 +592,8 @@ def decode_fwd(
             shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
             shared_w2_last, shared_w2_scale_last,
             x_next_hc,
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
+            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            routed_y_buf, combine_arrived,
             csa_layer_last, num_tokens, my_rank, last_moe_epoch,
         )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -694,26 +687,22 @@ def l3_decode_fwd(
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
-    count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
-    recv_scale_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
-    recv_w_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
-    recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
+    recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)
+    recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
+    arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
-    combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
     for r in pl.range(pld.world_size()):
-        pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32] = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
-        count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32] = pld.window(recv_scale_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
-        recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32] = pld.window(recv_w_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
-        recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         decode_fwd(
             x_hc[r],
             hc_attn_fn[r],
@@ -794,9 +783,8 @@ def l3_decode_fwd(
             hc_head_base[r],
             final_norm_w[r],
             hidden_out[r],
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
+            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            routed_y_buf, combine_arrived,
             r, num_tokens,
             device=r,
         )

@@ -13,15 +13,14 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-# The prefill path routes PREFILL_TOKENS tokens, so size the per-expert recv
-# buffers from the prefill formula. config.RECV_MAX defaults to the decode value;
-# override it before importing moe (which freezes the recv shapes at import).
+# The prefill path routes PREFILL_TOKENS tokens. Set MOE_TOKENS before importing
+# moe (which freezes recv shapes and derives RECV_MAX = EP * MOE_TOKENS at import).
 import config
 config.MOE_TOKENS = config.PREFILL_TOKENS
-config.RECV_MAX = config.PREFILL_RECV_MAX
 # Import moe first. It applies the EP2 FLASH override before dependent
 # modules bake config-derived MoE shapes.
 from moe import (
+    AUX_PAD,
     D,
     HC_DIM,
     HC_MULT,
@@ -36,7 +35,6 @@ from moe import (
     T,
     TOPK,
     VOCAB,
-    W_PAD,
     build_tensor_specs as build_moe_tensor_specs,
     golden_moe,
     moe,
@@ -187,15 +185,13 @@ def prefill_layer_core(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
-    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -252,9 +248,8 @@ def prefill_layer_core(
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         x_next,
-        pub_counts, count_done, data_done,
-        recv_x, recv_scale, recv_w, recv_r_route,
-        routed_y_buf, combine_done,
+        recv_meta, recv_x, recv_aux, recv_route, arrived,
+        routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
     return x_next
@@ -347,15 +342,13 @@ def prefill_layer_kernel(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
-    pub_counts: pld.DistributedTensor[[N_RANKS * N_RANKS, N_LOCAL], pl.INT32],
-    count_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_scale: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_w: pld.DistributedTensor[[N_LOCAL * RECV_MAX, W_PAD], pl.FP32],
-    recv_r_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_done: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -441,15 +434,13 @@ def prefill_layer_kernel(
         shared_w2,
         shared_w2_scale,
         x_next,
-        pub_counts,
-        count_done,
-        data_done,
+        recv_meta,
         recv_x,
-        recv_scale,
-        recv_w,
-        recv_r_route,
+        recv_aux,
+        recv_route,
+        arrived,
         routed_y_buf,
-        combine_done,
+        combine_arrived,
         num_tokens,
         layer_id,
         my_rank,
@@ -547,26 +538,22 @@ def l3_prefill_layer(
     num_tokens: pl.Scalar[pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
 ):
-    pub_counts_buf = pld.alloc_window_buffer(N_RANKS * N_RANKS * N_LOCAL * 4)
-    count_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    data_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
-    recv_scale_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
-    recv_w_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * W_PAD * 4)
-    recv_r_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
+    recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)
+    recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
+    arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
-    combine_done_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
     for rank in pl.range(pld.world_size()):
-        pub_counts = pld.window(pub_counts_buf, [N_RANKS * N_RANKS, N_LOCAL], dtype=pl.INT32)
-        count_done = pld.window(count_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_done = pld.window(data_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
         recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_scale = pld.window(recv_scale_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
-        recv_w = pld.window(recv_w_buf, [N_LOCAL * RECV_MAX, W_PAD], dtype=pl.FP32)
-        recv_r_route = pld.window(recv_r_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_done = pld.window(combine_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         prefill_layer_kernel(
             x_hc[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
@@ -597,9 +584,8 @@ def l3_prefill_layer(
             shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
             x_next[rank],
-            pub_counts, count_done, data_done,
-            recv_x, recv_scale, recv_w, recv_r_route,
-            routed_y_buf, combine_done,
+            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            routed_y_buf, combine_arrived,
             num_tokens, layer_id, rank, pl.const(1, pl.INT32),
             device=rank,
         )
