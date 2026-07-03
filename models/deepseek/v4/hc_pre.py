@@ -355,21 +355,23 @@ def hc_pre(
                         y2 = pl.row_expand_mul(x2, pre2)
                         y3 = pl.row_expand_mul(x3, pre3)
                         y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
-                        x_mixed = pl.assemble(x_mixed, pl.cast(y_tile, target_type=pl.BF16), [t0, d0])
+                        x_mixed = pl.assemble(x_mixed, pl.cast(y_tile, target_type=pl.BF16, mode="rint"), [t0, d0])
 
                 else:
                     ob = gw - tt_n - mixx_n
                     t0 = ob * COMB_T_TILE
                     # Fold Phase C's post gate: post = 2 * sigmoid(mix[:, hc:2hc] * inv * scale1 + base).
-                    # Computed inline and assembled straight into the output (no post_pad HBM buffer).
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + T_TILE]  # [1,T_TILE] row keeps the rsqrt tile 32B-aligned
-                    inv_col = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
+                    # The gate is tensor-world (mixes_raw slice -> sigmoid), and pl.store needs a Vec
+                    # TILE -- so post_pad is stashed HC_PAD-wide in same-core scratch and loaded back as
+                    # an aligned [COMB_T_TILE, HC_PAD] tile (a direct [.,HC_MULT] store would need a
+                    # 16B-row FP32 tile, which pto.alloc_tile rejects). pl.store then narrows valid
+                    # [COMB_T_TILE, HC_MULT] into the 4-wide post output.
+                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,COMB_T_TILE] row keeps the rsqrt tile 32B-aligned
+                    inv_col = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
                     post_base = hc_reshaped[0:1, HC_MULT:HC_MULT + HC_PAD]
-                    post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+                    post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + COMB_T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
                     post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
                     post_pad = pl.mul(pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0)), 2.0)
-                    # stash HC_PAD-wide in same-core scratch, load back as an aligned [8,8] tile,
-                    # then pl.store narrows the valid [8,4] into the 4-wide post output.
                     post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
                     post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
                                         valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
@@ -507,6 +509,17 @@ if __name__ == "__main__":
                              "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
                              "kept for CLI / CI back-compat.")
     args = parser.parse_args()
+
+    # hc_pre's fused body is specialized to Ascend 910B: NUM_CORES=24 IS the physical AIC
+    # count, and the hard full-occupancy mix-syncall hangs (AICore timeout 507018) unless the
+    # launch fills every physical core of the SoC. A5 (Ascend950) has a different core count,
+    # so 24 blocks would leave physical participants unreached -> reject it here rather than
+    # hang. Supporting A5 needs a backend-aware participant count + re-tuning/re-validation.
+    if args.platform in ("a5", "a5sim"):
+        raise SystemExit(
+            f"hc_pre is specialized to Ascend 910B (NUM_CORES={NUM_CORES} == physical AIC count); "
+            f"its full-occupancy mix-syncall would hang on {args.platform!r}. Run with -p a2a3."
+        )
 
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
 
