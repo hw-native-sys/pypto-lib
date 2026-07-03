@@ -258,7 +258,18 @@ K_TID_BASE = Q_ON * QKV_OK  # 50 — q tiles occupy [0, K_TID_BASE)
 V_TID_BASE = K_TID_BASE + KV_ON * QKV_OK  # 60 — k tiles in [K_TID_BASE, V_TID_BASE)
 RMS_TID_IDX = V_TID_BASE + KV_ON * QKV_OK  # 70 — v tiles in [V_TID_BASE, RMS_TID_IDX); rms_tid last
 ROPE_NDEPS = RMS_TID_IDX + 1  # 71
-FA_NDEPS = ROPE_NDEPS + 1  # rope deps + work_tid (fa_fused folds in rope as phase 0)
+WORK_TID_IDX = ROPE_NDEPS  # 71 — fa_work_build (fa_total block count); fa_fused folds rope in as phase 0
+# MLP/out accumulator-seed slots appended to the SAME rope_dep_tids array (deps= must
+# be one comprehension, not a mix). fa_fused gates on the 4 zero-fill seeds so the
+# ~305 downstream atomic-add tasks (out/gate/up/down_proj) can DROP their direct seed
+# edge — ordering stays correct transitively (seed -> fa_fused -> atomic-add), cutting
+# task-graph edges (AICPU dep-processing load). The seeds only dep on the prev layer,
+# so they finish long before fa_fused's rope chain — no critical-path delay.
+DOWN_SEED_IDX = WORK_TID_IDX + 1  # 72
+GATE_SEED_IDX = WORK_TID_IDX + 2  # 73
+UP_SEED_IDX = WORK_TID_IDX + 3  # 74
+OUT_SEED_IDX = WORK_TID_IDX + 4  # 75
+FA_NDEPS = OUT_SEED_IDX + 1  # 76 — rope deps + work_tid + 4 accumulator seeds
 
 # Fused QK-norm reduction alignment. The per-(KV head, batch) sum-of-squares emits a
 # col-major [rows, 1] tile; ptoas requires its column byte size (rows * sizeof(FP32))
@@ -559,38 +570,52 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 cursor = cursor + wb_ctx
             pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
 
-        rope_dep_tids[ROPE_NDEPS] = work_tid  # fa_fused (now folds in rope) also waits on fa_work_build
+        rope_dep_tids[WORK_TID_IDX] = work_tid  # fa_fused (now folds in rope) also waits on fa_work_build
 
-        # ── Scope 3b MLP-accumulator seeds, HOISTED between rope and attn. ──
-        # gate/up/down accumulators are zeroed for the later split-K atomic-add
+        # ── Scope 3b MLP/out accumulator seeds, HOISTED between rope and attn. ──
+        # gate/up/down/attn_proj accumulators are zeroed for the later split-K atomic-add
         # tasks; the seeds have NO data dependency on rope or attention, so placing
-        # them here lets the scheduler overlap the (vector) zero-fills with the
-        # fa_fused cube/vector work instead of serializing them at the head of the
-        # MLP manual_scope. Their TASK_IDs (seed_tid / gate_seed_tid / up_seed_tid)
-        # cross into the manual_scope below as explicit deps — the same pattern as
-        # online_softmax's captured attn_done_tid. The accumulator create_tensor
-        # calls move up with them (a seed must follow its tensor's allocation).
+        # them here lets the scheduler overlap the (vector) zero-fills with the fa_fused
+        # cube/vector work. Their TASK_IDs are stashed into rope_dep_tids so fa_fused
+        # gates on all 4 seeds — the many atomic-add successors then DROP their direct
+        # seed edge (ordered transitively via fa_fused; see the *_SEED_IDX comment). The
+        # accumulator create_tensor calls move up with them (a seed must follow its
+        # tensor's allocation) — including attn_proj_fp32 (was allocated in Scope-3).
         down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
+        attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
                 down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
+        rope_dep_tids[DOWN_SEED_IDX] = seed_tid
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as gate_seed_tid:
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
                 gate_acc_all = pl.assemble(gate_acc_all, zero, [0, n0])
+        rope_dep_tids[GATE_SEED_IDX] = gate_seed_tid
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as up_seed_tid:
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
                 up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
+        rope_dep_tids[UP_SEED_IDX] = up_seed_tid
+
+        # out_seed zeros attn_proj_fp32 in OUT_TN-wide chunks so out_proj split-K tasks
+        # can atomic-add into it. Hoisted alongside the MLP seeds (was at the head of
+        # the Scope-3 block) so it too funnels through fa_fused.
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as out_seed_tid:
+            for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
+                out_seed_n0 = nb * OUT_TN
+                out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
+                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
+        rope_dep_tids[OUT_SEED_IDX] = out_seed_tid
 
         # fa_fused: ONE mixed cube+vec root (QK -> softmax -> SV), BLOCK-LEVEL dense
         # static dispatch. Each grid-stride step processes exactly ONE real seq-block
@@ -607,7 +632,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             # NONE region (both lanes, disjoint (b, kvh) work). A function-level pl.split
             # cannot express this — it would also try to halve phase-2's un-halvable
             # [5, 128] / [1, 640] reduction tiles ("even split dimension").
-            deps=[rope_dep_tids[i] for i in range(FA_NDEPS)],  # rope deps + work_tid (rope folded into fa_fused phase 0)
+            deps=[rope_dep_tids[i] for i in range(FA_NDEPS)],  # rope deps + work_tid + 4 accumulator seeds (funnel; see *_SEED_IDX)
         ) as attn_done_tid:  # now also runs phase-2 softmax (writes attn_out) after the syncall
             fa_core = pl.get_block_idx()
             # ── Phase 0: QK-norm + RoPE, folded in (was the standalone rope_qkv grid).
@@ -838,21 +863,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     )
                     attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
 
-        # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all are created
-        # earlier, alongside their hoisted seed tasks between rope and attn.)
-        attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all / attn_proj_fp32
+        # are created earlier, alongside their hoisted seed tasks between rope and attn.)
         post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # raw residual h1 (add-back); FP32 (was BF16)
         mlp_norm_in = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
         inv_rms_tile = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
         mlp_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
-
-        # Out_seed zeros attn_proj_fp32 in OUT_TN-wide chunks so out_proj
-        # split-K tasks can atomic-add into it.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as out_seed_tid:
-            for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
-                out_seed_n0 = nb * OUT_TN
-                out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
-                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
 
         # ── Scope 3b: manual_scope MLP block. ──
         silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
@@ -872,7 +888,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="out_proj",
-                    deps=[out_seed_tid, attn_done_tid],
+                    deps=[attn_done_tid],  # out_seed funneled via fa_fused (attn_done_tid gates on it)
                 ) as out_tid:
                     out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
                     out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
@@ -952,7 +968,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="gate_proj",
-                    deps=[cast_tids[k_split], gate_seed_tid],
+                    deps=[cast_tids[k_split]],  # gate_seed funneled via fa_fused (cast_tid -> out_proj -> fa_fused)
                 ) as gate_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
                     w0 = w_gate[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
@@ -968,7 +984,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="up_proj",
-                    deps=[cast_tids[k_split], up_seed_tid],
+                    deps=[cast_tids[k_split]],  # up_seed funneled via fa_fused (cast_tid -> out_proj -> fa_fused)
                 ) as up_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
                     w0 = w_up[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
@@ -1020,7 +1036,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="down_proj",
-                    deps=[seed_tid, silu_tids[k_split]],
+                    deps=[silu_tids[k_split]],  # down_seed funneled via fa_fused (silu -> ... -> out_proj -> fa_fused)
                 ) as down_tid:
                     a0 = mlp_tile[:, k0 : k0 + DOWN_TK]
                     w0 = w_down[layer_inter_base + k0 : layer_inter_base + k0 + DOWN_TK, n0 : n0 + DOWN_TN]
