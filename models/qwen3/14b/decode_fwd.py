@@ -1204,7 +1204,6 @@ _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count 
 
 @pl.jit
 def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM head
-    hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -1844,7 +1843,9 @@ if __name__ == "__main__":
         sampled_ids_out = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
         next_hidden = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
         decode_fwd(
-            *stacked,
+            # stacked[0] is hs (hidden_states), kept for the decode_fwd_layers
+            # reference call below; decode_fwd no longer takes it.
+            *stacked[1:],
             logits,
             embed_weight,
             sampled_ids_in,
