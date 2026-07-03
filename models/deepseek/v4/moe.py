@@ -148,19 +148,22 @@ def dispatch(
                 pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
                 pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
-        # One meta row per dst (all N_LOCAL counts, zeros included), then notify.
+        # One meta row per dst (all N_LOCAL counts, zeros included), then bump the
+        # per-source arrival counter. AtomicAdd(1) is order-independent across the
+        # reused window, so a late notify from an earlier epoch cannot clobber it.
         meta_tile = pl.tile.full([1, N_LOCAL], dtype=pl.INT32, value=0)
         for dst in pl.range(N_RANKS):
             for e in pl.range(N_LOCAL):
                 pl.tile.write(meta_tile, [0, e], cursor[dst * N_LOCAL + e])
             pld.tile.remote_store(meta_tile, target=recv_meta, peer=dst, offsets=[my_rank, 0])
-            pld.system.notify(
-                target=arrived,
-                peer=dst,
-                offsets=[my_rank, 0],
-                value=moe_epoch,
-                op=pld.NotifyOp.Set,
-            )
+            if dst != my_rank:
+                pld.system.notify(
+                    target=arrived,
+                    peer=dst,
+                    offsets=[my_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
 
         # Wait for every source's flag.
         for src in pl.range(N_RANKS):
@@ -232,15 +235,15 @@ def combine(
                     shape=[1, D],
                 )
 
-        # Signal, then wait for every source.
+        # Signal, then wait for every source (AtomicAdd counter, epoch-safe).
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
                     target=combine_arrived,
                     peer=peer,
                     offsets=[my_rank, 0],
-                    value=moe_epoch,
-                    op=pld.NotifyOp.Set,
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
                 )
         for src in pl.range(N_RANKS):
             if src != my_rank:
