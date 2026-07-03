@@ -239,8 +239,8 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 4                  # B: requests per decode step
-DECODE_SEQ = 2                    # S: 2 tokens per step (MTP)
+DECODE_BATCH = 8                  # B: requests per decode step
+DECODE_SEQ = 1                    # S: 1 token per step for serving
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
