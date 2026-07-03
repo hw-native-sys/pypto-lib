@@ -66,8 +66,6 @@ def expert_shared(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
-    sh_pad = pl.create_tensor([T_PAD, D], dtype=pl.BF16)
-
     # One M-tile of SH_M_TILE rows per iteration (decode: 1 tile, T<=16 rows valid;
     # prefill: T_PAD/SH_M_TILE fully-valid tiles).
     for mt in pl.parallel(N_MTILES):
@@ -174,12 +172,10 @@ def expert_shared(
                 w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                 y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, h_tile_scale_dq), w2_scale_chunk)
-                sh_pad[ts0 : ts0 + SH_M_TILE, d0 : d0 + D_OUT_TILE_ACT] = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_output"):
-        for t0 in pl.range(0, T, SH_M_TILE):
-            for d0 in pl.pipeline(0, D, K_TILE, stage=2):
-                sh[t0:t0 + SH_M_TILE, d0:d0 + K_TILE] = sh_pad[t0:t0 + SH_M_TILE, d0:d0 + K_TILE]
+                # Write valid rows straight to the (unpadded) output, mirroring
+                # expert_routed's direct recv_y store; no sh_pad round-trip.
+                y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
+                sh[ts0 : ts0 + SH_VALID_M, d0 : d0 + D_OUT_TILE_ACT] = y_bf16[0:SH_VALID_M, :]
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value; sh is convenient because it's already pl.Out.
