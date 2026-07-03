@@ -92,7 +92,6 @@ def dispatch(
     recv_scale_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
-    recv_origin_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
@@ -198,7 +197,6 @@ def dispatch(
                     pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
                     pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
                     pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
-                    pl.write(recv_origin_out, [e, out_col], pl.cast(src, pl.INT32))
 
 
 # === Combine =================================================================
@@ -208,10 +206,9 @@ def dispatch(
 def combine(
     recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
-    recv_origin_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
-    recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -219,21 +216,33 @@ def combine(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_push"):
-        # Put each compact slot back to its origin rank at its route offset.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine"):
+        # Rebuild per-(e, src) base rows from recv_meta so the compact slots are
+        # walked src-major and the origin rank is the loop index src (static peer,
+        # no per-slot origin tensor).
+        cmb_base = pl.array.create(N_LOCAL * N_RANKS, pl.INT32)
         for e in pl.range(N_LOCAL):
-            n = pl.cast(pl.read(recv_count_out, [e, 0]), pl.INDEX)
-            for slot in pl.range(n):
-                origin = pl.read(recv_origin_out, [e, slot])
-                r_route = pl.cast(pl.read(recv_r_route_out, [e, slot]), pl.INDEX)
-                pld.tensor.put(
-                    dst=routed_y_buf,
-                    peer=origin,
-                    src=recv_y_flat,
-                    dst_offsets=[r_route, 0],
-                    src_offsets=[e * RECV_MAX + slot, 0],
-                    shape=[1, D],
-                )
+            base_acc = pl.const(0, pl.INT32)
+            for src in pl.range(N_RANKS):
+                cmb_base[e * N_RANKS + src] = base_acc
+                base_acc = base_acc + pl.read(recv_meta, [src, e])
+
+        # Put each compact slot back to its origin rank (= src) at its route offset.
+        for src in pl.range(N_RANKS):
+            for e in pl.range(N_LOCAL):
+                n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
+                b = pl.cast(cmb_base[e * N_RANKS + src], pl.INDEX)
+                for slot in pl.range(n):
+                    out_col = b + slot
+                    r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
+                    pld.tensor.put(
+                        dst=routed_y_buf,
+                        peer=src,
+                        src=recv_y_flat,
+                        dst_offsets=[r_route, 0],
+                        src_offsets=[e * RECV_MAX + out_col, 0],
+                        shape=[1, D],
+                    )
 
         # Signal, then wait for every source (AtomicAdd counter, epoch-safe).
         for peer in pl.range(N_RANKS):
@@ -260,7 +269,7 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    for tb in pl.spmd(T // 4, name_hint="combine_reduce"):
+    for tb in pl.spmd(T // 4, name_hint="shared_routed"):
         for tt in pl.range(4):
             t = tb * 4 + tt
             if t < active_tokens:
@@ -346,11 +355,10 @@ def moe(
     recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
     recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
-    recv_origin_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
-        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_origin_out, recv_count_out,
+        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived,
         num_tokens, my_rank, moe_epoch,
     )
@@ -366,8 +374,8 @@ def moe(
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         combine(
-            recv_y, recv_r_route_out, recv_origin_out, recv_count_out, sh,
-            ffn_out,
+            recv_y, recv_r_route_out, sh,
+            ffn_out, recv_meta,
             routed_y_buf, combine_arrived,
             num_tokens, my_rank, moe_epoch,
         )
