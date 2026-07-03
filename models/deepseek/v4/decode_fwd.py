@@ -878,19 +878,39 @@ def _make_final_norm_spec(name):
     raise ValueError(f"unclassified final norm spec: {name}")
 
 
-def _make_forward_metadata_specs(base_specs, start_pos=None):
+def make_forward_metadata_tensors(
+    base_specs,
+    start_pos=None,
+    commit_tokens=1,
+):
     import torch
-    from golden import TensorSpec
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        kv_seq_lens_from_starts,
+        mask_uncommitted_compressed_boundaries,
+        ori_slot_mapping,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
 
     seq_per_batch = T // B
     win = MODEL_CONFIG.sliding_window
 
+    def physical_blocks_from_spec(name):
+        shape = list(base_specs[name].shape)
+        block_num_dim = shape[1] if shape[0] == N_RANKS else shape[0]
+        return block_num_dim // B
+
+    hca_state_physical_blocks = physical_blocks_from_spec("hca_compress_state")
+    csa_state_physical_blocks = physical_blocks_from_spec("csa_compress_state")
+    csa_inner_state_physical_blocks = physical_blocks_from_spec("csa_inner_compress_state")
+
     def ranked(init_single):
         return torch.stack([init_single() for _ in range(N_RANKS)], dim=0)
 
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+    def init_default_start_pos():
         pattern = torch.tensor([
             10,
             CSA_COMPRESS_RATIO - seq_per_batch,
@@ -903,87 +923,112 @@ def _make_forward_metadata_specs(base_specs, start_pos=None):
             win,
         ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=seq_per_batch,
+            max_seq_len=MODEL_CONFIG.max_position_embeddings,
+            default_fn=init_default_start_pos,
+        )
 
     def init_position_ids_single():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((T,), dtype=torch.int32)
-        for t in range(T):
-            b = t // seq_per_batch
-            s = t - b * seq_per_batch
-            positions[t] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=seq_per_batch).reshape(-1).contiguous()
 
     def init_kv_seq_lens_single():
-        return (init_start_pos().to(torch.int64) + seq_per_batch).to(torch.int32)
+        return kv_seq_lens_from_starts(init_start_pos(), seq=seq_per_batch, commit_tokens=commit_tokens)
 
-    def init_block_table_single(max_blocks):
-        tbl = torch.full((B, max_blocks), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(max_blocks):
-                tbl[b, j] = b * max_blocks + j
-        return tbl
+    def init_block_table_single(max_blocks, physical_blocks=None):
+        return block_table(
+            batch=B,
+            table_blocks=max_blocks,
+            physical_blocks=max_blocks if physical_blocks is None else physical_blocks,
+        )
 
     def init_ori_slot_mapping_single():
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(ORI_MAX_BLOCKS).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            slot = pos % win
-            blk = int(block_table[b, slot // BLOCK_SIZE].item())
-            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
-        return mapping
+        return ori_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
+            init_block_table_single(ORI_MAX_BLOCKS),
+            block_size=BLOCK_SIZE,
+            window=win,
+        ).reshape(-1).contiguous()
 
     def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(max_blocks).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            if (pos + 1) % compress_ratio == 0:
-                cache_col = pos // compress_ratio
-                logical_blk = cache_col // BLOCK_SIZE
-                intra = cache_col % BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[t] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = position_ids_from_starts(init_start_pos(), seq=seq_per_batch)
+        return mask_uncommitted_compressed_boundaries(compressed_slot_mapping(
+            positions,
+            init_block_table_single(max_blocks),
+            compress_ratio=compress_ratio,
+            block_size=BLOCK_SIZE,
+        ), positions, compress_ratio=compress_ratio, commit_tokens=commit_tokens).reshape(-1).contiguous()
 
-    def init_state_slot_mapping_single(max_blocks, block_size):
-        positions = init_position_ids_single().to(torch.int64)
-        block_table = init_block_table_single(max_blocks).to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // seq_per_batch
-            pos = int(positions[t].item())
-            logical_blk = pos // block_size
-            intra = pos % block_size
-            blk = int(block_table[b, logical_blk].item())
-            mapping[t] = blk * block_size + intra
-        return mapping
+    def init_state_block_table_single(max_blocks, physical_blocks):
+        return block_table(
+            batch=B,
+            table_blocks=max_blocks,
+            physical_blocks=physical_blocks,
+        )
+
+    def init_state_slot_mapping_single(max_blocks, block_size, physical_blocks):
+        return state_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
+            init_state_block_table_single(max_blocks, physical_blocks),
+            state_block_size=block_size,
+        ).reshape(-1).contiguous()
 
     init_by_name = {
         "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
         "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
         "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS)),
-        "csa_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS)),
-        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_block_table_single(CSA_INNER_STATE_MAX_BLOCKS)),
+        "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS, hca_state_physical_blocks)),
+        "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS, csa_state_physical_blocks)),
+        "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_INNER_STATE_MAX_BLOCKS, csa_inner_state_physical_blocks)),
         "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
         "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
         "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
         "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
-        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE)),
-        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE)),
-        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE)),
+        "hca_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(HCA_COMPRESS_STATE_MAX_BLOCKS, HCA_COMPRESS_STATE_BLOCK_SIZE, hca_state_physical_blocks)),
+        "csa_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_MAIN_STATE_MAX_BLOCKS, CSA_MAIN_STATE_BLOCK_SIZE, csa_state_physical_blocks)),
+        "csa_inner_state_slot_mapping": lambda: ranked(lambda: init_state_slot_mapping_single(CSA_INNER_STATE_MAX_BLOCKS, CSA_INNER_STATE_BLOCK_SIZE, csa_inner_state_physical_blocks)),
         "position_ids": lambda: ranked(init_position_ids_single),
         "kv_seq_lens": lambda: ranked(init_kv_seq_lens_single),
     }
+    return {name: init_value() for name, init_value in init_by_name.items()}
+
+
+def _make_forward_metadata_specs(base_specs, start_pos=None, commit_tokens=1):
+    from golden import TensorSpec
+
+    metadata_names = [
+        "block_table",
+        "cmp_block_table",
+        "idx_block_table",
+        "hca_compress_state_block_table",
+        "csa_compress_state_block_table",
+        "csa_inner_compress_state_block_table",
+        "ori_slot_mapping",
+        "hca_cmp_slot_mapping",
+        "csa_cmp_slot_mapping",
+        "csa_idx_slot_mapping",
+        "hca_state_slot_mapping",
+        "csa_state_slot_mapping",
+        "csa_inner_state_slot_mapping",
+        "position_ids",
+        "kv_seq_lens",
+    ]
 
     return {
-        name: TensorSpec(name, list(base_specs[name].shape), base_specs[name].dtype, init_value=init_value)
-        for name, init_value in init_by_name.items()
+        name: TensorSpec(
+            name,
+            list(base_specs[name].shape),
+            base_specs[name].dtype,
+            init_value=lambda name=name: make_forward_metadata_tensors(
+                base_specs,
+                start_pos=start_pos,
+                commit_tokens=commit_tokens,
+            )[name],
+        )
+        for name in metadata_names
     }
 
 
@@ -1185,7 +1230,11 @@ def build_single_layer_tensor_specs(start_pos=None, layer_id=10):
 def build_tensor_specs(start_pos=None, num_tokens=T):
     import torch
     from golden import ScalarSpec, TensorSpec
-    base_specs = {spec.name: spec for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0) if isinstance(spec, TensorSpec)}
+    base_specs = {
+        spec.name: spec
+        for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0)
+        if isinstance(spec, TensorSpec)
+    }
     metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
     ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []

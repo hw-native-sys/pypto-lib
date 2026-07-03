@@ -84,13 +84,15 @@ COFF = 1 + int(OVERLAP)
 MAIN_OUT_DIM = COFF * HEAD_DIM
 MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 MAIN_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-MAIN_STATE_MAX_BLOCKS = 65
-MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_MAX_BLOCKS
+MAIN_STATE_PHYSICAL_BLOCKS = 65
+MAIN_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + MAIN_STATE_BLOCK_SIZE - 1) // MAIN_STATE_BLOCK_SIZE
+MAIN_STATE_BLOCK_NUM = B * MAIN_STATE_PHYSICAL_BLOCKS
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_MAX_BLOCKS = 65
-INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+INNER_STATE_PHYSICAL_BLOCKS = 65
+INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_PHYSICAL_BLOCKS
 IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
@@ -301,8 +303,9 @@ def attention_csa(
             kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
         for write_dt in pl.range(CSA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
-            write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
-            if write_row >= 0:
+            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
                 write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
                 write_zero = pl.mul(write_guard, 0.0)
                 write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
@@ -573,6 +576,15 @@ def golden_attention_csa(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        kv_seq_lens_from_starts,
+        ori_slot_mapping,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
     from golden import TensorSpec
     from hc_pre import golden_hc_pre
     from rope_tables import build_deepseek_v4_rope_tables
@@ -671,19 +683,21 @@ def build_tensor_specs(start_pos=None):
         state[:, :, MAIN_OUT_DIM:] = float("-inf")
         starts = init_start_pos().to(torch.int64)
         hist = torch.randn(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM) * 0.05
+        state_table = init_compress_state_block_table().to(torch.int64)
         for b in range(B):
             for abs_pos in range(int(starts[b].item())):
-                blk = b * MAIN_STATE_MAX_BLOCKS + abs_pos // MAIN_STATE_BLOCK_SIZE
+                logical_blk = abs_pos // MAIN_STATE_BLOCK_SIZE
+                blk = int(state_table[b, logical_blk].item())
                 intra = abs_pos % MAIN_STATE_BLOCK_SIZE
                 state[blk, intra] = hist[blk, intra]
         return state
 
     def init_compress_state_block_table():
-        tbl = torch.full((B, MAIN_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(MAIN_STATE_MAX_BLOCKS):
-                tbl[b, j] = b * MAIN_STATE_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=MAIN_STATE_MAX_BLOCKS,
+            physical_blocks=MAIN_STATE_PHYSICAL_BLOCKS,
+        )
 
     def init_weights_proj():
         return torch.randn(D, IDX_N_HEADS) * 0.2313
@@ -714,56 +728,52 @@ def build_tensor_specs(start_pos=None):
         state[:, :, INNER_OUT_DIM:] = float("-inf")
         starts = init_start_pos().to(torch.int64)
         hist = torch.randn(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM) * 0.05
+        state_table = init_inner_compress_state_block_table().to(torch.int64)
         for b in range(B):
             for abs_pos in range(int(starts[b].item())):
-                blk = b * INNER_STATE_MAX_BLOCKS + abs_pos // INNER_STATE_BLOCK_SIZE
+                logical_blk = abs_pos // INNER_STATE_BLOCK_SIZE
+                blk = int(state_table[b, logical_blk].item())
                 intra = abs_pos % INNER_STATE_BLOCK_SIZE
                 state[blk, intra] = hist[blk, intra]
         return state
 
     def init_inner_compress_state_block_table():
-        tbl = torch.full((B, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(INNER_STATE_MAX_BLOCKS):
-                tbl[b, j] = b * INNER_STATE_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=INNER_STATE_MAX_BLOCKS,
+            physical_blocks=INNER_STATE_PHYSICAL_BLOCKS,
+        )
 
     def init_kv_cache():
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_ori_block_table():
-        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(ORI_MAX_BLOCKS):
-                tbl[b, j] = b * ORI_MAX_BLOCKS + j
-        return tbl
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     def init_cmp_kv():
         return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_cmp_block_table():
-        tbl = torch.full((B, CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(CMP_MAX_BLOCKS):
-                tbl[b, j] = b * CMP_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_MAX_BLOCKS,
+        )
 
     def init_idx_kv_cache():
         return init_normalized_cache((IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM))
 
     def init_idx_block_table():
-        tbl = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(IDX_CACHE_MAX_BLOCKS):
-                tbl[b, j] = b * IDX_CACHE_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+        )
 
     def init_attn_sink():
         return torch.ones(H) * 4.0
 
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+    def init_default_start_pos():
         # Default per-batch pattern mirrors the HCA fixture style while keeping
         # CSA's separate ratio-4 compressor and sliding-window boundaries covered:
         #   10        : short-context compressed cache with multiple valid entries
@@ -787,87 +797,60 @@ def build_tensor_specs(start_pos=None):
             WIN,
         ], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
 
     def init_position_ids():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((T,), dtype=torch.int32)
-        for t in range(T):
-            b = t // S
-            s = t - b * S
-            positions[t] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()
 
     def init_kv_seq_lens():
-        starts = init_start_pos().to(torch.int64)
-        return (starts + S).to(torch.int32)
+        return kv_seq_lens_from_starts(init_start_pos(), seq=S)
 
     def init_ori_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_ori_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            pos = int(positions[t].item())
-            slot = pos % WIN
-            blk = int(block_table[b, slot // BLOCK_SIZE].item())
-            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
-        return mapping
+        return ori_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_ori_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        ).reshape(-1).contiguous()
 
     def init_cmp_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_cmp_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            pos = int(positions[t].item())
-            if (pos + 1) % COMPRESS_RATIO == 0:
-                cache_col = pos // COMPRESS_RATIO
-                logical_blk = cache_col // BLOCK_SIZE
-                intra = cache_col % BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[t] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = position_ids_from_starts(init_start_pos(), seq=S)
+        return compressed_slot_mapping(
+            positions,
+            init_cmp_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        ).reshape(-1).contiguous()
 
     def init_idx_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_idx_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            pos = int(positions[t].item())
-            if (pos + 1) % COMPRESS_RATIO == 0:
-                cache_col = pos // COMPRESS_RATIO
-                logical_blk = cache_col // BLOCK_SIZE
-                intra = cache_col % BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[t] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = position_ids_from_starts(init_start_pos(), seq=S)
+        return compressed_slot_mapping(
+            positions,
+            init_idx_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        ).reshape(-1).contiguous()
 
     def init_state_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_compress_state_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            pos = int(positions[t].item())
-            logical_blk = pos // MAIN_STATE_BLOCK_SIZE
-            intra = pos % MAIN_STATE_BLOCK_SIZE
-            blk = int(block_table[b, logical_blk].item())
-            mapping[t] = blk * MAIN_STATE_BLOCK_SIZE + intra
-        return mapping
+        return state_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_compress_state_block_table(),
+            state_block_size=MAIN_STATE_BLOCK_SIZE,
+        ).reshape(-1).contiguous()
 
     def init_inner_state_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_inner_compress_state_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            pos = int(positions[t].item())
-            logical_blk = pos // INNER_STATE_BLOCK_SIZE
-            intra = pos % INNER_STATE_BLOCK_SIZE
-            blk = int(block_table[b, logical_blk].item())
-            mapping[t] = blk * INNER_STATE_BLOCK_SIZE + intra
-        return mapping
+        return state_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_inner_compress_state_block_table(),
+            state_block_size=INNER_STATE_BLOCK_SIZE,
+        ).reshape(-1).contiguous()
 
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
@@ -994,9 +977,8 @@ if __name__ == "__main__":
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            # Tightened from CANN's 1e-2 bar: the realistic layer-8 hc_attn gates keep
-            # x_out well-conditioned, so it holds 0% over 3e-3 (worst rdiff well under 1).
-            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.008, max_diff_hd=1),
+            # Tightened from CANN's 1e-2 bar while allowing one BF16 step around unit-scale values.
+            "x_out": ratio_reldiff(diff_thd=4e-3, pct_thd=0.008, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

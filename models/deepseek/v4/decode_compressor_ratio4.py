@@ -46,8 +46,9 @@ OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 COMPRESS_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-COMPRESS_STATE_MAX_BLOCKS = 65
-COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
+COMPRESS_STATE_PHYSICAL_BLOCKS = 65
+COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
+COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
@@ -121,10 +122,11 @@ def compressor_ratio4(
         for c_idx in pl.range(B):
             for s in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s])
-                state_row = pl.cast(pl.read(state_slot_mapping, [c_idx, s]), pl.INDEX)
+                state_row_i64 = pl.read(state_slot_mapping, [c_idx, s])
                 proj_row = c_idx * S + s
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                if state_row >= 0:
+                if state_row_i64 >= 0:
+                    state_row = pl.cast(state_row_i64, pl.INDEX)
                     kv_tile = cmp4_kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
                     score_tile = cmp4_score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
                     ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
@@ -264,9 +266,10 @@ def compressor_ratio4(
             if pos_b + S >= COMPRESS_RATIO:
                 boundary_s = COMPRESS_RATIO - 1 - pos_b
                 kv_row_fp32 = normed_kv[pad_base + inner : pad_base + inner + 1, 0 : HEAD_DIM]
-                kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
-                cache_row = pl.cast(pl.read(cmp_slot_mapping, [c_idx, boundary_s]), pl.INDEX)
-                if cache_row >= 0:
+                cache_row_i64 = pl.read(cmp_slot_mapping, [c_idx, boundary_s])
+                if cache_row_i64 >= 0:
+                    cache_row = pl.cast(cache_row_i64, pl.INDEX)
+                    kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
                     cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
@@ -335,6 +338,32 @@ def golden_compressor(tensors):
     pooled = torch.zeros(bsz, 1, HEAD_DIM, dtype=torch.float32, device=x.device)
     should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
 
+    def read_front_state(b, abs_pos):
+        blk_id = int(compress_state_block_table[b, abs_pos // COMPRESS_STATE_BLOCK_SIZE].item())
+        if blk_id < 0:
+            return (
+                torch.zeros(HEAD_DIM, dtype=torch.float32, device=x.device),
+                torch.full((HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
+            )
+        intra = abs_pos % COMPRESS_STATE_BLOCK_SIZE
+        return (
+            compress_state[blk_id, intra, :HEAD_DIM],
+            compress_state[blk_id, intra, OUT_DIM:OUT_DIM + HEAD_DIM],
+        )
+
+    def read_back_state(b, abs_pos):
+        blk_id = int(compress_state_block_table[b, abs_pos // COMPRESS_STATE_BLOCK_SIZE].item())
+        if blk_id < 0:
+            return (
+                torch.zeros(HEAD_DIM, dtype=torch.float32, device=x.device),
+                torch.full((HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device),
+            )
+        intra = abs_pos % COMPRESS_STATE_BLOCK_SIZE
+        return (
+            compress_state[blk_id, intra, HEAD_DIM:OUT_DIM],
+            compress_state[blk_id, intra, OUT_DIM + HEAD_DIM:],
+        )
+
     for b in range(bsz):
         first_pos = int(position_ids[b, 0].item())
         pre_tokens = min(S, ratio - (first_pos % ratio))
@@ -366,16 +395,14 @@ def golden_compressor(tensors):
                     kv_rows.append(torch.zeros(HEAD_DIM, dtype=torch.float32, device=x.device))
                     score_rows.append(torch.full((HEAD_DIM,), float("-inf"), dtype=torch.float32, device=x.device))
                     continue
-                blk_id = int(compress_state_block_table[b, abs_pos // COMPRESS_STATE_BLOCK_SIZE].item())
-                intra = abs_pos % COMPRESS_STATE_BLOCK_SIZE
-                kv_rows.append(compress_state[blk_id, intra, :HEAD_DIM])
-                score_rows.append(compress_state[blk_id, intra, OUT_DIM:OUT_DIM + HEAD_DIM])
+                kv_row, score_row = read_front_state(b, abs_pos)
+                kv_rows.append(kv_row)
+                score_rows.append(score_row)
             for s in range(ratio):
                 abs_pos = cur_window_start + s
-                blk_id = int(compress_state_block_table[b, abs_pos // COMPRESS_STATE_BLOCK_SIZE].item())
-                intra = abs_pos % COMPRESS_STATE_BLOCK_SIZE
-                kv_rows.append(compress_state[blk_id, intra, HEAD_DIM:OUT_DIM])
-                score_rows.append(compress_state[blk_id, intra, OUT_DIM + HEAD_DIM:])
+                kv_row, score_row = read_back_state(b, abs_pos)
+                kv_rows.append(kv_row)
+                score_rows.append(score_row)
             kvs = torch.stack(kv_rows, dim=0).unsqueeze(0)
             scs = torch.stack(score_rows, dim=0).unsqueeze(0)
             pooled[b : b + 1] = (kvs * scs.softmax(dim=1)).sum(dim=1, keepdim=True)
@@ -406,12 +433,11 @@ def golden_compressor(tensors):
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-        # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0
-        # so the golden matches its [B, S, HEAD_DIM] zero-init.
-        tensors["kv"][b : b + 1, 0:1, :] = kv_b
-
         cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
         if cmp_row >= 0:
+            # Kernel writes committed pooled result only to kv[:, 0, :]; leave
+            # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
+            tensors["kv"][b : b + 1, 0:1, :] = kv_b
             blk_id = cmp_row // BLOCK_SIZE
             cmp_kv_cache[blk_id, cmp_row % BLOCK_SIZE, 0] = kv_b[0, 0]
 
@@ -420,6 +446,13 @@ def golden_compressor(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
 
@@ -432,11 +465,11 @@ def build_tensor_specs(start_pos=None):
         state[:, :, OUT_DIM:] = FP32_NEG_INF
         return state
     def init_compress_state_block_table():
-        tbl = torch.full((B, COMPRESS_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(COMPRESS_STATE_MAX_BLOCKS):
-                tbl[b, j] = b * COMPRESS_STATE_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=COMPRESS_STATE_MAX_BLOCKS,
+            physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
+        )
     # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) main compressor (mean l8/l32 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
     # gamma centers near the measured mean (not ones / not uniform).
@@ -464,9 +497,7 @@ def build_tensor_specs(start_pos=None):
             for j in range(CMP_MAX_BLOCKS):
                 tbl[b, j] = b * CMP_MAX_BLOCKS + j
         return tbl
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+    def init_default_start_pos():
         # Default per-batch pattern covers every ratio-4 decode branch:
         #   0           : no-compress, window start
         #   1           : no-compress, mid-window
@@ -488,39 +519,30 @@ def build_tensor_specs(start_pos=None):
         for b in range(B):
             vals[b] = pattern[b % int(pattern.numel())]
         return vals
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
     def init_position_ids():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((B, S), dtype=torch.int32)
-        for b in range(B):
-            for s in range(S):
-                positions[b, s] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=S)
     def init_state_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_compress_state_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                logical_blk = pos // COMPRESS_STATE_BLOCK_SIZE
-                intra = pos % COMPRESS_STATE_BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[b, s] = blk * COMPRESS_STATE_BLOCK_SIZE + intra
-        return mapping
+        return state_slot_mapping(
+            init_position_ids(),
+            init_compress_state_block_table(),
+            state_block_size=COMPRESS_STATE_BLOCK_SIZE,
+        )
     def init_cmp_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_cmp_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                if (pos + 1) % COMPRESS_RATIO == 0:
-                    cache_col = pos // COMPRESS_RATIO
-                    logical_blk = cache_col // BLOCK_SIZE
-                    intra = cache_col % BLOCK_SIZE
-                    blk = int(block_table[b, logical_blk].item())
-                    mapping[b, s] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_cmp_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        )
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),

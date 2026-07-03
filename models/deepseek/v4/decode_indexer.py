@@ -49,8 +49,9 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_MAX_BLOCKS = 65
-INNER_STATE_BLOCK_NUM = B * INNER_STATE_MAX_BLOCKS
+INNER_STATE_PHYSICAL_BLOCKS = 65
+INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
+INNER_STATE_BLOCK_NUM = B * INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
@@ -76,6 +77,53 @@ QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = S * IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
 ROPE_ROW_TILE = 32
+TOPK_HALF_LEN = SCORE_LEN // 2
+TOPK_HALF_PAIR_OFFSET = 2 * TOPK_HALF_LEN
+TOPK_PAIR_WIDTH = 2 * IDX_TOPK
+assert SCORE_LEN == 2 * TOPK_HALF_LEN, "decode indexer topk expects an even score length"
+assert TOPK_HALF_LEN == 2048, "decode indexer 4096-value topk uses two 2048-value halves"
+assert IDX_TOPK <= TOPK_HALF_LEN, "per-half candidate list must cover the final topk width"
+
+
+@pl.jit.inline
+def indexer_topk_core(
+    score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
+    topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
+    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    offset: pl.Scalar[pl.INT32],
+):
+    score_flat = pl.reshape(score, [T, SCORE_LEN])
+    topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
+    for t in pl.spmd(T, name_hint="topk"):
+        invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
+        topk_idxs_flat[t : t + 1, :] = invalid_idxs
+        batch_idx = t // S
+        cache_len_b = pl.min(pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO, SCORE_LEN)
+        if cache_len_b > 0:
+            offset_i32 = pl.cast(offset, target_type=pl.INT32)
+            score_full_raw = score_flat[t : t + 1, 0:SCORE_LEN]
+            score_full = pl.fillpad(pl.set_validshape(score_full_raw, 1, cache_len_b), pad_value=pl.PadValue.min)
+            score_full = pl.maximum(score_full, pl.full([1, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF))
+            idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
+            sorted_full = pl.sort32(score_full, idx_init)
+            sorted_full = pl.mrgsort(sorted_full, block_len=64)
+            sorted_full = pl.mrgsort(sorted_full, block_len=256)
+            sorted_full = pl.mrgsort(sorted_full, block_len=1024)
+
+            # After the 1024 merge, the 4096-score row is two sorted 2048-score
+            # runs. sort32/mrgsort keeps score/index pairs interleaved, so the
+            # second 2048-score run starts at pair-lane offset 2 * 2048.
+            half0_candidates = sorted_full[:, 0:TOPK_PAIR_WIDTH]
+            half1_candidates = sorted_full[:, TOPK_HALF_PAIR_OFFSET : TOPK_HALF_PAIR_OFFSET + TOPK_PAIR_WIDTH]
+            merged_candidates = pl.mrgsort(half0_candidates, half1_candidates)
+            topk_pairs = merged_candidates[:, 0:TOPK_PAIR_WIDTH]
+            topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
+            valid_topk = pl.min(IDX_TOPK, cache_len_b)
+            topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
+            topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
+
+    return topk_idxs
+
 
 @pl.jit.inline
 def indexer(
@@ -95,7 +143,7 @@ def indexer(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
@@ -262,25 +310,7 @@ def indexer(
             )
             score_flat[tb + s : tb + s + 1, cache0 : cache0 + CACHE_TILE] = weighted_score_valid_s
 
-    topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    for t in pl.spmd(T, name_hint="topk"):
-        invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
-        topk_idxs_flat[t : t + 1, :] = invalid_idxs
-        batch_idx = t // S
-        cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
-        if cache_len_b > 0:
-            offset_i32 = pl.cast(offset, target_type=pl.INT32)
-            score_row = score_flat[t : t + 1, :]
-            idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
-            sorted_score_tile = pl.sort32(score_row, idx_init)
-            sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=64)
-            sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=256)
-            sorted_score_tile = pl.mrgsort(sorted_score_tile, block_len=1024)
-            topk_pairs = sorted_score_tile[:, 0 : 2 * IDX_TOPK]
-            topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            valid_topk = pl.min(IDX_TOPK, cache_len_b)
-            topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
-            topk_idxs_flat[t : t + 1, 0 : IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
+    indexer_topk_core(score, topk_idxs, kv_seq_lens, offset)
 
     return score, topk_idxs
 
@@ -486,6 +516,14 @@ def golden_indexer(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        kv_seq_lens_from_starts,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
     from golden import ScalarSpec, TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
 
@@ -513,11 +551,11 @@ def build_tensor_specs(start_pos=None):
         state[:, :, INNER_OUT_DIM:] = FP32_NEG_INF
         return state
     def init_inner_compress_state_block_table():
-        tbl = torch.full((B, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(INNER_STATE_MAX_BLOCKS):
-                tbl[b, j] = b * INNER_STATE_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=INNER_STATE_MAX_BLOCKS,
+            physical_blocks=INNER_STATE_PHYSICAL_BLOCKS,
+        )
     def init_inner_wkv():
         return torch.randn(INNER_OUT_DIM, D) * 0.0293
     def init_inner_wgate():
@@ -529,14 +567,12 @@ def build_tensor_specs(start_pos=None):
     def init_idx_kv_cache():
         return torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     def init_idx_block_table():
-        tbl = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(IDX_CACHE_MAX_BLOCKS):
-                tbl[b, j] = b * IDX_CACHE_MAX_BLOCKS + j
-        return tbl
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+        return block_table(
+            batch=B,
+            table_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+        )
+    def init_default_start_pos():
         # Default per-batch pattern covers indexer score/topk and inner compressor branches:
         #   0             : no valid compressed cache
         #   1             : no-compress, mid-window, no valid compressed cache
@@ -562,42 +598,32 @@ def build_tensor_specs(start_pos=None):
         for b in range(B):
             vals[b] = pattern[b % int(pattern.numel())]
         return vals
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
     def init_position_ids():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((B, S), dtype=torch.int32)
-        for b in range(B):
-            for s in range(S):
-                positions[b, s] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=S)
     def init_kv_seq_lens():
-        starts = init_start_pos().to(torch.int64)
-        return (starts + S).to(torch.int32)
+        return kv_seq_lens_from_starts(init_start_pos(), seq=S)
     def init_inner_state_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_inner_compress_state_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                logical_blk = pos // INNER_STATE_BLOCK_SIZE
-                intra = pos % INNER_STATE_BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[b, s] = blk * INNER_STATE_BLOCK_SIZE + intra
-        return mapping
+        return state_slot_mapping(
+            init_position_ids(),
+            init_inner_compress_state_block_table(),
+            state_block_size=INNER_STATE_BLOCK_SIZE,
+        )
     def init_idx_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_idx_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                if (pos + 1) % COMPRESS_RATIO == 0:
-                    cache_col = pos // COMPRESS_RATIO
-                    logical_blk = cache_col // BLOCK_SIZE
-                    intra = cache_col % BLOCK_SIZE
-                    blk = int(block_table[b, logical_blk].item())
-                    mapping[b, s] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_idx_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        )
 
     # idx wq_b: simulate the real MXFP8 (e4m3 + 128x128-block E8M0) grid (~200 levels, scaleCV
     # ~0.61, ~1.1% zero spike) instead of a benign randn INT8. gen_shared_weight reduces over

@@ -174,7 +174,7 @@ FLASH = DeepSeekV4Config(
     hc_mult=4,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
-    max_position_embeddings=8192,  # official 1M;
+    max_position_embeddings=16384,  # 8k prompt + 512 decode steps target; official 1M;
     rope_theta=10000.0,
     compress_rope_theta=160000.0,
     rope_factor=16.0,
@@ -257,7 +257,7 @@ LM_HEAD_TP_SIZE = 8
 # decode-batch-sized physical pool because serving slot ids address the shared
 # decode KV-cache layout even when a prefill kernel handles one request at a time.
 KV_ORI_MAX_BLOCKS = 1
-KV_CMP_MAX_BLOCKS = 8
+KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64
 DECODE_ORI_BLOCK_NUM = DECODE_BATCH * KV_ORI_MAX_BLOCKS
 DECODE_CMP_BLOCK_NUM = DECODE_BATCH * KV_CMP_MAX_BLOCKS

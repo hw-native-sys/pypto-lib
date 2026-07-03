@@ -204,8 +204,9 @@ def attention_swa(
         wb_t0 = wb_blk * SWA_WB_TOKEN_TILE
         for write_dt in pl.range(SWA_WB_TOKEN_TILE):
             write_t = wb_t0 + write_dt
-            write_row = pl.cast(pl.read(ori_slot_mapping, [write_t]), pl.INDEX)
-            if write_row >= 0:
+            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
                 # WAR guard: the ZERO-GATHER kernel reads the ring page directly, so a
                 # token's writeback to slot p%WIN must not race a *sibling* token's
                 # valid read of that same slot (e.g. start=127: the s=1 token writes
@@ -404,6 +405,12 @@ def golden_attention_swa(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
+    from decode_metadata import (
+        block_table,
+        ori_slot_mapping,
+        position_ids_from_starts,
+        resolve_start_positions,
+    )
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
 
@@ -470,39 +477,31 @@ def build_tensor_specs(start_pos=None):
         return init_normalized_cache((B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM))
 
     def init_block_table():
-        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(ORI_MAX_BLOCKS):
-                tbl[b, j] = b * ORI_MAX_BLOCKS + j
-        return tbl
+        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     def init_attn_sink():
         return torch.zeros(H)
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+    def init_default_start_pos():
         # Values span the sliding-window regimes and wraparound write slots.
         pattern = torch.tensor([9, 31, 62, WIN - 1], dtype=torch.int32)
         return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
     def init_position_ids():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((T,), dtype=torch.int32)
-        for t in range(T):
-            b = t // S
-            s = t - b * S
-            positions[t] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=S).reshape(-1).contiguous()
     def init_ori_slot_mapping():
-        starts = init_start_pos().to(torch.int64)
-        block_table = init_block_table().to(torch.int64)
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
-            b = t // S
-            s = t - b * S
-            slot = int((starts[b].item() + s) % WIN)
-            blk = int(block_table[b, slot // BLOCK_SIZE].item())
-            mapping[t] = blk * BLOCK_SIZE + slot % BLOCK_SIZE
-        return mapping
+        return ori_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        ).reshape(-1).contiguous()
     def init_wo_a():
         return torch.randn(O_GROUPS, O_LORA, O_GROUP_IN) / O_GROUP_IN ** 0.5
     def init_wo_b():
@@ -534,8 +533,11 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("cmp_kv", [B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=lambda: torch.zeros(B * SPARSE_CMP_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)),
         TensorSpec("cmp_block_table", [B, SPARSE_CMP_MAX_BLOCKS], torch.int32,
-                   init_value=lambda: (torch.arange(B, dtype=torch.int32).unsqueeze(1) * SPARSE_CMP_MAX_BLOCKS
-                                       + torch.arange(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32).unsqueeze(0))),
+                       init_value=lambda: block_table(
+                           batch=B,
+                           table_blocks=SPARSE_CMP_MAX_BLOCKS,
+                           physical_blocks=SPARSE_CMP_MAX_BLOCKS,
+                       )),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),

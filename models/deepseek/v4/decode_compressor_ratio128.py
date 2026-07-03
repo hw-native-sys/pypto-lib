@@ -20,6 +20,7 @@ from config import (
     DECODE_BATCH,
     DECODE_SEQ,
     DECODE_CMP_BLOCK_NUM,
+    FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
 )
 
@@ -55,11 +56,12 @@ STATE_LEN = COFF * COMPRESS_RATIO
 #     cmp_slot_mapping[b, s]   -> flattened compressed-KV row, -1 means no-write
 # - APE remains ratio-local:
 #     ape_row = position_ids[b, s] % COMPRESS_RATIO
-# - COMPRESS_STATE_MAX_BLOCKS=64 is only enough for the current tests
-#   (64 * 8 positions per request), not full MAX_SEQ_LEN coverage.
-COMPRESS_STATE_MAX_BLOCKS = 64
-COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_MAX_BLOCKS
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
+# Logical state block tables cover MAX_SEQ_LEN while the physical state pool
+# remains bounded to the per-request rolling state capacity.
+COMPRESS_STATE_PHYSICAL_BLOCKS = 64
+COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
+COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
@@ -146,8 +148,9 @@ def compressor_ratio128(
                 proj_row = global_c_idx * s_dim + s
                 token_pos = pl.read(position_ids, [global_c_idx, s])
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
-                state_row = pl.cast(pl.read(state_slot_mapping, [global_c_idx, s]), target_type=pl.INDEX)
-                if state_row >= 0:
+                state_row_i64 = pl.read(state_slot_mapping, [global_c_idx, s])
+                if state_row_i64 >= 0:
+                    state_row = pl.cast(state_row_i64, target_type=pl.INDEX)
                     state_blk_id = state_row // COMPRESS_STATE_BLOCK_SIZE
                     state_intra = state_row % COMPRESS_STATE_BLOCK_SIZE
                     slot_col0_s = state_intra * COMPRESS_STATE_DIM
@@ -196,14 +199,15 @@ def compressor_ratio128(
             state_pos0 = compress_pos - (COMPRESS_RATIO - 1)
             base_logical_blk = state_pos0 // COMPRESS_STATE_BLOCK_SIZE
             for blk_i in pl.pipeline(NUM_STATE_BLOCKS, stage=2):
-                state_blk_id = pl.cast(
-                    pl.read(compress_state_block_table, [global_c_idx, base_logical_blk + blk_i]),
-                    target_type=pl.INDEX,
-                )
-                row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE
                 s0 = blk_i * COMPRESS_STATE_BLOCK_SIZE
-                slot_score = compress_state_rows[row0 : row0 + COMPRESS_STATE_BLOCK_SIZE, OUT_DIM + h0 : OUT_DIM + h0 + POOL_HEAD_TILE]
-                slot_kv = compress_state_rows[row0 : row0 + COMPRESS_STATE_BLOCK_SIZE, h0 : h0 + POOL_HEAD_TILE]
+                slot_score = pl.full([COMPRESS_STATE_BLOCK_SIZE, POOL_HEAD_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
+                slot_kv = pl.full([COMPRESS_STATE_BLOCK_SIZE, POOL_HEAD_TILE], dtype=pl.FP32, value=0.0)
+                state_blk_raw = pl.read(compress_state_block_table, [global_c_idx, base_logical_blk + blk_i])
+                if state_blk_raw >= 0:
+                    state_blk_id = pl.cast(state_blk_raw, target_type=pl.INDEX)
+                    row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE
+                    slot_score = compress_state_rows[row0 : row0 + COMPRESS_STATE_BLOCK_SIZE, OUT_DIM + h0 : OUT_DIM + h0 + POOL_HEAD_TILE]
+                    slot_kv = compress_state_rows[row0 : row0 + COMPRESS_STATE_BLOCK_SIZE, h0 : h0 + POOL_HEAD_TILE]
                 softmax_score_state[s0 : s0 + COMPRESS_STATE_BLOCK_SIZE, :] = slot_score
                 softmax_kv_state[s0 : s0 + COMPRESS_STATE_BLOCK_SIZE, :] = slot_kv
 
@@ -285,9 +289,10 @@ def compressor_ratio128(
             if pos_b + s_dim >= COMPRESS_RATIO:
                 boundary_s = COMPRESS_RATIO - 1 - pos_b
                 kv_row = normed_kv[pad_base + inner : pad_base + inner + 1, 0 : HEAD_DIM]
-                kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
-                cmp_row = pl.cast(pl.read(cmp_slot_mapping, [global_c_idx, boundary_s]), target_type=pl.INDEX)
-                if cmp_row >= 0:
+                cmp_row_i64 = pl.read(cmp_slot_mapping, [global_c_idx, boundary_s])
+                if cmp_row_i64 >= 0:
+                    cmp_row = pl.cast(cmp_row_i64, target_type=pl.INDEX)
+                    kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
                     cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
 
     kv = pl.reshape(kv_flat, [b_dim, s_dim, HEAD_DIM])
@@ -356,6 +361,11 @@ def golden_compressor(tensors):
         logical_blk = pos // COMPRESS_STATE_BLOCK_SIZE
         intra = pos % COMPRESS_STATE_BLOCK_SIZE
         sblk = int(compress_state_block_table[b, logical_blk].item())
+        if sblk < 0:
+            return (
+                torch.zeros(OUT_DIM, dtype=torch.float32, device=compress_state.device),
+                torch.full((OUT_DIM,), float("-inf"), dtype=torch.float32, device=compress_state.device),
+            )
         return (
             compress_state[sblk, intra, :OUT_DIM],
             compress_state[sblk, intra, OUT_DIM:2 * OUT_DIM],
@@ -430,15 +440,15 @@ def golden_compressor(tensors):
 
         kv_b = torch.cat([kv_b[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-        # Kernel writes pooled result only to kv[:, 0, :]; leave kv[:, 1:, :] = 0.
-        tensors["kv"][b : b + 1, 0:1, :] = kv_b
-
         boundary_positions = torch.nonzero((position_ids[b, :S] + 1) % ratio == 0, as_tuple=False).flatten()
         if int(boundary_positions.numel()) == 0:
             continue
         boundary_s = int(boundary_positions[0].item())
         cmp_row = int(cmp_slot_mapping[b, boundary_s].item())
         if cmp_row >= 0:
+            # Kernel writes committed pooled result only to kv[:, 0, :]; leave
+            # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
+            tensors["kv"][b : b + 1, 0:1, :] = kv_b
             cblk = cmp_row // BLOCK_SIZE
             intra_offset = cmp_row % BLOCK_SIZE
             cmp_kv_cache[cblk, intra_offset, 0] = kv_b[0, 0]
@@ -448,6 +458,13 @@ def golden_compressor(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
+    from decode_metadata import (
+        block_table,
+        compressed_slot_mapping,
+        position_ids_from_starts,
+        resolve_start_positions,
+        state_slot_mapping,
+    )
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
 
@@ -480,20 +497,20 @@ def build_tensor_specs(start_pos=None):
     def init_cmp_kv_cache():
         return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
     def init_compress_state_block_table():
-        # Always non-contiguous: swap logical blocks 0<->31 so the fixture
-        # validates block-table indirection rather than a contiguous layout.
-        tbl = torch.arange(B * COMPRESS_STATE_MAX_BLOCKS, dtype=torch.int32).view(B, COMPRESS_STATE_MAX_BLOCKS)
-        for b in range(B):
-            tbl[b, 0], tbl[b, 31] = tbl[b, 31].clone(), tbl[b, 0].clone()
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=COMPRESS_STATE_MAX_BLOCKS,
+            physical_blocks=COMPRESS_STATE_PHYSICAL_BLOCKS,
+            permuted=True,
+        )
     def init_cmp_block_table():
-        tbl = torch.arange(B * CMP_MAX_BLOCKS, dtype=torch.int32).view(B, CMP_MAX_BLOCKS)
-        for b in range(B):
-            tbl[b, 0], tbl[b, 1] = tbl[b, 1].clone(), tbl[b, 0].clone()
-        return tbl
-    def init_start_pos():
-        if start_pos is not None:
-            return torch.full((B,), start_pos, dtype=torch.int32)
+        return block_table(
+            batch=B,
+            table_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_MAX_BLOCKS,
+            permuted=True,
+        )
+    def init_default_start_pos():
         # Default per-batch pattern covers every ratio-128 decode branch:
         #   STATE_BLK-1 : no-compress, two MTP tokens straddle the state page (size 8)
         #   10          : no-compress, mid-window, single state page
@@ -513,39 +530,30 @@ def build_tensor_specs(start_pos=None):
         for b in range(B):
             vals[b] = pattern[b % int(pattern.numel())]
         return vals
+    def init_start_pos():
+        return resolve_start_positions(
+            start_pos,
+            batch=B,
+            seq=S,
+            max_seq_len=MAX_SEQ_LEN,
+            default_fn=init_default_start_pos,
+        )
     def init_position_ids():
-        starts = init_start_pos().to(torch.int64)
-        positions = torch.empty((B, S), dtype=torch.int32)
-        for b in range(B):
-            for s in range(S):
-                positions[b, s] = starts[b] + s
-        return positions
+        return position_ids_from_starts(init_start_pos(), seq=S)
     def init_state_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_compress_state_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                logical_blk = pos // COMPRESS_STATE_BLOCK_SIZE
-                intra = pos % COMPRESS_STATE_BLOCK_SIZE
-                blk = int(block_table[b, logical_blk].item())
-                mapping[b, s] = blk * COMPRESS_STATE_BLOCK_SIZE + intra
-        return mapping
+        return state_slot_mapping(
+            init_position_ids(),
+            init_compress_state_block_table(),
+            state_block_size=COMPRESS_STATE_BLOCK_SIZE,
+        )
     def init_cmp_slot_mapping():
-        positions = init_position_ids().to(torch.int64)
-        block_table = init_cmp_block_table().to(torch.int64)
-        mapping = torch.full((B, S), -1, dtype=torch.int64)
-        for b in range(B):
-            for s in range(S):
-                pos = int(positions[b, s].item())
-                if (pos + 1) % COMPRESS_RATIO == 0:
-                    cache_col = pos // COMPRESS_RATIO
-                    logical_blk = cache_col // BLOCK_SIZE
-                    intra = cache_col % BLOCK_SIZE
-                    blk = int(block_table[b, logical_blk].item())
-                    mapping[b, s] = blk * BLOCK_SIZE + intra
-        return mapping
+        positions = init_position_ids()
+        return compressed_slot_mapping(
+            positions,
+            init_cmp_block_table(),
+            compress_ratio=COMPRESS_RATIO,
+            block_size=BLOCK_SIZE,
+        )
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv", [B, S, HEAD_DIM], torch.float32, is_output=True),
