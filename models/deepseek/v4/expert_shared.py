@@ -44,13 +44,11 @@ N_MTILES = T_PAD // SH_M_TILE
 K_TILE = 512
 INTER_K = 512
 MM_INTER_TILE = 256
-MM_GATE_INNER = 4
 ACT_INTER_TILE = 128
 ACT_GATE_INNER = 4
 D_OUT_TILE = 256
 QUANT_TILE = 256
 D_OUT_TILE_ACT = 512
-W2_INNER = 4
 W2_ACT_INNER = 8
 
 
@@ -76,34 +74,30 @@ def expert_shared(
         up_i32 = pl.create_tensor([SH_M_TILE, MOE_INTER], dtype=pl.INT32)
 
         # gate (w1) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="sh_gate_mm"):
-            n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for ng in pl.range(MM_GATE_INNER):
-                n0 = n_base + ng * MM_INTER_TILE
-                gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
-                    sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    if k0 == 0:
-                        gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
-                    else:
-                        gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
-                gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm"):
+            n0 = nb_idx * MM_INTER_TILE
+            gate_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                sw1_k = shared_w1[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+            gate_i32[:, n0 : n0 + MM_INTER_TILE] = gate_acc
 
         # up (w3) cube matmul -> INT32 GM accumulator.
-        for nb_idx in pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="sh_up_mm"):
-            n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for ng in pl.range(MM_GATE_INNER):
-                n0 = n_base + ng * MM_INTER_TILE
-                up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                    xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
-                    sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                    if k0 == 0:
-                        up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
-                    else:
-                        up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
-                up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
+        for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm"):
+            n0 = nb_idx * MM_INTER_TILE
+            up_acc = pl.create_tensor([SH_M_TILE, MM_INTER_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                xs_k = pl.slice(x_local_i8, [SH_M_TILE, K_TILE], [ts0, k0], valid_shape=[SH_VALID_M, K_TILE])
+                sw3_k = shared_w3[n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+            up_i32[:, n0 : n0 + MM_INTER_TILE] = up_acc
 
         # SwiGLU activation (dequant gate/up, clamp, silu*up) -> FP32 GM.
         for nb_idx in pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="sh_gate_up_act"):
@@ -149,19 +143,17 @@ def expert_shared(
 
         # w2 (down) cube matmul -> INT32 GM accumulator.
         y_i32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.INT32)
-        for db_idx in pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="sh_w2_mm"):
-            d_base = db_idx * (W2_INNER * D_OUT_TILE)
-            for dg in pl.range(W2_INNER):
-                d0 = d_base + dg * D_OUT_TILE
-                y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
-                for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                    hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                    sw2_k = shared_w2[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                    if k0 == 0:
-                        y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
-                    else:
-                        y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
-                y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
+        for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
+            d0 = db_idx * D_OUT_TILE
+            y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
+                hs_k = h_tile_i8[:, k0 : k0 + INTER_K]
+                sw2_k = shared_w2[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                if k0 == 0:
+                    y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
+            y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
         for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act"):
