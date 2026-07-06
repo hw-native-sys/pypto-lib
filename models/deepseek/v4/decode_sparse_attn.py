@@ -456,21 +456,26 @@ def sparse_attn(
     proj_b_tids = pl.array.create(PB_DCHUNKS * O_GROUPS, pl.TASK_ID)
 
     with pl.manual_scope():
-        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g], peel-first-iter form.
+        # proj_a[g, nf]: BF16 grouped GEMM -> o_r[:, group g]. Single stage=2 pipeline
+        # over the full O_GROUP_IN reduction with an if-first branch (k0==0 -> matmul,
+        # else matmul_acc); iteration 0 stays a real matmul but sits inside the pipeline
+        # so its prologue prefetches iter 1. (Perf-neutral here -- the peel is only 1/16
+        # of this 16-deep BF16 reduction -- but kept in the same if-first form as qproj
+        # and proj_b for consistency.)
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T
             out_col_g = g * O_LORA
             for nf in pl.range(PA_NFRAGS):
                 n0 = nf * PROJ_A_MM_N_TILE
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="proj_a_mm", deps=[merge_tid]) as pa_tid:
-                    xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
-                    wa0_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-                    acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                    for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
-                        k0 = kb * A_K_TILE
+                    acc_a = pl.create_tensor([1, MM_T_TILE, PROJ_A_MM_N_TILE], dtype=pl.FP32)
+                    for k0 in pl.pipeline(0, O_GROUP_IN, A_K_TILE, stage=2):
                         xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
                         wa_k_chunk = wo_a[g:g + 1, n0:n0 + PROJ_A_MM_N_TILE, k0:k0 + A_K_TILE]
-                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                        if k0 == 0:
+                            acc_a = pl.matmul(xa_k_chunk, wa_k_chunk, b_trans=True, out_dtype=pl.FP32)
+                        else:
+                            acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
                     o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
                 proj_a_tids[g * PA_NFRAGS + nf] = pa_tid
 
@@ -516,8 +521,9 @@ def sparse_attn(
         # moves to proj_b_act). The slab's N-frags loop INSIDE the task, so proj_b stays
         # at PB_DCHUNKS*O_GROUPS = 32 tasks. Deps = quant[g] (all token-chunks) ONLY ->
         # group g's proj_b fires as soon as quant[g] lands, overlapping proj_a[g+1] (the
-        # back-to-back). Peel-first matmul (matmul_acc from a zero carry trips the TLOAD
-        # DN->NZ assertion, pypto#1540).
+        # back-to-back). The K reduction uses the if-first pipeline form (see inline note);
+        # iteration 0 must stay a real matmul -- matmul_acc from a zero carry trips the
+        # TLOAD DN->NZ assertion, pypto#1540.
         for dc in pl.parallel(PB_DCHUNKS):
             d0 = dc * PROJ_B_D_CHUNK
             for g in pl.range(O_GROUPS):
@@ -526,13 +532,24 @@ def sparse_attn(
                            deps=[quant_tids[g * NUM_QUANT_T_CHUNKS + tc] for tc in range(NUM_QUANT_T_CHUNKS)]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_CHUNK // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        acc_b = pl.matmul(o_r_i8_pad[:, col_g:col_g + B_K_TILE],
-                                          wo_b[n0:n0 + PROJ_B_MM_N_TILE, col_g:col_g + B_K_TILE],
-                                          b_trans=True, out_dtype=pl.INT32)
-                        for kb in pl.pipeline(1, O_LORA // B_K_TILE, stage=2):
+                        # Fold the whole O_LORA reduction into ONE stage=2 pipeline with an
+                        # if-first branch (kb==0 -> matmul, else matmul_acc) rather than a
+                        # bare first matmul + pipeline over the rest. Iteration 0 stays a real
+                        # matmul (never matmul_acc from a zero carry, so pypto#1540's TLOAD
+                        # DN->NZ assertion is not tripped), but now sits inside the pipeline so
+                        # its stage=2 prologue prefetches iter 1 -- this INT8 cube stays busy
+                        # from the first chunk. Measured -15.7% proj_b_mm (722 -> 609us
+                        # aggregate exec, 6 runs/form, disjoint ranges).
+                        acc_b = pl.create_tensor([T_PAD, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
                             k0 = col_g + kb * B_K_TILE
-                            acc_b = pl.matmul_acc(acc_b, o_r_i8_pad[:, k0:k0 + B_K_TILE],
-                                                  wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE], b_trans=True)
+                            if kb == 0:
+                                acc_b = pl.matmul(o_r_i8_pad[:, k0:k0 + B_K_TILE],
+                                                  wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE],
+                                                  b_trans=True, out_dtype=pl.INT32)
+                            else:
+                                acc_b = pl.matmul_acc(acc_b, o_r_i8_pad[:, k0:k0 + B_K_TILE],
+                                                      wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE], b_trans=True)
                         partials = pl.assemble(partials, acc_b, [0, g * D + n0])
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
 
