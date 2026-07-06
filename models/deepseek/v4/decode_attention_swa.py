@@ -21,7 +21,6 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     BLOCK_SIZE,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
@@ -404,13 +403,14 @@ def golden_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
         ori_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
+        swa_decode_start_set,
     )
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
@@ -483,9 +483,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS):
     def init_attn_sink():
         return torch.zeros(H)
     def init_default_start_pos():
-        # Values span the sliding-window regimes and wraparound write slots.
-        pattern = torch.tensor([9, 31, 62, WIN - 1], dtype=torch.int32)
-        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+        # Canonical SWA start-position set (sliding-window regimes + 8k long-context).
+        return swa_decode_start_set(batch=B, window=WIN)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -555,8 +554,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
-                        help="Fixture-only start_pos for all batches; default is the 8k target position.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch SWA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)

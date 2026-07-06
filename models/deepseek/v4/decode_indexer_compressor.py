@@ -15,7 +15,6 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_IDX_BLOCK_NUM,
@@ -463,11 +462,12 @@ def golden_compressor(tensors):
     tensors["idx_kv_cache"][:] = idx_kv_cache
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
+        csa_decode_start_set,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
@@ -519,27 +519,10 @@ def build_tensor_specs(start_pos=DECODE_START_POS):
             physical_blocks=IDX_CACHE_MAX_BLOCKS,
         )
     def init_default_start_pos():
-        # Default per-batch pattern covers every ratio-4 indexer compressor branch:
-        #   0           : no-compress, window start
-        #   1           : no-compress, mid-window
-        #   RATIO-S     : compress, boundary on 2nd token with empty previous window
-        #   RATIO-1     : compress, boundary on 1st token with 2nd token spilling to next window
-        #   2*RATIO-S   : compress aligned in the 2nd window with previous-window overlap
-        #   2*RATIO-1   : compress crossing in the 2nd window with previous-window overlap
-        #   STATE_BLK*32-1: compress crossing state logical block 31->32
-        pattern = torch.tensor([
-            0,
-            1,
-            COMPRESS_RATIO - S,
-            COMPRESS_RATIO - 1,
-            COMPRESS_RATIO * 2 - S,
-            COMPRESS_RATIO * 2 - 1,
-            COMPRESS_STATE_BLOCK_SIZE * 32 - 1,
-        ], dtype=torch.int32)
-        vals = torch.empty((B,), dtype=torch.int32)
-        for b in range(B):
-            vals[b] = pattern[b % int(pattern.numel())]
-        return vals
+        # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
+        return csa_decode_start_set(
+            batch=B, seq=S, compress_ratio=COMPRESS_RATIO,
+            state_block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -592,8 +575,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
-                        help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)

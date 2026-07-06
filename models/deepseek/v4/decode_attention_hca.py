@@ -20,7 +20,6 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_CMP_BLOCK_NUM,
@@ -498,11 +497,12 @@ def golden_attention_hca(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
+        hca_decode_start_set,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
@@ -608,17 +608,9 @@ def build_tensor_specs(start_pos=DECODE_START_POS):
     def init_attn_sink():
         return torch.zeros(H)
     def init_default_start_pos():
-        # Default per-batch pattern spans both HCA coverage axes at once:
-        # sparse visibility and compressor branches.
-        pattern = torch.tensor([
-            10,
-            COMPRESS_RATIO - S,
-            COMPRESS_RATIO - 1,
-            COMPRESS_RATIO,
-            COMPRESS_RATIO * 2 - S,
-            COMPRESS_RATIO * 3 - 1,
-        ], dtype=torch.int32)
-        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        return hca_decode_start_set(
+            batch=B, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -707,8 +699,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
-                        help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)

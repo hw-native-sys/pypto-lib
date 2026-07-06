@@ -19,7 +19,6 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
@@ -457,11 +456,12 @@ def golden_compressor(tensors):
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS):
+def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
+        hca_decode_start_set,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
@@ -512,25 +512,9 @@ def build_tensor_specs(start_pos=DECODE_START_POS):
             permuted=True,
         )
     def init_default_start_pos():
-        # Default per-batch pattern covers every ratio-128 decode branch:
-        #   STATE_BLK-1 : no-compress, two MTP tokens straddle the state page (size 8)
-        #   10          : no-compress, mid-window, single state page
-        #   RATIO-S     : compress, boundary on 2nd token (pre-scatter writes both)
-        #   RATIO-1     : compress, boundary on 1st token (2nd token spills to next window)
-        #   2*RATIO-S   : compress aligned in the 2nd compressed block (cache_col=1)
-        #   2*RATIO-1   : compress crossing in the 2nd block (state logical block 31->32)
-        pattern = torch.tensor([
-            COMPRESS_STATE_BLOCK_SIZE - 1,
-            10,
-            COMPRESS_RATIO - S,
-            COMPRESS_RATIO - 1,
-            COMPRESS_RATIO * 2 - S,
-            COMPRESS_RATIO * 2 - 1,
-        ], dtype=torch.int32)
-        vals = torch.empty((B,), dtype=torch.int32)
-        for b in range(B):
-            vals[b] = pattern[b % int(pattern.numel())]
-        return vals
+        # Canonical HCA start-position set (ratio-128 compressor branches + 8k long-context).
+        return hca_decode_start_set(
+            batch=B, compress_ratio=COMPRESS_RATIO, state_block_size=COMPRESS_STATE_BLOCK_SIZE)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -581,8 +565,9 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
-                        help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
