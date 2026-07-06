@@ -64,12 +64,13 @@ mechanisms (see the inline comments at each site for details):
    fa_work_build, mlp_out_seed, q_seed, down_proj) are also flagged so
    fa's ``dispatch_fanin`` can reach ``fanin_actual_count``.
 
-5. **out_proj 24/26 critical-path split** — Of the 50 out_proj tasks, ~24
-   feed the critical downstream chain (residual_rms_cast → gate/up_proj).
-   These 24 connect directly to fa (``deps=[attn_done_tid]``) for first-wave
-   dispatch. The remaining 26 go through ``out_proj_dummy``
+5. **out_proj critical-path split** — Of the OUT_PROJ_TOTAL_TASKS tasks,
+   OUT_PROJ_DIRECT_TASKS feed the critical downstream chain
+   (residual_rms_cast → gate/up_proj). These connect directly to fa
+   (``deps=[attn_done_tid]``) for first-wave dispatch. The remaining tasks
+   go through ``out_proj_dummy``
    (``task_dummy``, unflagged → no early dispatch) to defer their scheduling
-   priority, ensuring the critical 24 execute first.
+   priority, ensuring the critical tasks execute first.
 
 -- original header --
 Qwen3-14B decode — FUSED attn + dense balance + gp-loop pl.pipeline.
@@ -320,6 +321,12 @@ assert (K_RED_ROWS * 4) % 32 == 0, "K QK-norm reduction rows (K_RED_ROWS) must b
 # ── Scope 3a · out_proj (split-K × split-N, atomic-add into attn_proj_fp32) ──
 K_SPLITS_OUT = 5
 N_SPLITS_OUT = 10
+OUT_PROJ_TOTAL_TASKS = N_SPLITS_OUT * K_SPLITS_OUT
+# Tuned critical-path budget: last tasks feed residual_rms_cast first. Clamp so
+# retuned split counts cannot make the deferred range negative.
+OUT_PROJ_DIRECT_TARGET_TASKS = 24
+OUT_PROJ_DIRECT_TASKS = min(OUT_PROJ_DIRECT_TARGET_TASKS, OUT_PROJ_TOTAL_TASKS)
+OUT_PROJ_DEFERRED_TASKS = OUT_PROJ_TOTAL_TASKS - OUT_PROJ_DIRECT_TASKS
 OUT_INNER_TK = 64
 OUT_TN = HIDDEN // N_SPLITS_OUT  # 512 output N per task
 OUT_TK = HIDDEN // K_SPLITS_OUT  # 1024 K per task
@@ -375,6 +382,7 @@ assert N_SPLITS_OUT * OUT_TN == HIDDEN
 assert K_SPLITS_OUT * OUT_TK == HIDDEN
 assert OUT_N_SUB_K * OUT_INNER_TK == OUT_TK
 assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
+assert OUT_PROJ_DEFERRED_TASKS >= 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -492,17 +500,20 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     with pl.manual_scope():
         # Barrier: prevents kv_seed / mlp_out_seed from being early-dispatched so
         # they don't compete with q_proj for the dispatch window when prev_out
-        # completes. seed_dummy is unflagged → it never bumps dispatch_fanin → the
-        # seeds' dispatch_fanin can't reach fanin_actual_count via propagate → no
-        # early dispatch for them. The seeds themselves ARE flagged (as fa producers)
-        # so they still propagate to fa when they complete normally.
-        seed_dummy = pl.system.task_dummy(deps=[prev_out_tids[i] for i in range(DOWN_ON)])
+        # completes. seed_dummy is an unflagged empty barrier, so it adds no
+        # dependency on the previous dcr_xgamma task while still not bumping
+        # dispatch_fanin via early resolve.
+        seed_dummy = pl.system.task_dummy(deps=[])
+        prev_out_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_out_seed_deps[_dep_i] = prev_out_tids[_dep_i]
+        prev_out_seed_deps[DOWN_ON] = seed_dummy
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="rms_recip",
             allow_early_resolve=True,
-            deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy],
+            deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as rms_tid:
             partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
@@ -523,10 +534,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 q_proj = pl.assemble(
                     q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
                 )
+        prev_normed_q_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_normed_q_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
+        prev_normed_q_seed_deps[DOWN_ON] = q_seed_tid
         with pl.spmd(
             Q_ON * QKV_OK,
             name_hint="q_proj",
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], q_seed_tid],
+            deps=[prev_normed_q_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as q_proj_tid:
             q_blk = pl.get_block_idx()
             q_nt = q_blk // QKV_OK
@@ -551,16 +566,20 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
         # ── KV seed: zero k_proj + v_proj buffers. ──
         # ── KV seed: zeroed via seed_dummy barrier (see comment above). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy]) as kv_seed_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as kv_seed_tid:
             k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
             v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+        prev_normed_kv_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_normed_kv_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
+        prev_normed_kv_seed_deps[DOWN_ON] = kv_seed_tid
 
         # ── MLP/out seed: zero down/gate/up/out accumulators. ──
         down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy]) as mlp_out_seed_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as mlp_out_seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
@@ -587,7 +606,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             KV_ON * QKV_OK,
             name_hint="k_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], kv_seed_tid],
+            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as k_proj_tid:
             k_blk = pl.get_block_idx()
             k_nt = k_blk // QKV_OK
@@ -615,7 +634,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             KV_ON * QKV_OK,
             name_hint="v_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], kv_seed_tid],
+            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as v_proj_tid:
             v_blk = pl.get_block_idx()
             v_nt = v_blk // QKV_OK
@@ -918,22 +937,22 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         gate_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         up_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         cast_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
-        out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
-        # out_proj 24/26 critical-path split: ~24 of the 50 out_proj tasks feed the
-        # critical downstream chain (residual_rms_cast → gate/up_proj). These 24
-        # connect directly to fa for first-wave dispatch. The remaining 26 go through
+        out_tids = pl.array.create(OUT_PROJ_TOTAL_TASKS, pl.TASK_ID)
+        # out_proj critical-path split: OUT_PROJ_DIRECT_TASKS of the
+        # OUT_PROJ_TOTAL_TASKS tasks feed the critical downstream chain
+        # (residual_rms_cast → gate/up_proj). These connect directly to fa for
+        # first-wave dispatch. The remaining OUT_PROJ_DEFERRED_TASKS go through
         # out_proj_dummy (task_dummy, unflagged → no early dispatch) to defer their
-        # scheduling priority, ensuring the critical 24 execute first.
+        # scheduling priority, ensuring the critical tasks execute first.
         #
         # DSL constraint: the codegen drops runtime-selected deps (an if/else on the
         # dep variable is emitted as dead code), so the split must be two separate
         # pl.parallel loops with STATIC deps=[...] literals. The flattened out_idx
-        # (= n*K_SPLITS_OUT + k) gives an exact 24/26 boundary.
+        # (= n*K_SPLITS_OUT + k) gives an exact deferred/direct boundary.
         out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
-        N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - 24  # out_idx >= this => direct fa (last 24)
 
-        # First 26 (out_idx 0..N_OUT_DIRECT-1): via out_proj_dummy (deferred).
-        for out_idx in pl.parallel(0, N_OUT_DIRECT):
+        # First deferred tasks: via out_proj_dummy.
+        for out_idx in pl.parallel(0, OUT_PROJ_DEFERRED_TASKS):
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
@@ -956,8 +975,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add
                 )
             out_tids[out_idx] = out_tid
-        # Last 24 (out_idx N_OUT_DIRECT..49): direct fa dep (first-wave dispatch).
-        for out_idx in pl.parallel(N_OUT_DIRECT, N_SPLITS_OUT * K_SPLITS_OUT):
+        # Last direct tasks: direct fa dep (first-wave dispatch).
+        for out_idx in pl.parallel(OUT_PROJ_DEFERRED_TASKS, OUT_PROJ_TOTAL_TASKS):
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
