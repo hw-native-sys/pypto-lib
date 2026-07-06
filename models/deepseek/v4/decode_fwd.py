@@ -131,6 +131,26 @@ CACHE_POOL_NAMES = frozenset({
     "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
 })
 
+# Static weight parameters to keep device-resident, sharded per rank. Every host
+# param is a leading-dim-stacked ``[N_RANKS, *tail]`` tensor the orchestrator
+# slices as ``weight[r]`` and dispatches to ``device=r``; marking these
+# resident="stacked" makes the harness upload shard ``r`` to card ``r`` once and
+# reuse it across dispatches, skipping the per-dispatch H2D/D2H. Covers every
+# stacked attention / MoE weight, the replicated head/final-norm weights, and the
+# constant RoPE tables — but NOT the KV/compressor-state pools (``CACHE_POOL_NAMES``)
+# nor the per-step metadata (slot mappings, block tables, ids, kv_seq_lens,
+# position_ids, and the ``x_hc`` activation), which change per token.
+RESIDENT_WEIGHT_NAMES = frozenset(
+    [
+        n
+        for n in (*LAYER_STACKED_NAMES, *CSA_LAYER_STACKED_NAMES, *HCA_LAYER_STACKED_NAMES)
+        if n not in CACHE_POOL_NAMES
+    ]
+    + ["freqs_cos", "freqs_sin"]
+    + HC_HEAD_NAMES
+    + FINAL_NORM_NAMES
+)
+
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
@@ -1206,6 +1226,15 @@ def build_tensor_specs(start_pos=None, num_tokens=T):
             specs.append(_make_final_norm_spec(name))
         else:
             raise ValueError(f"unclassified decode_fwd spec: {name}")
+
+    # Shard the static weight parameters per rank and keep them device-resident
+    # (child_memory): each shard uploaded once to its card and reused across
+    # dispatches, skipping per-dispatch H2D/D2H. All resident names are inputs
+    # (is_output=False), so the flag is always valid.
+    for spec in specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
+
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs

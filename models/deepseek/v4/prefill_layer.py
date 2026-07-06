@@ -834,6 +834,41 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
             tensor_specs.append(spec)
 
     tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
+
+    # Keep the static weight parameters device-resident (child_memory), sharded
+    # per rank: each shard is a leading-dim-stacked [N_RANKS, *tail] tensor sliced
+    # as weight[r] and dispatched to device=r; resident="stacked" uploads shard r
+    # to card r once and reuses it across dispatches, skipping the per-dispatch
+    # H2D/D2H. Covers the attention weights, the per-kind compressor / indexer
+    # weights, the RoPE tables, the MoE FFN/gate/expert weights, and the static
+    # tid2eid route table — but NOT the KV / compressor-state caches, the per-step
+    # metadata (slot mappings, block tables, sparse indices, position_ids,
+    # input_ids), the input activation (x_hc), or the output (x_next). All resident
+    # names are inputs (is_output=False), so the flag is always valid.
+    RESIDENT_WEIGHT_NAMES = frozenset([
+        # Attention core weights + RoPE tables
+        "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+        "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+        "freqs_cos", "freqs_sin",
+        # HCA / CSA compressor + indexer weights (states/block tables excluded)
+        "hca_cmp_wkv", "hca_cmp_wgate", "hca_cmp_ape", "hca_cmp_norm_w",
+        "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w",
+        "csa_hadamard_idx", "csa_idx_wq_b", "csa_idx_wq_b_scale", "csa_weights_proj",
+        "csa_inner_wkv", "csa_inner_wgate", "csa_inner_ape", "csa_inner_norm_w",
+        # Attention output projection
+        "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+        # MoE FFN / gate / experts + static route table
+        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+        "gate_w", "gate_bias", "tid2eid",
+        "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+        "routed_w2", "routed_w2_scale",
+        "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+        "shared_w2", "shared_w2_scale",
+    ])
+    for spec in tensor_specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
+
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:

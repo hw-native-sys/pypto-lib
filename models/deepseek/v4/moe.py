@@ -868,7 +868,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
     sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
-    return [
+    specs = [
         TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.bfloat16, init_value=init_x_hc),
         TensorSpec("hc_ffn_fn",     [N_RANKS, MIX_HC, HC_DIM],       torch.float32,  init_value=init_hc_ffn_fn),
         TensorSpec("hc_ffn_scale",  [N_RANKS, 3],                    torch.float32,  init_value=init_hc_ffn_scale),
@@ -894,6 +894,28 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
+
+    # Keep the static weight parameters device-resident (child_memory), sharded
+    # per rank: each shard is a leading-dim-stacked [N_RANKS, *tail] tensor sliced
+    # as weight[r] and dispatched to device=r; resident="stacked" uploads shard r
+    # to card r once and reuses it across dispatches, skipping the per-dispatch
+    # H2D/D2H. Covers the routed/shared expert weights and their scales, the gate,
+    # the HC-FFN constants, the RMSNorm gamma, and the static tid2eid route table —
+    # but NOT the per-step activation (x_hc), per-step input_ids, or the output.
+    # All resident names are inputs (is_output=False), so the flag is always valid.
+    RESIDENT_WEIGHT_NAMES = frozenset([
+        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+        "gate_w", "gate_bias", "tid2eid",
+        "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+        "routed_w2", "routed_w2_scale",
+        "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
+        "shared_w2", "shared_w2_scale",
+    ])
+    for spec in specs:
+        if spec.name in RESIDENT_WEIGHT_NAMES:
+            spec.resident = "stacked"
+
+    return specs
 
 
 if __name__ == "__main__":
