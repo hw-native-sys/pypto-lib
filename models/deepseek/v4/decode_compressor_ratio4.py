@@ -19,7 +19,7 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DEFAULT_DECODE_TEST_START_POS,
+    DECODE_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_CMP_BLOCK_NUM,
@@ -445,7 +445,7 @@ def golden_compressor(tensors):
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
 
 
-def build_tensor_specs(start_pos=DEFAULT_DECODE_TEST_START_POS):
+def build_tensor_specs(start_pos=DECODE_START_POS):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
@@ -571,7 +571,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DEFAULT_DECODE_TEST_START_POS,
+    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
                         help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)

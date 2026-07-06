@@ -17,7 +17,7 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DEFAULT_DECODE_TEST_START_POS,
+    DECODE_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_IDX_BLOCK_NUM,
@@ -515,7 +515,7 @@ def golden_indexer(tensors):
     tensors["topk_idxs"][:] = topk_idxs.view(B, S, SCORE_LEN)
 
 
-def build_tensor_specs(start_pos=DEFAULT_DECODE_TEST_START_POS):
+def build_tensor_specs(start_pos=DECODE_START_POS):
     import torch  # type: ignore[import]
     from decode_metadata import (
         block_table,
@@ -676,7 +676,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable-l2-swimlane", type=int, default=0, choices=[0, 1, 2],
                         help="L2 swimlane level: 0=off, 1=AICore timing, 2=+AICPU timing.")
     parser.add_argument("--runtime-dir", type=str, default=None)
-    parser.add_argument("--start-pos", type=int, default=DEFAULT_DECODE_TEST_START_POS,
+    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
                         help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
