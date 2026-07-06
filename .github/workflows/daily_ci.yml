@@ -9,8 +9,9 @@ jobs:
   model-tests-sim:
     # Simulator job: no device needed, so it runs on the CPU runner inside the
     # ci-py310 container (mirrors pypto's codegen-tests setup, registry on port
-    # 5001). pypto/ptoas/pto-isa are installed exactly like the on-device a2a3
-    # job — only the runner label and the lack of Ascend host env differ.
+    # 5001). pypto/ptoas/pto-isa are installed by the setup-sim-job composite,
+    # exactly like the on-device a2a3 job — only the runner label and the lack of
+    # Ascend host env differ.
     runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 120
     strategy:
@@ -42,6 +43,7 @@ jobs:
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-sim:/root/.cache/pip
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
         -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
+        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ matrix.platform }}:/opt/pypto-src
 
     steps:
       - name: Checkout pypto-lib
@@ -49,84 +51,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Resolve toolchain + clone pypto
-        # Clone the pypto we build against ONCE here (job-private /tmp — this CPU
-        # host runs the a2a3sim/a5sim matrix concurrently, so a shared tree would
-        # corrupt). The Build step below reuses this checkout, so the toolchain
-        # pins and the installed pypto are always the same revision. pypto owns
-        # ptoas (toolchain/versions.env) and pins pto-isa via its runtime submodule
-        # (runtime/pto_isa.pin); read both.
-        run: |
-          rm -rf /tmp/pypto
-          git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git /tmp/pypto
-          {
-            grep -E '^PTOAS_VERSION=' /tmp/pypto/toolchain/versions.env
-            echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' /tmp/pypto/toolchain/versions.env)"
-            echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < /tmp/pypto/runtime/pto_isa.pin)"
-          } >> "$GITHUB_ENV"
-
-      # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
-      # stale objects compiled against the old ISA headers (see issue #1139):
-      # a different commit hashes to a different key, forcing a real recompile.
-      - name: Scope ccache to pto-isa version
-        run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
-
-      - name: Show ccache stats (before)
-        run: ccache -s || true
-
-      - name: Clone pto-isa repository (pinned)
-        run: |
-          rm -rf "$PTO_ISA_ROOT"
-          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
-            || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
-          cd "$PTO_ISA_ROOT"
-          git checkout ${{ env.PTO_ISA_COMMIT }}
-
-      - name: Build and install pypto and simpler
-        # Reuses /tmp/pypto cloned by the resolve step above (same revision the
-        # toolchain pins were read from).
-        run: |
-          python -m pip install --upgrade pip
-          pip install scikit-build-core nanobind cmake ninja
-          pip install --no-build-isolation /tmp/pypto
-          pip install --no-build-isolation /tmp/pypto/runtime
-
-      - name: Install runner dependencies
-        run: |
-          pip install nanobind
-          pip install torch
-
-      - name: Show ccache stats (after)
-        run: ccache -s || true
-
-      - name: Install ptoas (local cache)
-        env:
-          PTOAS_CACHE_DIR: /opt/ptoas-cache
-        run: |
-          CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
-          download_ptoas() {
-            echo "Downloading ptoas ${PTOAS_VERSION}"
-            mkdir -p "$PTOAS_CACHE_DIR"
-            curl --fail --location --retry 3 --retry-all-errors \
-              https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
-              -o "$CACHE_ARCHIVE.tmp"
-            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
-            mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
-          }
-          if [ ! -f "$CACHE_ARCHIVE" ]; then
-            echo "Cache miss"
-            download_ptoas
-          elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
-            echo "Cache corrupted — removing and re-downloading"
-            rm -f "$CACHE_ARCHIVE"
-            download_ptoas
-          else
-            echo "Cache hit — using $CACHE_ARCHIVE"
-          fi
-          mkdir -p "$PTOAS_ROOT"
-          tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
-          chmod +x "$PTOAS_ROOT/ptoas"
-          chmod +x "$PTOAS_ROOT/bin/ptoas"
+      - name: Setup simulator job
+        uses: ./.github/actions/setup-sim-job
 
       - name: Run model tests (${{ matrix.platform }})
         shell: bash
@@ -186,9 +112,13 @@ jobs:
     # No container: multi-card kernels use HCCL, which needs a host-only env
     # (set_env.sh, HCCL plugin paths) — in docker the chip child silent-crashes
     # in comm_init. So this job runs directly on the host like pypto's
-    # dist-system-tests, on a 2-device runner so it can also schedule the
-    # multi-card files. Checkout / install happen under ./dist-checkout to avoid
-    # colliding with any container-owned workspace left on the shared runner.
+    # dist-system-tests. It holds NO card: every model run is wrapped in
+    # `task-submit --device "$DEVICE_ID"` (mechanism B), which borrows a card
+    # (or an N-card set for the multi-card `# ci: devices=N` files) from the
+    # host-level device queue and passes the lent set as $TASK_DEVICE. The
+    # backend controls whether DEVICE_ID is `auto` or a fixed card id. Checkout /
+    # install happen under ./dist-checkout to avoid colliding with any
+    # container-owned workspace left on the shared runner.
     runs-on: [self-hosted, linux, arm64, npu]
     timeout-minutes: 60
     defaults:
@@ -212,127 +142,25 @@ jobs:
       PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-a2a3
 
     steps:
-      - name: Checkout pypto-lib
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves sibling
+        # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
         with:
-          path: dist-checkout
+          sparse-checkout: .github/actions
+          clean: false
           persist-credentials: false
 
-      - name: Resolve toolchain + sync pypto source
-        # Sync the cached pypto checkout ONCE here; the Build step below reuses it,
-        # so the toolchain pins and the installed pypto are always the same
-        # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
-        # its runtime submodule (runtime/pto_isa.pin); read both.
-        run: |
-          PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
-          if [ -d "$PYPTO_SRC/.git" ]; then
-            echo "Cache hit — updating pypto"
-            git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD
-            git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
-            git -C "$PYPTO_SRC" clean -ffdx
-            git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
-          else
-            echo "Cache miss — cloning pypto"
-            git clone --recurse-submodules --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"
-          fi
-          git -C "$PYPTO_SRC" submodule update --init --recursive
-          rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
-          {
-            grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
-            echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env")"
-            echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
-          } >> "$GITHUB_ENV"
+      - name: Setup NPU device job
+        uses: ./.github/actions/setup-npu-device-job
+        with:
+          checkout-path: dist-checkout
 
-      - name: Check NPU
-        working-directory: .
-        run: npu-smi info
-
-      # See the sim job: namespace the cache by pto-isa commit so an ISA bump
-      # forces a real recompile instead of reusing stale objects (issue #1139).
-      - name: Scope ccache to pto-isa version
-        run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
-
-      - name: Clone pto-isa repository (pinned)
-        run: |
-          rm -rf "$PTO_ISA_ROOT"
-          timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
-            || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
-          cd "$PTO_ISA_ROOT"
-          git checkout ${{ env.PTO_ISA_COMMIT }}
-
-      - name: Bootstrap conda + per-job venv + write activate.sh
-        # Per-job venv layered on conda py310-lib; activate.sh lets each later step
-        # enter the env with a single `source activate.sh`. set_env.sh wires up
-        # the Ascend/HCCL host environment; LD_LIBRARY_PATH is prepended with
-        # $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
-        run: |
-          source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310-lib
-          python -m venv venv --system-site-packages
-          cat > activate.sh <<'EOF'
-          source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310-lib
-          source "$GITHUB_WORKSPACE/dist-checkout/venv/bin/activate"
-          source /usr/local/Ascend/cann-9.0.0/set_env.sh
-          export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
-          EOF
-
-      - name: Show ccache stats (before)
-        run: ccache -s || true
-
-      - name: Build and install pypto and simpler
-        # Reuses the pypto source synced by the resolve step above (same revision
-        # the toolchain pins were read from).
-        run: |
-          source activate.sh
-          PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
-          python -m pip install --upgrade pip
-          pip install scikit-build-core nanobind cmake ninja
-          pip install --no-build-isolation "$PYPTO_SRC"
-          pip install --no-build-isolation "$PYPTO_SRC/runtime"
-
-      - name: Install runner dependencies
-        run: |
-          source activate.sh
-          pip install nanobind
-          pip install torch
-
-      - name: Show ccache stats (after)
-        run: ccache -s || true
-
-      - name: Install ptoas (local cache)
-        env:
-          PTOAS_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas
-        run: |
-          CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
-          download_ptoas() {
-            echo "Downloading ptoas ${PTOAS_VERSION}"
-            mkdir -p "$PTOAS_CACHE_DIR"
-            curl --fail --location --retry 3 --retry-all-errors \
-              https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
-              -o "$CACHE_ARCHIVE.tmp"
-            echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
-            mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
-          }
-          if [ ! -f "$CACHE_ARCHIVE" ]; then
-            echo "Cache miss"
-            download_ptoas
-          elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
-            echo "Cache corrupted — removing and re-downloading"
-            rm -f "$CACHE_ARCHIVE"
-            download_ptoas
-          else
-            echo "Cache hit — using $CACHE_ARCHIVE"
-          fi
-          mkdir -p "$PTOAS_ROOT"
-          tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
-          chmod +x "$PTOAS_ROOT/ptoas"
-          chmod +x "$PTOAS_ROOT/bin/ptoas"
-
-      - name: Run model tests (a2a3)
+      - name: Run model tests (a2a3, via task-submit)
         shell: bash
         env:
-          PYTHONPATH: ${{ github.workspace }}/dist-checkout
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
           PYPTO_BENCH: '1'
@@ -341,9 +169,6 @@ jobs:
           PTO2_RING_HEAP: 1073741824
         run: |
           source activate.sh
-          # grep for the device marker returns non-zero on single-card files
-          # (no match); with bash's default -e -o pipefail that would abort the
-          # whole step on the first such file, so disable errexit for the loop.
           set +e
           : > results.tsv
           failed=()
@@ -352,34 +177,19 @@ jobs:
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
             # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
-            # the top; ring sizes come from the step env: above. Output is
-            # captured (not streamed) so the perf line can be parsed.
-            local ndev out rc perf
+            # the top; borrow that many cards with `--device-num N` (defaults to
+            # ep2 / 2-card runs). $TASK_DEVICE is the lent set (a single id, or
+            # comma-separated for N>1) and is passed straight to -d. The child's
+            # stdout is captured (not streamed) so the perf line can be parsed;
+            # the ring env above is preserved into the child.
+            local ndev devnum_flag out rc perf
             ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
             ndev=${ndev:-1}
-            if [ "$ndev" -gt 1 ]; then
-              if [ -z "$DEVICE_RANGE" ]; then
-                echo "::error file=${file}::needs $ndev devices but DEVICE_RANGE is unset"
-                failed+=("$label")
-                printf '%s\tfail\t-\n' "$label" >> results.tsv
-                echo "::endgroup::"
-                return
-              fi
-              local actual_ndev
-              actual_ndev=$(tr ',' '\n' <<<"$DEVICE_RANGE" | sed '/^$/d' | wc -l)
-              if [ "$actual_ndev" -lt "$ndev" ]; then
-                echo "::error file=${file}::needs $ndev devices but DEVICE_RANGE only provides $actual_ndev ($DEVICE_RANGE)"
-                failed+=("$label")
-                printf '%s\tfail\t-\n' "$label" >> results.tsv
-                echo "::endgroup::"
-                return
-              fi
-              out=$( timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$(cut -d, -f1-"$ndev" <<<"$DEVICE_RANGE")" "$@" 2>&1 )
-              rc=$?
-            else
-              out=$( timeout --kill-after=10s 300s python "$file" -p a2a3 -d "$DEVICE_ID" "$@" 2>&1 )
-              rc=$?
-            fi
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
+            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 1800 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
+            rc=$?
             printf '%s\n' "$out"
             perf=$(printf '%s\n' "$out" | extract_perf)
             perf=${perf:--}
@@ -392,10 +202,17 @@ jobs:
             fi
             echo "::endgroup::"
           }
-          # Run every model file once with no extra args.
+          # Run every model file once at its default world size (ep2 / 2-card).
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
             run_case "$f" "$f"
           done
+          # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
+          # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
+          # own --device-num (card pool must provide that many cards), e.g.:
+          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 1800 --max-time 900 \
+          #     --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && \
+          #       PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout \
+          #       python models/deepseek/v4/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
@@ -403,8 +220,15 @@ jobs:
           fi
           echo "All model tests passed."
 
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: dist-checkout
+
       - name: Clean up build artifacts
         if: always()
+        working-directory: dist-checkout
         run: rm -rf build_output
 
       - name: Upload results artifact

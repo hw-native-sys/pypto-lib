@@ -1,0 +1,220 @@
+name: Setup NPU device job (pypto-lib)
+description: >-
+  Shared setup for the self-hosted NPU device jobs (ci.yml `a2a3`,
+  daily_ci.yml `model-tests-a2a3`): resilient checkout into a per-job dir,
+  toolchain resolution from the cached pypto source, ptoas + pto-isa install,
+  a per-job conda venv + activate.sh, and a from-source build/install of pypto +
+  simpler. Unlike pypto (which builds itself), pypto-lib builds against a
+  separate pypto clone kept in the shared ci-cache/pypto-src dir; the toolchain
+  pins (ptoas version/sha, pto-isa commit) are read from that same clone so the
+  installed pypto and the pins always match.
+
+  The calling job must define the ASCEND_HOME_PATH, PTOAS_ROOT, PTO_ISA_ROOT,
+  CCACHE_*, CMAKE_* and PIP_CACHE_DIR environment variables (identical across the
+  two device jobs); they are read from the job environment here. PTOAS_VERSION,
+  PTOAS_SHA256, PTO_ISA_COMMIT and CCACHE_NAMESPACE are resolved and exported by
+  this action.
+
+inputs:
+  checkout-path:
+    description: >-
+      Workspace-relative dir to check the repo out into (also the venv /
+      activate.sh home). Isolates each job's tree on the shared self-hosted host.
+    required: true
+  unset-ring:
+    description: >-
+      When 'true', activate.sh unsets PTO2_RING_* (some multi-card HCCL paths
+      break with the runner's systemd ring-sizing env). Default 'false' keeps
+      them — the single- and multi-card model/example runs rely on the ring env.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # Self-hosted runners reuse the workspace across runs. A prior run — or a
+    # force-pushed PR ref moving refs/remotes/pull/<n>/merge — can leave the
+    # checkout dir with a stale submodule object store, so actions/checkout's
+    # forced submodule update dies with "fatal: Unable to find current revision
+    # in submodule path ...". Try the fast incremental checkout first; on any
+    # failure purge the dir and re-clone from scratch.
+    - name: Checkout pypto-lib (incremental)
+      id: checkout
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Purge stale checkout on failure
+      if: steps.checkout.outcome == 'failure'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: rm -rf "${{ inputs.checkout-path }}"
+
+    - name: Checkout pypto-lib (clean re-clone)
+      if: steps.checkout.outcome == 'failure'
+      uses: actions/checkout@v4
+      with:
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Resolve toolchain + sync pypto source
+      # Sync the cached pypto checkout ONCE here; the Build step below reuses it,
+      # so the toolchain pins and the installed pypto are always the same
+      # revision. pypto owns ptoas (toolchain/versions.env) and pins pto-isa via
+      # its runtime submodule (runtime/pto_isa.pin); read both.
+      shell: bash
+      run: |
+        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
+        # github.com clones/fetches over this runner's link drop mid-transfer
+        # (GnuTLS recv error / early EOF), and there is no pypto gitcode mirror.
+        # Tighten git's stall detection so a dead transfer aborts fast instead of
+        # hanging until EOF; the cache-miss clone below also retries with backoff.
+        git config --global http.postBuffer 1048576000
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 60
+        # Retry any git command up to 4 times with backoff (transient TLS drops).
+        retry() {
+          local attempt=0
+          until "$@"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 4 ]; then
+              echo "'$*' failed after $attempt attempts"; return 1
+            fi
+            echo "'$*' attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+        }
+        if [ -d "$PYPTO_SRC/.git" ]; then
+          echo "Cache hit — updating pypto"
+          retry git -C "$PYPTO_SRC" fetch --depth=1 origin HEAD || exit 1
+          git -C "$PYPTO_SRC" reset --hard FETCH_HEAD
+          git -C "$PYPTO_SRC" clean -ffdx
+          git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
+        else
+          echo "Cache miss — cloning pypto"
+          # rm before each attempt so a retried clone never hits a partial dir.
+          clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
+          retry clone_pypto || exit 1
+        fi
+        retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
+        rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+        {
+          grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
+          echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env")"
+          echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
+        } >> "$GITHUB_ENV"
+
+    - name: Check NPU
+      shell: bash
+      run: npu-smi info
+
+    # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
+    # stale objects compiled against the old ISA headers (see issue #1139):
+    # a different commit hashes to a different key, forcing a real recompile.
+    - name: Scope ccache to pto-isa version
+      shell: bash
+      run: echo "CCACHE_NAMESPACE=pto-isa-${PTO_ISA_COMMIT}" >> "$GITHUB_ENV"
+
+    - name: Clone pto-isa repository (pinned)
+      shell: bash
+      run: |
+        rm -rf "$PTO_ISA_ROOT"
+        timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
+          || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
+        cd "$PTO_ISA_ROOT"
+        git checkout "$PTO_ISA_COMMIT"
+
+    - name: Bootstrap conda + per-job venv + write activate.sh
+      # Per-job venv layered on conda py310-lib; activate.sh lets each later step
+      # (and every task-submit child) enter the env with a single
+      # `source activate.sh`. set_env.sh wires up the Ascend/HCCL host
+      # environment; LD_LIBRARY_PATH is prepended with $CONDA_PREFIX/lib because
+      # ptoas needs a newer GLIBCXX than the system.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
+        conda activate py310-lib
+        # Explicit reset: don't rely solely on the checkout's `git clean -ffdx`
+        # to have removed a prior run's venv — a stale venv would let `python -m
+        # venv` reuse it and carry over old site-packages.
+        rm -rf venv
+        python -m venv venv --system-site-packages
+        cat > activate.sh <<'EOF'
+        source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
+        conda activate py310-lib
+        # Derive the venv from this script's own location instead of
+        # $GITHUB_WORKSPACE: when activate.sh is sourced inside a task-submit
+        # child, a truncated env snapshot could drop $GITHUB_WORKSPACE and point
+        # the source at a wrong/absent path. BASH_SOURCE is snapshot-independent.
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        source /usr/local/Ascend/cann-9.0.0/set_env.sh
+        export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
+        EOF
+        # Some multi-card HCCL paths break with the runner's systemd PTO2_RING_*
+        # env; append the unset only when the caller asks.
+        if [ "${{ inputs.unset-ring }}" = "true" ]; then
+          printf '%s\n' 'unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL' >> activate.sh
+        fi
+
+    - name: Show ccache stats (before)
+      shell: bash
+      run: ccache -s || true
+
+    - name: Build and install pypto and simpler
+      # Reuses the pypto source synced by the resolve step above (same revision
+      # the toolchain pins were read from).
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
+        python -m pip install --upgrade pip
+        pip install scikit-build-core nanobind cmake ninja
+        pip install --no-build-isolation "$PYPTO_SRC"
+        pip install --no-build-isolation "$PYPTO_SRC/runtime"
+
+    - name: Install runner dependencies
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      run: |
+        source activate.sh
+        pip install nanobind
+        pip install torch
+
+    - name: Show ccache stats (after)
+      shell: bash
+      run: ccache -s || true
+
+    - name: Install ptoas (local cache)
+      shell: bash
+      env:
+        PTOAS_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas
+      run: |
+        CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+        download_ptoas() {
+          echo "Downloading ptoas ${PTOAS_VERSION}"
+          mkdir -p "$PTOAS_CACHE_DIR"
+          curl --fail --location --retry 3 --retry-all-errors \
+            https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
+            -o "$CACHE_ARCHIVE.tmp"
+          echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
+          mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+        }
+        if [ ! -f "$CACHE_ARCHIVE" ]; then
+          echo "Cache miss"
+          download_ptoas
+        elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
+          echo "Cache corrupted — removing and re-downloading"
+          rm -f "$CACHE_ARCHIVE"
+          download_ptoas
+        else
+          echo "Cache hit — using $CACHE_ARCHIVE"
+        fi
+        mkdir -p "$PTOAS_ROOT"
+        tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
+        chmod +x "$PTOAS_ROOT/ptoas"
+        chmod +x "$PTOAS_ROOT/bin/ptoas"

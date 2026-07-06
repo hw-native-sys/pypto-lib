@@ -45,27 +45,33 @@ identical.
 ### Multi-card kernels in CI
 
 Most kernels take a single `-d <id>`. A kernel that needs several NPUs
-(e.g. a 2-rank EP program parsing `-d` as a comma-separated list) must
-declare its card count with a marker comment near the top of the file:
+(e.g. an EP/TP program parsing `-d` as a comma-separated list) declares its
+card count with a marker comment near the top of the file:
 
 ```python
 # ci: devices=2
 ```
 
-The real-NPU CI job greps for `# ci: devices=N`; when `N > 1` it runs the
-file with `$DEVICE_RANGE` (a comma-separated id list such as `0,1`)
-instead of the single `$DEVICE_ID`. Files without the marker default to
-one device. See the `a2a3` job in
+The real-NPU CI job greps for `# ci: devices=N`; when `N > 1` it borrows
+that many cards from the host device queue with
+`task-submit --device "$DEVICE_ID" --device-num N`. `$DEVICE_ID` is `auto`
+(borrow any free cards) or a fixed id set by the CI backend, and the lent
+set comes back as `$TASK_DEVICE`, passed straight to `-d`. Files without the
+marker default to one card. Runs use each program's **default** world size
+(ep2 / 2 cards); higher world sizes (ep4/ep8) are exercised as explicit
+`task-submit --device-num 4/8 … python … --ep 4` steps added by hand in
+[daily_ci.yml](../.github/workflows/daily_ci.yml) (the card pool must provide
+that many cards). See the `a2a3` job in
 [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 
-Multi-card kernels use HCCL, which silent-crashes inside docker and breaks
-when `PTO2_RING_*` are set. For this reason the real-NPU job runs **on the
-host (no container)** — set up via conda + `set_env.sh`, mirroring pypto's
-`dist-system-tests` — and unsets `PTO2_RING_*` for multi-card files while
-keeping the large ring sizes for single-card ones. Running a multi-card
-kernel locally needs the same: a real `set_env.sh`-sourced shell with
-`PTO2_RING_*` unset, e.g.
-`python models/deepseek/v4/moe.py -p a2a3 -d 0,1`.
+Multi-card kernels use HCCL, which silent-crashes inside docker. For this
+reason the real-NPU job runs **on the host (no container)** — set up via
+conda + `set_env.sh`, mirroring pypto's `dist-system-tests`. The job keeps
+the large `PTO2_RING_*` sizes for every run and preserves them into each
+task-submit child; the `setup-npu-device-job` action exposes an `unset-ring`
+input to drop them if an HCCL path ever needs it. Running a multi-card
+kernel locally needs a real `set_env.sh`-sourced shell, e.g.
+`python models/deepseek/v4/moe.py -p a2a3 --ep 2 -d 0,1`.
 
 ## Phases inside `golden.run`
 
