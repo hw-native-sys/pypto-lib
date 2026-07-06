@@ -75,6 +75,7 @@ from decode_attention_csa import (
     golden_attention_csa,
 )
 from config import FLASH as MODEL_CONFIG
+from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -614,7 +615,7 @@ def _attention_kind_for_layer(layer_id):
     raise ValueError(f"unsupported compress ratio {ratio} for layer_id={layer_id}")
 
 
-def build_tensor_specs(start_pos=None, layer_id=10):
+def build_tensor_specs(start_pos=DEFAULT_DECODE_TEST_START_POS, layer_id=10):
     import torch
     from golden import ScalarSpec, TensorSpec
 
@@ -809,8 +810,8 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=str,
                         default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
-    parser.add_argument("--start-pos", type=int, default=None,
-                        help="If set, use this single start_pos for all batches.")
+    parser.add_argument("--start-pos", type=int, default=DEFAULT_DECODE_TEST_START_POS,
+                        help="Fixture-only start_pos for all batches; default is the 8k target position.")
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)

@@ -20,6 +20,9 @@ import torch
 from config import BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ, FLASH as M
 
 
+DEFAULT_DECODE_TEST_START_POS = 8192
+
+
 def resolve_start_positions(
     start_pos: int | None,
     *,
