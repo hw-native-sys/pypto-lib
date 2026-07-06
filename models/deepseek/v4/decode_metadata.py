@@ -17,7 +17,15 @@ from typing import Callable
 
 import torch
 
-from config import BLOCK_SIZE, DECODE_BATCH, DECODE_SEQ, FLASH as M
+from config import (
+    BLOCK_SIZE,
+    C4A_COMPRESSOR_BLOCK_SIZE,
+    C128_COMPRESSOR_BLOCK_SIZE,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    DECODE_START_POS,
+    FLASH as M,
+)
 
 
 def resolve_start_positions(
@@ -36,6 +44,85 @@ def resolve_start_positions(
         starts = torch.zeros(batch, dtype=torch.int32)
     _validate_starts(starts, seq=seq, max_seq_len=max_seq_len)
     return starts
+
+
+# --- Canonical decode fixture start-position sets, one per attention family. ---
+# Each set packs the family's distinct position regimes into the batch dimension
+# (one start_pos per request); `long_pos` (the 8k target) adds the long-context
+# rolling-state / INT64-slot / long-topk path. Sets are order-preserving-deduped
+# (S=1 collapses the `-seq`/`-1` boundary pairs; some regimes also coincide at the
+# current constants, e.g. window-1 == state_block*32-1 at ratio 4). Coverage is
+# capped at `batch` slots, so sets are kept <= batch to avoid silent truncation.
+
+def _tile_starts(pattern: list[int], batch: int) -> torch.Tensor:
+    uniq: list[int] = []
+    for p in pattern:
+        if p not in uniq:
+            uniq.append(int(p))
+    vals = torch.empty((batch,), dtype=torch.int32)
+    for b in range(batch):
+        vals[b] = uniq[b % len(uniq)]
+    return vals
+
+
+# `long_pos` (8k) is listed first in each set so it survives truncation even when
+# batch < set size (until coverage is decoupled from batch), then the remaining
+# regimes in descending importance.
+
+def swa_decode_start_set(
+    *,
+    batch: int = DECODE_BATCH,
+    window: int = M.sliding_window,
+    long_pos: int = DECODE_START_POS,
+) -> torch.Tensor:
+    # long-context wraparound + in-window boundary + one in-window interior slot.
+    pattern = [long_pos, window - 1, 31]
+    return _tile_starts(pattern, batch)
+
+
+def hca_decode_start_set(
+    *,
+    batch: int = DECODE_BATCH,
+    compress_ratio: int = 128,
+    state_block_size: int = C128_COMPRESSOR_BLOCK_SIZE,
+    long_pos: int = DECODE_START_POS,
+) -> torch.Tensor:
+    R = compress_ratio
+    pattern = [
+        long_pos,              # 8k long-context
+        R - 1,                 # compress boundary, one cache entry
+        R,                     # no new boundary on 1st token; 2nd advances window
+        2 * R - 1,             # compressed block crossing
+        state_block_size - 1,  # last slot of state page 0
+        10,                    # pre-compression, state page 1
+    ]
+    return _tile_starts(pattern, batch)
+
+
+def csa_decode_start_set(
+    *,
+    batch: int = DECODE_BATCH,
+    seq: int = DECODE_SEQ,
+    compress_ratio: int = 4,
+    state_block_size: int = C4A_COMPRESSOR_BLOCK_SIZE,
+    cache_tile: int = 64,
+    window: int = M.sliding_window,
+    long_pos: int = DECODE_START_POS,
+) -> torch.Tensor:
+    R = compress_ratio
+    pattern = [
+        long_pos,                   # 8k long-context (rolling state, INT64 slot, topk 4096)
+        0,                          # cold start, no valid compressed cache
+        R - seq,                    # compress boundary on 2nd token (== R-1 at seq=1)
+        R - 1,                      # compress boundary on 1st token
+        2 * R - 1,                  # 2nd window with previous-window overlap
+        window - 1,                 # sliding-window boundary (== state block 31->32 at ratio 4)
+        window,                     # post-window ring-cache path
+        state_block_size * 32 - 1,  # inner state logical block 31->32 crossing
+        R * cache_tile - 1,         # indexer score over exactly one cache tile
+        R * 2 * cache_tile - 1,     # indexer score over two cache tiles
+    ]
+    return _tile_starts(pattern, batch)
 
 
 def position_ids_from_starts(starts: torch.Tensor, *, seq: int = DECODE_SEQ) -> torch.Tensor:

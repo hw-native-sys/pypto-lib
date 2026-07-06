@@ -33,7 +33,6 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_CMP_BLOCK_NUM,
@@ -575,11 +574,12 @@ def golden_attention_csa(tensors):
     tensors["x_out"][:] = y
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS):
+def build_tensor_specs(start_pos=None):
     import torch
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
+        csa_decode_start_set,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
@@ -775,29 +775,10 @@ def build_tensor_specs(start_pos=DECODE_START_POS):
         return torch.ones(H) * 4.0
 
     def init_default_start_pos():
-        # Default per-batch pattern mirrors the HCA fixture style while keeping
-        # CSA's separate ratio-4 compressor and sliding-window boundaries covered:
-        #   10        : short-context compressed cache with multiple valid entries
-        #   RATIO-S   : compress, boundary on 2nd token with one cache entry
-        #   RATIO-1   : compress, boundary on 1st token with one cache entry
-        #   RATIO     : no new boundary on 1st token; 2nd token advances the next window
-        #   2*RATIO-S : compress aligned in the 2nd window with previous-window overlap
-        #   3*RATIO-1 : compress crossing in the 3rd window with previous-window overlap
-        #   WIN-S     : final token reaches the sliding-window boundary
-        #   WIN-1     : 1st token reaches the sliding-window boundary; 2nd spills past it
-        #   WIN       : post-window ring-cache path with valid compressed tail
-        pattern = torch.tensor([
-            10,
-            COMPRESS_RATIO - S,
-            COMPRESS_RATIO - 1,
-            COMPRESS_RATIO,
-            COMPRESS_RATIO * 2 - S,
-            COMPRESS_RATIO * 3 - 1,
-            WIN - S,
-            WIN - 1,
-            WIN,
-        ], dtype=torch.int32)
-        return pattern.repeat((B + pattern.numel() - 1) // pattern.numel())[:B].clone()
+        # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).
+        return csa_decode_start_set(
+            batch=B, seq=S, compress_ratio=COMPRESS_RATIO,
+            state_block_size=INNER_STATE_BLOCK_SIZE, window=WIN)
     def init_start_pos():
         return resolve_start_positions(
             start_pos,
@@ -954,8 +935,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--start-pos", type=int, default=DECODE_START_POS,
-                        help="Fixture-only start_pos for position_ids and slot mappings; default is the 8k target position.")
+    parser.add_argument("--start-pos", type=int, default=None,
+                        help="Uniform fixture-only start_pos override for all batches; "
+                             "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--golden-data", type=str, default=None,
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
