@@ -21,13 +21,13 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
+    DEFAULT_DECODE_TEST_START_POS,
     BLOCK_SIZE,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
 )
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope

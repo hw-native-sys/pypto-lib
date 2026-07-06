@@ -76,8 +76,7 @@ from decode_attention_csa import (
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
 )
-from config import FLASH as MODEL_CONFIG
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
+from config import DEFAULT_DECODE_TEST_START_POS, FLASH as MODEL_CONFIG
 from moe import (
     AUX_PAD,
     IDX_PAD,

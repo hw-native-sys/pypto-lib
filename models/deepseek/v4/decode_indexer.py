@@ -17,6 +17,7 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
+    DEFAULT_DECODE_TEST_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_IDX_BLOCK_NUM,
@@ -25,7 +26,6 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 from decode_indexer_compressor import indexer_compressor
 
 # model config

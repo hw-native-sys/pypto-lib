@@ -20,6 +20,7 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
+    DEFAULT_DECODE_TEST_START_POS,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_CMP_BLOCK_NUM,
@@ -29,7 +30,6 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope

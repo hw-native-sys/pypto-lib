@@ -19,11 +19,11 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
+    DEFAULT_DECODE_TEST_START_POS,
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
 )
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")

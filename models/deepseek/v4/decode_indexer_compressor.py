@@ -15,13 +15,13 @@ from config import (
     FLASH as M,
     DECODE_BATCH,
     DECODE_SEQ,
+    DEFAULT_DECODE_TEST_START_POS,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
     DECODE_IDX_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
     FP32_NEG_INF,
 )
-from decode_metadata import DEFAULT_DECODE_TEST_START_POS
 
 
 # model config
