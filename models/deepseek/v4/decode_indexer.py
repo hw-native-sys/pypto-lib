@@ -221,10 +221,7 @@ def indexer(
     kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="score_init"):
-        for si0 in pl.range(0, T, S):
-            score_flat[si0 : si0 + S, :] = pl.full([S, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
-
+    # No score_init: reduce writes the valid region; the tail is never read (topk re-masks).
     # Score in three GM-handoff stages: quant (vec) -> matmul (cube) -> reduce (vec).
     kv_q_i8_gm = pl.create_tensor([T * IDX_KV_LEN, IDX_HEAD_DIM], dtype=pl.INT8)
     kv_dq_gm = pl.create_tensor([T * IDX_KV_LEN, 1], dtype=pl.FP32)
@@ -710,6 +707,20 @@ if __name__ == "__main__":
         )
     topk_idxs_compare.__name__ = "topk_pair_compare"
 
+    # Compare `score` only over the valid region (golden pads the tail with FP32_NEG_INF).
+    def score_valid_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        expected_f = expected.cpu().to(torch.float32)
+        valid = expected_f != FP32_NEG_INF
+        return ratio_allclose(atol=1e-4, rtol=1.0 / 128)(
+            actual.cpu().to(torch.float32)[valid],
+            expected_f[valid],
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol, atol=atol,
+        )
+    score_valid_compare.__name__ = "score_valid_region_compare"
+
     result = run_jit(
         fn=indexer_test,
         specs=build_tensor_specs(args.start_pos),
@@ -724,7 +735,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "score":        ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "score":        score_valid_compare,
             "topk_idxs":    topk_idxs_compare,
             "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=4 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE * IDX_HEAD_DIM)),
         },
