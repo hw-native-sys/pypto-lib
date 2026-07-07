@@ -118,6 +118,7 @@ KV_PROJ_SPMD_BLOCKS = 8
 QK_NORM_SPMD_BLOCKS = NUM_KV_HEADS
 POST_RMSNORM_SPMD_BLOCKS = 8
 DOWN_RESID_SPMD_BLOCKS = 20
+ATTN_MASK_NEG_INF = -3.4028234663852886e38
 OUT_PROJ_SPMD_BLOCKS = 20
 SILU_SPMD_BLOCKS = 24
 GATE_PROJ_SPMD_BLOCKS = 24
@@ -251,6 +252,7 @@ def _attention_phase_window(
                                                             pl.mul(scores_valid, ATTN_SCALE),
                                                             pad_value=pl.PadValue.min,
                                                         )
+                                                        scores = pl.maximum(scores, ATTN_MASK_NEG_INF)
                                                         cur_mi = pl.row_max(scores)
                                                         exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                                                         exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)

@@ -119,6 +119,7 @@ KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
 Q_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 5 (GQA ratio)
 HALF_DIM = HEAD_DIM // 2  # 64 (RoPE rotates lo/hi halves)
 ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
+ATTN_MASK_NEG_INF = -3.4028234663852886e38
 HIDDEN_INV = 1.0 / HIDDEN
 HEAD_DIM_INV = 1.0 / HEAD_DIM  # per-head QK-norm RMSNorm denominator
 
@@ -795,6 +796,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     # box (matmul M fractal).
                     scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
                     scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
+                    scores = pl.maximum(scores, ATTN_MASK_NEG_INF)
                     cur_mi = pl.row_max(scores)
                     exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
                     cur_li = pl.row_sum(exp_scores)
