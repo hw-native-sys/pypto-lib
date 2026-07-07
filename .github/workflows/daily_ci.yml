@@ -63,6 +63,14 @@ jobs:
           PTO2_RING_HEAP: 1073741824
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger. On a SIMPLER_PROFILING build every
+          # simpler_run emits its [STRACE] timing tree at the INFO_V9 tier, and
+          # simpler's logger defaults to INFO — so without this the console floods
+          # with markers. PYPTO_LOG_LEVEL/PYPTO_WARNING_LEVEL above drive pypto's
+          # own C++ logger, not simpler's; PYPTO_RUNTIME_LOG is simpler's knob.
+          # benchmark() still reads timing: it raises this to v9 only around its
+          # own fd-captured loop, then restores.
+          PYPTO_RUNTIME_LOG: error
         run: |
           : > results.tsv
           failed=()
@@ -163,6 +171,11 @@ jobs:
         env:
           PYPTO_LOG_LEVEL: error
           PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger — see the sim job for the full note.
+          # Without this a SIMPLER_PROFILING build floods the log with [STRACE]
+          # INFO_V9 markers on every dispatch (correctness runs included, not just
+          # benchmark's own fd-captured loop). benchmark() still reads timing.
+          PYPTO_RUNTIME_LOG: error
           PYPTO_BENCH: '1'
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
@@ -172,7 +185,21 @@ jobs:
           set +e
           : > results.tsv
           failed=()
-          extract_perf() { grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1; }
+          # Perf number per case, from the headline `effective_us` line: L2
+          # reports the mean Effective window; L3 (multi-card) reports the min —
+          # the fastest round (best-of-N), which filters out cross-rank scheduling
+          # jitter since each round is already a max across ranks. L3 is detected
+          # by the `l3=1` / `l3_resident=1` marker its benchmark emits. The
+          # per-rank breakdown lines use an `eff_us` token (not `effective_us`),
+          # so neither grep ever matches them.
+          extract_perf() {
+            local out; out=$(cat)
+            if printf '%s' "$out" | grep -qE 'l3=1|l3_resident=1'; then
+              printf '%s' "$out" | grep -oP 'effective_us .*min=\K[0-9.]+' | tail -1
+            else
+              printf '%s' "$out" | grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
+            fi
+          }
           run_case() {
             local file="$1" label="$2"; shift 2
             echo "::group::${label}"
@@ -258,7 +285,7 @@ jobs:
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
 
           results = {p: {} for p in PLATFORMS}
-          perf = {}  # case -> a2a3 effective mean (us)
+          perf = {}  # case -> a2a3 effective (us): L2 mean, L3 min — see extract_perf
           root = pathlib.Path("results")
           for p in PLATFORMS:
               tsv = root / f"results-{p}" / "results.tsv"
@@ -277,7 +304,7 @@ jobs:
 
           print("## Daily CI Model Test Results")
           print()
-          print("| Case | a2a3 | a2a3 perf (us) | a2a3sim | a5sim |")
+          print("| Case | a2a3 | a2a3 effective (us) | a2a3sim | a5sim |")
           print("| ---- | --- | --- | --- | --- |")
           for case in all_cases:
               cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
