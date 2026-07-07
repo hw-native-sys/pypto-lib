@@ -493,17 +493,20 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     with pl.manual_scope():
         # Barrier: prevents kv_seed / mlp_out_seed from being early-dispatched so
         # they don't compete with q_proj for the dispatch window when prev_out
-        # completes. seed_dummy is unflagged → it never bumps dispatch_fanin → the
-        # seeds' dispatch_fanin can't reach fanin_actual_count via propagate → no
-        # early dispatch for them. The seeds themselves ARE flagged (as fa producers)
-        # so they still propagate to fa when they complete normally.
-        seed_dummy = pl.system.task_dummy(deps=[prev_out_tids[i] for i in range(DOWN_ON)])
+        # completes. seed_dummy is an unflagged empty barrier, so it adds no
+        # dependency on the previous dcr_xgamma task while still not bumping
+        # dispatch_fanin via early resolve.
+        seed_dummy = pl.system.task_dummy(deps=[])
+        prev_out_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_out_seed_deps[_dep_i] = prev_out_tids[_dep_i]
+        prev_out_seed_deps[DOWN_ON] = seed_dummy
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="rms_recip",
             allow_early_resolve=True,
-            deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy],
+            deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as rms_tid:
             partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
@@ -524,10 +527,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 q_proj = pl.assemble(
                     q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
                 )
+        prev_normed_q_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_normed_q_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
+        prev_normed_q_seed_deps[DOWN_ON] = q_seed_tid
         with pl.spmd(
             Q_ON * QKV_OK,
             name_hint="q_proj",
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], q_seed_tid],
+            deps=[prev_normed_q_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as q_proj_tid:
             q_blk = pl.get_block_idx()
             q_nt = q_blk // QKV_OK
@@ -552,16 +559,20 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
         # ── KV seed: zero k_proj + v_proj buffers. ──
         # ── KV seed: zeroed via seed_dummy barrier (see comment above). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy]) as kv_seed_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as kv_seed_tid:
             k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
             v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+        prev_normed_kv_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        for _dep_i in pl.unroll(DOWN_ON):
+            prev_normed_kv_seed_deps[_dep_i] = prev_normed_tids[_dep_i]
+        prev_normed_kv_seed_deps[DOWN_ON] = kv_seed_tid
 
         # ── MLP/out seed: zero down/gate/up/out accumulators. ──
         down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_tids[0], prev_out_tids[1], prev_out_tids[2], prev_out_tids[3], prev_out_tids[4], seed_dummy]) as mlp_out_seed_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as mlp_out_seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
@@ -588,7 +599,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             KV_ON * QKV_OK,
             name_hint="k_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], kv_seed_tid],
+            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as k_proj_tid:
             k_blk = pl.get_block_idx()
             k_nt = k_blk // QKV_OK
@@ -616,7 +627,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             KV_ON * QKV_OK,
             name_hint="v_proj",
             allow_early_resolve=True,
-            deps=[prev_normed_tids[0], prev_normed_tids[1], prev_normed_tids[2], prev_normed_tids[3], prev_normed_tids[4], kv_seed_tid],
+            deps=[prev_normed_kv_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as v_proj_tid:
             v_blk = pl.get_block_idx()
             v_nt = v_blk // QKV_OK
