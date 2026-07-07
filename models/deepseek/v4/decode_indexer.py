@@ -283,16 +283,18 @@ def indexer(
         b = tg // S
         s = tg - b * S
         clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
-        cblk_b = (clen_b + REDUCE_TILE - 1) // REDUCE_TILE
+        pos_t = pl.read(position_ids, [b, s])
+        visible_len_t = pl.min(pl.min(clen_b, (pos_t + 1) // COMPRESS_RATIO), SCORE_LEN)
+        cblk_t = (visible_len_t + REDUCE_TILE - 1) // REDUCE_TILE
         tb = b * S
         qb = b * S * IDX_N_HEADS
         qh_scale_s = pl.reshape(qr_hadamard_scale_dq[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, :], [1, IDX_N_HEADS])
         weights_row_s = pl.reshape(weights[tb + s : tb + s + 1, :], [1, IDX_N_HEADS])
-        lane_iters = (cblk_b - split + REDUCE_NSPLIT - 1) // REDUCE_NSPLIT
+        lane_iters = (cblk_t - split + REDUCE_NSPLIT - 1) // REDUCE_NSPLIT
         for cb_local in pl.pipeline(0, lane_iters, stage=2):
             cb = split + cb_local * REDUCE_NSPLIT
             cache0 = cb * REDUCE_TILE
-            valid_len = pl.min(REDUCE_TILE, clen_b - cache0)
+            valid_len = pl.min(REDUCE_TILE, visible_len_t - cache0)
             base = tg * IDX_KV_LEN + cache0
             score_acc_red = score_acc_gm[base : base + REDUCE_TILE, :]
             kv_dq_red = kv_dq_gm[base : base + REDUCE_TILE, :]
@@ -315,11 +317,14 @@ def indexer(
         invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
         topk_idxs_flat[t : t + 1, :] = invalid_idxs
         batch_idx = t // S
-        cache_len_b = pl.min(pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO, SCORE_LEN)
-        if cache_len_b > 0:
+        token_s = t - batch_idx * S
+        cache_len_b = pl.read(kv_seq_lens, [batch_idx]) // COMPRESS_RATIO
+        pos_t = pl.read(position_ids, [batch_idx, token_s])
+        visible_len_t = pl.min(pl.min(cache_len_b, (pos_t + 1) // COMPRESS_RATIO), SCORE_LEN)
+        if visible_len_t > 0:
             offset_i32 = pl.cast(offset, target_type=pl.INT32)
             score_full_raw = score_flat[t : t + 1, 0:SCORE_LEN]
-            score_full = pl.fillpad(pl.set_validshape(score_full_raw, 1, cache_len_b), pad_value=pl.PadValue.min)
+            score_full = pl.fillpad(pl.set_validshape(score_full_raw, 1, visible_len_t), pad_value=pl.PadValue.min)
             score_full = pl.maximum(score_full, pl.full([1, SCORE_LEN], dtype=pl.FP32, value=FP32_NEG_INF))
             idx_init = pl.arange(0, [1, SCORE_LEN], dtype=pl.UINT32)
             sorted_full = pl.sort32(score_full, idx_init)
@@ -335,7 +340,7 @@ def indexer(
             merged_candidates = pl.mrgsort(half0_candidates, half1_candidates)
             topk_pairs = merged_candidates[:, 0:TOPK_PAIR_WIDTH]
             topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-            valid_topk = pl.min(IDX_TOPK, cache_len_b)
+            valid_topk = pl.min(IDX_TOPK, visible_len_t)
             topk_idxs_valid = pl.set_validshape(topk_idxs_tile, 1, valid_topk)
             topk_idxs_flat[t : t + 1, 0:IDX_TOPK] = pl.add(topk_idxs_valid, offset_i32)
 
@@ -530,12 +535,15 @@ def golden_indexer(tensors):
         score = score_i32.float() * q_scale[b]
         score = (torch.relu(score) * weights[b].unsqueeze(-1)).sum(dim=1)
         score = score * kv_scale.view(1, cache_len)
-        score_full[b, :, :cache_len] = score.to(torch.float32)
-
-        k = min(IDX_TOPK, cache_len)
-        _, idx = score.topk(k, dim=-1)
-        topk_idxs[b, :, :k] = idx.to(torch.int32)
-        topk_idxs[b, :, :k] += offset
+        for s in range(seqlen):
+            visible_len = min(cache_len, int(tensors["position_ids"][b, s].item() + 1) // ratio, SCORE_LEN)
+            if visible_len <= 0:
+                continue
+            score_full[b, s, :visible_len] = score[s, :visible_len].to(torch.float32)
+            k = min(IDX_TOPK, visible_len)
+            _, idx = score[s, :visible_len].topk(k, dim=-1)
+            topk_idxs[b, s, :k] = idx.to(torch.int32)
+            topk_idxs[b, s, :k] += offset
 
     tensors["score"][:] = score_full
 
