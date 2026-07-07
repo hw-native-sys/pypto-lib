@@ -707,6 +707,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             NUM_CORES,
             name_hint="fa_fused",
             allow_early_resolve=True,
+            sync_start=True,
             # NOTE: no function-level UP_DOWN split here. Phase-1 (attn) and phase-2
             # (online-softmax) are split PER-REGION instead (pl.split_aiv): phase-1 is a
             # data-parallel UP_DOWN region (the compiler inserts aiv_shard / aic_gather,
