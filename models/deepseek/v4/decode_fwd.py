@@ -151,6 +151,14 @@ RESIDENT_WEIGHT_NAMES = frozenset(
     + FINAL_NORM_NAMES
 )
 
+# The KV/compressor-state pools (``CACHE_POOL_NAMES``) are kept device-resident too
+# — uploaded once and reused, skipping the per-dispatch H2D these otherwise pay.
+# The subset the kernel writes in place (``pl.InOut`` in the host signature) is
+# additionally read back once at the end for validation (``is_output=True`` ->
+# ``copy_stacked_from``). Only ``kv_cache`` is ``pl.InOut``; the rest (cmp_kv,
+# idx_kv_cache, *_compress_state) are read-only inputs — resident but not read back.
+RESIDENT_CACHE_OUTPUT_NAMES = frozenset(["kv_cache"])
+
 
 @pl.jit(auto_scope=False)
 def decode_fwd(
@@ -846,7 +854,9 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
         packed_shape,
         spec.dtype,
         init_value=init_value,
-        is_output=False,
+        # Caches the kernel writes in place (kv_cache) are read back for
+        # validation; every other stacked tensor is a plain input.
+        is_output=name in RESIDENT_CACHE_OUTPUT_NAMES,
     )
 
 
@@ -1278,10 +1288,11 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
 
     # Shard the static weight parameters per rank and keep them device-resident
     # (child_memory): each shard uploaded once to its card and reused across
-    # dispatches, skipping per-dispatch H2D/D2H. All resident names are inputs
-    # (is_output=False), so the flag is always valid.
+    # dispatches, skipping per-dispatch H2D/D2H. RESIDENT_WEIGHT_NAMES are static
+    # weights; CACHE_POOL_NAMES are the KV/state caches (the written kv_cache is
+    # also is_output=True and read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
     for spec in specs:
-        if spec.name in RESIDENT_WEIGHT_NAMES:
+        if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in CACHE_POOL_NAMES:
             spec.resident = "stacked"
 
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))

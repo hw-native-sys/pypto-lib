@@ -841,10 +841,12 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
     # to card r once and reuses it across dispatches, skipping the per-dispatch
     # H2D/D2H. Covers the attention weights, the per-kind compressor / indexer
     # weights, the RoPE tables, the MoE FFN/gate/expert weights, and the static
-    # tid2eid route table — but NOT the KV / compressor-state caches, the per-step
-    # metadata (slot mappings, block tables, sparse indices, position_ids,
-    # input_ids), the input activation (x_hc), or the output (x_next). All resident
-    # names are inputs (is_output=False), so the flag is always valid.
+    # tid2eid route table. The KV / compressor-state caches (RESIDENT_CACHE_NAMES)
+    # are kept resident too; the ones the kernel writes (pl.Out: kv_cache, cmp_kv,
+    # idx_kv_cache) are already is_output=True (inherited) and read back at the end
+    # for validation, the *_state caches are read-only inputs. NOT resident: the
+    # per-step metadata (slot mappings, block tables, sparse indices, position_ids,
+    # input_ids), the input activation (x_hc), or the output (x_next).
     RESIDENT_WEIGHT_NAMES = frozenset([
         # Attention core weights + RoPE tables
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
@@ -865,8 +867,14 @@ def build_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=2):
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
     ])
+    RESIDENT_CACHE_NAMES = frozenset([
+        "kv_cache", "cmp_kv", "idx_kv_cache",
+        "csa_cmp_kv_state", "csa_cmp_score_state",
+        "csa_inner_kv_state", "csa_inner_score_state",
+        "hca_cmp_kv_state", "hca_cmp_score_state",
+    ])
     for spec in tensor_specs:
-        if spec.name in RESIDENT_WEIGHT_NAMES:
+        if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
