@@ -20,17 +20,22 @@ def _source(name: str) -> str:
 
 
 def test_fixed_batch_greedy_tie_break_reads_winning_chunk_from_local_slice() -> None:
-    source = _source("decode_fwd.py")
+    sources = {
+        "decode_layer.py": "SAMPLE_VOCAB_CHUNK",
+        "greedy_sample.py": "VOCAB_CHUNK",
+    }
 
-    assert "winning_logits = pl.slice(logits" in source
-    assert "winning_logits, [0, pl.cast(scan_t, pl.INDEX)]" in source
-    assert "val = pl.read(logits, [b, token_idx])" not in source
-    assert "chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)" in source
-    assert "local_scores = pl.fillpad" not in source
-    assert "winning_logits = pl.fillpad" not in source
-    assert "REAL_VOCAB_TAIL" in source
-    assert "fillpad" in source
-    assert "SAMPLE_VOCAB_CHUNK" in source
+    for filename, chunk_name in sources.items():
+        source = _source(filename)
+        assert "winning_logits = pl.slice(logits" in source
+        assert "winning_logits, [0, pl.cast(scan_t, pl.INDEX)]" in source
+        assert "val = pl.read(logits, [b, token_idx])" not in source
+        assert "chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)" in source
+        assert "local_scores = pl.fillpad" not in source
+        assert "winning_logits = pl.fillpad" not in source
+        assert "REAL_VOCAB_TAIL" in source
+        assert "fillpad" in source
+        assert chunk_name in source
 
 
 def test_prefill_keeps_sampling_in_standalone_kernels() -> None:
@@ -44,7 +49,8 @@ def test_prefill_keeps_sampling_in_standalone_kernels() -> None:
 
 
 def test_decode_comment_matches_next_hidden_seed() -> None:
-    source = _source("decode_fwd.py")
+    source = _source("decode_layer.py")
 
     assert "loop-carried `cur` is seeded from next_hidden" in source
     assert "loop-carried `cur` is seeded from hidden_states" not in source
+
