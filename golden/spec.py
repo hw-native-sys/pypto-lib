@@ -50,9 +50,14 @@ class TensorSpec:
         resident: Keep this tensor device-resident (``child_memory``): the harness
             uploads it once and reuses it across the validation dispatch and every
             benchmark round, skipping the per-dispatch host→device upload and
-            device→host readback. Only supported for L3 distributed programs and
-            only for inputs — combining a resident mode with ``is_output=True``
-            raises ``ValueError``. Values:
+            device→host readback. Only supported for L3 distributed programs.
+            Combine with ``is_output=True`` for a read-write **resident state
+            buffer** (e.g. a KV cache the kernel updates in place every dispatch):
+            it is uploaded once as its initial state (from ``init_value``), updated
+            on-device across dispatches, and read back **once** at the end (via
+            ``copy_stacked_from`` / ``copy_from``) for golden validation — trading
+            the per-dispatch H2D+D2H of a plain output for a single end-of-run D2H.
+            Values:
 
             - ``None`` / ``False`` — not resident (default).
             - an ``int`` worker id (``0``, ``1``, …) — whole-tensor resident on
@@ -85,11 +90,13 @@ class TensorSpec:
     resident: int | str | bool | None = None
 
     def __post_init__(self) -> None:
+        # Validate the ``resident`` mode. ``resident`` + ``is_output`` is allowed:
+        # a read-write resident state buffer (e.g. a KV cache) uploaded once,
+        # updated in place on-device across dispatches, and read back once at the
+        # end for validation.
         r = self.resident
-        if r is None or r is False:
-            resident_on = False
-        elif r == "stacked":
-            resident_on = True
+        if r is None or r is False or r == "stacked":
+            pass
         elif isinstance(r, bool):  # r is True — bool is an int subclass, check before int
             raise ValueError(
                 f"TensorSpec {self.name!r}: resident=True is ambiguous; pass an int worker id "
@@ -100,18 +107,11 @@ class TensorSpec:
                 raise ValueError(
                     f"TensorSpec {self.name!r}: resident worker id must be >= 0, got {r}."
                 )
-            resident_on = True
         else:
             raise ValueError(
                 f"TensorSpec {self.name!r}: resident must be None/False (off), an int worker id "
                 f'(whole-tensor resident on that card), or "stacked" (leading-dim sharded); '
                 f"got {r!r}."
-            )
-        if resident_on and self.is_output:
-            raise ValueError(
-                f"TensorSpec {self.name!r}: resident is only valid for inputs "
-                f"(a resident weight stays device-resident across dispatches); it "
-                f"cannot be combined with is_output=True."
             )
 
     @property
