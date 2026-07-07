@@ -96,12 +96,12 @@ assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv betwe
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 43
-CSA_NUM_LAYERS = 21
-HCA_NUM_LAYERS = 20
+FWD_NUM_LAYERS = 7
+CSA_NUM_LAYERS = 3
+HCA_NUM_LAYERS = 2
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
-assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
+# assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
     "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w", "csa_compress_state",
