@@ -78,17 +78,6 @@ assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
-# Dispatch warmup toggle. ON only when moe.py is run as a standalone script
-# (`python moe.py ...`), where `__name__ == "__main__"`; when moe is imported
-# (`from moe import ...`) by the decode/prefill forward paths it is OFF, so
-# those runs are unaffected. When on, dispatch runs a Phase-0 cross-rank barrier
-# (reusing the `arrived` window) that absorbs the cold-start inter-rank arrival
-# skew before dispatch's own barrier, so the measured dispatch Exec reflects
-# steady state instead of first-sync launch skew. Off -> no new window/param is
-# threaded through the shared path, so imported callers are unchanged.
-_DISPATCH_WARMUP = __name__ == "__main__"
-
-
 # === Dispatch ================================================================
 # Lane push, count publish, arrival wait, and cumsum gather run in one
 # pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
@@ -118,37 +107,7 @@ def dispatch(
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
 
-    # Phase-0 warmup barrier (active only for standalone `python moe.py` runs;
-    # see _DISPATCH_WARMUP). It runs in its own CORE_GROUP task that dispatch deps
-    # on, so the cold-start inter-rank arrival skew lands in `dispatch_warmup` and
-    # dispatch's own Exec stays stable. Reuses the `arrived` window (no new
-    # window/param -> shared moe()/dispatch() and their positional callers are
-    # untouched): the warmup round drives `arrived` to `2*moe_epoch-1` and
-    # dispatch's own round to `2*moe_epoch`. When off (imported moe), the warmup
-    # task body is empty and the threshold stays `moe_epoch`, so behaviour is
-    # unchanged. Purely a timing stabilizer. (The scope is emitted unconditionally
-    # so no traced variable diverges in type across the compile-time flag; the DSL
-    # rejects that.)
-    _arrived_expected = moe_epoch
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_warmup") as _warmup_tid:
-        if _DISPATCH_WARMUP:
-            for peer in pl.range(N_RANKS):
-                if peer != my_rank:
-                    pld.system.notify(
-                        target=arrived, peer=peer, offsets=[my_rank, 0],
-                        value=1, op=pld.NotifyOp.AtomicAdd,
-                    )
-            for src in pl.range(N_RANKS):
-                if src != my_rank:
-                    pld.system.wait(
-                        signal=arrived, offsets=[src, 0],
-                        expected=pl.cast(2 * moe_epoch - 1, pl.INT32),
-                        cmp=pld.WaitCmp.Ge,
-                    )
-    if _DISPATCH_WARMUP:
-        _arrived_expected = pl.cast(2 * moe_epoch, pl.INT32)
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch", deps=[_warmup_tid]):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch"):
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -211,7 +170,7 @@ def dispatch(
                 pld.system.wait(
                     signal=arrived,
                     offsets=[src, 0],
-                    expected=_arrived_expected,
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
