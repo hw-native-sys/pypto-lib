@@ -110,13 +110,17 @@ def gate(
                 x_norm_i8[t0 : t0 + T_TILE, xq_b_k : xq_b_k + QUANT_TILE] = \
                     pl.cast(xn_q_half, pl.INT8, mode="trunc")
 
-    # Pad columns [N_EXPERTS, SCORE_PAD) never see a matmul; zero the routed
-    # score and NEG_INF the biased score so sort keeps them last. Done here (not
-    # inside the fanned gate spmd) so gate_spmd writes only the active columns.
-    if N_EXPERTS < SCORE_PAD:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pad_init"):
-            route_scores_buf[:, N_EXPERTS:SCORE_PAD] = \
-                pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=0.0)
+    # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
+    # columns so the sort ranks pad experts last. Route write-backs are guarded to
+    # active tokens, so the inactive-zero can run here rather than post-route.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+        for zt in pl.range(T):
+            if zt >= active_tokens:
+                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
+                for zk in pl.range(TOPK):
+                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
+                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
+        if N_EXPERTS < SCORE_PAD:
             biased_scores_buf[:, N_EXPERTS:SCORE_PAD] = \
                 pl.full([T_PAD, SCORE_PAD - N_EXPERTS], dtype=pl.FP32, value=FP32_NEG_INF)
 
@@ -147,10 +151,11 @@ def gate(
         gp_neg_floor = pl.mul(gp_neg_floor_mask, pl.exp(pl.minimum(gate_logits_tile, 0.0)))
         gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
         gp_score = pl.sqrt(gp_softplus)
-        gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
-        gp_biased = pl.add(gp_score, gp_bias)
         route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-        biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
+        if layer_id >= N_HASH_LAYERS:
+            gp_bias = pl.col_expand_mul(pl.full([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32, value=1.0), gp_bias_row)
+            gp_biased = pl.add(gp_score, gp_bias)
+            biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
@@ -175,9 +180,10 @@ def gate(
             hs_denom = pl.reshape(pl.row_sum(hs_vals_buf), [GATE_T_TILE, 1])
             hs_weights_buf = pl.mul(pl.row_expand_div(hs_vals_buf, hs_denom), ROUTE_SCALE)
             for hs_wt_tt in pl.range(GATE_T_TILE):
-                for hs_wt_k in pl.range(TOPK):
-                    pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
-                    pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
+                if t1 + hs_wt_tt < active_tokens:
+                    for hs_wt_k in pl.range(TOPK):
+                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_buf, [hs_wt_tt, hs_wt_k]))
+                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_buf, [hs_wt_tt, hs_wt_k]))
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
             t1 = ts_idx * GATE_T_TILE
@@ -211,17 +217,10 @@ def gate(
             nm_denom = pl.reshape(pl.row_sum(topk_vals_pad), [GATE_T_TILE, 1])
             nm_weights_pad = pl.mul(pl.row_expand_div(topk_vals_pad, nm_denom), ROUTE_SCALE)
             for nm_tt in pl.range(GATE_T_TILE):
-                for nm_k in pl.range(TOPK):
-                    pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
-                    pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
-
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_inactive_zero"):
-        for zt in pl.range(T):
-            if zt >= active_tokens:
-                pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
-                for zk in pl.range(TOPK):
-                    pl.write(indices, [zt, zk], pl.cast(0, pl.INT32))
-                    pl.write(weights, [zt, zk], pl.cast(0.0, pl.FP32))
+                if t1 + nm_tt < active_tokens:
+                    for nm_k in pl.range(TOPK):
+                        pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
+                        pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value. weights is convenient because it's already pl.Out and reads as
