@@ -1,0 +1,87 @@
+name: Run pypto-serving Qwen tests
+description: >-
+  Checkout pypto-serving, replace its pypto-lib submodule with the current
+  pypto-lib checkout under test, and run the Qwen serving tests via
+  task-submit.
+
+inputs:
+  pypto-lib-checkout-path:
+    description: Workspace-relative path to the pypto-lib checkout under test.
+    required: true
+  pypto-serving-checkout-path:
+    description: Workspace-relative path where pypto-serving should be checked out.
+    required: true
+  pypto-serving-ref:
+    description: pypto-serving ref to test against.
+    required: false
+    default: main
+  model-dir:
+    description: Qwen3 model directory used by pypto-serving tests.
+    required: true
+  pto2-ring-dep-pool:
+    description: PTO2_RING_DEP_POOL value for pypto-serving tests.
+    required: false
+    default: "16384"
+  pto2-ring-task-window:
+    description: PTO2_RING_TASK_WINDOW value for pypto-serving tests.
+    required: false
+    default: "16384"
+  pto2-ring-heap:
+    description: PTO2_RING_HEAP value for pypto-serving tests.
+    required: false
+    default: "1073741824"
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout pypto-serving
+      uses: actions/checkout@v4
+      with:
+        repository: hw-native-sys/pypto-serving
+        ref: ${{ inputs.pypto-serving-ref }}
+        path: ${{ inputs.pypto-serving-checkout-path }}
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Override pypto-serving submodule with pypto-lib under test
+      shell: bash
+      env:
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        PYPTO_LIB_SHA=$(git -C "$PYPTO_LIB_CHECKOUT" rev-parse HEAD)
+        rm -rf "$PYPTO_SERVING_CHECKOUT/pypto-lib"
+        git clone --no-checkout "$PYPTO_LIB_CHECKOUT" "$PYPTO_SERVING_CHECKOUT/pypto-lib"
+        git -C "$PYPTO_SERVING_CHECKOUT/pypto-lib" checkout "$PYPTO_LIB_SHA"
+        echo "pypto-lib under test: $(git -C "$PYPTO_SERVING_CHECKOUT/pypto-lib" rev-parse HEAD)"
+        echo "pypto-serving base:  $(git -C "$PYPTO_SERVING_CHECKOUT" rev-parse HEAD)"
+
+    - name: Install pypto-serving test dependencies
+      shell: bash
+      working-directory: ${{ inputs.pypto-lib-checkout-path }}
+      run: |
+        source activate.sh
+        pip install transformers safetensors pytest
+
+    - name: Run pypto-serving Qwen tests
+      shell: bash
+      env:
+        PYPTO_QWEN3_MODEL_DIR: ${{ inputs.model-dir }}
+        PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
+        PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
+        PTO2_RING_HEAP: ${{ inputs.pto2-ring-heap }}
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
+        run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
+        run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
+        run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
+        run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
+        task-submit --device "$DEVICE_ID" --timeout 0 --max-time 0 \
+          --run "$run_cmd"
