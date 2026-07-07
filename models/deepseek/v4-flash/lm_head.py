@@ -32,28 +32,27 @@ from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE, PREFILL_TOKENS
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
 
 
-# Tensor shapes and loop trip counts are static in the frontend, so the TP
-# world size is a build-time constant. Read --tp at import time. When lm_head is
-# composed into decode_fwd, default to --ep so the EP and LM-head TP worlds match.
+# Tensor shapes and loop trip counts are static in the frontend, so the TP and
+# owner worlds are build-time constants.  Standalone lm_head keeps
+# OWNER_SIZE == TP_SIZE; when composed into decode_fwd, OWNER_SIZE comes from
+# --ep and may be larger than TP_SIZE.
 _TP_CHOICES = (2, 4, 8)
 _TP_DEFAULT = 2
 
 
-def _parse_tp_argv():
+def _parse_int_argv(name, default=None):
     for i, tok in enumerate(sys.argv):
-        if tok == "--tp" and i + 1 < len(sys.argv):
+        if tok == name and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
-        if tok.startswith("--tp="):
+        if tok.startswith(f"{name}="):
             return int(tok.split("=", 1)[1])
-    for i, tok in enumerate(sys.argv):
-        if tok == "--ep" and i + 1 < len(sys.argv):
-            return int(sys.argv[i + 1])
-        if tok.startswith("--ep="):
-            return int(tok.split("=", 1)[1])
-    return _TP_DEFAULT
+    return default
 
 
-TP_SIZE = _parse_tp_argv()
+TP_SIZE = _parse_int_argv("--tp", None)
+if TP_SIZE is None:
+    TP_SIZE = _parse_int_argv("--ep", _TP_DEFAULT)
+OWNER_SIZE = _parse_int_argv("--ep", TP_SIZE)
 
 T = DECODE_TOKENS
 T_MAX = max(DECODE_TOKENS, PREFILL_TOKENS)
@@ -73,6 +72,8 @@ assert DECODE_TOKENS % T_TILE == 0 and PREFILL_TOKENS % T_TILE == 0
 assert DECODE_TOKENS <= MATMUL_T_TILE and PREFILL_TOKENS % MATMUL_T_TILE == 0
 assert VOCAB % TP_SIZE == 0
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
+assert OWNER_SIZE in _TP_CHOICES, f"--ep must be one of {_TP_CHOICES} (got {OWNER_SIZE})"
+assert TP_SIZE <= OWNER_SIZE, f"--tp must be <= --ep/OWNER_SIZE, got tp={TP_SIZE}, owner={OWNER_SIZE}"
 assert TP_SIZE <= LM_HEAD_TP_SIZE
 
 K_BLOCKS = D // LM_HEAD_K_CHUNK  # 32.
@@ -322,6 +323,223 @@ def lm_head_tp(
             logits_shard = lm_head(owner_hidden, lm_head_weight, logits_shard)
             logits = route_logits_shard_step(logits_shard, logits, logits_window, owner_rank, my_rank)
     logits = finish_logits_step(logits, logits_window, logits_done, my_rank)
+    return logits
+
+
+@pl.jit.incore
+def publish_hidden_to_tp_decoupled(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    hidden_window: pld.DistributedTensor[[OWNER_SIZE * T_MAX, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[OWNER_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    t_dim = pl.tensor.dim(hidden_states, 0)
+    row_base = my_rank * T_MAX
+
+    for peer in pl.range(TP_SIZE):
+        if peer != my_rank:
+            for t0 in pl.range(0, t_dim, T_TILE):
+                for kb in pl.range(HIDDEN_COMM_BLOCKS):
+                    k0 = kb * HIDDEN_COMM_CHUNK
+                    hidden_tile = pl.load(hidden_states, [t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
+                    pld.tile.remote_store(
+                        hidden_tile,
+                        target=hidden_window,
+                        peer=peer,
+                        offsets=[row_base + t0, k0],
+                    )
+
+    for peer in pl.range(TP_SIZE):
+        if peer != my_rank:
+            pld.system.notify(
+                target=hidden_done,
+                peer=peer,
+                offsets=[my_rank, 0],
+                value=DONE_VALUE,
+                op=pld.NotifyOp.Set,
+            )
+
+
+@pl.jit.incore
+def wait_owner_hidden_decoupled(
+    hidden_done: pld.DistributedTensor[[OWNER_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    for src in pl.range(OWNER_SIZE):
+        if src != my_rank:
+            pld.system.wait(
+                signal=hidden_done,
+                offsets=[src, 0],
+                expected=DONE_VALUE,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+
+@pl.jit.incore
+def load_owner_hidden_decoupled(
+    owner_hidden: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
+    hidden_window: pld.DistributedTensor[[OWNER_SIZE * T_MAX, D], pl.BF16],
+    owner_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DYN, D], pl.BF16]:
+    t_dim = pl.tensor.dim(owner_hidden, 0)
+    row_base = owner_rank * T_MAX
+
+    for t0 in pl.range(0, t_dim, T_TILE):
+        for kb in pl.range(HIDDEN_COMM_BLOCKS):
+            k0 = kb * HIDDEN_COMM_CHUNK
+            tile = pl.load(hidden_window, [row_base + t0, k0], [T_TILE, HIDDEN_COMM_CHUNK])
+            pl.store(tile, [t0, k0], owner_hidden)
+    return owner_hidden
+
+
+@pl.jit.incore
+def route_logits_shard_decoupled(
+    logits_shard: pl.Tensor[[T_MAX, VOCAB_PER_TP], pl.FP32],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
+    owner_rank: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(logits, 0)
+    vocab_base = tp_rank * VOCAB_PER_TP
+
+    for t0 in pl.range(0, t_dim, T_TILE):
+        for ob in pl.range(VOCAB_FULL_BLOCKS_PER_TP):
+            o0 = ob * VOCAB_CHUNK
+            if owner_rank == tp_rank:
+                tile = pl.load(logits_shard, [t0, o0], [T_TILE, VOCAB_CHUNK])
+                pl.store(tile, [t0, vocab_base + o0], logits)
+            else:
+                pld.tensor.put(
+                    dst=logits_window,
+                    peer=owner_rank,
+                    src=logits_shard,
+                    dst_offsets=[t0, vocab_base + o0],
+                    src_offsets=[t0, o0],
+                    shape=[T_TILE, VOCAB_CHUNK],
+                )
+
+        if VOCAB_TAIL != 0:
+            tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+            if owner_rank == tp_rank:
+                tile_tail = pl.load(logits_shard, [t0, tail_o0], [T_TILE, VOCAB_TAIL])
+                pl.store(tile_tail, [t0, vocab_base + tail_o0], logits)
+            else:
+                pld.tensor.put(
+                    dst=logits_window,
+                    peer=owner_rank,
+                    src=logits_shard,
+                    dst_offsets=[t0, vocab_base + tail_o0],
+                    src_offsets=[t0, tail_o0],
+                    shape=[T_TILE, VOCAB_TAIL],
+                )
+    return logits
+
+
+@pl.jit.incore
+def notify_logits_shard_done_decoupled(
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+):
+    for owner in pl.range(OWNER_SIZE):
+        if owner != tp_rank:
+            pld.system.notify(
+                target=logits_done,
+                peer=owner,
+                offsets=[tp_rank, 0],
+                value=DONE_VALUE,
+                op=pld.NotifyOp.Set,
+            )
+
+
+@pl.jit.incore
+def finish_logits_decoupled(
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(logits, 0)
+    for src in pl.range(TP_SIZE):
+        if src != my_rank:
+            pld.system.wait(
+                signal=logits_done,
+                offsets=[src, 0],
+                expected=DONE_VALUE,
+                cmp=pld.WaitCmp.Ge,
+            )
+
+    for t0 in pl.range(0, t_dim, T_TILE):
+        for src in pl.range(TP_SIZE):
+            if src != my_rank:
+                src_vocab_base = src * VOCAB_PER_TP
+                for ob in pl.range(VOCAB_FULL_BLOCKS_PER_TP):
+                    o0 = ob * VOCAB_CHUNK
+                    tile = pl.load(
+                        logits_window,
+                        [t0, src_vocab_base + o0],
+                        [T_TILE, VOCAB_CHUNK],
+                    )
+                    pl.store(tile, [t0, src_vocab_base + o0], logits)
+
+                if VOCAB_TAIL != 0:
+                    tail_o0 = VOCAB_FULL_BLOCKS_PER_TP * VOCAB_CHUNK
+                    tile = pl.load(
+                        logits_window,
+                        [t0, src_vocab_base + tail_o0],
+                        [T_TILE, VOCAB_TAIL],
+                    )
+                    pl.store(tile, [t0, src_vocab_base + tail_o0], logits)
+    return logits
+
+
+@pl.jit
+def lm_head_tp_decoupled_worker(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    hidden_window: pld.DistributedTensor[[OWNER_SIZE * T_MAX, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[OWNER_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    # scalars trailing — runtime TaskArgs requires all tensor args before any
+    # scalar args (#1603-adjacent constraint).
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    t_dim = pl.tensor.dim(hidden_states, 0)
+    publish_hidden_to_tp_decoupled(hidden_states, hidden_window, hidden_done, my_rank)
+    wait_owner_hidden_decoupled(hidden_done, my_rank)
+
+    for owner_rank in pl.range(OWNER_SIZE):
+        logits_shard = pl.create_tensor([T_MAX, VOCAB_PER_TP], dtype=pl.FP32)
+        if owner_rank == my_rank:
+            logits_shard = lm_head(hidden_states, lm_head_weight, logits_shard)
+            logits = route_logits_shard_decoupled(logits_shard, logits, logits_window, owner_rank, my_rank)
+        else:
+            owner_hidden = pl.create_tensor([t_dim, D], dtype=pl.BF16)
+            owner_hidden = load_owner_hidden_decoupled(owner_hidden, hidden_window, owner_rank)
+            logits_shard = lm_head(owner_hidden, lm_head_weight, logits_shard)
+            logits = route_logits_shard_decoupled(logits_shard, logits, logits_window, owner_rank, my_rank)
+
+    notify_logits_shard_done_decoupled(logits_done, my_rank)
+    logits = finish_logits_decoupled(logits, logits_window, logits_done, my_rank)
+    return logits
+
+
+@pl.jit
+def lm_head_owner_only_decoupled(
+    hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
+    logits: pl.Out[pl.Tensor[[T_DYN, VOCAB], pl.FP32]],
+    hidden_window: pld.DistributedTensor[[OWNER_SIZE * T_MAX, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[OWNER_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[T_MAX, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    # scalars trailing — runtime TaskArgs requires all tensor args before any
+    # scalar args (#1603-adjacent constraint).
+    my_rank: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T_DYN, VOCAB], pl.FP32]:
+    publish_hidden_to_tp_decoupled(hidden_states, hidden_window, hidden_done, my_rank)
+    logits = finish_logits_decoupled(logits, logits_window, logits_done, my_rank)
     return logits
 
 
