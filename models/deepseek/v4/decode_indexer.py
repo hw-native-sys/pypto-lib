@@ -67,9 +67,12 @@ REDUCE_TILE = 128
 # score_kv_quant / score_reduce fan the cache-tile loop across NSPLIT extra lanes: T * NSPLIT.
 QUANT_NSPLIT = 4
 REDUCE_NSPLIT = 4
-Q_TILE = 128
-Q_OUT_TILE = 256
-QR_PROJ_ROW_TILE = 8
+Q_TILE = 256
+# Q_OUT_TILE is the per-task N granularity (sets idx_qr_proj task count); MM_N_TILE
+# is the Mat-safe cube N-tile. Q_OUT_TILE fans Q_OUT_TILE // MM_N_TILE cube ops per
+# task so task count halves without growing the [Q_TILE, MM_N_TILE] L1 wq load.
+Q_OUT_TILE = 1024
+MM_N_TILE = 512
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
 # weights_proj is a single-tile CORE_GROUP scope (one 16-row boxed matmul); decode
@@ -119,27 +122,26 @@ def indexer(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
-    qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // (2 * Q_OUT_TILE), name_hint="qr_proj"):
-        for nt in pl.range(2):
-            o0 = (idx * 2 + nt) * Q_OUT_TILE
-            qr_acc = pl.create_tensor([MM_ROW_TILE, Q_OUT_TILE], dtype=pl.INT32)
-            for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
-                q0 = kb * Q_TILE
-                qr_tile = pl.slice(qr, [T_PAD, Q_TILE], [0, q0], valid_shape=[T, Q_TILE])
-                wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-                if q0 == 0:
-                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-                else:
-                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
-            qr_acc_pad[0:T_PAD, o0:o0 + Q_OUT_TILE] = qr_acc
-            wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-            for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-                acc_fp32 = pl.cast(qr_acc_pad[r0 : r0 + QR_PROJ_ROW_TILE, o0:o0 + Q_OUT_TILE], target_type=pl.FP32, mode="none")
-                scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-                qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
-                qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
+    for o_base in pl.parallel(0, IDX_N_HEADS * IDX_HEAD_DIM, Q_OUT_TILE):
+        qr_acc_pad = pl.create_tensor([T_PAD, Q_OUT_TILE], dtype=pl.INT32)
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_qr_proj_matmul"):
+            for ns in pl.range(0, Q_OUT_TILE, MM_N_TILE):
+                qr_acc = pl.create_tensor([MM_ROW_TILE, MM_N_TILE], dtype=pl.INT32)
+                for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+                    q0 = kb * Q_TILE
+                    qr_tile = pl.slice(qr, [T_PAD, Q_TILE], [0, q0], valid_shape=[T, Q_TILE])
+                    wq_tile = wq_b[q0 : q0 + Q_TILE, o_base + ns : o_base + ns + MM_N_TILE]
+                    if q0 == 0:
+                        qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+                    else:
+                        qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+                qr_acc_pad[0:T_PAD, ns : ns + MM_N_TILE] = qr_acc
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="idx_qr_proj_dequant"):
+            wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
+            acc_fp32 = pl.cast(qr_acc_pad[0:T, 0 : Q_OUT_TILE], target_type=pl.FP32, mode="none")
+            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale[0:T, :]), wq_scale)
+            qr_proj[0:T, o_base : o_base + Q_OUT_TILE] = qr_dequant
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
