@@ -171,7 +171,7 @@ def hc_pre(
     mixx_n = tt_n * MIXX_DS           # mix_x fans over token-tile x D-slice
     pool_d = 2 * tt_n + mixx_n        # phase-D flattened pool: sinkhorn(tt_n)|mix_x(mixx_n)|write_post(tt_n)
 
-    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True) as _hc_tid:  # inline form requires the TaskId capture
+    with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
         # ===================== PHASE A: cast (AIV) + seed (AIV) =====================
