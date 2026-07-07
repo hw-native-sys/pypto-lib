@@ -66,8 +66,8 @@ def mtp_projection(
     hidden_flat = pl.reshape(hidden_states, [t_dim, D])
     prev_flat = pl.reshape(prev_hidden_states, [t_dim, HC_DIM])
     out_flat = pl.reshape(hidden_states_out, [t_dim, HC_DIM])
-    hidden_norm = pl.create_tensor([t_linear, D], dtype=pl.BF16)
-    prev_norm = pl.create_tensor([t_linear, HC_DIM], dtype=pl.BF16)
+    hidden_norm = pl.create_tensor([t_linear, D], dtype=pl.FP32)
+    prev_norm = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)
     hidden_i8 = pl.create_tensor([t_linear, D], dtype=pl.INT8)
     prev_i8 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.INT8)
     hidden_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
@@ -115,9 +115,8 @@ def mtp_projection(
                     pl.col_expand_mul(pl.row_expand_mul(hidden_chunk, hidden_inv), enorm),
                     e_smooth,
                 )
-                hidden_norm_bf16 = pl.cast(hidden_norm_tile, target_type=pl.BF16, mode="rint")
-                hidden_norm = pl.assemble(hidden_norm, hidden_norm_bf16, [t0, k0])
-                hidden_abs = pl.maximum(pl.cast(hidden_norm_bf16, target_type=pl.FP32), pl.neg(pl.cast(hidden_norm_bf16, target_type=pl.FP32)))
+                hidden_norm = pl.assemble(hidden_norm, hidden_norm_tile, [t0, k0])
+                hidden_abs = pl.maximum(hidden_norm_tile, pl.neg(hidden_norm_tile))
                 hidden_amax_parts = pl.assemble(hidden_amax_parts, pl.reshape(pl.row_max(hidden_abs), [1, T_TILE]), [kb, t0])
                 hnorm = pl.reshape(hnorm_w[k0 : k0 + D_CHUNK], [1, D_CHUNK])
                 h_smooth = pl.reshape(h_proj_smooth[k0 : k0 + D_CHUNK], [1, D_CHUNK])
@@ -129,12 +128,8 @@ def mtp_projection(
                         pl.col_expand_mul(pl.row_expand_mul(prev_chunk, prev_inv), hnorm),
                         h_smooth,
                     )
-                    prev_norm_bf16 = pl.cast(prev_norm_tile, target_type=pl.BF16, mode="rint")
-                    prev_norm = pl.assemble(prev_norm, prev_norm_bf16, [t0, prev_k0])
-                    prev_abs = pl.maximum(
-                        pl.cast(prev_norm_bf16, target_type=pl.FP32),
-                        pl.neg(pl.cast(prev_norm_bf16, target_type=pl.FP32)),
-                    )
+                    prev_norm = pl.assemble(prev_norm, prev_norm_tile, [t0, prev_k0])
+                    prev_abs = pl.maximum(prev_norm_tile, pl.neg(prev_norm_tile))
                     prev_amax_parts = pl.assemble(
                         prev_amax_parts,
                         pl.reshape(pl.row_max(prev_abs), [1, T_TILE]),
@@ -150,7 +145,7 @@ def mtp_projection(
             hidden_scale_dq = pl.assemble(hidden_scale_dq, pl.reshape(pl.recip(hidden_sq_row), [T_TILE, 1]), [t0, 0])
             hidden_sq_col = pl.reshape(hidden_sq_row, [T_TILE, 1])
             for k0 in pl.range(0, D, QUANT_CHUNK):
-                hidden_q_f32 = pl.cast(hidden_norm[t0 : t0 + T_TILE, k0 : k0 + QUANT_CHUNK], target_type=pl.FP32)
+                hidden_q_f32 = hidden_norm[t0 : t0 + T_TILE, k0 : k0 + QUANT_CHUNK]
                 hidden_q_i32 = pl.cast(pl.row_expand_mul(hidden_q_f32, hidden_sq_col), target_type=pl.INT32, mode="rint")
                 hidden_q_half = pl.cast(hidden_q_i32, target_type=pl.FP16, mode="round")
                 hidden_i8 = pl.assemble(hidden_i8, pl.cast(hidden_q_half, target_type=pl.INT8, mode="trunc"), [t0, k0])
@@ -163,7 +158,7 @@ def mtp_projection(
                 prev_sq_col = pl.reshape(prev_sq_row, [T_TILE, 1])
                 for k0 in pl.range(0, D, QUANT_CHUNK):
                     prev_k0 = hc * D + k0
-                    prev_q_f32 = pl.cast(prev_norm[t0 : t0 + T_TILE, prev_k0 : prev_k0 + QUANT_CHUNK], target_type=pl.FP32)
+                    prev_q_f32 = prev_norm[t0 : t0 + T_TILE, prev_k0 : prev_k0 + QUANT_CHUNK]
                     prev_q_i32 = pl.cast(pl.row_expand_mul(prev_q_f32, prev_sq_col), target_type=pl.INT32, mode="rint")
                     prev_q_half = pl.cast(prev_q_i32, target_type=pl.FP16, mode="round")
                     prev_i8 = pl.assemble(prev_i8, pl.cast(prev_q_half, target_type=pl.INT8, mode="trunc"), [t0, prev_k0])
@@ -269,8 +264,8 @@ def _rms_norm(x, weight):
 def golden_mtp_projection(tensors):
     import torch
 
-    hidden_states = (_rms_norm(tensors["hidden_states"], tensors["enorm_w"]) * tensors["e_proj_smooth"].float()).to(torch.bfloat16)
-    prev_hidden_states = (_rms_norm(tensors["prev_hidden_states"], tensors["hnorm_w"]) * tensors["h_proj_smooth"].float()).to(torch.bfloat16)
+    hidden_states = _rms_norm(tensors["hidden_states"], tensors["enorm_w"]) * tensors["e_proj_smooth"].float()
+    prev_hidden_states = _rms_norm(tensors["prev_hidden_states"], tensors["hnorm_w"]) * tensors["h_proj_smooth"].float()
     hidden_i8, hidden_scale = _quantize_rows(hidden_states.float())
     prev_i8, prev_scale = _quantize_rows(prev_hidden_states.float())
     hidden_e = hidden_i8.to(torch.int32).matmul(tensors["e_proj_w"].to(torch.int32).t()).float()
@@ -306,7 +301,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
     t = batch * seq
 
     def init_proj_pair():
-        w = (torch.rand(D, D)/ D ** 0.5).to(torch.bfloat16)
+        w = (0.25 * torch.rand(D, D) / D ** 0.5).to(torch.bfloat16)
         return _quantize_weight_per_out(w)
 
     e_proj_cache = None
@@ -385,9 +380,9 @@ if __name__ == "__main__":
             atol=1e-3,
             compare_fn={
                 # Raw MTP projection adds two W8A8 terms before the next block's
-                # normalization, so near-zero cancellation leaves more outliers
-                # than qkv_proj_rope's post-RMSNorm q/kv outputs.
-                "hidden_states_out": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.05),
+                # normalization, so near-zero cancellation leaves more relative
+                # outliers than qkv_proj_rope's post-RMSNorm q/kv outputs.
+                "hidden_states_out": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.05),
             },
         )
         if not result.passed:

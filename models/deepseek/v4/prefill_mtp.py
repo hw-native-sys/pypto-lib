@@ -592,7 +592,7 @@ def main():
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.10),
+            "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
             "pre_hc_hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
         },
     )
