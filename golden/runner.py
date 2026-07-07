@@ -569,6 +569,39 @@ def _benchmark_l3_resident(
     return stats
 
 
+def _readback_resident_outputs(
+    rt: Any,
+    resident_specs: list[TensorSpec],
+    resident_handles: list[tuple[str, Any, bool, int]],
+    tensors: dict[str, torch.Tensor],
+) -> None:
+    """D2H the final device state of every resident+output spec into its host tensor.
+
+    A resident spec marked ``is_output`` is a read-write state buffer (e.g. a KV
+    cache): uploaded once, updated in place on-device, and — unlike a plain output
+    — never read back per dispatch. Before validation we read each such buffer
+    back **once** into ``tensors[name]`` (the shared host buffer :func:`_validate`
+    reads as the device output). ``"stacked"`` uses ``copy_stacked_from`` (per-shard
+    D2H); a whole-tensor buffer uses ``copy_from`` on its owning card.
+    """
+    out_names = {s.name for s in resident_specs if s.is_output}
+    for name, handle, is_stacked, wid in resident_handles:
+        if name not in out_names:
+            continue
+        if is_stacked:
+            if not hasattr(rt, "copy_stacked_from"):
+                raise ValueError(
+                    f"TensorSpec {name!r}: resident=\"stacked\" read-back validation needs "
+                    f"a pypto runtime exposing DistributedWorker.copy_stacked_from; "
+                    f"this runtime lacks it."
+                )
+            rt.copy_stacked_from(handle, tensors[name])
+        else:
+            rt.copy_from(
+                tensors[name].data_ptr(), handle.data_ptr, handle.nbytes, worker_id=wid
+            )
+
+
 def _run_l3_resident(
     compiled: Any,
     tensor_specs: list[TensorSpec],
@@ -587,7 +620,10 @@ def _run_l3_resident(
     Each resident spec is uploaded once via ``rt.alloc_tensor(init=...)`` and
     reused across the validation dispatch and every benchmark round, so its
     weight is never re-uploaded (H2D) or read back (D2H); per-call IO stays
-    shared-memory host tensors reused in place.
+    shared-memory host tensors reused in place. A resident spec that is also an
+    output is a read-write state buffer (e.g. a KV cache): uploaded once as its
+    initial state, updated in place on-device, and read back once before
+    validation via :func:`_readback_resident_outputs`.
 
     Validation runs between the first dispatch and the benchmark loop (so the
     proven outputs are compared before benchmark rounds overwrite them). When
@@ -656,6 +692,13 @@ def _run_l3_resident(
             # 1) Validation dispatch (resident weights uploaded above, reused here).
             rt(*ordered, config=run_config)
             if golden_outputs is not None:
+                # A resident spec that is also an output is a read-write state
+                # buffer (e.g. a KV cache): updated in place on-device and skipping
+                # the per-dispatch D2H, so its host tensor is stale. Read the final
+                # device state back once into that host tensor so _validate compares
+                # what the kernel actually produced (one end-of-run D2H, not a
+                # per-dispatch one).
+                _readback_resident_outputs(rt, resident_specs, resident_handles, tensors)
                 _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
 
             # 2) Optional benchmark (env-gated): reuse the resident weights across

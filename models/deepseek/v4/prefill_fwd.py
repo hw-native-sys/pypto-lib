@@ -197,6 +197,19 @@ RESIDENT_WEIGHT_NAMES = frozenset(
     + FINAL_NORM_NAMES
 )
 
+# KV / state caches to keep device-resident (child_memory) as well, skipping the
+# per-dispatch H2D these otherwise pay every dispatch (they dominate the residual
+# host-transfer cost). All of CACHE_NAMES becomes resident.
+RESIDENT_CACHE_NAMES = frozenset(CACHE_NAMES)
+
+# The subset the kernel updates in place (``pl.InOut`` at the l3_prefill_fwd host
+# signature) is additionally read back once at the end for validation
+# (``is_output=True`` -> ``copy_stacked_from``). The other caches are plain
+# ``pl.Tensor`` inputs — read-only here, so resident but not read back. Only
+# ``kv_cache`` is ``pl.InOut``; the rest (cmp_kv, *_kv_state, *_score_state,
+# idx_kv_cache) are read-only inputs.
+RESIDENT_CACHE_OUTPUT_NAMES = frozenset(["kv_cache"])
+
 
 @pl.jit(auto_scope=False)
 def prefill_fwd(
@@ -860,7 +873,13 @@ def _make_stacked_spec(name, base_specs):
         base_init = spec.init_value
         return torch.cat([base_init() for _ in range(count)], dim=1)
 
-    return TensorSpec(name, packed_shape, spec.dtype, init_value=init_value, is_output=False)
+    # Caches the kernel writes in place (kv_cache) are outputs read back for
+    # validation; every other stacked tensor is a plain input (weight or read-only
+    # cache).
+    return TensorSpec(
+        name, packed_shape, spec.dtype, init_value=init_value,
+        is_output=name in RESIDENT_CACHE_OUTPUT_NAMES,
+    )
 
 
 def _make_shared_spec(name, base_specs, start_pos):
@@ -1269,10 +1288,11 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
 
     # Shard the static weight parameters per rank and keep them device-resident
     # (child_memory): each shard uploaded once to its card and reused across
-    # dispatches, skipping per-dispatch H2D/D2H. All resident names are inputs
-    # (is_output=False), so the flag is always valid.
+    # dispatches, skipping per-dispatch H2D/D2H. RESIDENT_WEIGHT_NAMES are static
+    # weights; RESIDENT_CACHE_NAMES are the KV/state caches (the written kv_cache
+    # is also is_output=True and read back at the end via RESIDENT_CACHE_OUTPUT_NAMES).
     for spec in specs:
-        if spec.name in RESIDENT_WEIGHT_NAMES:
+        if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))

@@ -110,15 +110,15 @@ class TestTensorSpecCreateTensor:
         with pytest.raises(ValueError, match="resident worker id must be >= 0"):
             TensorSpec("w", [4], torch.float32, resident=-1)
 
-    def test_resident_output_rejected(self):
-        """A resident input combined with is_output=True is rejected."""
-        with pytest.raises(ValueError, match="resident is only valid for inputs"):
-            TensorSpec("bad", [4], torch.float32, is_output=True, resident=0)
+    def test_resident_output_accepted(self):
+        """resident + is_output is a read-write resident state buffer (e.g. KV cache)."""
+        spec = TensorSpec("kv", [4], torch.float32, is_output=True, resident=0)
+        assert spec.resident == 0 and spec.is_resident is True and spec.is_output is True
 
-    def test_resident_stacked_output_rejected(self):
-        """resident="stacked" with is_output=True is also rejected."""
-        with pytest.raises(ValueError, match="resident is only valid for inputs"):
-            TensorSpec("bad", [2, 4], torch.float32, is_output=True, resident="stacked")
+    def test_resident_stacked_output_accepted(self):
+        """resident="stacked" + is_output is a per-rank read-write state buffer."""
+        spec = TensorSpec("kv", [2, 4], torch.float32, is_output=True, resident="stacked")
+        assert spec.resident == "stacked" and spec.is_resident is True and spec.is_output is True
 
     def test_tensor_init_ignores_spec_shape(self):
         """Pin current behavior: when init_value is a Tensor, spec.shape is NOT enforced.

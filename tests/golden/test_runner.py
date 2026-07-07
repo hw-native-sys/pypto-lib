@@ -1329,6 +1329,75 @@ class TestResidentPath:
         assert calls["stacked"] == [((2, 4), None)]  # identity worker_ids
         assert calls["freed"] == 1
 
+    def test_run_l3_resident_output_reads_back(self, monkeypatch):
+        """A resident+is_output spec (state buffer) is read back via copy_stacked_from
+        before validation, so _validate sees the device's final state, not the stale host."""
+        import golden.runner as R
+
+        calls = {"readback": 0, "validated_value": None}
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def alloc_stacked_tensor(self, host, worker_ids=None):
+                return types.SimpleNamespace(full_shape=tuple(host.shape))
+
+            def free_stacked_tensor(self, _h):
+                pass
+
+            def __call__(self, *_args, config=None):
+                pass
+
+            def copy_stacked_from(self, _handle, host):
+                calls["readback"] += 1
+                host.fill_(7.0)  # simulate the device's final in-place-updated state
+
+        class _FakeDCP:
+            def prepare(self):
+                return _FakeRT()
+
+        fake_mod = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_mod.DistributedCompiledProgram = _FakeDCP
+
+        specs = [
+            TensorSpec(
+                "kv", [2, 4], torch.float32, init_value=torch.zeros,
+                is_output=True, resident="stacked",
+            )
+        ]
+        tensors = {"kv": torch.zeros(2, 4)}
+        golden = {"kv": torch.full((2, 4), 7.0)}
+
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["kv"])
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        def _fake_validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn):
+            calls["validated_value"] = tensors["kv"].clone()
+
+        monkeypatch.setattr(R, "_validate", _fake_validate)
+
+        with patch.dict(sys.modules, {"pypto.ir.distributed_compiled_program": fake_mod}):
+            R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=specs,
+                tensors=tensors,
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=golden,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert calls["readback"] == 1
+        # _validate must have seen the read-back device state (7.0), not the stale 0.0.
+        assert calls["validated_value"] is not None
+        assert torch.equal(calls["validated_value"], torch.full((2, 4), 7.0))
+
     def test_run_l3_resident_rejects_non_l3(self):
         """The helper itself raises ValueError for a non-L3 compiled object."""
         with patch.dict(

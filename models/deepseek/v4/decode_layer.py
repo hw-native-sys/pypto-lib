@@ -773,11 +773,12 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     # dispatches, skipping the per-dispatch H2D/D2H. The attention weights are
     # exactly ``replicated_attention`` (every attention param that is not a
     # KV/state cache or per-step metadata); the MoE set adds the FFN/gate/expert
-    # weights and the static tid2eid route table. NOT resident: the KV/state
-    # caches (kv_cache, cmp_kv, idx_kv_cache, *_compress_state), the per-step slot
-    # mappings / block tables / ids / position_ids / kv_seq_lens, the input
-    # activation (x_hc), and the output (x_next). All resident names are inputs
-    # (is_output=False), so the flag is always valid.
+    # weights and the static tid2eid route table. The KV/state caches
+    # (RESIDENT_CACHE_NAMES) are kept resident too — the written kv_cache is also
+    # is_output=True (line above) and read back once at the end for validation;
+    # the others are read-only inputs. NOT resident: the per-step slot mappings /
+    # block tables / ids / position_ids / kv_seq_lens, the input activation
+    # (x_hc), and the output (x_next), which change per token.
     RESIDENT_WEIGHT_NAMES = replicated_attention | {
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
@@ -786,8 +787,12 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
     }
+    RESIDENT_CACHE_NAMES = {
+        "kv_cache", "cmp_kv", "idx_kv_cache",
+        "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
+    }
     for spec in specs:
-        if spec.name in RESIDENT_WEIGHT_NAMES:
+        if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
     specs.extend([
