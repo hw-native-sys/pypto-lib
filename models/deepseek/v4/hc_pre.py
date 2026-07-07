@@ -119,7 +119,7 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 # partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
 # cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
 # decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 16
+LINEAR_OK = 8
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -456,13 +456,9 @@ def _hc_pre_separate(
             k0 = k_base + kb * RMS_K_CHUNK
             x_chunk = pl.cast(x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK], target_type=pl.FP32)
             x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK] = x_chunk
-    # x_pad: zero-fill the 8->16 pad rows so the cube tile reads a defined tail.
-    if t_linear > t_dim:
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_x_pad"):
-            for k0 in pl.pipeline(0, HC_DIM, RMS_K_CHUNK, stage=4):
-                x_fp32[t_dim:t_linear, k0:k0 + RMS_K_CHUNK] = pl.full(
-                    [LINEAR_T_TILE - T_TILE, RMS_K_CHUNK], dtype=pl.FP32, value=0.0
-                )
+    # No x_pad scope: the 8->16 pad rows are left unwritten and the linear matmul below
+    # masks them with valid_shape (zero-fills the row tail), matching the syncall path. The
+    # rms scope only reads the t_dim real rows, so nothing else consumes the pad tail.
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
@@ -484,10 +480,11 @@ def _hc_pre_separate(
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = x_fp32[t0:t0 + LINEAR_T_TILE, k0:k0 + LINEAR_K_CHUNK]
+            x_linear_chunk = pl.slice(x_fp32, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, k0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
             if kb == 0:
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
