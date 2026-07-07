@@ -65,9 +65,11 @@ runs:
         fi
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+        # Strip trailing CR/whitespace: a CRLF versions.env or pto_isa.pin would
+        # otherwise leak a '\r' into the cache archive name and break the download.
         {
-          grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env"
-          echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env")"
+          echo "PTOAS_VERSION=$(grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env" | cut -d= -f2 | tr -d '[:space:]')"
+          echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env" | tr -d '[:space:]')"
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
         } >> "$GITHUB_ENV"
 
@@ -85,9 +87,23 @@ runs:
     - name: Clone pto-isa repository (pinned)
       shell: bash
       run: |
+        # Each composite step is a fresh shell, so re-declare the retry helper
+        # here to wrap the clone in the same transient-TLS backoff as the sync
+        # step above (a single network blip must not fail the whole job).
+        retry() {
+          local attempt=0
+          until "$@"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 4 ]; then
+              echo "'$*' failed after $attempt attempts"; return 1
+            fi
+            echo "'$*' attempt $attempt failed; retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+        }
         rm -rf "$PTO_ISA_ROOT"
-        timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
-          || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
+        retry timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
+          || { rm -rf "$PTO_ISA_ROOT"; retry timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
         cd "$PTO_ISA_ROOT"
         git checkout "$PTO_ISA_COMMIT"
 
@@ -120,11 +136,16 @@ runs:
         download_ptoas() {
           echo "Downloading ptoas ${PTOAS_VERSION}"
           mkdir -p "$PTOAS_CACHE_DIR"
+          # Unique per-process temp file: the concurrent a2a3sim/a5sim jobs share
+          # this cache dir, so a fixed "$CACHE_ARCHIVE.tmp" could corrupt the
+          # download when both miss the cache at once.
+          local tmp
+          tmp="$(mktemp "$CACHE_ARCHIVE.XXXXXX")"
           curl --fail --location --retry 3 --retry-all-errors \
             https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
-            -o "$CACHE_ARCHIVE.tmp"
-          echo "${PTOAS_SHA256}  $CACHE_ARCHIVE.tmp" | sha256sum -c -
-          mv "$CACHE_ARCHIVE.tmp" "$CACHE_ARCHIVE"
+            -o "$tmp"
+          echo "${PTOAS_SHA256}  $tmp" | sha256sum -c -
+          mv "$tmp" "$CACHE_ARCHIVE"
         }
         if [ ! -f "$CACHE_ARCHIVE" ]; then
           echo "Cache miss"

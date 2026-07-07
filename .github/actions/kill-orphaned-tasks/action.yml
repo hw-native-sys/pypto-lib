@@ -18,18 +18,22 @@ runs:
   steps:
     - name: Kill orphaned task-submit tasks
       shell: bash
+      # Pass checkout-path via env rather than inlining ${{ }} into the script,
+      # so a path with spaces or shell metacharacters can't break or inject.
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
       run: |
         # Guard against an empty checkout-path: grep -F "$GITHUB_WORKSPACE/"
         # would match every task on a shared workspace root and kill other jobs'
         # tasks. checkout-path is a required input, but fail safe rather than
         # sorry if a caller ever passes an empty string.
-        if [ -z "${{ inputs.checkout-path }}" ]; then
+        if [ -z "$CHECKOUT_PATH" ]; then
           echo "checkout-path is empty — skipping task-submit cleanup"
           exit 0
         fi
-        echo "cleaning up task-submit tasks for $GITHUB_WORKSPACE/${{ inputs.checkout-path }}"
+        echo "cleaning up task-submit tasks for $GITHUB_WORKSPACE/$CHECKOUT_PATH"
         task-submit --list 2>/dev/null \
-          | grep -F "$GITHUB_WORKSPACE/${{ inputs.checkout-path }}" \
+          | grep -F "$GITHUB_WORKSPACE/$CHECKOUT_PATH" \
           | grep -oE 'task_[0-9_]+' \
           | sort -u \
           | while read -r tid; do
