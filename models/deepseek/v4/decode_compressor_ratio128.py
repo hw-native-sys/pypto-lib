@@ -162,16 +162,6 @@ def compressor_ratio128(
                     compress_state_flat[state_blk_id : state_blk_id + 1, slot_col0_s + OUT_DIM : slot_col0_s + 2 * OUT_DIM] = score_row
 
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(RMS_PAD_ROWS * HEAD_DIM // (RMS_PAD_TILE * HEAD_TILE), name_hint="pooled_pad_init") as init_tid:
-        init_idx = pl.tile.get_block_idx()
-        pad_base = (init_idx // (HEAD_DIM // HEAD_TILE)) * RMS_PAD_TILE
-        h0 = (init_idx % (HEAD_DIM // HEAD_TILE)) * HEAD_TILE
-        pooled_kv[pad_base + RMS_TILE : pad_base + RMS_PAD_TILE, h0 : h0 + HEAD_TILE] = pl.full(
-            [RMS_PAD_TAIL, HEAD_TILE],
-            dtype=pl.FP32,
-            value=0.0,
-        )
-
     # One GM row per compressed-state slot (block * BLOCK_SIZE + intra). This lets
     # softmax_pool fetch a whole physical block's BLOCK_SIZE state rows in a single
     # strided MTE2 instead of BLOCK_SIZE single-row gathers.
@@ -179,7 +169,7 @@ def compressor_ratio128(
         compress_state, [compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM]
     )
     NUM_STATE_BLOCKS = STATE_LEN // COMPRESS_STATE_BLOCK_SIZE
-    with pl.spmd(b_dim * HEAD_DIM // POOL_HEAD_TILE, name_hint="softmax_pool", deps=[scatter_tid, init_tid]) as pool_tid:
+    with pl.spmd(b_dim * HEAD_DIM // POOL_HEAD_TILE, name_hint="softmax_pool", deps=[scatter_tid]) as pool_tid:
         idx = pl.tile.get_block_idx()
         global_c_idx = idx // (HEAD_DIM // POOL_HEAD_TILE)
         pad_idx = (global_c_idx // RMS_TILE) * RMS_PAD_TILE + (global_c_idx % RMS_TILE)
