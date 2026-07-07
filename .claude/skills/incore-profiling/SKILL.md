@@ -149,7 +149,8 @@ mv build_output/incore_<kernel>_<source>_<ts>/trace.clean.json \
   `find "$ASCEND_HOME_PATH" -name libruntime_camodel.so` and pass the variant
   matching your device (`npu-smi info`), e.g. `--soc-version Ascend910B1`.
 - **Trace is ~0 cycles / `CUBE=0` / only SCALAR+sync instrs** — the kernel is
-  data-dependent and the auto golden zeroed its control tensor. See **Caveats**.
+  data-dependent, or its generated standalone case has wrong dynamic scalar tail
+  args. See **Caveats** before trusting the trace.
 - **`CANN set_env.sh not found`** — pass `--cann-set-env <path>`, or set
   `ASCEND_HOME_PATH` / `CANN_SET_ENV`.
 - **`Cannot find msopprof` / `…/tools/msopprof/bin/msopprof does not exist`** —
@@ -176,20 +177,47 @@ mv build_output/incore_<kernel>_<source>_<ts>/trace.clean.json \
 
 ## Caveats
 
-**Data-dependent kernels read misleadingly fast.** The auto-generated `golden.py`
-zero-fills integer input buffers. If a kernel's loop trip-count, grid-stride
-bound, or work-table length is **read from an input tensor**, the zeroed input
-yields 0 iterations: a sub-microsecond, near-empty trace with `CUBE=0` cycles
-that looks like the kernel is free. This is an artifact of synthetic inputs, not
-a fast kernel — the tool flags it with a `WARN` line and a non-empty `message` in
-`summary.txt`/`manifest_export.csv`. The generator already sizes every GM buffer
-to its full `.pto` shape, so you do **not** need to resize anything — to profile
-such a kernel for real, just overwrite the **control** inputs with a valid set
-(non-zero loop bound + dense work table + real lengths) by editing the case's
-`golden.py` (or writing the `vN.bin` directly) and the scalar tail args in
-`main.cpp`, then rebuild the `*_sim` target and re-run `msprof op simulator`.
-Only the control tensors must be real — per-instruction cost is data-independent,
-so the bulk data tensors can stay random/zero.
+**Data-dependent and dynamic-shape kernels read misleadingly fast.** The
+auto-generated `golden.py` zero-fills integer input buffers, and the generated
+`main.cpp` initializes scalar tail args to `1`. If a kernel's loop trip-count,
+grid-stride bound, work-table length, or tensor extent comes from either place,
+the standalone case can execute only the scalar prologue + sync path: a
+sub-microsecond, near-empty trace with `CUBE=0` cycles that looks like the kernel
+is free. This is an artifact of synthetic inputs, not a fast kernel — the tool
+flags it with a `WARN` line and a non-empty `message` in
+`summary.txt`/`manifest_export.csv`.
+
+Before trusting a trace, inspect `instr_metrics.json` or the per-core
+`*_instr_exe.csv`. A real mixed cube/vector kernel should have non-zero CUBE
+cycles on `core0.cubecore0` and non-zero VECTOR cycles on the vector cores. If
+not, wire a real workload and collect again.
+
+For a real workload:
+
+1. Identify the standalone case under
+   `<run_root>/cases/ptoas/<kernel>_msprof/`.
+2. Replace the relevant `vN.bin` files with real control inputs. Bulk FP/BF16
+   data may stay random/zero when only instruction timing matters, but any
+   tensor that controls loop bounds, valid lengths, masks, or work tables must
+   be realistic.
+3. Patch `main.cpp` scalar tail args. PyPTO dynamic shapes often appear as
+   hidden scalar args after the GM pointers, and the generator writes them as
+   `1`. Derive their meanings from the generated orchestration file
+   (`build_output/<case>/orchestration/*.cpp`, look for `params_t*.add_scalar`)
+   or from the `.pto`/kernel signature, then set real values such as `t_dim`,
+   padded extents, task-pool counts, scale scalars, and block metadata.
+4. Rebuild the standalone simulator target (`cmake --build <build-dir>`) after
+   editing `main.cpp`.
+5. Re-run `msprof op simulator` from the case directory, or make sure the
+   working directory contains the patched `vN.bin` files, because generated
+   `main.cpp` reads them as `./vN.bin`.
+6. Clean the new `OPPROF_*` with `python -m pypto.tools.clean_sim_trace ... -o
+   build_output/incore_<kernel>_<source>_<workload>_<ts>/` and record the wired
+   workload plus scalar args in `summary.txt`.
+
+The generator already sizes every GM buffer to its full `.pto` shape, so you
+usually do **not** need to resize allocations; patch contents and scalar values
+first.
 
 ## How it works
 

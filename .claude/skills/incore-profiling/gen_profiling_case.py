@@ -112,8 +112,8 @@ def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
     m = re.search(r"__global__\s+AICORE\s+void\s+(\w+)\s*\(([^)]*)\)", cpp_text)
     if m:
         return m.group(1), False, [_parse_param(p) for p in _split_params(m.group(2))]
-    m = re.search(r"\bAICORE\s+void\s+(\w+)\s*\(([^)]*)\)", cpp_text)
-    if m and not m.group(1).endswith(("_aic", "_aiv")):
+    m = re.search(r"(?<!__global__\s)\bAICORE\s+void\s+(\w+)\s*\(([^)]*)\)", cpp_text)
+    if m and not (m.group(1).endswith("_aic") or m.group(1).endswith("_aiv")):
         return m.group(1), False, [_parse_param(p) for p in _split_params(m.group(2))]
     m = re.search(r"\bAICORE\s+void\s+(\w+)_aic\s*\(([^)]*)\)", cpp_text)
     if m:
@@ -376,7 +376,7 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
     )
     call = ", ".join(p.name for p in params)
 
-    has_global_entry = re.search(rf'__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(', cpp_text)
+    has_global_entry = bool(re.search(rf"__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(", cpp_text))
     if not is_mixed and not has_global_entry:
         impl_name = f"{name}_impl"
         cpp_text = re.sub(
