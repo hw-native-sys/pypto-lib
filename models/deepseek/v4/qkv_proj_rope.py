@@ -241,28 +241,47 @@ def qkv_proj_rope(
     # columns [h0:h0+NOPE_DIM) and rope columns [h0+NOPE_DIM:h0+HEAD_DIM) are disjoint,
     # so each task writes a clean head/row block of q.
     #
-    # RoPE stays on the interleaved layout and rotates via a j^1 swap gather + sign mask
-    # (CANN A3 rotate_interleaved). The rotation index/sign and the interleave-duplicated
-    # cos/sin are built ENTIRELY IN-KERNEL: swap_idx (j^1), sign ([-1,+1,...]) and dup_idx
-    # (j>>1) from pl.arange (once per task), and cos_il/sin_il dup-gathered per tg
-    # (head-independent, reused across both heads). inv_rms is per-row so it factors out
-    # of the rotation and is folded into the writeback.
+    # RoPE stays on the interleaved layout and rotates via a j^1 swap gather.
+    # Precompute the head-invariant swap index, interleaved cos, and sign-folded
+    # sin once; q_head tasks only load those factors. This mirrors sparse-attn
+    # rope_cs and avoids scatter.
     #   out[j] = inv_rms * (x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j])
+    q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.INT32)
+    for cp in pl.spmd(1, name_hint="q_rope_cs"):
+        cp_r0 = cp * ROPE_HALF
+        cp_c0 = 2 * cp_r0
+        cs_col = pl.col_expand_mul(
+            pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32),
+        )
+        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))
+        cs_sign = pl.sub(pl.mul(cs_lane, 2.0), 1.0)
+        q_rope_swap_idx[0:Q_ROPE_T_TILE, 0:ROPE_DIM] = pl.cast(
+            pl.sub(pl.add(cs_col, 1.0), pl.mul(cs_lane, 2.0)), target_type=pl.INT32
+        )
+        for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
+            tg = tg_idx * Q_ROPE_T_TILE
+            cs_cos = pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, cp_r0 : cp_r0 + ROPE_HALF], target_type=pl.FP32)
+            cs_sin = pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, cp_r0 : cp_r0 + ROPE_HALF], target_type=pl.FP32)
+            q_rope_cos_il[tg : tg + Q_ROPE_T_TILE, cp_c0 : cp_c0 + ROPE_DIM] = pl.gather(
+                cs_cos, dim=-1, index=cs_dup_idx
+            )
+            q_rope_sin_signed[tg : tg + Q_ROPE_T_TILE, cp_c0 : cp_c0 + ROPE_DIM] = pl.mul(
+                pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign
+            )
+
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
     for hg_idx in pl.spmd(H // 2, name_hint="q_head_rms_nope_rope", allow_early_resolve=True):
         hg = hg_idx * 2
-        # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
-        q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        q_col = pl.col_expand_mul(q_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        q_dup_f = pl.cast(pl.cast(pl.mul(q_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        q_dup_idx = pl.cast(q_dup_f, target_type=pl.INT32)                                       # j>>1
-        q_lane = pl.sub(q_col, pl.mul(q_dup_f, 2.0))                                             # j%2
-        q_swap_idx = pl.cast(pl.sub(pl.add(q_col, 1.0), pl.mul(q_lane, 2.0)), target_type=pl.INT32)  # j^1
-        q_sign = pl.sub(pl.mul(q_lane, 2.0), 1.0)                                                # [-1,+1,...]
+        q_swap_idx = q_rope_swap_idx[0:Q_ROPE_T_TILE, 0:ROPE_DIM]
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
             tg = tg_idx * Q_ROPE_T_TILE
-            q_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
-            q_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
+            q_cos_il = q_rope_cos_il[tg : tg + Q_ROPE_T_TILE, 0:ROPE_DIM]
+            q_sin_signed = q_rope_sin_signed[tg : tg + Q_ROPE_T_TILE, 0:ROPE_DIM]
             for h_inner in pl.range(2):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
@@ -288,7 +307,7 @@ def qkv_proj_rope(
 
                 # RoPE writeback on columns [h0+NOPE_DIM:h0+HEAD_DIM), inv_rms folded after.
                 q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
-                q_rope_rot = pl.add(pl.mul(q_rope_chunk, q_cos_il), pl.mul(pl.mul(q_rope_swapped, q_sign), q_sin_il))
+                q_rope_rot = pl.add(pl.mul(q_rope_chunk, q_cos_il), pl.mul(q_rope_swapped, q_sin_signed))
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = pl.cast(
                     pl.row_expand_mul(q_rope_rot, q_head_inv_rms_t), target_type=pl.BF16, mode="rint"
                 )
