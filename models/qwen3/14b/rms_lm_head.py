@@ -116,7 +116,7 @@ def rms_lm_head(
                         [lm_o0, lm_k0],
                     )
                     lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
-                lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
+                lm_acc_trimmed = pl.tensor.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
                 out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
 
     return out
