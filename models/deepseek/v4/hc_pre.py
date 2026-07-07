@@ -442,6 +442,7 @@ def _hc_pre_separate(
     scale0 = pl.read(hc_scale, [0])
     scale1 = pl.read(hc_scale, [1])
     scale2 = pl.read(hc_scale, [2])
+    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
@@ -494,14 +495,12 @@ def _hc_pre_separate(
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
         mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
 
-    # split_pre_post: scale mixes_raw by inv_rms, then the pre / post / comb gates.
-    # pre is stashed for mix_x; post-pad for write_post; comb logits for comb_sinkhorn.
+    # split_pre_post: scale mixes_raw by inv_rms, then the pre / post gates. The comb gate
+    # is NOT done here anymore -- comb_sinkhorn reads its 4 groups straight from mixes_raw and
+    # inv_rms, so the comb_logits GM round-trip is dropped (pre stays for mix_x, post-pad for
+    # write_post).
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    # MIX_PAD (not HC_MULT*HC_MULT=16): comb_sinkhorn loads each group HC_PAD-wide at
-    # offset k*HC_MULT, so group 3 reads cols [12:20] -- the 32-wide alloc keeps every
-    # load descriptor in-bounds even though valid_shapes bounds the real transfer.
-    comb_logits = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
@@ -520,11 +519,6 @@ def _hc_pre_separate(
         post_pad = pl.mul(post_sig, 2.0)
         post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
 
-        comb_base = pl.reshape(hc_base[HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], [1, HC_MULT * HC_MULT])
-        comb_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], inv_col), scale2)
-        comb_logits_tile = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
-        comb_logits = pl.assemble(comb_logits, comb_logits_tile, [t0, 0])
-
     # write_post: narrow post-pad [.,HC_PAD] -> post [.,HC_MULT].
     for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="write_post"):
         t0 = ob * COMB_T_TILE
@@ -532,13 +526,26 @@ def _hc_pre_separate(
                             valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
         pl.store(post_tile, [t0, 0], post)
 
-    # comb_sinkhorn: softmax + 20-iter Sinkhorn (column-first) -> comb.
+    # comb_sinkhorn: comb gate (direct from mixes_raw, no comb_logits round-trip) + softmax +
+    # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
+    # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
+    # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
     for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
         t0 = ob * COMB_T_TILE
-        row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        comb_off = HC_MULT * 2
+        mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb0 = pl.load(hc_base_2d, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb1 = pl.load(hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb2 = pl.load(hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb3 = pl.load(hc_base_2d, [0, comb_off + 3 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row0 = pl.add(pl.mul(pl.row_expand_mul(mix_g0, inv_col_t), scale2), pl.col_expand(mix_g0, cb0))
+        row1 = pl.add(pl.mul(pl.row_expand_mul(mix_g1, inv_col_t), scale2), pl.col_expand(mix_g1, cb1))
+        row2 = pl.add(pl.mul(pl.row_expand_mul(mix_g2, inv_col_t), scale2), pl.col_expand(mix_g2, cb2))
+        row3 = pl.add(pl.mul(pl.row_expand_mul(mix_g3, inv_col_t), scale2), pl.col_expand(mix_g3, cb3))
         row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
         row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
         row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
