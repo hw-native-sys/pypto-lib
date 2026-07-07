@@ -35,14 +35,8 @@ ROPE_TILE = 64
 ROPE_PAIR_TILE = 32
 HEAD_TILE = 64
 Q_PROJ_OUT_TILE = 128   # qproj_dequant N-tile (128 INT32 = 512B = 1 full L2 line)
-Q_PROJ_TILE = 512       # qproj K-tile (Q_LORA reduction)
-# qproj_matmul output N-tile, DECOUPLED from the dequant N-tile above. wq_b is INT8
-# with N innermost, so a B-row is TN bytes: at the old TN=128 each 128B row still pulls
-# a full 512B L2 line -> 4x weight over-fetch on this MTE2-bound matmul. TN=256 halves
-# that (256B/line). It can't go wider without M-splitting: TM*TN*4 (L0C Acc) caps at
-# 128KB, so TN=512 forces TM=64, and the resulting weight re-load + TK<=256 cap measured
-# no faster end-to-end. Measured: qproj_matmul -17.5%, decode total -4.3% vs TN=128.
-QPROJ_MM_N_TILE = 256
+Q_PROJ_TILE = 128       # qproj K-tile (Q_LORA reduction); 8 slices -> deep stage=2 pipeline, double-buffered Mat fits
+QPROJ_MM_N_TILE = 1024  # full L2 lines per wq_b row (no over-fetch)
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 256
@@ -163,7 +157,7 @@ def qkv_proj_rope(
             qr_fp32 = pl.assemble(qr_fp32, q_acc, [t0, q_a_col0], atomic=pl.AtomicType.Add)
 
     # Two passes per block: pass 1 computes amax; pass 2 recomputes norm and quantizes.
-    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant"):
+    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="qr_rms_norm_quant", allow_early_resolve=True):
         tg = tg_idx * T_TILE
         qr_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         qr_amax_g = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -205,20 +199,21 @@ def qkv_proj_rope(
     # can defer the off-critical-path dequant (q has large downstream slack) to when AIV is free.
     q_proj_fp32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.FP32)
     q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
-    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 4, name_hint="qproj_matmul"):
-        hg = hg_idx * 4
-        for h_inner in pl.range(4):
+    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 2, name_hint="qproj_matmul"):
+        hg = hg_idx * 2
+        for h_inner in pl.range(2):
             w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
             for tc in pl.range(t_matmul // QPROJ_M_TILE):
                 t0 = tc * QPROJ_M_TILE
-                qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, 0:Q_PROJ_TILE]
-                wq_chunk = wq_b[0:Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
-                for qb in pl.pipeline(1, Q_LORA // Q_PROJ_TILE, stage=2):
+                col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
+                for qb in pl.pipeline(0, Q_LORA // Q_PROJ_TILE, stage=2):
                     qr_proj_col0 = qb * Q_PROJ_TILE
                     qr_i8_chunk = qr_i8_matmul[t0 : t0 + QPROJ_M_TILE, qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE]
                     wq_chunk = wq_b[qr_proj_col0 : qr_proj_col0 + Q_PROJ_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE]
-                    col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
+                    if qr_proj_col0 == 0:
+                        col_acc = pl.matmul(qr_i8_chunk, wq_chunk, out_dtype=pl.INT32)
+                    else:
+                        col_acc = pl.matmul_acc(col_acc, qr_i8_chunk, wq_chunk)
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
     for hg_idx in pl.spmd(((H * HEAD_DIM) // Q_PROJ_OUT_TILE) // 16, name_hint="qproj_dequant"):
