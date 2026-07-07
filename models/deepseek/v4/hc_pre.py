@@ -171,16 +171,18 @@ def _hc_pre_syncall(
     # Cross-barrier intermediates: allocated ONCE in GM/HBM, live across the phases.
     x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    # comb_logits / post_pad_store are now SAME-CORE scratch: the sinkhorn / write_post task
-    # writes its token-tile's gate then reads it back on the SAME core (no barrier). They are
-    # kept (not deleted) because both feed a downstream pl.load->pl.store that needs an
-    # HC_PAD-wide (32B-aligned) tile -- a narrow [T_TILE, HC_MULT] FP32 tile is 16B rows and
-    # pto.alloc_tile rejects it. pre (mix_x) is consumed in tensor-world, so it needs no buffer.
+    # post_pad_store is SAME-CORE scratch: write_post writes its token-tile's post gate then
+    # reads it back on the SAME core (no barrier). It is kept (not deleted) because its
+    # downstream pl.load->pl.store needs an HC_PAD-wide (32B-aligned) tile -- a narrow
+    # [T_TILE, HC_MULT] FP32 tile is 16B rows and pto.alloc_tile rejects it. pre (mix_x) and
+    # comb (loaded straight from mixes_raw) are consumed in-tile, so they need no scratch.
     post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)  # HC_PAD-wide same-core scratch; write_post narrows to post
-    # MIX_PAD (not HC_MULT*HC_MULT=16): comb_sinkhorn loads each group HC_PAD-wide at
-    # offset k*HC_MULT, so group 3 reads cols [12:20] -- a 16-wide alloc puts that load
-    # descriptor out of bounds. The 32-wide alloc keeps every descriptor in-bounds.
-    comb_logits = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    # inv_rms same-core scratch for the comb gate: the per-token inv is a [T_TILE,1] COLUMN,
+    # which the comb groups (Tiles) need as a Tile too. pto rejects a transposed [T_TILE,1]
+    # tile (row-major, 4B row < 32B) and forbids Tile x Tensor ops, so the tensor-world inv
+    # is spilled to this [t_linear,1] buffer and loaded back as a [T_TILE,1] Tile (8 floats,
+    # vs the 128-float [.,16] comb_logits round-trip this replaces).
+    inv_gm = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)  # RMS split-K sum-of-squares (row layout: [1,T_TILE] tiles stay 32B-aligned)
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
@@ -264,20 +266,33 @@ def _hc_pre_syncall(
             for gw in pl.range(lane, pool_d, NUM_CORES * 2):
                 if gw < tt_n:
                     t0 = gw * COMB_T_TILE
-                    # Fold Phase C's comb-logit gate here: rsqrt(sq_sum) inline, scale the raw
-                    # mix by inv * scale2, add the group bias -> comb_logits[t0]. Written and
-                    # read back on THIS core (no barrier); the tile-world sinkhorn below is
-                    # unchanged (still loads per-group padded tiles from comb_logits).
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,T_TILE] row keeps the rsqrt tile 32B-aligned
-                    inv_col = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
-                    comb_base = hc_reshaped[0:1, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT]
-                    comb_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + COMB_T_TILE, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], inv_col), scale2)
-                    comb_logits_tile = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
-                    comb_logits = pl.assemble(comb_logits, comb_logits_tile, [t0, 0])
-                    row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    # Fold Phase C's comb gate here AND skip the comb_logits GM round-trip:
+                    # load the 4 comb groups DIRECTLY from mixes_raw (pad-capable loads at cols
+                    # 8/12/16/20 within the 32-wide MIX_PAD row), then apply inv_rms * scale2 +
+                    # group bias PER GROUP in-tile. The previous version assembled a [.,16]
+                    # comb_logits tile to GM and loaded the 4 misaligned 4-wide groups back
+                    # (pto cannot slice a 16B sub-tile in-register); loading straight from the
+                    # matmul output drops that store+load, matching the prefill path.
+                    # inv_rms for the comb gate must be a TILE (the comb groups below are
+                    # Tiles). Compute it in tensor-world, spill to inv_gm, and load it back as a
+                    # [T_TILE,1] Tile (a transposed [T_TILE,1] tile is rejected -- 4B row).
+                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,T_TILE] tensor
+                    inv_col_tensor = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
+                    inv_gm = pl.assemble(inv_gm, inv_col_tensor, [t0, 0])
+                    inv_col_t = pl.load(inv_gm, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)  # [T_TILE,1] tile
+                    comb_off = HC_MULT * 2
+                    mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb0 = pl.load(hc_reshaped, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb1 = pl.load(hc_reshaped, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb2 = pl.load(hc_reshaped, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb3 = pl.load(hc_reshaped, [0, comb_off + 3 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    row0 = pl.add(pl.mul(pl.row_expand_mul(mix_g0, inv_col_t), scale2), pl.col_expand(mix_g0, cb0))
+                    row1 = pl.add(pl.mul(pl.row_expand_mul(mix_g1, inv_col_t), scale2), pl.col_expand(mix_g1, cb1))
+                    row2 = pl.add(pl.mul(pl.row_expand_mul(mix_g2, inv_col_t), scale2), pl.col_expand(mix_g2, cb2))
+                    row3 = pl.add(pl.mul(pl.row_expand_mul(mix_g3, inv_col_t), scale2), pl.col_expand(mix_g3, cb3))
                     row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
                     row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
                     row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
