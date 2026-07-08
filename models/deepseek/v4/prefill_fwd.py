@@ -283,6 +283,7 @@ def prefill_fwd(
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
     recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
     arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
@@ -367,7 +368,7 @@ def prefill_fwd(
             shared_w1_l0, shared_w1_scale_l0, shared_w3_l0, shared_w3_scale_l0,
             shared_w2_l0, shared_w2_scale_l0,
             hidden,
-            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
         )
@@ -429,7 +430,7 @@ def prefill_fwd(
             shared_w1_l1, shared_w1_scale_l1, shared_w3_l1, shared_w3_scale_l1,
             shared_w2_l1, shared_w2_scale_l1,
             hidden,
-            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
@@ -526,7 +527,7 @@ def prefill_fwd(
                 shared_w1_csa, shared_w1_scale_csa, shared_w3_csa, shared_w3_scale_csa,
                 shared_w2_csa, shared_w2_scale_csa,
                 hidden_mid,
-                recv_meta, recv_x, recv_aux, recv_route, arrived,
+                recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 csa_layer, nt, my_rank, csa_moe_epoch,
             )
@@ -598,7 +599,7 @@ def prefill_fwd(
                 shared_w1_hca, shared_w1_scale_hca, shared_w3_hca, shared_w3_scale_hca,
                 shared_w2_hca, shared_w2_scale_hca,
                 hidden,
-                recv_meta, recv_x, recv_aux, recv_route, arrived,
+                recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
                 hca_layer, nt, my_rank, hca_moe_epoch,
             )
@@ -691,7 +692,7 @@ def prefill_fwd(
             shared_w1_last, shared_w1_scale_last, shared_w3_last, shared_w3_scale_last,
             shared_w2_last, shared_w2_scale_last,
             x_next_hc,
-            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
@@ -795,6 +796,7 @@ def l3_prefill_fwd(
     recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)
     recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
     arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    data_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
     routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
     combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
@@ -804,6 +806,7 @@ def l3_prefill_fwd(
         recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
         recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
         arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         prefill_fwd(
@@ -829,7 +832,7 @@ def l3_prefill_fwd(
             cmp_sparse_indices[r], cmp_sparse_lens[r],
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
             hidden_out[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r],
             gate_w[r], gate_bias[r], tid2eid[r],
