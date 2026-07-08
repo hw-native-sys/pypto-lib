@@ -58,12 +58,13 @@ mechanisms below.
 
 ## 2. Replay failing data with `golden_data`
 
-Every run snapshots its inputs to `data/in/<name>.pt` and its golden
-outputs to `data/out/<name>.pt` inside the build directory (unless the run
-used `save_data=False` — e.g. the `--save-data`-off full-model kernels — in
-which case nothing was saved and there is nothing to replay). To reproduce a
-failure on the **exact same tensors** instead of re-rolling random data,
-point a re-run at that directory:
+A run only snapshots its inputs to `data/in/<name>.pt` and its golden
+outputs to `data/out/<name>.pt` inside the build directory when it is called
+with `save_data=True` (full-model kernels expose this as `--save-data`).
+`save_data` is off by default, so without it nothing is saved and there is
+nothing to replay. When the snapshot exists, reproduce a failure on the
+**exact same tensors** instead of re-rolling random data by pointing a
+re-run at that directory:
 
 ```bash
 python models/deepseek/v4/decode_attention_csa.py -p a2a3 -d 0 \
