@@ -37,9 +37,11 @@ from decode_attention_swa import (
     O_GROUP_IN,
     O_LORA,
     ORI_MAX_BLOCKS,
+    ORI_TABLE_MAX_BLOCKS,
     Q_LORA,
     ROPE_HEAD_DIM,
     T,
+    WIN as SWA_WIN,
     attention_swa,
     build_tensor_specs as build_attention_tensor_specs,
 )
@@ -114,7 +116,7 @@ HCA_LAYER_STACKED_NAMES = [
 ]
 
 LAYER_STACKED_NAMES = ['attn_norm_w', 'attn_sink', 'cmp_kv', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_cmp_wgate', 'csa_cmp_wkv', 'csa_compress_state', 'csa_hadamard_idx', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_inner_ape', 'csa_inner_compress_state', 'csa_inner_norm_w', 'csa_inner_wgate', 'csa_inner_wkv', 'csa_weights_proj', 'gamma_ckv', 'gamma_cq', 'gate_bias', 'gate_w', 'hc_attn_base', 'hc_attn_fn', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_fn', 'hc_ffn_scale', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_cmp_wgate', 'hca_cmp_wkv', 'hca_compress_state', 'idx_kv_cache', 'idx_kv_scale', 'kv_cache', 'norm_w', 'routed_w1', 'routed_w1_scale', 'routed_w2', 'routed_w2_scale', 'routed_w3', 'routed_w3_scale', 'shared_w1', 'shared_w1_scale', 'shared_w2', 'shared_w2_scale', 'shared_w3', 'shared_w3_scale', 'tid2eid', 'wkv', 'wo_a', 'wo_b', 'wo_b_scale', 'wq_a', 'wq_b', 'wq_b_scale']
-SHARED_NAMES = ['x_hc', 'block_table', 'cmp_block_table', 'csa_cmp_slot_mapping', 'csa_compress_state_block_table', 'csa_idx_slot_mapping', 'csa_inner_compress_state_block_table', 'csa_inner_state_slot_mapping', 'csa_state_slot_mapping', 'freqs_cos', 'freqs_sin', 'hca_cmp_slot_mapping', 'hca_compress_state_block_table', 'hca_state_slot_mapping', 'idx_block_table', 'input_ids', 'kv_seq_lens', 'ori_slot_mapping', 'position_ids']
+SHARED_NAMES = ['x_hc', 'block_table', 'cmp_block_table', 'csa_cmp_slot_mapping', 'csa_compress_state_block_table', 'csa_idx_slot_mapping', 'csa_inner_compress_state_block_table', 'csa_inner_state_slot_mapping', 'csa_state_slot_mapping', 'freqs_cos', 'freqs_sin', 'hca_cmp_slot_mapping', 'hca_compress_state_block_table', 'hca_state_slot_mapping', 'idx_block_table', 'input_ids', 'kv_seq_lens', 'ori_slot_mapping', 'position_ids', 'swa_indices', 'swa_lens', 'swa_slot_mapping', 'window_swa_indices', 'window_swa_lens']
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 
@@ -221,8 +223,13 @@ def decode_fwd(
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[T], pl.INT64],
+    swa_indices: pl.Tensor[[T, SWA_WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -331,9 +338,8 @@ def decode_fwd(
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
             attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
             wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
-            kv_cache_l0, block_table,
-            ori_slot_mapping, position_ids,
-            cmp_kv_l0, cmp_block_table,
+            kv_cache_l0,
+            swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             x_attn0,
         )
@@ -357,9 +363,8 @@ def decode_fwd(
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
             attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
             wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
-            kv_cache_l1, block_table,
-            ori_slot_mapping, position_ids,
-            cmp_kv_l1, cmp_block_table,
+            kv_cache_l1,
+            swa_slot_mapping, swa_indices, swa_lens, position_ids,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             x_attn1,
         )
@@ -447,9 +452,10 @@ def decode_fwd(
                 csa_idx_wq_b_csa, csa_idx_wq_b_scale_csa, csa_weights_proj_csa, csa_hadamard_idx_csa,
                 csa_inner_wkv_csa, csa_inner_wgate_csa, csa_inner_ape_csa, csa_inner_norm_w_csa,
                 csa_inner_compress_state_csa, csa_inner_compress_state_block_table,
-                kv_cache_csa, block_table, cmp_kv_csa, cmp_block_table,
+                kv_cache_csa, cmp_kv_csa, cmp_block_table,
                 idx_kv_cache_csa, idx_kv_scale_csa, idx_block_table,
-                ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+                ori_slot_mapping, window_swa_indices, window_swa_lens,
+                csa_cmp_slot_mapping, csa_idx_slot_mapping,
                 csa_state_slot_mapping, csa_inner_state_slot_mapping,
                 position_ids, kv_seq_lens,
                 attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
@@ -517,8 +523,9 @@ def decode_fwd(
                 wkv_hca, gamma_cq_hca, gamma_ckv_hca, freqs_cos, freqs_sin,
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_compress_state_hca, hca_compress_state_block_table,
-                kv_cache_hca, block_table, cmp_kv_hca, cmp_block_table,
-                ori_slot_mapping, hca_cmp_slot_mapping, hca_state_slot_mapping,
+                kv_cache_hca, cmp_kv_hca, cmp_block_table,
+                ori_slot_mapping, window_swa_indices, window_swa_lens,
+                hca_cmp_slot_mapping, hca_state_slot_mapping,
                 position_ids, kv_seq_lens,
                 attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
                 x_attn_hca,
@@ -605,9 +612,10 @@ def decode_fwd(
             csa_idx_wq_b_last, csa_idx_wq_b_scale_last, csa_weights_proj_last, csa_hadamard_idx_last,
             csa_inner_wkv_last, csa_inner_wgate_last, csa_inner_ape_last, csa_inner_norm_w_last,
             csa_inner_compress_state_last, csa_inner_compress_state_block_table,
-            kv_cache_last, block_table, cmp_kv_last, cmp_block_table,
+            kv_cache_last, cmp_kv_last, cmp_block_table,
             idx_kv_cache_last, idx_kv_scale_last, idx_block_table,
-            ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
+            ori_slot_mapping, window_swa_indices, window_swa_lens,
+            csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             position_ids, kv_seq_lens,
             attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
@@ -696,8 +704,13 @@ def l3_decode_fwd(
     shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    block_table: pl.Tensor[[N_RANKS, B, ORI_MAX_BLOCKS], pl.INT32],
+    block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    window_swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
+    swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    swa_indices: pl.Tensor[[N_RANKS, T, SWA_WIN], pl.INT32],
+    swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
@@ -797,6 +810,11 @@ def l3_decode_fwd(
             freqs_sin[r],
             block_table[r],
             ori_slot_mapping[r],
+            window_swa_indices[r],
+            window_swa_lens[r],
+            swa_slot_mapping[r],
+            swa_indices[r],
+            swa_lens[r],
             hca_cmp_slot_mapping[r],
             hca_state_slot_mapping[r],
             csa_cmp_slot_mapping[r],
@@ -922,12 +940,15 @@ def make_forward_metadata_tensors(
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
+        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         mask_uncommitted_compressed_boundaries,
         ori_slot_mapping,
+        paged_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
+        swa_indices_and_lens,
     )
 
     seq_per_batch = T // B
@@ -983,10 +1004,45 @@ def make_forward_metadata_tensors(
     def init_ori_slot_mapping_single():
         return ori_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
-            init_block_table_single(ORI_MAX_BLOCKS),
+            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,
             window=win,
         ).reshape(-1).contiguous()
+
+    def init_swa_slot_mapping_single():
+        return paged_slot_mapping(
+            position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
+            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            block_size=BLOCK_SIZE,
+        ).reshape(-1).contiguous()
+
+    def init_swa_metadata_single():
+        return swa_indices_and_lens(
+            position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
+            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            block_size=BLOCK_SIZE,
+            window=win,
+        )
+
+    def init_swa_indices_single():
+        return init_swa_metadata_single()[0].contiguous()
+
+    def init_swa_lens_single():
+        return init_swa_metadata_single()[1].contiguous()
+
+    def init_window_swa_metadata_single():
+        return history_window_swa_indices_and_lens(
+            position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
+            init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
+            block_size=BLOCK_SIZE,
+            window=win,
+        )
+
+    def init_window_swa_indices_single():
+        return init_window_swa_metadata_single()[0].contiguous()
+
+    def init_window_swa_lens_single():
+        return init_window_swa_metadata_single()[1].contiguous()
 
     def init_compressed_slot_mapping_single(compress_ratio, max_blocks):
         positions = position_ids_from_starts(init_start_pos(), seq=seq_per_batch)
@@ -1012,13 +1068,18 @@ def make_forward_metadata_tensors(
         ).reshape(-1).contiguous()
 
     init_by_name = {
-        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_MAX_BLOCKS)),
+        "block_table": lambda: ranked(lambda: init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS)),
         "cmp_block_table": lambda: ranked(lambda: init_block_table_single(CSA_CMP_MAX_BLOCKS)),
         "idx_block_table": lambda: ranked(lambda: init_block_table_single(CSA_IDX_CACHE_MAX_BLOCKS)),
         "hca_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(HCA_COMPRESS_STATE_MAX_BLOCKS, hca_state_physical_blocks)),
         "csa_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_MAIN_STATE_MAX_BLOCKS, csa_state_physical_blocks)),
         "csa_inner_compress_state_block_table": lambda: ranked(lambda: init_state_block_table_single(CSA_INNER_STATE_MAX_BLOCKS, csa_inner_state_physical_blocks)),
         "ori_slot_mapping": lambda: ranked(init_ori_slot_mapping_single),
+        "swa_slot_mapping": lambda: ranked(init_swa_slot_mapping_single),
+        "swa_indices": lambda: ranked(init_swa_indices_single),
+        "swa_lens": lambda: ranked(init_swa_lens_single),
+        "window_swa_indices": lambda: ranked(init_window_swa_indices_single),
+        "window_swa_lens": lambda: ranked(init_window_swa_lens_single),
         "hca_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(HCA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
         "csa_cmp_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_CMP_MAX_BLOCKS)),
         "csa_idx_slot_mapping": lambda: ranked(lambda: init_compressed_slot_mapping_single(CSA_COMPRESS_RATIO, CSA_IDX_CACHE_MAX_BLOCKS)),
@@ -1042,12 +1103,17 @@ def _make_forward_metadata_specs(base_specs, start_pos=DECODE_START_POS, commit_
         "csa_compress_state_block_table",
         "csa_inner_compress_state_block_table",
         "ori_slot_mapping",
+        "window_swa_indices",
+        "window_swa_lens",
+        "swa_slot_mapping",
         "hca_cmp_slot_mapping",
         "csa_cmp_slot_mapping",
         "csa_idx_slot_mapping",
         "hca_state_slot_mapping",
         "csa_state_slot_mapping",
         "csa_inner_state_slot_mapping",
+        "swa_indices",
+        "swa_lens",
         "position_ids",
         "kv_seq_lens",
     ]
@@ -1103,6 +1169,7 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
     build_tensor_specs restacks across the 43 forward layers."""
     import torch
+    from decode_metadata import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)
@@ -1130,6 +1197,9 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         "hca": hca_specs,
         "csa": csa_specs,
     }[attention_kind]
+
+    def init_block_table():
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     replicated_attention = {
         "hc_attn_fn",
@@ -1180,8 +1250,13 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("freqs_cos", swa_specs["freqs_cos"]),
         ("freqs_sin", swa_specs["freqs_sin"]),
         ("kv_cache", swa_specs["kv_cache"]),
-        ("block_table", swa_specs["block_table"]),
-        ("ori_slot_mapping", active_specs["ori_slot_mapping"]),
+        ("block_table", TensorSpec("block_table", [B, ORI_TABLE_MAX_BLOCKS], torch.int32, init_value=init_block_table)),
+        ("ori_slot_mapping", active_specs.get("ori_slot_mapping", hca_specs["ori_slot_mapping"])),
+        ("window_swa_indices", hca_specs["window_swa_indices"]),
+        ("window_swa_lens", hca_specs["window_swa_lens"]),
+        ("swa_slot_mapping", swa_specs["swa_slot_mapping"]),
+        ("swa_indices", swa_specs["swa_indices"]),
+        ("swa_lens", swa_specs["swa_lens"]),
         ("hca_cmp_slot_mapping", hca_specs["cmp_slot_mapping"]),
         ("hca_state_slot_mapping", hca_specs["state_slot_mapping"]),
         ("csa_cmp_slot_mapping", csa_specs["cmp_slot_mapping"]),
@@ -1272,7 +1347,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
         if isinstance(spec, TensorSpec)
     }
     metadata_specs = _make_forward_metadata_specs(base_specs, start_pos=start_pos)
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'window_swa_indices', 'window_swa_lens', 'swa_slot_mapping', 'swa_indices', 'swa_lens', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
     specs = []
     for name in ordered_names:
         if name in metadata_specs:

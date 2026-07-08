@@ -26,6 +26,7 @@ from config import (
     DECODE_ORI_BLOCK_NUM,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
+    KV_ORI_TABLE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -66,6 +67,7 @@ OVERLAP = COMPRESS_RATIO == 4   # always False for HCA
 COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
@@ -120,10 +122,11 @@ def attention_hca(
     # KV cache split into ori (sliding window) and cmp (compressed) pools to match sparse_attn's contract.
     # cmp_kv is shared with the compressor: it writes the compressed row directly into this pool.
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -205,20 +208,12 @@ def attention_hca(
                 topk_s = topk_t - topk_b * S
                 topk_abs_pos = pl.read(position_ids, [topk_t])
 
-                # Block 0 (slots [0,WIN)) = PHYSICAL window page (slot k -> ring row k),
-                # zero-gathered by the kernel. Valid iff k <= abs_pos AND k is NOT a
-                # current-token ring slot (those hold stale KV and are attended via the
-                # overlay in block 1). build_valid turns this into the page's bias.
+                # Block 0: metadata-packed historical window slots. Raw k indexes
+                # window_swa_indices[topk_t, k], which is already a physical cache row.
+                topk_window_len = pl.read(window_swa_lens, [topk_t])
                 for topk_k in pl.range(WIN):
-                    if topk_k <= topk_abs_pos:
-                        topk_out = topk_k
-                        for topk_os in pl.range(S):
-                            if topk_os <= topk_s:
-                                topk_overlay_t = topk_b * S + topk_os
-                                topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                                if topk_k == topk_overlay_pos % WIN:
-                                    topk_out = -1
-                        pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_out, pl.INT32))
+                    if topk_k < topk_window_len:
+                        pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_k, pl.INT32))
                     else:
                         pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
 
@@ -241,7 +236,7 @@ def attention_hca(
                         pl.write(topk_all, [topk_t, WIN + S + topk_ck], pl.cast(-1, pl.INT32))
 
     sparse_attn_hca(
-        q, kv_cache, ori_block_table, kv,
+        q, kv_cache, window_swa_indices, kv,
         cmp_kv, cmp_block_table, topk_all,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
@@ -302,10 +297,11 @@ def attention_hca_test(
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -323,8 +319,9 @@ def attention_hca_test(
         freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         compress_state, compress_state_block_table,
-        kv_cache, ori_block_table, cmp_kv, cmp_block_table,
-        ori_slot_mapping, cmp_slot_mapping, state_slot_mapping,
+        kv_cache, cmp_kv, cmp_block_table,
+        ori_slot_mapping, window_swa_indices, window_swa_lens,
+        cmp_slot_mapping, state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink,
         wo_a, wo_b, wo_b_scale,
@@ -399,7 +396,8 @@ def golden_attention_hca(tensors):
     })
 
     kv_cache = tensors["kv_cache"]
-    ori_block_table = tensors["ori_block_table"]
+    window_swa_indices = tensors["window_swa_indices"]
+    window_swa_lens = tensors["window_swa_lens"]
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -435,22 +433,16 @@ def golden_attention_hca(tensors):
         "state_slot_mapping": state_slot_mapping_bsd,
     })
 
-    # ZERO-GATHER layout (must mirror the wrapper's hca_overlay_topk EXACTLY so the
-    # golden's block-0 gather lands in the same PHYSICAL order as the kernel's page
-    # read -- bf16 PV is not associative): block 0 [0,WIN) = physical window (slot k ->
-    # ring row k, live iff k<=abs_pos AND k is not a current-token ring slot); block 1
-    # head [WIN,WIN+S) = relocated overlay; block 1 tail [WIN+S,..) = compressed.
+    # Sparse layout: block 0 uses metadata-packed physical history-window slots;
+    # block 1 head [WIN,WIN+S) is the current MTP overlay; block 1 tail is compressed.
     topk_all = torch.full((T, HCA_SPARSE_TOPK), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
         s = t % S
         abs_pos = int(position_ids[t].item())
-        overlay_slots = {
-            int(position_ids[b * S + os].item()) % win: os
-            for os in range(s + 1)
-        }
-        for k in range(win):
-            if k <= abs_pos and k not in overlay_slots:
+        hist_len = int(window_swa_lens[t].item())
+        for k in range(hist_len):
+            if int(window_swa_indices[t, k].item()) >= 0:
                 topk_all[t, k] = k
         for os in range(s + 1):
             topk_all[t, win + os] = WIN + os
@@ -461,7 +453,7 @@ def golden_attention_hca(tensors):
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
-        "ori_block_table": ori_block_table,
+        "window_swa_indices": window_swa_indices,
         "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
@@ -503,6 +495,7 @@ def build_tensor_specs(start_pos=None):
         block_table,
         compressed_slot_mapping,
         hca_decode_start_set,
+        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
@@ -595,8 +588,8 @@ def build_tensor_specs(start_pos=None):
     def init_cmp_kv():
         return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
-    def init_ori_block_table():
-        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+    def init_window_block_table():
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     def init_cmp_block_table():
         return block_table(
@@ -626,10 +619,21 @@ def build_tensor_specs(start_pos=None):
     def init_ori_slot_mapping():
         return ori_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=S),
-            init_ori_block_table(),
+            init_window_block_table(),
             block_size=BLOCK_SIZE,
             window=WIN,
         ).reshape(-1).contiguous()
+    def init_window_swa_metadata():
+        return history_window_swa_indices_and_lens(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_window_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        )
+    def init_window_swa_indices():
+        return init_window_swa_metadata()[0].contiguous()
+    def init_window_swa_lens():
+        return init_window_swa_metadata()[1].contiguous()
     def init_cmp_slot_mapping():
         positions = position_ids_from_starts(init_start_pos(), seq=S)
         return compressed_slot_mapping(
@@ -675,10 +679,11 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
+        TensorSpec("window_swa_lens", [T], torch.int32, init_value=init_window_swa_lens),
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
         TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),

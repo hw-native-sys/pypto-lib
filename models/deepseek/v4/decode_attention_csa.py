@@ -41,6 +41,7 @@ from config import (
     IDX_CACHE_MAX_BLOCKS,
     KV_CMP_MAX_BLOCKS,
     KV_ORI_MAX_BLOCKS,
+    KV_ORI_TABLE_MAX_BLOCKS,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -95,6 +96,7 @@ INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STA
 INNER_STATE_BLOCK_NUM = B * INNER_STATE_PHYSICAL_BLOCKS
 IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
@@ -138,13 +140,14 @@ def attention_csa(
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -243,17 +246,12 @@ def attention_csa(
     for t_idx in pl.spmd(T, name_hint="csa_sparse_idx_tile"):
         topk_b = t_idx // S
         topk_s = t_idx - topk_b * S
-        topk_abs_pos = pl.read(position_ids, [t_idx])
+        topk_window_len = pl.read(window_swa_lens, [t_idx])
         for topk_k in pl.range(WIN):
-            if topk_k <= topk_abs_pos:
-                topk_out = topk_k
-                for topk_os in pl.range(S):
-                    if topk_os <= topk_s:
-                        topk_overlay_t = topk_b * S + topk_os
-                        topk_overlay_pos = pl.read(position_ids, [topk_overlay_t])
-                        if topk_k == topk_overlay_pos % WIN:
-                            topk_out = WIN + topk_os
-                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_out, pl.INT32))
+            if topk_k < topk_window_len:
+                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_k, pl.INT32))
+            elif topk_k - topk_window_len <= topk_s:
+                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(WIN + topk_k - topk_window_len, pl.INT32))
             else:
                 pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
 
@@ -285,7 +283,7 @@ def attention_csa(
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
-        q, kv_cache, ori_block_table, kv,
+        q, kv_cache, window_swa_indices, kv,
         cmp_kv, cmp_block_table, cmp_sparse_indices, valid_block_mask,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
@@ -349,13 +347,14 @@ def attention_csa_test(
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    window_swa_lens: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -378,9 +377,10 @@ def attention_csa_test(
         idx_wq_b, idx_wq_b_scale, weights_proj, hadamard_idx,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_compress_state, inner_compress_state_block_table,
-        kv_cache, ori_block_table, cmp_kv, cmp_block_table,
+        kv_cache, cmp_kv, cmp_block_table,
         idx_kv_cache, idx_kv_scale, idx_block_table,
-        ori_slot_mapping, cmp_slot_mapping, idx_slot_mapping,
+        ori_slot_mapping, window_swa_indices, window_swa_lens,
+        cmp_slot_mapping, idx_slot_mapping,
         state_slot_mapping, inner_state_slot_mapping,
         position_ids, kv_seq_lens,
         attn_sink, wo_a, wo_b, wo_b_scale,
@@ -455,7 +455,8 @@ def golden_attention_csa(tensors):
     })
 
     kv_cache = tensors["kv_cache"]
-    ori_block_table = tensors["ori_block_table"]
+    window_swa_indices = tensors["window_swa_indices"]
+    window_swa_lens = tensors["window_swa_lens"]
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 
@@ -514,20 +515,12 @@ def golden_attention_csa(tensors):
         b = t // S
         s = t % S
         abs_pos = int(position_ids[t].item())
-        overlay_slots = {
-            int(position_ids[b * S + os].item()) % WIN: os
-            for os in range(s + 1)
-        }
-        if abs_pos >= WIN - 1:
-            win_start = (abs_pos % WIN) + 1
-            vals = ((torch.arange(WIN, dtype=torch.int32) + win_start) % WIN).tolist()
-        else:
-            vals = list(range(abs_pos + 1))
-        for k, raw in enumerate(vals):
-            if raw in overlay_slots:
-                sparse_topk[t, k] = WIN + overlay_slots[raw]
-            else:
-                sparse_topk[t, k] = raw
+        hist_len = int(window_swa_lens[t].item())
+        for k in range(hist_len):
+            if int(window_swa_indices[t, k].item()) >= 0:
+                sparse_topk[t, k] = k
+        for os in range(s + 1):
+            sparse_topk[t, hist_len + os] = WIN + os
     idx_topk_flat = idx_topk_full.view(T, INDEXER_SCORE_LEN)
     for t in range(T):
         b = t // S
@@ -542,7 +535,7 @@ def golden_attention_csa(tensors):
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
-        "ori_block_table": ori_block_table,
+        "window_swa_indices": window_swa_indices,
         "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
@@ -583,6 +576,7 @@ def build_tensor_specs(start_pos=None):
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
+        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
@@ -745,8 +739,8 @@ def build_tensor_specs(start_pos=None):
     def init_kv_cache():
         return init_normalized_cache((ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
 
-    def init_ori_block_table():
-        return block_table(batch=B, table_blocks=ORI_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
+    def init_window_block_table():
+        return block_table(batch=B, table_blocks=ORI_TABLE_MAX_BLOCKS, physical_blocks=ORI_MAX_BLOCKS)
 
     def init_cmp_kv():
         return init_normalized_cache((CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM))
@@ -794,10 +788,24 @@ def build_tensor_specs(start_pos=None):
     def init_ori_slot_mapping():
         return ori_slot_mapping(
             position_ids_from_starts(init_start_pos(), seq=S),
-            init_ori_block_table(),
+            init_window_block_table(),
             block_size=BLOCK_SIZE,
             window=WIN,
         ).reshape(-1).contiguous()
+
+    def init_window_swa_metadata():
+        return history_window_swa_indices_and_lens(
+            position_ids_from_starts(init_start_pos(), seq=S),
+            init_window_block_table(),
+            block_size=BLOCK_SIZE,
+            window=WIN,
+        )
+
+    def init_window_swa_indices():
+        return init_window_swa_metadata()[0].contiguous()
+
+    def init_window_swa_lens():
+        return init_window_swa_metadata()[1].contiguous()
 
     def init_cmp_slot_mapping():
         positions = position_ids_from_starts(init_start_pos(), seq=S)
@@ -911,13 +919,14 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
         TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
-        TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: shared_idx_kv_cache_i8.clone()),
         TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: shared_idx_kv_scale.clone()),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
+        TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
+        TensorSpec("window_swa_lens", [T], torch.int32, init_value=init_window_swa_lens),
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
         TensorSpec("idx_slot_mapping", [T], torch.int64, init_value=init_idx_slot_mapping),
         TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
