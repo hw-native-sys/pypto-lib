@@ -85,7 +85,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 #               task, ordered by the runtime task graph (dep_gen ON), applied to ALL T.
 # Switch via env DSV4_HC_PRE_IMPL={syncall,separate} or by reassigning this module global
 # before the kernel is traced (the __main__ below wires it to --impl).
-HC_PRE_IMPL = os.environ.get("DSV4_HC_PRE_IMPL", "syncall").lower()
+HC_PRE_IMPL = os.environ.get("DSV4_HC_PRE_IMPL", "separate").lower()
 
 
 D = M.hidden_size
@@ -119,7 +119,7 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 # partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
 # cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
 # decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 8
+LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -471,10 +471,11 @@ def _hc_pre_separate(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # seed: zero mixes_raw for the split-K atomic-add accumulation.
-    for tc in pl.spmd(t_linear // T_TILE, name_hint="hc_pre_seed"):
-        ts0 = tc * T_TILE
-        mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
+    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed"):
+        for ts0 in pl.range(0, t_linear, T_TILE):
+            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
 
     # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
