@@ -495,7 +495,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # completes. seed_dummy is an unflagged empty barrier, so it adds no
         # dependency on the previous dcr_xgamma task while still not bumping
         # dispatch_fanin via early resolve.
-        seed_dummy = pl.system.task_dummy(deps=[])
+        seed_dummy = pl.system.task_dummy(deps=[prev_out_tids[i] for i in range(DOWN_ON)])
         prev_out_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
         for _dep_i in pl.unroll(DOWN_ON):
             prev_out_seed_deps[_dep_i] = prev_out_tids[_dep_i]
