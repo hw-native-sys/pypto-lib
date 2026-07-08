@@ -976,7 +976,7 @@ def run(
     compare_fn: dict[str, Callable] | None = None,
     compile_only: bool = False,
     runtime_dir: str | None = None,
-    save_data: bool = True,
+    save_data: bool = False,
 ) -> RunResult:
     """Compile *program*, run on device, and validate against golden.
 
@@ -1005,12 +1005,12 @@ def run(
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
             rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
-        save_data: When True (default), persist generated inputs to
+        save_data: When True, persist generated inputs to
             ``{work_dir}/data/in/`` and golden outputs to
-            ``{work_dir}/data/out/`` for later replay via *golden_data*. Set
-            False to skip the on-disk ``.pt`` snapshot when inputs are large
-            (e.g. full-model weights) and replay is not needed; validation
-            still runs against the in-memory golden.
+            ``{work_dir}/data/out/`` for later replay via *golden_data*.
+            Defaults to False, skipping the on-disk ``.pt`` snapshot;
+            validation still runs against the in-memory golden. Enable it
+            when you need to replay the exact inputs/outputs later.
 
     Returns:
         :class:`RunResult`.
@@ -1158,7 +1158,7 @@ def run_jit(
     compare_fn: dict[str, Callable] | None = None,
     compile_only: bool = False,
     runtime_dir: str | None = None,
-    save_data: bool = True,
+    save_data: bool = False,
 ) -> RunResult:
     """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
 
@@ -1190,12 +1190,12 @@ def run_jit(
         runtime_dir: Pre-compiled ``build_output/`` directory to reuse. Skips
             compile and invalidates cached ``.so``/``.bin`` so cpp edits
             rebuild; *compile_cfg* is ignored and *compile_only* is rejected.
-        save_data: When True (default), persist generated inputs to
+        save_data: When True, persist generated inputs to
             ``{work_dir}/data/in/`` and golden outputs to
-            ``{work_dir}/data/out/`` for later replay via *golden_data*. Set
-            False to skip the on-disk ``.pt`` snapshot when inputs are large
-            (e.g. full-model weights) and replay is not needed; validation
-            still runs against the in-memory golden.
+            ``{work_dir}/data/out/`` for later replay via *golden_data*.
+            Defaults to False, skipping the on-disk ``.pt`` snapshot;
+            validation still runs against the in-memory golden. Enable it
+            when you need to replay the exact inputs/outputs later.
 
     Returns:
         :class:`RunResult`.
