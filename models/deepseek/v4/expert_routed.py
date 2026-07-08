@@ -75,6 +75,20 @@ def expert_routed(
         n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
         flat_base = local_i * RECV_MAX
 
+        # Slice each expert's private data slab once, outside the compute scopes,
+        # so the routed stages take per-expert views as inputs. This decouples
+        # dependency tracking across experts: expert compute can start as soon as
+        # its own dispatch payload lands, rather than waiting on the full recv.
+        x_local = recv_x[local_i : local_i + 1]
+        scale_dq_local = recv_scale_dq[local_i : local_i + 1]
+        weights_local = recv_weights[local_i : local_i + 1]
+        w1_local = routed_w1[local_i : local_i + 1]
+        w1_scale_local = routed_w1_scale[local_i : local_i + 1]
+        w3_local = routed_w3[local_i : local_i + 1]
+        w3_scale_local = routed_w3_scale[local_i : local_i + 1]
+        w2_local = routed_w2[local_i : local_i + 1]
+        w2_scale_local = routed_w2_scale[local_i : local_i + 1]
+
         for t in pl.parallel(n_tiles):
             tile_idx = local_i * TILES_PER_EXPERT + t
             t0 = t * RECV_TILE
@@ -95,8 +109,8 @@ def expert_routed(
                         n0 = n_base + ng * MM_INTER_TILE
                         gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                         for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                            x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
-                            w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                            x_k = x_local[:, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                            w1_k = w1_local[:, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                             if k0 == 0:
                                 gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
                             else:
@@ -110,8 +124,8 @@ def expert_routed(
                         n0 = n_base + ng * MM_INTER_TILE
                         up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                         for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                            x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
-                            w3_k = routed_w3[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
+                            x_k = x_local[:, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                            w3_k = w3_local[:, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                             if k0 == 0:
                                 up_acc = pl.matmul(x_k, w3_k, b_trans=True, out_dtype=pl.INT32)
                             else:
@@ -129,9 +143,9 @@ def expert_routed(
                         n0 = n_base + ng * ACT_INTER_TILE
                         gate_2d_i32 = gate_i32[:, n0 : n0 + ACT_INTER_TILE]
                         up_2d_i32 = up_i32[:, n0 : n0 + ACT_INTER_TILE]
-                        recv_x_scale_dq = pl.reshape(recv_scale_dq[local_i : local_i + 1, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
-                        w1_scale_chunk = routed_w1_scale[local_i : local_i + 1, n0 : n0 + ACT_INTER_TILE]
-                        w3_scale_chunk = routed_w3_scale[local_i : local_i + 1, n0 : n0 + ACT_INTER_TILE]
+                        recv_x_scale_dq = pl.reshape(scale_dq_local[:, t0 : t0 + RECV_TILE], [RECV_TILE, 1])
+                        w1_scale_chunk = w1_scale_local[:, n0 : n0 + ACT_INTER_TILE]
+                        w3_scale_chunk = w3_scale_local[:, n0 : n0 + ACT_INTER_TILE]
                         gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
                         up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
                         gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
@@ -175,7 +189,7 @@ def expert_routed(
                         y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
                         for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
                             h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                            w2_k = routed_w2[local_i : local_i + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                            w2_k = w2_local[:, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
                             if k0 == 0:
                                 y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
                             else:
@@ -188,7 +202,7 @@ def expert_routed(
                 recv_y_block = pl.create_tensor([RECV_TILE, W2_ACT_INNER * D_OUT_TILE_ACT], dtype=pl.BF16)
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_w2_act", deps=[w2_tids[tile_idx]]):
                     w_col_blk = pl.reshape(
-                        recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
+                        weights_local[:, t0 : t0 + RECV_TILE],
                         [RECV_TILE, 1],
                     )
                     row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
@@ -196,7 +210,7 @@ def expert_routed(
                         act_d0 = act_d_base + dg * D_OUT_TILE_ACT
                         block_d0 = dg * D_OUT_TILE_ACT
                         y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                        w2_scale_chunk = w2_scale_local[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
                         y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
                         y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
                         recv_y_block[:, block_d0 : block_d0 + D_OUT_TILE_ACT] = pl.cast(
