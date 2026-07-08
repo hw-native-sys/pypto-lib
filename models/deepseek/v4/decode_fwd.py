@@ -940,7 +940,6 @@ def make_forward_metadata_tensors(
     from decode_metadata import (
         block_table,
         compressed_slot_mapping,
-        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         mask_uncommitted_compressed_boundaries,
         ori_slot_mapping,
@@ -1031,7 +1030,7 @@ def make_forward_metadata_tensors(
         return init_swa_metadata_single()[1].contiguous()
 
     def init_window_swa_metadata_single():
-        return history_window_swa_indices_and_lens(
+        return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=seq_per_batch),
             init_block_table_single(ORI_TABLE_MAX_BLOCKS, ORI_MAX_BLOCKS),
             block_size=BLOCK_SIZE,

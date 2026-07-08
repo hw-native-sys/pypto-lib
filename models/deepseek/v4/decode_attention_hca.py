@@ -35,7 +35,7 @@ from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from decode_compressor_ratio128 import compressor_ratio128
-from decode_sparse_attn_hca import sparse_attn_hca, PADDED_TOPK
+from decode_sparse_attn_hca import sparse_attn_hca, CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
 
 # model config
@@ -77,22 +77,17 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = 64
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
-CMP_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
+COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
-SPARSE_TOPK = WIN + SPARSE_IDX_TOPK        # sparse_attn module's TOPK (= 640 for demo)
-HCA_TOPK_LIMIT = min(CMP_TOPK, SPARSE_IDX_TOPK)
+HCA_TOPK_LIMIT = min(COMPRESS_TOPK, SPARSE_IDX_TOPK)
 
-# ZERO-GATHER: block 0 = window page (slots [0,WIN)), block 1 = S relocated overlay
-# slots + the compressed tail, padded to PADDED_TOPK (the kernel reads the full,
-# 32-byte-aligned PADDED_TOPK width; the tail past WIN+S+compressed stays -1).
-HCA_SPARSE_TOPK = PADDED_TOPK
+HCA_CMP_TOPK = HCA_SPARSE_CMP_TOPK
 
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
-HCA_TOPK_TOKEN_TILE = 8   # tokens per overlay-topk SPMD block
+HCA_TOPK_TOKEN_TILE = 8   # tokens per cache-window topk SPMD block
 HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
-WRITEBACK_GUARD_TILE = 16  # head cols folded with attn_out*0 to order the writeback after sparse_attn's gather
 
 
 @pl.jit.inline
@@ -179,6 +174,16 @@ def attention_hca(
         q, kv, qr, qr_scale,
     )
 
+    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    for wb_blk in pl.spmd(T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback"):
+        wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
+        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
+            write_t = wb_t0 + write_dt
+            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+
     x_normed_bsd = pl.reshape(x_normed, [B, S, D])
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
@@ -198,78 +203,31 @@ def attention_hca(
     # K/V by its stored raw value (order-agnostic), so the full-ring rotation is
     # dead. The compressed-slot ramp is fused into the same block.
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    topk_all = pl.create_tensor([T, HCA_SPARSE_TOPK], dtype=pl.INT32)
-    for topk_block in pl.spmd(T // HCA_TOPK_TOKEN_TILE, name_hint="hca_overlay_topk"):
+    topk_all = pl.create_tensor([T, HCA_CMP_TOPK], dtype=pl.INT32)
+    for topk_block in pl.spmd(T // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk"):
         topk_t0 = topk_block * HCA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(HCA_TOPK_TOKEN_TILE):
             topk_t = topk_t0 + topk_dt
             if topk_t < T:
                 topk_b = topk_t // S
-                topk_s = topk_t - topk_b * S
                 topk_abs_pos = pl.read(position_ids, [topk_t])
 
-                # Block 0: metadata-packed historical window slots. Raw k indexes
-                # window_swa_indices[topk_t, k], which is already a physical cache row.
-                topk_window_len = pl.read(window_swa_lens, [topk_t])
-                for topk_k in pl.range(WIN):
-                    if topk_k < topk_window_len:
-                        pl.write(topk_all, [topk_t, topk_k], pl.cast(topk_k, pl.INT32))
-                    else:
-                        pl.write(topk_all, [topk_t, topk_k], pl.cast(-1, pl.INT32))
-
-                # Block 1 head: S relocated overlay slots (raw WIN+os), gathered.
-                for topk_os in pl.range(S):
-                    if topk_os <= topk_s:
-                        pl.write(topk_all, [topk_t, WIN + topk_os], pl.cast(WIN + topk_os, pl.INT32))
-                    else:
-                        pl.write(topk_all, [topk_t, WIN + topk_os], pl.cast(-1, pl.INT32))
-
-                # Block 1 tail: compressed slots (raw WIN+S+ck), gathered.
                 topk_cmp_valid = pl.min(
                     HCA_TOPK_LIMIT,
                     pl.min((topk_abs_pos + 1) // COMPRESS_RATIO, pl.read(kv_seq_lens, [topk_b]) // COMPRESS_RATIO),
                 )
-                for topk_ck in pl.range(HCA_SPARSE_TOPK - WIN - S):
+                for topk_ck in pl.range(HCA_CMP_TOPK):
                     if topk_ck < topk_cmp_valid:
-                        pl.write(topk_all, [topk_t, WIN + S + topk_ck], pl.cast(WIN + S + topk_ck, pl.INT32))
+                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(topk_ck, pl.INT32))
                     else:
-                        pl.write(topk_all, [topk_t, WIN + S + topk_ck], pl.cast(-1, pl.INT32))
+                        pl.write(topk_all, [topk_t, topk_ck], pl.cast(-1, pl.INT32))
 
     sparse_attn_hca(
-        q, kv_cache, window_swa_indices, kv,
+        q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, topk_all,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
-
-    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
-    # history (the current token reaches attention via the `kv` overlay).
-    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for wb_blk in pl.spmd(T // HCA_WB_TOKEN_TILE, name_hint="hca_cache_writeback"):
-        wb_t0 = wb_blk * HCA_WB_TOKEN_TILE
-        # No-op self-copy marks kv_cache_flat add_inout for the WAR edge vs
-        # sparse_attn's read (pypto-lib#481); row 0 is batch 0's intra-0 slot, only
-        # ever written by batch-0 tokens, which all live in this same block 0, so
-        # there is no cross-block race.
-        if wb_blk == 0:
-            kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
-            kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
-        for write_dt in pl.range(HCA_WB_TOKEN_TILE):
-            write_t = wb_t0 + write_dt
-            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                # Fold attn_out*0 into the first WRITEBACK_GUARD_TILE cols so the
-                # writeback data-depends on attn_out -> it cannot run until
-                # sparse_attn has finished its in-qk_pv gather of the old cache.
-                # Needed because the fused gather_row read is not a tracked tile
-                # load, so the kv_touch marker alone does not order it (pypto-lib#481).
-                write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                write_zero = pl.mul(write_guard, 0.0)
-                write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(
-                    pl.add(write_kv_head, write_zero), target_type=pl.BF16)
-                kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
@@ -433,28 +391,26 @@ def golden_attention_hca(tensors):
         "state_slot_mapping": state_slot_mapping_bsd,
     })
 
-    # Sparse layout: block 0 uses metadata-packed physical history-window slots;
-    # block 1 head [WIN,WIN+S) is the current MTP overlay; block 1 tail is compressed.
-    topk_all = torch.full((T, HCA_SPARSE_TOPK), -1, dtype=torch.int32)
+    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
+    for t in range(T):
+        write_row = int(ori_slot_mapping[t].item())
+        if write_row >= 0:
+            write_blk = write_row // BLOCK_SIZE
+            write_intra = write_row % BLOCK_SIZE
+            kv_cache[write_blk, write_intra, 0] = kv[t]
+
+    topk_all = torch.full((T, HCA_CMP_TOPK), -1, dtype=torch.int32)
     for t in range(T):
         b = t // S
-        s = t % S
         abs_pos = int(position_ids[t].item())
-        hist_len = int(window_swa_lens[t].item())
-        for k in range(hist_len):
-            if int(window_swa_indices[t, k].item()) >= 0:
-                topk_all[t, k] = k
-        for os in range(s + 1):
-            topk_all[t, win + os] = WIN + os
         cmp_valid = min(HCA_TOPK_LIMIT, (abs_pos + 1) // ratio, int(kv_seq_lens[b].item()) // ratio)
         if cmp_valid:
-            topk_all[t, win + S:win + S + cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32) + win + S
+            topk_all[t, :cmp_valid] = torch.arange(cmp_valid, dtype=torch.int32)
 
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "window_swa_indices": window_swa_indices,
-        "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": topk_all,
@@ -466,15 +422,6 @@ def golden_attention_hca(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
-
-    # In-place sliding-window KV-cache update (validated as an inout tensor).
-    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
-    for t in range(T):
-        write_row = int(ori_slot_mapping[t].item())
-        if write_row >= 0:
-            write_blk = write_row // BLOCK_SIZE
-            write_intra = write_row % BLOCK_SIZE
-            kv_cache[write_blk, write_intra, 0] = kv[t]
 
     # ===== Block.hc_post =====
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
@@ -495,12 +442,12 @@ def build_tensor_specs(start_pos=None):
         block_table,
         compressed_slot_mapping,
         hca_decode_start_set,
-        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
+        swa_indices_and_lens,
     )
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
@@ -624,7 +571,7 @@ def build_tensor_specs(start_pos=None):
             window=WIN,
         ).reshape(-1).contiguous()
     def init_window_swa_metadata():
-        return history_window_swa_indices_and_lens(
+        return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=S),
             init_window_block_table(),
             block_size=BLOCK_SIZE,

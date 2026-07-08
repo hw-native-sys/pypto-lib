@@ -73,7 +73,6 @@ IDX_N_HEADS = M.index_n_heads
 IDX_HEAD_DIM = M.index_head_dim
 IDX_TOPK = M.index_topk
 INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
-SPARSE_TOPK = WIN + IDX_TOPK
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
@@ -103,9 +102,7 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
-WRITEBACK_GUARD_TILE = 16
-CSA_CMP_GE_BIAS = float(1 - (WIN + S))  # raw - (WIN + S) + 1, folded for the ge clamp
-CSA_CMP_WIN_S_F = float(WIN + S)
+CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 
 @pl.jit.inline
@@ -207,6 +204,16 @@ def attention_csa(
         q, kv, qr, qr_scale,
     )
 
+    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    for wb_blk in pl.spmd(T // CSA_WB_TOKEN_TILE, name_hint="csa_cache_writeback"):
+        wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
+        for write_dt in pl.range(CSA_WB_TOKEN_TILE):
+            write_t = wb_t0 + write_dt
+            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+
     x_normed = pl.reshape(x_normed_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
@@ -233,44 +240,31 @@ def attention_csa(
         idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
-        kv_seq_lens, WIN + S,
+        kv_seq_lens, 0,
     )
 
     # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
     # fixed metadata while the CSA path still composes indexer at runtime.
-    cmp_sparse_indices = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
+    cmp_sparse_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
-    # Overlay build, one token per SPMD core.
-    for t_idx in pl.spmd(T, name_hint="csa_sparse_idx_tile"):
-        topk_b = t_idx // S
-        topk_s = t_idx - topk_b * S
-        topk_window_len = pl.read(window_swa_lens, [t_idx])
-        for topk_k in pl.range(WIN):
-            if topk_k < topk_window_len:
-                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(topk_k, pl.INT32))
-            elif topk_k - topk_window_len <= topk_s:
-                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(WIN + topk_k - topk_window_len, pl.INT32))
-            else:
-                pl.write(cmp_sparse_indices, [t_idx, topk_k], pl.cast(-1, pl.INT32))
 
-    # Compressed slots [WIN, WIN + IDX_TOPK): vectorized masked copy over all T rows,
-    # keeping raw iff WIN + S <= raw < WIN + S + floor((pos + 1) / 4), as
+    # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows,
+    # keeping raw iff 0 <= raw < floor((pos + 1) / 4), as
     # out = mask * (raw + 1) - 1.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_compressed_slots", allow_early_resolve=True):
         c_raw = pl.cast(idx_topk_flat[0 : T, 0 : IDX_TOPK], target_type=pl.FP32)
         c_pos = pl.cast(position_ids_t1[0 : T, 0 : 1], target_type=pl.FP32)
         c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        c_upper = pl.add(c_pos_q, CSA_CMP_WIN_S_F)
         # Broadcast the per-token bound over IDX_TOPK cols.
-        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_upper)
+        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
         c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
         c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
         c_mask = pl.mul(c_ge, c_lt)
         c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
-        cmp_sparse_indices[0 : T, WIN : WIN + IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
-        # Block 0 (sliding-window / overlay) is always live; write all of
+        cmp_sparse_indices[0 : T, 0 : IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        # Block 0 (sliding-window) is always live; write all of
         # valid_block_mask from this single scope.
         for c_t0 in pl.range(T):
             pl.write(valid_block_mask, [c_t0, 0], pl.cast(1, pl.INT32))
@@ -283,33 +277,11 @@ def attention_csa(
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
-        q, kv_cache, window_swa_indices, kv,
+        q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, cmp_sparse_indices, valid_block_mask,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
-
-    # Commit current MTP tokens only after sparse_attn has gathered the old cache
-    # plus the explicit overlay, matching the SWA/HCA MTP contract.
-    kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for wb_blk in pl.spmd(T // CSA_WB_TOKEN_TILE, name_hint="csa_cache_writeback"):
-        wb_t0 = wb_blk * CSA_WB_TOKEN_TILE
-        # No-op self-copy marks kv_cache_flat add_inout for the WAR edge vs
-        # sparse_attn's read (pypto-lib#481); row 0 is only ever written by
-        # token 0, which lives in this same block, so no cross-block race.
-        if wb_blk == 0:
-            kc_touch = kv_cache_flat[0 : 1, 0 : HEAD_DIM]
-            kv_cache_flat[0 : 1, 0 : HEAD_DIM] = kc_touch
-        for write_dt in pl.range(CSA_WB_TOKEN_TILE):
-            write_t = wb_t0 + write_dt
-            write_row_i64 = pl.read(ori_slot_mapping, [write_t])
-            if write_row_i64 >= 0:
-                write_row = pl.cast(write_row_i64, pl.INDEX)
-                write_guard = pl.cast(attn_out[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                write_zero = pl.mul(write_guard, 0.0)
-                write_kv_head = pl.cast(kv[write_t : write_t + 1, 0 : WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                kv_cache_flat[write_row : write_row + 1, 0 : WRITEBACK_GUARD_TILE] = pl.cast(pl.add(write_kv_head, write_zero), target_type=pl.BF16)
-                kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE : HEAD_DIM] = kv[write_t : write_t + 1, WRITEBACK_GUARD_TILE : HEAD_DIM]
 
     hc_post(attn_out, x_hc, post_t, comb_t, x_out)
     return x_out
@@ -507,20 +479,18 @@ def golden_attention_csa(tensors):
         "idx_slot_mapping": idx_slot_mapping_bsd,
         "inner_state_slot_mapping": inner_state_slot_mapping_bsd,
         "kv_seq_lens": tensors["kv_seq_lens"],
-        "offset": torch.tensor(WIN + S, dtype=torch.int32),
+        "offset": torch.tensor(0, dtype=torch.int32),
     })
 
-    sparse_topk = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
+    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
     for t in range(T):
-        b = t // S
-        s = t % S
-        abs_pos = int(position_ids[t].item())
-        hist_len = int(window_swa_lens[t].item())
-        for k in range(hist_len):
-            if int(window_swa_indices[t, k].item()) >= 0:
-                sparse_topk[t, k] = k
-        for os in range(s + 1):
-            sparse_topk[t, hist_len + os] = WIN + os
+        write_row = int(ori_slot_mapping[t].item())
+        if write_row >= 0:
+            blk_id = write_row // BLOCK_SIZE
+            intra = write_row % BLOCK_SIZE
+            kv_cache[blk_id, intra, 0] = kv[t]
+
+    sparse_topk = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
     idx_topk_flat = idx_topk_full.view(T, INDEXER_SCORE_LEN)
     for t in range(T):
         b = t // S
@@ -528,15 +498,14 @@ def golden_attention_csa(tensors):
         cmp_valid = min((abs_pos + 1) // COMPRESS_RATIO, int(kv_seq_lens[b].item()) // COMPRESS_RATIO)
         for ck, raw_t in enumerate(idx_topk_flat[t, :IDX_TOPK].tolist()):
             raw = int(raw_t)
-            if raw >= WIN + S and raw - (WIN + S) < cmp_valid:
-                sparse_topk[t, WIN + ck] = raw
+            if raw >= 0 and raw < cmp_valid:
+                sparse_topk[t, ck] = raw
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "window_swa_indices": window_swa_indices,
-        "mtp_kv_overlay": kv,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
         "cmp_sparse_indices": sparse_topk,
@@ -548,16 +517,6 @@ def golden_attention_csa(tensors):
         "wo_b_scale": tensors["wo_b_scale"],
         "attn_out": attn_out,
     })
-
-    kv_cache_out = kv_cache.clone()
-    ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)
-    for t in range(T):
-        write_row = int(ori_slot_mapping[t].item())
-        if write_row >= 0:
-            blk_id = write_row // BLOCK_SIZE
-            intra = write_row % BLOCK_SIZE
-            kv_cache_out[blk_id, intra, 0] = kv[t]
-    tensors["kv_cache"][:] = kv_cache_out
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
@@ -576,12 +535,12 @@ def build_tensor_specs(start_pos=None):
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
-        history_window_swa_indices_and_lens,
         kv_seq_lens_from_starts,
         ori_slot_mapping,
         position_ids_from_starts,
         resolve_start_positions,
         state_slot_mapping,
+        swa_indices_and_lens,
     )
     from golden import TensorSpec
     from hc_pre import golden_hc_pre
@@ -794,7 +753,7 @@ def build_tensor_specs(start_pos=None):
         ).reshape(-1).contiguous()
 
     def init_window_swa_metadata():
-        return history_window_swa_indices_and_lens(
+        return swa_indices_and_lens(
             position_ids_from_starts(init_start_pos(), seq=S),
             init_window_block_table(),
             block_size=BLOCK_SIZE,
