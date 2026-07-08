@@ -66,9 +66,12 @@ H_TILE = 16
 # (its [64,128] softmax and co-resident QK+PV L0C accumulators overflow Vec/L0C).
 QK_M_TILE = 32
 ATTN_K_TILE = 128
-# Split each token's sparse blocks across a small number of qk_pv lanes. Full
-# per-block fanout makes qk_pv short but multiplies task/setup cost too much.
-QK_BLOCK_NSPLIT = 3
+# qk_pv dispatch width = the a2a3 AIC (MIX-cluster) count. A runtime pre-pass
+# (qk_plan, below) load-balances the T*SPARSE_BLOCKS work items across these lanes,
+# replacing the old fixed strided (token, block-lane) NSPLIT split whose imbalance
+# grew with per-token variance in the valid-block count. Platform-specific: this is
+# the 24-wide dispatch a2a3 targets; re-sweep NUM_QK_CORES for other AIC counts.
+NUM_QK_CORES = 24
 ROPE_TILE = 16
 ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 # proj_a cube K-frag. 256 (not 128) keeps the B-cache-line floor: B is K-contiguous
@@ -181,7 +184,9 @@ TOPK = TOPK_FULL
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-assert QK_BLOCK_NSPLIT <= SPARSE_BLOCKS
+# qk_pv work items: one per (token, sparse block), load-balanced across NUM_QK_CORES
+# lanes by the qk_plan pre-pass (non-empty tiles first, empty tiles appended).
+QK_ITEMS = T * SPARSE_BLOCKS
 
 
 @pl.jit.inline
@@ -260,24 +265,54 @@ def sparse_attn(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    # Fan qk_pv across a small number of sparse-block lanes as well as tokens.
-    # The old task shape was one task per token and serialized all SPARSE_BLOCKS
-    # inside it, making each qk_pv task long at 8k. Full per-block fanout makes
-    # tasks short but overpays setup, so use a small NSPLIT like indexer score.
-    with pl.spmd(T * QK_BLOCK_NSPLIT, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
-        qk_unit = pl.tile.get_block_idx()
-        qk_t = qk_unit // QK_BLOCK_NSPLIT
-        qk_split = qk_unit - qk_t * QK_BLOCK_NSPLIT
-        qk_b = qk_t // S
-        qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        qk_window_base = qk_t * WIN
-        qk_overlay_base = qk_b * S
-        # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
-        # then both head-batches' QK (b_trans) and PV consume the SAME normal-layout
-        # tile -- one gather per (token, block), no GM staging.
-        qk_lane_iters = (SPARSE_BLOCKS - qk_split + QK_BLOCK_NSPLIT - 1) // QK_BLOCK_NSPLIT
-        for qk_sb_i in pl.range(qk_lane_iters):
-            qk_sb = qk_split + qk_sb_i * QK_BLOCK_NSPLIT
+    # Load-balanced qk_pv planning (qk_plan): a single scalar task compacts the
+    # T*SPARSE_BLOCKS (token, sparse-block) work items into qk_order[] -- non-empty
+    # tiles (valid_block_mask > 0) first, empty tiles appended -- via one running
+    # write cursor. qk_pv then dispatches NUM_QK_CORES lanes; lane c walks its items
+    # strided by NUM_QK_CORES (qk_order[c], qk_order[c + NC], ...). Because the
+    # non-empty tiles occupy the front of qk_order, they spread one-per-lane before
+    # any lane takes a second -- the heavy tiles balance evenly across cores while the
+    # cheap empty tiles fill the tail slots. Replaces the fixed strided (token,
+    # block-lane) NSPLIT mapping, whose imbalance grew with per-token variance in the
+    # valid-block count. The T/SPARSE_BLOCKS scan loops are trace-time unrolled (small
+    # constants) so the cursor read-modify-write is an explicit sequential chain.
+    qk_order = pl.create_tensor([QK_ITEMS], dtype=pl.INT32)
+    qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_plan") as qk_plan_tid:
+        pl.write(qk_wcur, [0], pl.cast(0, pl.INT32))
+        # Pass 1: non-empty tiles to the front of qk_order.
+        for plan_t in pl.unroll(T):
+            for plan_sb in pl.unroll(SPARSE_BLOCKS):
+                if pl.read(valid_block_mask, [plan_t, plan_sb]) > 0:
+                    plan_w = pl.read(qk_wcur, [0])
+                    pl.write(qk_order, [plan_w], pl.cast(plan_t * SPARSE_BLOCKS + plan_sb, pl.INT32))
+                    pl.write(qk_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
+        # Pass 2: empty tiles appended to the tail.
+        for plan_t in pl.unroll(T):
+            for plan_sb in pl.unroll(SPARSE_BLOCKS):
+                if pl.read(valid_block_mask, [plan_t, plan_sb]) <= 0:
+                    plan_w = pl.read(qk_wcur, [0])
+                    pl.write(qk_order, [plan_w], pl.cast(plan_t * SPARSE_BLOCKS + plan_sb, pl.INT32))
+                    pl.write(qk_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
+
+    # One lane per core; deps on the window gather (window_kv_flat). Each lane walks
+    # its planned items -- the (token, block) work is derived per item, and the
+    # window/overlay/compressed KV gather + sparse_blk_* stores below are unchanged.
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[gather_tids[0], qk_plan_tid]) as qk_tid:
+        qk_core = pl.tile.get_block_idx()
+        # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
+        # count is derived from the lane index (no stored per-core count); a lane
+        # with index >= QK_ITEMS runs zero iterations.
+        qk_lane_iters = (QK_ITEMS - qk_core + NUM_QK_CORES - 1) // NUM_QK_CORES
+        for qk_it in pl.range(qk_lane_iters):
+            qk_flat = qk_core + qk_it * NUM_QK_CORES
+            qk_item = pl.cast(pl.read(qk_order, [qk_flat]), pl.INDEX)
+            qk_t = qk_item // SPARSE_BLOCKS
+            qk_sb = qk_item - qk_t * SPARSE_BLOCKS
+            qk_b = qk_t // S
+            qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+            qk_window_base = qk_t * WIN
+            qk_overlay_base = qk_b * S
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
             qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
