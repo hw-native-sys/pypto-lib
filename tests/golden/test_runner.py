@@ -291,6 +291,7 @@ class TestGoldenFnPath:
                 program=object(),
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
+                save_data=True,
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
@@ -416,6 +417,7 @@ class TestNoValidation:
                 specs=three_kinds_specs,
                 golden_fn=None,
                 golden_data=None,
+                save_data=True,
             )
 
         assert r.passed
@@ -506,6 +508,7 @@ class TestRuntimeDir:
                 specs=three_kinds_specs,
                 golden_fn=golden_fn,
                 runtime_dir=str(prebuilt),
+                save_data=True,
             )
 
         assert r.passed, f"unexpected failure: {r.error}"
@@ -713,7 +716,7 @@ class TestScalarMixedSpecs:
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
         with compile_p, exec_p:
-            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn)
+            r = run(program=object(), specs=mixed_specs, golden_fn=golden_fn, save_data=True)
 
         assert r.passed, f"unexpected failure: {r.error}"
         scalar_path = compiled_dir / "data" / "in" / "alpha.pt"
