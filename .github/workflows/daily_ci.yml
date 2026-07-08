@@ -165,6 +165,7 @@ jobs:
         uses: ./.github/actions/setup-npu-device-job
         with:
           checkout-path: dist-checkout
+          build-namespace: a2a3-daily
 
       - name: Run model tests (a2a3, via task-submit)
         shell: bash

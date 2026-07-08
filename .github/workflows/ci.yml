@@ -239,6 +239,7 @@ jobs:
         uses: ./.github/actions/setup-npu-device-job
         with:
           checkout-path: dist-checkout
+          build-namespace: a2a3
 
       - name: Run a2a3 tests (via task-submit)
         shell: bash
@@ -325,6 +326,7 @@ jobs:
         uses: ./.github/actions/setup-npu-device-job
         with:
           checkout-path: dist-checkout
+          build-namespace: serving
 
       - name: Run pypto-serving e2e model tests
         uses: ./.github/actions/pypto-serving-tests
