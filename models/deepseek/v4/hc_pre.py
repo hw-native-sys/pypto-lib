@@ -19,6 +19,15 @@ projection hc_fn[mix_hc, hc*D], the per-group scales hc_scale[3] and biases hc_b
     comb[T, hc, hc] = sinkhorn(softmax(reshape(mixes[:, 2hc:] * s2 + base, hc, hc)))
     x_mixed[T, D]   = sum_h pre[:, h] * x[:, h, :]
 
+TWO IMPLEMENTATIONS, selected by the ``HC_PRE_IMPL`` module flag (env ``DSV4_HC_PRE_IMPL``
+or ``--impl``); both are UNIFIED over decode + prefill and compute the identical math above:
+  * ``_hc_pre_syncall`` (default) -- the #684 fusion documented below: ONE full-occupancy
+    ``pl.spmd(24)`` with 2 hard ``pl.system.syncall`` barriers, run with dep_gen OFF.
+  * ``_hc_pre_separate`` -- the pre-#684 structure: each work-type is its OWN ``pl.spmd``
+    task (cast / rms / seed / linear / split_pre_post / write_post / comb_sinkhorn / mix_x),
+    ordered by the runtime task graph (dep_gen ON), tile sizes aligned to the syncall path.
+The rest of this docstring describes the default ``_hc_pre_syncall`` fusion.
+
 FUSION (unified decode + prefill): the whole op is ONE ``pl.spmd(NUM_CORES=24)`` launch --
 24 persistent blocks == 24 AIC + 48 AIV == every 910B core (the full-occupancy contract a
 hard ``pl.system.syncall(core_type="mix")`` requires). The body is 3 phases separated by 2
@@ -59,12 +68,24 @@ N (MIX_PAD) and hc(4) to an 8-wide vector row (HC_PAD).
 """
 
 
+import os
+
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
 
 
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
+
+# Implementation selector (both versions are UNIFIED -- one code path for decode AND
+# prefill; no separate decode/prefill dispatch):
+#   "syncall"  (default) -- the #684 fused kernel: ONE full-occupancy pl.spmd(24) with
+#               2 hard pl.system.syncall barriers; runs with dep_gen OFF (pypto#1931).
+#   "separate" -- the pre-#684 multi-scope structure: each work-type is its own pl.spmd
+#               task, ordered by the runtime task graph (dep_gen ON), applied to ALL T.
+# Switch via env DSV4_HC_PRE_IMPL={syncall,separate} or by reassigning this module global
+# before the kernel is traced (the __main__ below wires it to --impl).
+HC_PRE_IMPL = os.environ.get("DSV4_HC_PRE_IMPL", "separate").lower()
 
 
 D = M.hidden_size
@@ -98,7 +119,7 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 # partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
 # cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
 # decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 16
+LINEAR_OK = 4
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
@@ -130,7 +151,7 @@ assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
 
 
 @pl.jit.inline
-def hc_pre(
+def _hc_pre_syncall(
     x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
@@ -150,16 +171,18 @@ def hc_pre(
     # Cross-barrier intermediates: allocated ONCE in GM/HBM, live across the phases.
     x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-    # comb_logits / post_pad_store are now SAME-CORE scratch: the sinkhorn / write_post task
-    # writes its token-tile's gate then reads it back on the SAME core (no barrier). They are
-    # kept (not deleted) because both feed a downstream pl.load->pl.store that needs an
-    # HC_PAD-wide (32B-aligned) tile -- a narrow [T_TILE, HC_MULT] FP32 tile is 16B rows and
-    # pto.alloc_tile rejects it. pre (mix_x) is consumed in tensor-world, so it needs no buffer.
+    # post_pad_store is SAME-CORE scratch: write_post writes its token-tile's post gate then
+    # reads it back on the SAME core (no barrier). It is kept (not deleted) because its
+    # downstream pl.load->pl.store needs an HC_PAD-wide (32B-aligned) tile -- a narrow
+    # [T_TILE, HC_MULT] FP32 tile is 16B rows and pto.alloc_tile rejects it. pre (mix_x) and
+    # comb (loaded straight from mixes_raw) are consumed in-tile, so they need no scratch.
     post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)  # HC_PAD-wide same-core scratch; write_post narrows to post
-    # MIX_PAD (not HC_MULT*HC_MULT=16): comb_sinkhorn loads each group HC_PAD-wide at
-    # offset k*HC_MULT, so group 3 reads cols [12:20] -- a 16-wide alloc puts that load
-    # descriptor out of bounds. The 32-wide alloc keeps every descriptor in-bounds.
-    comb_logits = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    # inv_rms same-core scratch for the comb gate: the per-token inv is a [T_TILE,1] COLUMN,
+    # which the comb groups (Tiles) need as a Tile too. pto rejects a transposed [T_TILE,1]
+    # tile (row-major, 4B row < 32B) and forbids Tile x Tensor ops, so the tensor-world inv
+    # is spilled to this [t_linear,1] buffer and loaded back as a [T_TILE,1] Tile (8 floats,
+    # vs the 128-float [.,16] comb_logits round-trip this replaces).
+    inv_gm = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     sq_sum_acc = pl.create_tensor([1, t_linear], dtype=pl.FP32)  # RMS split-K sum-of-squares (row layout: [1,T_TILE] tiles stay 32B-aligned)
 
     # Per-phase grid-stride bounds (dynamic in t_dim; grid-stride round-robins any T over cores).
@@ -243,20 +266,33 @@ def hc_pre(
             for gw in pl.range(lane, pool_d, NUM_CORES * 2):
                 if gw < tt_n:
                     t0 = gw * COMB_T_TILE
-                    # Fold Phase C's comb-logit gate here: rsqrt(sq_sum) inline, scale the raw
-                    # mix by inv * scale2, add the group bias -> comb_logits[t0]. Written and
-                    # read back on THIS core (no barrier); the tile-world sinkhorn below is
-                    # unchanged (still loads per-group padded tiles from comb_logits).
-                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,T_TILE] row keeps the rsqrt tile 32B-aligned
-                    inv_col = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
-                    comb_base = hc_reshaped[0:1, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT]
-                    comb_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + COMB_T_TILE, HC_MULT * 2:HC_MULT * 2 + HC_MULT * HC_MULT], inv_col), scale2)
-                    comb_logits_tile = pl.add(comb_scaled, pl.col_expand(comb_scaled, comb_base))
-                    comb_logits = pl.assemble(comb_logits, comb_logits_tile, [t0, 0])
-                    row0 = pl.load(comb_logits, [t0, 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row1 = pl.load(comb_logits, [t0, 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row2 = pl.load(comb_logits, [t0, 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-                    row3 = pl.load(comb_logits, [t0, 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    # Fold Phase C's comb gate here AND skip the comb_logits GM round-trip:
+                    # load the 4 comb groups DIRECTLY from mixes_raw (pad-capable loads at cols
+                    # 8/12/16/20 within the 32-wide MIX_PAD row), then apply inv_rms * scale2 +
+                    # group bias PER GROUP in-tile. The previous version assembled a [.,16]
+                    # comb_logits tile to GM and loaded the 4 misaligned 4-wide groups back
+                    # (pto cannot slice a 16B sub-tile in-register); loading straight from the
+                    # matmul output drops that store+load, matching the prefill path.
+                    # inv_rms for the comb gate must be a TILE (the comb groups below are
+                    # Tiles). Compute it in tensor-world, spill to inv_gm, and load it back as a
+                    # [T_TILE,1] Tile (a transposed [T_TILE,1] tile is rejected -- 4B row).
+                    ssq_row = sq_sum_acc[0:1, t0:t0 + COMB_T_TILE]  # [1,T_TILE] tensor
+                    inv_col_tensor = pl.reshape(pl.rsqrt(pl.add(pl.mul(ssq_row, HC_DIM_INV), NORM_EPS), high_precision=True), [COMB_T_TILE, 1])
+                    inv_gm = pl.assemble(inv_gm, inv_col_tensor, [t0, 0])
+                    inv_col_t = pl.load(inv_gm, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)  # [T_TILE,1] tile
+                    comb_off = HC_MULT * 2
+                    mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb0 = pl.load(hc_reshaped, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb1 = pl.load(hc_reshaped, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb2 = pl.load(hc_reshaped, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    cb3 = pl.load(hc_reshaped, [0, comb_off + 3 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+                    row0 = pl.add(pl.mul(pl.row_expand_mul(mix_g0, inv_col_t), scale2), pl.col_expand(mix_g0, cb0))
+                    row1 = pl.add(pl.mul(pl.row_expand_mul(mix_g1, inv_col_t), scale2), pl.col_expand(mix_g1, cb1))
+                    row2 = pl.add(pl.mul(pl.row_expand_mul(mix_g2, inv_col_t), scale2), pl.col_expand(mix_g2, cb2))
+                    row3 = pl.add(pl.mul(pl.row_expand_mul(mix_g3, inv_col_t), scale2), pl.col_expand(mix_g3, cb3))
                     row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
                     row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
                     row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
@@ -377,6 +413,271 @@ def hc_pre(
                                         valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
                     pl.store(post_tile, [t0, 0], post)
     return x_mixed
+
+
+@pl.jit.inline
+def _hc_pre_separate(
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_scale: pl.Tensor[[3], pl.FP32],
+    hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+    x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+    post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+    comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+):
+    """Multi-scope (separate-task) hc_pre -- the pre-#684 structure, applied to ALL T.
+
+    Identical math to _hc_pre_syncall, but each work-type is its OWN pl.spmd task instead
+    of one full-occupancy pl.spmd + hard pl.system.syncall barriers. The runtime task
+    graph orders the scopes by their GM read/write dependencies (seed -> linear atomic-add
+    -> split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
+    (the __main__ harness sets enable_dep_gen accordingly). Tile sizes are aligned to the
+    tuned syncall version (D_CHUNK / D_SPMD / LINEAR_* / t_linear round-up); cross-barrier
+    buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
+    T_MAX. Kept as a switchable alternative to the fused kernel (perf is not the goal here).
+    """
+    t_dim = pl.tensor.dim(x, 0)
+    t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE  # pad t_dim up to whole 16-row cube tiles
+    x_flat = pl.reshape(x, [t_dim, HC_DIM])
+    scale0 = pl.read(hc_scale, [0])
+    scale1 = pl.read(hc_scale, [1])
+    scale2 = pl.read(hc_scale, [2])
+    hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
+
+    inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
+    x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
+    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+
+    # cast: x (BF16) -> x_fp32 (FP32), fanned over (token-tile x K-slice).
+    for blk in pl.spmd((t_dim // T_TILE) * (HC_DIM // CAST_K_SPMD), name_hint="hc_pre_cast"):
+        t0 = (blk // (HC_DIM // CAST_K_SPMD)) * T_TILE
+        k_base = (blk % (HC_DIM // CAST_K_SPMD)) * CAST_K_SPMD
+        for kb in pl.pipeline(CAST_K_SPMD // RMS_K_CHUNK, stage=4):
+            k0 = k_base + kb * RMS_K_CHUNK
+            x_chunk = pl.cast(x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK], target_type=pl.FP32)
+            x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK] = x_chunk
+    # No x_pad scope: the 8->16 pad rows are left unwritten and the linear matmul below
+    # masks them with valid_shape (zero-fills the row tail), matching the syncall path. The
+    # rms scope only reads the t_dim real rows, so nothing else consumes the pad tail.
+
+    # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
+        t0 = t * T_TILE
+        sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
+            k0 = kb * RMS_K_CHUNK
+            x_chunk = x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+            sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
+        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
+        inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
+
+    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
+    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed"):
+        for ts0 in pl.range(0, t_linear, T_TILE):
+            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
+
+    # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
+        t0 = (task // LINEAR_OK) * LINEAR_T_TILE
+        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
+        acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
+        for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
+            k0 = k_base + kb * LINEAR_K_CHUNK
+            x_linear_chunk = pl.slice(x_fp32, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
+            w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, k0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
+            if kb == 0:
+                acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
+            else:
+                acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
+        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+
+    # split_pre_post: scale mixes_raw by inv_rms, then the pre / post gates. The comb gate
+    # is NOT done here anymore -- comb_sinkhorn reads its 4 groups straight from mixes_raw and
+    # inv_rms, so the comb_logits GM round-trip is dropped (pre stays for mix_x, post-pad for
+    # write_post).
+    pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+        t0 = ob * T_TILE
+        inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
+
+        pre_base = pl.reshape(hc_base[0:HC_PAD], [1, HC_PAD])
+        pre_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, 0:HC_PAD], inv_col), scale0)
+        pre_logits = pl.add(pre_scaled, pl.col_expand(pre_scaled, pre_base))
+        pre_sig = pl.recip(pl.add(pl.exp(pl.neg(pre_logits)), 1.0))
+        pre_val = pl.add(pre_sig, HC_EPS)
+        pre_val_store = pl.assemble(pre_val_store, pre_val, [t0, 0])
+
+        post_base = pl.reshape(hc_base[HC_MULT:HC_MULT + HC_PAD], [1, HC_PAD])
+        post_scaled = pl.mul(pl.row_expand_mul(mixes_raw[t0:t0 + T_TILE, HC_MULT:HC_MULT + HC_PAD], inv_col), scale1)
+        post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
+        post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
+        post_pad = pl.mul(post_sig, 2.0)
+        post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
+
+    # write_post: narrow post-pad [.,HC_PAD] -> post [.,HC_MULT].
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="write_post"):
+        t0 = ob * COMB_T_TILE
+        post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
+                            valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        pl.store(post_tile, [t0, 0], post)
+
+    # comb_sinkhorn: comb gate (direct from mixes_raw, no comb_logits round-trip) + softmax +
+    # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
+    # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
+    # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
+        t0 = ob * COMB_T_TILE
+        inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
+        comb_off = HC_MULT * 2
+        mix_g0 = pl.load(mixes_raw, [t0, comb_off + 0 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g1 = pl.load(mixes_raw, [t0, comb_off + 1 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g2 = pl.load(mixes_raw, [t0, comb_off + 2 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        mix_g3 = pl.load(mixes_raw, [t0, comb_off + 3 * HC_MULT], [COMB_T_TILE, HC_PAD], valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb0 = pl.load(hc_base_2d, [0, comb_off + 0 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb1 = pl.load(hc_base_2d, [0, comb_off + 1 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb2 = pl.load(hc_base_2d, [0, comb_off + 2 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        cb3 = pl.load(hc_base_2d, [0, comb_off + 3 * HC_MULT], [1, HC_PAD], valid_shapes=[1, HC_MULT], target_memory=pl.MemorySpace.Vec)
+        row0 = pl.add(pl.mul(pl.row_expand_mul(mix_g0, inv_col_t), scale2), pl.col_expand(mix_g0, cb0))
+        row1 = pl.add(pl.mul(pl.row_expand_mul(mix_g1, inv_col_t), scale2), pl.col_expand(mix_g1, cb1))
+        row2 = pl.add(pl.mul(pl.row_expand_mul(mix_g2, inv_col_t), scale2), pl.col_expand(mix_g2, cb2))
+        row3 = pl.add(pl.mul(pl.row_expand_mul(mix_g3, inv_col_t), scale2), pl.col_expand(mix_g3, cb3))
+        row0_p = pl.fillpad(row0, pad_value=pl.PadValue.min)
+        row1_p = pl.fillpad(row1, pad_value=pl.PadValue.min)
+        row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
+        row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
+
+        row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row0_max = pl.row_max(row0_p, row_max_tmp)
+        row1_max = pl.row_max(row1_p, row_max_tmp)
+        row2_max = pl.row_max(row2_p, row_max_tmp)
+        row3_max = pl.row_max(row3_p, row_max_tmp)
+        row0_exp = pl.exp(pl.row_expand_sub(row0_p, row0_max))
+        row1_exp = pl.exp(pl.row_expand_sub(row1_p, row1_max))
+        row2_exp = pl.exp(pl.row_expand_sub(row2_p, row2_max))
+        row3_exp = pl.exp(pl.row_expand_sub(row3_p, row3_max))
+        row0_sum = pl.row_sum(row0_exp, row_sum_tmp)
+        row1_sum = pl.row_sum(row1_exp, row_sum_tmp)
+        row2_sum = pl.row_sum(row2_exp, row_sum_tmp)
+        row3_sum = pl.row_sum(row3_exp, row_sum_tmp)
+        row0_soft = pl.add(pl.row_expand_div(row0_exp, row0_sum), HC_EPS)
+        row1_soft = pl.add(pl.row_expand_div(row1_exp, row1_sum), HC_EPS)
+        row2_soft = pl.add(pl.row_expand_div(row2_exp, row2_sum), HC_EPS)
+        row3_soft = pl.add(pl.row_expand_div(row3_exp, row3_sum), HC_EPS)
+
+        row0_valid = pl.set_validshape(row0_soft, COMB_T_TILE, HC_MULT)
+        row1_valid = pl.set_validshape(row1_soft, COMB_T_TILE, HC_MULT)
+        row2_valid = pl.set_validshape(row2_soft, COMB_T_TILE, HC_MULT)
+        row3_valid = pl.set_validshape(row3_soft, COMB_T_TILE, HC_MULT)
+        row0_eff = pl.fillpad(row0_valid, pad_value=pl.PadValue.zero)
+        row1_eff = pl.fillpad(row1_valid, pad_value=pl.PadValue.zero)
+        row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
+        row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
+
+        row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
+        col_sum = pl.add(col_sum, HC_EPS)
+        row0_cur = pl.div(row0_eff, col_sum)
+        row1_cur = pl.div(row1_eff, col_sum)
+        row2_cur = pl.div(row2_eff, col_sum)
+        row3_cur = pl.div(row3_eff, col_sum)
+
+        for _sk_it in pl.pipeline(HC_SINKHORN_ITER - 1, stage=2):
+            row0_rowsum = pl.add(pl.row_sum(row0_cur, row_sum_tmp_iter), HC_EPS)
+            row1_rowsum = pl.add(pl.row_sum(row1_cur, row_sum_tmp_iter), HC_EPS)
+            row2_rowsum = pl.add(pl.row_sum(row2_cur, row_sum_tmp_iter), HC_EPS)
+            row3_rowsum = pl.add(pl.row_sum(row3_cur, row_sum_tmp_iter), HC_EPS)
+            row0_norm = pl.row_expand_div(row0_cur, row0_rowsum)
+            row1_norm = pl.row_expand_div(row1_cur, row1_rowsum)
+            row2_norm = pl.row_expand_div(row2_cur, row2_rowsum)
+            row3_norm = pl.row_expand_div(row3_cur, row3_rowsum)
+            col_sum = pl.add(pl.add(row0_norm, row1_norm), pl.add(row2_norm, row3_norm))
+            col_sum = pl.add(col_sum, HC_EPS)
+            row0_cur = pl.div(row0_norm, col_sum)
+            row1_cur = pl.div(row1_norm, col_sum)
+            row2_cur = pl.div(row2_norm, col_sum)
+            row3_cur = pl.div(row3_norm, col_sum)
+
+        row0_out = pl.set_validshape(row0_cur, COMB_T_TILE, HC_MULT)
+        row1_out = pl.set_validshape(row1_cur, COMB_T_TILE, HC_MULT)
+        row2_out = pl.set_validshape(row2_cur, COMB_T_TILE, HC_MULT)
+        row3_out = pl.set_validshape(row3_cur, COMB_T_TILE, HC_MULT)
+        pl.store(row0_out, [t0, 0 * HC_MULT], comb)
+        pl.store(row1_out, [t0, 1 * HC_MULT], comb)
+        pl.store(row2_out, [t0, 2 * HC_MULT], comb)
+        pl.store(row3_out, [t0, 3 * HC_MULT], comb)
+
+    # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD tasks per tile).
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x"):
+        t0 = (blk // (D // D_SPMD)) * T_TILE
+        d_base = (blk % (D // D_SPMD)) * D_SPMD
+        pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
+        pre0 = pl.reshape(pre_tile_t[0:1, 0:T_TILE], [T_TILE, 1])
+        pre1 = pl.reshape(pre_tile_t[1:2, 0:T_TILE], [T_TILE, 1])
+        pre2 = pl.reshape(pre_tile_t[2:3, 0:T_TILE], [T_TILE, 1])
+        pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
+        for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
+            d0 = d_base + db * D_CHUNK
+            x0 = pl.cast(x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x1 = pl.cast(x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x2 = pl.cast(x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x3 = pl.cast(x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            y0 = pl.row_expand_mul(x0, pre0)
+            y1 = pl.row_expand_mul(x1, pre1)
+            y2 = pl.row_expand_mul(x2, pre2)
+            y3 = pl.row_expand_mul(x3, pre3)
+            y_tile = pl.add(pl.add(y0, y1), pl.add(y2, y3))
+            x_mixed[t0:t0 + T_TILE, d0:d0 + D_CHUNK] = pl.cast(y_tile, target_type=pl.BF16, mode="rint")
+    return x_mixed
+
+
+def _bind_hc_pre():
+    """Define and return the public `hc_pre` inline kernel for the selected HC_PRE_IMPL.
+
+    pypto constrains how the choice can be expressed:
+      * a kernel-body branch on the module-global string (``if HC_PRE_IMPL == ...``) fails
+        -- pypto's frontend treats it as device control flow and cannot resolve the name;
+      * an alias (``hc_pre = _hc_pre_syncall``) fails at the call site -- pypto matches the
+        call-site NAME against the callee's registered ``__name__`` ("hc_pre" != the impl).
+    So `hc_pre` must BE a decorated inline named ``hc_pre`` that calls the chosen impl by
+    its literal name; the selection is a plain-Python ``if`` at import (never seen by a
+    kernel). Re-invoke to rebind after changing HC_PRE_IMPL (the __main__ --impl path).
+    """
+    if HC_PRE_IMPL == "separate":
+        @pl.jit.inline
+        def hc_pre(
+            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+            hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+            hc_scale: pl.Tensor[[3], pl.FP32],
+            hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+            x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+            post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+            comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+        ):
+            _hc_pre_separate(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+            return x_mixed
+    else:
+        @pl.jit.inline
+        def hc_pre(
+            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+            hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+            hc_scale: pl.Tensor[[3], pl.FP32],
+            hc_base: pl.Tensor[[MIX_HC], pl.FP32],
+            x_mixed: pl.Tensor[[T_DYN, D], pl.BF16],
+            post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
+            comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
+        ):
+            _hc_pre_syncall(x, hc_fn, hc_scale, hc_base, x_mixed, post, comb)
+            return x_mixed
+    return hc_pre
+
+
+# Public entry point. Callers do `from hc_pre import hc_pre`; env DSV4_HC_PRE_IMPL (or the
+# __main__ --impl flag, which rebinds) picks the implementation at import time.
+hc_pre = _bind_hc_pre()
 
 
 @pl.jit
@@ -505,20 +806,31 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="deprecated no-op: dep_gen is already forced off for hc_pre "
-                             "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
-                             "kept for CLI / CI back-compat.")
+                        help="deprecated no-op: dep_gen is auto-selected per --impl (OFF for "
+                             "'syncall' per pypto#1931, ON for 'separate'); kept for CLI / CI back-compat.")
+    parser.add_argument("--impl", choices=["syncall", "separate"], default=HC_PRE_IMPL,
+                        help="hc_pre implementation: 'syncall' (fused single task, #684) or "
+                             "'separate' (multi-scope task graph, pre-#684). Both are unified "
+                             "over decode+prefill. Default from env DSV4_HC_PRE_IMPL.")
     args = parser.parse_args()
 
-    # hc_pre's fused body is specialized to Ascend 910B: NUM_CORES=24 IS the physical AIC
-    # count, and the hard full-occupancy mix-syncall hangs (AICore timeout 507018) unless the
-    # launch fills every physical core of the SoC. A5 (Ascend950) has a different core count,
-    # so 24 blocks would leave physical participants unreached -> reject it here rather than
-    # hang. Supporting A5 needs a backend-aware participant count + re-tuning/re-validation.
+    # Select the implementation for this run: set the flag, then rebind the module-global
+    # `hc_pre` to the chosen inline kernel BEFORE run_jit traces hc_pre_test (which resolves
+    # `hc_pre` from the module namespace at trace time).
+    HC_PRE_IMPL = args.impl
+    hc_pre = _bind_hc_pre()
+    print(f"hc_pre implementation: {HC_PRE_IMPL}")
+
+    # hc_pre is specialized to Ascend 910B. The "syncall" body sets NUM_CORES=24 == the
+    # physical AIC count and its hard full-occupancy mix-syncall hangs (AICore timeout
+    # 507018) unless the launch fills every physical core; A5 (Ascend950) has a different
+    # core count. The "separate" body has no such barrier but is still 910B-tuned (tile
+    # sizes + device-only atomic-add). Either way, reject A5 rather than hang / mis-run;
+    # supporting it needs a backend-aware participant count + re-tuning/re-validation.
     if args.platform in ("a5", "a5sim"):
         raise SystemExit(
             f"hc_pre is specialized to Ascend 910B (NUM_CORES={NUM_CORES} == physical AIC count); "
-            f"its full-occupancy mix-syncall would hang on {args.platform!r}. Run with -p a2a3."
+            f"the {HC_PRE_IMPL!r} impl would hang / mis-run on {args.platform!r}. Run with -p a2a3."
         )
 
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
@@ -537,10 +849,12 @@ if __name__ == "__main__":
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
-                # dep_gen forced OFF: this kernel's full-occupancy pl.system.syncall is
+                # dep_gen: the "syncall" version's full-occupancy pl.system.syncall is
                 # incompatible with dep_gen -- the DFX instrumentation perturbs core
-                # occupancy and trips AICore timeout 507018 (pypto#1931).
-                enable_dep_gen=False,
+                # occupancy and trips AICore timeout 507018 (pypto#1931) -- so it runs with
+                # dep_gen OFF. The "separate" version has no hard syncall and RELIES on
+                # dep_gen to order its multi-scope task graph, so it runs with dep_gen ON.
+                enable_dep_gen=(HC_PRE_IMPL == "separate"),
             ),
             rtol=1e-3,
             atol=1e-3,
