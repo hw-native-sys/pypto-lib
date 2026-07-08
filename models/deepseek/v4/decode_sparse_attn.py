@@ -38,7 +38,7 @@ NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
 IDX_TOPK = M.index_topk
-TOPK_FULL = WIN + IDX_TOPK           # full sparse-K width (window + indexer topk)
+TOPK_FULL = WIN + IDX_TOPK           # sparse-K columns: window/overlay block + indexer topk
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -188,7 +188,7 @@ assert QK_BLOCK_NSPLIT <= SPARSE_BLOCKS
 def sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -206,7 +206,7 @@ def sparse_attn(
     # Gather the sliding-window + current-MTP overlay + compressed-cache rows
     # into a per-token packed KV list. Raw index contract:
     #   -1              invalid
-    #   [0, WIN)        historical ring/window KV
+    #   [0, WIN)        index into per-token physical window_swa_indices
     #   [WIN, WIN + S)  current MTP overlay KV for this batch
     #   [WIN + S, ...)  compressed KV slots
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -236,15 +236,24 @@ def sparse_attn(
         kvt_row = ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM]
         ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM] = kvt_row
 
-    # Flash-fusion: the per-token KV gather is folded INTO qk_pv (below) -- each
-    # (token, sparse-block) gathers its ATTN_K_TILE rows straight into an L1 matmul
-    # operand via pl.gather_row (GM->L1, no tmov), so the sparse_kv GM staging
-    # tensor and the standalone gather_kv / gather_kv_cmp kernels are gone. The raw
-    # index -> physical row contract is unchanged (see line 138); invalid (raw < 0)
-    # slots gather ori_kv_flat[0] (a finite, in-range row) and are zeroed out by the
-    # NEG_INF softmax bias instead of by a zero KV row -- equivalent because the bias
-    # drives exp(score) to ~0, and an all-invalid block is annihilated in merge_norm
-    # by beta = exp(NEG_INF - m) = 0 regardless of its (finite) numerator.
+    window_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
+    gather_tids = pl.array.create(1, pl.TASK_ID)
+    with pl.spmd(T, name_hint="window_gather_kv") as gather_tid:
+        g_t = pl.tile.get_block_idx()
+        g_base = g_t * WIN
+        for g_r in pl.range(WIN):
+            g_slot_i32 = pl.read(window_swa_indices, [g_t, g_r])
+            g_dst = g_base + g_r
+            if g_slot_i32 >= 0:
+                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                window_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+            else:
+                window_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    gather_tids[0] = gather_tid
+
+    # qk_pv gathers overlay/compressed rows into an L1 matmul operand and reads
+    # historical window rows from the metadata-packed staging buffer. Invalid lanes
+    # gather a finite row and are zeroed out by the NEG_INF softmax bias.
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     o_packed = pl.create_tensor([O_GROUPS * T, O_GROUP_IN], dtype=pl.BF16)
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
@@ -255,12 +264,13 @@ def sparse_attn(
     # The old task shape was one task per token and serialized all SPARSE_BLOCKS
     # inside it, making each qk_pv task long at 8k. Full per-block fanout makes
     # tasks short but overpays setup, so use a small NSPLIT like indexer score.
-    for qk_unit in pl.spmd(T * QK_BLOCK_NSPLIT, name_hint="qk_pv"):
+    with pl.spmd(T * QK_BLOCK_NSPLIT, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
+        qk_unit = pl.tile.get_block_idx()
         qk_t = qk_unit // QK_BLOCK_NSPLIT
         qk_split = qk_unit - qk_t * QK_BLOCK_NSPLIT
         qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
+        qk_window_base = qk_t * WIN
         qk_overlay_base = qk_b * S
         # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
         # then both head-batches' QK (b_trans) and PV consume the SAME normal-layout
@@ -287,8 +297,8 @@ def sparse_attn(
                         qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_k])
                         if qk_ridx >= 0:
                             if qk_ridx < WIN:
-                                qk_src = qk_ori_base + qk_ridx
-                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
+                                qk_src = qk_window_base + qk_ridx
+                                qk_kv = pl.gather_row(qk_kv, window_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
                             elif qk_ridx < WIN + S:
                                 qk_ov = qk_overlay_base + (qk_ridx - WIN)
                                 qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
@@ -575,7 +585,7 @@ def sparse_attn(
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -592,7 +602,7 @@ def sparse_attn_test(
     sparse_attn(
         q,
         ori_kv,
-        ori_block_table,
+        window_swa_indices,
         mtp_kv_overlay,
         cmp_kv,
         cmp_block_table,
@@ -639,7 +649,7 @@ def golden_sparse_attn(tensors):
 
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
-    ori_block_table = tensors["ori_block_table"]
+    window_swa_indices = tensors["window_swa_indices"]
     mtp_kv_overlay = tensors["mtp_kv_overlay"].float()
     cmp_kv = tensors["cmp_kv"].float()
     cmp_block_table = tensors["cmp_block_table"]
@@ -654,7 +664,7 @@ def golden_sparse_attn(tensors):
     o = torch.zeros(T, H, HEAD_DIM)
 
     # Per-query-token attention. cmp_sparse_indices is the authoritative
-    # topk list: -1 invalid; raw < WIN selects ring cache;
+    # topk list: -1 invalid; raw < WIN indexes window_swa_indices;
     # WIN <= raw < WIN+S selects the current MTP overlay; raw >= WIN+S
     # selects the compressed-cache tail.
     for t in range(T):
@@ -668,10 +678,15 @@ def golden_sparse_attn(tensors):
                 valid.append(False)
                 continue
             if raw < WIN:
-                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-                intra = raw % BLOCK_SIZE
-                kv_rows.append(ori_kv[blk_id, intra, 0])
-                valid.append(True)
+                slot = int(window_swa_indices[t, raw].item())
+                if slot >= 0:
+                    blk_id = slot // BLOCK_SIZE
+                    intra = slot % BLOCK_SIZE
+                    kv_rows.append(ori_kv[blk_id, intra, 0])
+                    valid.append(True)
+                else:
+                    kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
+                    valid.append(False)
             elif raw < WIN + S:
                 overlay_s = raw - WIN
                 kv_rows.append(mtp_kv_overlay[b * S + overlay_s])
@@ -791,6 +806,18 @@ def build_tensor_specs(
             kv[0, WIN - 1, 0].fill_(8.0)
         return kv
 
+    def init_window_swa_indices():
+        """Build physical cache-row indices for standalone window raw slots."""
+        tbl = init_window_block_table()
+        indices = torch.full((T, WIN), -1, dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            for raw in range(WIN):
+                blk = int(tbl[b, raw // BLOCK_SIZE].item())
+                if blk >= 0:
+                    indices[t, raw] = blk * BLOCK_SIZE + raw % BLOCK_SIZE
+        return indices
+
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
         return torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
@@ -807,7 +834,7 @@ def build_tensor_specs(
         """Initialize the per-head sink logits to zero."""
         return torch.zeros(H)
 
-    def init_ori_block_table():
+    def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
         tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(B):
@@ -891,7 +918,7 @@ def build_tensor_specs(
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
+        TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("mtp_kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_mtp_kv_overlay),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),

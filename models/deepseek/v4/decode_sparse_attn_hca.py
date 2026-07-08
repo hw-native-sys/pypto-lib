@@ -169,7 +169,7 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-# HCA sparse-K width: window (block 0, zero-gather) + S relocated overlay slots +
+# HCA sparse-K width: historical window + S relocated overlay slots +
 # the deterministic ratio-128 compressed tail (both in block 1, gathered).
 TOPK = WIN + S + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
@@ -177,16 +177,14 @@ TOPK = WIN + S + min(MAX_SEQ_LEN // 128, IDX_TOPK)
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
-# ZERO-GATHER contract: block 0 reads the window ring page directly as an ATTN_K_TILE-row
-# GM slice, so the window page must be exactly one tile.
-assert WIN == ATTN_K_TILE, f"HCA zero-gather requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
+assert WIN == ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
 
 
 @pl.jit.inline
 def sparse_attn_hca(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -200,10 +198,10 @@ def sparse_attn_hca(
     attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     """Run sparse decode attention, inverse RoPE, and grouped output projection."""
-    # Gather the sliding-window + current-MTP overlay + compressed-cache rows
+    # Gather the historical window + current-MTP overlay + compressed-cache rows
     # into a per-token packed KV list. Raw index contract:
     #   -1              invalid
-    #   [0, WIN)        historical ring/window KV
+    #   [0, WIN)        index into per-token physical window_swa_indices
     #   [WIN, WIN + S)  current MTP overlay KV for this batch
     #   [WIN + S, ...)  compressed KV slots
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -220,18 +218,23 @@ def sparse_attn_hca(
         v_valid_f = pl.minimum(pl.maximum(pl.add(v_idx_f, 1.0), 0.0), 1.0)
         sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : PADDED_TOPK] = pl.mul(pl.sub(v_valid_f, 1.0), -NEG_INF)
 
-    # ZERO-GATHER (block 0): no kv_touch. Block 0 reads the ring page as a DIRECT GM
-    # slice (tracked by the dep system), so the layer's KV-cache writeback gets its WAR
-    # edge for free (the wrapper still folds an attn_out write-guard for robustness).
-    # Block 1 still gathers, but only mtp_kv_overlay/cmp_kv -- never ori_kv -- so there
-    # is no untracked ori_kv read left.
+    window_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
+    gather_tids = pl.array.create(1, pl.TASK_ID)
+    with pl.spmd(T, name_hint="window_gather_kv") as gather_tid:
+        g_t = pl.tile.get_block_idx()
+        g_base = g_t * WIN
+        for g_r in pl.range(WIN):
+            g_slot_i32 = pl.read(window_swa_indices, [g_t, g_r])
+            g_dst = g_base + g_r
+            if g_slot_i32 >= 0:
+                g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                window_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+            else:
+                window_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+    gather_tids[0] = gather_tid
 
-    # Flash-fusion: the per-token compressed+overlay gather is folded INTO qk_pv
-    # (below) -- each (token, sparse-block) gathers its ATTN_K_TILE rows straight
-    # into an L1 matmul operand via pl.gather_row (GM->L1, no tmov), so the sparse_kv
-    # GM staging tensor and the standalone gather_kv kernel are gone. Raw-index
-    # contract unchanged (line 124); invalid (raw < 0) lanes gather row 0, and padded
-    # (k >= TOPK) lanes skip the gather entirely (the NEG_INF bias zeros them).
+    # qk_pv gathers overlay/compressed rows into an L1 matmul operand and reads
+    # historical window rows from the metadata-packed staging buffer.
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -242,10 +245,11 @@ def sparse_attn_hca(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    for qk_t in pl.spmd(T, name_hint="qk_pv"):
+    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]]) as qk_tid:
+        qk_t = pl.tile.get_block_idx()
         qk_b = qk_t // S
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-        qk_ori_base = pl.cast(pl.read(ori_block_table, [qk_b, 0]), pl.INDEX) * BLOCK_SIZE
+        qk_window_base = qk_t * WIN
         qk_overlay_base = qk_b * S
         # Sparse-block OUTER / head-tile INNER: gather the block's KV into L1 once,
         # then both head-batches' QK (b_trans) and PV consume the SAME tile.
@@ -253,16 +257,8 @@ def sparse_attn_hca(
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
             if qk_sb == 0:
-                # ZERO-GATHER block 0 = window ring page ori_kv[block_table[b,0]]
-                # (physical rows 0..WIN-1) read as a DIRECT GM slice -- no gather_row.
-                # cmp_sparse_indices[0:WIN] is physical/identity order with the
-                # current-token ring slots set to -1, so build_valid's bias masks each
-                # page row exactly (the overlay rows are attended in block 1 instead).
-                qk_kv = ori_kv_flat[qk_ori_base : qk_ori_base + ATTN_K_TILE, 0 : HEAD_DIM]
+                qk_kv = window_kv_flat[qk_window_base : qk_window_base + ATTN_K_TILE, 0 : HEAD_DIM]
             else:
-                # Block 1 = relocated overlay + compressed rows, gathered into an L1
-                # matmul operand. Invalid (raw < 0) lanes gather row 0; padded
-                # (qk_k >= TOPK) lanes skip the gather (NEG_INF bias zeros their weight).
                 qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
                 for qk_r in pl.range(ATTN_K_TILE):
                     qk_k = qk_s0 + qk_r
@@ -270,8 +266,8 @@ def sparse_attn_hca(
                         qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_k])
                         if qk_ridx >= 0:
                             if qk_ridx < WIN:
-                                qk_src = qk_ori_base + qk_ridx
-                                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
+                                qk_src = qk_window_base + qk_ridx
+                                qk_kv = pl.gather_row(qk_kv, window_kv_flat, [qk_r, 0], [qk_src, 0], [1, HEAD_DIM])
                             elif qk_ridx < WIN + S:
                                 qk_ov = qk_overlay_base + (qk_ridx - WIN)
                                 qk_kv = pl.gather_row(qk_kv, mtp_kv_overlay, [qk_r, 0], [qk_ov, 0], [1, HEAD_DIM])
@@ -546,7 +542,7 @@ def sparse_attn_hca(
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
+    window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     mtp_kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
@@ -562,7 +558,7 @@ def sparse_attn_test(
     sparse_attn_hca(
         q,
         ori_kv,
-        ori_block_table,
+        window_swa_indices,
         mtp_kv_overlay,
         cmp_kv,
         cmp_block_table,
@@ -608,7 +604,7 @@ def golden_sparse_attn(tensors):
 
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
-    ori_block_table = tensors["ori_block_table"]
+    window_swa_indices = tensors["window_swa_indices"]
     mtp_kv_overlay = tensors["mtp_kv_overlay"].float()
     cmp_kv = tensors["cmp_kv"].float()
     cmp_block_table = tensors["cmp_block_table"]
@@ -623,7 +619,7 @@ def golden_sparse_attn(tensors):
     o = torch.zeros(T, H, HEAD_DIM)
 
     # Per-query-token attention. cmp_sparse_indices is the authoritative
-    # topk list: -1 invalid; raw < WIN selects ring cache;
+    # topk list: -1 invalid; raw < WIN indexes window_swa_indices;
     # WIN <= raw < WIN+S selects the current MTP overlay; raw >= WIN+S
     # selects the compressed-cache tail.
     for t in range(T):
@@ -637,10 +633,15 @@ def golden_sparse_attn(tensors):
                 valid.append(False)
                 continue
             if raw < WIN:
-                blk_id = int(ori_block_table[b, raw // BLOCK_SIZE].item())
-                intra = raw % BLOCK_SIZE
-                kv_rows.append(ori_kv[blk_id, intra, 0])
-                valid.append(True)
+                slot = int(window_swa_indices[t, raw].item())
+                if slot >= 0:
+                    blk_id = slot // BLOCK_SIZE
+                    intra = slot % BLOCK_SIZE
+                    kv_rows.append(ori_kv[blk_id, intra, 0])
+                    valid.append(True)
+                else:
+                    kv_rows.append(torch.zeros(HEAD_DIM, dtype=ori_kv.dtype))
+                    valid.append(False)
             elif raw < WIN + S:
                 overlay_s = raw - WIN
                 kv_rows.append(mtp_kv_overlay[b * S + overlay_s])
@@ -753,6 +754,18 @@ def build_tensor_specs(
             kv[0, WIN - 1, 0].fill_(8.0)
         return kv
 
+    def init_window_swa_indices():
+        """Build physical cache-row indices for standalone window raw slots."""
+        tbl = init_window_block_table()
+        indices = torch.full((T, WIN), -1, dtype=torch.int32)
+        for t in range(T):
+            b = t // S
+            for raw in range(WIN):
+                blk = int(tbl[b, raw // BLOCK_SIZE].item())
+                if blk >= 0:
+                    indices[t, raw] = blk * BLOCK_SIZE + raw % BLOCK_SIZE
+        return indices
+
     def init_cmp_kv():
         """Initialize the compressed-cache KV pages."""
         return torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
@@ -769,7 +782,7 @@ def build_tensor_specs(
         """Initialize the per-head sink logits to zero."""
         return torch.zeros(H)
 
-    def init_ori_block_table():
+    def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
         tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(B):
@@ -847,7 +860,7 @@ def build_tensor_specs(
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("ori_block_table", [B, ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
+        TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("mtp_kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_mtp_kv_overlay),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),

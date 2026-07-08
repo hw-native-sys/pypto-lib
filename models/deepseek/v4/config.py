@@ -254,10 +254,13 @@ C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 LM_HEAD_TP_SIZE = 8
 
-# Static paged-cache pools shared by decode and prefill kernels. Prefill uses a
-# decode-batch-sized physical pool because serving slot ids address the shared
-# decode KV-cache layout even when a prefill kernel handles one request at a time.
-KV_ORI_MAX_BLOCKS = 1
+# Static paged-cache pools shared by decode and prefill kernels. Decode ori-KV
+# is a sliding-window ring, so it only needs enough physical pages to cover the
+# window plus the current decode chunk boundary. Its block table keeps vLLM-style
+# absolute logical block columns so long-context metadata can still address the
+# current window without allocating full-context KV pages.
+KV_ORI_MAX_BLOCKS = (FLASH.sliding_window + DECODE_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
+KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
 KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64
 DECODE_ORI_BLOCK_NUM = DECODE_BATCH * KV_ORI_MAX_BLOCKS
