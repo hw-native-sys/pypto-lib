@@ -112,7 +112,9 @@ def indexer(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
     topk_idxs: pl.Tensor[[B, S, SCORE_LEN], pl.INT32],
@@ -216,65 +218,38 @@ def indexer(
         x, inner_kv,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        cos, sin, hadamard, idx_kv_cache,
+        cos, sin, hadamard, idx_kv_cache, idx_kv_scale,
         position_ids, idx_slot_mapping, inner_state_slot_mapping,
     )
 
-    kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
+    kv_cache_i8_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
+    kv_scale_flat = pl.reshape(idx_kv_scale, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1])
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
+
     # No score_init: reduce writes the valid region; the tail is never read (topk re-masks).
-    # Score in three GM-handoff stages: quant (vec) -> matmul (cube) -> reduce (vec).
-    kv_q_i8_gm = pl.create_tensor([T * IDX_KV_LEN, IDX_HEAD_DIM], dtype=pl.INT8)
-    kv_dq_gm = pl.create_tensor([T * IDX_KV_LEN, 1], dtype=pl.FP32)
+    # Two GM-handoff stages: matmul (cube, reads paged C8 directly) -> reduce (vec).
     score_acc_gm = pl.create_tensor([T * IDX_KV_LEN, IDX_N_HEADS], dtype=pl.INT32)
 
-    for unit in pl.spmd(T * QUANT_NSPLIT, name_hint="score_kv_quant"):
-        tg = unit // QUANT_NSPLIT
-        split = unit - tg * QUANT_NSPLIT
-        b = tg // S
-        clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
-        cblk_b = (clen_b + CACHE_TILE - 1) // CACHE_TILE
-        # this lane owns cache tiles cb = split, split + NSPLIT, split + 2*NSPLIT, ...
-        lane_iters = (cblk_b - split + QUANT_NSPLIT - 1) // QUANT_NSPLIT
-        for cb_local in pl.range(lane_iters):
-            cb = split + cb_local * QUANT_NSPLIT
-            cache0 = cb * CACHE_TILE
-            idx_blk_off = cache0 // BLOCK_SIZE
-            idx_intra = cache0 % BLOCK_SIZE
-            idx_blk_id = pl.cast(
-                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + idx_blk_off]),
-                pl.INDEX,
-            )
-            kv0 = idx_blk_id * BLOCK_SIZE + idx_intra
-            base = tg * IDX_KV_LEN + cache0
-            kv_q_full_f32 = pl.cast(kv_cache_flat[kv0 : kv0 + CACHE_TILE, 0 : IDX_HEAD_DIM], target_type=pl.FP32)
-            # amax = max(|x|); abs-based (max(row_max, -row_min) is wrong on signed KV)
-            kv_amax = pl.reshape(pl.row_max(pl.abs(kv_q_full_f32)), [1, CACHE_TILE])
-            kv_amax = pl.maximum(kv_amax, pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS))
-            kv_scale_quant_row = pl.div(pl.full([1, CACHE_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
-            kv_cache_scale_dq = pl.reshape(pl.recip(kv_scale_quant_row), [CACHE_TILE, 1])
-            kv_scale_quant = pl.reshape(kv_scale_quant_row, [CACHE_TILE, 1])
-            kv_q_full_scaled = pl.row_expand_mul(kv_q_full_f32, kv_scale_quant)
-            kv_q_full_i32 = pl.cast(kv_q_full_scaled, target_type=pl.INT32, mode="rint")
-            kv_q_full_half = pl.cast(kv_q_full_i32, target_type=pl.FP16, mode="round")
-            kv_q_i8_full = pl.cast(kv_q_full_half, target_type=pl.INT8, mode="trunc")
-            kv_q_i8_gm[base : base + CACHE_TILE, :] = kv_q_i8_full
-            kv_dq_gm[base : base + CACHE_TILE, :] = kv_cache_scale_dq
-
+    # read paged C8 KV one page per tile, matmul with the per-step-quantized query
     for tg in pl.spmd(T, name_hint="score_mat"):
         b = tg // S
         s = tg - b * S
         clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
-        cblk_b = (clen_b + MAT_TILE - 1) // MAT_TILE
+        cblk_b = (clen_b + BLOCK_SIZE - 1) // BLOCK_SIZE
         qb = b * S * IDX_N_HEADS
         qr_full = qr_hadamard_i8[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
         for cb in pl.range(cblk_b):
-            cache0 = cb * MAT_TILE
+            cache0 = cb * BLOCK_SIZE
+            idx_blk_id = pl.cast(
+                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
+                pl.INDEX,
+            )
+            kv0 = idx_blk_id * BLOCK_SIZE
             base = tg * IDX_KV_LEN + cache0
-            kv_q_i8_mat = kv_q_i8_gm[base : base + MAT_TILE, :]
-            score_acc_mat = pl.matmul(kv_q_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
-            score_acc_gm[base : base + MAT_TILE, :] = score_acc_mat
+            kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + BLOCK_SIZE, :]
+            score_acc_mat = pl.matmul(kv_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
+            score_acc_gm[base : base + BLOCK_SIZE, :] = score_acc_mat
 
     for unit in pl.spmd(T * REDUCE_NSPLIT, name_hint="score_reduce"):
         tg = unit // REDUCE_NSPLIT
@@ -295,8 +270,13 @@ def indexer(
             cache0 = cb * REDUCE_TILE
             valid_len = pl.min(REDUCE_TILE, visible_len_t - cache0)
             base = tg * IDX_KV_LEN + cache0
+            idx_blk_id = pl.cast(
+                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
+                pl.INDEX,
+            )
+            kv0 = idx_blk_id * BLOCK_SIZE
             score_acc_red = score_acc_gm[base : base + REDUCE_TILE, :]
-            kv_dq_red = kv_dq_gm[base : base + REDUCE_TILE, :]
+            kv_dq_red = kv_scale_flat[kv0 : kv0 + REDUCE_TILE, :]  # paged per-position dequant scale
             score_tile_red = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")
             # per-position dequant kv_dq_red applied after the head-sum
             score_tile_red = pl.col_expand_mul(score_tile_red, qh_scale_s)
@@ -364,7 +344,8 @@ def indexer_test(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.INT32]],
@@ -392,6 +373,7 @@ def indexer_test(
         inner_ape,
         inner_norm_w,
         idx_kv_cache,
+        idx_kv_scale,
         idx_block_table,
         score,
         topk_idxs,
@@ -401,7 +383,7 @@ def indexer_test(
         kv_seq_lens,
         offset,
     )
-    return score, idx_kv_cache, topk_idxs
+    return score, idx_kv_cache, idx_kv_scale, topk_idxs
 
 
 def _int8_quant_per_row(x):
@@ -501,6 +483,7 @@ def golden_indexer(tensors):
         "compress_state": tensors["inner_compress_state"],
         "compress_state_block_table": tensors["inner_compress_state_block_table"],
         "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_kv_scale": tensors["idx_kv_scale"],
         "position_ids": tensors["position_ids"],
         "idx_slot_mapping": tensors["idx_slot_mapping"],
         "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
@@ -509,7 +492,9 @@ def golden_indexer(tensors):
 
     weights = (x @ weights_proj) * WEIGHTS_SCALE
 
-    idx_kv_cache = tensors["idx_kv_cache"].float()
+    # C8 cache: pre-quantized INT8 KV + per-position dequant scale (no score-time re-quant)
+    idx_kv_cache_i8 = tensors["idx_kv_cache"]
+    idx_kv_scale = tensors["idx_kv_scale"].float()
     idx_block_table = tensors["idx_block_table"]
     score_full = torch.full((bsz, seqlen, SCORE_LEN), FP32_NEG_INF, dtype=torch.float32)
     topk_idxs = torch.full((bsz, seqlen, SCORE_LEN), -1, dtype=torch.int32)
@@ -522,14 +507,14 @@ def golden_indexer(tensors):
         if cache_len <= 0:
             continue
 
-        kv_rows = []
+        kv_i8_rows = []
+        kv_scale_rows = []
         for slot in range(cache_len):
             blk_id = int(idx_block_table[b, slot // BLOCK_SIZE].item())
-            kv_rows.append(idx_kv_cache[blk_id, slot % BLOCK_SIZE, 0])
-        kv_view = torch.stack(kv_rows, dim=0).unsqueeze(0)
-        kv_i8, kv_scale = _int8_quant_per_row(kv_view.reshape(cache_len, IDX_HEAD_DIM))
-        kv_i8 = kv_i8.view(cache_len, IDX_HEAD_DIM)
-        kv_scale = kv_scale.view(cache_len, 1)
+            kv_i8_rows.append(idx_kv_cache_i8[blk_id, slot % BLOCK_SIZE, 0])
+            kv_scale_rows.append(idx_kv_scale[blk_id, slot % BLOCK_SIZE, 0, 0])
+        kv_i8 = torch.stack(kv_i8_rows, dim=0).view(cache_len, IDX_HEAD_DIM)
+        kv_scale = torch.stack(kv_scale_rows, dim=0).view(cache_len, 1)
         score_i32 = torch.einsum("shd,td->sht", q_i8[b].to(torch.int32), kv_i8.to(torch.int32))
         score = score_i32.float() * q_scale[b]
         score = (torch.relu(score) * weights[b].unsqueeze(-1)).sum(dim=1)
@@ -600,8 +585,6 @@ def build_tensor_specs(start_pos=None):
         return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
         return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
-    def init_idx_kv_cache():
-        return torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     def init_idx_block_table():
         return block_table(
             batch=B,
@@ -648,6 +631,13 @@ def build_tensor_specs(start_pos=None):
     wq_b_i8 = wq_b_i8_T.t().contiguous()
     qr_i8, qr_scale = _int8_quant_per_row(init_qr())
 
+    # C8 indexer cache fixture: INT8 + scale from one bf16-rounded random draw
+    idx_kv_cache_bf16 = torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM).to(torch.bfloat16)
+    idx_kv_i8, idx_kv_sc = _int8_quant_per_row(
+        idx_kv_cache_bf16.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
+    idx_kv_i8 = idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
+    idx_kv_sc = idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
         TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
@@ -665,7 +655,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_kv_i8, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=lambda: idx_kv_sc, is_output=True),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.
         TensorSpec("score", [B, S, SCORE_LEN], torch.float32, is_output=True),
@@ -747,7 +738,10 @@ if __name__ == "__main__":
         compare_fn={
             "score":        score_valid_compare,
             "topk_idxs":    topk_idxs_compare,
-            "idx_kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=4 / (IDX_CACHE_BLOCK_NUM * BLOCK_SIZE * IDX_HEAD_DIM)),
+            # C8 cache: history is exact; only the <=B boundary rows the compressor rewrote may
+            # differ by +/-1 LSB from the bf16 round of a fresh position.
+            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:
