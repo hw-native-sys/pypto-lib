@@ -42,6 +42,7 @@ from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
     INDEXER_SCORE_CAP,
     INDEXER_TOPK_CAP,
+    _int8_quant_per_row as _idx_int8_quant_per_row,
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
@@ -154,7 +155,8 @@ def prefill_attention_csa(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -220,7 +222,7 @@ def prefill_attention_csa(
         idx_cos, idx_sin, freqs_cos, freqs_sin, hadamard_idx,
         inner_kv_state, inner_score_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        idx_kv_cache, idx_block_table,
+        idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, cmp_topk_indices,
         position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
@@ -321,7 +323,7 @@ def prefill_attention_csa(
                         write_t : write_t + 1, WRITEBACK_GUARD_TILE:HEAD_DIM]
 
     hc_post(attn_out, x_hc, post, comb, x_out)
-    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
+    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
 
 
 @pl.jit
@@ -362,7 +364,8 @@ def prefill_attention_csa_test(
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -387,13 +390,13 @@ def prefill_attention_csa_test(
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         inner_kv_state, inner_score_state, inner_compress_state_block_table,
         kv_cache, ori_block_table, ori_slot_mapping,
-        cmp_kv, cmp_block_table, idx_kv_cache, idx_block_table,
+        cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids, cmp_slot_mapping, idx_slot_mapping,
         state_slot_mapping, inner_state_slot_mapping,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out, num_tokens,
     )
-    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, inner_kv_state, inner_score_state, x_out
+    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
 
 
 def golden_prefill_attention_csa(tensors):
@@ -481,6 +484,7 @@ def golden_prefill_attention_csa(tensors):
         "inner_ape": tensors["inner_ape"],
         "inner_norm_w": tensors["inner_norm_w"],
         "idx_kv_cache": tensors["idx_kv_cache"],
+        "idx_kv_scale": tensors["idx_kv_scale"],
         "idx_block_table": tensors["idx_block_table"],
         "position_ids": tensors["position_ids"],
         "num_tokens": tensors["num_tokens"],
@@ -774,9 +778,16 @@ def build_tensor_specs(
             if row >= 0:
                 flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
         return state
-    def init_idx_kv_cache():
-        cache = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
-        cache_flat = cache.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+    # C8 historical index cache: completed compressed slots hold INT8 + a per-position dequant scale.
+    # Build both from one bf16-rounded random draw so cache and scale stay consistent.
+    _idx_hist = {}
+    def _build_idx_hist():
+        if "cache" in _idx_hist:
+            return
+        cache_i8 = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
+        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
         table = init_idx_block_table()
         completed = context_len // COMPRESS_RATIO
         for cmp_slot in range(completed):
@@ -784,8 +795,18 @@ def build_tensor_specs(
                 break
             row = cache_row_from_table(table, cmp_slot)
             if row >= 0:
-                cache_flat[row] = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
-        return cache
+                hist_bf16 = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
+                hi8, hsc = _idx_int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
+                c_flat[row] = hi8.view(IDX_HEAD_DIM)
+                s_flat[row] = hsc.view(1)
+        _idx_hist["cache"] = cache_i8
+        _idx_hist["scale"] = scale
+    def init_idx_kv_cache():
+        _build_idx_hist()
+        return _idx_hist["cache"].clone()
+    def init_idx_kv_scale():
+        _build_idx_hist()
+        return _idx_hist["scale"].clone()
     def init_kv_cache():
         cache = torch.zeros(CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
@@ -975,8 +996,14 @@ def build_tensor_specs(
         TensorSpec(
             "idx_kv_cache",
             [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
-            torch.bfloat16,
+            torch.int8,
             init_value=init_idx_kv_cache,
+        ),
+        TensorSpec(
+            "idx_kv_scale",
+            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1],
+            torch.float32,
+            init_value=init_idx_kv_scale,
         ),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),

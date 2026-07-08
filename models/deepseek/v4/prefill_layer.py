@@ -216,7 +216,8 @@ def prefill_layer_core(
     cmp_block_table: pl.Tensor[[PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[PREFILL_TOKENS_DYN, SPARSE_TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
@@ -282,6 +283,7 @@ def prefill_layer_core(
     cmp_kv.bind_dynamic(0, PREFILL_CMP_CACHE_BLOCKS_DYN)
     cmp_block_table.bind_dynamic(0, PREFILL_CMP_BLOCK_TABLE_DYN)
     idx_kv_cache.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
+    idx_kv_scale.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
     idx_block_table.bind_dynamic(0, PREFILL_IDX_BLOCK_TABLE_DYN)
     hca_cmp_kv_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
     hca_cmp_score_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
@@ -309,6 +311,8 @@ def prefill_layer_core(
                               [ridx * CMP_CACHE_BLOCKS, 0, 0, 0])
         cmp_block_table_req = pl.slice(cmp_block_table, [CMP_TABLE_BLOCKS], [ridx * CMP_TABLE_BLOCKS])
         idx_kv_cache_req = pl.slice(idx_kv_cache, [IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, IDX_HEAD_DIM],
+                                    [ridx * IDX_CACHE_BLOCKS, 0, 0, 0])
+        idx_kv_scale_req = pl.slice(idx_kv_scale, [IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1],
                                     [ridx * IDX_CACHE_BLOCKS, 0, 0, 0])
         idx_block_table_req = pl.slice(idx_block_table, [IDX_TABLE_BLOCKS], [ridx * IDX_TABLE_BLOCKS])
         hca_kv_state_req = pl.slice(hca_cmp_kv_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
@@ -399,7 +403,7 @@ def prefill_layer_core(
                     csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
                     csa_inner_kv_state_req, csa_inner_score_state_req, csa_inner_state_table_req,
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
-                    cmp_kv_req, cmp_block_table_req, idx_kv_cache_req, idx_block_table_req,
+                    cmp_kv_req, cmp_block_table_req, idx_kv_cache_req, idx_kv_scale_req, idx_block_table_req,
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
                     csa_state_slot_tile, csa_inner_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
@@ -493,7 +497,8 @@ def l3_prefill_layer(
     cmp_block_table: pl.Tensor[[N_RANKS, PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, SPARSE_TOPK], pl.INT32],
     cmp_sparse_lens: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
     position_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
@@ -563,7 +568,7 @@ def l3_prefill_layer(
             kv_cache[rank], ori_block_table[rank], ori_slot_mapping[rank],
             cmp_kv[rank], cmp_block_table[rank],
             cmp_sparse_indices[rank], cmp_sparse_lens[rank],
-            idx_kv_cache[rank], idx_block_table[rank],
+            idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
             position_ids[rank],
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
             csa_cmp_slot_mapping[rank], csa_idx_slot_mapping[rank],
@@ -634,6 +639,7 @@ HOST_TENSOR_ORDER = (
     "cmp_sparse_indices",
     "cmp_sparse_lens",
     "idx_kv_cache",
+    "idx_kv_scale",
     "idx_block_table",
     "position_ids",
     "hca_cmp_slot_mapping",
@@ -688,7 +694,7 @@ _TOKEN_META_NAMES = {
 # Child-local cache/state/table tensors (request-local slices, persist across tiles).
 _CACHE_STATE_NAMES = {
     "kv_cache", "block_table", "ori_block_table", "cmp_kv", "cmp_block_table",
-    "idx_kv_cache", "idx_block_table",
+    "idx_kv_cache", "idx_kv_scale", "idx_block_table",
     "cmp_kv_state", "cmp_score_state", "compress_state_block_table",
     "inner_kv_state", "inner_score_state", "inner_compress_state_block_table",
 }
@@ -701,6 +707,7 @@ _PACKED_CACHE_SPECS = {
     "cmp_kv": "cmp_kv",
     "cmp_block_table": "cmp_block_table",
     "idx_kv_cache": "idx_kv_cache",
+    "idx_kv_scale": "idx_kv_scale",
     "idx_block_table": "idx_block_table",
     "hca_cmp_kv_state": ("hca", "cmp_kv_state"),
     "hca_cmp_score_state": ("hca", "cmp_score_state"),
@@ -731,7 +738,7 @@ def _req_block_count(kind, child_name):
         return CMP_CACHE_BLOCKS
     if child_name == "cmp_block_table":
         return CMP_TABLE_BLOCKS
-    if child_name == "idx_kv_cache":
+    if child_name in ("idx_kv_cache", "idx_kv_scale"):
         return IDX_CACHE_BLOCKS
     if child_name == "idx_block_table":
         return IDX_TABLE_BLOCKS
@@ -750,7 +757,7 @@ def _child_to_packed(kind, child_name):
     """Map a child-local cache/state name to its packed-buffer name for this kind."""
     if child_name in ("block_table", "ori_block_table"):
         return "ori_block_table"
-    if child_name in ("kv_cache", "cmp_kv", "cmp_block_table", "idx_kv_cache", "idx_block_table"):
+    if child_name in ("kv_cache", "cmp_kv", "cmp_block_table", "idx_kv_cache", "idx_kv_scale", "idx_block_table"):
         return child_name
     prefix = "hca_" if kind == "hca" else "csa_"
     return prefix + child_name
@@ -1010,7 +1017,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
             return (active.get("ori_block_table") or swa["block_table"]), kind, cn
         if cn in ("cmp_kv", "cmp_block_table"):
             return (active.get(cn) or csa[cn]), kind, cn
-        if cn in ("idx_kv_cache", "idx_block_table"):
+        if cn in ("idx_kv_cache", "idx_kv_scale", "idx_block_table"):
             return csa[cn], kind, cn
         return active[cn], kind, cn  # kv_cache
 

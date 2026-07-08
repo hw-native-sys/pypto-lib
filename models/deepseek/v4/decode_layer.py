@@ -155,7 +155,8 @@ def decode_layer(
     csa_inner_compress_state_block_table: pl.Tensor[[B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
@@ -227,7 +228,7 @@ def decode_layer(
             csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
             csa_inner_compress_state, csa_inner_compress_state_block_table,
             kv_cache, block_table, cmp_kv, cmp_block_table,
-            idx_kv_cache, idx_block_table,
+            idx_kv_cache, idx_kv_scale, idx_block_table,
             ori_slot_mapping, csa_cmp_slot_mapping, csa_idx_slot_mapping,
             csa_state_slot_mapping, csa_inner_state_slot_mapping,
             position_ids, kv_seq_lens,
@@ -315,7 +316,8 @@ def l3_decode_layer(
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
@@ -375,7 +377,7 @@ def l3_decode_layer(
             csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r],
             csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
             csa_inner_compress_state[r], csa_inner_compress_state_block_table[r],
-            cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_block_table[r],
+            cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
@@ -515,6 +517,7 @@ def golden_decode_layer_csa(tensors):
             "cmp_kv": tensors["cmp_kv"][r],
             "cmp_block_table": tensors["cmp_block_table"][r],
             "idx_kv_cache": tensors["idx_kv_cache"][r],
+            "idx_kv_scale": tensors["idx_kv_scale"][r],
             "idx_block_table": tensors["idx_block_table"][r],
             "ori_slot_mapping": tensors["ori_slot_mapping"][r],
             "cmp_slot_mapping": tensors["cmp_slot_mapping"][r],
@@ -732,6 +735,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("cmp_kv", csa_specs["cmp_kv"]),
         ("cmp_block_table", csa_specs["cmp_block_table"]),
         ("idx_kv_cache", csa_specs["idx_kv_cache"]),
+        ("idx_kv_scale", csa_specs["idx_kv_scale"]),
         ("idx_block_table", csa_specs["idx_block_table"]),
     ]
 
@@ -788,7 +792,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         "shared_w2", "shared_w2_scale",
     }
     RESIDENT_CACHE_NAMES = {
-        "kv_cache", "cmp_kv", "idx_kv_cache",
+        "kv_cache", "cmp_kv", "idx_kv_cache", "idx_kv_scale",
         "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
     }
     for spec in specs:
