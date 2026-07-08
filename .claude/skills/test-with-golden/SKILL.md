@@ -1,6 +1,6 @@
 ---
 name: test-with-golden
-description: Speed up iterative kernel testing by generating the golden reference ONCE (save_data=True) and replaying it on every later run via golden_data, skipping input generation and the torch golden recompute each iteration. Use for performance/timing tuning where the kernel's numerical result is unchanged between runs; NOT recommended for precision debugging.
+description: Speed up iterative kernel testing by generating the golden reference ONCE (save_data=True) and replaying it on every later run via golden_data, skipping input generation and the torch golden recompute each iteration. Adds a --save-data flag to the kernel when it lacks one. Use for performance/timing tuning where the kernel's numerical result is unchanged between runs; NOT recommended for precision debugging.
 ---
 
 # Test with a frozen golden (`test-with-golden`)
@@ -45,19 +45,39 @@ If the kernel's `__main__` exposes a `--save-data` flag, use it:
 python models/deepseek/v4/decode_attention_swa.py -p a2a3 -d 0 --save-data
 ```
 
-If it exposes only `--golden-data` (or neither), pass `save_data=True` at the
-`run` / `run_jit` call site for this first run — e.g. temporarily edit the
-kernel's `run_jit(...)` to add `save_data=True`, or add a `--save-data`
-argparse flag wired to it. (Before this change many kernels relied on
-`save_data` defaulting to True; with the new default they must opt in.)
+**If the kernel has no `--save-data` flag, add it as part of this workflow.**
+`save_data` defaults to False, so a kernel without the flag never persists a
+snapshot and there is nothing to replay. Grep the kernel's `__main__` for
+`--save-data`; when it is missing, wire the flag in with two small edits:
+
+1. Add the argument next to the existing `--golden-data` (or the other flags):
+
+   ```python
+   parser.add_argument("--save-data", action="store_true", default=False,
+                       help="persist inputs + golden to data/ for later --golden-data replay")
+   ```
+
+2. Forward it into the `run` / `run_jit` call:
+
+   ```python
+   save_data=args.save_data,
+   ```
+
+If the kernel also lacks `--golden-data`, add that too
+(`parser.add_argument("--golden-data", type=str, default=None)` +
+`golden_data=args.golden_data`) so step 3 has a knob to point at. These edits
+are local to the kernel's CLI; keep them only as long as you are iterating,
+and revert them when done unless the kernel should carry the flags upstream.
 
 ### 2. Locate the persisted data directory
 
-The snapshot lives under the compiled output dir, `{work_dir}/data`:
+The snapshot lands under the compiled output dir, `{work_dir}/data`, which is
+`build_output/<program>/data` **relative to the directory you launched the
+kernel from** (not necessarily next to the kernel file):
 
 ```bash
-find models/deepseek/v4/build_output -type d -name data
-# -> models/deepseek/v4/build_output/<program>/data   (contains in/ and out/)
+find build_output -type d -name data
+# -> build_output/_jit_<program>_<timestamp>/data   (contains in/ and out/)
 ```
 
 You can also read `result.work_dir` from the `RunResult` — the data dir is
@@ -66,15 +86,25 @@ You can also read `result.work_dir` from the `RunResult` — the data dir is
 ### 3. Subsequent runs — replay the frozen golden
 
 Point every later run at that directory. Input generation and the torch golden
-are both skipped; validation still runs against the cached `out/`:
+are both skipped (the run logs a `cache hit` for each); validation still runs
+against the cached `out/`:
 
 ```bash
 python models/deepseek/v4/decode_attention_swa.py -p a2a3 -d 0 \
-    --golden-data models/deepseek/v4/build_output/<program>/data
+    --golden-data build_output/_jit_<program>_<timestamp>/data
 ```
 
-For kernels without a `--golden-data` flag, pass
-`golden_data="<dir>"` at the `run_jit` call site instead.
+A successful replay prints, before the runtime stage:
+
+```
+[RUN] generate inputs ...
+[RUN]   cache hit: build_output/_jit_<program>_<timestamp>/data/in
+[RUN] compute golden ...
+[RUN]   cache hit: build_output/_jit_<program>_<timestamp>/data/out
+```
+
+For kernels without a `--golden-data` flag, add one (step 1) or pass
+`golden_data="<dir>"` at the `run` / `run_jit` call site instead.
 
 ## Requirements and caveats
 
