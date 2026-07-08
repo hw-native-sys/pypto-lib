@@ -81,6 +81,7 @@ SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_ORI_BLOCK_NUM = B * SPARSE_ORI_MAX_BLOCKS
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+WRITEBACK_GUARD_TILE = 16
 
 # HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
 MIX_PAD = 32
@@ -181,16 +182,20 @@ def prefill_attention_swa(
     # history (the current tokens reach attention via the `kv` overlay).
     kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_writeback"):
-        # No-op self-copy: marks kv_cache add_inout so the runtime orders this
-        # write after the gather's read (WAR); see pypto-lib#481.
-        kc_touch = kv_cache_flat[0:1, 0:HEAD_DIM]
-        kv_cache_flat[0:1, 0:HEAD_DIM] = kc_touch
         for write_t in pl.range(T):
             if write_t < num_tokens:
                 write_row_raw = pl.read(ori_slot_mapping, [write_t])
                 if write_row_raw >= 0:
                     write_row = pl.cast(write_row_raw, pl.INDEX)
-                    kv_cache_flat[write_row : write_row + 1, 0:HEAD_DIM] = kv[write_t : write_t + 1, 0:HEAD_DIM]
+                    # Fold a zeroed attn_out read into the first 32B of the
+                    # cache row so writeback is ordered after sparse_attn.
+                    write_guard = pl.cast(attn_out[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                    write_zero = pl.mul(write_guard, 0.0)
+                    write_kv_head = pl.cast(kv[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
+                    kv_cache_flat[write_row : write_row + 1, 0:WRITEBACK_GUARD_TILE] = pl.cast(
+                        pl.add(write_kv_head, write_zero), target_type=pl.BF16)
+                    kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE:HEAD_DIM] = kv[
+                        write_t : write_t + 1, WRITEBACK_GUARD_TILE:HEAD_DIM]
 
     hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, x_out
