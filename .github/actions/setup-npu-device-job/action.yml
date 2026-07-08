@@ -219,7 +219,10 @@ runs:
               echo "build of '$target' failed after $attempt attempts"; return 1
             fi
             echo "build of '$target' attempt $attempt failed; cleaning and retrying in $((attempt * 10))s"
-            rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+            # Purge the retrying target's own build trees (scikit-build-core may
+            # use either build/ or _skbuild/), so a half-written configure state
+            # can't poison the retry.
+            rm -rf "$target/build" "$target/_skbuild"
             sleep $((attempt * 10))
           done
         }
