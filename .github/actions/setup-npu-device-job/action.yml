@@ -5,9 +5,10 @@ description: >-
   toolchain resolution from the cached pypto source, ptoas + pto-isa install,
   a per-job conda venv + activate.sh, and a from-source build/install of pypto +
   simpler. Unlike pypto (which builds itself), pypto-lib builds against a
-  separate pypto clone kept in the shared ci-cache/pypto-src dir; the toolchain
-  pins (ptoas version/sha, pto-isa commit) are read from that same clone so the
-  installed pypto and the pins always match.
+  separate pypto clone kept in a per-job ci-cache/pypto-src-<build-namespace>
+  dir (concurrent device jobs must not share one build tree — see the
+  build-namespace input); the toolchain pins (ptoas version/sha, pto-isa commit)
+  are read from that same clone so the installed pypto and the pins always match.
 
   The calling job must define the ASCEND_HOME_PATH, PTOAS_ROOT, PTO_ISA_ROOT,
   CCACHE_*, CMAKE_* and PIP_CACHE_DIR environment variables (identical across the
@@ -28,6 +29,18 @@ inputs:
       them — the single- and multi-card model/example runs rely on the ring env.
     required: false
     default: 'false'
+  build-namespace:
+    description: >-
+      Per-job discriminator for the pypto build tree. The a2a3 and serving
+      device jobs run concurrently on the same self-hosted host; without
+      isolation they sync + build into one shared ci-cache/pypto-src dir and
+      race — one job's `reset --hard` / `rm -rf build` corrupts the other's
+      in-flight libbacktrace configure, surfacing as intermittent "C compiler
+      cannot create executables" / "Unknown BACKTRACE_ELF_SIZE" build failures.
+      Each caller passes a unique value so every job gets its own
+      pypto-src-<namespace> clone + build tree (mirrors the sim job's per-platform
+      pypto-src-${matrix.platform} isolation).
+    required: true
 
 runs:
   using: composite
@@ -66,7 +79,10 @@ runs:
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
       run: |
-        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
+        # Per-job build tree: a2a3 and serving run concurrently on the same host,
+        # so they must NOT share one pypto-src dir (their concurrent sync/build
+        # races corrupt libbacktrace's configure). See build-namespace input.
+        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ inputs.build-namespace }}"
         # github.com clones/fetches over this runner's link drop mid-transfer
         # (GnuTLS recv error / early EOF), and there is no pypto gitcode mirror.
         # Tighten git's stall detection so a dead transfer aborts fast instead of
@@ -187,11 +203,28 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       run: |
         source activate.sh
-        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src"
+        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ inputs.build-namespace }}"
         python -m pip install --upgrade pip
         pip install scikit-build-core nanobind cmake ninja
-        pip install --no-build-isolation "$PYPTO_SRC"
-        pip install --no-build-isolation "$PYPTO_SRC/runtime"
+        # The from-source pypto / simpler builds compile native code (libbacktrace
+        # et al.) with conda's compiler_compat toolchain, which intermittently
+        # fails to configure on this host ("C compiler cannot create executables").
+        # Retry a few times, purging the stale build tree first so a half-written
+        # configure / ccache state from the failed attempt can't poison the retry.
+        retry_build() {
+          local target="$1" attempt=0
+          until pip install --no-build-isolation "$target"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "build of '$target' failed after $attempt attempts"; return 1
+            fi
+            echo "build of '$target' attempt $attempt failed; cleaning and retrying in $((attempt * 10))s"
+            rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+            sleep $((attempt * 10))
+          done
+        }
+        retry_build "$PYPTO_SRC" || exit 1
+        retry_build "$PYPTO_SRC/runtime" || exit 1
 
     - name: Install runner dependencies
       shell: bash
