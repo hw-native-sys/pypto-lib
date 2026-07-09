@@ -32,7 +32,7 @@ from config import (
 )
 from hc_post import golden_hc_post, hc_post
 from hc_pre import golden_hc_pre, hc_pre
-from prefill_compressor_ratio128 import (
+from compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
@@ -83,6 +83,7 @@ SPARSE_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 COMPRESS_RATIO = 128
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_STATE_LEN = COMPRESS_RATIO
+MAIN_STATE_DIM = 2 * MAIN_OUT_DIM
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 START_POS = 0
 HCA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS
@@ -116,9 +117,8 @@ def prefill_attention_hca(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -173,7 +173,7 @@ def prefill_attention_hca(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     prefill_compressor_ratio128(
-        x_normed, cmp_kv_state, cmp_score_state, compress_state_block_table,
+        x_normed, compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         freqs_cos, freqs_sin, cmp_kv,
         position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
@@ -240,9 +240,8 @@ def prefill_attention_hca_test(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
+    compress_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_STATE_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -264,7 +263,7 @@ def prefill_attention_hca_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_kv_state, cmp_score_state, compress_state_block_table,
+        compress_state, compress_state_block_table,
         kv_cache, ori_slot_mapping, ori_block_table,
         cmp_kv, cmp_block_table,
         position_ids, cmp_slot_mapping, state_slot_mapping,
@@ -341,8 +340,7 @@ def golden_prefill_attention_hca(tensors):
     cmp_kv = tensors["cmp_kv"]
     golden_prefill_compressor_ratio128({
         "x": x_normed.view(T, D),
-        "kv_state": tensors["cmp_kv_state"],
-        "score_state": tensors["cmp_score_state"],
+        "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
         "wkv": tensors["cmp_wkv"],
         "wgate": tensors["cmp_wgate"],
@@ -504,7 +502,7 @@ def build_tensor_specs(
         return shared_freqs_sin.clone()
     # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_hca / decode_compressor_ratio128.
+    # Mirrors decode_attention_hca / compressor_ratio128 decode mode.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0246
     def init_cmp_wgate():
@@ -515,28 +513,21 @@ def build_tensor_specs(
         return 0.1001 + torch.randn(HEAD_DIM,) * 0.0549
     state_table = _state_block_table(HCA_STATE_MAX_BLOCKS)
     def init_compress_state_block_table():
-        return state_table.clone()
+        return state_table.unsqueeze(0).clone()
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
         block = abs_pos // HCA_STATE_BLOCK_SIZE
         intra = abs_pos % HCA_STATE_BLOCK_SIZE
         return int(state_table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
-    def init_cmp_state():
-        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
-        flat = state.view(-1, MAIN_OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
+        flat = state.view(-1, MAIN_STATE_DIM)
         for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
-        return state
-    def init_cmp_score_state():
-        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
-        flat = state.view(-1, MAIN_OUT_DIM)
-        for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
-            row = state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
+                flat[row, 0:MAIN_OUT_DIM] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
+                flat[row, MAIN_OUT_DIM:MAIN_STATE_DIM] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
         return state
     def cache_row_from_table(table, slot):
         block = slot // BLOCK_SIZE
@@ -633,20 +624,14 @@ def build_tensor_specs(
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         # Compressor caches are written in-place but not validated here (decode
-        # parity); the dedicated prefill_compressor_ratio128 test covers them.
+        # parity); the dedicated compressor_ratio128 prefill mode covers them.
         TensorSpec(
-            "cmp_kv_state",
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
+            "compress_state",
+            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_STATE_DIM],
             torch.float32,
-            init_value=init_cmp_state,
+            init_value=init_compress_state,
         ),
-        TensorSpec(
-            "cmp_score_state",
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
-            torch.float32,
-            init_value=init_cmp_score_state,
-        ),
-        TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
+        TensorSpec("compress_state_block_table", [B, HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec(
             "kv_cache",
             [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
