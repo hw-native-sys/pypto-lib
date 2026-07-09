@@ -195,20 +195,17 @@ def dispatch(
             pl.write(recv_count_out, [e, 0], acc)
 
     # Phase 2: move the bulk payload (x / aux / route) to each destination lane.
-    # Split over (dst, loc_e) so the blocking cross-rank puts fan out across
-    # N_RANKS * N_LOCAL cores instead of serializing in one CORE_GROUP block. Block
-    # (dst, loc_e) owns exactly one global expert eid = dst*N_LOCAL+loc_e, so its
-    # arrival slot is a single per-block counter that feeds only put/remote_store
-    # offsets (the ptoas-safe path -- never a GM scalar store or tile-store offset).
-    # The payload-arrival handshake moves to the gather region, which fences the
-    # whole push grid via deps. This rides its own window (`data_arrived`), so it
-    # needs no ordering against the meta phase and overlaps it freely.
-    BLOCKS_PER_DST = N_LOCAL  # compile-time: keeps // and % dividing by a constant
-    with pl.spmd(N_RANKS * N_LOCAL, name_hint="dispatch_push") as _push_tid:
-        blk = pl.tile.get_block_idx()
-        dst = blk // BLOCKS_PER_DST
-        loc_e = blk % BLOCKS_PER_DST
-        eid_match = dst * N_LOCAL + loc_e
+    # Split over LOCAL EXPERT INDEX only (N_LOCAL blocks): block loc_e handles the
+    # expert-index loc_e on EVERY destination rank, so the blocking cross-rank puts
+    # fan out across N_LOCAL cores while the grid stays one wave for any EP (vs
+    # N_RANKS*N_LOCAL, which is N_EXPERTS_GLOBAL blocks). One arrival-slot counter per
+    # destination rank; both eid//N_LOCAL and eid%N_LOCAL divide by the compile-time
+    # constant N_LOCAL, and the counters feed only put/remote_store offsets (the
+    # ptoas-safe path). The payload-arrival handshake moves to the gather region,
+    # which fences the whole push grid via deps; it rides its own `data_arrived`
+    # window, so it needs no ordering against the meta phase and overlaps it freely.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push") as _push_tid:
+        loc_e = pl.tile.get_block_idx()
 
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -216,11 +213,12 @@ def dispatch(
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        # Single per-block slot counter; token-major order matches the meta pass's
-        # per-lane cumulative count, so the padded lane layout gather compacts is
-        # byte-identical to the original single-block push.
-        slot_ctr = pl.array.create(1, pl.INT32)
-        slot_ctr[0] = 0
+        # One slot counter per destination rank; token-major order matches the meta
+        # pass's per-(dst, loc_e) cumulative count, so the padded lane layout gather
+        # compacts is byte-identical to the original single-block push.
+        slot_ctr = pl.array.create(N_RANKS, pl.INT32)
+        for d in pl.range(N_RANKS):
+            slot_ctr[d] = 0
         e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
         # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
@@ -228,9 +226,11 @@ def dispatch(
         for t in pl.range(active_tokens):
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
-                if eid == eid_match:
-                    slot = slot_ctr[0]
-                    slot_ctr[0] = slot + 1
+                dst = eid // N_LOCAL
+                le = eid - dst * N_LOCAL
+                if le == loc_e:
+                    slot = slot_ctr[dst]
+                    slot_ctr[dst] = slot + 1
                     # lane (loc_e, my_rank, slot) on peer=dst
                     row = e_lane_base + slot
                     pld.tensor.put(
@@ -319,61 +319,80 @@ def combine(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
-    # SPMD combine: one block per destination rank. Each block d runs the full
-    # pairwise exchange with peer d (put its slice -> notify d -> wait d) inside a
-    # single kernel, independently of the other blocks, so no rank's combine
-    # ordering depends on another's. The per-peer barriers collectively fence
-    # every remote write into this rank's routed_y_buf before the reduce reads it.
-    for d in pl.spmd(N_RANKS, name_hint="combine"):
-        # Rebuild per-(e, src) base rows from recv_meta so the compact slots are
-        # walked src-major; this block only consumes column d (origin rank = d).
-        cmb_base = pl.array.create(N_LOCAL * N_RANKS, pl.INT32)
-        for e in pl.range(N_LOCAL):
-            base_acc = pl.const(0, pl.INT32)
-            for src in pl.range(N_RANKS):
-                cmb_base[e * N_RANKS + src] = base_acc
-                base_acc = base_acc + pl.read(recv_meta, [src, e])
 
-        # Put each compact slot back to its origin rank (= d) at its route offset.
+    # AICPU cumsum -> per-(expert, source) compact base row + count as plain tensors.
+    # combine is parallelized over LOCAL EXPERT (N_LOCAL-wide SPMD grid); a loop-carried
+    # cumsum inside such a grid risks the ptoas loop-carried-scalar miscompile (grid-size
+    # sensitive), so the prefix sum stays on AICPU -- same A-tile shape as dispatch_gather.
+    cmb_base_t = pl.create_tensor([N_LOCAL, N_RANKS], dtype=pl.INT32)
+    cmb_cnt_t = pl.create_tensor([N_LOCAL, N_RANKS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_base") as _cbase_tid:
         for e in pl.range(N_LOCAL):
-            n = pl.cast(pl.read(recv_meta, [d, e]), pl.INDEX)
-            b = pl.cast(cmb_base[e * N_RANKS + d], pl.INDEX)
+            acc = pl.const(0, pl.INT32)
+            for src in pl.range(N_RANKS):
+                c = pl.read(recv_meta, [src, e])
+                pl.write(cmb_base_t, [e, src], acc)
+                pl.write(cmb_cnt_t, [e, src], c)
+                acc = acc + c
+
+    # SPMD combine: one block per LOCAL EXPERT e. Block e pushes every one of expert e's
+    # compact rows back to its ORIGIN rank (= the source lane src it arrived on) at its
+    # route offset. Rows are src-major, so src's slice is [base, base+cnt). Each route
+    # maps to a unique (dst, loc_e) and a unique r_route, so the blocks -- and the
+    # cross-rank puts -- are write-disjoint (no rank/expert writes another's slot). The
+    # per-peer arrival handshake moves to combine_wait, since a per-expert block spans
+    # all peers and cannot host a per-peer notify/wait.
+    with pl.spmd(N_LOCAL, name_hint="combine", deps=[_cbase_tid]) as _cscatter_tid:
+        e = pl.tile.get_block_idx()
+        e_base_row = e * RECV_MAX
+        for src in pl.range(N_RANKS):
+            n = pl.cast(pl.read(cmb_cnt_t, [e, src]), pl.INDEX)
+            b = pl.cast(pl.read(cmb_base_t, [e, src]), pl.INDEX)
             for slot in pl.range(n):
                 out_col = b + slot
                 r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
                 pld.tensor.put(
                     dst=routed_y_buf,
-                    peer=d,
+                    peer=src,
                     src=recv_y_flat,
                     dst_offsets=[r_route, 0],
-                    src_offsets=[e * RECV_MAX + out_col, 0],
+                    src_offsets=[e_base_row + out_col, 0],
                     shape=[1, D],
                 )
 
-        # Pairwise barrier with peer d only; the self block (d == my_rank) does
-        # local puts and needs no signal/wait.
-        if d != my_rank:
-            pld.system.notify(
-                target=combine_arrived,
-                peer=d,
-                offsets=[my_rank, 0],
-                value=1,
-                op=pld.NotifyOp.AtomicAdd,
-            )
-            pld.system.wait(
-                signal=combine_arrived,
-                offsets=[d, 0],
-                expected=moe_epoch,
-                cmp=pld.WaitCmp.Ge,
-            )
+    # Payload-arrival handshake: bump + wait combine_arrived per peer, after the whole
+    # scatter grid landed (deps fences all N_LOCAL blocks, so every put to a peer has
+    # completed before that peer is notified). notify-then-wait is symmetric across
+    # ranks, so it cannot deadlock.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
+        for peer in pl.range(N_RANKS):
+            if peer != my_rank:
+                pld.system.notify(
+                    target=combine_arrived,
+                    peer=peer,
+                    offsets=[my_rank, 0],
+                    value=1,
+                    op=pld.NotifyOp.AtomicAdd,
+                )
+        for src in pl.range(N_RANKS):
+            if src != my_rank:
+                pld.system.wait(
+                    signal=combine_arrived,
+                    offsets=[src, 0],
+                    expected=moe_epoch,
+                    cmp=pld.WaitCmp.Ge,
+                )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k].
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so every
+    # peer's remote write into this rank's routed_y_buf has landed -- the local RAW edge
+    # alone would only order after this rank's own outgoing puts, not the incoming ones.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    for t in pl.spmd(T, name_hint="shared_routed"):
+    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+        t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
             for k in pl.range(TOPK):
