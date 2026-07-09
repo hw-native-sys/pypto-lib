@@ -523,6 +523,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.spmd(
             Q_ON * QKV_OK,
             name_hint="q_proj",
+            allow_early_resolve=True,
             deps=[prev_normed_q_seed_deps[i] for i in range(DOWN_ON + 1)],
         ) as q_proj_tid:
             q_blk = pl.get_block_idx()
@@ -961,7 +962,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # pl.parallel loops with STATIC deps=[...] literals. The flattened out_idx
         # (= n*K_SPLITS_OUT + k) gives an exact 24/26 boundary.
         out_proj_dummy = pl.system.task_dummy(deps=[attn_done_tid])
-        N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - 24  # out_idx >= this => direct fa (last 24)
+        N_OUT_DIRECT = N_SPLITS_OUT * K_SPLITS_OUT - N_OUT_DIRECT_BLOCKS  # out_idx >= this => direct fa
 
         # First 26 (out_idx 0..N_OUT_DIRECT-1): via out_proj_dummy (deferred).
         for out_idx in pl.parallel(0, N_OUT_DIRECT):
@@ -987,30 +988,35 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add
                 )
             out_tids[out_idx] = out_tid
-        # Last 24 (out_idx N_OUT_DIRECT..49): direct fa dep (first-wave dispatch).
-        for out_idx in pl.parallel(N_OUT_DIRECT, N_SPLITS_OUT * K_SPLITS_OUT):
+        # Last 24 (out_idx N_OUT_DIRECT..49): direct fa dep, as ONE SPMD task so it
+        # is a single early-dispatch candidate whose 24 tiles are staged block-by-
+        # block, instead of 24 separate CORE_GROUP tasks. block_idx -> (n, k) tile.
+        with pl.spmd(
+            N_OUT_DIRECT_BLOCKS, name_hint="out_proj", deps=[attn_done_tid]
+        ) as out_proj_direct_tid:
+            out_idx = N_OUT_DIRECT + pl.get_block_idx()
             n_out_proj = out_idx // K_SPLITS_OUT
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
             k_op = k_split_out * OUT_TK
-            with pl.at(
-                level=pl.Level.CORE_GROUP, name_hint="out_proj", deps=[attn_done_tid]
-            ) as out_tid:
-                out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
-                out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
-                out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
-                for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
-                    out_ks_off = out_lk * OUT_INNER_TK
-                    out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
-                    out_w_k = wo[
-                        layer_hidden_base + k_op + out_ks_off : layer_hidden_base + k_op + out_ks_off + OUT_INNER_TK,
-                        n_op : n_op + OUT_TN,
-                    ]
-                    out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k)
-                attn_proj_fp32 = pl.assemble(
-                    attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add
-                )
-            out_tids[out_idx] = out_tid
+            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+            out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
+            out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
+            for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
+                out_ks_off = out_lk * OUT_INNER_TK
+                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
+                out_w_k = wo[
+                    layer_hidden_base + k_op + out_ks_off : layer_hidden_base + k_op + out_ks_off + OUT_INNER_TK,
+                    n_op : n_op + OUT_TN,
+                ]
+                out_c_acc = pl.matmul_acc(out_c_acc, out_a_k, out_w_k)
+            attn_proj_fp32 = pl.assemble(
+                attn_proj_fp32, out_c_acc, [0, n_op], atomic=pl.AtomicType.Add
+            )
+        # All 24 direct tiles share the one SPMD tid; downstream out_tids[] readers
+        # (residual_rms_cast / post_rms_reduce) now gate on the whole SPMD task.
+        for _b in pl.unroll(N_OUT_DIRECT_BLOCKS):
+            out_tids[N_OUT_DIRECT + _b] = out_proj_direct_tid
 
         # Tiled residual + BF16 cast.
         for k_slice in pl.unroll(K_SPLITS_MLP):
