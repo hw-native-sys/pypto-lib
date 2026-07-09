@@ -493,12 +493,11 @@ def _hc_pre_separate(
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
         mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
 
-    # split_pre_post: scale mixes_raw by inv_rms, then the pre / post gates. The comb gate
-    # is NOT done here anymore -- comb_sinkhorn reads its 4 groups straight from mixes_raw and
-    # inv_rms, so the comb_logits GM round-trip is dropped (pre stays for mix_x, post-pad for
-    # write_post).
+    # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
+    # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
+    # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
+    # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    post_pad_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
     for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
@@ -515,14 +514,7 @@ def _hc_pre_separate(
         post_logits = pl.add(post_scaled, pl.col_expand(post_scaled, post_base))
         post_sig = pl.recip(pl.add(pl.exp(pl.neg(post_logits)), 1.0))
         post_pad = pl.mul(post_sig, 2.0)
-        post_pad_store = pl.assemble(post_pad_store, post_pad, [t0, 0])
-
-    # write_post: narrow post-pad [.,HC_PAD] -> post [.,HC_MULT].
-    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="write_post"):
-        t0 = ob * COMB_T_TILE
-        post_tile = pl.load(post_pad_store, [t0, 0], [COMB_T_TILE, HC_PAD],
-                            valid_shapes=[COMB_T_TILE, HC_MULT], target_memory=pl.MemorySpace.Vec)
-        pl.store(post_tile, [t0, 0], post)
+        post[t0:t0 + T_TILE, 0:HC_MULT] = pl.slice(post_pad, [T_TILE, HC_PAD], [0, 0], valid_shape=[T_TILE, HC_MULT])
 
     # comb_sinkhorn: comb gate (direct from mixes_raw, no comb_logits round-trip) + softmax +
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
