@@ -51,7 +51,7 @@ from hc_pre import hc_pre
 from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_sparse_attn import sparse_attn, ATTN_K_TILE, SPARSE_BLOCKS
+from decode_sparse_attn import sparse_attn
 
 # model config
 B = DECODE_BATCH
@@ -102,8 +102,6 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 CSA_WB_TOKEN_TILE = 8
-CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
-COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 
 @pl.jit.inline
 def attention_csa(
@@ -243,42 +241,15 @@ def attention_csa(
         kv_seq_lens, 0,
     )
 
-    # Keep sparse indices as an explicit scratch tensor so sparse_attn sees
-    # fixed metadata while the CSA path still composes indexer at runtime.
-    cmp_sparse_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
+    # sparse_attn now folds the compressed-slot masking + valid-block flags in from
+    # the raw indexer topk + position, so pass those directly.
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
-
-    # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows,
-    # keeping raw iff 0 <= raw < floor((pos + 1) / 4), as
-    # out = mask * (raw + 1) - 1.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_compressed_slots", allow_early_resolve=True):
-        c_raw = pl.cast(idx_topk_flat[0 : T, 0 : IDX_TOPK], target_type=pl.FP32)
-        c_pos = pl.cast(position_ids_t1[0 : T, 0 : 1], target_type=pl.FP32)
-        c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        # Broadcast the per-token bound over IDX_TOPK cols.
-        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
-        c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
-        c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
-        c_mask = pl.mul(c_ge, c_lt)
-        c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
-        cmp_sparse_indices[0 : T, 0 : IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
-        # Block 0 (sliding-window) is always live; write all of
-        # valid_block_mask from this single scope.
-        for c_t0 in pl.range(T):
-            pl.write(valid_block_mask, [c_t0, 0], pl.cast(1, pl.INT32))
-        for c_sb in pl.range(1, SPARSE_BLOCKS):
-            c_s0 = (c_sb - 1) * ATTN_K_TILE
-            c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
-            for c_dt in pl.range(T):
-                c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
-                pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, window_swa_indices,
-        cmp_kv, cmp_block_table, cmp_sparse_indices, valid_block_mask,
+        cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
@@ -387,7 +358,6 @@ def golden_attention_csa(tensors):
     })
 
     position_ids = tensors["position_ids"].to(torch.int64)
-    kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     position_ids_bsd = position_ids.reshape(B, S).to(torch.int32).contiguous()
     cmp_slot_mapping_bsd = tensors["cmp_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
     idx_slot_mapping_bsd = tensors["idx_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
@@ -490,25 +460,19 @@ def golden_attention_csa(tensors):
             intra = write_row % BLOCK_SIZE
             kv_cache[blk_id, intra, 0] = kv[t]
 
-    sparse_topk = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
     idx_topk_flat = idx_topk_full.view(T, INDEXER_SCORE_LEN)
-    for t in range(T):
-        b = t // S
-        abs_pos = int(position_ids[t].item())
-        cmp_valid = min((abs_pos + 1) // COMPRESS_RATIO, int(kv_seq_lens[b].item()) // COMPRESS_RATIO)
-        for ck, raw_t in enumerate(idx_topk_flat[t, :IDX_TOPK].tolist()):
-            raw = int(raw_t)
-            if raw >= 0 and raw < cmp_valid:
-                sparse_topk[t, ck] = raw
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
+    # sparse_attn folds the compressed-slot masking in (0 <= raw < floor((pos+1)/
+    # COMPRESS_RATIO)); pass raw idx_topk + position so the golden masks the same way.
     golden_sparse_attn({
         "q": q,
         "ori_kv": kv_cache,
         "window_swa_indices": window_swa_indices,
         "cmp_kv": cmp_kv,
         "cmp_block_table": cmp_block_table,
-        "cmp_sparse_indices": sparse_topk,
+        "idx_topk": idx_topk_flat,
+        "position_ids": position_ids.view(T, 1),
         "attn_sink": tensors["attn_sink"],
         "freqs_cos": rope_cos_t,
         "freqs_sin": rope_sin_t,
