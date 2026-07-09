@@ -193,7 +193,7 @@ def compressor_ratio4(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
+    with pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]) as _rms_write_tid:
         batch_base_idx = pl.tile.get_block_idx()
         batch_base = batch_base_idx * RMS_TILE
         pad_base = batch_base_idx * RMS_PAD_TILE
@@ -239,10 +239,8 @@ def compressor_ratio4(
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
         normed_kv[pad_base : pad_base + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
-    with pl.spmd(B // RMS_TILE, name_hint="kv_and_cache_write", deps=[rms_tid]) as _write_tid:
-        batch_base_idx = pl.tile.get_block_idx()
-        batch_base = batch_base_idx * RMS_TILE
-        pad_base = batch_base_idx * RMS_PAD_TILE
+        # cache write: this block reads back only its own normed_kv rows (pad_base slab), so
+        # the normed_kv RAW is intra-block -- no separate scope / cross-task barrier needed.
         for inner in pl.range(RMS_TILE):
             c_idx = batch_base + inner
             first_pos_b = pl.read(position_ids, [c_idx, 0])
