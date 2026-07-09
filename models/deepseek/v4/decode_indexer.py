@@ -240,7 +240,7 @@ def indexer(
         cblk_b = (clen_b + BLOCK_SIZE - 1) // BLOCK_SIZE
         qb = b * S * IDX_N_HEADS
         qr_full = qr_hadamard_i8[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
-        for cb in pl.range(cblk_b):
+        for cb in pl.pipeline(0, cblk_b, stage=2):
             cache0 = cb * BLOCK_SIZE
             idx_blk_id = pl.cast(
                 pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
