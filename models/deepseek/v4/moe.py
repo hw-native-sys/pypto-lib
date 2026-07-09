@@ -234,28 +234,27 @@ def dispatch(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # Gather lanes into the compact per-expert buffers, in its own task. It reads
-    # recv_meta (from dispatch_meta) and the landed recv_x/aux/route (from
-    # dispatch_push), so it orders after both -- while dispatch_meta and
-    # dispatch_push stay independent and can overlap. recv_x_out is this task's
+    # Gather lanes into the compact per-expert buffers: one SPMD block per local
+    # expert. Reads recv_meta (from dispatch_meta) and the landed recv_x/aux/route
+    # (from dispatch_push), so it orders after both -- while dispatch_meta and
+    # dispatch_push stay independent and can overlap. recv_x_out is this grid's
     # output; expert_routed reads it in auto scope and orders after it.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_gather"):
-        for e in pl.range(N_LOCAL):
-            e_base_row = e * RECV_MAX
-            b = pl.cast(0, pl.INDEX)
-            for src in pl.range(N_RANKS):
-                cnt = pl.read(recv_meta, [src, e])
-                n = pl.cast(cnt, pl.INDEX)
-                src_base_row = e_base_row + src * MAX_PER_SRC
-                for slot in pl.range(n):
-                    in_row = src_base_row + slot
-                    out_col = b + slot
-                    out_row = e_base_row + out_col
-                    recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
-                    pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
-                    pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
-                    pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
-                b = b + n
+    for e in pl.spmd(N_LOCAL, name_hint="dispatch_gather"):
+        e_base_row = e * RECV_MAX
+        b = pl.cast(0, pl.INDEX)
+        for src in pl.range(N_RANKS):
+            cnt = pl.read(recv_meta, [src, e])
+            n = pl.cast(cnt, pl.INDEX)
+            src_base_row = e_base_row + src * MAX_PER_SRC
+            for slot in pl.range(n):
+                in_row = src_base_row + slot
+                out_col = b + slot
+                out_row = e_base_row + out_col
+                recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
+                pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
+                pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
+                pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
+            b = b + n
 
 
 # === Combine =================================================================
