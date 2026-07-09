@@ -22,7 +22,7 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
 )
 from compressor_ratio128 import compressor_rmsnorm_rope  # ratio-agnostic rmsnorm+rope
-from compressor_schedule import build_decode_padded_write_schedule, build_prefill_write_schedule, gather_compressor_rope_rows
+from compressor_schedule import build_prefill_write_schedule, gather_compressor_rope_rows
 
 
 EPS = M.rms_norm_eps
@@ -235,17 +235,18 @@ def compressor_core_ratio4(
     cos_b: pl.Tensor[[CORE_WRITE_ROWS, ROPE_HALF], pl.FP32],
     sin_b: pl.Tensor[[CORE_WRITE_ROWS, ROPE_HALF], pl.FP32],
 ):
-    """Shared decode/prefill ratio4 compression math core (mirrors
-    compressor_core_ratio128, adapted for the overlap window: COFF=2 state,
-    STATE_LEN=8 online-softmax pool over the whole head, POOL_HEAD_BLOCKS=1).
+    """Prefill ratio4 compression math core (mirrors compressor_core_ratio128,
+    adapted for the overlap window: COFF=2 state, STATE_LEN=8 online-softmax pool
+    over the whole head, POOL_HEAD_BLOCKS=1).
 
       scatter projected (kv, score+APE) into paged state (skip slot < 0)
         -> softmax-pool each real window (compact pool_row_map, block-table gather)
         -> rmsnorm + rope at the window position.
 
-    Stops at normed_kv; each caller finalizes its own outputs (decode: per-token
-    kv + paged cmp_kv_cache; prefill: cmp_kv + keepalive) since those diverge and
-    stay in the regime wrapper."""
+    Stops at normed_kv; the prefill wrapper finalizes cmp_kv + keepalive. Decode no
+    longer shares this core: it fuses scatter+pool and rmsnorm+rope+cache-write into
+    two tasks over a single paged 16-row block (see decode_compressor_ratio4), which
+    a packed multi-write prefill schedule cannot reuse."""
     token_rows = pl.tensor.dim(state_slot_mapping, 0)
     write_rows = pl.tensor.dim(write_dst_map, 1)
     pool_rows = pl.tensor.dim(pool_row_map, 1)
@@ -329,10 +330,9 @@ DECODE_MM_B_TILE = 16
 DECODE_BS_PAD = ((DECODE_B * DECODE_S + DECODE_MM_B_TILE - 1) // DECODE_MM_B_TILE) * DECODE_MM_B_TILE
 DECODE_HEAD_TILE = 64
 DECODE_HEAD_DIM_TILE = 128
-DECODE_RMS_TILE = 4
-DECODE_RMS_PAD_TILE = 16
-DECODE_RMS_PAD_TAIL = DECODE_RMS_PAD_TILE - DECODE_RMS_TILE
-DECODE_RMS_PAD_ROWS = (DECODE_B // DECODE_RMS_TILE) * DECODE_RMS_PAD_TILE
+DECODE_RMS_PAD_TILE = 16  # pad DECODE_B rows into one 16-row block (min M for FP32 vec ops)
+DECODE_RMS_PAD_ROWS = DECODE_RMS_PAD_TILE  # single block; requires DECODE_B <= RMS_PAD_TILE
+assert DECODE_B <= DECODE_RMS_PAD_TILE
 
 @pl.jit.inline
 def decode_compressor_ratio4(
@@ -351,82 +351,160 @@ def decode_compressor_ratio4(
     cmp_slot_mapping: pl.Tensor[[DECODE_T], pl.INT64],
     state_slot_mapping: pl.Tensor[[DECODE_T], pl.INT64],
 ):
-    # Thin decode wrapper: build the padded per-batch write schedule, project
-    # (dynamic-M tiling), run the shared core with the paged decode state, then
-    # write the per-token kv output + paged cmp_kv_cache. See compressor_core_ratio4.
+    # Decode fuses the paged CSA compressor into two tasks (upstream #734 single-block
+    # form). scatter_softmax_pool computes each batch's overlap window from its own
+    # just-scattered paged state (per-batch block table, so no cross-task barrier);
+    # rmsnorm_rope_cache_write normalizes the single 16-row block and writes the
+    # per-token kv output + paged cmp_kv_cache. Prefill keeps the multi-write shared
+    # core (compressor_core_ratio4): a single paged block and packed multi-writes
+    # diverge too much to share the fused path. Reads stay token-major ([T]).
     kv_flat = kv
     compress_state_flat = pl.reshape(compress_state, [DECODE_COMPRESS_STATE_BLOCK_NUM * DECODE_COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [DECODE_COMPRESSOR_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-
-    write_pos_map = pl.create_tensor([1, DECODE_RMS_PAD_ROWS], dtype=pl.INT32)
-    write_dst_map = pl.create_tensor([1, DECODE_RMS_PAD_ROWS], dtype=pl.INT32)
-    kv_out_row_map = pl.create_tensor([1, DECODE_RMS_PAD_ROWS], dtype=pl.INT32)
-    state_table_row_map = pl.create_tensor([1, DECODE_RMS_PAD_ROWS], dtype=pl.INT32)
-    build_decode_padded_write_schedule(
-        position_ids,
-        cmp_slot_mapping,
-        pl.const(DECODE_S, pl.INT32),
-        pl.const(COMPRESS_RATIO, pl.INT32),
-        pl.const(DECODE_RMS_TILE, pl.INT32),
-        pl.const(DECODE_RMS_PAD_TILE, pl.INT32),
-        write_pos_map,
-        write_dst_map,
-        kv_out_row_map,
-        state_table_row_map,
-    )
-
-    # Compact pool enumeration: one entry per batch row -> its scattered padded
-    # write row (pad_row = (b // RMS_TILE) * RMS_PAD_TILE + b % RMS_TILE, matching
-    # build_decode_padded_write_schedule). The core pools only these DECODE_B rows.
-    pool_row_map = pl.create_tensor([1, DECODE_B], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="decode_pool_row_map"):
-        for b in pl.range(DECODE_B):
-            pad_row = (b // DECODE_RMS_TILE) * DECODE_RMS_PAD_TILE + (b % DECODE_RMS_TILE)
-            pl.write(pool_row_map, [0, b], pl.cast(pad_row, pl.INT32))
 
     cmp4_kv_proj_pad = pl.create_tensor([DECODE_BS_PAD, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_pad = pl.create_tensor([DECODE_BS_PAD, OUT_DIM], dtype=pl.FP32)
     compressor_ratio4_proj(x, wkv, wgate, cmp4_kv_proj_pad, cmp4_score_proj_pad)
 
+    # scatter_softmax_pool: per batch, scatter the padded proj rows into the paged
+    # compress_state, then online-softmax pool that batch's window into pooled_kv.
+    # One region -- each batch's pool reads only its own just-scattered state.
     pooled_kv = pl.create_tensor([DECODE_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    normed_kv = pl.create_tensor([DECODE_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    cos_b = pl.create_tensor([DECODE_RMS_PAD_ROWS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    sin_b = pl.create_tensor([DECODE_RMS_PAD_ROWS, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    compressor_core_ratio4(
-        cmp4_kv_proj_pad,
-        cmp4_score_proj_pad,
-        position_ids,
-        state_slot_mapping,
-        ape,
-        norm_w,
-        compress_state_flat,
-        compress_state_block_table,
-        freqs_cos,
-        freqs_sin,
-        write_pos_map,
-        write_dst_map,
-        state_table_row_map,
-        pool_row_map,
-        pooled_kv,
-        normed_kv,
-        cos_b,
-        sin_b,
-    )
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
+        for c_idx in pl.range(DECODE_B):
+            for s_sc in pl.pipeline(DECODE_S, stage=2):
+                proj_row = c_idx * DECODE_S + s_sc
+                token_pos = pl.read(position_ids, [proj_row])
+                state_row_i64 = pl.read(state_slot_mapping, [proj_row])
+                token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
+                if state_row_i64 >= 0:
+                    state_row = pl.cast(state_row_i64, pl.INDEX)
+                    kv_tile = cmp4_kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    score_tile = cmp4_score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    ape_tile = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
+                    score_tile = pl.add(score_tile, ape_tile)
+                    compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
+                    compress_state_flat[state_row : state_row + 1, OUT_DIM : COMPRESS_STATE_DIM] = score_tile
 
-    # Decode finalize: per-token kv output + paged cmp_kv_cache (reads normed_kv).
-    with pl.spmd(DECODE_B // DECODE_RMS_TILE, name_hint="kv_and_cache_write") as _write_tid:
-        batch_base_idx = pl.tile.get_block_idx()
-        pad_base = batch_base_idx * DECODE_RMS_PAD_TILE
-        for inner in pl.range(DECODE_RMS_TILE):
-            pad_row = pad_base + inner
-            cache_row_raw = pl.read(write_dst_map, [0, pad_row])
-            if cache_row_raw >= 0:
-                kv_row_raw = pl.read(kv_out_row_map, [0, pad_row])
-                if kv_row_raw >= 0:
-                    kv_row = pl.cast(kv_row_raw, pl.INDEX)
-                    cache_row = pl.cast(cache_row_raw, pl.INDEX)
-                    kv_row_fp32 = normed_kv[pad_row : pad_row + 1, 0 : HEAD_DIM]
-                    kv_flat[kv_row : kv_row + 1, :] = kv_row_fp32
+            pad_idx = c_idx
+            first_pos_b = pl.read(position_ids, [c_idx * DECODE_S])
+            pos_b = first_pos_b % COMPRESS_RATIO
+            pre_tokens_b = COMPRESS_RATIO - pos_b
+            boundary_end_b = first_pos_b + pre_tokens_b - 1
+            cur_window_start_b = boundary_end_b - COMPRESS_RATIO + 1
+            prev_window_start_b = cur_window_start_b - COMPRESS_RATIO
+
+            if pos_b + DECODE_S >= COMPRESS_RATIO:
+                # Head-chunk loop collapsed to one [1, HEAD_DIM] tile: the online
+                # softmax is per-column elementwise, so widening is bit-identical.
+                last_abs = cur_window_start_b + COMPRESS_RATIO - 1
+                last_blk_off = last_abs // DECODE_COMPRESS_STATE_BLOCK_SIZE
+                last_intra = last_abs % DECODE_COMPRESS_STATE_BLOCK_SIZE
+                last_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, last_blk_off]), pl.INDEX)
+                last_row = last_blk_id * DECODE_COMPRESS_STATE_BLOCK_SIZE + last_intra
+                mi = compress_state_flat[last_row : last_row + 1, OUT_DIM + HEAD_DIM : COMPRESS_STATE_DIM]
+                li = pl.exp(pl.sub(mi, mi))
+                oi = compress_state_flat[last_row : last_row + 1, HEAD_DIM : OUT_DIM]
+
+                for s in pl.range(0, COMPRESS_RATIO):
+                    prev_abs = prev_window_start_b + s
+                    front_score = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=FP32_NEG_INF)
+                    front_kv = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                    if first_pos_b >= COMPRESS_RATIO:
+                        prev_blk_off = prev_abs // DECODE_COMPRESS_STATE_BLOCK_SIZE
+                        prev_intra = prev_abs % DECODE_COMPRESS_STATE_BLOCK_SIZE
+                        prev_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, prev_blk_off]), pl.INDEX)
+                        prev_row = prev_blk_id * DECODE_COMPRESS_STATE_BLOCK_SIZE + prev_intra
+                        front_score = compress_state_flat[prev_row : prev_row + 1, OUT_DIM : OUT_DIM + HEAD_DIM]
+                        front_kv = compress_state_flat[prev_row : prev_row + 1, 0 : HEAD_DIM]
+                    mi_next_front = pl.maximum(mi, front_score)
+                    alpha_front = pl.exp(pl.sub(mi, mi_next_front))
+                    beta_front = pl.exp(pl.sub(front_score, mi_next_front))
+                    li = pl.add(pl.mul(alpha_front, li), beta_front)
+                    oi = pl.add(pl.mul(oi, alpha_front), pl.mul(front_kv, beta_front))
+                    mi = mi_next_front
+
+                for s in pl.range(0, COMPRESS_RATIO - 1):
+                    cur_abs = cur_window_start_b + s
+                    cur_blk_off = cur_abs // DECODE_COMPRESS_STATE_BLOCK_SIZE
+                    cur_intra = cur_abs % DECODE_COMPRESS_STATE_BLOCK_SIZE
+                    cur_blk_id = pl.cast(pl.read(compress_state_block_table, [c_idx, cur_blk_off]), pl.INDEX)
+                    cur_row = cur_blk_id * DECODE_COMPRESS_STATE_BLOCK_SIZE + cur_intra
+                    back_score = compress_state_flat[cur_row : cur_row + 1, OUT_DIM + HEAD_DIM : COMPRESS_STATE_DIM]
+                    back_kv = compress_state_flat[cur_row : cur_row + 1, HEAD_DIM : OUT_DIM]
+                    mi_next_back = pl.maximum(mi, back_score)
+                    alpha_back = pl.exp(pl.sub(mi, mi_next_back))
+                    beta_back = pl.exp(pl.sub(back_score, mi_next_back))
+                    li = pl.add(pl.mul(alpha_back, li), beta_back)
+                    oi = pl.add(pl.mul(oi, alpha_back), pl.mul(back_kv, beta_back))
+                    mi = mi_next_back
+
+                pooled_chunk = pl.div(oi, li)
+                pooled_kv[pad_idx : pad_idx + 1, 0 : HEAD_DIM] = pooled_chunk
+
+    # rmsnorm_rope_cache_write: normalize + rope the single 16-row block, then write
+    # the per-token kv output + paged cmp_kv_cache. The cache write reads back only
+    # this block's own normed_kv rows (intra-block RAW) -- no separate scope needed.
+    normed_kv = pl.create_tensor([DECODE_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
+    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write"):
+        # single 16-row block: DECODE_B real rows at 0..DECODE_B-1, rest are pad.
+        # In-kernel token-major gather of each batch's compressor rope row.
+        cos_b = pl.full([DECODE_RMS_PAD_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([DECODE_RMS_PAD_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
+        for inner in pl.range(DECODE_B):
+            first_pos_b = pl.read(position_ids, [inner * DECODE_S])
+            cmp_pos_b = pl.cast(first_pos_b - (first_pos_b % COMPRESS_RATIO), pl.INDEX)
+            cos_b[inner : inner + 1, 0 : ROPE_HALF] = pl.cast(
+                freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HALF], target_type=pl.FP32)
+            sin_b[inner : inner + 1, 0 : ROPE_HALF] = pl.cast(
+                freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HALF], target_type=pl.FP32)
+
+        partial_sq = pl.full([1, DECODE_RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
+        for k0 in pl.range(0, HEAD_DIM, DECODE_HEAD_TILE):
+            kv_rms_chunk = pooled_kv[0 : DECODE_RMS_PAD_TILE, k0 : k0 + DECODE_HEAD_TILE]
+            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
+            kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, DECODE_RMS_PAD_TILE])
+            partial_sq = pl.add(partial_sq, kv_rms_rowsum)
+
+        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [DECODE_RMS_PAD_TILE, 1])
+        inv_rms = pl.recip(pl.sqrt(variance))
+        for k0 in pl.range(0, NOPE_HEAD_DIM, DECODE_HEAD_TILE):
+            kv_norm_chunk = pooled_kv[0 : DECODE_RMS_PAD_TILE, k0 : k0 + DECODE_HEAD_TILE]
+            gamma = pl.cast(norm_w_2d[:, k0 : k0 + DECODE_HEAD_TILE], pl.FP32)
+            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
+            normed_kv[0 : DECODE_RMS_PAD_TILE, k0 : k0 + DECODE_HEAD_TILE] = normed_chunk
+
+        kv_rope_norm = pooled_kv[0 : DECODE_RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
+        # A3 interleaved swap-gather rope (swap/sign/dup indices built in-kernel from
+        # pl.arange): out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]. normed_kv is
+        # FP32 so rope_rot is written directly.
+        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
+        rope_ones = pl.full([DECODE_RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
+        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
+        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
+        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
+        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        normed_kv[0 : DECODE_RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
+
+        for inner in pl.range(DECODE_B):
+            c_idx = inner
+            first_pos_b = pl.read(position_ids, [c_idx * DECODE_S])
+            pos_b = first_pos_b % COMPRESS_RATIO
+            if pos_b + DECODE_S >= COMPRESS_RATIO:
+                boundary_s = COMPRESS_RATIO - 1 - pos_b
+                kv_row_fp32 = normed_kv[inner : inner + 1, 0 : HEAD_DIM]
+                cache_row_i64 = pl.read(cmp_slot_mapping, [c_idx * DECODE_S + boundary_s])
+                if cache_row_i64 >= 0:
+                    cache_row = pl.cast(cache_row_i64, pl.INDEX)
+                    kv_flat[c_idx * DECODE_S : c_idx * DECODE_S + 1, :] = kv_row_fp32
                     cmp_kv_cache_flat[cache_row : cache_row + 1, :] = pl.cast(kv_row_fp32, target_type=pl.BF16, mode="rint")
 
     return kv_flat
