@@ -174,26 +174,25 @@ def expert_routed(
                             y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
                     y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
-            for db_idx in pl.parallel(D // (W2_ACT_INNER * D_OUT_TILE_ACT)):
+            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
+            with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
+                db_idx = pl.tile.get_block_idx()
                 act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-                recv_y_block = pl.create_tensor([RECV_TILE, W2_ACT_INNER * D_OUT_TILE_ACT], dtype=pl.BF16)
-                with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_w2_act"):
-                    w_col_blk = pl.reshape(
-                        recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
-                        [RECV_TILE, 1],
+                w_col_blk = pl.reshape(
+                    recv_weights[local_i : local_i + 1, t0 : t0 + RECV_TILE],
+                    [RECV_TILE, 1],
+                )
+                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
+                for dg in pl.pipeline(W2_ACT_INNER, stage=2):
+                    act_d0 = act_d_base + dg * D_OUT_TILE_ACT
+                    y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                    w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
+                    y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
+                    recv_y_tile[:, act_d0 : act_d0 + D_OUT_TILE_ACT] = pl.cast(
+                        y_2d, target_type=pl.BF16, mode="rint"
                     )
-                    row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
-                    for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                        act_d0 = act_d_base + dg * D_OUT_TILE_ACT
-                        block_d0 = dg * D_OUT_TILE_ACT
-                        y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                        w2_scale_chunk = routed_w2_scale[local_i : local_i + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                        y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                        y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                        recv_y_block[:, block_d0 : block_d0 + D_OUT_TILE_ACT] = pl.cast(
-                            y_2d, target_type=pl.BF16, mode="rint"
-                        )
-                recv_y_flat = pl.assemble(recv_y_flat, recv_y_block, [flat_t0, act_d_base])
+            recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_t0, 0])
 
     return recv_y
 
