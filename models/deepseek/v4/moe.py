@@ -117,7 +117,7 @@ def dispatch(
     # Phase 1: count routes, publish counts, barrier on meta only, then cumsum ->
     # recv_count_out. Earliest recv_count_out can be produced -- it needs every
     # source's counts but none of the bulk payload.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta") as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -172,10 +172,10 @@ def dispatch(
                 acc = acc + pl.read(recv_meta, [src, e])
             pl.write(recv_count_out, [e, 0], acc)
 
-    # Phase 2: move the bulk payload (x / aux / route) to each destination lane,
-    # then bump + wait `data_arrived` so the gather sees landed data. Rides its own
-    # window, so it needs no ordering against the meta phase and overlaps it freely.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_push"):
+    # Phase 2: move the bulk payload (x / aux / route) to each destination lane.
+    # Rides its own `data_arrived` window, so it needs no ordering against the meta
+    # phase and overlaps it freely.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_push") as _push_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -215,7 +215,10 @@ def dispatch(
                 pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
                 pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
-        # Bump + wait the payload arrival counter on its own window.
+    # Payload-arrival handshake in its own task, fenced on dispatch_push via deps so
+    # this rank's `data_arrived` notify to a peer fires only after every put to it
+    # has landed; then wait every source so the gather reads land-complete lanes.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid]) as _wait_tid:
         for dst in pl.range(N_RANKS):
             if dst != my_rank:
                 pld.system.notify(
@@ -235,11 +238,13 @@ def dispatch(
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
-    # expert. Reads recv_meta (from dispatch_meta) and the landed recv_x/aux/route
-    # (from dispatch_push), so it orders after both -- while dispatch_meta and
-    # dispatch_push stay independent and can overlap. recv_x_out is this grid's
-    # output; expert_routed reads it in auto scope and orders after it.
-    for e in pl.spmd(N_LOCAL, name_hint="dispatch_gather"):
+    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (payload landed) -- the
+    # local RAW edge on recv_x only orders after this rank's own outgoing puts, not
+    # the incoming ones. dispatch_meta and dispatch_push stay independent and can
+    # overlap. recv_x_out is this grid's output; expert_routed reads it in auto
+    # scope and orders after it.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid]) as _gather_tid:
+        e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
