@@ -59,10 +59,9 @@ MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 HEAD_DIM_TILE = 128
-RMS_TILE = 4
-RMS_PAD_TILE = 16
-RMS_PAD_TAIL = RMS_PAD_TILE - RMS_TILE
-RMS_PAD_ROWS = (B // RMS_TILE) * RMS_PAD_TILE
+RMS_PAD_TILE = 16  # pad B rows up to one 16-row block (hadamard matmul M multiple of 16)
+RMS_PAD_ROWS = RMS_PAD_TILE  # single block; requires B <= RMS_PAD_TILE
+assert B <= RMS_PAD_TILE
 
 
 @pl.jit.inline
@@ -122,7 +121,7 @@ def indexer_compressor(
     # online-softmax pool that batch's window into pooled_kv. One region -- each batch's pool
     # reads only its own just-scattered state (per-batch block table), so no cross-task barrier.
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool") as pool_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
         for c_idx in pl.range(B):
             for s_sc in pl.pipeline(S, stage=2):
                 token_pos = pl.read(position_ids, [c_idx, s_sc])
@@ -138,7 +137,7 @@ def indexer_compressor(
                     compress_state_flat[state_row : state_row + 1, 0 : OUT_DIM] = kv_tile
                     compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
-            pad_idx = (c_idx // RMS_TILE) * RMS_PAD_TILE + (c_idx % RMS_TILE)
+            pad_idx = c_idx
             first_pos_b = pl.read(position_ids, [c_idx, 0])
             pos_b = first_pos_b % COMPRESS_RATIO
             pre_tokens_b = COMPRESS_RATIO - pos_b
@@ -198,17 +197,15 @@ def indexer_compressor(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.BF16)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.spmd(B // RMS_TILE, name_hint="rmsnorm_rope", deps=[pool_tid]) as rms_tid:
-        batch_base_idx = pl.tile.get_block_idx()
-        batch_base = batch_base_idx * RMS_TILE
-        pad_base = batch_base_idx * RMS_PAD_TILE
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
+        # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        cos_b[0:RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = cos[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
-        sin_b[0:RMS_TILE, 0 : ROPE_HEAD_DIM // 2] = sin[batch_base : batch_base + RMS_TILE, 0 : ROPE_HEAD_DIM // 2]
+        cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
+        sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
             partial_sq = pl.add(partial_sq, kv_rms_rowsum)
@@ -216,16 +213,16 @@ def indexer_compressor(
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_PAD_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
         for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+            kv_norm_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[pad_base : pad_base + RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
+            normed_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
                 normed_chunk,
                 target_type=pl.BF16,
                 mode="rint",
             )
 
-        kv_rope_norm = pooled_kv[pad_base : pad_base + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        kv_rope_norm = pooled_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         # A3 interleaved swap-gather (same form as kv_rms_norm_rope in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
@@ -246,30 +243,25 @@ def indexer_compressor(
         sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[pad_base : pad_base + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
+        normed_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
             rope_rot,
             target_type=pl.BF16,
             mode="rint",
         )
 
     kv_final = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
-    with pl.spmd(B // RMS_TILE, name_hint="kv_hadamard", deps=[rms_tid]) as hadamard_tid:
-        batch_base_idx = pl.tile.get_block_idx()
-        pad_base = batch_base_idx * RMS_PAD_TILE
-        kv_proj_tile = normed_kv[pad_base : pad_base + RMS_PAD_TILE, 0 : HEAD_DIM]
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_hadamard"):
+        kv_proj_tile = normed_kv[0 : RMS_PAD_TILE, 0 : HEAD_DIM]
         for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
             hadamard_tile = hadamard[0 : HEAD_DIM, o0 : o0 + OUT_TILE]
             kv_hadamard_acc = pl.matmul(kv_proj_tile, hadamard_tile, out_dtype=pl.FP32)
-            kv_final[pad_base : pad_base + RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
+            kv_final[0 : RMS_PAD_TILE, o0 : o0 + OUT_TILE] = kv_hadamard_acc
 
-    with pl.spmd(B // RMS_TILE, name_hint="kv_and_cache_write", deps=[hadamard_tid]) as _write_tid:
-        batch_base_idx = pl.tile.get_block_idx()
-        batch_base = batch_base_idx * RMS_TILE
-        pad_base = batch_base_idx * RMS_PAD_TILE
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_and_cache_write"):
         # C8 quant-on-write: per-row INT8 quant of the block (M=RMS_PAD_TILE keeps tiles 32B-aligned;
         # quantize the bf16-rounded value to match golden)
         kv_blk_f32 = pl.cast(
-            pl.cast(kv_final[pad_base : pad_base + RMS_PAD_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint"),
+            pl.cast(kv_final[0 : RMS_PAD_TILE, 0 : HEAD_DIM], target_type=pl.BF16, mode="rint"),
             target_type=pl.FP32)
         # amax = max(|x|); abs-based (max(row_max, -row_min) is wrong on signed KV)
         kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, RMS_PAD_TILE])
@@ -281,13 +273,13 @@ def indexer_compressor(
         kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
         kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
         kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
-        for inner in pl.range(RMS_TILE):
-            c_idx = batch_base + inner
+        for inner in pl.range(B):
+            c_idx = inner
             first_pos_b = pl.read(position_ids, [c_idx, 0])
             pos_b = first_pos_b % COMPRESS_RATIO
             if pos_b + S >= COMPRESS_RATIO:
                 boundary_s = COMPRESS_RATIO - 1 - pos_b
-                kv_row_fp32 = kv_final[pad_base + inner : pad_base + inner + 1, 0 : HEAD_DIM]
+                kv_row_fp32 = kv_final[inner : inner + 1, 0 : HEAD_DIM]
                 cache_row_i64 = pl.read(idx_slot_mapping, [c_idx, boundary_s])
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)
