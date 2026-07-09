@@ -98,7 +98,6 @@ from prefill_attention_csa import (
     ROPE_HEAD_DIM,
     SPARSE_CMP_MAX_BLOCKS,
     SPARSE_ORI_MAX_BLOCKS,
-    SPARSE_TOPK,
     START_POS,
     build_tensor_specs as build_csa_attention_tensor_specs,
     prefill_attention_csa,
@@ -165,7 +164,6 @@ SHARED_NAMES = [
     "hca_cmp_slot_mapping", "hca_state_slot_mapping",
     "csa_cmp_slot_mapping", "csa_idx_slot_mapping",
     "csa_state_slot_mapping", "csa_inner_state_slot_mapping",
-    "cmp_sparse_indices", "cmp_sparse_lens",
 ]
 
 # KV / state caches: per-token persistent buffers, not weights — kept as host
@@ -271,8 +269,6 @@ def prefill_fwd(
     csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
@@ -354,7 +350,7 @@ def prefill_fwd(
             wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
             freqs_cos, freqs_sin,
             kv_cache_l0, ori_block_table, ori_slot_mapping,
-            cmp_sparse_indices, cmp_sparse_lens, position_ids,
+            position_ids,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             x_attn0, nt,
         )
@@ -416,7 +412,7 @@ def prefill_fwd(
             wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
             freqs_cos, freqs_sin,
             kv_cache_l1, ori_block_table, ori_slot_mapping,
-            cmp_sparse_indices, cmp_sparse_lens, position_ids,
+            position_ids,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             x_attn1, nt,
         )
@@ -584,7 +580,7 @@ def prefill_fwd(
                 hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                 hca_cmp_kv_state_hca, hca_cmp_score_state_hca, hca_compress_state_block_table,
                 kv_cache_hca, ori_slot_mapping, ori_block_table,
-                cmp_kv_hca, cmp_block_table, cmp_sparse_indices, cmp_sparse_lens,
+                cmp_kv_hca, cmp_block_table,
                 position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
                 attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
                 x_attn_hca, nt,
@@ -763,8 +759,6 @@ def l3_prefill_fwd(
     csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    cmp_sparse_indices: pl.Tensor[[N_RANKS, T, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -829,7 +823,6 @@ def l3_prefill_fwd(
             hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
             csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
-            cmp_sparse_indices[r], cmp_sparse_lens[r],
             hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
             hidden_out[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
@@ -905,7 +898,7 @@ def _make_shared_spec(name, base_specs, start_pos):
         if name == "input_ids":
             return ranked((torch.arange(T, dtype=torch.int64) % VOCAB))
         if name == "ori_slot_mapping":
-            return ranked((pos % BLOCK_SIZE).to(torch.int64))
+            return ranked(pos.to(torch.int64))
         if name in ("hca_state_slot_mapping", "csa_state_slot_mapping", "csa_inner_state_slot_mapping"):
             return ranked(pos.to(torch.int64))
         if name == "hca_cmp_slot_mapping":
@@ -918,17 +911,10 @@ def _make_shared_spec(name, base_specs, start_pos):
             mask = ((pos + 1) % CSA_COMPRESS_RATIO) == 0
             out[mask] = ((pos[mask] + 1) // CSA_COMPRESS_RATIO) - 1
             return ranked(out)
-        if name == "cmp_sparse_lens":
-            return ranked(torch.clamp(torch.arange(1, T + 1, dtype=torch.int32), max=SPARSE_TOPK))
-        if name == "cmp_sparse_indices":
-            out = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-            for t in range(T):
-                valid = min(t + 1, SPARSE_TOPK)
-                first = t + 1 - valid
-                for k in range(valid):
-                    out[t, k] = BLOCK_SIZE + first + k
+        if name in ("ori_block_table", "cmp_block_table", "idx_block_table"):
+            out = torch.arange(spec.shape[-1], dtype=spec.dtype)
             return ranked(out)
-        # block tables and any remaining shared metadata: smoke zeros.
+        # Any remaining shared metadata: smoke zeros.
         return torch.zeros(list(spec.shape), dtype=spec.dtype)
 
     return TensorSpec(name, list(spec.shape), spec.dtype, init_value=init_value, is_output=False)
@@ -1022,8 +1008,6 @@ HOST_TENSOR_ORDER = (
     "ori_slot_mapping",
     "cmp_kv",
     "cmp_block_table",
-    "cmp_sparse_indices",
-    "cmp_sparse_lens",
     "idx_kv_cache",
     "idx_kv_scale",
     "idx_block_table",
@@ -1167,8 +1151,6 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         ("ori_slot_mapping", active["ori_slot_mapping"]),
         ("cmp_kv", active.get("cmp_kv", csa["cmp_kv"])),
         ("cmp_block_table", active.get("cmp_block_table", csa["cmp_block_table"])),
-        ("cmp_sparse_indices", active.get("cmp_sparse_indices", swa["cmp_sparse_indices"])),
-        ("cmp_sparse_lens", active.get("cmp_sparse_lens", swa["cmp_sparse_lens"])),
         ("idx_kv_cache", csa["idx_kv_cache"]),
         ("idx_kv_scale", csa["idx_kv_scale"]),
         ("idx_block_table", csa["idx_block_table"]),
@@ -1266,7 +1248,6 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         "hca_cmp_slot_mapping", "hca_state_slot_mapping",
         "csa_cmp_slot_mapping", "csa_idx_slot_mapping",
         "csa_state_slot_mapping", "csa_inner_state_slot_mapping",
-        "cmp_sparse_indices", "cmp_sparse_lens",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
