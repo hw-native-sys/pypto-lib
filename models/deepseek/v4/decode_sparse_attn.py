@@ -233,13 +233,12 @@ def sparse_attn(
 
     # WAR marker (pypto-lib#481): the fused gather reads ori_kv inside qk_pv, but a
     # scalar-driven gather_row does not by itself mark the param add_inout (and an
-    # in-qk_pv self-copy collides with the gather's tensor view). A separate per-token
-    # no-op self-copy -- same [g_t:g_t+1] granularity the old gather_kv used -- marks
-    # ori_kv add_inout before qk_pv, so the enclosing layer's in-place KV-cache
-    # writeback gets its WAR edge against the gather read.
-    for kvt_t in pl.spmd(T, name_hint="kv_touch"):
-        kvt_row = ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM] = kvt_row
+    # in-qk_pv self-copy collides with the gather's tensor view). One no-op self-copy
+    # marks ori_kv add_inout before qk_pv, so the enclosing layer's in-place KV-cache
+    # writeback gets its WAR edge against the gather read. add_inout is a param-level
+    # property, so a single tile touch suffices -- no per-token fan-out.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch"):
+        ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
 
     # qk_pv gathers window/compressed rows into one L1 matmul operand. Invalid
     # lanes gather a finite row and are zeroed out by the NEG_INF softmax bias.
