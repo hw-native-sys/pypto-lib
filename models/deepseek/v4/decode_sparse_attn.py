@@ -49,13 +49,18 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # kernel-local
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 DEFAULT_COMPRESS_RATIO = 4
+# CSA compressed-slot masking (folded in from the CSA orchestrator): raw indexer
+# topk -> per-token bound floor((pos + 1) / COMPRESS_RATIO).
+MAX_SEQ_LEN = M.max_position_embeddings
+INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
+COMPRESS_RATIO_INV = 1.0 / DEFAULT_COMPRESS_RATIO
+CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
-VALID_TOKEN_TILE = 8
 ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -73,8 +78,6 @@ ATTN_K_TILE = 128
 # grew with per-token variance in the valid-block count. Platform-specific: this is
 # the 24-wide dispatch a2a3 targets; re-sweep NUM_QK_CORES for other AIC counts.
 NUM_QK_CORES = 24
-ROPE_TILE = 16
-ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 # proj_a cube K-frag. 256 (not 128) keeps the B-cache-line floor: B is K-contiguous
 # under b_trans, so K*2B(bf16) = 512B == the a2a3 L2 line (K=128 was 256B, half a
 # line -> wasted MTE2 DMA). At 256 the cube's L0A/L0B operand staging hits 100%
@@ -144,7 +147,6 @@ PB_ACT_NREG = D // PROJ_B_ACT_N_TILE
 PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 NEG_INF = -1.0e20
 
-assert T % VALID_TOKEN_TILE == 0
 assert T % 2 == 0
 assert T % ROPE_OUT_TOK_TILE == 0  # rope-pack loop tiles tokens by ROPE_OUT_TOK_TILE
 assert H % 4 == 0
@@ -197,8 +199,8 @@ def sparse_attn(
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[T, SPARSE_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -215,31 +217,14 @@ def sparse_attn(
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
 
-    # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
-    # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-    for v_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="build_valid", allow_early_resolve=True):
-        v_t0 = v_blk * VALID_TOKEN_TILE
-        v_win_f = pl.cast(window_swa_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : WIN], target_type=pl.FP32)
-        v_idx_f = pl.cast(cmp_sparse_indices[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : CMP_TOPK], target_type=pl.FP32)
-        # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
-        # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
-        # 2 vector ops instead of the add/max/min/sub clamp chain.
-        v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, 0 : WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
-        sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, WIN : TOPK] = pl.mul(pl.minimum(v_idx_f, 0.0), -NEG_INF)
-        if PADDED_TOPK > TOPK:
-            sparse_bias[v_t0 : v_t0 + VALID_TOKEN_TILE, TOPK : PADDED_TOPK] = pl.full(
-                [VALID_TOKEN_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
-
     # WAR marker (pypto-lib#481): the fused gather reads ori_kv inside qk_pv, but a
     # scalar-driven gather_row does not by itself mark the param add_inout (and an
-    # in-qk_pv self-copy collides with the gather's tensor view). A separate per-token
-    # no-op self-copy -- same [g_t:g_t+1] granularity the old gather_kv used -- marks
-    # ori_kv add_inout before qk_pv, so the enclosing layer's in-place KV-cache
-    # writeback gets its WAR edge against the gather read.
-    for kvt_t in pl.spmd(T, name_hint="kv_touch"):
-        kvt_row = ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM]
-        ori_kv_flat[kvt_t : kvt_t + 1, 0 : HEAD_DIM] = kvt_row
+    # in-qk_pv self-copy collides with the gather's tensor view). One no-op self-copy
+    # marks ori_kv add_inout before qk_pv, so the enclosing layer's in-place KV-cache
+    # writeback gets its WAR edge against the gather read. add_inout is a param-level
+    # property, so a single tile touch suffices -- no per-token fan-out.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_touch"):
+        ori_kv_flat[0:T, 0:HEAD_DIM] = ori_kv_flat[0:T, 0:HEAD_DIM]
 
     # qk_pv gathers window/compressed rows into one L1 matmul operand. Invalid
     # lanes gather a finite row and are zeroed out by the NEG_INF softmax bias.
@@ -260,9 +245,48 @@ def sparse_attn(
     # block-lane) NSPLIT mapping, whose imbalance grew with per-token variance in the
     # valid-block count. The T/SPARSE_BLOCKS scan loops are trace-time unrolled (small
     # constants) so the cursor read-modify-write is an explicit sequential chain.
+    # cmp_sparse_indices holds compressed-cache slots (invalid = -1); valid_block_mask
+    # flags non-empty sparse blocks. Both feed qk_pv, so they stay GM scratch here.
+    cmp_sparse_indices = pl.create_tensor([T, CMP_TOPK], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([T, SPARSE_BLOCKS], dtype=pl.INT32)
     qk_order = pl.create_tensor([QK_ITEMS], dtype=pl.INT32)
     qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_plan") as qk_plan_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
+        # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows, keeping
+        # raw iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), as out = mask*(raw + 1) - 1.
+        c_raw = pl.cast(idx_topk[0:T, 0:IDX_TOPK], target_type=pl.FP32)
+        c_pos = pl.cast(position_ids[0:T, 0:1], target_type=pl.FP32)
+        c_pos_q = pl.cast(pl.cast(pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        # Broadcast the per-token bound over IDX_TOPK cols.
+        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
+        c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
+        c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
+        c_mask = pl.mul(c_ge, c_lt)
+        c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
+        cmp_sparse_indices[0:T, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+        # Block 0 (sliding-window) is always live; blocks 1.. from the compressed mask.
+        for c_t0 in pl.range(T):
+            pl.write(valid_block_mask, [c_t0, 0], pl.cast(1, pl.INT32))
+        for c_sb in pl.range(1, SPARSE_BLOCKS):
+            c_s0 = (c_sb - 1) * ATTN_K_TILE
+            c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
+            for c_dt in pl.range(T):
+                c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
+                pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
+
+        # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
+        # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
+        v_win_f = pl.cast(window_swa_indices[0:T, 0:WIN], target_type=pl.FP32)
+        # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
+        # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
+        # 2 vector ops instead of the add/max/min/sub clamp chain. c_out is the just-
+        # computed post-mask compressed slots (integer-valued), reused directly.
+        v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
+        sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
+        sparse_bias[0:T, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
+        if PADDED_TOPK > TOPK:
+            sparse_bias[0:T, TOPK:PADDED_TOPK] = pl.full([T, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+
         pl.write(qk_wcur, [0], pl.cast(0, pl.INT32))
         # Pass 1: non-empty tiles to the front of qk_order.
         for plan_t in pl.unroll(T):
@@ -373,21 +397,18 @@ def sparse_attn(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
         cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+            pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
         cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
         cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
         cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+        cs_cos = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        rope_cos_il[0:T, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, 0:ROPE_DIM] = pl.mul(pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
@@ -599,8 +620,8 @@ def sparse_attn_test(
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, CMP_TOPK], pl.INT32],
-    valid_block_mask: pl.Tensor[[T, SPARSE_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[T, 1], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -615,8 +636,8 @@ def sparse_attn_test(
         window_swa_indices,
         cmp_kv,
         cmp_block_table,
-        cmp_sparse_indices,
-        valid_block_mask,
+        idx_topk,
+        position_ids,
         attn_sink,
         freqs_cos,
         freqs_sin,
@@ -661,7 +682,12 @@ def golden_sparse_attn(tensors):
     window_swa_indices = tensors["window_swa_indices"]
     cmp_kv = tensors["cmp_kv"].float()
     cmp_block_table = tensors["cmp_block_table"]
-    cmp_sparse_indices = tensors["cmp_sparse_indices"]
+    # Compressed slots: keep raw indexer topk iff 0 <= raw < floor((pos + 1) /
+    # COMPRESS_RATIO), else -1 -- the masking sparse_attn now folds in internally.
+    raw = tensors["idx_topk"][:, :CMP_TOPK].to(torch.int64)
+    bound = ((tensors["position_ids"][:, 0].to(torch.int64) + 1) // DEFAULT_COMPRESS_RATIO).unsqueeze(1)
+    keep = (raw >= 0) & (raw < bound)
+    cmp_sparse_indices = torch.where(keep, raw, torch.full_like(raw, -1)).to(torch.int32)
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
@@ -865,17 +891,18 @@ def build_tensor_specs(
             indices[0, :] = -1
         return indices
 
-    def init_valid_block_mask():
-        """Mark sparse-attention K tiles that contain at least one non-negative index."""
-        indices = init_cmp_sparse_indices()
-        mask = torch.zeros((T, SPARSE_BLOCKS), dtype=torch.int32)
-        mask[:, 0] = 1
-        for sb in range(1, SPARSE_BLOCKS):
-            c0 = (sb - 1) * ATTN_K_TILE
-            c1 = min(c0 + ATTN_K_TILE, CMP_TOPK)
-            if c0 < CMP_TOPK:
-                mask[:, sb] = (indices[:, c0:c1] >= 0).any(dim=1).to(torch.int32)
-        return mask
+    def init_idx_topk():
+        """Raw indexer topk feeding sparse_attn's compressed-slot masking. Only the
+        first CMP_TOPK cols are read; identity mask here (see init_position_ids), so
+        the masked output equals this fixture pattern."""
+        topk = torch.full((T, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
+        topk[:, :CMP_TOPK] = init_cmp_sparse_indices()
+        return topk
+
+    def init_position_ids():
+        """Large enough that floor((pos + 1) / COMPRESS_RATIO) >= CMP_TOPK, so the
+        per-token bound never clips the fixture slots (mask reduces to raw >= 0)."""
+        return torch.full((T, 1), DEFAULT_COMPRESS_RATIO * CMP_TOPK, dtype=torch.int32)
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -906,8 +933,8 @@ def build_tensor_specs(
         TensorSpec("window_swa_indices", [T, WIN], torch.int32, init_value=init_window_swa_indices),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [B, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("cmp_sparse_indices", [T, CMP_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
-        TensorSpec("valid_block_mask", [T, SPARSE_BLOCKS], torch.int32, init_value=init_valid_block_mask),
+        TensorSpec("idx_topk", [T, INDEXER_SCORE_LEN], torch.int32, init_value=init_idx_topk),
+        TensorSpec("position_ids", [T, 1], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [T, ROPE_DIM], torch.bfloat16, init_value=init_sin),
