@@ -51,10 +51,10 @@ mechanisms (see the inline comments at each site for details):
    single merged seed + fa dep suffices. This reduces orchestrator
    generation, scheduler dependency resolution, and AICore launch overhead.
 
-3. **seed_dummy barrier** — ``seed_dummy`` (unflagged ``task_dummy``) gates
-   rms_recip / kv_seed / mlp_out_seed so they are NOT early-dispatched. At
-   the moment prev_out completes, only q_proj should get the dispatch window
-   (it is the longest predecessor of fa). Without the barrier, kv/mlp seeds
+3. **block_early_dispatch** — rms_recip / kv_seed / mlp_out_seed carry
+   ``block_early_dispatch=True`` so the scheduler never early-dispatches them.
+   At the moment prev_out completes, only q_proj should get the dispatch window
+   (it is the longest predecessor of fa); without the block the kv/mlp seeds
    would compete for the window, delaying q_proj.
 
 4. **allow_early_resolve** — Flags the critical path (q_proj → fa_fused →
@@ -491,22 +491,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     fa_total = pl.create_tensor([1, 1], dtype=pl.INT32)
 
     with pl.manual_scope():
-        # Barrier: prevents kv_seed / mlp_out_seed from being early-dispatched so
-        # they don't compete with q_proj for the dispatch window when prev_out
-        # completes. seed_dummy is an unflagged empty barrier, so it adds no
-        # dependency on the previous dcr_xgamma task while still not bumping
-        # dispatch_fanin via early resolve.
-        seed_dummy = pl.system.task_dummy(deps=[prev_out_tids[i] for i in range(DOWN_ON)])
-        prev_out_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
+        # rms_recip / kv_seed / mlp_out_seed opt out of early-dispatch via
+        # block_early_dispatch=True below, so they no longer compete with q_proj
+        # for the dispatch window when prev_out completes — no dummy barrier needed.
+        prev_out_seed_deps = pl.array.create(DOWN_ON, pl.TASK_ID)
         for _dep_i in pl.unroll(DOWN_ON):
             prev_out_seed_deps[_dep_i] = prev_out_tids[_dep_i]
-        prev_out_seed_deps[DOWN_ON] = seed_dummy
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="rms_recip",
             allow_early_resolve=True,
-            deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)],
+            block_early_dispatch=True,
+            deps=[prev_out_seed_deps[i] for i in range(DOWN_ON)],
         ) as rms_tid:
             partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
@@ -558,8 +555,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             rope_dep_tids[_i] = q_proj_tid
 
         # ── KV seed: zero k_proj + v_proj buffers. ──
-        # ── KV seed: zeroed via seed_dummy barrier (see comment above). ──
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as kv_seed_tid:
+        # ── KV seed: zero-fill, gated from early-dispatch by block_early_dispatch. ──
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_seed", block_early_dispatch=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON)]) as kv_seed_tid:
             k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
             v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
         prev_normed_kv_seed_deps = pl.array.create(DOWN_ON + 1, pl.TASK_ID)
@@ -572,7 +569,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON + 1)]) as mlp_out_seed_tid:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_out_seed", allow_early_resolve=True, block_early_dispatch=True, deps=[prev_out_seed_deps[i] for i in range(DOWN_ON)]) as mlp_out_seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
