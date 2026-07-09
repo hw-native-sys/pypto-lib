@@ -90,6 +90,13 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+            # Shared modules (config.py, helper libs) have no __main__ guard —
+            # they are imported by kernels, not run. Running them import-exits 0
+            # and shows a misleading pass, so drop them from the report entirely
+            # (matches detect_changes.py's `_has_main` runnable definition).
+            if ! grep -q '__main__' "$f"; then
+              continue
+            fi
             if grep -qE '^#\s*ci:\s*no-sim' "$f"; then
               echo "::group::${f}"
               echo "skip (no-sim): ${f}"
@@ -232,6 +239,11 @@ jobs:
           }
           # Run every model file once at its default world size (ep2 / 2-card).
           for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+            # Skip shared modules with no __main__ guard (config.py, helper libs):
+            # they are imported, not run, so they don't belong in the report.
+            if ! grep -q '__main__' "$f"; then
+              continue
+            fi
             run_case "$f" "$f"
           done
           # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
