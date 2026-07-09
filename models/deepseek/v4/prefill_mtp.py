@@ -84,7 +84,7 @@ MTP_MOE_EPOCH = 1
 @pl.jit
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
     e_proj_w: pl.Tensor[[D, D], pl.INT8],
@@ -138,7 +138,7 @@ def mtp_prefill_fwd(
     mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -151,8 +151,8 @@ def mtp_prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
-    projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     mtp_projection(
         hidden_states, prev_hidden_states,
@@ -196,7 +196,7 @@ def mtp_prefill_fwd(
 @pl.jit.host
 def l3_mtp_prefill_fwd(
     hidden_states: pl.Tensor[[N_RANKS, T, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
@@ -250,7 +250,7 @@ def l3_mtp_prefill_fwd(
     mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
@@ -351,7 +351,7 @@ def _projection_specs():
 
     return [
         TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: torch.randn(N_RANKS, T, D).to(torch.bfloat16)),
-        TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.bfloat16,
+        TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.float32,
                    init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
         TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
@@ -424,7 +424,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             specs.append(_ranked(base[name], torch))
 
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

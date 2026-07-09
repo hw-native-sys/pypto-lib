@@ -152,7 +152,7 @@ PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_BLOCKS
 
 @pl.jit
 def prefill_layer_core(
-    x_hc: pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32],
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
@@ -247,7 +247,7 @@ def prefill_layer_core(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -258,7 +258,7 @@ def prefill_layer_core(
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16]:
+) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]:
     x_hc.bind_dynamic(0, PREFILL_TOKENS_DYN)
     ori_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
     position_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -360,7 +360,7 @@ def prefill_layer_core(
                                                  valid_shape=[valid_tok])
             input_ids_tile = pl.slice(input_ids, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
 
-            x_attn_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.BF16)
+            x_attn_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
             if layer_id < 2:
                 prefill_attention_swa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -403,7 +403,7 @@ def prefill_layer_core(
                     x_attn_tile, valid_n,
                 )
 
-            x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.BF16)
+            x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
             moe(
                 x_attn_tile,
                 hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -427,7 +427,7 @@ def prefill_layer_core(
 
 @pl.jit.host
 def l3_prefill_layer(
-    x_hc: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32],
     seq_lens: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
     chunk_lens: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
     chunk_offsets: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
@@ -522,7 +522,7 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
@@ -970,7 +970,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
                 ids[rank, base:base + chunk_len] = (torch.arange(chunk_len, dtype=torch.int64) + base + rank) % VOCAB
         return ids.contiguous()
 
-    tensor_specs.append(TensorSpec("x_hc", [N_RANKS, total_tokens, HC_MULT, D], torch.bfloat16, init_value=init_x_hc))
+    tensor_specs.append(TensorSpec("x_hc", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, init_value=init_x_hc))
     tensor_specs.append(TensorSpec("input_ids", [N_RANKS, total_tokens], torch.int64, init_value=init_input_ids))
     tensor_specs.append(TensorSpec("position_ids", [N_RANKS, total_tokens], torch.int32,
                                    init_value=replicate(meta["position_ids"])))
@@ -1044,7 +1044,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.bfloat16, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, is_output=True))
 
     # Keep static weight parameters device-resident (child_memory), sharded per
     # rank. Dynamic cache/state/table tensors must stay as host tensors because
@@ -1156,7 +1156,7 @@ def golden_prefill_layer(tensors):
             valid = min(T, chunk_len - p0)
             base = chunk_base + p0
 
-            x_attn_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+            x_attn_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
             for rank in range(N_RANKS):
                 attn_tensors = {}
                 for spec in attn_specs:
@@ -1166,7 +1166,7 @@ def golden_prefill_layer(tensors):
                     if name == "x_out":
                         attn_tensors[name] = x_attn_tile[rank]
                     elif name == "x_hc":
-                        attn_tensors[name] = tile_buffer(tensors["x_hc"], rank, base, valid, (HC_MULT, D), torch.bfloat16)
+                        attn_tensors[name] = tile_buffer(tensors["x_hc"], rank, base, valid, (HC_MULT, D), torch.float32)
                     elif name in _TOKEN_META_NAMES:
                         packed = mapped[name]
                         attn_tensors[name] = tile_buffer(packed, rank, base, valid, tuple(packed.shape[2:]), packed.dtype)

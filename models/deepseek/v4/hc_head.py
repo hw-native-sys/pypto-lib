@@ -68,7 +68,7 @@ assert T_MAX % LINEAR_T_TILE == 0
 
 @pl.jit.inline
 def hc_head(
-    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
@@ -79,25 +79,19 @@ def hc_head(
     x_flat = pl.reshape(x_hc, [t_dim, HC_DIM])
     y_flat = pl.reshape(y, [t_dim, D])
     inv_rms = pl.create_tensor([T_MAX, 1], dtype=pl.FP32)
-    x_fp32 = pl.create_tensor([T_MAX, HC_DIM], dtype=pl.FP32)  # FP32 activations, produced by the RMS scope
+    # x arrives as FP32 (hc residual stream is FP32 end-to-end), so there is no
+    # x_fp32 staging buffer: the head-projection matmul (pure-AIC) and the inv_rms
+    # reduce below read x_flat directly.
     mixes_raw = pl.create_tensor([T_MAX, HC_PAD], dtype=pl.FP32)
     pre_t = pl.create_tensor([HC_PAD, T_MAX], dtype=pl.FP32)
-    # Cast scope: stream x (BF16) -> x_fp32 (FP32) once. Both the head-projection
-    # matmul (pure-AIC) and the inv_rms reduce below consume these FP32 activations.
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_cast", allow_early_resolve=True):
-        t0 = t * T_TILE
-        for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
-            k0 = kb * RMS_K_CHUNK
-            x_chunk = pl.cast(x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK], target_type=pl.FP32)
-            x_fp32[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK] = x_chunk
-            
+
     # inv_rms scope: read the FP32 activations back and reduce sum-of-squares -> rsqrt.
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_head_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(RMS_K_BLOCKS, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_fp32[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK]
+            x_chunk = x_flat[t0 : t0 + T_TILE, k0 : k0 + RMS_K_CHUNK]
             sq_sum = pl.add(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]),
@@ -122,7 +116,7 @@ def hc_head(
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = x_fp32[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # pre-cast FP32 -> pure-AIC matmul
+            x_linear_chunk = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # FP32 input -> pure-AIC matmul
             w_chunk = pl.slice(
                 hc_head_fn,
                 [HC_PAD, LINEAR_K_CHUNK],
@@ -164,10 +158,10 @@ def hc_head(
             pre3 = pl.reshape(pre_t[3:4, t0 : t0 + T_TILE], [T_TILE, 1])
             for db in pl.pipeline(D_BLOCKS, stage=2):
                 d0 = db * D_CHUNK
-                x_h0 = pl.cast(x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                x_h1 = pl.cast(x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                x_h2 = pl.cast(x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                x_h3 = pl.cast(x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                x_h0 = x_flat[t0 : t0 + T_TILE, 0 * D + d0 : 0 * D + d0 + D_CHUNK]
+                x_h1 = x_flat[t0 : t0 + T_TILE, 1 * D + d0 : 1 * D + d0 + D_CHUNK]
+                x_h2 = x_flat[t0 : t0 + T_TILE, 2 * D + d0 : 2 * D + d0 + D_CHUNK]
+                x_h3 = x_flat[t0 : t0 + T_TILE, 3 * D + d0 : 3 * D + d0 + D_CHUNK]
                 y_tile = pl.add(
                     pl.add(pl.row_expand_mul(x_h0, pre0), pl.row_expand_mul(x_h1, pre1)),
                     pl.add(pl.row_expand_mul(x_h2, pre2), pl.row_expand_mul(x_h3, pre3)),
@@ -180,7 +174,7 @@ def hc_head(
 
 @pl.jit
 def hc_head_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
@@ -247,7 +241,7 @@ def build_tensor_specs():
         return torch.randn(HC_MULT, HC_DIM) * 0.0519
 
     return [
-        TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_head_fn", [HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
         TensorSpec("hc_head_scale", [1], torch.float32,
                    init_value=lambda: torch.tensor([0.076099])),

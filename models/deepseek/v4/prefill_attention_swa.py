@@ -106,7 +106,7 @@ assert SPARSE_ORI_MAX_BLOCKS == BLOCK_NUM
 
 @pl.jit.inline
 def prefill_attention_swa(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -127,7 +127,7 @@ def prefill_attention_swa(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -215,7 +215,7 @@ def prefill_attention_swa(
 
 @pl.jit
 def prefill_attention_swa_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -236,7 +236,7 @@ def prefill_attention_swa_test(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     prefill_attention_swa(
@@ -359,7 +359,7 @@ def golden_prefill_attention_swa(tensors):
 
     tensors["kv_cache"][:] = kv_cache_in
 
-    y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
+    y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
     golden_hc_post({
         "x": attn_out.view(T, D),
         "residual": x_hc_flat,
@@ -484,7 +484,7 @@ def build_tensor_specs(
     wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
 
     return [
-        TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -506,7 +506,7 @@ def build_tensor_specs(
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
     ]
 
