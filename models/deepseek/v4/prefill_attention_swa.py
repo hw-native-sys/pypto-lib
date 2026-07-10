@@ -130,12 +130,25 @@ def prefill_attention_swa(
     x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
+    x_hc_pre = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    for guard_t in pl.parallel(0, T, 1):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_zero_inactive_hc_pre"):
+            zero_tile = pl.full([1, 1, 256], dtype=pl.FP32, value=0.0)
+            for guard_h in pl.range(HC_MULT):
+                for guard_d0 in pl.range(0, D, 256):
+                    if guard_t < num_tokens:
+                        x_hc_pre[guard_t : guard_t + 1, guard_h : guard_h + 1, guard_d0 : guard_d0 + 256] = x_hc[
+                            guard_t : guard_t + 1, guard_h : guard_h + 1, guard_d0 : guard_d0 + 256
+                        ]
+                    else:
+                        x_hc_pre[guard_t : guard_t + 1, guard_h : guard_h + 1, guard_d0 : guard_d0 + 256] = zero_tile
+
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
     # attention/o_proj -> KV writeback -> hc_post.
-    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
+    hc_pre(x_hc_pre, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
@@ -211,7 +224,7 @@ def prefill_attention_swa(
         wo_a, wo_b, wo_b_scale, attn_out,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post(attn_out, x_hc_pre, post, comb, x_out)
     return kv_cache, x_out
 
 
