@@ -208,7 +208,7 @@ def _attention_phase_window(
                                                     scores = pl.fillpad(
                                                         pl.set_validshape(
                                                             pl.mul(raw_scores, ATTN_SCALE),
-                                                            Q_HEAD_BATCH_PAD,
+                                                            Q_HEAD_BATCH,
                                                             valid_len,
                                                         ),
                                                         pad_value=pl.PadValue.min,
@@ -454,7 +454,7 @@ def _attention_phase_window_full_single_block(
                 scores0 = pl.fillpad(
                     pl.set_validshape(
                         pl.mul(raw_scores0, ATTN_SCALE),
-                        Q_HEAD_BATCH_PAD,
+                        Q_HEAD_BATCH,
                         ctx_len0,
                     ),
                     pad_value=pl.PadValue.min,
@@ -464,7 +464,7 @@ def _attention_phase_window_full_single_block(
                 scores1 = pl.fillpad(
                     pl.set_validshape(
                         pl.mul(raw_scores1, ATTN_SCALE),
-                        Q_HEAD_BATCH_PAD,
+                        Q_HEAD_BATCH,
                         ctx_len1,
                     ),
                     pad_value=pl.PadValue.min,
@@ -474,7 +474,7 @@ def _attention_phase_window_full_single_block(
                 scores2 = pl.fillpad(
                     pl.set_validshape(
                         pl.mul(raw_scores2, ATTN_SCALE),
-                        Q_HEAD_BATCH_PAD,
+                        Q_HEAD_BATCH,
                         ctx_len2,
                     ),
                     pad_value=pl.PadValue.min,
@@ -484,7 +484,7 @@ def _attention_phase_window_full_single_block(
                 scores3 = pl.fillpad(
                     pl.set_validshape(
                         pl.mul(raw_scores3, ATTN_SCALE),
-                        Q_HEAD_BATCH_PAD,
+                        Q_HEAD_BATCH,
                         ctx_len3,
                     ),
                     pad_value=pl.PadValue.min,
