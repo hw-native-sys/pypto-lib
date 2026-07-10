@@ -643,42 +643,113 @@ def golden_moe(tensors):
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    for r in range(N_RANKS):
-        # Stage 1: hc_pre
-        x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
-        post_t = torch.zeros(T, HC_MULT, dtype=torch.float32)
-        comb_t = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
+    # Stages 1-2: hc_pre + gate per rank. Rank-independent, so compute once and
+    # reuse for both the dispatch replay and each rank's local stages.
+    all_post = []
+    all_comb = []
+    all_indices = []
+    all_x_i8 = []
+    all_scale = []
+    all_weights = []
+    for src in range(N_RANKS):
+        src_x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
+        src_post = torch.zeros(T, HC_MULT, dtype=torch.float32)
+        src_comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
         golden_hc_pre({
-            "x":        tensors["x_hc"][r],
-            "hc_fn":    tensors["hc_ffn_fn"][r],
-            "hc_scale": tensors["hc_ffn_scale"][r],
-            "hc_base":  tensors["hc_ffn_base"][r],
-            "x_mixed":  x_mixed,
-            "post":     post_t,
-            "comb":     comb_t,
+            "x":        tensors["x_hc"][src],
+            "hc_fn":    tensors["hc_ffn_fn"][src],
+            "hc_scale": tensors["hc_ffn_scale"][src],
+            "hc_base":  tensors["hc_ffn_base"][src],
+            "x_mixed":  src_x_mixed,
+            "post":     src_post,
+            "comb":     src_comb,
         })
-
-        # Stage 2: gate (global routing)
-        x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
-        x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
-        x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
-        indices = torch.zeros(T, TOPK, dtype=torch.int32)
-        weights = torch.zeros(T, TOPK, dtype=torch.float32)
+        src_x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
+        src_x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
+        src_x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
+        src_indices = torch.zeros(T, TOPK, dtype=torch.int32)
+        src_weights = torch.zeros(T, TOPK, dtype=torch.float32)
         golden_gate_core({
-            "x_mixed":      x_mixed,
-            "norm_w":       tensors["norm_w"][r],
-            "gate_w":       tensors["gate_w"][r],
-            "gate_bias":    tensors["gate_bias"][r],
+            "x_mixed":      src_x_mixed,
+            "norm_w":       tensors["norm_w"][src],
+            "gate_w":       tensors["gate_w"][src],
+            "gate_bias":    tensors["gate_bias"][src],
             "layer_id":     tensors["layer_id"],
             "num_tokens":   tensors["num_tokens"],
-            "tid2eid":      tensors["tid2eid"][r],
-            "input_ids":    tensors["input_ids"][r],
-            "x_norm":       x_norm,
-            "x_norm_i8":    x_norm_i8,
-            "x_norm_scale": x_norm_scale,
-            "indices":      indices,
-            "weights":      weights,
+            "tid2eid":      tensors["tid2eid"][src],
+            "input_ids":    tensors["input_ids"][src],
+            "x_norm":       src_x_norm,
+            "x_norm_i8":    src_x_norm_i8,
+            "x_norm_scale": src_x_norm_scale,
+            "indices":      src_indices,
+            "weights":      src_weights,
         })
+        all_post.append(src_post)
+        all_comb.append(src_comb)
+        all_indices.append(src_indices)
+        all_x_i8.append(src_x_norm_i8)
+        all_scale.append(src_x_norm_scale)
+        all_weights.append(src_weights)
+
+    # Route counts per (src, dst, local expert); drives the per-source lane cumsum.
+    send_counts = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
+    for src in range(N_RANKS):
+        for t in range(num_tokens):
+            for k in range(TOPK):
+                eid = int(all_indices[src][t, k].item())
+                send_counts[src, eid // N_LOCAL, eid % N_LOCAL] += 1
+
+    # Stages 4-5: dispatch replay + routed expert per dst. Also rank-independent
+    # (each recv row's SwiGLU output depends only on that row), so compute once.
+    dst_recv_y = {}
+    for dst in range(N_RANKS):
+        # Pack onto rank dst in src-major order within each local expert — same
+        # convention as dispatch's per-source lane cumsum.
+        d_recv_x = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.int8)
+        d_recv_scale = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
+        d_recv_w = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
+        d_recv_count = torch.zeros(N_LOCAL, 1, dtype=torch.int32)
+        d_slot_offsets = torch.zeros(N_RANKS, N_LOCAL, dtype=torch.int32)
+        d_running = torch.zeros(N_LOCAL, dtype=torch.int32)
+        for src in range(N_RANKS):
+            d_slot_offsets[src] = d_running.clone()
+            d_running = d_running + send_counts[src, dst]
+        for e in range(N_LOCAL):
+            d_recv_count[e, 0] = int(d_running[e].item())
+        for src in range(N_RANKS):
+            cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
+            for t in range(num_tokens):
+                for k in range(TOPK):
+                    eid = int(all_indices[src][t, k].item())
+                    if eid // N_LOCAL != dst:
+                        continue
+                    loc_e = eid % N_LOCAL
+                    slot = int(d_slot_offsets[src, loc_e].item() + cursor[loc_e].item())
+                    cursor[loc_e] += 1
+                    d_recv_x[loc_e, slot, :] = all_x_i8[src][t, :]
+                    d_recv_scale[loc_e, slot] = float(all_scale[src][t, 0].item())
+                    d_recv_w[loc_e, slot] = float(all_weights[src][t, k].item())
+        d_recv_y = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.bfloat16)
+        golden_expert_routed({
+            "recv_x":            d_recv_x,
+            "recv_scale_dq":     d_recv_scale,
+            "recv_weights":      d_recv_w,
+            "recv_expert_count": d_recv_count,
+            "routed_w1":         tensors["routed_w1"][dst],
+            "routed_w1_scale":   tensors["routed_w1_scale"][dst],
+            "routed_w3":         tensors["routed_w3"][dst],
+            "routed_w3_scale":   tensors["routed_w3_scale"][dst],
+            "routed_w2":         tensors["routed_w2"][dst],
+            "routed_w2_scale":   tensors["routed_w2_scale"][dst],
+            "recv_y":            d_recv_y,
+        })
+        dst_recv_y[dst] = d_recv_y
+
+    for r in range(N_RANKS):
+        x_norm_i8 = all_x_i8[r]
+        x_norm_scale = all_scale[r]
+        post_t = all_post[r]
+        comb_t = all_comb[r]
 
         # Stage 3: expert_shared (local)
         sh = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -695,107 +766,6 @@ def golden_moe(tensors):
             "sh":               sh,
         })
 
-        # Stage 4: host-side dispatch simulation across all ranks for this dst=r.
-        # Collect all (src, t, k) routes that land on rank r.
-        recv_x = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.int8)
-        recv_scale = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-        recv_w = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-        recv_r_route = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.int32)
-        recv_count = torch.zeros(N_LOCAL, 1, dtype=torch.int32)
-
-        # Compute slot offsets the way dispatch does (source-major within each
-        # local expert = the per-source lane cumsum), so the order matches the
-        # on-device run.
-        send_counts = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
-        all_indices = []
-        all_x_i8 = []
-        all_scale = []
-        all_weights = []
-        for src in range(N_RANKS):
-            src_x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
-            src_post = torch.zeros(T, HC_MULT, dtype=torch.float32)
-            src_comb = torch.zeros(T, HC_MULT * HC_MULT, dtype=torch.float32)
-            golden_hc_pre({
-                "x":        tensors["x_hc"][src],
-                "hc_fn":    tensors["hc_ffn_fn"][src],
-                "hc_scale": tensors["hc_ffn_scale"][src],
-                "hc_base":  tensors["hc_ffn_base"][src],
-                "x_mixed":  src_x_mixed,
-                "post":     src_post,
-                "comb":     src_comb,
-            })
-            src_x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
-            src_x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
-            src_x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
-            src_indices = torch.zeros(T, TOPK, dtype=torch.int32)
-            src_weights = torch.zeros(T, TOPK, dtype=torch.float32)
-            golden_gate_core({
-                "x_mixed":      src_x_mixed,
-                "norm_w":       tensors["norm_w"][src],
-                "gate_w":       tensors["gate_w"][src],
-                "gate_bias":    tensors["gate_bias"][src],
-                "layer_id":     tensors["layer_id"],
-                "num_tokens":   tensors["num_tokens"],
-                "tid2eid":      tensors["tid2eid"][src],
-                "input_ids":    tensors["input_ids"][src],
-                "x_norm":       src_x_norm,
-                "x_norm_i8":    src_x_norm_i8,
-                "x_norm_scale": src_x_norm_scale,
-                "indices":      src_indices,
-                "weights":      src_weights,
-            })
-            all_indices.append(src_indices)
-            all_x_i8.append(src_x_norm_i8)
-            all_scale.append(src_x_norm_scale)
-            all_weights.append(src_weights)
-            for t in range(num_tokens):
-                for k in range(TOPK):
-                    eid = int(src_indices[t, k].item())
-                    dst = eid // N_LOCAL
-                    loc_e = eid % N_LOCAL
-                    send_counts[src, dst, loc_e] += 1
-
-        # Pack onto rank r in src-major (rank 0 first, then rank 1) within each
-        # local expert — same convention as dispatch's per-source lane cumsum.
-        slot_offsets = torch.zeros(N_RANKS, N_LOCAL, dtype=torch.int32)
-        running = torch.zeros(N_LOCAL, dtype=torch.int32)
-        for src in range(N_RANKS):
-            slot_offsets[src] = running.clone()
-            running = running + send_counts[src, r]
-        for e in range(N_LOCAL):
-            recv_count[e, 0] = int(running[e].item())
-
-        for src in range(N_RANKS):
-            cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
-            for t in range(num_tokens):
-                for k in range(TOPK):
-                    eid = int(all_indices[src][t, k].item())
-                    if eid // N_LOCAL != r:
-                        continue
-                    loc_e = eid % N_LOCAL
-                    slot = int(slot_offsets[src, loc_e].item() + cursor[loc_e].item())
-                    cursor[loc_e] += 1
-                    recv_x[loc_e, slot, :] = all_x_i8[src][t, :]
-                    recv_scale[loc_e, slot] = float(all_scale[src][t, 0].item())
-                    recv_w[loc_e, slot] = float(all_weights[src][t, k].item())
-                    recv_r_route[loc_e, slot] = t * TOPK + k
-
-        # Stage 5: routed expert (local, weighted)
-        recv_y = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.bfloat16)
-        golden_expert_routed({
-            "recv_x":            recv_x,
-            "recv_scale_dq":     recv_scale,
-            "recv_weights":      recv_w,
-            "recv_expert_count": recv_count,
-            "routed_w1":         tensors["routed_w1"][r],
-            "routed_w1_scale":   tensors["routed_w1_scale"][r],
-            "routed_w3":         tensors["routed_w3"][r],
-            "routed_w3_scale":   tensors["routed_w3_scale"][r],
-            "routed_w2":         tensors["routed_w2"][r],
-            "routed_w2_scale":   tensors["routed_w2_scale"][r],
-            "recv_y":            recv_y,
-        })
-
         # Stage 6: combine — for each (src, t, k) that originated on this
         # rank, find the (loc_e, slot) on rank dst where the SwiGLU result
         # landed, then accumulate by r_route = t*TOPK+k.
@@ -807,75 +777,17 @@ def golden_moe(tensors):
                 loc_e = eid % N_LOCAL
                 my_routes.append((t, k, dst, loc_e))
 
-        # For each dst, dst-side has packing where rank-r's contribution lives
-        # at slot offset = Sigma_{s<r} send_counts[s, dst, loc_e].
-        dst_recv_y = {}
-        dst_recv_count = {}
-        for dst in range(N_RANKS):
-            # Replay dispatch from ALL src ranks to dst, then expert_routed,
-            # then pull out per-route results.
-            d_recv_x = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.int8)
-            d_recv_scale = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-            d_recv_w = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.float32)
-            d_recv_r_route = torch.zeros(N_LOCAL, RECV_MAX, dtype=torch.int32)
-            d_recv_count = torch.zeros(N_LOCAL, 1, dtype=torch.int32)
-            d_slot_offsets = torch.zeros(N_RANKS, N_LOCAL, dtype=torch.int32)
-            d_running = torch.zeros(N_LOCAL, dtype=torch.int32)
-            for src in range(N_RANKS):
-                d_slot_offsets[src] = d_running.clone()
-                d_running = d_running + send_counts[src, dst]
-            for e in range(N_LOCAL):
-                d_recv_count[e, 0] = int(d_running[e].item())
-            for src in range(N_RANKS):
-                cursor = torch.zeros(N_LOCAL, dtype=torch.int32)
-                for t in range(num_tokens):
-                    for k in range(TOPK):
-                        eid = int(all_indices[src][t, k].item())
-                        if eid // N_LOCAL != dst:
-                            continue
-                        loc_e = eid % N_LOCAL
-                        slot = int(d_slot_offsets[src, loc_e].item() + cursor[loc_e].item())
-                        cursor[loc_e] += 1
-                        d_recv_x[loc_e, slot, :] = all_x_i8[src][t, :]
-                        d_recv_scale[loc_e, slot] = float(all_scale[src][t, 0].item())
-                        d_recv_w[loc_e, slot] = float(all_weights[src][t, k].item())
-                        d_recv_r_route[loc_e, slot] = t * TOPK + k
-            d_recv_y = torch.zeros(N_LOCAL, RECV_MAX, D, dtype=torch.bfloat16)
-            golden_expert_routed({
-                "recv_x":            d_recv_x,
-                "recv_scale_dq":     d_recv_scale,
-                "recv_weights":      d_recv_w,
-                "recv_expert_count": d_recv_count,
-                "routed_w1":         tensors["routed_w1"][dst],
-                "routed_w1_scale":   tensors["routed_w1_scale"][dst],
-                "routed_w3":         tensors["routed_w3"][dst],
-                "routed_w3_scale":   tensors["routed_w3_scale"][dst],
-                "routed_w2":         tensors["routed_w2"][dst],
-                "routed_w2_scale":   tensors["routed_w2_scale"][dst],
-                "recv_y":            d_recv_y,
-            })
-            dst_recv_y[dst] = d_recv_y
-            dst_recv_count[dst] = d_recv_count
-
-        # Now combine — per-route reverse lookup of dst's slot for THIS rank
-        # r's (t, k):
+        # Rank r's contribution to dst sits at slot offset
+        # Sigma_{s<r} send_counts[s, dst, loc_e] plus a running per-(dst, loc_e)
+        # cursor over r's own routes in (t, k) order.
         routed_y_buf_r = torch.zeros(N_ROUTES, D, dtype=torch.bfloat16)
+        cursors = {}
         for (t, k, dst, loc_e) in my_routes:
-            # Find this rank r's slot inside dst.recv_x: src=r block,
-            # cursor = how many of r's (t', k' <= (t, k)) so far targeted this loc_e.
-            src_off = 0
-            for s in range(r):
-                src_off += int(send_counts[s, dst, loc_e].item())
-            # Count how many earlier (t', k') from rank r targeted (dst, loc_e).
-            cursor = 0
-            for (tt, kk, dd, ll) in my_routes:
-                if (tt, kk) == (t, k):
-                    break
-                if dd == dst and ll == loc_e:
-                    cursor += 1
-            slot = src_off + cursor
+            src_off = int(send_counts[:r, dst, loc_e].sum().item())
+            cursor = cursors.get((dst, loc_e), 0)
+            cursors[(dst, loc_e)] = cursor + 1
             r_route = t * TOPK + k
-            routed_y_buf_r[r_route, :] = dst_recv_y[dst][loc_e, slot, :]
+            routed_y_buf_r[r_route, :] = dst_recv_y[dst][loc_e, src_off + cursor, :]
 
         # Stage 7: reduce + sh + hc_post
         acc = sh.float().clone()

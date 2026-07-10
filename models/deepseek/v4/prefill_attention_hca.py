@@ -15,6 +15,8 @@ consumes lowered metadata such as position_ids, dense slot mappings, and sparse
 indices.
 """
 
+import functools
+
 import pypto.language as pl
 
 from config import (
@@ -373,6 +375,14 @@ def golden_prefill_attention_hca(tensors):
     tensors["x_out"][:] = y.view(T, HC_MULT, D)
 
 
+@functools.lru_cache(maxsize=None)
+def _state_block_table(max_blocks):
+    """Constant scrambled state block table [max_blocks]."""
+    import torch
+    blocks = torch.arange(max_blocks, dtype=torch.int32)
+    return (blocks * 17 + 3) % max_blocks
+
+
 def build_tensor_specs(
     start_pos: int = START_POS,
     num_tokens: int = T,
@@ -514,18 +524,15 @@ def build_tensor_specs(
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0340
     def init_cmp_norm_w():
         return 0.1001 + torch.randn(HEAD_DIM,) * 0.0549
+    state_table = _state_block_table(HCA_STATE_MAX_BLOCKS)
     def init_compress_state_block_table():
-        table = torch.full((HCA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(HCA_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % HCA_STATE_MAX_BLOCKS
-        return table
+        return state_table.clone()
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
-        table = init_compress_state_block_table()
         block = abs_pos // HCA_STATE_BLOCK_SIZE
         intra = abs_pos % HCA_STATE_BLOCK_SIZE
-        return int(table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
+        return int(state_table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
     def init_cmp_state():
         state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
         flat = state.view(-1, MAIN_OUT_DIM)

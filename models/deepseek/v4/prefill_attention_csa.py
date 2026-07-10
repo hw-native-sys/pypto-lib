@@ -14,6 +14,8 @@ the layer owns the per-request loop and feeds this op one
 contiguous run of <=T tokens.
 """
 
+import functools
+
 import pypto.language as pl
 
 from config import (
@@ -561,6 +563,14 @@ def golden_prefill_attention_csa(tensors):
     tensors["x_out"][:] = y
 
 
+@functools.lru_cache(maxsize=None)
+def _state_block_table(max_blocks):
+    """Constant scrambled state block table [max_blocks]."""
+    import torch
+    blocks = torch.arange(max_blocks, dtype=torch.int32)
+    return (blocks * 17 + 3) % max_blocks
+
+
 def build_tensor_specs(
     start_pos: int = START_POS,
     num_tokens: int = T,
@@ -706,18 +716,15 @@ def build_tensor_specs(
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
     def init_cmp_norm_w():
         return 0.9666 + torch.randn(HEAD_DIM,) * 0.1929
+    state_table = _state_block_table(CSA_STATE_MAX_BLOCKS)
     def init_compress_state_block_table():
-        table = torch.full((CSA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(CSA_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % CSA_STATE_MAX_BLOCKS
-        return table
+        return state_table.clone()
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
-        table = init_compress_state_block_table()
         block = abs_pos // CSA_STATE_BLOCK_SIZE
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
-        return int(table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
+        return int(state_table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
     def init_cmp_state():
         state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
         flat = state.view(-1, MAIN_OUT_DIM)
@@ -750,18 +757,15 @@ def build_tensor_specs(
         return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
         return 0.6850 + torch.randn(IDX_HEAD_DIM,) * 0.2610
+    inner_state_table = _state_block_table(INNER_STATE_MAX_BLOCKS)
     def init_inner_compress_state_block_table():
-        table = torch.full((INNER_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
-        for block in range(INNER_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % INNER_STATE_MAX_BLOCKS
-        return table
+        return inner_state_table.clone()
     def inner_state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
             return -1
-        table = init_inner_compress_state_block_table()
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        return int(table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
+        return int(inner_state_table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_inner_kv_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
         flat = state.view(-1, INNER_OUT_DIM)
