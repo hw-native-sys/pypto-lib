@@ -127,6 +127,34 @@ assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 # the final RMSNorm gamma — mirrors decode_fwd.
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
+TAIL_D_CHUNK = 512
+TAIL_D_BLOCKS = D // TAIL_D_CHUNK
+assert D % TAIL_D_CHUNK == 0
+
+
+@pl.jit.inline
+def _zero_hc_tail(
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    num_tokens: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+
+    for block in pl.spmd(T * HC_MULT, name_hint="prefill_zero_hc_tail"):
+        if block == 0:
+            x_hc[0:1, 0:1, 0:16] = x_hc[0:1, 0:1, 0:16]
+        t = block // HC_MULT
+        h = block % HC_MULT
+        if t >= active_tokens:
+            for db in pl.pipeline(TAIL_D_BLOCKS, stage=2):
+                d0 = db * TAIL_D_CHUNK
+                x_hc[t:t + 1, h:h + 1, d0:d0 + TAIL_D_CHUNK] = pl.full(
+                    [1, 1, TAIL_D_CHUNK], dtype=pl.BF16, value=0.0
+                )
+    return x_hc
 
 # Per-FWD-layer stacked weights (sliced by the FWD layer index 0..42).
 FWD_LAYER_STACKED_NAMES = [
@@ -358,6 +386,7 @@ def prefill_fwd(
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             x_attn0, nt,
         )
+    x_attn0 = _zero_hc_tail(x_attn0, nt)
     with pl.scope():
         moe(
             x_attn0,
@@ -420,6 +449,7 @@ def prefill_fwd(
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             x_attn1, nt,
         )
+    x_attn1 = _zero_hc_tail(x_attn1, nt)
     with pl.scope():
         moe(
             x_attn1,
@@ -517,6 +547,7 @@ def prefill_fwd(
                 attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
                 x_attn_csa, nt,
             )
+        x_attn_csa = _zero_hc_tail(x_attn_csa, nt)
         with pl.scope():
             moe(
                 x_attn_csa,
@@ -589,6 +620,7 @@ def prefill_fwd(
                 attn_sink_hca, wo_a_hca, wo_b_hca, wo_b_scale_hca,
                 x_attn_hca, nt,
             )
+        x_attn_hca = _zero_hc_tail(x_attn_hca, nt)
         with pl.scope():
             moe(
                 x_attn_hca,
@@ -682,6 +714,7 @@ def prefill_fwd(
             attn_sink_last, wo_a_last, wo_b_last, wo_b_scale_last,
             x_attn_last, nt,
         )
+    x_attn_last = _zero_hc_tail(x_attn_last, nt)
     with pl.scope():
         moe(
             x_attn_last,
