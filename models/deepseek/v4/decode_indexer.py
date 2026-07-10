@@ -75,12 +75,20 @@ Q_OUT_TILE = 1024
 MM_N_TILE = 512
 MM_ROW_TILE = 16
 T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
-# weights_proj is a single-tile CORE_GROUP scope (one 16-row boxed matmul); decode
-# T fits in one tile. Fail loudly if a config makes T exceed it (would drop rows).
-assert T_PAD == MM_ROW_TILE, "weights_proj single-tile scope assumes decode T <= MM_ROW_TILE"
+# weights_proj is one 16-row boxed matmul per task; decode T fits in one row tile.
+# Fail loudly if a config makes T exceed it (would drop rows).
+assert T_PAD == MM_ROW_TILE, "weights_proj single-row-tile scope assumes decode T <= MM_ROW_TILE"
 HEAD_DIM_TILE = 32
 D_TILE = 512
-WEIGHTS_ROW_TILE = 8
+# weights_proj splits K, not N: a [D_TILE, IDX_N_HEADS] row block reads contiguous GM,
+# while an N slice would take 32B out of every 128B row. Each task writes its own
+# partial row block, summed by a separate reduce scope -- a zero-seed + atomic-add
+# assemble races here, since T_PAD == MM_ROW_TILE makes the seed a full-extent write.
+# WEIGHTS_K_SLICE // D_TILE == 2, so the inner loop is a pl.range: a degenerate
+# 2-iteration pl.pipeline(stage=2) miscompiles over matmul.
+WEIGHTS_OK = 4
+WEIGHTS_K_SLICE = D // WEIGHTS_OK
+assert WEIGHTS_K_SLICE % D_TILE == 0
 QH_QUANT_TILE = 64
 # cube tile for q @ hadamard; L0C caps it at QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB.
 QH_MM_TILE = 64
@@ -212,17 +220,25 @@ def indexer(
 
     x_flat = pl.reshape(x, [T, D])
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj"):
+    weights_partial = pl.create_tensor([WEIGHTS_OK * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
+    for kb in pl.spmd(WEIGHTS_OK, name_hint="weights_proj"):
+        k_base = kb * WEIGHTS_K_SLICE
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
-        for db in pl.pipeline(0, D // D_TILE, stage=2):
-            d0 = db * D_TILE
+        for db in pl.range(WEIGHTS_K_SLICE // D_TILE):
+            d0 = k_base + db * D_TILE
             x_tile = pl.slice(x_flat, [MM_ROW_TILE, D_TILE], [0, d0], valid_shape=[pl.min(MM_ROW_TILE, T), D_TILE])
             weights_proj_tile = weights_proj[d0 : d0 + D_TILE, :]
-            if d0 == 0:
+            if db == 0:
                 weights_acc = pl.matmul(x_tile, weights_proj_tile, out_dtype=pl.FP32)
             else:
                 weights_acc = pl.matmul_acc(weights_acc, x_tile, weights_proj_tile)
-        weights[0:MM_ROW_TILE, :] = pl.mul(weights_acc, WEIGHTS_SCALE)
+        weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :] = weights_acc
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="weights_proj_reduce"):
+        w_sum = weights_partial[0:MM_ROW_TILE, :]
+        for kb in pl.unroll(1, WEIGHTS_OK):
+            w_sum = pl.add(w_sum, weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :])
+        weights[0:MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
 
     indexer_compressor(
         x, inner_kv,
