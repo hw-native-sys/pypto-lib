@@ -413,19 +413,11 @@ def _attention_phase_window_full_single_block(
                     [Q_HEAD_PAD, HEAD_DIM],
                     [q_row3, 0],
                 )
-                q_batch = pl.reshape(
-                    pl.concat(
-                        pl.concat(
-                            pl.reshape(q0, [1, Q_HEAD_PAD * HEAD_DIM]),
-                            pl.reshape(q1, [1, Q_HEAD_PAD * HEAD_DIM]),
-                        ),
-                        pl.concat(
-                            pl.reshape(q2, [1, Q_HEAD_PAD * HEAD_DIM]),
-                            pl.reshape(q3, [1, Q_HEAD_PAD * HEAD_DIM]),
-                        ),
-                    ),
-                    [QKPV_BATCH_ROWS, HEAD_DIM],
-                )
+                q_batch = pl.create_tensor([QKPV_BATCH_ROWS, HEAD_DIM], dtype=pl.BF16)
+                q_batch = pl.assemble(q_batch, q0, [0, 0])
+                q_batch = pl.assemble(q_batch, q1, [Q_HEAD_PAD, 0])
+                q_batch = pl.assemble(q_batch, q2, [2 * Q_HEAD_PAD, 0])
+                q_batch = pl.assemble(q_batch, q3, [3 * Q_HEAD_PAD, 0])
                 raw_scores_batch = pl.matmul(
                     q_batch,
                     k_tile,
@@ -489,19 +481,11 @@ def _attention_phase_window_full_single_block(
                     ),
                     pad_value=pl.PadValue.min,
                 )
-                scores_batch = pl.reshape(
-                    pl.concat(
-                        pl.concat(
-                            pl.reshape(scores0, [1, Q_HEAD_BATCH_PAD * SEQ_TILE]),
-                            pl.reshape(scores1, [1, Q_HEAD_BATCH_PAD * SEQ_TILE]),
-                        ),
-                        pl.concat(
-                            pl.reshape(scores2, [1, Q_HEAD_BATCH_PAD * SEQ_TILE]),
-                            pl.reshape(scores3, [1, Q_HEAD_BATCH_PAD * SEQ_TILE]),
-                        ),
-                    ),
-                    [QKPV_BATCH_ROWS, SEQ_TILE],
-                )
+                scores_batch = pl.create_tensor([QKPV_BATCH_ROWS, SEQ_TILE], dtype=pl.FP32)
+                scores_batch = pl.assemble(scores_batch, scores0, [0, 0])
+                scores_batch = pl.assemble(scores_batch, scores1, [Q_HEAD_BATCH_PAD, 0])
+                scores_batch = pl.assemble(scores_batch, scores2, [2 * Q_HEAD_BATCH_PAD, 0])
+                scores_batch = pl.assemble(scores_batch, scores3, [3 * Q_HEAD_BATCH_PAD, 0])
                 cur_mi_batch = pl.row_max(scores_batch)
                 exp_scores_batch = pl.exp(pl.row_expand_sub(scores_batch, cur_mi_batch))
                 exp_scores_bf16_batch = pl.cast(exp_scores_batch, target_type=pl.BF16)
@@ -769,9 +753,10 @@ def prefill_layer(
 
                 # ── Scope 2: Q/K norm + RoPE + KV cache update + causal attention ──
                 attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                all_q_padded_tile = pl.create_tensor(
+                all_q_padded_tile = pl.full(
                     [TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM],
                     dtype=pl.BF16,
+                    value=0.0,
                 )
                 for final_ti0 in pl.range(0, valid_tok, FINALIZE_TOK_GROUP):
                     finalize_tok = pl.min(FINALIZE_TOK_GROUP, valid_tok - final_ti0)
@@ -792,13 +777,8 @@ def prefill_layer(
                             q_block_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD
                             for ki in pl.range(NUM_KV_HEADS):
                                 kv_col = ki * HEAD_DIM
-                                k_head = pl.slice(
-                                    k_proj_tile,
-                                    [Q_HEAD_PAD, HEAD_DIM],
-                                    [ti, kv_col],
-                                    valid_shape=[1, HEAD_DIM],
-                                )
-                                k_sq = pl.reshape(pl.row_sum(pl.mul(k_head, k_head)), [Q_HEAD_PAD, 1])
+                                k_head = pl.slice(k_proj_tile, [1, HEAD_DIM], [ti, kv_col])
+                                k_sq = pl.reshape(pl.row_sum(pl.mul(k_head, k_head)), [1, 1])
                                 k_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS)))
                                 k_normed = pl.col_expand_mul(
                                     pl.row_expand_mul(k_head, k_inv_rms),
@@ -851,17 +831,8 @@ def prefill_layer(
                                     pl.slice(q_proj_tile, [1, Q_HEAD_BATCH * HEAD_DIM], [ti, q_base * HEAD_DIM]),
                                     [Q_HEAD_BATCH, HEAD_DIM],
                                 )
-                                q_block_pad = pl.create_tensor([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32)
+                                q_block_pad = pl.full([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0)
                                 q_block_pad = pl.assemble(q_block_pad, q_block_raw, [0, 0])
-                                q_block_pad = pl.assemble(
-                                    q_block_pad,
-                                    pl.full(
-                                        [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM],
-                                        dtype=pl.FP32,
-                                        value=0.0,
-                                    ),
-                                    [Q_HEAD_BATCH, 0],
-                                )
                                 q_sq = pl.reshape(
                                     pl.row_sum(pl.mul(q_block_pad, q_block_pad)),
                                     [Q_HEAD_PAD, 1],
@@ -902,18 +873,6 @@ def prefill_layer(
                                     all_q_padded_tile,
                                     pl.cast(q_rot_hi, target_type=pl.BF16),
                                     [q_pad_row0, HALF_DIM],
-                                )
-                                all_q_padded_tile = pl.assemble(
-                                    all_q_padded_tile,
-                                    pl.cast(
-                                        pl.full(
-                                            [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM],
-                                            dtype=pl.FP32,
-                                            value=0.0,
-                                        ),
-                                        target_type=pl.BF16,
-                                    ),
-                                    [q_pad_row0 + Q_HEAD_BATCH, 0],
                                 )
 
                     b_i32 = pl.cast(b, pl.INT32)
