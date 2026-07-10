@@ -82,6 +82,8 @@ HEAD_DIM_TILE = 32
 D_TILE = 512
 WEIGHTS_ROW_TILE = 8
 QH_QUANT_TILE = 64
+# cube tile for q @ hadamard; L0C caps it at QH_MM_TILE * IDX_HEAD_DIM * 4B <= 64KiB.
+QH_MM_TILE = 64
 QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = S * IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
@@ -178,15 +180,21 @@ def indexer(
         rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(qr_swapped, sin_il_signed))
         qr_bf16[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
+    # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
+    # in its own scope so the two run as separate cube and vector tasks.
+    qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul"):
+        o0 = idx * QH_MM_TILE
+        qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
+        qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
+
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
     for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant"):
         o0 = idx * QH_QUANT_TILE
-        qh_q = qr_bf16[o0 : o0 + QH_QUANT_TILE, :]
-        qh_acc = pl.matmul(qh_q, hadamard, out_dtype=pl.FP32)
         qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
-            qh_a_f32 = qh_acc[0 : QH_QUANT_TILE, h0 : h0 + QH_HEAD_DIM_TILE]
+            qh_a_f32 = qh_acc_gm[o0 : o0 + QH_QUANT_TILE, h0 : h0 + QH_HEAD_DIM_TILE]
             qh_a_abs = pl.maximum(qh_a_f32, pl.neg(qh_a_f32))
             qh_a_max = pl.reshape(pl.row_max(qh_a_abs), [1, QH_QUANT_TILE])
             qh_amax = pl.maximum(qh_amax, qh_a_max)
@@ -195,7 +203,7 @@ def indexer(
         qr_hadamard_scale_dq[o0 : o0 + QH_QUANT_TILE, :] = qh_scale_dq
         qh_scale_quant = pl.reshape(qh_scale_quant_row, [QH_QUANT_TILE, 1])
         for h1 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
-            qh_q_f32 = qh_acc[0 : QH_QUANT_TILE, h1 : h1 + QH_HEAD_DIM_TILE]
+            qh_q_f32 = qh_acc_gm[o0 : o0 + QH_QUANT_TILE, h1 : h1 + QH_HEAD_DIM_TILE]
             qh_q_scaled = pl.row_expand_mul(qh_q_f32, qh_scale_quant)
             qh_q_i32 = pl.cast(qh_q_scaled, target_type=pl.INT32, mode="rint")
             qh_q_half = pl.cast(qh_q_i32, target_type=pl.FP16, mode="round")
