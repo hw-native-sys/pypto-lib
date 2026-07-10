@@ -24,13 +24,19 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
 )
-from compressor_schedule import build_decode_padded_write_schedule, build_prefill_write_schedule, gather_compressor_rope_rows
+from compressor_common import (
+    COMPRESSOR_RMS_ROW_TILE as RMS_ROW_TILE,
+    build_decode_padded_write_schedule,
+    build_prefill_write_schedule,
+    compressor_rmsnorm_rope,
+    finalize_compressor_writes,
+    gather_compressor_rope_rows,
+)
 
 
 EPS = M.rms_norm_eps
 D = M.hidden_size
 HEAD_DIM = M.head_dim
-HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 ROPE_HALF = ROPE_HEAD_DIM // 2
 NOPE_HEAD_DIM = M.nope_head_dim
@@ -107,24 +113,20 @@ PROJ_ROWS_PAD = pl.dynamic("COMPRESSOR_PROJ_ROWS_PAD")
 PROJ_MM_B_TILE = 16
 PROJ_OUT_TILE = 64  # decode (small M): coarse tiles avoid dispatch overhead
 PROJ_K_TILE = 512
-RMS_ROW_TILE = 8
-COMPRESSOR_RMS_ROWS = pl.dynamic("COMPRESSOR_RMS_ROWS")
 POOL_STATE_ROWS = pl.dynamic("COMPRESSOR128_POOL_STATE_ROWS")
 POOL_TABLE_ROWS = pl.dynamic("COMPRESSOR128_POOL_TABLE_ROWS")
 POOL_TABLE_BLOCKS = pl.dynamic("COMPRESSOR128_POOL_TABLE_BLOCKS")
 POOL_STATE_BLOCKS = STATE_LEN // RATIO128_STATE_BLOCK_SIZE
 
-# Shared-core dynamic shapes (bind per caller: decode vs prefill). The state and
-# cmp-cache tensors are passed as pre-reshaped flat views so their shapes stay
-# statically inferable per call site (dim()-derived reshapes inside the core are
-# not).
+# Shared-core dynamic shapes (bind per caller: decode vs prefill). State tensors
+# are passed as pre-reshaped flat views so their shapes stay statically inferable
+# per call site (dim()-derived reshapes inside the core are not).
 CORE_PROJ_ROWS = pl.dynamic("COMPRESSOR_CORE_PROJ_ROWS")
 CORE_TOKENS = pl.dynamic("COMPRESSOR_CORE_TOKENS")
 CORE_WRITE_ROWS = pl.dynamic("COMPRESSOR_CORE_WRITE_ROWS")
 CORE_STATE_ROWS = pl.dynamic("COMPRESSOR_CORE_STATE_ROWS")
 CORE_TABLE_ROWS = pl.dynamic("COMPRESSOR_CORE_TABLE_ROWS")
 CORE_TABLE_BLOCKS = pl.dynamic("COMPRESSOR_CORE_TABLE_BLOCKS")
-CORE_CMP_ROWS = pl.dynamic("COMPRESSOR_CORE_CMP_ROWS")
 # Compact per-regime pool enumeration length: decode binds it to the batch-row
 # count (real windows), prefill to its write-row count. Pooling only the real
 # windows — instead of every RMS-padded write row — keeps decode off the padded
@@ -238,49 +240,6 @@ def prefill_compressor_ratio128_proj(
 
 
 @pl.jit.inline
-def compressor_rmsnorm_rope(
-    pooled_kv: pl.Tensor[[COMPRESSOR_RMS_ROWS, HEAD_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos_b: pl.Tensor[[COMPRESSOR_RMS_ROWS, ROPE_HALF], pl.FP32],
-    sin_b: pl.Tensor[[COMPRESSOR_RMS_ROWS, ROPE_HALF], pl.FP32],
-    normed_kv: pl.Tensor[[COMPRESSOR_RMS_ROWS, HEAD_DIM], pl.FP32],
-):
-    norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    rows = pl.tensor.dim(pooled_kv, 0)
-    for rt in pl.spmd(rows // RMS_ROW_TILE, name_hint="rmsnorm_rope"):
-        r0 = rt * RMS_ROW_TILE
-        partial_sq = pl.full([1, RMS_ROW_TILE], dtype=pl.FP32, value=0.0)
-        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
-            rms_h0 = rms_kb * HEAD_TILE
-            kv_rms_chunk = pooled_kv[r0 : r0 + RMS_ROW_TILE, rms_h0 : rms_h0 + HEAD_TILE]
-            kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
-            partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_ROW_TILE]))
-        variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_ROW_TILE, 1])
-        inv_rms = pl.recip(pl.sqrt(variance))
-        for rms_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
-            norm_h0 = rms_kb * HEAD_TILE
-            kv_norm_chunk = pooled_kv[r0 : r0 + RMS_ROW_TILE, norm_h0 : norm_h0 + HEAD_TILE]
-            gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
-            normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[r0 : r0 + RMS_ROW_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
-
-        kv_rope_norm = pooled_kv[r0 : r0 + RMS_ROW_TILE, NOPE_HEAD_DIM:HEAD_DIM]
-        gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
-        rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        rope_ones = pl.full([RMS_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
-        cos_il = pl.gather(cos_b[r0 : r0 + RMS_ROW_TILE, 0:ROPE_HALF], dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b[r0 : r0 + RMS_ROW_TILE, 0:ROPE_HALF], dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[r0 : r0 + RMS_ROW_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
-
-@pl.jit.inline
 def compressor_core_ratio128(
     kv_proj: pl.Tensor[[CORE_PROJ_ROWS, OUT_DIM], pl.FP32],
     score_proj: pl.Tensor[[CORE_PROJ_ROWS, OUT_DIM], pl.FP32],
@@ -296,24 +255,17 @@ def compressor_core_ratio128(
     write_dst_map: pl.Tensor[[1, CORE_WRITE_ROWS], pl.INT32],
     state_table_row_map: pl.Tensor[[1, CORE_WRITE_ROWS], pl.INT32],
     pool_row_map: pl.Tensor[[1, CORE_POOL_ROWS], pl.INT32],
-    cmp_kv_cache_flat: pl.Tensor[[CORE_CMP_ROWS, HEAD_DIM], pl.BF16],
     pooled_kv: pl.Tensor[[CORE_WRITE_ROWS, HEAD_DIM], pl.FP32],
     normed_kv: pl.Tensor[[CORE_WRITE_ROWS, HEAD_DIM], pl.FP32],
     cos_b: pl.Tensor[[CORE_WRITE_ROWS, ROPE_HALF], pl.FP32],
     sin_b: pl.Tensor[[CORE_WRITE_ROWS, ROPE_HALF], pl.FP32],
 ):
-    """Shared decode/prefill ratio128 compression pipeline (mirrors
-    _golden_compressor_ratio128_pipeline). Regime differences — write schedule,
-    proj tiling, paged vs fresh state binding, per-token kv output — live in the
-    caller; this is the batch-agnostic math core:
+    """Shared decode/prefill ratio128 compression math pipeline.
 
-      scatter projected (kv, score+APE) into paged state (skip slot < 0)
-        -> softmax-pool each complete window (block-table gather)
-        -> rmsnorm + rope at the window position
-        -> write the compressed row to cmp_kv_cache.
-
-    On return `normed_kv` holds the per-write compressed rows (fp32), so a caller
-    that also emits a per-token kv output (decode) scatters them from there."""
+    Regime-specific projection tiling, write scheduling, cache finalization, and
+    optional per-token output remain in the caller. The core scatters projected
+    state, pools every complete window, applies RMSNorm and RoPE, then returns the
+    per-write FP32 rows in `normed_kv`."""
     token_rows = pl.tensor.dim(state_slot_mapping, 0)
     write_rows = pl.tensor.dim(write_dst_map, 1)
 
@@ -378,18 +330,8 @@ def compressor_core_ratio128(
         cos_b,
         sin_b,
     )
-    compressor_rmsnorm_rope(pooled_kv, norm_w, cos_b, sin_b, normed_kv)
-
-    # 5. Write the compressed row to cmp_kv_cache. write_dst >= 0 and kv_out_row >= 0
-    # are set together by the schedule, so gating on write_dst alone matches the
-    # golden. A caller that also needs per-token kv reads normed_kv afterward.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_finalize", deps=[pool_tid]):
-        for final_row in pl.range(write_rows):
-            cmp_row_raw = pl.read(write_dst_map, [0, final_row])
-            if cmp_row_raw >= 0:
-                cmp_row = pl.cast(cmp_row_raw, target_type=pl.INDEX)
-                kv_row = normed_kv[final_row : final_row + 1, 0:HEAD_DIM]
-                cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
+    normed_kv = compressor_rmsnorm_rope(pooled_kv, norm_w, cos_b, sin_b, normed_kv)
+    return normed_kv
 
 
 @pl.jit.inline
@@ -453,7 +395,7 @@ def decode_compressor_ratio128(
     normed_kv = pl.create_tensor([DECODE_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     cos_b = pl.create_tensor([DECODE_RMS_PAD_ROWS, ROPE_HALF], dtype=pl.FP32)
     sin_b = pl.create_tensor([DECODE_RMS_PAD_ROWS, ROPE_HALF], dtype=pl.FP32)
-    compressor_core_ratio128(
+    normed_kv = compressor_core_ratio128(
         kv_proj_pad,
         score_proj_pad,
         position_ids,
@@ -468,11 +410,17 @@ def decode_compressor_ratio128(
         write_dst_map,
         state_table_row_map,
         pool_row_map,
-        cmp_kv_cache_flat,
         pooled_kv,
         normed_kv,
         cos_b,
         sin_b,
+    )
+    finalize_compressor_writes(
+        normed_kv,
+        write_dst_map,
+        cmp_kv_cache_flat,
+        pl.const(DECODE_RMS_PAD_ROWS, pl.INT32),
+        pl.const(0, pl.INT32),
     )
 
     # Decode-only: scatter the compressed rows to the per-token kv output.
@@ -535,7 +483,6 @@ def prefill_compressor_ratio128(
     # is marked -1 by the host). See compressor_core_ratio128.
     write_pos_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
-    kv_out_row_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
     state_table_row_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
     build_prefill_write_schedule(
         position_ids,
@@ -543,7 +490,6 @@ def prefill_compressor_ratio128(
         num_tokens,
         write_pos_map,
         write_dst_map,
-        kv_out_row_map,
         state_table_row_map,
     )
 
@@ -568,7 +514,7 @@ def prefill_compressor_ratio128(
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     cos_b = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, ROPE_HALF], dtype=pl.FP32)
     sin_b = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, ROPE_HALF], dtype=pl.FP32)
-    compressor_core_ratio128(
+    normed_kv_pad = compressor_core_ratio128(
         kv_proj_scratch,
         score_proj_scratch,
         position_ids,
@@ -583,11 +529,17 @@ def prefill_compressor_ratio128(
         write_dst_map,
         state_table_row_map,
         pool_row_map,
-        cmp_kv_flat,
         pooled_kv_pad,
         normed_kv_pad,
         cos_b,
         sin_b,
+    )
+    finalize_compressor_writes(
+        normed_kv_pad,
+        write_dst_map,
+        cmp_kv_flat,
+        pl.const(HCA_C128_RMS_TILE, pl.INT32),
+        pl.const(0, pl.INT32),
     )
     return cmp_kv, compress_state
 

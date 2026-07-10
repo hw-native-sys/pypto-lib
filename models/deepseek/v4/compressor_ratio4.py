@@ -21,8 +21,12 @@ from config import (
     FP32_NEG_INF,
     PREFILL_CMP_BLOCK_NUM,
 )
-from compressor_ratio128 import compressor_rmsnorm_rope  # ratio-agnostic rmsnorm+rope
-from compressor_schedule import build_prefill_write_schedule, gather_compressor_rope_rows
+from compressor_common import (
+    build_prefill_write_schedule,
+    compressor_rmsnorm_rope,
+    finalize_compressor_writes,
+    gather_compressor_rope_rows,
+)
 
 
 EPS = M.rms_norm_eps
@@ -306,7 +310,8 @@ def compressor_core_ratio4(
         cos_b,
         sin_b,
     )
-    compressor_rmsnorm_rope(pooled_kv, norm_w, cos_b, sin_b, normed_kv)
+    normed_kv = compressor_rmsnorm_rope(pooled_kv, norm_w, cos_b, sin_b, normed_kv)
+    return normed_kv
 
 
 # Decode shape and paging contract.
@@ -863,7 +868,6 @@ def prefill_compressor_ratio4(
 
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
-    kv_out_row_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     state_table_row_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     build_prefill_write_schedule(
         position_ids,
@@ -871,7 +875,6 @@ def prefill_compressor_ratio4(
         num_tokens,
         write_pos_map,
         write_dst_map,
-        kv_out_row_map,
         state_table_row_map,
     )
 
@@ -891,7 +894,7 @@ def prefill_compressor_ratio4(
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     cos_b = pl.create_tensor([MAX_CMP_WRITES, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     sin_b = pl.create_tensor([MAX_CMP_WRITES, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    compressor_core_ratio4(
+    normed_kv = compressor_core_ratio4(
         cmp4_kv_proj_scratch,
         cmp4_score_proj_scratch,
         position_ids,
@@ -912,28 +915,13 @@ def prefill_compressor_ratio4(
         sin_b,
     )
 
-    # Prefill finalize: write cmp_kv (reads normed_kv); keepalive-copy the tail
-    # rows that carry no compression write so the output stays fully defined.
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_c4_cache_write"):
-        final_base = final_block * PACKED_RMS_TILE
-        for final_dt in pl.range(PACKED_RMS_TILE):
-            final_i = final_base + final_dt
-            dst_row_raw = pl.read(write_dst_map, [0, final_i])
-            if dst_row_raw >= 0:
-                kv_out_raw = pl.read(kv_out_row_map, [0, final_i])
-                if kv_out_raw >= 0:
-                    dst_row = pl.cast(dst_row_raw, pl.INDEX)
-                    cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(
-                        normed_kv[final_i : final_i + 1, 0:HEAD_DIM],
-                        target_type=pl.BF16,
-                        mode="rint",
-                    )
-            else:
-                keepalive_row = PREFILL_CMP_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + final_i
-                cmp_kv_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = cmp_kv_flat[
-                    keepalive_row : keepalive_row + 1,
-                    0:HEAD_DIM,
-                ]
+    cmp_kv_flat = finalize_compressor_writes(
+        normed_kv,
+        write_dst_map,
+        cmp_kv_flat,
+        pl.const(PACKED_RMS_TILE, pl.INT32),
+        pl.const(1, pl.INT32),
+    )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     compress_state = pl.reshape(compress_state_flat, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
