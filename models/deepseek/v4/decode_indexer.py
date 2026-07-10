@@ -156,7 +156,7 @@ def indexer(
     # picks the per-batch cos/sin row. Rotation indices/sign and cos_il/sin_il are
     # built once per block.
     #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]  (sign folded into sin_il_signed)
-    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope"):
+    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
         o0 = idx * ROPE_ROW_TILE
         batch_idx = o0 // ROPE_ROW_BLOCK
         cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
@@ -183,14 +183,14 @@ def indexer(
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul"):
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="qr_hadamard_matmul", allow_early_resolve=True):
         o0 = idx * QH_MM_TILE
         qh_acc = pl.matmul(qr_bf16[o0 : o0 + QH_MM_TILE, :], hadamard, out_dtype=pl.FP32)
         qh_acc_gm[o0 : o0 + QH_MM_TILE, :] = qh_acc
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant"):
+    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant", allow_early_resolve=True):
         o0 = idx * QH_QUANT_TILE
         qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
@@ -242,7 +242,7 @@ def indexer(
     score_acc_gm = pl.create_tensor([T * IDX_KV_LEN, IDX_N_HEADS], dtype=pl.INT32)
 
     # read paged C8 KV one page per tile, matmul with the per-step-quantized query
-    for tg in pl.spmd(T, name_hint="score_mat"):
+    for tg in pl.spmd(T, name_hint="score_mat", allow_early_resolve=True):
         b = tg // S
         s = tg - b * S
         clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
@@ -261,7 +261,7 @@ def indexer(
             score_acc_mat = pl.matmul(kv_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
             score_acc_gm[base : base + BLOCK_SIZE, :] = score_acc_mat
 
-    for unit in pl.spmd(T * REDUCE_NSPLIT, name_hint="score_reduce"):
+    for unit in pl.spmd(T * REDUCE_NSPLIT, name_hint="score_reduce", allow_early_resolve=True):
         tg = unit // REDUCE_NSPLIT
         split = unit - tg * REDUCE_NSPLIT
         b = tg // S
@@ -302,7 +302,7 @@ def indexer(
             score_flat[tb + s : tb + s + 1, cache0 : cache0 + REDUCE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
-    for t in pl.spmd(T, name_hint="topk"):
+    for t in pl.spmd(T, name_hint="topk", allow_early_resolve=True):
         invalid_idxs = pl.full([1, SCORE_LEN], dtype=pl.INT32, value=-1)
         topk_idxs_flat[t : t + 1, :] = invalid_idxs
         batch_idx = t // S
