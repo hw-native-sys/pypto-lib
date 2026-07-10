@@ -284,33 +284,31 @@ def combine(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine") as _cscatter_tid:
-        # Rebuild per-(e, src) base rows from recv_meta so the compact slots are
-        # walked src-major and the origin rank is the loop index src (static peer,
-        # no per-slot origin tensor).
-        cmb_base = pl.array.create(N_LOCAL * N_RANKS, pl.INT32)
-        for e in pl.range(N_LOCAL):
-            base_acc = pl.const(0, pl.INT32)
-            for src in pl.range(N_RANKS):
-                cmb_base[e * N_RANKS + src] = base_acc
-                base_acc = base_acc + pl.read(recv_meta, [src, e])
-
-        # Put each compact slot back to its origin rank (= src) at its route offset.
+    # One SPMD block per LOCAL EXPERT: block e pushes every one of expert e's compact
+    # rows back to its origin rank (= the source lane src it arrived on) at its route
+    # offset. Rows are src-major, so src's slice is [b, b + n) and the per-(e, src)
+    # base is just a loop-carried prefix sum over src inside the block -- no AICPU
+    # cumsum table needed (same shape as dispatch_gather). Each route maps to a unique
+    # (dst, loc_e) and a unique r_route, so the blocks and their cross-rank puts are
+    # write-disjoint.
+    with pl.spmd(N_LOCAL, name_hint="combine") as _cscatter_tid:
+        e = pl.tile.get_block_idx()
+        e_base_row = e * RECV_MAX
+        b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
-                b = pl.cast(cmb_base[e * N_RANKS + src], pl.INDEX)
-                for slot in pl.range(n):
-                    out_col = b + slot
-                    r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
-                    pld.tensor.put(
-                        dst=routed_y_buf,
-                        peer=src,
-                        src=recv_y_flat,
-                        dst_offsets=[r_route, 0],
-                        src_offsets=[e * RECV_MAX + out_col, 0],
-                        shape=[1, D],
-                    )
+            n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
+            for slot in pl.range(n):
+                out_col = b + slot
+                r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
+                pld.tensor.put(
+                    dst=routed_y_buf,
+                    peer=src,
+                    src=recv_y_flat,
+                    dst_offsets=[r_route, 0],
+                    src_offsets=[e_base_row + out_col, 0],
+                    shape=[1, D],
+                )
+            b = b + n
 
     # Payload-arrival handshake in its own task, fenced on the scatter via deps so a
     # peer is notified only after every put to it has landed. notify-then-wait is
