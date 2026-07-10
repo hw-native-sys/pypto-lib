@@ -34,7 +34,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
-from decode_compressor_ratio128 import compressor_ratio128
+from compressor_ratio128 import decode_compressor_ratio128
 from decode_sparse_attn_hca import sparse_attn_hca, CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
 
@@ -140,20 +140,13 @@ def attention_hca(
     comb_t = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post_t, comb_t)
 
+    # The compressor now indexes the shared freqs table in-kernel (decode and prefill use
+    # the same rope path), so the host no longer precomputes a per-batch cmp_cos/cmp_sin.
+    # This loop only builds the per-token step rope table for qkv_proj_rope.
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
         for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos_row = freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
-            cmp_sin_row = freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2]
-            cmp_cos[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_cos_row, target_type=pl.FP32)
-            cmp_sin[b : b + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(cmp_sin_row, target_type=pl.FP32)
             for s in pl.range(S):
                 t = b * S + s
                 pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
@@ -184,17 +177,14 @@ def attention_hca(
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_normed_bsd = pl.reshape(x_normed, [B, S, D])
-    cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    compressor_ratio128(
-        x_normed_bsd, cmp_kv_proj,
+    cmp_kv_proj = pl.create_tensor([T, HEAD_DIM], dtype=pl.FP32)
+    # decode_compressor_ratio128 is token-major: pass the native [T] tensors directly (no [B, S] adapter).
+    decode_compressor_ratio128(
+        x_normed, cmp_kv_proj,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
-        position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
+        freqs_cos, freqs_sin, cmp_kv,
+        position_ids, cmp_slot_mapping, state_slot_mapping,
     )
 
     # Sparse-index build fanned out over an SPMD (8 tokens/block) instead of one
@@ -297,7 +287,7 @@ def golden_attention_hca(tensors):
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
     from rmsnorm import golden_rms_norm
-    from decode_compressor_ratio128 import golden_compressor
+    from compressor_ratio128 import golden_decode_compressor_ratio128
     from decode_sparse_attn_hca import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -360,22 +350,9 @@ def golden_attention_hca(tensors):
     cmp_block_table = tensors["cmp_block_table"]
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
 
-    half_rd = rd // 2
-    cmp_cos = torch.empty(B, half_rd, dtype=torch.float32)
-    cmp_sin = torch.empty(B, half_rd, dtype=torch.float32)
-    for b in range(B):
-        first_pos_b = int(position_ids[b * S].item())
-        cmp_offset_b = ratio - (first_pos_b % ratio)
-        cmp_pos_b = first_pos_b + cmp_offset_b - ratio
-        cmp_cos[b] = freqs_cos[cmp_pos_b, :half_rd].float()
-        cmp_sin[b] = freqs_sin[cmp_pos_b, :half_rd].float()
-
-    cmp_kv_proj = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
-    position_ids_bsd = position_ids.reshape(B, S).to(torch.int32).contiguous()
-    cmp_slot_mapping_bsd = tensors["cmp_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
-    state_slot_mapping_bsd = tensors["state_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
-    golden_compressor({
-        "x": x_normed.reshape(B, S, D),
+    cmp_kv_proj = torch.zeros(T, HEAD_DIM, dtype=torch.float32)
+    golden_decode_compressor_ratio128({
+        "x": x_normed,
         "kv": cmp_kv_proj,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
@@ -383,12 +360,12 @@ def golden_attention_hca(tensors):
         "wgate": tensors["cmp_wgate"],
         "ape": tensors["cmp_ape"],
         "norm_w": tensors["cmp_norm_w"],
-        "cos": cmp_cos,
-        "sin": cmp_sin,
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
         "cmp_kv_cache": cmp_kv,
-        "position_ids": position_ids_bsd,
-        "cmp_slot_mapping": cmp_slot_mapping_bsd,
-        "state_slot_mapping": state_slot_mapping_bsd,
+        "position_ids": tensors["position_ids"],
+        "cmp_slot_mapping": tensors["cmp_slot_mapping"],
+        "state_slot_mapping": tensors["state_slot_mapping"],
     })
 
     ori_slot_mapping = tensors["ori_slot_mapping"].to(torch.int64)

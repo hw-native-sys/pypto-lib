@@ -28,6 +28,7 @@ from config import (
 # model config
 B = DECODE_BATCH
 S = DECODE_SEQ
+T = B * S
 EPS = M.rms_norm_eps
 D = M.hidden_size
 HEAD_DIM = M.index_head_dim
@@ -66,28 +67,26 @@ assert B <= RMS_PAD_TILE
 
 @pl.jit.inline
 def indexer_compressor(
-    x: pl.Tensor[[B, S, D], pl.BF16],
-    kv: pl.Tensor[[B, S, HEAD_DIM], pl.FP32],
+    x: pl.Tensor[[T, D], pl.BF16],
+    kv: pl.Tensor[[T, HEAD_DIM], pl.FP32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
-    position_ids: pl.Tensor[[B, S], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
-    x_flat = pl.reshape(x, [B * S, D])
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(compress_state, [COMPRESS_STATE_BLOCK_NUM * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
-    kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1])
 
@@ -99,11 +98,11 @@ def indexer_compressor(
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             x_rows = pl.min(MM_B_TILE, B * S - global_row0)
-            x_tile = pl.slice(x_flat, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
+            x_tile = pl.slice(x, [MM_B_TILE, K_TILE], [global_row0, k0], valid_shape=[x_rows, K_TILE])
             # Weights stored transposed [OUT_DIM, D] and consumed via b_trans=True so the
             # GM->L1 load is a DN2ZN (each [OUT_TILE, K_TILE] row is K-contiguous = long
             # bursts) instead of ND2NZ on [K_TILE, OUT_TILE] (K strided = many short
-            # bursts). Mirrors the main compressor (decode_compressor_ratio4); the strided
+            # bursts). Mirrors compressor_ratio4 decode mode; the strided
             # ND2NZ form here was ~2x slower on this matmul (43us -> ~20us per task).
             wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
@@ -123,10 +122,10 @@ def indexer_compressor(
     pooled_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="scatter_softmax_pool"):
         for c_idx in pl.range(B):
-            for s_sc in pl.pipeline(S, stage=2):
-                token_pos = pl.read(position_ids, [c_idx, s_sc])
-                state_row_i64 = pl.read(inner_state_slot_mapping, [c_idx, s_sc])
-                proj_row = c_idx * S + s_sc
+            for s in pl.pipeline(S, stage=2):
+                proj_row = c_idx * S + s
+                token_pos = pl.read(position_ids, [proj_row])
+                state_row_i64 = pl.read(inner_state_slot_mapping, [proj_row])
                 token_ape_row = pl.cast(token_pos % COMPRESS_RATIO, target_type=pl.INDEX)
                 if state_row_i64 >= 0:
                     state_row = pl.cast(state_row_i64, pl.INDEX)
@@ -138,7 +137,7 @@ def indexer_compressor(
                     compress_state_flat[state_row : state_row + 1, OUT_DIM : 2 * OUT_DIM] = score_tile
 
             pad_idx = c_idx
-            first_pos_b = pl.read(position_ids, [c_idx, 0])
+            first_pos_b = pl.read(position_ids, [c_idx * S])
             pos_b = first_pos_b % COMPRESS_RATIO
             pre_tokens_b = COMPRESS_RATIO - pos_b
             boundary_end_b = first_pos_b + pre_tokens_b - 1
@@ -201,8 +200,19 @@ def indexer_compressor(
         # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
-        sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        # in-kernel gather of the per-batch compressor rope rows (single 16-row block:
+        # real rows 0..B-1, pad rows B..15 keep the zero cos/sin from the pl.full above)
+        for inner in pl.range(B):
+            first_pos_b = pl.read(position_ids, [inner * S])
+            cmp_pos_b = pl.cast(first_pos_b - (first_pos_b % COMPRESS_RATIO), pl.INDEX)
+            cos_b[inner : inner + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2],
+                target_type=pl.FP32,
+            )
+            sin_b[inner : inner + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : ROPE_HEAD_DIM // 2],
+                target_type=pl.FP32,
+            )
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
             kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
@@ -275,41 +285,40 @@ def indexer_compressor(
         kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
         for inner in pl.range(B):
             c_idx = inner
-            first_pos_b = pl.read(position_ids, [c_idx, 0])
+            first_pos_b = pl.read(position_ids, [c_idx * S])
             pos_b = first_pos_b % COMPRESS_RATIO
             if pos_b + S >= COMPRESS_RATIO:
                 boundary_s = COMPRESS_RATIO - 1 - pos_b
                 kv_row_fp32 = kv_final[inner : inner + 1, 0 : HEAD_DIM]
-                cache_row_i64 = pl.read(idx_slot_mapping, [c_idx, boundary_s])
+                cache_row_i64 = pl.read(idx_slot_mapping, [c_idx * S + boundary_s])
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)
-                    kv_flat[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
+                    kv[c_idx * S : c_idx * S + 1, :] = kv_row_fp32
                     idx_kv_cache_flat[cache_row : cache_row + 1, :] = kv_i8_blk[inner : inner + 1, :]
                     # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
                     pl.write(idx_kv_scale_flat, [cache_row, 0], pl.read(kv_scale_dq_col, [inner, 0]))
 
-    kv = pl.reshape(kv_flat, [B, S, HEAD_DIM])
     return kv
 
 
 @pl.jit
 def compressor_test(
-    x: pl.Tensor[[B, S, D], pl.BF16],
-    kv: pl.Out[pl.Tensor[[B, S, HEAD_DIM], pl.FP32]],
+    x: pl.Tensor[[T, D], pl.BF16],
+    kv: pl.Out[pl.Tensor[[T, HEAD_DIM], pl.FP32]],
     compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    position_ids: pl.Tensor[[B, S], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     indexer_compressor(
         x,
@@ -320,8 +329,8 @@ def compressor_test(
         wgate,
         ape,
         norm_w,
-        cos,
-        sin,
+        freqs_cos,
+        freqs_sin,
         hadamard,
         idx_kv_cache,
         idx_kv_scale,
@@ -336,21 +345,21 @@ def golden_compressor(tensors):
     """Torch reference for Compressor.forward (decode branch, ratio=4 overlap)."""
     import torch
 
-    x = tensors["x"].float()
+    x = tensors["x"].float().reshape(B, S, D)
     compress_state = tensors["compress_state"]
     compress_state_block_table = tensors["compress_state_block_table"]
     wkv = tensors["wkv"].float()
     wgate = tensors["wgate"].float()
     ape = tensors["ape"]
     norm_w = tensors["norm_w"]
-    cos = tensors["cos"]
-    sin = tensors["sin"]
+    freqs_cos = tensors["freqs_cos"]
+    freqs_sin = tensors["freqs_sin"]
     hadamard = tensors["hadamard"].float()
     idx_kv_cache = tensors["idx_kv_cache"]
     idx_kv_scale = tensors["idx_kv_scale"]
-    position_ids = tensors["position_ids"].to(torch.int64)
-    idx_slot_mapping = tensors["idx_slot_mapping"].to(torch.int64)
-    inner_state_slot_mapping = tensors["inner_state_slot_mapping"].to(torch.int64)
+    position_ids = tensors["position_ids"].to(torch.int64).reshape(B, S)
+    idx_slot_mapping = tensors["idx_slot_mapping"].to(torch.int64).reshape(B, S)
+    inner_state_slot_mapping = tensors["inner_state_slot_mapping"].to(torch.int64).reshape(B, S)
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
@@ -449,7 +458,9 @@ def golden_compressor(tensors):
 
         x_pair = kv_b[..., -rd:].unflatten(-1, (-1, 2))
         x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        cos_v, sin_v = cos[b].view(-1), sin[b].view(-1)
+        cmp_pos = first_pos - (first_pos % ratio)
+        cos_v = freqs_cos[cmp_pos, : rd // 2].float().view(-1)
+        sin_v = freqs_sin[cmp_pos, : rd // 2].float().view(-1)
         y0 = x0 * cos_v - x1 * sin_v
         y1 = x0 * sin_v + x1 * cos_v
 
@@ -461,7 +472,7 @@ def golden_compressor(tensors):
         if cache_row >= 0:
             # Kernel writes committed pooled result only to kv[:, 0, :]; leave
             # speculative-boundary rows and kv[:, 1:, :] zero-initialized.
-            tensors["kv"][b : b + 1, 0:1, :] = kv_b
+            tensors["kv"][b * S : b * S + 1, :] = kv_b.reshape(1, HEAD_DIM)
             blk_id = cache_row // BLOCK_SIZE
             intra = cache_row % BLOCK_SIZE
             # C8 quant-on-write: quantize the bf16-rounded compressed row to int8 + per-position scale
@@ -486,12 +497,12 @@ def build_tensor_specs(start_pos=None):
         state_slot_mapping,
     )
     from golden import TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+    from rope_tables import build_deepseek_v4_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def init_x():
-        return torch.rand(B, S, D)
+        return torch.rand(T, D)
     def init_compress_state():
         state = torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         state[:, :, OUT_DIM:] = FP32_NEG_INF
@@ -513,14 +524,10 @@ def build_tensor_specs(start_pos=None):
         return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.1528
     def init_norm_w():
         return 0.6850 + 0.2610 * torch.randn(HEAD_DIM)
-    def init_rope_positions():
-        first_pos = init_position_ids().to(torch.int64)[:, 0]
-        cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
-        return (first_pos + cmp_offset - COMPRESS_RATIO).to(torch.int64)
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[0]
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
+    def init_freqs_cos():
+        return shared_freqs_cos.clone()
+    def init_freqs_sin():
+        return shared_freqs_sin.clone()
     def init_hadamard():
         return torch.rand(HEAD_DIM, HEAD_DIM) * (HEAD_DIM ** -0.5)
     def init_idx_kv_cache():
@@ -546,40 +553,42 @@ def build_tensor_specs(start_pos=None):
             max_seq_len=MAX_SEQ_LEN,
             default_fn=init_default_start_pos,
         )
-    def init_position_ids():
+    def init_position_ids_2d():
         return position_ids_from_starts(init_start_pos(), seq=S)
+    def init_position_ids():
+        return init_position_ids_2d().reshape(T).contiguous()
     def init_inner_state_slot_mapping():
         return state_slot_mapping(
-            init_position_ids(),
+            init_position_ids_2d(),
             init_compress_state_block_table(),
             state_block_size=COMPRESS_STATE_BLOCK_SIZE,
-        )
+        ).reshape(T).contiguous()
     def init_idx_slot_mapping():
-        positions = init_position_ids()
+        positions = init_position_ids_2d()
         return compressed_slot_mapping(
             positions,
             init_idx_block_table(),
             compress_ratio=COMPRESS_RATIO,
             block_size=BLOCK_SIZE,
-        )
+        ).reshape(T).contiguous()
 
     return [
-        TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [B, S, HEAD_DIM], torch.float32, is_output=True),
+        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("kv", [T, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
         TensorSpec("ape", [COMPRESS_RATIO, OUT_DIM], torch.float32, init_value=init_ape),
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
-        TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
+        TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
+        TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
-        TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
-        TensorSpec("idx_slot_mapping", [B, S], torch.int64, init_value=init_idx_slot_mapping),
-        TensorSpec("inner_state_slot_mapping", [B, S], torch.int64, init_value=init_inner_state_slot_mapping),
+        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
+        TensorSpec("idx_slot_mapping", [T], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [T], torch.int64, init_value=init_inner_state_slot_mapping),
     ]
 
 

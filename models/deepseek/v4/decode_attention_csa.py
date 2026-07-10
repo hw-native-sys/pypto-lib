@@ -45,7 +45,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-from decode_compressor_ratio4 import compressor_ratio4
+from compressor_ratio4 import decode_compressor_ratio4
 from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
@@ -62,7 +62,6 @@ D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
-HALF_ROPE = ROPE_HEAD_DIM // 2
 Q_LORA = M.q_lora_rank
 WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
@@ -162,13 +161,8 @@ def attention_csa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            step_pos_b = pl.cast(first_pos_b, pl.INDEX)
             for s in pl.range(S):
                 t = b * S + s
                 pos_b = pl.cast(pl.read(position_ids, [t]), pl.INDEX)
@@ -176,20 +170,9 @@ def attention_csa(
                 sin_row = pl.cast(freqs_sin[pos_b : pos_b + 1, 0 : ROPE_HEAD_DIM], target_type=pl.FP32)
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16)
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16)
-            step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
-    cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
-        for b in pl.range(B):
-            first_t = b * S
-            first_pos_b = pl.read(position_ids, [first_t])
-            cmp_offset_b = COMPRESS_RATIO - (first_pos_b % COMPRESS_RATIO)
-            cmp_pos_b = pl.cast(first_pos_b + cmp_offset_b - COMPRESS_RATIO, pl.INDEX)
-            cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-            cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
-
+    # The ratio-4 compressor now indexes the shared freqs table in-kernel (same rope path
+    # as decode/prefill), so the host no longer precomputes a per-batch cmp_cos/cmp_sin.
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
     rms_norm(x_mixed, attn_norm_w, x_normed_t)
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
@@ -212,32 +195,27 @@ def attention_csa(
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_normed = pl.reshape(x_normed_t, [B, S, D])
-    cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
-    position_ids_bsd = pl.reshape(position_ids, [B, S])
-    cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
-    idx_slot_mapping_bsd = pl.reshape(idx_slot_mapping, [B, S])
-    state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
-    inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
-    compressor_ratio4(
-        x_normed, cmp_out,
+    cmp_out = pl.create_tensor([T, HEAD_DIM], dtype=pl.FP32)
+    # decode_compressor_ratio4 is token-major: pass the native [T] tensors directly (no [B, S] adapter).
+    decode_compressor_ratio4(
+        x_normed_t, cmp_out,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
-        position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
+        freqs_cos, freqs_sin, cmp_kv,
+        position_ids, cmp_slot_mapping, state_slot_mapping,
     )
 
-    idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
-    idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
-    idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
+    idx_kv_unused = pl.create_tensor([T, IDX_HEAD_DIM], dtype=pl.FP32)
+    idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_LEN], dtype=pl.FP32)
+    idx_topk_full = pl.create_tensor([T, INDEXER_SCORE_LEN], dtype=pl.INT32)
     indexer(
-        x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-        weights_proj, step_cos, step_sin, hadamard_idx,
+        x_normed_t, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
+        weights_proj, freqs_cos, freqs_sin, hadamard_idx,
         idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, idx_topk_full,
-        position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
+        position_ids, idx_slot_mapping, inner_state_slot_mapping,
         kv_seq_lens, 0,
     )
 
@@ -336,7 +314,7 @@ def golden_attention_csa(tensors):
     """Torch reference for the ratio-4 compression-step CSA orchestration."""
     import torch
 
-    from decode_compressor_ratio4 import golden_compressor
+    from compressor_ratio4 import golden_decode_compressor_ratio4
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
     from qkv_proj_rope import golden_qkv_proj_rope
@@ -358,23 +336,11 @@ def golden_attention_csa(tensors):
     })
 
     position_ids = tensors["position_ids"].to(torch.int64)
-    position_ids_bsd = position_ids.reshape(B, S).to(torch.int32).contiguous()
-    cmp_slot_mapping_bsd = tensors["cmp_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
-    idx_slot_mapping_bsd = tensors["idx_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
-    state_slot_mapping_bsd = tensors["state_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
-    inner_state_slot_mapping_bsd = tensors["inner_state_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
 
     freqs_cos = tensors["freqs_cos"]
     freqs_sin = tensors["freqs_sin"]
     rope_cos_t = freqs_cos[position_ids].contiguous()
     rope_sin_t = freqs_sin[position_ids].contiguous()
-    first_pos = position_ids.reshape(B, S)[:, 0]
-    step_cos = freqs_cos[first_pos, :HALF_ROPE].float().contiguous()
-    step_sin = freqs_sin[first_pos, :HALF_ROPE].float().contiguous()
-    cmp_pos = first_pos + (COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)) - COMPRESS_RATIO
-    cmp_cos = freqs_cos[cmp_pos, :HALF_ROPE].float().contiguous()
-    cmp_sin = freqs_sin[cmp_pos, :HALF_ROPE].float().contiguous()
-
     q = torch.zeros(T, H, HEAD_DIM, dtype=torch.bfloat16)
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr_i8 = torch.zeros(T, Q_LORA, dtype=torch.int8)
@@ -402,9 +368,9 @@ def golden_attention_csa(tensors):
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 
-    cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
-    golden_compressor({
-        "x": x_normed.reshape(B, S, D),
+    cmp_out = torch.zeros(T, HEAD_DIM, dtype=torch.float32)
+    golden_decode_compressor_ratio4({
+        "x": x_normed,
         "kv": cmp_out,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
@@ -412,26 +378,26 @@ def golden_attention_csa(tensors):
         "wgate": tensors["cmp_wgate"],
         "ape": tensors["cmp_ape"],
         "norm_w": tensors["cmp_norm_w"],
-        "cos": cmp_cos,
-        "sin": cmp_sin,
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
         "cmp_kv_cache": cmp_kv,
-        "position_ids": position_ids_bsd,
-        "cmp_slot_mapping": cmp_slot_mapping_bsd,
-        "state_slot_mapping": state_slot_mapping_bsd,
+        "position_ids": tensors["position_ids"],
+        "cmp_slot_mapping": tensors["cmp_slot_mapping"],
+        "state_slot_mapping": tensors["state_slot_mapping"],
     })
 
-    idx_kv = torch.zeros(B, S, IDX_HEAD_DIM, dtype=torch.float32)
-    idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
-    idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
+    idx_kv = torch.zeros(T, IDX_HEAD_DIM, dtype=torch.float32)
+    idx_score = torch.zeros(T, INDEXER_SCORE_LEN, dtype=torch.float32)
+    idx_topk_full = torch.full((T, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
     golden_indexer({
-        "x": x_normed.reshape(B, S, D),
+        "x": x_normed,
         "qr": qr_i8,
         "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],
         "wq_b_scale": tensors["idx_wq_b_scale"],
         "weights_proj": tensors["weights_proj"],
-        "cos": step_cos,
-        "sin": step_sin,
+        "freqs_cos": freqs_cos,
+        "freqs_sin": freqs_sin,
         "hadamard": tensors["hadamard_idx"],
         "inner_kv": idx_kv,
         "inner_compress_state": tensors["inner_compress_state"],
@@ -445,9 +411,9 @@ def golden_attention_csa(tensors):
         "idx_block_table": tensors["idx_block_table"],
         "score": idx_score,
         "topk_idxs": idx_topk_full,
-        "position_ids": position_ids_bsd,
-        "idx_slot_mapping": idx_slot_mapping_bsd,
-        "inner_state_slot_mapping": inner_state_slot_mapping_bsd,
+        "position_ids": position_ids.to(torch.int32).contiguous(),
+        "idx_slot_mapping": tensors["idx_slot_mapping"].to(torch.int64).contiguous(),
+        "inner_state_slot_mapping": tensors["inner_state_slot_mapping"].to(torch.int64).contiguous(),
         "kv_seq_lens": tensors["kv_seq_lens"],
         "offset": torch.tensor(0, dtype=torch.int32),
     })

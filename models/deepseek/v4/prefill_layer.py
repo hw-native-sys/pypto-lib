@@ -75,6 +75,7 @@ from prefill_attention_hca import (
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as HCA_MAIN_OUT_DIM,
+    MAIN_STATE_DIM as HCA_MAIN_STATE_DIM,
     build_tensor_specs as build_hca_attention_tensor_specs,
     golden_prefill_attention_hca,
     prefill_attention_hca,
@@ -93,10 +94,12 @@ from prefill_attention_csa import (
     IDX_HEAD_DIM,
     IDX_N_HEADS,
     INNER_OUT_DIM,
+    INNER_STATE_DIM,
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
     MAIN_OUT_DIM as CSA_MAIN_OUT_DIM,
+    MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
     MAX_SEQ_LEN,
     O_GROUPS,
     O_GROUP_IN,
@@ -119,6 +122,7 @@ assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 # fixed ``[T, ...]`` tile at a time.
 TOK_TILE = T
 PREFILL_CHUNK_TOKENS = T
+CHILD_BATCH = config.PREFILL_BATCH
 DEFAULT_CHUNK_LENS = (T, T + T // 2)
 DEFAULT_USER_BATCH = len(DEFAULT_CHUNK_LENS)
 
@@ -148,6 +152,9 @@ PREFILL_IDX_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_BLOCK_TABLE_DYN")
 PREFILL_HCA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_BLOCKS_DYN")
 PREFILL_CSA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_BLOCKS_DYN")
 PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_BLOCKS_DYN")
+PREFILL_HCA_STATE_TABLE_ROWS_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_TABLE_ROWS_DYN")
+PREFILL_CSA_STATE_TABLE_ROWS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_TABLE_ROWS_DYN")
+PREFILL_INNER_STATE_TABLE_ROWS_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_TABLE_ROWS_DYN")
 
 
 @pl.jit
@@ -173,26 +180,22 @@ def prefill_layer_core(
     hca_cmp_wgate: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    hca_cmp_kv_state: pl.InOut[pl.Tensor[
-        [PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
+    hca_compress_state: pl.InOut[pl.Tensor[
+        [PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_STATE_DIM],
         pl.FP32,
     ]],
-    hca_cmp_score_state: pl.InOut[pl.Tensor[
-        [PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
-        pl.FP32,
-    ]],
-    hca_compress_state_block_table: pl.Tensor[[PREFILL_HCA_STATE_BLOCKS_DYN], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[
+        [PREFILL_HCA_STATE_TABLE_ROWS_DYN, HCA_STATE_MAX_BLOCKS],
+        pl.INT32,
+    ],
     csa_cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    csa_cmp_kv_state: pl.InOut[
-        pl.Tensor[[PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32]
+    csa_compress_state: pl.InOut[
+        pl.Tensor[[PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32]
     ],
-    csa_cmp_score_state: pl.InOut[
-        pl.Tensor[[PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32]
-    ],
-    csa_compress_state_block_table: pl.Tensor[[PREFILL_CSA_STATE_BLOCKS_DYN], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[PREFILL_CSA_STATE_TABLE_ROWS_DYN, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -201,13 +204,13 @@ def prefill_layer_core(
     csa_inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    csa_inner_kv_state: pl.InOut[
-        pl.Tensor[[PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32]
+    csa_inner_compress_state: pl.InOut[
+        pl.Tensor[[PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]
     ],
-    csa_inner_score_state: pl.InOut[
-        pl.Tensor[[PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32]
+    csa_inner_compress_state_block_table: pl.Tensor[
+        [PREFILL_INNER_STATE_TABLE_ROWS_DYN, INNER_STATE_MAX_BLOCKS],
+        pl.INT32,
     ],
-    csa_inner_compress_state_block_table: pl.Tensor[[PREFILL_INNER_STATE_BLOCKS_DYN], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[PREFILL_ORI_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[PREFILL_ORI_BLOCK_TABLE_DYN], pl.INT32],
     ori_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
@@ -215,7 +218,7 @@ def prefill_layer_core(
     cmp_block_table: pl.Tensor[[PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
+    idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN, IDX_TABLE_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
@@ -281,15 +284,12 @@ def prefill_layer_core(
     idx_kv_cache.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
     idx_kv_scale.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
     idx_block_table.bind_dynamic(0, PREFILL_IDX_BLOCK_TABLE_DYN)
-    hca_cmp_kv_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
-    hca_cmp_score_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
-    hca_compress_state_block_table.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
-    csa_cmp_kv_state.bind_dynamic(0, PREFILL_CSA_STATE_BLOCKS_DYN)
-    csa_cmp_score_state.bind_dynamic(0, PREFILL_CSA_STATE_BLOCKS_DYN)
-    csa_compress_state_block_table.bind_dynamic(0, PREFILL_CSA_STATE_BLOCKS_DYN)
-    csa_inner_kv_state.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
-    csa_inner_score_state.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
-    csa_inner_compress_state_block_table.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
+    hca_compress_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
+    hca_compress_state_block_table.bind_dynamic(0, PREFILL_HCA_STATE_TABLE_ROWS_DYN)
+    csa_compress_state.bind_dynamic(0, PREFILL_CSA_STATE_BLOCKS_DYN)
+    csa_compress_state_block_table.bind_dynamic(0, PREFILL_CSA_STATE_TABLE_ROWS_DYN)
+    csa_inner_compress_state.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
+    csa_inner_compress_state_block_table.bind_dynamic(0, PREFILL_INNER_STATE_TABLE_ROWS_DYN)
     user_batch = pl.tensor.dim(seq_lens, 0)
     for request_id in pl.range(user_batch):
         chunk_len_b = pl.tensor.read(chunk_lens, [request_id])
@@ -310,25 +310,28 @@ def prefill_layer_core(
                                     [ridx * IDX_CACHE_BLOCKS, 0, 0, 0])
         idx_kv_scale_req = pl.slice(idx_kv_scale, [IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1],
                                     [ridx * IDX_CACHE_BLOCKS, 0, 0, 0])
-        idx_block_table_req = pl.slice(idx_block_table, [IDX_TABLE_BLOCKS], [ridx * IDX_TABLE_BLOCKS])
-        hca_kv_state_req = pl.slice(hca_cmp_kv_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
-                                    [ridx * HCA_STATE_BLOCK_NUM, 0, 0])
-        hca_score_state_req = pl.slice(hca_cmp_score_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
-                                       [ridx * HCA_STATE_BLOCK_NUM, 0, 0])
-        hca_state_table_req = pl.slice(hca_compress_state_block_table, [HCA_STATE_MAX_BLOCKS],
-                                       [ridx * HCA_STATE_MAX_BLOCKS])
-        csa_kv_state_req = pl.slice(csa_cmp_kv_state, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM],
-                                    [ridx * CSA_STATE_BLOCK_NUM, 0, 0])
-        csa_score_state_req = pl.slice(csa_cmp_score_state, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM],
-                                       [ridx * CSA_STATE_BLOCK_NUM, 0, 0])
-        csa_state_table_req = pl.slice(csa_compress_state_block_table, [CSA_STATE_MAX_BLOCKS],
-                                       [ridx * CSA_STATE_MAX_BLOCKS])
-        csa_inner_kv_state_req = pl.slice(csa_inner_kv_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM],
-                                          [ridx * INNER_STATE_BLOCK_NUM, 0, 0])
-        csa_inner_score_state_req = pl.slice(csa_inner_score_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM],
-                                             [ridx * INNER_STATE_BLOCK_NUM, 0, 0])
-        csa_inner_state_table_req = pl.slice(csa_inner_compress_state_block_table, [INNER_STATE_MAX_BLOCKS],
-                                             [ridx * INNER_STATE_MAX_BLOCKS])
+        idx_block_table_req = pl.slice(idx_block_table, [CHILD_BATCH, IDX_TABLE_BLOCKS], [ridx * CHILD_BATCH, 0])
+        hca_compress_state_req = pl.slice(hca_compress_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_MAIN_STATE_DIM],
+                                          [ridx * HCA_STATE_BLOCK_NUM, 0, 0])
+        hca_state_table_req = pl.slice(
+            hca_compress_state_block_table,
+            [CHILD_BATCH, HCA_STATE_MAX_BLOCKS],
+            [ridx * CHILD_BATCH, 0],
+        )
+        csa_compress_state_req = pl.slice(csa_compress_state, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM],
+                                          [ridx * CSA_STATE_BLOCK_NUM, 0, 0])
+        csa_state_table_req = pl.slice(
+            csa_compress_state_block_table,
+            [CHILD_BATCH, CSA_STATE_MAX_BLOCKS],
+            [ridx * CHILD_BATCH, 0],
+        )
+        csa_inner_compress_state_req = pl.slice(csa_inner_compress_state, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM],
+                                                [ridx * INNER_STATE_BLOCK_NUM, 0, 0])
+        csa_inner_state_table_req = pl.slice(
+            csa_inner_compress_state_block_table,
+            [CHILD_BATCH, INNER_STATE_MAX_BLOCKS],
+            [ridx * CHILD_BATCH, 0],
+        )
 
         for tile_id in pl.range(tok_blocks):
             p0 = tile_id * TOK_TILE
@@ -377,7 +380,7 @@ def prefill_layer_core(
                     attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
-                    hca_kv_state_req, hca_score_state_req, hca_state_table_req,
+                    hca_compress_state_req, hca_state_table_req,
                     kv_cache_req, ori_slot_tile, ori_block_table_req,
                     cmp_kv_req, cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
@@ -390,11 +393,11 @@ def prefill_layer_core(
                     attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w,
-                    csa_kv_state_req, csa_score_state_req, csa_state_table_req,
+                    csa_compress_state_req, csa_state_table_req,
                     csa_hadamard_idx,
                     csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj,
                     csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
-                    csa_inner_kv_state_req, csa_inner_score_state_req, csa_inner_state_table_req,
+                    csa_inner_compress_state_req, csa_inner_state_table_req,
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
                     cmp_kv_req, cmp_block_table_req, idx_kv_cache_req, idx_kv_scale_req, idx_block_table_req,
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
@@ -448,26 +451,25 @@ def l3_prefill_layer(
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    hca_cmp_kv_state: pl.InOut[pl.Tensor[
-        [N_RANKS, PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
+    hca_compress_state: pl.InOut[pl.Tensor[
+        [N_RANKS, PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_STATE_DIM],
         pl.FP32,
     ]],
-    hca_cmp_score_state: pl.InOut[pl.Tensor[
-        [N_RANKS, PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, HCA_MAIN_OUT_DIM],
-        pl.FP32,
-    ]],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_HCA_STATE_BLOCKS_DYN], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[
+        [N_RANKS, PREFILL_HCA_STATE_TABLE_ROWS_DYN, HCA_STATE_MAX_BLOCKS],
+        pl.INT32,
+    ],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
-    csa_cmp_kv_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32]
+    csa_compress_state: pl.InOut[
+        pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32]
     ],
-    csa_cmp_score_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, CSA_MAIN_OUT_DIM], pl.FP32]
+    csa_compress_state_block_table: pl.Tensor[
+        [N_RANKS, PREFILL_CSA_STATE_TABLE_ROWS_DYN, CSA_STATE_MAX_BLOCKS],
+        pl.INT32,
     ],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_BLOCKS_DYN], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -476,13 +478,13 @@ def l3_prefill_layer(
     csa_inner_wgate: pl.Tensor[[N_RANKS, INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, IDX_HEAD_DIM], pl.BF16],
-    csa_inner_kv_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32]
+    csa_inner_compress_state: pl.InOut[
+        pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32]
     ],
-    csa_inner_score_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32]
+    csa_inner_compress_state_block_table: pl.Tensor[
+        [N_RANKS, PREFILL_INNER_STATE_TABLE_ROWS_DYN, INNER_STATE_MAX_BLOCKS],
+        pl.INT32,
     ],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_BLOCKS_DYN], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_ORI_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, PREFILL_ORI_BLOCK_TABLE_DYN], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
@@ -490,7 +492,7 @@ def l3_prefill_layer(
     cmp_block_table: pl.Tensor[[N_RANKS, PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
+    idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN, IDX_TABLE_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
     hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
     hca_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
@@ -550,14 +552,13 @@ def l3_prefill_layer(
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
             hca_cmp_wkv[rank], hca_cmp_wgate[rank], hca_cmp_ape[rank], hca_cmp_norm_w[rank],
-            hca_cmp_kv_state[rank], hca_cmp_score_state[rank], hca_compress_state_block_table[rank],
+            hca_compress_state[rank], hca_compress_state_block_table[rank],
             csa_cmp_wkv[rank], csa_cmp_wgate[rank], csa_cmp_ape[rank], csa_cmp_norm_w[rank],
-            csa_cmp_kv_state[rank], csa_cmp_score_state[rank], csa_compress_state_block_table[rank],
+            csa_compress_state[rank], csa_compress_state_block_table[rank],
             csa_hadamard_idx[rank],
             csa_idx_wq_b[rank], csa_idx_wq_b_scale[rank], csa_weights_proj[rank],
             csa_inner_wkv[rank], csa_inner_wgate[rank], csa_inner_ape[rank], csa_inner_norm_w[rank],
-            csa_inner_kv_state[rank], csa_inner_score_state[rank],
-            csa_inner_compress_state_block_table[rank],
+            csa_inner_compress_state[rank], csa_inner_compress_state_block_table[rank],
             kv_cache[rank], ori_block_table[rank], ori_slot_mapping[rank],
             cmp_kv[rank], cmp_block_table[rank],
             idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
@@ -602,15 +603,13 @@ HOST_TENSOR_ORDER = (
     "hca_cmp_wgate",
     "hca_cmp_ape",
     "hca_cmp_norm_w",
-    "hca_cmp_kv_state",
-    "hca_cmp_score_state",
+    "hca_compress_state",
     "hca_compress_state_block_table",
     "csa_cmp_wkv",
     "csa_cmp_wgate",
     "csa_cmp_ape",
     "csa_cmp_norm_w",
-    "csa_cmp_kv_state",
-    "csa_cmp_score_state",
+    "csa_compress_state",
     "csa_compress_state_block_table",
     "csa_hadamard_idx",
     "csa_idx_wq_b",
@@ -620,8 +619,7 @@ HOST_TENSOR_ORDER = (
     "csa_inner_wgate",
     "csa_inner_ape",
     "csa_inner_norm_w",
-    "csa_inner_kv_state",
-    "csa_inner_score_state",
+    "csa_inner_compress_state",
     "csa_inner_compress_state_block_table",
     "kv_cache",
     "ori_block_table",
@@ -685,8 +683,8 @@ _TOKEN_META_NAMES = {
 _CACHE_STATE_NAMES = {
     "kv_cache", "block_table", "ori_block_table", "cmp_kv", "cmp_block_table",
     "idx_kv_cache", "idx_kv_scale", "idx_block_table",
-    "cmp_kv_state", "cmp_score_state", "compress_state_block_table",
-    "inner_kv_state", "inner_score_state", "inner_compress_state_block_table",
+    "compress_state", "compress_state_block_table",
+    "inner_compress_state", "inner_compress_state_block_table",
 }
 
 # Packed per-request cache/state/table tensors (packed-name -> child-local name,
@@ -699,22 +697,19 @@ _PACKED_CACHE_SPECS = {
     "idx_kv_cache": "idx_kv_cache",
     "idx_kv_scale": "idx_kv_scale",
     "idx_block_table": "idx_block_table",
-    "hca_cmp_kv_state": ("hca", "cmp_kv_state"),
-    "hca_cmp_score_state": ("hca", "cmp_score_state"),
+    "hca_compress_state": ("hca", "compress_state"),
     "hca_compress_state_block_table": ("hca", "compress_state_block_table"),
-    "csa_cmp_kv_state": ("csa", "cmp_kv_state"),
-    "csa_cmp_score_state": ("csa", "cmp_score_state"),
+    "csa_compress_state": ("csa", "compress_state"),
     "csa_compress_state_block_table": ("csa", "compress_state_block_table"),
-    "csa_inner_kv_state": ("csa", "inner_kv_state"),
-    "csa_inner_score_state": ("csa", "inner_score_state"),
+    "csa_inner_compress_state": ("csa", "inner_compress_state"),
     "csa_inner_compress_state_block_table": ("csa", "inner_compress_state_block_table"),
 }
 
 _HISTORY_CACHE_NAMES = {
     "kv_cache", "cmp_kv", "idx_kv_cache",
-    "hca_cmp_kv_state", "hca_cmp_score_state",
-    "csa_cmp_kv_state", "csa_cmp_score_state",
-    "csa_inner_kv_state", "csa_inner_score_state",
+    "hca_compress_state",
+    "csa_compress_state",
+    "csa_inner_compress_state",
 }
 
 
@@ -731,15 +726,15 @@ def _req_block_count(kind, child_name):
     if child_name in ("idx_kv_cache", "idx_kv_scale"):
         return IDX_CACHE_BLOCKS
     if child_name == "idx_block_table":
-        return IDX_TABLE_BLOCKS
-    if child_name in ("cmp_kv_state", "cmp_score_state"):
+        return CHILD_BATCH
+    if child_name == "compress_state":
         return HCA_STATE_BLOCK_NUM if kind == "hca" else CSA_STATE_BLOCK_NUM
     if child_name == "compress_state_block_table":
-        return HCA_STATE_MAX_BLOCKS if kind == "hca" else CSA_STATE_MAX_BLOCKS
-    if child_name in ("inner_kv_state", "inner_score_state"):
+        return CHILD_BATCH
+    if child_name == "inner_compress_state":
         return INNER_STATE_BLOCK_NUM
     if child_name == "inner_compress_state_block_table":
-        return INNER_STATE_MAX_BLOCKS
+        return CHILD_BATCH
     raise KeyError(child_name)
 
 
@@ -1108,7 +1103,7 @@ def golden_prefill_layer(tensors):
         mapped.update({
             "cmp_wkv": tensors["hca_cmp_wkv"], "cmp_wgate": tensors["hca_cmp_wgate"],
             "cmp_ape": tensors["hca_cmp_ape"], "cmp_norm_w": tensors["hca_cmp_norm_w"],
-            "cmp_kv_state": tensors["hca_cmp_kv_state"], "cmp_score_state": tensors["hca_cmp_score_state"],
+            "compress_state": tensors["hca_compress_state"],
             "compress_state_block_table": tensors["hca_compress_state_block_table"],
             "cmp_slot_mapping": tensors["hca_cmp_slot_mapping"], "state_slot_mapping": tensors["hca_state_slot_mapping"],
         })
@@ -1117,13 +1112,13 @@ def golden_prefill_layer(tensors):
         mapped.update({
             "cmp_wkv": tensors["csa_cmp_wkv"], "cmp_wgate": tensors["csa_cmp_wgate"],
             "cmp_ape": tensors["csa_cmp_ape"], "cmp_norm_w": tensors["csa_cmp_norm_w"],
-            "cmp_kv_state": tensors["csa_cmp_kv_state"], "cmp_score_state": tensors["csa_cmp_score_state"],
+            "compress_state": tensors["csa_compress_state"],
             "compress_state_block_table": tensors["csa_compress_state_block_table"],
             "hadamard_idx": tensors["csa_hadamard_idx"], "idx_wq_b": tensors["csa_idx_wq_b"],
             "idx_wq_b_scale": tensors["csa_idx_wq_b_scale"], "idx_weights_proj": tensors["csa_weights_proj"],
             "inner_wkv": tensors["csa_inner_wkv"], "inner_wgate": tensors["csa_inner_wgate"],
             "inner_ape": tensors["csa_inner_ape"], "inner_norm_w": tensors["csa_inner_norm_w"],
-            "inner_kv_state": tensors["csa_inner_kv_state"], "inner_score_state": tensors["csa_inner_score_state"],
+            "inner_compress_state": tensors["csa_inner_compress_state"],
             "inner_compress_state_block_table": tensors["csa_inner_compress_state_block_table"],
             "cmp_slot_mapping": tensors["csa_cmp_slot_mapping"], "idx_slot_mapping": tensors["csa_idx_slot_mapping"],
             "state_slot_mapping": tensors["csa_state_slot_mapping"],

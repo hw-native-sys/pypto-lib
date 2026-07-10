@@ -24,6 +24,7 @@ from config import (
     PREFILL_IDX_BLOCK_NUM,
 )
 from prefill_indexer_compressor import (
+    COMPRESS_STATE_DIM as INNER_STATE_DIM,
     INNER_STATE_BLOCK_NUM,
     INNER_STATE_BLOCK_SIZE,
     INNER_STATE_MAX_BLOCKS,
@@ -107,14 +108,11 @@ def prefill_indexer(
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
@@ -122,7 +120,7 @@ def prefill_indexer(
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
     idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[T, INDEXER_SCORE_CAP], pl.FP32]],
     cmp_topk_indices: pl.Out[pl.Tensor[[T, IDX_TOPK], pl.INT32]],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -156,8 +154,9 @@ def prefill_indexer(
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="prefill_idx_qr_rope"):
         o0 = idx * ROPE_ROW_BLOCK
         token_idx = idx  # ROPE_ROW_BLOCK == IDX_N_HEADS, so one task == one token
-        cos_b = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
+        pos_t = pl.cast(pl.read(position_ids, [token_idx]), pl.INDEX)
+        cos_b = pl.cast(freqs_cos[pos_t : pos_t + 1, 0 : ROPE_HEAD_DIM // 2], target_type=pl.FP32)
+        sin_b = pl.cast(freqs_sin[pos_t : pos_t + 1, 0 : ROPE_HEAD_DIM // 2], target_type=pl.FP32)
         rope_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
         rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
@@ -225,7 +224,7 @@ def prefill_indexer(
     # === inner compressor: build the paged compressed index KV cache ===
     prefill_indexer_compressor(
         x,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         freqs_cos, freqs_sin, hadamard,
         idx_kv_cache, idx_kv_scale, idx_block_table,
@@ -251,7 +250,7 @@ def prefill_indexer(
         for cb in pl.range(INDEXER_SCORE_BLOCKS):
             cache0 = cb * CACHE_TILE
             if max_visible > cache0:
-                idx_blk_id = pl.cast(pl.read(idx_block_table, [cache0 // BLOCK_SIZE]), pl.INDEX)
+                idx_blk_id = pl.cast(pl.read(idx_block_table, [0, cache0 // BLOCK_SIZE]), pl.INDEX)
                 kv_row0 = idx_blk_id * BLOCK_SIZE + (cache0 % BLOCK_SIZE)
                 # C8: the compressor stored this block as INT8 + a per-position dequant scale; read
                 # both from the paged cache directly (no score-time re-quant).
@@ -331,8 +330,7 @@ def golden_prefill_indexer_core(tensors):
     compressor_tensors = {
         "x": tensors["x"],
         "kv": torch.zeros(MAX_CMP_WRITES, IDX_HEAD_DIM, dtype=torch.bfloat16),
-        "kv_state": tensors["inner_kv_state"],
-        "score_state": tensors["inner_score_state"],
+        "compress_state": tensors["inner_compress_state"],
         "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
@@ -375,8 +373,8 @@ def golden_prefill_indexer_core(tensors):
     wq_b = tensors["wq_b"]
     wq_b_scale = tensors["wq_b_scale"].float()
     hadamard = tensors["hadamard"].float()
-    cos = tensors["cos"].float().view(T, 1, -1)
-    sin = tensors["sin"].float().view(T, 1, -1)
+    cos = tensors["freqs_cos"][position_ids, : rd // 2].float().view(T, 1, -1)
+    sin = tensors["freqs_sin"][position_ids, : rd // 2].float().view(T, 1, -1)
     q_i32 = qr.to(torch.int32) @ wq_b.to(torch.int32)
     q = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(T, IDX_N_HEADS, IDX_HEAD_DIM)
     q_pair = q[..., -rd:].unflatten(-1, (-1, 2))
@@ -394,7 +392,7 @@ def golden_prefill_indexer_core(tensors):
     scale_flat = tensors["idx_kv_scale"].float().reshape(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
     idx_block_table = tensors["idx_block_table"]
     rows = [
-        int(idx_block_table[c // BLOCK_SIZE].item()) * BLOCK_SIZE + (c % BLOCK_SIZE)
+        int(idx_block_table[0, c // BLOCK_SIZE].item()) * BLOCK_SIZE + (c % BLOCK_SIZE)
         for c in range(max_visible)
     ]
     kv_i8 = torch.stack([cache_flat_i8[r] for r in rows], dim=0).to(torch.int32)  # [max_visible, dim]
@@ -440,21 +438,18 @@ def prefill_indexer_test(
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    cos: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[T, ROPE_HEAD_DIM // 2], pl.FP32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[T, INDEXER_SCORE_CAP], pl.FP32]],
     topk_idxs: pl.Out[pl.Tensor[[T, INDEXER_SCORE_CAP], pl.INT32]],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -465,8 +460,8 @@ def prefill_indexer_test(
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     prefill_indexer(
         x, qr, qr_scale, wq_b, wq_b_scale, weights_proj,
-        cos, sin, freqs_cos, freqs_sin, hadamard,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        freqs_cos, freqs_sin, hadamard,
+        inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         score, cmp_topk_indices,
@@ -511,7 +506,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+    from rope_tables import build_deepseek_v4_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
@@ -529,9 +524,9 @@ def build_tensor_specs(start_pos: int = START_POS):
         raise ValueError(f"fixture generated {write_count} compressed writes, cap is {MAX_CMP_WRITES}")
 
     def init_inner_compress_state_block_table():
-        table = torch.full((INNER_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
+        table = torch.full((B, INNER_STATE_MAX_BLOCKS), -1, dtype=torch.int32)
         for block in range(INNER_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % INNER_STATE_MAX_BLOCKS
+            table[0, block] = (block * 17 + 3) % INNER_STATE_MAX_BLOCKS
         return table
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -539,7 +534,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         table = init_inner_compress_state_block_table()
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
-        return int(table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
+        return int(table[0, block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_freqs_cos():
@@ -551,13 +546,14 @@ def build_tensor_specs(start_pos: int = START_POS):
         while h.shape[0] < IDX_HEAD_DIM:
             h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
         return (h * (IDX_HEAD_DIM ** -0.5)).to(torch.bfloat16)
-    def init_inner_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
-        flat = state.view(-1, INNER_OUT_DIM)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)
+        flat = state.view(-1, INNER_STATE_DIM)
         for abs_pos in range(max(0, start_pos - INNER_STATE_LEN), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(INNER_OUT_DIM) - 0.5) * 0.05
+                flat[row, 0:INNER_OUT_DIM] = (torch.rand(INNER_OUT_DIM) - 0.5) * 0.05
+                flat[row, INNER_OUT_DIM:INNER_STATE_DIM] = (torch.rand(INNER_OUT_DIM) - 0.5) * 0.05
         return state
     # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
@@ -599,15 +595,15 @@ def build_tensor_specs(start_pos: int = START_POS):
         _build_idx_hist()
         return _idx_hist["scale"].clone()
     def init_idx_block_table():
-        table = torch.full((IDX_CACHE_MAX_BLOCKS,), -1, dtype=torch.int32)
+        table = torch.full((B, IDX_CACHE_MAX_BLOCKS), -1, dtype=torch.int32)
         for block in range(IDX_CACHE_MAX_BLOCKS):
-            table[block] = block
+            table[0, block] = block
         return table
     def idx_row(cmp_slot):
         table = init_idx_block_table()
         block = cmp_slot // BLOCK_SIZE
         intra = cmp_slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
+        phys_block = int(table[0, block].item())
         if phys_block < 0:
             return -1
         return phys_block * BLOCK_SIZE + intra
@@ -631,11 +627,6 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_weights_proj():
         # weights_proj calibrated to the real DeepSeek-V4-Flash indexer weights projection.
         return torch.randn(D, IDX_N_HEADS) * 0.2313
-    def init_cos():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_position_ids().to(torch.int64))[0]
-    def init_sin():
-        return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_position_ids().to(torch.int64))[1]
-
     # idx wq_b uses the real MXFP8 grid (not a benign randn int8); qr is per-row int8 like the
     # runtime W8A8C16 activation path.
     wq_b_i8_T, wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
@@ -649,21 +640,18 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
         TensorSpec("weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=init_weights_proj),
-        TensorSpec("cos", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
-        TensorSpec("sin", [T, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("inner_kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
-        TensorSpec("inner_score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
-        TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
+        TensorSpec("inner_compress_state_block_table", [B, INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
         TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
-        TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
+        TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("score", [T, INDEXER_SCORE_CAP], torch.float32, is_output=True),
         TensorSpec("topk_idxs", [T, INDEXER_SCORE_CAP], torch.int32, is_output=True),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
