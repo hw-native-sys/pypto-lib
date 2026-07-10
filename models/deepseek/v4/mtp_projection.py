@@ -50,7 +50,7 @@ assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 @pl.jit.inline
 def mtp_projection(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
     e_proj_w: pl.Tensor[[D, D], pl.INT8],
@@ -59,7 +59,7 @@ def mtp_projection(
     h_proj_w: pl.Tensor[[D, D], pl.INT8],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
-    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    hidden_states_out: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
 ):
     t_dim = pl.tensor.dim(hidden_states, 0)
     t_linear = ((t_dim + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
@@ -76,7 +76,7 @@ def mtp_projection(
     prev_amax_parts = pl.create_tensor([HC_MULT * D_BLOCKS, t_linear], dtype=pl.FP32)
     hidden_scale_dq = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     prev_scale_dq = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
-    out_pad = pl.create_tensor([t_linear, HC_DIM], dtype=pl.BF16)
+    out_pad = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)
 
     for t0 in pl.parallel(0, t_dim, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_rms"):
@@ -95,7 +95,7 @@ def mtp_projection(
                 for kb in pl.pipeline(D_BLOCKS, stage=2):
                     k0 = kb * D_CHUNK
                     prev_k0 = hc * D + k0
-                    prev_chunk = pl.cast(prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK], target_type=pl.FP32)
+                    prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK]
                     prev_sq_sum = pl.add(
                         prev_sq_sum,
                         pl.reshape(pl.row_sum(pl.mul(prev_chunk, prev_chunk)), [1, T_TILE]),
@@ -123,7 +123,7 @@ def mtp_projection(
                 for hc in pl.range(HC_MULT):
                     prev_k0 = hc * D + k0
                     prev_inv = pl.reshape(prev_inv_rms[hc : hc + 1, t0 : t0 + T_TILE], [T_TILE, 1])
-                    prev_chunk = pl.cast(prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK], target_type=pl.FP32)
+                    prev_chunk = prev_flat[t0 : t0 + T_TILE, prev_k0 : prev_k0 + D_CHUNK]
                     prev_norm_tile = pl.col_expand_mul(
                         pl.col_expand_mul(pl.row_expand_mul(prev_chunk, prev_inv), hnorm),
                         h_smooth,
@@ -200,7 +200,7 @@ def mtp_projection(
                         h_scale,
                     )
                     acc = pl.add(hidden_deq, prev_deq)
-                    out_pad = pl.assemble(out_pad, pl.cast(acc, target_type=pl.BF16, mode="rint"), [t0, prev_out])
+                    out_pad = pl.assemble(out_pad, acc, [t0, prev_out])
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_output"):
         for t0 in pl.pipeline(0, t_dim, T_TILE, stage=2):
@@ -219,7 +219,7 @@ def mtp_projection(
 @pl.jit
 def mtp_projection_test(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    prev_hidden_states: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
     e_proj_w: pl.Tensor[[D, D], pl.INT8],
@@ -228,7 +228,7 @@ def mtp_projection_test(
     h_proj_w: pl.Tensor[[D, D], pl.INT8],
     h_proj_w_scale: pl.Tensor[[D], pl.FP32],
     h_proj_smooth: pl.Tensor[[D], pl.FP32],
-    hidden_states_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
+    hidden_states_out: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
 ):
     hidden_states.bind_dynamic(0, T_DYN)
     prev_hidden_states.bind_dynamic(0, T_DYN)
@@ -272,7 +272,7 @@ def golden_mtp_projection(tensors):
     hidden_e = hidden_e * hidden_scale * tensors["e_proj_w_scale"].float().view(1, D)
     hidden_h = prev_i8.to(torch.int32).matmul(tensors["h_proj_w"].to(torch.int32).t()).float()
     hidden_h = hidden_h * prev_scale * tensors["h_proj_w_scale"].float().view(1, 1, D)
-    tensors["hidden_states_out"][:] = (hidden_e.unsqueeze(1) + hidden_h).to(torch.bfloat16)
+    tensors["hidden_states_out"][:] = (hidden_e.unsqueeze(1) + hidden_h).to(torch.float32)
 
 
 def _quantize_rows(x):
@@ -331,7 +331,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
 
     return [
         TensorSpec("hidden_states", [t, D], torch.bfloat16, init_value=lambda: torch.randn(t, D)),
-        TensorSpec("prev_hidden_states", [t, HC_MULT, D], torch.bfloat16, init_value=lambda: torch.randn(t, HC_MULT, D)),
+        TensorSpec("prev_hidden_states", [t, HC_MULT, D], torch.float32, init_value=lambda: torch.randn(t, HC_MULT, D)),
         TensorSpec("enorm_w", [D], torch.float32, init_value=lambda: torch.ones(D)),
         TensorSpec("hnorm_w", [D], torch.float32, init_value=lambda: torch.ones(D)),
         TensorSpec("e_proj_w", [D, D], torch.int8, init_value=init_e_proj_w),
@@ -340,7 +340,7 @@ def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
         TensorSpec("h_proj_w", [D, D], torch.int8, init_value=init_h_proj_w),
         TensorSpec("h_proj_w_scale", [D], torch.float32, init_value=init_h_proj_w_scale),
         TensorSpec("h_proj_smooth", [D], torch.float32, init_value=lambda: torch.ones(D)),
-        TensorSpec("hidden_states_out", [t, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("hidden_states_out", [t, HC_MULT, D], torch.float32, is_output=True),
     ]
 
 

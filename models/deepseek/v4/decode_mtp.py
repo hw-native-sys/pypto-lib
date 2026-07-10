@@ -85,7 +85,7 @@ MTP_MOE_EPOCH = 1
 @pl.jit
 def mtp_decode_layer(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
-    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
@@ -140,7 +140,7 @@ def mtp_decode_layer(
     mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -152,7 +152,7 @@ def mtp_decode_layer(
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     mtp_projection(
         hidden_states,
         prev_pre_hc_hidden,
@@ -166,7 +166,7 @@ def mtp_decode_layer(
         h_proj_smooth,
         projected_hidden,
     )
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     attention_swa(
         projected_hidden,
         hc_attn_fn,
@@ -237,7 +237,7 @@ def mtp_decode_layer(
 @pl.jit.host
 def l3_mtp_decode_layer(
     hidden_states: pl.Tensor[[N_RANKS, T, D], pl.BF16],
-    prev_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
+    prev_pre_hc_hidden: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
@@ -292,7 +292,7 @@ def l3_mtp_decode_layer(
     mtp_hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     mtp_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    next_pre_hc_hidden: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    next_pre_hc_hidden: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
@@ -415,7 +415,7 @@ def _projection_specs():
         "prev_pre_hc_hidden": TensorSpec(
             "prev_pre_hc_hidden",
             [N_RANKS, T, HC_MULT, D],
-            torch.bfloat16,
+            torch.float32,
             init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16),
         ),
         "enorm_w": TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
@@ -552,7 +552,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
             spec.resident = "stacked"
 
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("next_pre_hc_hidden", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 

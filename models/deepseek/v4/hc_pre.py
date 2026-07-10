@@ -152,7 +152,7 @@ assert D % D_SPMD == 0 and D_SPMD % D_CHUNK == 0
 
 @pl.jit.inline
 def _hc_pre_syncall(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -169,7 +169,8 @@ def _hc_pre_syncall(
     hc_reshaped = pl.reshape(hc_base, [1, MIX_HC])
 
     # Cross-barrier intermediates: allocated ONCE in GM/HBM, live across the phases.
-    x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
+    # x arrives as FP32 (hc residual stream is FP32 end-to-end), so there is no x_fp32
+    # staging buffer: linear / rms read x_flat directly.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
     # post_pad_store is SAME-CORE scratch: write_post writes its token-tile's post gate then
     # reads it back on the SAME core (no barrier). It is kept (not deleted) because its
@@ -197,17 +198,11 @@ def _hc_pre_syncall(
     with pl.spmd(NUM_CORES, name_hint="hc_pre_fused", sync_start=True, allow_early_resolve=True) as _hc_tid:  # inline form requires the TaskId capture
         core = pl.tile.get_block_idx()  # 0 .. NUM_CORES-1
 
-        # ===================== PHASE A: cast (AIV) + seed (AIV) =====================
-        # Both AIV, independent. Barrier 1 publishes x_fp32 and the zeroed mixes_raw.
+        # ===================== PHASE A: seed (AIV) ================================
+        # x is already FP32 (no cast); Phase A only zero-seeds mixes_raw + sq_sum_acc.
+        # Barrier 1 publishes the zeroed mixes_raw / sq_sum_acc for the Phase-B atomic-adds.
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
             lane = core * 2 + aiv_id  # 0..47
-            for blk in pl.range(lane, cast_n, NUM_CORES * 2):
-                t0 = (blk // CAST_KS) * T_TILE
-                k_base = (blk % CAST_KS) * CAST_K_SPMD
-                for kb in pl.pipeline(CAST_K_SPMD // RMS_K_CHUNK, stage=4):
-                    k0 = k_base + kb * RMS_K_CHUNK
-                    x_chunk = pl.cast(x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK], target_type=pl.FP32)
-                    x_fp32 = pl.assemble(x_fp32, x_chunk, [t0, k0])
             for tc in pl.range(lane, seed_n, NUM_CORES * 2):
                 ts0 = tc * T_TILE
                 mixes_raw = pl.assemble(mixes_raw, pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0), [ts0, 0])
@@ -224,7 +219,7 @@ def _hc_pre_syncall(
             acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
             for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
                 k0 = k_base + kb * LINEAR_K_CHUNK
-                x_linear_chunk = pl.slice(x_fp32, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
+                x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
                 w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, k0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
                 if kb == 0:
                     acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
@@ -239,7 +234,7 @@ def _hc_pre_syncall(
                 sq_part = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
                 for kb in pl.pipeline(RMS_CHUNKS_PER_SPLIT, stage=4):
                     k0 = k_base + kb * RMS_K_CHUNK
-                    x_chunk = x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+                    x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
                     sq_part = pl.add(sq_part, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
                 sq_sum_acc = pl.assemble(sq_sum_acc, sq_part, [0, t0], atomic=pl.AtomicType.Add)
         pl.system.syncall(core_type="mix")
@@ -382,10 +377,10 @@ def _hc_pre_syncall(
                     pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
                     for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
                         d0 = d_base + db * D_CHUNK
-                        x0 = pl.cast(x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                        x1 = pl.cast(x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                        x2 = pl.cast(x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK], target_type=pl.FP32)
-                        x3 = pl.cast(x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+                        x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK]
+                        x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK]
+                        x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK]
+                        x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK]
                         y0 = pl.row_expand_mul(x0, pre0)
                         y1 = pl.row_expand_mul(x1, pre1)
                         y2 = pl.row_expand_mul(x2, pre2)
@@ -417,7 +412,7 @@ def _hc_pre_syncall(
 
 @pl.jit.inline
 def _hc_pre_separate(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -445,20 +440,12 @@ def _hc_pre_separate(
     hc_base_2d = pl.reshape(hc_base, [1, MIX_HC])  # for per-group comb base loads in comb_sinkhorn
 
     inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
-    x_fp32 = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)  # FP32 activations for the pure-AIC matmul + rms
+    # x arrives as FP32 from the prior hc_post (the hc residual stream is FP32 end-to-end),
+    # so the old BF16->FP32 cast scope + x_fp32 staging buffer are gone: linear / rms read
+    # x_flat directly. The 8->16 pad rows of the cube tile are never materialized -- the
+    # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
+    # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
-
-    # cast: x (BF16) -> x_fp32 (FP32), fanned over (token-tile x K-slice).
-    for blk in pl.spmd((t_dim // T_TILE) * (HC_DIM // CAST_K_SPMD), name_hint="hc_pre_cast"):
-        t0 = (blk // (HC_DIM // CAST_K_SPMD)) * T_TILE
-        k_base = (blk % (HC_DIM // CAST_K_SPMD)) * CAST_K_SPMD
-        for kb in pl.pipeline(CAST_K_SPMD // RMS_K_CHUNK, stage=4):
-            k0 = k_base + kb * RMS_K_CHUNK
-            x_chunk = pl.cast(x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK], target_type=pl.FP32)
-            x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK] = x_chunk
-    # No x_pad scope: the 8->16 pad rows are left unwritten and the linear matmul below
-    # masks them with valid_shape (zero-fills the row tail), matching the syncall path. The
-    # rms scope only reads the t_dim real rows, so nothing else consumes the pad tail.
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
@@ -466,7 +453,7 @@ def _hc_pre_separate(
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
             k0 = kb * RMS_K_CHUNK
-            x_chunk = x_fp32[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
+            x_chunk = x_flat[t0:t0 + T_TILE, k0:k0 + RMS_K_CHUNK]
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
@@ -485,7 +472,7 @@ def _hc_pre_separate(
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = pl.slice(x_fp32, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
+            x_linear_chunk = pl.slice(x_flat, [LINEAR_T_TILE, LINEAR_K_CHUNK], [t0, k0], valid_shape=[t_rows, LINEAR_K_CHUNK])
             w_chunk = pl.slice(hc_fn, [MIX_PAD, LINEAR_K_CHUNK], [0, k0], valid_shape=[MIX_HC, LINEAR_K_CHUNK])
             if kb == 0:
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
@@ -613,10 +600,10 @@ def _hc_pre_separate(
         pre3 = pl.reshape(pre_tile_t[3:4, 0:T_TILE], [T_TILE, 1])
         for db in pl.pipeline(D_SPMD // D_CHUNK, stage=2):
             d0 = d_base + db * D_CHUNK
-            x0 = pl.cast(x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK], target_type=pl.FP32)
-            x1 = pl.cast(x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK], target_type=pl.FP32)
-            x2 = pl.cast(x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK], target_type=pl.FP32)
-            x3 = pl.cast(x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK], target_type=pl.FP32)
+            x0 = x_flat[t0:t0 + T_TILE, 0 * D + d0:0 * D + d0 + D_CHUNK]
+            x1 = x_flat[t0:t0 + T_TILE, 1 * D + d0:1 * D + d0 + D_CHUNK]
+            x2 = x_flat[t0:t0 + T_TILE, 2 * D + d0:2 * D + d0 + D_CHUNK]
+            x3 = x_flat[t0:t0 + T_TILE, 3 * D + d0:3 * D + d0 + D_CHUNK]
             y0 = pl.row_expand_mul(x0, pre0)
             y1 = pl.row_expand_mul(x1, pre1)
             y2 = pl.row_expand_mul(x2, pre2)
@@ -641,7 +628,7 @@ def _bind_hc_pre():
     if HC_PRE_IMPL == "separate":
         @pl.jit.inline
         def hc_pre(
-            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
             hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
             hc_scale: pl.Tensor[[3], pl.FP32],
             hc_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -654,7 +641,7 @@ def _bind_hc_pre():
     else:
         @pl.jit.inline
         def hc_pre(
-            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+            x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
             hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
             hc_scale: pl.Tensor[[3], pl.FP32],
             hc_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -674,7 +661,7 @@ hc_pre = _bind_hc_pre()
 
 @pl.jit
 def hc_pre_test(
-    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     hc_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_scale: pl.Tensor[[3], pl.FP32],
     hc_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -767,7 +754,7 @@ def build_tensor_specs(B, S):
         ])
 
     return [
-        TensorSpec("x", [T, HC_MULT, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [T, HC_MULT, D], torch.float32, init_value=init_x),
         TensorSpec("hc_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_fn),
         TensorSpec("hc_scale", [3], torch.float32, init_value=init_hc_scale),
         TensorSpec("hc_base", [MIX_HC], torch.float32, init_value=init_hc_base),

@@ -92,7 +92,7 @@ HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
 @pl.jit.inline
 def attention_hca(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     # hc_pre weights
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -132,7 +132,7 @@ def attention_hca(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
 ):
     """HCA decode orchestration for compress_ratio=128."""
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -235,7 +235,7 @@ def attention_hca(
 
 @pl.jit
 def attention_hca_test(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -268,7 +268,7 @@ def attention_hca_test(
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
 ):
     attention_hca(
         x_hc,
@@ -424,7 +424,7 @@ def golden_attention_hca(tensors):
     })
 
     # ===== Block.hc_post =====
-    y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
+    y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
     golden_hc_post({
         "x": attn_out,
         "residual": tensors["x_hc"],
@@ -606,7 +606,7 @@ def build_tensor_specs(start_pos=None):
     wo_b_i8, wo_b_scale = quant_w_per_row(wo_b_bf16)
 
     return [
-        TensorSpec("x_hc", [T, HC_MULT, D], torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
@@ -639,7 +639,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
         TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=lambda: wo_b_i8),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=lambda: wo_b_scale),
-        TensorSpec("x_out", [T, HC_MULT, D], torch.bfloat16, is_output=True),
+        TensorSpec("x_out", [T, HC_MULT, D], torch.float32, is_output=True),
     ]
 
 

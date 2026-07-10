@@ -355,7 +355,7 @@ def combine(
 @pl.jit.inline(auto_scope=False)
 def moe(
     # model inputs
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -377,7 +377,7 @@ def moe(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
-    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -393,7 +393,7 @@ def moe(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id for the shared flag windows (distinct from layer_id).
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
@@ -458,7 +458,7 @@ def moe(
 @pl.jit
 def moe_test(
     # model inputs
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -480,7 +480,7 @@ def moe_test(
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
-    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -496,7 +496,7 @@ def moe_test(
     my_rank: pl.Scalar[pl.INT32],
     # 1-based MoE call id; multi-layer callers increment it per reused window.
     moe_epoch: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     moe(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
@@ -514,7 +514,7 @@ def moe_test(
 
 @pl.jit.host
 def l3_moe(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
+    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -535,7 +535,7 @@ def l3_moe(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
+    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -589,7 +589,7 @@ def golden_moe(tensors):
     from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
 
-    x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+    x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
     for r in range(N_RANKS):
@@ -832,7 +832,7 @@ def golden_moe(tensors):
             for t in range(num_tokens):
                 acc[t, :] += routed_y_buf_r[t * TOPK + k, :].float()
         ffn_out = acc.to(torch.bfloat16)
-        x_next_r = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
+        x_next_r = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
         golden_hc_post({
             "x":        ffn_out,
             "residual": tensors["x_hc"][r],
@@ -945,7 +945,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     specs = [
-        TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.bfloat16, init_value=init_x_hc),
+        TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.float32, init_value=init_x_hc),
         TensorSpec("hc_ffn_fn",     [N_RANKS, MIX_HC, HC_DIM],       torch.float32,  init_value=init_hc_ffn_fn),
         TensorSpec("hc_ffn_scale",  [N_RANKS, 3],                    torch.float32,  init_value=init_hc_ffn_scale),
         TensorSpec("hc_ffn_base",   [N_RANKS, MIX_HC],               torch.float32,  init_value=init_hc_ffn_base),
@@ -966,7 +966,7 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
         TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
-        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.bfloat16, is_output=True),
+        TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
     ]
