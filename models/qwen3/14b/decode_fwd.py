@@ -26,8 +26,8 @@ single full-tensor auto-dep writer gated on the 85 down_proj TaskIds.
 
 FP32 boundaries:
   * FIRST layer  — `copy_hidden` casts the external BF16 embed input -> FP32 once.
-  * LAST layer   — `cast_lmhead_in` casts the final FP32 hidden -> BF16 once for the
-                   (unchanged, BF16-input) rms_lm_head.
+  * LAST layer   — final RMSNorm consumes the FP32 carry directly, then casts only
+                   the normalized LM-head input to BF16 for the cube matmul.
 `decode_fwd` (single-dispatch, with LM head) and `decode_fwd_layers` (chunked, no
 LM head) share the one FP32-carry `_decode_layer`.
 Numerics differ from the BF16 baseline (more precise — no per-layer BF16 rounding),
@@ -93,7 +93,7 @@ from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
 from config import KV_CACHE_ROWS_DYN, REAL_VOCAB, VOCAB  # vocab size for the fused decode_fwd LM head / logits
-from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
+from rms_lm_head import rms_lm_head_fp32  # LM head for the fused multi-layer decode_fwd
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Functional config — model architecture + workload.
@@ -1125,13 +1125,12 @@ def _token_embed_inline(
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
     next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
 ) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-    for b in pl.parallel(0, BATCH, 1):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
-            token_id = pl.read(sampled_ids, [b, 0])
-            token_row = pl.cast(token_id, target_type=pl.INDEX)
-            for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
-                hidden_chunk = pl.slice(embed_weight, [1, EMBED_HIDDEN_CHUNK], [token_row, k0])
-                next_hidden = pl.assemble(next_hidden, hidden_chunk, [b, k0])
+    for b in pl.spmd(BATCH, name_hint="token_embed"):
+        token_id = pl.read(sampled_ids, [b, 0])
+        token_row = pl.cast(token_id, target_type=pl.INDEX)
+        for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+            hidden_chunk = pl.slice(embed_weight, [1, EMBED_HIDDEN_CHUNK], [token_row, k0])
+            next_hidden = pl.assemble(next_hidden, hidden_chunk, [b, k0])
     return next_hidden
 
 
@@ -1140,75 +1139,74 @@ def _greedy_sample_inline(
     logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
     sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
 ) -> pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]:
-    for b in pl.parallel(BATCH):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_sample"):
-            idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
-            chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
-            chunk_vals[:, :] = pl.full([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32, value=-3.402823e38)
-            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
-                c0 = c * SAMPLE_VOCAB_CHUNK
-                local_scores = logits[b : b + 1, c0 : c0 + SAMPLE_VOCAB_CHUNK]
-                if SAMPLE_REAL_VOCAB_TAIL != 0:
-                    if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
-                        local_scores_valid = pl.set_validshape(local_scores, 1, SAMPLE_REAL_VOCAB_TAIL)
-                        local_scores_padded = pl.fillpad(local_scores_valid, pad_value=pl.PadValue.min)
-                        sorted_pairs = pl.sort32(local_scores_padded, idx_init)
-                    else:
-                        sorted_pairs = pl.sort32(local_scores, idx_init)
+    for b in pl.spmd(BATCH, name_hint="greedy_sample"):
+        idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
+        chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
+        chunk_vals[:, :] = pl.full([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32, value=-3.402823e38)
+        for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+            c0 = c * SAMPLE_VOCAB_CHUNK
+            local_scores = logits[b : b + 1, c0 : c0 + SAMPLE_VOCAB_CHUNK]
+            if SAMPLE_REAL_VOCAB_TAIL != 0:
+                if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
+                    local_scores_valid = pl.set_validshape(local_scores, 1, SAMPLE_REAL_VOCAB_TAIL)
+                    local_scores_padded = pl.fillpad(local_scores_valid, pad_value=pl.PadValue.min)
+                    sorted_pairs = pl.sort32(local_scores_padded, idx_init)
                 else:
                     sorted_pairs = pl.sort32(local_scores, idx_init)
-                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
-                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
-                top_pairs = sorted_pairs[:, 0 : 2 * SAMPLE_TOPK]
-                top_vals = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-                best_val = pl.read(top_vals, [0, 0])
-                pl.write(chunk_vals, [0, c], best_val)
+            else:
+                sorted_pairs = pl.sort32(local_scores, idx_init)
+            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
+            top_pairs = sorted_pairs[:, 0 : 2 * SAMPLE_TOPK]
+            top_vals = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+            best_val = pl.read(top_vals, [0, 0])
+            pl.write(chunk_vals, [0, c], best_val)
 
-            chunk_sorted = pl.sort32(chunk_vals, idx_init)
-            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=64)
-            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=256)
-            chunk_top_pairs = chunk_sorted[:, 0 : 2 * SAMPLE_TOPK]
-            chunk_top_vals = pl.gather(chunk_top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-            best_val = pl.read(chunk_top_vals, [0, 0])
-            chunk_i32 = pl.cast(0, pl.INT32)
-            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
-                scan_c = (SAMPLE_REAL_NUM_VOCAB_CHUNKS - 1) - c
-                val = pl.read(chunk_vals, [0, scan_c])
-                if val == best_val:
-                    chunk_i32 = pl.cast(scan_c, pl.INT32)
+        chunk_sorted = pl.sort32(chunk_vals, idx_init)
+        chunk_sorted = pl.mrgsort(chunk_sorted, block_len=64)
+        chunk_sorted = pl.mrgsort(chunk_sorted, block_len=256)
+        chunk_top_pairs = chunk_sorted[:, 0 : 2 * SAMPLE_TOPK]
+        chunk_top_vals = pl.gather(chunk_top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+        best_val = pl.read(chunk_top_vals, [0, 0])
+        chunk_i32 = pl.cast(0, pl.INT32)
+        for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+            scan_c = (SAMPLE_REAL_NUM_VOCAB_CHUNKS - 1) - c
+            val = pl.read(chunk_vals, [0, scan_c])
+            if val == best_val:
+                chunk_i32 = pl.cast(scan_c, pl.INT32)
 
-            local_token = pl.cast(0, pl.INT32)
-            chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
-            chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
-            winning_logits = pl.slice(logits, [1, SAMPLE_VOCAB_CHUNK], [pl.cast(b, pl.INDEX), chunk_base_idx])
-            if SAMPLE_REAL_VOCAB_TAIL != 0:
-                if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
-                    winning_logits_valid = pl.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
-                    winning_logits_padded = pl.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
-                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                        val = pl.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
-                        if val == best_val:
-                            local_token = pl.cast(scan_t, pl.INT32)
-                else:
-                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                        val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
-                        if val == best_val:
-                            local_token = pl.cast(scan_t, pl.INT32)
+        local_token = pl.cast(0, pl.INT32)
+        chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
+        chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
+        winning_logits = pl.slice(logits, [1, SAMPLE_VOCAB_CHUNK], [pl.cast(b, pl.INDEX), chunk_base_idx])
+        if SAMPLE_REAL_VOCAB_TAIL != 0:
+            if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
+                winning_logits_valid = pl.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
+                winning_logits_padded = pl.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
+                for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                    scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                    val = pl.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
+                    if val == best_val:
+                        local_token = pl.cast(scan_t, pl.INT32)
             else:
                 for t in pl.range(SAMPLE_VOCAB_CHUNK):
                     scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
                     val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
                     if val == best_val:
                         local_token = pl.cast(scan_t, pl.INT32)
-            token_id = chunk_base + local_token
-            if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
-                token_id = pl.cast(0, pl.INT32)
-            token_out = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
-            token_out[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-            pl.write(token_out, [0, 0], token_id)
-            sampled_ids[b : b + 1, :] = token_out
+        else:
+            for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
+                if val == best_val:
+                    local_token = pl.cast(scan_t, pl.INT32)
+        token_id = chunk_base + local_token
+        if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
+            token_id = pl.cast(0, pl.INT32)
+        token_out = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+        token_out[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+        pl.write(token_out, [0, 0], token_id)
+        sampled_ids[b : b + 1, :] = token_out
     return sampled_ids
 
 
@@ -1319,22 +1317,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
             carry_tids, carry_normed_tids,
         )
         normed = next_normed
-    # LAST-layer boundary: cast the final FP32 hidden -> BF16 once for the (unchanged,
-    # BF16-input) rms_lm_head. This single cast replaces the per-layer round-trips.
-    cur_bf16 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for lb0 in pl.parallel(0, BATCH, BATCH):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="cast_lmhead_in"):
-            for lkb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
-                lk0 = lkb * RMSNORM_K_CHUNK
-                cur_bf16 = pl.assemble(
-                    cur_bf16,
-                    pl.cast(
-                        pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [lb0, lk0]),
-                        target_type=pl.BF16,
-                    ),
-                    [lb0, lk0],
-                )
-    out = rms_lm_head(cur_bf16, final_norm_weight, lm_head_weight, seq_lens, out)
+    out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, seq_lens, out)
     sampled_ids_out = _greedy_sample_inline(out, sampled_ids_out)
     return out, sampled_ids_out, next_hidden
 
@@ -1769,7 +1752,7 @@ if __name__ == "__main__":
     _CHUNK_NLAYERS = 1
 
     # Compile-only smoke: explicit --smoke, or any *sim platform (the CI
-    # `python decode_layer.py -p a2a3sim` sweep — codegen regressions are still
+    # `python decode_fwd.py -p a2a3sim` sweep — codegen regressions are still
     # caught without needing a device or the heavy full-graph simulation).
     if args.smoke or args.platform.endswith("sim"):
         smoke_out = torch.empty([BATCH, HIDDEN], dtype=torch.bfloat16)
@@ -1786,7 +1769,7 @@ if __name__ == "__main__":
 
         inputs = random_inputs(full_seq=args.max_seq, seed=args.seed)
         specs = _build_specs(inputs)
-        print(f"[decode_layer] single-layer golden unit test | platform={args.platform} "
+        print(f"[decode_fwd] single-layer golden unit test | platform={args.platform} "
               f"device={args.device} seq={'MAX' if args.max_seq else 'varied'} seed={args.seed} "
               f"seq_lens={inputs['seq_lens'].tolist()}")
         # Ratio tolerance: bf16 outputs cannot satisfy a strict 100% allclose at

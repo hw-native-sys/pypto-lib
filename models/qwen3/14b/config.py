@@ -59,7 +59,7 @@ Q_HEAD_BATCH = 5
 Q_HEAD_PAD = 16
 # SEQ_TILE = 128 keeps each K/V tile at 32 KB (BLOCK_SIZE * HEAD_DIM * BF16),
 # letting the cube L0B fit two tiles simultaneously (64 KB platform limit).
-# This is required by the fa_fused mixed root in decode_layer.py; raising
+# This is required by the fa_fused mixed root in decode_fwd.py; raising
 # SEQ_TILE to 256 makes a single tile fill L0B and breaks the cube/vec fuse.
 SEQ_TILE = 128
 SB_BATCH = 128
