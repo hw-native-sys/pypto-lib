@@ -294,20 +294,38 @@ def gen_routed_weight(shape, dequant_std):
     FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
     FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
     FP4_MAX, TINY = 6.0, 1e-20
+    GROUP = 32
+    CHUNK_ELEMS = 1 << 25    # elements per pass; unchunked this walks GiB-sized temporaries
 
-    def sim_fp4(W, group=32):    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim
-        *lead, out, inn = W.shape
-        Wg = W.reshape(*lead, out, inn // group, group)
-        scale = torch.exp2(torch.ceil(torch.log2((Wg.abs().amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
-        q = torch.sign(Wg) * FP4_MAG[torch.searchsorted(FP4_MID, (Wg / scale).abs()).clamp_max(7)]
-        return (q * scale).reshape(*lead, out, inn)
+    *lead, out, inn = shape
+    n_lead = 1
+    for dim in lead:
+        n_lead *= dim
 
-    Wq = sim_fp4(torch.randn(*shape))
-    amax = Wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale = amax / INT8_SCALE_MAX
-    w_i8 = torch.round(Wq / scale).clamp_(-INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+    W = torch.randn(*shape).reshape(n_lead, out, inn)
+    w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
+    scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
+
+    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim, then per-output-channel
+    # INT8. Chunked over the leading dim: every reduction here is confined to one
+    # (out, in) row, so the chunk boundary cannot change a result.
+    step = max(1, CHUNK_ELEMS // (out * inn))
+    for i0 in range(0, n_lead, step):
+        w = W[i0:i0 + step]
+        wg = w.reshape(-1, out, inn // GROUP, GROUP)
+        absw = wg.abs()
+        grp_scale = torch.exp2(torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
+        idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
+        wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
+        amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+        chan_scale = amax / INT8_SCALE_MAX
+        w_i8[i0:i0 + step] = torch.round(wq.div_(chan_scale)).clamp_(
+            -INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
+        scale[i0:i0 + step] = chan_scale
+    del W
+
     scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8, scale
+    return w_i8.reshape(*shape), scale.reshape(*lead, out)
 
 
 def build_tensor_specs():

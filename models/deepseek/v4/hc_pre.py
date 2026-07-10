@@ -709,15 +709,17 @@ def golden_hc_pre(tensors):
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
 
-    mix_cols = []
-    for m in range(MIX_HC):
-        mix_col = torch.zeros(t_dim, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, LINEAR_K_CHUNK):
-            x_chunk = x_flat_2d[:, k0:k0 + LINEAR_K_CHUNK]
-            w_chunk = hc_fn[m:m + 1, k0:k0 + LINEAR_K_CHUNK]
-            mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
-        mix_cols.append(mix_col * rsqrt)
-    mixes = torch.cat(mix_cols, dim=1)  # [T, mix_hc]
+    # Per-K-chunk partial dots in one reduction, then accumulated in chunk order
+    # to match the cube K-fragment accumulation. Summing over n_chunk with a
+    # single torch.sum instead reorders the adds and is not bit-exact.
+    n_chunk = HC_DIM // LINEAR_K_CHUNK
+    x_k = x_flat_2d.reshape(t_dim, 1, n_chunk, LINEAR_K_CHUNK)
+    w_k = hc_fn.reshape(1, MIX_HC, n_chunk, LINEAR_K_CHUNK)
+    per_chunk = (x_k * w_k).sum(dim=3)                       # [T, mix_hc, n_chunk]
+    mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)  # [T, mix_hc]
+    for c in range(n_chunk):
+        mixes += per_chunk[:, :, c]
+    mixes *= rsqrt
 
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
     post_t = 2 * torch.sigmoid(mixes[..., HC_MULT:HC_MULT * 2] * hc_scale[1]
