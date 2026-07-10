@@ -257,8 +257,8 @@ def prefill_fwd(
     csa_inner_compress_state_block_table: pl.Tensor[[B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[B, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[B, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -739,8 +739,8 @@ def l3_prefill_fwd(
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, B, INNER_STATE_MAX_BLOCKS], pl.INT32],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[N_RANKS, B, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[N_RANKS, B, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
@@ -905,6 +905,7 @@ def _make_shared_spec(name, base_specs, start_pos):
             return ranked(out)
         if name in ("ori_block_table", "cmp_block_table", "idx_block_table"):
             out = torch.arange(spec.shape[-1], dtype=spec.dtype)
+            out = out.expand(*spec.shape[1:]).contiguous()
             return ranked(out)
         # Any remaining shared metadata: smoke zeros.
         return torch.zeros(list(spec.shape), dtype=spec.dtype)

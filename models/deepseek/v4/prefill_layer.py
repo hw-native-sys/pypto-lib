@@ -718,11 +718,11 @@ def _req_block_count(kind, child_name):
     if child_name == "kv_cache":
         return ORI_CACHE_BLOCKS
     if child_name in ("block_table", "ori_block_table"):
-        return CHILD_BATCH
+        return ORI_TABLE_BLOCKS
     if child_name == "cmp_kv":
         return CMP_CACHE_BLOCKS
     if child_name == "cmp_block_table":
-        return CHILD_BATCH
+        return CMP_TABLE_BLOCKS
     if child_name in ("idx_kv_cache", "idx_kv_scale"):
         return IDX_CACHE_BLOCKS
     if child_name == "idx_block_table":
