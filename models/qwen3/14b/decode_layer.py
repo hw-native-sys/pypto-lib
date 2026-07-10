@@ -1218,7 +1218,6 @@ _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count 
 
 @pl.jit
 def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM head
-    hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -1857,7 +1856,7 @@ if __name__ == "__main__":
         # (NOT per-layer stacked); the PAGED KV pool kc/vc IS stacked N times (one
         # paged pool per layer, indexed by layer_cache_base).
         stacked = [
-            hs, stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
+            stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
             stack0(qn, N), stack0(kn, N), sl, bt, sm, rc, rs, stack0(kc, N), stack0(vc, N),
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
@@ -1894,7 +1893,7 @@ if __name__ == "__main__":
         # from decode_fwd and making the argmax check pass/fail for the wrong reason.
         _CHUNK_NLAYERS = N
         ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-        decode_fwd_layers(*stacked[:len(INPUT_NAMES)], ref_out, config=run_cfg)
+        decode_fwd_layers(hs, *stacked[:len(INPUT_NAMES) - 1], ref_out, config=run_cfg)
         hn = ref_out.float()
         inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
         ref_normed = (hn * inv) * final_norm_w.float()
