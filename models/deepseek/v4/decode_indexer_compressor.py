@@ -84,6 +84,7 @@ def indexer_compressor(
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
@@ -93,7 +94,12 @@ def indexer_compressor(
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1])
 
-    for idx in pl.spmd(BS_PAD * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), name_hint="kv_score_proj"):
+    # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
+    # critical path and must win the cores when rms_norm retires.
+    with pl.spmd(
+        BS_PAD * OUT_DIM // (MM_B_TILE * PROJ_OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
+    ) as _kv_score_tid:
+        idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // PROJ_OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // PROJ_OUT_TILE)) * PROJ_OUT_TILE
         kv_acc = pl.create_tensor([MM_B_TILE, PROJ_OUT_TILE], dtype=pl.FP32)
@@ -313,6 +319,8 @@ def compressor_test(
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
+    # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
+    late_dep = pl.system.task_dummy(deps=[])
     indexer_compressor(
         x,
         kv,
@@ -330,6 +338,7 @@ def compressor_test(
         position_ids,
         idx_slot_mapping,
         inner_state_slot_mapping,
+        late_dep,
     )
     return kv, compress_state, idx_kv_cache, idx_kv_scale
 

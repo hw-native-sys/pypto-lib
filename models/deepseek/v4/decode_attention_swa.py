@@ -119,7 +119,9 @@ def attention_swa(
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -127,7 +129,7 @@ def attention_swa(
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale,
+        q, kv, qr, qr_scale, late_dep,
     )
 
     # Commit the current decode KV before attention. The SWA attention kernel

@@ -191,7 +191,11 @@ def attention_csa(
             cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
+    # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
+    # and weights_proj. The latter three take this barrier instead of racing the first:
+    # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
+    late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -199,7 +203,7 @@ def attention_csa(
     qkv_proj_rope(
         x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale,
+        q, kv, qr, qr_scale, late_dep,
     )
 
     kv_cache_flat = pl.reshape(kv_cache, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -225,6 +229,7 @@ def attention_csa(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos, cmp_sin, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
+        late_dep,
     )
 
     idx_kv_unused = pl.create_tensor([B, S, IDX_HEAD_DIM], dtype=pl.FP32)
@@ -238,7 +243,7 @@ def attention_csa(
         idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, idx_topk_full,
         position_ids_bsd, idx_slot_mapping_bsd, inner_state_slot_mapping_bsd,
-        kv_seq_lens, 0,
+        kv_seq_lens, 0, late_dep,
     )
 
     # sparse_attn now folds the compressed-slot masking + valid-block flags in from

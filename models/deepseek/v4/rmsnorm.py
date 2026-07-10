@@ -37,7 +37,10 @@ def rms_norm(
     x_normed: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
     t_dim = pl.tensor.dim(x, 0)
-    for tg_idx in pl.spmd(t_dim // T_TILE, name_hint="rms_norm"):
+    # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
+    # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
+    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm") as rms_tid:
+        tg_idx = pl.tile.get_block_idx()
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
@@ -57,7 +60,7 @@ def rms_norm(
                 mode="rint",
             )
 
-    return x_normed
+    return rms_tid
 
 
 @pl.jit
@@ -69,7 +72,7 @@ def rms_norm_test(
     x.bind_dynamic(0, T_DYN)
     x_normed.bind_dynamic(0, T_DYN)
 
-    x_normed = rms_norm(x, norm_w, x_normed)
+    rms_norm(x, norm_w, x_normed)
     return x_normed
 
 

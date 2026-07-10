@@ -133,6 +133,7 @@ def indexer(
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_matmul"):
@@ -221,7 +222,10 @@ def indexer(
     x_flat = pl.reshape(x, [T, D])
     weights = pl.create_tensor([T_PAD, IDX_N_HEADS], dtype=pl.FP32)
     weights_partial = pl.create_tensor([WEIGHTS_OK * MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
-    for kb in pl.spmd(WEIGHTS_OK, name_hint="weights_proj"):
+    # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
+    # critical path and must win the cores when rms_norm retires.
+    with pl.spmd(WEIGHTS_OK, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
+        kb = pl.tile.get_block_idx()
         k_base = kb * WEIGHTS_K_SLICE
         weights_acc = pl.create_tensor([MM_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
         for db in pl.range(WEIGHTS_K_SLICE // D_TILE):
@@ -246,6 +250,7 @@ def indexer(
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cos, sin, hadamard, idx_kv_cache, idx_kv_scale,
         position_ids, idx_slot_mapping, inner_state_slot_mapping,
+        late_dep,
     )
 
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
@@ -381,6 +386,8 @@ def indexer_test(
     kv_seq_lens: pl.Tensor[[B], pl.INT32],
     offset: pl.Scalar[pl.INT32],
 ):
+    # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
+    late_dep = pl.system.task_dummy(deps=[])
     indexer(
         x,
         qr,
@@ -408,6 +415,7 @@ def indexer_test(
         inner_state_slot_mapping,
         kv_seq_lens,
         offset,
+        late_dep,
     )
     return score, idx_kv_cache, idx_kv_scale, topk_idxs
 

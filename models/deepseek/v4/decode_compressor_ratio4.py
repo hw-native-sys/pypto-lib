@@ -83,6 +83,7 @@ def compressor_ratio4(
     position_ids: pl.Tensor[[B, S], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     x_flat = pl.reshape(x, [B * S, D])
     cmp4_kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
@@ -91,7 +92,12 @@ def compressor_ratio4(
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
 
-    for idx in pl.spmd(BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj"):
+    # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
+    # critical path and must win the cores when rms_norm retires.
+    with pl.spmd(
+        BS_PAD * OUT_DIM // (MM_B_TILE * OUT_TILE), name_hint="kv_score_proj", deps=[late_dep]
+    ) as _kv_score_tid:
+        idx = pl.tile.get_block_idx()
         global_row0 = (idx // (OUT_DIM // OUT_TILE)) * MM_B_TILE
         o0 = (idx % (OUT_DIM // OUT_TILE)) * OUT_TILE
         kv_acc = pl.create_tensor([MM_B_TILE, OUT_TILE], dtype=pl.FP32)
@@ -272,6 +278,8 @@ def compressor_test(
     cmp_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
 ):
+    # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
+    late_dep = pl.system.task_dummy(deps=[])
     compressor_ratio4(
         x,
         kv,
@@ -287,6 +295,7 @@ def compressor_test(
         position_ids,
         cmp_slot_mapping,
         state_slot_mapping,
+        late_dep,
     )
     return kv, compress_state, cmp_kv_cache
 

@@ -115,6 +115,7 @@ def qkv_proj_rope(
     kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    late_dep: pl.Scalar[pl.TASK_ID],
 ):
     t_dim = pl.tensor.dim(x, 0)
     x_view = pl.reshape(x, [t_dim, D])
@@ -305,7 +306,11 @@ def qkv_proj_rope(
                 kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
                     [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    for kbg in pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul"):
+    # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
+    # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
+    # take the cores first.
+    with pl.spmd((HEAD_DIM // KV_N_TILE) * KV_OK, name_hint="kv_proj_matmul", deps=[late_dep]) as _kv_tid:
+        kbg = pl.tile.get_block_idx()
         kv_col0 = (kbg // KV_OK) * KV_N_TILE
         kv_k_base = (kbg % KV_OK) * KV_K_SLICE
         for tc in pl.range(t_matmul // KV_M_TILE):
@@ -400,6 +405,8 @@ def qkv_proj_rope_test(
     qr.bind_dynamic(0, T_DYN)
     qr_scale.bind_dynamic(0, T_DYN)
 
+    # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
+    late_dep = pl.system.task_dummy(deps=[])
     qkv_proj_rope(
         x,
         wq_a,
@@ -414,6 +421,7 @@ def qkv_proj_rope_test(
         kv,
         qr,
         qr_scale,
+        late_dep,
     )
     return q
 

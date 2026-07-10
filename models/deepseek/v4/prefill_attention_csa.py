@@ -177,7 +177,9 @@ def prefill_attention_csa(
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_norm(x_mixed, attn_norm_w, x_normed)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
+    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    late_dep = pl.system.task_dummy(deps=[rms_tid])
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
@@ -196,7 +198,7 @@ def prefill_attention_csa(
     qkv_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
-        q, kv, qr, qr_scale,
+        q, kv, qr, qr_scale, late_dep,
     )
 
     kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
