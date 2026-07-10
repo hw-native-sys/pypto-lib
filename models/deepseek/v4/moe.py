@@ -175,18 +175,23 @@ def dispatch(
     # Phase 2: move the bulk payload (x / aux / route) to each destination lane.
     # Rides its own `data_arrived` window, so it needs no ordering against the meta
     # phase and overlaps it freely.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_push") as _push_tid:
+    # Split over LOCAL EXPERT INDEX (N_LOCAL blocks): block loc_e handles expert
+    # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
+    # across N_LOCAL cores. One slot counter per destination rank; token-major
+    # order matches the meta pass's per-(dst, loc_e) cumulative count, so the
+    # padded lane layout the gather compacts is identical to the single-block push.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push") as _push_tid:
+        loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
         if active_tokens > T:
             active_tokens = pl.cast(T, pl.INDEX)
 
-        # Fresh cursor assigns the same per-lane slots as the count pass above.
-        push_cursor = pl.array.create(N_RANKS * N_LOCAL, pl.INT32)
+        slot_ctr = pl.array.create(N_RANKS, pl.INT32)
         for d in pl.range(N_RANKS):
-            for e in pl.range(N_LOCAL):
-                push_cursor[d * N_LOCAL + e] = 0
+            slot_ctr[d] = 0
+        e_lane_base = loc_e * RECV_MAX + my_rank * MAX_PER_SRC
 
         # Pad tiles zeroed once; used cols overwritten per push, then remote_store.
         aux_tile = pl.tile.full([1, AUX_PAD], dtype=pl.FP32, value=0.0)
@@ -195,25 +200,25 @@ def dispatch(
             for k in pl.range(TOPK):
                 eid = pl.read(indices, [t, k])
                 dst = eid // N_LOCAL
-                loc_e = eid - dst * N_LOCAL
-                bucket = dst * N_LOCAL + loc_e
-                slot = push_cursor[bucket]
-                push_cursor[bucket] = slot + 1
-                # lane (loc_e, my_rank, slot) on peer=dst
-                row = loc_e * RECV_MAX + my_rank * MAX_PER_SRC + slot
-                pld.tensor.put(
-                    dst=recv_x,
-                    peer=dst,
-                    src=x_norm_i8,
-                    dst_offsets=[row, 0],
-                    src_offsets=[t, 0],
-                    shape=[1, D],
-                )
-                pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
-                pl.tile.write(aux_tile, [0, AUX_W], pl.read(weights, [t, k]))
-                pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
-                pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
-                pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
+                le = eid - dst * N_LOCAL
+                if le == loc_e:
+                    slot = slot_ctr[dst]
+                    slot_ctr[dst] = slot + 1
+                    # lane (loc_e, my_rank, slot) on peer=dst
+                    row = e_lane_base + slot
+                    pld.tensor.put(
+                        dst=recv_x,
+                        peer=dst,
+                        src=x_norm_i8,
+                        dst_offsets=[row, 0],
+                        src_offsets=[t, 0],
+                        shape=[1, D],
+                    )
+                    pl.tile.write(aux_tile, [0, AUX_SCALE], pl.read(x_norm_scale, [t, 0]))
+                    pl.tile.write(aux_tile, [0, AUX_W], pl.read(weights, [t, k]))
+                    pld.tile.remote_store(aux_tile, target=recv_aux, peer=dst, offsets=[row, 0])
+                    pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
+                    pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
     # Payload-arrival handshake in its own task, fenced on dispatch_push via deps so
     # this rank's `data_arrived` notify to a peer fires only after every put to it
