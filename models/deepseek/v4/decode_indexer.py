@@ -147,7 +147,9 @@ def indexer(
         qr_proj[0:T, o_base : o_base + Q_OUT_TILE] = qr_dequant
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
+    # half rotated then rounded.
+    qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     # spmd over ROPE_ROW_TILE-row blocks; batch_idx = block base // ROPE_ROW_BLOCK
     # picks the per-batch cos/sin row. Rotation indices/sign and cos_il/sin_il are
     # built once per block.
@@ -169,20 +171,19 @@ def indexer(
         cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
         # fold sign into sin_il
         sin_il_signed = pl.mul(pl.gather(sin_b32, dim=-1, index=rope_dup_idx), rope_sign)
+        qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
+        qr_bf16[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM] = pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint")
         qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
         qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
         rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(qr_swapped, sin_il_signed))
-        qr_rope_out[o0 : o0 + ROPE_ROW_TILE, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+        qr_bf16[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
     qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
     for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_TILE, name_hint="qr_hadamard_quant"):
         o0 = idx * QH_QUANT_TILE
-        qh_nope_raw = qr_proj_flat[o0 : o0 + QH_QUANT_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qh_nope = pl.cast(qh_nope_raw, target_type=pl.BF16, mode="rint")
-        qh_rope = qr_rope_out[o0 : o0 + QH_QUANT_TILE, :]
-        qh_acc = pl.matmul(qh_nope, hadamard[0 : IDX_NOPE_HEAD_DIM, :], out_dtype=pl.FP32)
-        qh_acc = pl.matmul_acc(qh_acc, qh_rope, hadamard[IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM, :])
+        qh_q = qr_bf16[o0 : o0 + QH_QUANT_TILE, :]
+        qh_acc = pl.matmul(qh_q, hadamard, out_dtype=pl.FP32)
         qh_amax = pl.full([1, QH_QUANT_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         for h0 in pl.range(0, IDX_HEAD_DIM, QH_HEAD_DIM_TILE):
             qh_a_f32 = qh_acc[0 : QH_QUANT_TILE, h0 : h0 + QH_HEAD_DIM_TILE]
