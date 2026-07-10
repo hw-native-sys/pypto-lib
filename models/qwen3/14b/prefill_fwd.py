@@ -753,10 +753,9 @@ def prefill_layer(
 
                 # ── Scope 2: Q/K norm + RoPE + KV cache update + causal attention ──
                 attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                all_q_padded_tile = pl.full(
+                all_q_padded_tile = pl.create_tensor(
                     [TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM],
                     dtype=pl.BF16,
-                    value=0.0,
                 )
                 for final_ti0 in pl.range(0, valid_tok, FINALIZE_TOK_GROUP):
                     finalize_tok = pl.min(FINALIZE_TOK_GROUP, valid_tok - final_ti0)
@@ -873,6 +872,18 @@ def prefill_layer(
                                     all_q_padded_tile,
                                     pl.cast(q_rot_hi, target_type=pl.BF16),
                                     [q_pad_row0, HALF_DIM],
+                                )
+                                all_q_padded_tile = pl.assemble(
+                                    all_q_padded_tile,
+                                    pl.cast(
+                                        pl.full(
+                                            [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM],
+                                            dtype=pl.FP32,
+                                            value=0.0,
+                                        ),
+                                        target_type=pl.BF16,
+                                    ),
+                                    [q_pad_row0 + Q_HEAD_BATCH, 0],
                                 )
 
                     b_i32 = pl.cast(b, pl.INT32)
