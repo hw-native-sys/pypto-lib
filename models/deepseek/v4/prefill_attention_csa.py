@@ -41,7 +41,6 @@ from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
     INDEXER_SCORE_CAP,
-    INDEXER_TOPK_CAP,
     _int8_quant_per_row as _idx_int8_quant_per_row,
     gen_shared_weight,
     golden_prefill_indexer_core,
@@ -150,7 +149,7 @@ def prefill_attention_csa(
     inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    kv_cache: pl.Out[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     cmp_kv: pl.Out[pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
@@ -198,6 +197,15 @@ def prefill_attention_csa(
         q, kv, qr, qr_scale,
     )
 
+    kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_write"):
+        for write_t in pl.range(T):
+            if write_t < num_tokens:
+                write_row_raw = pl.read(ori_slot_mapping, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
+
     prefill_compressor_ratio4(
         x_normed, cmp_kv_state, cmp_score_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
@@ -228,99 +236,48 @@ def prefill_attention_csa(
         idx_slot_mapping, inner_state_slot_mapping,
     )
 
-    # Assemble the packed sparse-index rows (window ring + overlay + compressed
-    # slots) inline; padding rows stay all -1 via the pl.full row template.
-    # Rows are fully -1 padded below, so expose the whole width to the shared kernel
-    # via a constant lens == SPARSE_TOPK (the kernel's per-slot >= 0 check does the
-    # masking). Build it through assemble (SSA-tracked) so the gather's read is ordered
-    # after this write, not via in-place pl.write which can race the round-trip.
-    # Build it 2D ([1, T], assemble-friendly) inside a scope, then reshape to the
-    # [T] the kernel expects -- assemble + reshape is SSA-tracked so the gather's read
-    # is ordered after this write (a 1D in-place pl.write races the round-trip).
-    cmp_sparse_lens_2d = pl.create_tensor([1, T], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_sparse_lens"):
-        cmp_sparse_lens_2d = pl.assemble(cmp_sparse_lens_2d, pl.full([1, T], dtype=pl.INT32, value=SPARSE_TOPK), [0, 0])
-    cmp_sparse_lens = pl.reshape(cmp_sparse_lens_2d, [T])
-    cmp_sparse_work = pl.create_tensor([T, SPARSE_TOPK], dtype=pl.INT32)
-
-    # abs-position -> token-index map. Position ids are unique per token
-    # (pos[t] = context_len + local_idx, holds for both full and suffix prefill),
-    # so this replaces the per-(token, slot) O(T) linear scan below with an O(1)
-    # lookup. Mirrors the write_pos_map precompute in prefill_compressor_ratio4.
-    pos_to_token = pl.create_tensor([1, MAX_SEQ_LEN], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_pos_map"):
-        pos_to_token[0:1, 0:MAX_SEQ_LEN] = pl.full([1, MAX_SEQ_LEN], dtype=pl.INT32, value=-1)
-        for map_t in pl.range(T):
-            if map_t < num_tokens:
-                map_pos = pl.read(position_ids, [map_t])
-                pl.write(pos_to_token, [0, pl.cast(map_pos, pl.INDEX)], pl.cast(map_t, pl.INT32))
-
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
                               name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
             t_idx = topk_t0 + topk_dt
-            sparse_row = pl.full([1, SPARSE_TOPK], dtype=pl.INT32, value=-1)
+            swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
             if t_idx < num_tokens:
                 abs_pos = pl.read(position_ids, [t_idx])
-                window_valid = pl.min(WIN, abs_pos + 1)
+                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
                 key_start_abs = abs_pos + 1 - window_valid
-                for sparse_col in pl.range(SPARSE_TOPK):
-                    sparse_raw = pl.cast(-1, pl.INT32)
-                    sparse_col_i32 = pl.cast(sparse_col, pl.INT32)
-                    if sparse_col_i32 < window_valid:
-                        key_abs = key_start_abs + sparse_col_i32
-                        sparse_raw = pl.cast(key_abs % WIN, pl.INT32)
-                        # Prefer the overlay row (WIN + token) when a token with
-                        # position == key_abs exists and is <= t_idx.
-                        overlay_t = pl.read(pos_to_token, [0, pl.cast(key_abs, pl.INDEX)])
-                        if overlay_t >= 0:
-                            if overlay_t <= t_idx:
-                                sparse_raw = pl.cast(WIN + overlay_t, pl.INT32)
-                    else:
-                        comp_start = window_valid
-                        if sparse_col_i32 >= comp_start:
-                            comp_col = sparse_col_i32 - comp_start
-                            visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                            if comp_col < visible_cmp:
-                                if comp_col < pl.cast(INDEXER_TOPK_CAP, pl.INT32):
-                                    topk_raw = pl.read(cmp_topk_indices, [t_idx, comp_col])
-                                    if topk_raw >= WIN + T:
-                                        sparse_raw = topk_raw
-                    pl.write(sparse_row, [0, sparse_col], sparse_raw)
-            cmp_sparse_work = pl.assemble(cmp_sparse_work, sparse_row, [t_idx, 0])
-    # CSA builds every sparse row itself and pads unused entries with -1, so it
-    # can safely expose the full row width to the shared sparse-attn kernel,
-    # while external serving callers still use cmp_sparse_lens in
-    # prefill_sparse_attn where lens == 0 means no valid sparse indices.
+                for win_col in pl.range(WIN):
+                    win_col_i32 = pl.cast(win_col, pl.INT32)
+                    if win_col_i32 < window_valid:
+                        key_abs = key_start_abs + win_col_i32
+                        blk_slot = key_abs // BLOCK_SIZE
+                        blk = pl.read(ori_block_table, [pl.cast(blk_slot, pl.INDEX)])
+                        if blk >= 0:
+                            row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                            pl.write(swa_row, [0, win_col], row)
+                visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
+                for cmp_col in pl.range(IDX_TOPK):
+                    cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
+                    if cmp_col_i32 < visible_cmp:
+                        topk_raw = pl.read(cmp_topk_indices, [t_idx, cmp_col])
+                        if topk_raw >= 0:
+                            if topk_raw < pl.cast(SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE, pl.INT32):
+                                pl.write(cmp_row, [0, cmp_col], topk_raw)
+            swa_indices = pl.assemble(swa_indices, swa_row, [t_idx, 0])
+            cmp_indices = pl.assemble(cmp_indices, cmp_row, [t_idx, 0])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     prefill_sparse_attn(
-        q, kv_cache, ori_block_table, kv,
+        q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
-        cmp_sparse_work, cmp_sparse_lens,
+        cmp_indices,
         attn_sink, num_tokens,
         rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
-    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
-    # history (the current tokens reach attention via the `kv` overlay).
-    kv_cache_flat = pl.reshape(kv_cache, [CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_cache_writeback"):
-        for write_t in pl.range(T):
-            if write_t < num_tokens:
-                write_row_raw = pl.read(ori_slot_mapping, [write_t])
-                if write_row_raw >= 0:
-                    write_row = pl.cast(write_row_raw, pl.INDEX)
-                    # Fold a zeroed attn_out read into the first 32B of the
-                    # cache row so writeback is ordered after sparse_attn.
-                    write_guard = pl.cast(attn_out[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                    write_zero = pl.mul(write_guard, 0.0)
-                    write_kv_head = pl.cast(kv[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                    kv_cache_flat[write_row : write_row + 1, 0:WRITEBACK_GUARD_TILE] = pl.cast(
-                        pl.add(write_kv_head, write_zero), target_type=pl.BF16)
-                    kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE:HEAD_DIM] = kv[
-                        write_t : write_t + 1, WRITEBACK_GUARD_TILE:HEAD_DIM]
 
     hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
@@ -492,46 +449,51 @@ def golden_prefill_attention_csa(tensors):
         "inner_state_slot_mapping": tensors["inner_state_slot_mapping"],
     })
 
+    kv_cache_in = tensors["kv_cache"].clone()
+    kv_cache_flat = kv_cache_in.view(CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    for t in range(num_tokens):
+        dst_row = int(tensors["ori_slot_mapping"][t].item())
+        if dst_row >= 0:
+            kv_cache_flat[dst_row, :] = kv[t]
+
+    def cache_row_from_table(table, slot):
+        block = slot // BLOCK_SIZE
+        intra = slot % BLOCK_SIZE
+        phys_block = int(table[block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * BLOCK_SIZE + intra
+
     def assemble_sparse_indices(cmp_topk):
-        topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-        sparse_lens = torch.zeros(T, dtype=torch.int32)
+        swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
+        cmp_idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
-        current = {int(pos[t].item()): t for t in range(num_tokens)}
-        compressed_cap = SPARSE_PREFILL_SPARSE_PAD - WIN
+        ori_table = tensors["ori_block_table"]
+        cmp_cap = SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
         for t in range(num_tokens):
             abs_pos = int(pos[t].item())
             window_valid = min(WIN, abs_pos + 1)
             key_start_abs = abs_pos + 1 - window_valid
             for k, key_abs in enumerate(range(key_start_abs, abs_pos + 1)):
-                overlay_t = current.get(key_abs)
-                if overlay_t is not None and overlay_t <= t:
-                    topk_idxs[t, k] = WIN + overlay_t
-                else:
-                    topk_idxs[t, k] = key_abs % WIN
-            cursor = window_valid
+                row = cache_row_from_table(ori_table, key_abs)
+                if row >= 0:
+                    swa_idx[t, k] = row
             visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-            for ck, raw_t in enumerate(cmp_topk[t, :compressed_cap].tolist()):
-                if cursor >= SPARSE_PREFILL_SPARSE_PAD:
-                    break
+            for ck, raw_t in enumerate(cmp_topk[t, :IDX_TOPK].tolist()):
                 raw = int(raw_t)
-                if raw >= WIN + T and raw - (WIN + T) < visible_cmp:
-                    topk_idxs[t, cursor] = raw
-                    cursor += 1
-            sparse_lens[t] = cursor
-        return topk_idxs, sparse_lens
+                if raw >= 0 and raw < visible_cmp and raw < cmp_cap:
+                    cmp_idx[t, ck] = raw
+        return swa_idx, cmp_idx
 
-    cmp_sparse_indices, cmp_sparse_lens = assemble_sparse_indices(cmp_topk_indices)
-    kv_cache_in = tensors["kv_cache"].clone()
+    swa_indices, cmp_indices = assemble_sparse_indices(cmp_topk_indices)
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_prefill_sparse_attn({
         "q": q,
         "ori_kv": kv_cache_in,
-        "ori_block_table": tensors["ori_block_table"],
-        "kv_overlay": kv,
+        "swa_indices": swa_indices,
         "cmp_kv": tensors["cmp_kv"],
         "cmp_block_table": tensors["cmp_block_table"],
-        "cmp_sparse_indices": cmp_sparse_indices,
-        "cmp_sparse_lens": cmp_sparse_lens,
+        "cmp_indices": cmp_indices,
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],
         "freqs_cos": rope_cos_t,
@@ -542,13 +504,7 @@ def golden_prefill_attention_csa(tensors):
         "attn_out": attn_out,
     })
 
-    kv_cache_out = kv_cache_in.clone()
-    kv_cache_flat = kv_cache_out.view(CSA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-    for t in range(num_tokens):
-        dst_row = int(tensors["ori_slot_mapping"][t].item())
-        if dst_row >= 0:
-            kv_cache_flat[dst_row, :] = kv[t]
-    tensors["kv_cache"][:] = kv_cache_out
+    tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
@@ -612,51 +568,6 @@ def build_tensor_specs(
         if len(records) > MAX_CMP_WRITES:
             raise ValueError(f"CSA fixture generated {len(records)} compressed writes, cap is {MAX_CMP_WRITES}")
         return records
-
-    def validate_overlay_topk(topk_idxs, pos):
-        current = {int(pos[t].item()): t for t in range(num_tokens)}
-        for t in range(num_tokens):
-            abs_pos = int(pos[t].item())
-            window_valid = min(WIN, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            seen_window_abs = set()
-            seen_cmp = set()
-            for raw_i in topk_idxs[t, :SPARSE_TOPK].tolist():
-                raw = int(raw_i)
-                if raw < 0:
-                    continue
-                if raw < WIN:
-                    candidates = [
-                        key_abs
-                        for key_abs in range(key_start_abs, abs_pos + 1)
-                        if key_abs % WIN == raw
-                    ]
-                    if len(candidates) != 1:
-                        raise ValueError(f"ambiguous CSA ring raw={raw} for token {t}")
-                    key_abs = candidates[0]
-                    if key_abs in current:
-                        raise ValueError(f"current suffix abs_pos={key_abs} must use CSA overlay for token {t}")
-                    if key_abs in seen_window_abs:
-                        raise ValueError(f"duplicate CSA window abs_pos={key_abs} for token {t}")
-                    seen_window_abs.add(key_abs)
-                elif raw < WIN + T:
-                    overlay_t = raw - WIN
-                    if overlay_t >= num_tokens:
-                        raise ValueError(f"CSA overlay raw={raw} points past active tokens for token {t}")
-                    key_abs = int(pos[overlay_t].item())
-                    if key_abs > abs_pos:
-                        raise ValueError(f"CSA overlay raw={raw} is future key abs_pos={key_abs} for token {t}")
-                    if key_abs in seen_window_abs:
-                        raise ValueError(f"duplicate CSA overlay abs_pos={key_abs} for token {t}")
-                    seen_window_abs.add(key_abs)
-                else:
-                    cmp_slot = raw - (WIN + T)
-                    visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
-                    if cmp_slot < 0 or cmp_slot >= visible_cmp:
-                        raise ValueError(f"CSA compressed slot={cmp_slot} is not visible for token {t}")
-                    if cmp_slot in seen_cmp:
-                        raise ValueError(f"duplicate CSA compressed slot={cmp_slot} for token {t}")
-                    seen_cmp.add(cmp_slot)
 
     def init_x_hc():
         x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
@@ -813,7 +724,7 @@ def build_tensor_specs(
         table = init_ori_block_table()
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
-            row = cache_row_from_table(table, abs_pos % WIN)
+            row = cache_row_from_table(table, abs_pos)
             value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
@@ -828,7 +739,7 @@ def build_tensor_specs(
         pos = token_pos()
         table = init_ori_block_table()
         for t in range(num_tokens):
-            mapping[t] = cache_row_from_table(table, int(pos[t].item()) % WIN)
+            mapping[t] = cache_row_from_table(table, int(pos[t].item()))
         return mapping
     def init_cmp_kv():
         cache = torch.zeros(CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
@@ -860,30 +771,6 @@ def build_tensor_specs(
         if phys_block < 0:
             return -1
         return phys_block * BLOCK_SIZE + intra
-    def init_cmp_sparse_indices():
-        topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-        pos = token_pos()
-        current = {int(pos[t].item()): t for t in range(num_tokens)}
-        for t in range(num_tokens):
-            abs_pos = int(pos[t].item())
-            window_valid = min(WIN, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            cursor = 0
-            for key_abs in range(key_start_abs, abs_pos + 1):
-                overlay_t = current.get(key_abs)
-                if overlay_t is not None and overlay_t <= t:
-                    topk_idxs[t, cursor] = WIN + overlay_t
-                else:
-                    topk_idxs[t, cursor] = key_abs % WIN
-                cursor += 1
-            visible_cmp = min((abs_pos + 1) // COMPRESS_RATIO, SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE)
-            for cmp_slot in range(visible_cmp):
-                if cursor >= SPARSE_PREFILL_SPARSE_PAD:
-                    break
-                topk_idxs[t, cursor] = WIN + T + cmp_slot
-                cursor += 1
-        validate_overlay_topk(topk_idxs, pos)
-        return topk_idxs
     def init_position_ids():
         return token_pos()
     def init_cmp_slot_mapping():

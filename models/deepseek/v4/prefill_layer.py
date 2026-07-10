@@ -104,7 +104,6 @@ from prefill_attention_csa import (
     PREFILL_IDX_BLOCK_NUM,
     Q_LORA,
     ROPE_HEAD_DIM,
-    SPARSE_TOPK,
     SPARSE_CMP_MAX_BLOCKS,
     SPARSE_ORI_MAX_BLOCKS,
     build_tensor_specs as build_csa_attention_tensor_specs,
@@ -214,8 +213,6 @@ def prefill_layer_core(
     ori_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
     cmp_kv: pl.InOut[pl.Tensor[[PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[PREFILL_TOKENS_DYN, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
@@ -264,8 +261,6 @@ def prefill_layer_core(
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.BF16]:
     x_hc.bind_dynamic(0, PREFILL_TOKENS_DYN)
     ori_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    cmp_sparse_indices.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    cmp_sparse_lens.bind_dynamic(0, PREFILL_TOKENS_DYN)
     position_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
     hca_cmp_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
     hca_state_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -355,9 +350,6 @@ def prefill_layer_core(
             x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0],
                                  valid_shape=[valid_tok, HC_MULT, D])
             ori_slot_tile = pl.slice(ori_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
-            cmp_sparse_indices_tile = pl.slice(cmp_sparse_indices, [TOK_TILE, SPARSE_TOPK], [tile_base, 0],
-                                               valid_shape=[valid_tok, SPARSE_TOPK])
-            cmp_sparse_lens_tile = pl.slice(cmp_sparse_lens, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
             position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
             hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
             hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
@@ -375,7 +367,7 @@ def prefill_layer_core(
                     attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
                     freqs_cos, freqs_sin,
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
-                    cmp_sparse_indices_tile, cmp_sparse_lens_tile, position_ids_tile,
+                    position_ids_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
                 )
@@ -387,7 +379,7 @@ def prefill_layer_core(
                     hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
                     hca_kv_state_req, hca_score_state_req, hca_state_table_req,
                     kv_cache_req, ori_slot_tile, ori_block_table_req,
-                    cmp_kv_req, cmp_block_table_req, cmp_sparse_indices_tile, cmp_sparse_lens_tile,
+                    cmp_kv_req, cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
@@ -496,8 +488,6 @@ def l3_prefill_layer(
     ori_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
     cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[N_RANKS, PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
@@ -570,7 +560,6 @@ def l3_prefill_layer(
             csa_inner_compress_state_block_table[rank],
             kv_cache[rank], ori_block_table[rank], ori_slot_mapping[rank],
             cmp_kv[rank], cmp_block_table[rank],
-            cmp_sparse_indices[rank], cmp_sparse_lens[rank],
             idx_kv_cache[rank], idx_kv_scale[rank], idx_block_table[rank],
             position_ids[rank],
             hca_cmp_slot_mapping[rank], hca_state_slot_mapping[rank],
@@ -639,8 +628,6 @@ HOST_TENSOR_ORDER = (
     "ori_slot_mapping",
     "cmp_kv",
     "cmp_block_table",
-    "cmp_sparse_indices",
-    "cmp_sparse_lens",
     "idx_kv_cache",
     "idx_kv_scale",
     "idx_block_table",
@@ -691,7 +678,7 @@ _KIND_BUILDER = {
 
 # Child-local token-metadata tensors (gathered per tile from the packed buffers).
 _TOKEN_META_NAMES = {
-    "position_ids", "ori_slot_mapping", "cmp_sparse_indices", "cmp_sparse_lens",
+    "position_ids", "ori_slot_mapping",
     "cmp_slot_mapping", "state_slot_mapping", "idx_slot_mapping", "inner_state_slot_mapping",
 }
 # Child-local cache/state/table tensors (request-local slices, persist across tiles).
@@ -790,7 +777,7 @@ def _tile_token_meta(kind, context_len, valid_tok, torch):
     """Child-local [T] token metadata for one tile, via the fixed-T child builder.
 
     Reuses the existing single-tile builders, which already encode the
-    absolute-position ring/overlay/compressed/state coordinate logic. ``context_len``
+    absolute-position paged-cache/state coordinate logic. ``context_len``
     is the tile's absolute start position; ``valid_tok`` its active token count.
     """
     from golden import TensorSpec
@@ -798,13 +785,6 @@ def _tile_token_meta(kind, context_len, valid_tok, torch):
     specs = {s.name: s for s in _KIND_BUILDER[kind](start_pos=context_len, num_tokens=valid_tok)
              if isinstance(s, TensorSpec)}
     meta = {name: _spec_value(specs[name], torch) for name in specs if name in _TOKEN_META_NAMES}
-    if "cmp_sparse_indices" not in meta:
-        # CSA ignores cmp_sparse_indices/lens; provide window-only SWA values so the
-        # shared packed tensors are well-formed.
-        swa = {s.name: s for s in build_swa_attention_tensor_specs(start_pos=context_len, num_tokens=valid_tok)
-               if isinstance(s, TensorSpec)}
-        meta["cmp_sparse_indices"] = _spec_value(swa["cmp_sparse_indices"], torch)
-        meta["cmp_sparse_lens"] = _spec_value(swa["cmp_sparse_lens"], torch)
     return meta
 
 
@@ -826,8 +806,6 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
     """Assemble rank-shared padded-physical [total_tokens, ...] metadata tensors."""
     pos = torch.zeros(total_tokens, dtype=torch.int32)
     ori_slot = torch.full((total_tokens,), -1, dtype=torch.int64)
-    sparse_idx = torch.full((total_tokens, SPARSE_TOPK), -1, dtype=torch.int32)
-    sparse_lens = torch.zeros(total_tokens, dtype=torch.int32)
     hca_cmp = torch.full((total_tokens,), -1, dtype=torch.int64)
     hca_state = torch.full((total_tokens,), -1, dtype=torch.int64)
     csa_cmp = torch.full((total_tokens,), -1, dtype=torch.int64)
@@ -839,8 +817,6 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
         m = _tile_token_meta(kind, ctx, valid, torch)
         pos[base:base + T] = m["position_ids"][:T]
         ori_slot[base:base + T] = m["ori_slot_mapping"][:T]
-        sparse_idx[base:base + T] = m["cmp_sparse_indices"][:T]
-        sparse_lens[base:base + T] = m["cmp_sparse_lens"][:T]
         if kind == "hca":
             hca_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
             hca_state[base:base + T] = m["state_slot_mapping"][:T]
@@ -853,8 +829,6 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
     return {
         "position_ids": pos,
         "ori_slot_mapping": ori_slot,
-        "cmp_sparse_indices": sparse_idx,
-        "cmp_sparse_lens": sparse_lens,
         "hca_cmp_slot_mapping": hca_cmp,
         "hca_state_slot_mapping": hca_state,
         "csa_cmp_slot_mapping": csa_cmp,
@@ -1002,10 +976,6 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
                                    init_value=replicate(meta["position_ids"])))
     tensor_specs.append(TensorSpec("ori_slot_mapping", [N_RANKS, total_tokens], torch.int64,
                                    init_value=replicate(meta["ori_slot_mapping"])))
-    tensor_specs.append(TensorSpec("cmp_sparse_indices", [N_RANKS, total_tokens, SPARSE_TOPK], torch.int32,
-                                   init_value=replicate(meta["cmp_sparse_indices"])))
-    tensor_specs.append(TensorSpec("cmp_sparse_lens", [N_RANKS, total_tokens], torch.int32,
-                                   init_value=replicate(meta["cmp_sparse_lens"])))
     for name in ("hca_cmp_slot_mapping", "hca_state_slot_mapping", "csa_cmp_slot_mapping",
                  "csa_idx_slot_mapping", "csa_state_slot_mapping", "csa_inner_state_slot_mapping"):
         tensor_specs.append(TensorSpec(name, [N_RANKS, total_tokens], torch.int64, init_value=replicate(meta[name])))

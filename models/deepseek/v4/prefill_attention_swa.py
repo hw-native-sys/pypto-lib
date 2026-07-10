@@ -119,11 +119,9 @@ def prefill_attention_swa(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.Out[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -164,38 +162,52 @@ def prefill_attention_swa(
         q, kv, qr, qr_scale,
     )
 
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
-        for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
-            pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
-    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    prefill_sparse_attn(
-        q, kv_cache, block_table, kv,
-        cmp_kv_dummy, cmp_block_table_dummy,
-        cmp_sparse_indices, cmp_sparse_lens,
-        attn_sink, num_tokens,
-        rope_cos_t, rope_sin_t,
-        wo_a, wo_b, wo_b_scale, attn_out,
-    )
-    # Commit new tokens to the cache AFTER sparse_attn reads the pre-update
-    # history (the current tokens reach attention via the `kv` overlay).
     kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_writeback"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_write"):
         for write_t in pl.range(T):
             if write_t < num_tokens:
                 write_row_raw = pl.read(ori_slot_mapping, [write_t])
                 if write_row_raw >= 0:
                     write_row = pl.cast(write_row_raw, pl.INDEX)
-                    # Fold a zeroed attn_out read into the first 32B of the
-                    # cache row so writeback is ordered after sparse_attn.
-                    write_guard = pl.cast(attn_out[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                    write_zero = pl.mul(write_guard, 0.0)
-                    write_kv_head = pl.cast(kv[write_t : write_t + 1, 0:WRITEBACK_GUARD_TILE], target_type=pl.FP32)
-                    kv_cache_flat[write_row : write_row + 1, 0:WRITEBACK_GUARD_TILE] = pl.cast(
-                        pl.add(write_kv_head, write_zero), target_type=pl.BF16)
-                    kv_cache_flat[write_row : write_row + 1, WRITEBACK_GUARD_TILE:HEAD_DIM] = kv[
-                        write_t : write_t + 1, WRITEBACK_GUARD_TILE:HEAD_DIM]
+                    kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
+
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
+        for idx_t in pl.range(T):
+            idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            if idx_t < num_tokens:
+                abs_pos = pl.read(position_ids, [idx_t])
+                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                for win_col in pl.range(WIN):
+                    win_col_i32 = pl.cast(win_col, pl.INT32)
+                    if win_col_i32 < window_valid:
+                        key_abs = key_start_abs + win_col_i32
+                        blk_slot = key_abs // BLOCK_SIZE
+                        blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
+                        if blk >= 0:
+                            row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
+                            pl.write(idx_row, [0, win_col], row)
+            swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
+
+    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
+        for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
+            pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
+    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_empty_cmp_meta"):
+        for cmp_t in pl.range(T):
+            cmp_indices_dummy[cmp_t:cmp_t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
+    attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
+    prefill_sparse_attn(
+        q, kv_cache, swa_indices,
+        cmp_kv_dummy, cmp_block_table_dummy,
+        cmp_indices_dummy,
+        attn_sink, num_tokens,
+        rope_cos_t, rope_sin_t,
+        wo_a, wo_b, wo_b_scale, attn_out,
+    )
 
     hc_post(attn_out, x_hc, post, comb, x_out)
     return kv_cache, x_out
@@ -219,8 +231,6 @@ def prefill_attention_swa_test(
     kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_sparse_indices: pl.Tensor[[T, SPARSE_TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
@@ -235,7 +245,7 @@ def prefill_attention_swa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         kv_cache, block_table, ori_slot_mapping,
-        cmp_sparse_indices, cmp_sparse_lens, position_ids,
+        position_ids,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out, num_tokens,
     )
@@ -301,16 +311,42 @@ def golden_prefill_attention_swa(tensors):
     })
 
     kv_cache_in = tensors["kv_cache"].clone()
+    kv_cache_flat = kv_cache_in.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    for t in range(num_tokens):
+        dst_row = int(tensors["ori_slot_mapping"][t].item())
+        if dst_row >= 0:
+            kv_cache_flat[dst_row, :] = kv[t]
+
+    def cache_row_from_table(table, slot):
+        block = slot // BLOCK_SIZE
+        intra = slot % BLOCK_SIZE
+        phys_block = int(table[block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * BLOCK_SIZE + intra
+
+    def build_swa_metadata():
+        idx = torch.full((T, WIN), -1, dtype=torch.int32)
+        pos = tensors["position_ids"]
+        table = tensors["block_table"]
+        for t in range(num_tokens):
+            abs_pos = int(pos[t].item())
+            window_valid = min(WIN, abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            for k, key_abs in enumerate(range(key_start_abs, abs_pos + 1)):
+                row = cache_row_from_table(table, key_abs)
+                if row >= 0:
+                    idx[t, k] = row
+        return idx
+
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
     golden_prefill_sparse_attn({
         "q": q,
         "ori_kv": kv_cache_in,
-        "ori_block_table": tensors["block_table"],
-        "kv_overlay": kv,
+        "swa_indices": build_swa_metadata(),
         "cmp_kv": torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16),
         "cmp_block_table": torch.zeros(SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32),
-        "cmp_sparse_indices": tensors["cmp_sparse_indices"],
-        "cmp_sparse_lens": tensors["cmp_sparse_lens"],
+        "cmp_indices": torch.full((T, IDX_TOPK), -1, dtype=torch.int32),
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],
         "freqs_cos": rope_cos_t,
@@ -321,13 +357,7 @@ def golden_prefill_attention_swa(tensors):
         "attn_out": attn_out,
     })
 
-    kv_cache_out = kv_cache_in.clone()
-    kv_cache_flat = kv_cache_out.view(BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
-    for t in range(num_tokens):
-        dst_row = int(tensors["ori_slot_mapping"][t].item())
-        if dst_row >= 0:
-            kv_cache_flat[dst_row, :] = kv[t]
-    tensors["kv_cache"][:] = kv_cache_out
+    tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.bfloat16)
     golden_hc_post({
@@ -372,45 +402,6 @@ def build_tensor_specs(
             pos[local_s] = context_len + local_s
         return pos
 
-    def validate_overlay_topk(topk_idxs, pos, sparse_lens=None):
-        current = {int(pos[t].item()): t for t in range(num_tokens)}
-
-        for t in range(num_tokens):
-            abs_pos = int(pos[t].item())
-            window_valid = min(WIN, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            seen_abs = set()
-
-            sparse_len = SPARSE_TOPK if sparse_lens is None else int(sparse_lens[t].item())
-            for raw_i in topk_idxs[t, :sparse_len].tolist():
-                raw = int(raw_i)
-                if raw < 0:
-                    continue
-                if raw < WIN:
-                    candidates = [
-                        key_abs
-                        for key_abs in range(key_start_abs, abs_pos + 1)
-                        if key_abs % WIN == raw
-                    ]
-                    if len(candidates) != 1:
-                        raise ValueError(f"ambiguous ring raw={raw} for token {t}")
-                    key_abs = candidates[0]
-                    if key_abs in current:
-                        raise ValueError(f"current suffix abs_pos={key_abs} must use overlay for token {t}")
-                elif raw < WIN + T:
-                    overlay_t = raw - WIN
-                    if overlay_t >= num_tokens:
-                        raise ValueError(f"overlay raw={raw} points past active tokens for token {t}")
-                    key_abs = int(pos[overlay_t].item())
-                    if key_abs > abs_pos:
-                        raise ValueError(f"overlay raw={raw} is future key abs_pos={key_abs} for token {t}")
-                else:
-                    raise ValueError(f"SWA topk raw={raw} is outside ring/overlay contract")
-
-                if key_abs in seen_abs:
-                    raise ValueError(f"duplicate key abs_pos={key_abs} for token {t}")
-                seen_abs.add(key_abs)
-
     def init_x_hc():
         x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
@@ -449,9 +440,9 @@ def build_tensor_specs(
     def init_freqs_sin():
         return shared_freqs_sin.clone()
     def init_block_table():
-        # Single-request paged table: one window page mapped to physical block 0.
         tbl = torch.full((BLOCK_NUM,), -1, dtype=torch.int32)
-        tbl[0] = 0
+        for block in range(BLOCK_NUM):
+            tbl[block] = block
         return tbl
     def cache_row_from_table(table, slot):
         block = slot // BLOCK_SIZE
@@ -466,7 +457,7 @@ def build_tensor_specs(
         table = init_block_table()
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
-            row = cache_row_from_table(table, abs_pos % WIN)
+            row = cache_row_from_table(table, abs_pos)
             value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
@@ -476,38 +467,8 @@ def build_tensor_specs(
         pos = token_pos()
         table = init_block_table()
         for t in range(num_tokens):
-            mapping[t] = cache_row_from_table(table, int(pos[t].item()) % WIN)
+            mapping[t] = cache_row_from_table(table, int(pos[t].item()))
         return mapping
-    def init_cmp_sparse_indices():
-        topk_idxs = torch.full((T, SPARSE_TOPK), -1, dtype=torch.int32)
-        pos = token_pos()
-        current = {int(pos[t].item()): t for t in range(num_tokens)}
-        for t in range(num_tokens):
-            abs_pos = int(pos[t].item())
-            window_valid = min(WIN, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            for key_i in range(window_valid):
-                key_abs = key_start_abs + key_i
-                overlay_t = current.get(key_abs)
-                if overlay_t is not None and overlay_t <= t:
-                    topk_idxs[t, key_i] = WIN + overlay_t
-                else:
-                    topk_idxs[t, key_i] = key_abs % WIN
-        sparse_lens = torch.zeros(T, dtype=torch.int32)
-        for t in range(num_tokens):
-            valid = (topk_idxs[t] >= 0).nonzero()
-            if valid.numel():
-                sparse_lens[t] = int(valid[-1].item()) + 1
-        validate_overlay_topk(topk_idxs, pos, sparse_lens)
-        return topk_idxs
-    def init_cmp_sparse_lens():
-        topk_idxs = init_cmp_sparse_indices()
-        lens = torch.zeros(T, dtype=torch.int32)
-        for t in range(num_tokens):
-            valid = (topk_idxs[t] >= 0).nonzero()
-            if valid.numel():
-                lens[t] = int(valid[-1].item()) + 1
-        return lens
     def init_position_ids():
         return token_pos()
     def init_attn_sink():
@@ -540,8 +501,6 @@ def build_tensor_specs(
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("block_table", [BLOCK_NUM], torch.int32, init_value=init_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
-        TensorSpec("cmp_sparse_indices", [T, SPARSE_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
-        TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),

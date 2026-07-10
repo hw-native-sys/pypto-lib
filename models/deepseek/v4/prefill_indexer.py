@@ -69,7 +69,6 @@ INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
 assert INDEXER_SCORE_CAP == 256, "INDEXER_SCORE_CAP must stay at 256 rows"
 INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
-INDEXER_OFFSET = WIN + T
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
 # Q-projection / score tiling (mirrors decode_indexer)
@@ -303,10 +302,9 @@ def prefill_indexer(
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=MRG_TOPK_RUN)
                     topk_pairs = sorted_tile[:, 0 : 2 * PREFILL_TOPK_CAP]
                     topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
-                    offset_tile = pl.full([1, PREFILL_TOPK_CAP], dtype=pl.INT32, value=INDEXER_OFFSET)
-                    topk_off = pl.add(topk_idxs_tile, offset_tile)
                     valid_topk = pl.min(PREFILL_TOPK_CAP, visible_t)
-                    cmp_topk_indices[t : t + 1, 0:PREFILL_TOPK_CAP] = pl.set_validshape(topk_off, 1, valid_topk)
+                    cmp_topk_indices[t : t + 1, 0:PREFILL_TOPK_CAP] = pl.set_validshape(
+                        topk_idxs_tile, 1, valid_topk)
 
     return idx_kv_cache, idx_kv_scale, score, cmp_topk_indices
 
@@ -411,7 +409,7 @@ def golden_prefill_indexer_core(tensors):
     score = score_i32.float() * q_sc * kv_sc
     score = (torch.relu(score) * weights.unsqueeze(-1)).sum(dim=1)  # [T, max_visible]
 
-    # Per-token causal mask, then top-k over the visible compressed positions (+ raw-index offset).
+    # Per-token causal mask, then top-k over the visible compressed positions.
     col = torch.arange(max_visible).unsqueeze(0)
     score = score.masked_fill(col >= visible.unsqueeze(1), FP32_NEG_INF)
     score_full[:, :max_visible] = score
@@ -419,7 +417,7 @@ def golden_prefill_indexer_core(tensors):
         k = int(min(INDEXER_TOPK_CAP, int(visible[t].item())))
         if k > 0:
             sel = score[t].topk(k, dim=-1)[1]
-            cmp_topk_indices[t, :k] = sel.to(torch.int32) + INDEXER_OFFSET
+            cmp_topk_indices[t, :k] = sel.to(torch.int32)
     return cmp_topk_indices, score_full
 
 
@@ -700,8 +698,8 @@ if __name__ == "__main__":
         score = actual_outputs["score"]
         a_top = actual[..., :IDX_TOPK]
         e_top = expected[..., :IDX_TOPK]
-        invalid_top = a_top < INDEXER_OFFSET
-        a_orig = (a_top.long() - INDEXER_OFFSET).clamp(min=0, max=score.shape[-1] - 1)
+        invalid_top = a_top < 0
+        a_orig = a_top.long().clamp(min=0, max=score.shape[-1] - 1)
         paired = torch.gather(score, dim=-1, index=a_orig)
         paired = torch.where(invalid_top, torch.full_like(paired, -torch.inf), paired)
         synth_actual = {**actual_outputs, "_topk_paired_scores": paired}

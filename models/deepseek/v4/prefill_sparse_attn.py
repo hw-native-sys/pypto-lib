@@ -8,9 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 token-major prefill sparse attention with grouped output projection.
 
-Raw-index contract for cmp_sparse_indices: -1 invalid; [0, WIN) ring KV;
-[WIN, WIN + T) current-suffix overlay; [WIN + T, ...) compressed KV. cmp_sparse_lens[t]
-is the usable prefix length; --compress-ratio {0,4,128} is a standalone fixture knob only.
+Sparse reads are split by cache source. ``swa_indices`` contains physical rows
+in the original KV cache; ``cmp_indices`` contains compressed logical slots that
+are lowered through ``cmp_block_table``. ``-1`` marks invalid entries.
 """
 
 import pypto.language as pl
@@ -104,20 +104,18 @@ assert D % PROJ_B_ACT_N_TILE == 0 and O_LORA % QUANT_TILE == 0
 PREFILL_ATTN_TILE = 128
 PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_ATTN_TILE
 PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
-# Columns of the padded sparse window that carry a real cmp_sparse_indices entry
-# (the rest of the [TOPK, PREFILL_SPARSE_PAD) tail, if any, is always masked).
+# Columns of the padded sparse window that carry real metadata entries.
 SPARSE_BIAS_COLS = min(TOPK, PREFILL_SPARSE_PAD)
+SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 
 @pl.jit.inline
 def prefill_sparse_attn(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
-    kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
+    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -127,18 +125,10 @@ def prefill_sparse_attn(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    """Token-major sparse attention with current-suffix KV overlay: gather the
-    sliding-window / overlay / compressed KV rows, then run causal sparse attention,
-    inverse RoPE, and the grouped INT8 output projection -- all in one scope set,
-    mirroring decode_sparse_attn.
-
-    Raw index contract: -1 invalid; [0, WIN) ring KV; [WIN, WIN + T) overlay row;
-    [WIN + T, ...) compressed slot. HCA/CSA use all three sources; SWA passes dummy
-    compressed tensors with compressed raw indices unreachable. cmp_sparse_lens is the
-    usable prefix per row (pass TOPK when the rows are already -1 padded, e.g. CSA)."""
+    """Gather cache-first SWA/compressed rows, then run sparse attention and o-proj."""
     # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
-    # single wide MTE3 store. cmp_sparse_lens clamps the usable prefix.
+    # single wide MTE3 store. Invalid slots are carried by -1 padding.
     ori_kv_flat = pl.reshape(ori_kv, [ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
@@ -153,50 +143,43 @@ def prefill_sparse_attn(
                 block_base = gather_t * PREFILL_SPARSE_PAD + gather_k0
                 stage = pl.full([PREFILL_ATTN_TILE, HEAD_DIM], dtype=pl.BF16, value=0.0)
                 if gather_t < num_tokens:
-                    gather_len = pl.read(cmp_sparse_lens, [gather_t])
-                    gather_len_eff = pl.cast(0, pl.INT32)
-                    if gather_len > 0:
-                        gather_len_eff = gather_len
                     for gather_ki in pl.range(PREFILL_ATTN_TILE):
                         gather_k = gather_k0 + gather_ki
                         gather_raw = pl.cast(-1, pl.INT32)
-                        if gather_k < TOPK:
-                            if gather_k < gather_len_eff:
-                                gather_raw = pl.read(cmp_sparse_indices, [gather_t, gather_k])
-                        if gather_raw >= 0:
-                            if gather_raw < WIN:
-                                blk_slot = gather_raw // BLOCK_SIZE
-                                blk = pl.cast(pl.read(ori_block_table, [blk_slot]), pl.INDEX)
-                                src = blk * BLOCK_SIZE + (gather_raw - blk_slot * BLOCK_SIZE)
+                        if gather_k < WIN:
+                            gather_raw = pl.read(swa_indices, [gather_t, gather_k])
+                            if gather_raw >= 0:
+                                src = pl.cast(gather_raw, pl.INDEX)
                                 stage[gather_ki:gather_ki + 1, :] = ori_kv_flat[src:src + 1, :]
-                            elif gather_raw < WIN + T:
-                                ov = pl.cast(gather_raw - WIN, pl.INDEX)
-                                stage[gather_ki:gather_ki + 1, :] = kv_overlay[ov:ov + 1, :]
-                            else:
-                                cmp_slot = gather_raw - (WIN + T)
-                                blk_slot = cmp_slot // BLOCK_SIZE
-                                blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
-                                src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
-                                stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
+                        else:
+                            gather_cmp_k = gather_k - WIN
+                            if gather_cmp_k < IDX_TOPK:
+                                gather_raw = pl.read(cmp_indices, [gather_t, gather_cmp_k])
+                                if gather_raw >= 0:
+                                    cmp_slot = gather_raw
+                                    blk_slot = cmp_slot // BLOCK_SIZE
+                                    blk = pl.cast(pl.read(cmp_block_table, [blk_slot]), pl.INDEX)
+                                    src = blk * BLOCK_SIZE + (cmp_slot - blk_slot * BLOCK_SIZE)
+                                    stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
                 sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
     # Additive softmax bias: 0 for valid slots, FP32_NEG_INF for padding, so the QK softmax
     # masks invalid slots without rescanning validity per head. A slot is valid when its raw
-    # index is >= 0 AND its column lies inside the per-token cmp_sparse_lens prefix; the
-    # [TOPK, PREFILL_SPARSE_PAD) tail (no raw index exists) is always masked.
-    cmp_sparse_lens_2d = pl.reshape(cmp_sparse_lens, [T, 1])
+    # index is >= 0; the [TOPK, PREFILL_SPARSE_PAD) tail is always masked.
     sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
     for bias_blk in pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias"):
         bias_t0 = bias_blk * BIAS_TOKEN_TILE
-        bias_idx = pl.cast(cmp_sparse_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_BIAS_COLS], target_type=pl.FP32)
-        bias_raw_flag = pl.minimum(pl.maximum(pl.add(bias_idx, 1.0), 0.0), 1.0)
-        bias_col = pl.col_expand(
-            pl.full([BIAS_TOKEN_TILE, SPARSE_BIAS_COLS], dtype=pl.FP32, value=0.0),
-            pl.cast(pl.arange(0, [1, SPARSE_BIAS_COLS], dtype=pl.INT32), target_type=pl.FP32))
-        bias_len = pl.cast(cmp_sparse_lens_2d[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:1], target_type=pl.FP32)
-        bias_len_flag = pl.minimum(pl.maximum(pl.neg(pl.row_expand_sub(bias_col, bias_len)), 0.0), 1.0)
-        bias_valid = pl.mul(bias_raw_flag, bias_len_flag)
-        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_BIAS_COLS] = pl.mul(pl.sub(bias_valid, 1.0), -FP32_NEG_INF)
+        bias_win_idx = pl.cast(swa_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN], target_type=pl.FP32)
+        bias_win_raw_flag = pl.minimum(pl.maximum(pl.add(bias_win_idx, 1.0), 0.0), 1.0)
+        sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:WIN] = pl.mul(
+            pl.sub(bias_win_raw_flag, 1.0), -FP32_NEG_INF)
+        if SPARSE_CMP_BIAS_COLS > 0:
+            bias_cmp_idx = pl.cast(
+                cmp_indices[bias_t0:bias_t0 + BIAS_TOKEN_TILE, 0:SPARSE_CMP_BIAS_COLS],
+                target_type=pl.FP32)
+            bias_cmp_raw_flag = pl.minimum(pl.maximum(pl.add(bias_cmp_idx, 1.0), 0.0), 1.0)
+            sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, WIN:SPARSE_BIAS_COLS] = pl.mul(
+                pl.sub(bias_cmp_raw_flag, 1.0), -FP32_NEG_INF)
         if PREFILL_SPARSE_PAD > SPARSE_BIAS_COLS:
             sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = pl.full(
                 [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
@@ -450,12 +433,10 @@ def prefill_sparse_attn(
 def prefill_sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[ORI_MAX_BLOCKS], pl.INT32],
-    kv_overlay: pl.Tensor[[T, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
-    cmp_sparse_indices: pl.Tensor[[T, TOPK], pl.INT32],
-    cmp_sparse_lens: pl.Tensor[[T], pl.INT32],
+    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -468,12 +449,10 @@ def prefill_sparse_attn_test(
     return prefill_sparse_attn(
         q,
         ori_kv,
-        ori_block_table,
-        kv_overlay,
+        swa_indices,
         cmp_kv,
         cmp_block_table,
-        cmp_sparse_indices,
-        cmp_sparse_lens,
+        cmp_indices,
         attn_sink,
         num_tokens,
         freqs_cos,
@@ -507,18 +486,16 @@ def _int8_quant_per_row(x):
     return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 def golden_prefill_sparse_attn(tensors):
-    """Self-contained torch reference for the unified overlay sparse-attn entry."""
+    """Self-contained torch reference for the cache-first sparse-attn entry."""
     import torch
 
     num_tokens = int(tensors["num_tokens"])
     q = tensors["q"].float()
     ori_kv = tensors["ori_kv"].float()
-    kv_overlay = tensors["kv_overlay"].float()
     cmp_kv = tensors["cmp_kv"].float()
-    ori_block_table = tensors["ori_block_table"]
     cmp_block_table = tensors["cmp_block_table"]
-    cmp_sparse_indices = tensors["cmp_sparse_indices"]
-    cmp_sparse_lens = tensors["cmp_sparse_lens"]
+    swa_indices = tensors["swa_indices"]
+    cmp_indices = tensors["cmp_indices"]
     attn_sink = tensors["attn_sink"].float()
     cos = tensors["freqs_cos"].float()
     sin = tensors["freqs_sin"].float()
@@ -529,25 +506,18 @@ def golden_prefill_sparse_attn(tensors):
     o = torch.zeros(T, H, HEAD_DIM)
     for t in range(num_tokens):
         gathered = []
-        sparse_len = max(0, min(int(cmp_sparse_lens[t].item()), PREFILL_SPARSE_PAD, TOPK))
-        for raw_i in cmp_sparse_indices[t, :sparse_len].tolist():
-            raw = int(raw_i)
-            if raw < 0:
+        for row_i in swa_indices[t].tolist():
+            row = int(row_i)
+            if row < 0:
                 continue
-            if raw < WIN:
-                block_id = int(ori_block_table[raw // BLOCK_SIZE].item())
-                intra = raw % BLOCK_SIZE
-                gathered.append(ori_kv[block_id, intra, 0])
-            elif raw < WIN + T:
-                overlay_t = raw - WIN
-                if 0 <= overlay_t < num_tokens:
-                    gathered.append(kv_overlay[overlay_t])
-            else:
-                cmp_slot = raw - (WIN + T)
-                if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
-                    continue
-                block_id = int(cmp_block_table[cmp_slot // BLOCK_SIZE].item())
-                intra = cmp_slot % BLOCK_SIZE
+            gathered.append(ori_kv.reshape(-1, HEAD_DIM)[row])
+        for raw_i in cmp_indices[t].tolist():
+            cmp_slot = int(raw_i)
+            if cmp_slot < 0 or cmp_slot >= CMP_MAX_BLOCKS * BLOCK_SIZE:
+                continue
+            block_id = int(cmp_block_table[cmp_slot // BLOCK_SIZE].item())
+            intra = cmp_slot % BLOCK_SIZE
+            if block_id >= 0:
                 gathered.append(cmp_kv[block_id, intra, 0])
 
         if not gathered:
@@ -636,13 +606,6 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         return ((torch.rand(T, H, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_ori_kv():
         return ((torch.rand(ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
-    def init_ori_block_table():
-        table = torch.zeros(ORI_MAX_BLOCKS, dtype=torch.int32)
-        for blk in range(ORI_MAX_BLOCKS):
-            table[blk] = blk
-        return table
-    def init_kv_overlay():
-        return ((torch.rand(T, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_kv():
         return ((torch.rand(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
     def init_cmp_block_table():
@@ -650,27 +613,21 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
         for blk in range(CMP_MAX_BLOCKS):
             table[blk] = blk
         return table
-    def init_cmp_sparse_indices():
-        idx = torch.full((T, TOPK), -1, dtype=torch.int32)
+    def init_swa_indices():
+        idx = torch.full((T, WIN), -1, dtype=torch.int32)
         for t in range(num_tokens):
-            window = torch.arange(t + 1, dtype=torch.int32) + WIN
-            cursor = min(window.numel(), PREFILL_SPARSE_PAD)
-            idx[t, :cursor] = window[:cursor]
-            if compress_ratio:
-                comp_count = min(cmp_valid, (t + 1) // compress_ratio)
-                comp_count = min(comp_count, PREFILL_SPARSE_PAD - cursor)
-                if comp_count > 0:
-                    comp = torch.arange(comp_count, dtype=torch.int32) + WIN + T
-                    idx[t, cursor : cursor + comp_count] = comp
+            window_start = max(0, t - WIN + 1)
+            window = torch.arange(window_start, t + 1, dtype=torch.int32)
+            idx[t, :window.numel()] = window
         return idx
-    def init_cmp_sparse_lens():
-        idx = init_cmp_sparse_indices()
-        lens = torch.zeros(T, dtype=torch.int32)
-        for t in range(num_tokens):
-            valid = (idx[t] >= 0).nonzero()
-            if valid.numel():
-                lens[t] = int(valid[-1].item()) + 1
-        return lens
+    def init_cmp_indices():
+        idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
+        if compress_ratio:
+            for t in range(num_tokens):
+                comp_count = min(cmp_valid, (t + 1) // compress_ratio, IDX_TOPK)
+                if comp_count > 0:
+                    idx[t, :comp_count] = torch.arange(comp_count, dtype=torch.int32)
+        return idx
     def init_attn_sink():
         return torch.zeros(H)
     def init_freqs_cos():
@@ -687,12 +644,10 @@ def build_tensor_specs(compress_ratio: int = DEFAULT_COMPRESS_RATIO):
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),
         TensorSpec("ori_kv", [ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_ori_kv),
-        TensorSpec("ori_block_table", [ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec("kv_overlay", [T, HEAD_DIM], torch.bfloat16, init_value=init_kv_overlay),
+        TensorSpec("swa_indices", [T, WIN], torch.int32, init_value=init_swa_indices),
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec("cmp_sparse_indices", [T, TOPK], torch.int32, init_value=init_cmp_sparse_indices),
-        TensorSpec("cmp_sparse_lens", [T], torch.int32, init_value=init_cmp_sparse_lens),
+        TensorSpec("cmp_indices", [T, IDX_TOPK], torch.int32, init_value=init_cmp_indices),
         TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("freqs_cos", [T, ROPE_DIM], torch.bfloat16, init_value=init_freqs_cos),
