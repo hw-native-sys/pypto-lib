@@ -142,7 +142,7 @@ def qkv_proj_rope(
                 qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
                     [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
                 )
-    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul"):
+    for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
         for tc in pl.range(t_matmul // QR_M_TILE):
@@ -247,7 +247,7 @@ def qkv_proj_rope(
     # of the rotation and is folded into the writeback.
     #   out[j] = inv_rms * (x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j])
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="q_head_rms_nope_rope", allow_early_resolve=True):
+    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="q_head_rms_nope_rope"):
         hg = hg_idx * Q_ROPE_H_TILE
         # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
         q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
