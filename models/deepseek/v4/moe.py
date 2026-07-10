@@ -284,7 +284,7 @@ def combine(
     moe_epoch: pl.Scalar[pl.INT32],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL * RECV_MAX, D])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine") as _cscatter_tid:
         # Rebuild per-(e, src) base rows from recv_meta so the compact slots are
         # walked src-major and the origin rank is the loop index src (static peer,
         # no per-slot origin tensor).
@@ -312,7 +312,10 @@ def combine(
                         shape=[1, D],
                     )
 
-        # Signal, then wait for every source (AtomicAdd counter, epoch-safe).
+    # Payload-arrival handshake in its own task, fenced on the scatter via deps so a
+    # peer is notified only after every put to it has landed. notify-then-wait is
+    # symmetric across ranks, so it cannot deadlock.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
@@ -331,13 +334,16 @@ def combine(
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k].
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so
+    # every peer's remote write into this rank's routed_y_buf has landed -- the local
+    # RAW edge alone would only order after this rank's own outgoing puts.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    for t in pl.spmd(T, name_hint="shared_routed"):
+    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+        t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
             for k in pl.range(TOPK):
