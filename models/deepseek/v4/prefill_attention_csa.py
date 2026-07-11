@@ -933,6 +933,9 @@ def valid_ratio_reldiff(
     base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
 
     def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
+        if tail_nonzero:
+            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
         return base_cmp(
             actual[:num_tokens],
             expected[:num_tokens],

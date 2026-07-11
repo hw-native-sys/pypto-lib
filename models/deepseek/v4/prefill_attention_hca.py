@@ -706,6 +706,9 @@ def valid_ratio_reldiff(
         rtol,
         atol,
     ):
+        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
+        if tail_nonzero:
+            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
         return base_cmp(
             actual[:num_tokens],
             expected[:num_tokens],
