@@ -122,6 +122,10 @@ CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
+# T // 2 active tokens need more than the runtime's default ring-2 heap while
+# the 43-layer prefill scope is open. Keep the other rings on their defaults.
+PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
+
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
 # the final RMSNorm gamma — mirrors decode_fwd.
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
@@ -1299,8 +1303,8 @@ def main():
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
-    parser.add_argument("--num-tokens", type=int, default=T,
-                        help=f"Active token rows for MoE routing/combine; default is T={T}.")
+    parser.add_argument("--num-tokens", type=int, default=T // 2,
+                        help=f"Active token rows for MoE routing/combine; default is T // 2={T // 2}.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1328,6 +1332,7 @@ def main():
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            ring_heap=PREFILL_RING_HEAP,
         ),
     )
     if not result.passed:

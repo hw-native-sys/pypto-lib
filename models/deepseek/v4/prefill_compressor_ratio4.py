@@ -104,16 +104,18 @@ def prefill_compressor_ratio4(
     write_pos_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     write_dst_map = pl.create_tensor([1, MAX_CMP_WRITES], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_c4_write_map"):
-        write_pos_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
-        write_dst_map[0:1, 0:MAX_CMP_WRITES] = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
+        write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
+        write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
         for map_w in pl.range(T):
             if map_w < num_tokens:
                 map_slot_raw = pl.read(cmp_slot_mapping, [map_w])
                 if map_slot_raw >= 0:
-                    pl.write(write_pos_map, [0, map_seen], pl.read(position_ids, [map_w]))
-                    pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_w]))
+                    pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
+        write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
+        write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
 
     for pool_idx in pl.spmd(PACKED_POOL_BLOCKS, name_hint="prefill_c4_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
