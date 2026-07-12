@@ -30,7 +30,7 @@ from config import (
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
-from hc_post import golden_hc_post_active, hc_post_active
+from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_compressor_ratio128 import (
     HCA_STATE_BLOCK_NUM,
@@ -219,7 +219,7 @@ def prefill_attention_hca(
         wo_a, wo_b, wo_b_scale, attn_out,
     )
 
-    hc_post_active(attn_out, x_hc, post, comb, x_out, num_tokens)
+    hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
     return x_out
 
 
@@ -406,7 +406,7 @@ def golden_prefill_attention_hca(tensors):
     })
 
     y = torch.zeros(B, S, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post_active({
+    golden_hc_post_prefill({
         "x": attn_out.view(T, D),
         "residual": x_hc_flat,
         "post": post,

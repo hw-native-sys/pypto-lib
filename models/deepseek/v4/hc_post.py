@@ -10,6 +10,9 @@
 output with its hc-residual into the next hc-stack via post and comb weights.
 Supports both decode and prefill batch/sequence sizes via dynamic-shape tensors."""
 
+# ``hc_post`` processes a dynamic tensor whose rows are all valid (decode/MoE).
+# ``hc_post_prefill`` processes only the active prefix of a static prefill tensor
+# and deterministically zero-fills its inactive tail.
 
 import pypto.language as pl
 
@@ -65,7 +68,7 @@ def hc_post(
 
 
 @pl.jit.inline
-def hc_post_active(
+def hc_post_prefill(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
@@ -86,7 +89,7 @@ def hc_post_active(
     active_tiles = (active_tokens + T_TILE - 1) // T_TILE
 
     if active_tokens > 0:
-        for block in pl.spmd(active_tiles * HC_MULT, name_hint="hc_post_active"):
+        for block in pl.spmd(active_tiles * HC_MULT, name_hint="hc_post_prefill"):
             token_block = block // HC_MULT
             out_h = block % HC_MULT
             t0 = token_block * T_TILE
@@ -158,7 +161,7 @@ def golden_hc_post(tensors):
     tensors["y"][:] = y
 
 
-def golden_hc_post_active(tensors):
+def golden_hc_post_prefill(tensors):
     """Prefill reference: compute active rows and zero the static tail."""
     golden_hc_post(tensors)
     num_tokens = int(tensors["num_tokens"])

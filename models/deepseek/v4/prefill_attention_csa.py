@@ -38,7 +38,7 @@ from prefill_compressor_ratio4 import (
     golden_prefill_compressor_ratio4,
     prefill_compressor_ratio4,
 )
-from hc_post import golden_hc_post_active, hc_post_active
+from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
@@ -283,7 +283,7 @@ def prefill_attention_csa(
         wo_a, wo_b, wo_b_scale, attn_out,
     )
 
-    hc_post_active(attn_out, x_hc, post, comb, x_out, num_tokens)
+    hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
 
 
@@ -511,7 +511,7 @@ def golden_prefill_attention_csa(tensors):
     tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post_active({
+    golden_hc_post_prefill({
         "x": attn_out,
         "residual": tensors["x_hc"],
         "post": post,
