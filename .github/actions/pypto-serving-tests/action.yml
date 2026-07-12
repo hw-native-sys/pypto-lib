@@ -1,7 +1,7 @@
-name: Run pypto-serving Qwen tests
+name: Run pypto-serving model tests
 description: >-
   Checkout pypto-serving, replace its pypto-lib submodule with the current
-  pypto-lib checkout under test, and run the Qwen serving tests via
+  pypto-lib checkout under test, and run the selected serving tests via
   task-submit.
 
 inputs:
@@ -11,12 +11,11 @@ inputs:
   pypto-serving-checkout-path:
     description: Workspace-relative path where pypto-serving should be checked out.
     required: true
-  pypto-serving-ref:
-    description: pypto-serving ref to test against.
-    required: false
-    default: main
+  model-name:
+    description: Serving model guard to run (qwen3-14b or deepseek-v4).
+    required: true
   model-dir:
-    description: Qwen3 model directory used by pypto-serving tests.
+    description: Model directory used by the selected pypto-serving test.
     required: true
   pto2-ring-dep-pool:
     description: PTO2_RING_DEP_POOL value for pypto-serving tests.
@@ -38,7 +37,7 @@ runs:
       uses: actions/checkout@v4
       with:
         repository: hw-native-sys/pypto-serving
-        ref: ${{ inputs.pypto-serving-ref }}
+        ref: main
         path: ${{ inputs.pypto-serving-checkout-path }}
         submodules: recursive
         persist-credentials: false
@@ -61,9 +60,10 @@ runs:
       working-directory: ${{ inputs.pypto-lib-checkout-path }}
       run: |
         source activate.sh
-        pip install transformers safetensors pytest
+        pip install transformers safetensors pytest fastapi uvicorn
 
     - name: Run pypto-serving Qwen tests
+      if: ${{ inputs.model-name == 'qwen3-14b' }}
       shell: bash
       env:
         PYPTO_QWEN3_MODEL_DIR: ${{ inputs.model-dir }}
@@ -74,8 +74,8 @@ runs:
         PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
       run: |
         source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
-        run_cmd="cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
-        run_cmd="$run_cmd && source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
         run_cmd="$run_cmd && DEVICE_ID=\$TASK_DEVICE"
         run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
         run_cmd="$run_cmd PYPTO_QWEN3_MODEL_DIR=$PYPTO_QWEN3_MODEL_DIR"
@@ -83,5 +83,40 @@ runs:
         run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
         run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
         run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
-        task-submit --device "$DEVICE_ID" --timeout 0 --max-time 0 \
+        task-submit --device "$DEVICE_ID" --timeout 1200 --max-time 1800 \
+          --run "$run_cmd"
+
+    - name: Run pypto-serving DeepSeek V4 accuracy test
+      if: ${{ inputs.model-name == 'deepseek-v4' }}
+      shell: bash
+      env:
+        PYPTO_DSV4_MODEL_DIR: ${{ inputs.model-dir }}
+        PYPTO_RUNTIME_LOG: error
+        PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
+        PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
+        PTO2_RING_HEAP: ${{ inputs.pto2-ring-heap }}
+        PTO2_OP_EXECUTE_TIMEOUT_US: 400000000
+        PTO2_STREAM_SYNC_TIMEOUT_MS: 440000
+        PTO2_SCHEDULER_TIMEOUT_MS: 320000
+        SERVING_WORKER_STEP_TIMEOUT: 1800
+        PYPTO_LIB_CHECKOUT: ${{ inputs.pypto-lib-checkout-path }}
+        PYPTO_SERVING_CHECKOUT: ${{ inputs.pypto-serving-checkout-path }}
+      run: |
+        source "$GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="source $GITHUB_WORKSPACE/$PYPTO_LIB_CHECKOUT/activate.sh"
+        run_cmd="$run_cmd && cd $GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd && TASK_DEVICE=\$TASK_DEVICE"
+        run_cmd="$run_cmd PYTHONPATH=$GITHUB_WORKSPACE/$PYPTO_SERVING_CHECKOUT"
+        run_cmd="$run_cmd PYPTO_DSV4_MODEL_DIR=$PYPTO_DSV4_MODEL_DIR"
+        run_cmd="$run_cmd PYPTO_RUNTIME_LOG=$PYPTO_RUNTIME_LOG"
+        run_cmd="$run_cmd PTO2_RING_DEP_POOL=$PTO2_RING_DEP_POOL"
+        run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
+        run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
+        run_cmd="$run_cmd PTO2_OP_EXECUTE_TIMEOUT_US=$PTO2_OP_EXECUTE_TIMEOUT_US"
+        run_cmd="$run_cmd PTO2_STREAM_SYNC_TIMEOUT_MS=$PTO2_STREAM_SYNC_TIMEOUT_MS"
+        run_cmd="$run_cmd PTO2_SCHEDULER_TIMEOUT_MS=$PTO2_SCHEDULER_TIMEOUT_MS"
+        run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
+        run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
+        task-submit --device auto --device-num 8 --ignore-whitelist \
+          --timeout 1200 --max-time 1800 \
           --run "$run_cmd"

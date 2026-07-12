@@ -56,7 +56,8 @@ jobs:
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       files: ${{ steps.check.outputs.files }}
-      run_serving_tests: ${{ steps.check.outputs.run_serving_tests }}
+      run_qwen_serving_tests: ${{ steps.check.outputs.run_qwen_serving_tests }}
+      run_deepseek_serving_tests: ${{ steps.check.outputs.run_deepseek_serving_tests }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,8 +70,9 @@ jobs:
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "files=" >> "$GITHUB_OUTPUT"
-            # serving is a PR-only job (see its `if`), so never arm it here.
-            echo "run_serving_tests=false" >> "$GITHUB_OUTPUT"
+            # Serving is PR-only (see its `if`), so never arm it here.
+            echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
+            echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           CHANGED_FILES=$(git diff --name-only \
@@ -88,13 +90,17 @@ jobs:
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
-          # pypto-serving e2e only exercises Qwen3-14B (tests/test_qwen3_accuracy.py
-          # against the Qwen3-14B checkpoint), so only a qwen3-14b source change can
-          # affect it. CI-infra edits (.github/**) must not trigger this expensive job.
+          # Serving e2e jobs are model-specific and expensive. CI-infra edits
+          # (.github/**) must not trigger them.
           if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3/14b/'; then
-            echo "run_serving_tests=true" >> "$GITHUB_OUTPUT"
+            echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run_serving_tests=false" >> "$GITHUB_OUTPUT"
+            echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4/'; then
+            echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
           fi
           echo "Selected files: $FILES"
 
@@ -301,12 +307,15 @@ jobs:
         working-directory: dist-checkout
         run: rm -rf build_output
 
-  serving-qwen3-14b:
+  serving:
     needs: detect-changes
-    # PR-only: push/dispatch never run the (expensive) qwen3-14b serving e2e.
-    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.run_serving_tests == 'true'
+    # PR-only: run one shared setup, then the guards selected by model changes.
+    if: >-
+      github.event_name == 'pull_request' &&
+      (needs.detect-changes.outputs.run_qwen_serving_tests == 'true' ||
+       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true')
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
@@ -333,12 +342,26 @@ jobs:
           checkout-path: dist-checkout
           build-namespace: serving
 
-      - name: Run pypto-serving e2e model tests
+      - name: Run pypto-serving Qwen3-14B tests
+        if: needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
         uses: ./.github/actions/pypto-serving-tests
         with:
           pypto-lib-checkout-path: dist-checkout
           pypto-serving-checkout-path: serving-checkout
+          model-name: qwen3-14b
           model-dir: /data/l00955553/model/Qwen3-14B
+
+      - name: Run pypto-serving DeepSeek V4 tests
+        if: needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
+        uses: ./.github/actions/pypto-serving-tests
+        with:
+          pypto-lib-checkout-path: dist-checkout
+          pypto-serving-checkout-path: serving-checkout
+          model-name: deepseek-v4
+          model-dir: /data/l00955553/model/dsv4-flash-w8a8
+          pto2-ring-dep-pool: "131072"
+          pto2-ring-task-window: "131072"
+          pto2-ring-heap: "2147483648"
 
       - name: Kill orphaned task-submit tasks
         if: always()
@@ -348,4 +371,4 @@ jobs:
 
       - name: Clean up build artifacts
         if: always()
-        run: rm -rf dist-checkout/build_output serving-checkout/build_output serving-checkout/pypto-lib/build_output
+        run: rm -rf serving-checkout/build_output
