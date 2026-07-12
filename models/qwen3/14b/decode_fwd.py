@@ -626,6 +626,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.spmd(
             NUM_CORES,
             name_hint="fa_fused",
+            # The two in-kernel hard pl.system.syncall barriers need every block co-resident
+            # at the FFTS barrier; without sync_start the runtime may dispatch blocks in
+            # waves and the barrier deadlocks on device (507018).
+            sync_start=True,
             # NOTE: no function-level UP_DOWN split here. Phase-1 (attn) and phase-2
             # (online-softmax) are split PER-REGION instead (pl.split_aiv): phase-1 is a
             # data-parallel UP_DOWN region (the compiler inserts aiv_shard / aic_gather,
