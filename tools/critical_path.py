@@ -44,6 +44,23 @@ from pathlib import Path
 
 INF = float("inf")
 
+# Structured per-task L2 records file. Current runs emit ``l2_swimlane_records.json``;
+# ``l2_perf_records.json`` is the name used in some docs / older runtimes. The first
+# name that exists in a rank dir is used.
+SWIMLANE_RECORD_NAMES = ("l2_swimlane_records.json", "l2_perf_records.json")
+
+
+def _read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _find_records(d: Path) -> Path | None:
+    """Return the structured swimlane-records file in *d*, or None."""
+    for name in SWIMLANE_RECORD_NAMES:
+        if (d / name).exists():
+            return d / name
+    return None
+
 
 # --------------------------------------------------------------------------- #
 # Data loading and per-task graph construction                                #
@@ -71,20 +88,27 @@ def discover_rank_dirs(root: Path) -> list[Path]:
     if root.is_file():
         root = root.parent
     dirs: set[Path] = set()
-    for rec in root.rglob("l2_swimlane_records.json"):
-        d = rec.parent
-        if (d / "deps.json").exists() and (d / "name_map.json").exists():
-            dirs.add(d)
+    for name in SWIMLANE_RECORD_NAMES:
+        for rec in root.rglob(name):
+            d = rec.parent
+            if (d / "deps.json").exists() and (d / "name_map.json").exists():
+                dirs.add(d)
     return sorted(dirs)
 
 
 def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
-    sw = json.loads((rank_dir / "l2_swimlane_records.json").read_text())
-    deps = json.loads((rank_dir / "deps.json").read_text())
-    name_map = json.loads((rank_dir / "name_map.json").read_text())["callable_id_to_name"]
+    rec_file = _find_records(rank_dir)
+    if rec_file is None:
+        raise FileNotFoundError(
+            f"no swimlane records ({' / '.join(SWIMLANE_RECORD_NAMES)}) in {rank_dir}")
+    sw = _read_json(rec_file)
+    deps = _read_json(rank_dir / "deps.json")
+    name_map = _read_json(rank_dir / "name_map.json")["callable_id_to_name"]
 
     freq = int(sw["metadata"]["clock_freq_hz"])
     recs = sw["aicore_tasks"]  # [core, task_id, seq, start_tick, end_tick, callable_id]
+    if not recs:
+        raise RuntimeError(f"no aicore_tasks records in {rec_file} (empty/failed profiling run?)")
 
     start: dict[str, int] = {}
     end: dict[str, int] = {}
@@ -100,7 +124,9 @@ def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
         core_slices[core].append((st, en, t))
 
     dur = {t: end[t] - start[t] for t in start}
-    tinfo = {t["task_id"]: t for t in deps["tasks"]}
+    # task_id / edge endpoints are strings in deps.json but ints in the swimlane
+    # records; normalise everything to str so the joins never silently miss.
+    tinfo = {str(t["task_id"]): t for t in deps["tasks"]}
 
     def name_of(t: str) -> str:
         ks = tinfo.get(t, {}).get("kernel_ids") or []
@@ -120,7 +146,7 @@ def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
     kept = 0
     seen: set[tuple[str, str]] = set()
     for e in deps["edges"]:
-        p, s = e["pred"], e["succ"]
+        p, s = str(e["pred"]), str(e["succ"])
         if p == s or p not in start or s not in start or (p, s) in seen:
             continue
         seen.add((p, s))
@@ -348,9 +374,10 @@ def render_report(results: list[RankResult], top: int) -> str:
 
 
 def _family(name: str) -> str:
-    n = re.sub(r"_\d+$", "", name)
-    n = re.sub(r"_(aic|aiv)$", "", n)
-    return n
+    # Strip an optional trailing block index and/or an aic/aiv suffix in a single
+    # pass, so 'gate_0_aic', 'hc_pre_fused_3_aic' and 'exp_up_mm_2' all fold to
+    # their family ('gate', 'hc_pre_fused', 'exp_up_mm').
+    return re.sub(r"(_\d+)?(_(?:aic|aiv))?$", "", name)
 
 
 def render_summary(results: list[RankResult]) -> str:
@@ -409,7 +436,7 @@ def main(argv: list[str]) -> int:
 
     report = render_report(results, args.top)
     out_path = (root if root.is_dir() else root.parent) / args.report
-    out_path.write_text(report)
+    out_path.write_text(report, encoding="utf-8")
 
     print(f"Analyzed {len(results)} rank(s) under {root}")
     print(render_summary(results))
