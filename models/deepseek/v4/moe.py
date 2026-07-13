@@ -259,8 +259,8 @@ def dispatch(
         # merges the former dispatch_gather (removes the push->gather task boundary).
         # deps=[_meta_tid] on the launch orders the gather's recv_meta reads.
         pl.system.syncall(mode="hard", core_type="aiv_only")
-        if loc_e < N_LOCAL:
-            e = loc_e
+        # Grid-stride over experts so any N_LOCAL is covered even when N_LOCAL > AIV_CORES.
+        for e in pl.range(loc_e, N_LOCAL, AIV_CORES):
             e_base_row = e * RECV_MAX
             b = pl.cast(0, pl.INDEX)
             for src in pl.range(N_RANKS):
@@ -306,8 +306,10 @@ def combine(
     # (FFTS) barrier: only the first N_LOCAL blocks scatter their expert's rows;
     # the remaining blocks just rendezvous at the barrier.
     with pl.spmd(AIV_CORES, sync_start=True, name_hint="combine") as _cscatter_tid:
-        e = pl.tile.get_block_idx()
-        if e < N_LOCAL:
+        block_idx = pl.tile.get_block_idx()
+        # Grid-stride over experts so any N_LOCAL is covered even when
+        # N_LOCAL > AIV_CORES (a block handles experts block_idx, block_idx+AIV_CORES, ...).
+        for e in pl.range(block_idx, N_LOCAL, AIV_CORES):
             e_base_row = e * RECV_MAX
             b = pl.cast(0, pl.INDEX)
             for src in pl.range(N_RANKS):
@@ -331,7 +333,7 @@ def combine(
         # and block 0 can notify peers without racing the data. Replaces the separate
         # pl.at(combine_wait) task and its two runtime task-boundary stalls.
         pl.system.syncall(mode="hard", core_type="aiv_only")
-        if e == 0:
+        if block_idx == 0:
             for peer in pl.range(N_RANKS):
                 if peer != my_rank:
                     pld.system.notify(
