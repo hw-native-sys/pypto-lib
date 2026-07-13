@@ -47,18 +47,28 @@ residual -> post-RMSNorm -> MLP -> residual).
 
 import pypto.language as pl
 
-# --- Qwen3-14B model shape (B fixed to its max value 16, no dynamic dim) ----
-BATCH = 16
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
-HEAD_DIM = 128
-HIDDEN = NUM_HEADS * HEAD_DIM        # 5120
-KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
-INTERMEDIATE = 17408                 # MLP hidden size
+from config import (
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
+)
 
-EPS = 1e-6
-HIDDEN_INV = 1.0 / HIDDEN
-HEAD_DIM_INV = 1.0 / HEAD_DIM
+BATCH = M.batch
+MAX_SEQ = M.max_seq
+NUM_HEADS = M.num_heads
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
+TOTAL_Q_GROUPS = M.total_q_groups
 
 VEC_BF16 = 128  # [BATCH, 128] BF16 = 4 KB (full BF16 column tile)
 VEC_W = 64      # [BATCH, 64]  FP32 = 4 KB (one half of a BF16 tile)
@@ -68,16 +78,9 @@ MM_K = 32       # [32, 64] BF16 = 4 KB weight tile is the binding operand
 HALVES_PER_HEAD = 2  # VEC_W blocks per HEAD_DIM head
 
 # --- Scope 2 (RoPE + paged-cache + flash attention) ------------------------
-HALF_DIM = HEAD_DIM // 2                  # 64
-BLOCK_SIZE = 128                          # paged KV-cache block length
-MAX_SEQ = 4096
-MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE  # 32
-Q_HEAD_BATCH = 5                          # real Q heads per KV head
-Q_HEAD_PAD = 16                           # padded Q rows the cube operates on
-Q_PER_KV = NUM_HEADS // NUM_KV_HEADS      # 5
-TOTAL_Q_GROUPS = NUM_KV_HEADS             # Q_GROUPS == 1 for Qwen3-14B
+BLOCK_SIZE = T.block_size                 # paged KV-cache block length
+MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 NEG_INF = -3.0e38
-ATTN_SCALE = 1.0 / (HEAD_DIM ** 0.5)
 
 # Flash-attention sub-tiling, sized so every QK / SV / oi tile is 4 KB.
 ATT_SEQ = 64   # online-step width; scores [Q_HEAD_PAD, 64] FP32 = 4 KB

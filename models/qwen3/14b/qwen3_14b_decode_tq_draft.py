@@ -29,44 +29,41 @@ from turboquant_kv import (
 from rms_lm_head import rms_lm_head
 
 from config import (
-    ATTN_SCALE,
-    BATCH,
-    BATCH_TILE,
-    BLOCK_SIZE,
-    BLOCK_TABLE_FLAT_DYN,
-    EPS,
-    HALF_DIM,
-    HEAD_DIM,
-    HEAD_DIM_INV,
-    HIDDEN,
-    HIDDEN_INV,
-    INTERMEDIATE,
-    K_CHUNK,
-    KV_HIDDEN,
-    LAYER_DYN,
-    LAYER_HIDDEN_ROWS_DYN,
-    LAYER_INTER_ROWS_DYN,
-    MAX_BLOCKS_PER_SEQ,
-    NUM_HEADS,
-    NUM_KV_HEADS,
-    Q_GROUPS,
-    Q_HEAD_BATCH,
-    Q_HEAD_PAD,
-    Q_OUT_CHUNK,
-    Q_PER_KV,
-    ROPE_SEQ_DYN,
-    TOTAL_Q_GROUPS,
-    USER_BATCH_DYN,
-    VOCAB,
+    QWEN3_14B_DIMS as D,
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
 )
 
 # pyright: reportUndefinedVariable=false
 
 
-from config import (
-    MAX_SEQ,
-    NUM_LAYERS,
-)
+USER_BATCH_DYN = D.user_batch
+BLOCK_TABLE_FLAT_DYN = D.block_table_flat
+ROPE_SEQ_DYN = D.rope_seq
+LAYER_DYN = D.layer
+LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
+LAYER_INTER_ROWS_DYN = D.layer_inter_rows
+
+BATCH = M.batch
+MAX_SEQ = M.max_seq
+NUM_HEADS = M.num_heads
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+VOCAB = M.vocab
+NUM_LAYERS = M.num_layers
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
+Q_GROUPS = M.q_groups
+TOTAL_Q_GROUPS = M.total_q_groups
 
 # TQ-specific constants (not in config.py).
 
@@ -75,7 +72,11 @@ QUANT_CACHE_ROWS_DYN = pl.dynamic("QUANT_CACHE_ROWS_DYN")
 KV_NORMS_OUT_DYN = pl.dynamic("KV_NORMS_OUT_DYN")
 
 # Tiling constants (TQ-specific, differ from config.py values).
+BATCH_TILE = 16
+BLOCK_SIZE = T.block_size
 SCOPE1_K_CHUNK = 512
+K_CHUNK = 256
+Q_OUT_CHUNK = 256
 KV_OUT_CHUNK = 64
 CMP_TILE = 64  # K dequant sub-tile (gather-based, matches turboquant_kv)
 CMP_TILE_SV = 64  # V dequant sub-tile (BLOCK_SIZE=128 = 2 * CMP_TILE_SV)
@@ -86,6 +87,7 @@ N_LEVELS = 16  # int4 -> 16 levels
 
 
 # Derived constants.
+MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 MAX_CTX_BLOCKS = MAX_BLOCKS_PER_SEQ
 SCOPE1_HIDDEN_BLOCKS = HIDDEN // SCOPE1_K_CHUNK
 HIDDEN_BLOCKS = HIDDEN // K_CHUNK
@@ -1304,4 +1306,3 @@ if __name__ == "__main__":
 
 __all__ = ["decode_fwd_tq", "build_tensor_specs", "golden_decode_fwd_tq",
            "golden_decode_fwd_fp", "make_pass_rate_compare"]
-

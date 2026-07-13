@@ -22,31 +22,9 @@ Structurally identical to prefill_fwd.py except:
 import pypto.language as pl
 
 from config import (
-    ATTN_SCALE,
-    BATCH,
-    BATCH_TILE,
-    BLOCK_TABLE_FLAT_DYN,
-    EPS,
-    HALF_DIM,
-    HEAD_DIM,
-    HEAD_DIM_INV,
-    HIDDEN,
-    HIDDEN_INV,
-    INTERMEDIATE,
-    KV_HIDDEN,
-    LAYER_DYN,
-    LAYER_HIDDEN_ROWS_DYN,
-    LAYER_INTER_ROWS_DYN,
-    LM_HEAD_K_CHUNK,
-    NUM_HEADS,
-    NUM_KV_HEADS,
-    NUM_LAYERS,
-    Q_GROUPS,
-    Q_PER_KV,
-    TOTAL_Q_GROUPS,
-    USER_BATCH_DYN,
-    VOCAB,
-    VOCAB_CHUNK,
+    QWEN3_14B_DIMS as D,
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
 )
 from rms_lm_head import rms_lm_head
 from turboquant_kv import (
@@ -58,9 +36,34 @@ from turboquant_kv import (
 # ---------------------------------------------------------------------------
 # Dynamic dims (prefill-specific)
 # ---------------------------------------------------------------------------
+USER_BATCH_DYN = D.user_batch
+BLOCK_TABLE_FLAT_DYN = D.block_table_flat
+LAYER_DYN = D.layer
+LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
+LAYER_INTER_ROWS_DYN = D.layer_inter_rows
 PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
 QUANT_CACHE_ROWS_DYN = pl.dynamic("QUANT_CACHE_ROWS_DYN")
 LAYER_ROT_ROWS_DYN = pl.dynamic("LAYER_ROT_ROWS_DYN")
+
+BATCH = M.batch
+NUM_HEADS = M.num_heads
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+VOCAB = M.vocab
+NUM_LAYERS = M.num_layers
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
+Q_GROUPS = M.q_groups
+TOTAL_Q_GROUPS = M.total_q_groups
 
 # ---------------------------------------------------------------------------
 # TQ constants
@@ -72,20 +75,21 @@ N_LEVELS = 16  # int4 -> 16 levels
 # Prefill-specific tiling constants (local, may differ from config.py)
 # ---------------------------------------------------------------------------
 MAX_SEQ = 128
+BATCH_TILE = 16
 K_CHUNK = 128
 Q_OUT_CHUNK = 64
 KV_OUT_CHUNK = 64
 TOK_TILE = 16
-Q_HEAD_BATCH = 5  # Q heads per attention group
+SEQ_TILE = T.seq_tile
+BLOCK_SIZE = T.block_size
 Q_HEAD_BATCH_PAD = 16  # padded to 32-byte alignment (8 * 4 = 32)
-Q_HEAD_PAD = 16  # padded Q rows for cube alignment
-SEQ_TILE = 128  # sequence tile for attention
 CMP_TILE = 64  # Smaller tile for fused dequant to fit A2A3 memory limits
 CMP_TILE_SV = 64  # Even smaller tile for SV fused dequant (Vec buffer constraint)
 CMP_CHUNK = 32  # Gather sub-tile for dequant (32 rows * 1B = 32-byte aligned), matches decode
 SB_BATCH = 128
-BLOCK_SIZE = SEQ_TILE
 MLP_OUT_CHUNK = 128
+LM_HEAD_K_CHUNK = 128
+VOCAB_CHUNK = 64
 
 HIDDEN_BLOCKS = HIDDEN // K_CHUNK
 Q_OUT_BLOCKS = HIDDEN // Q_OUT_CHUNK
@@ -1362,4 +1366,3 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
-

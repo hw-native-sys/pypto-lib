@@ -12,16 +12,21 @@ from __future__ import annotations
 
 import pypto.language as pl
 
-from config import BATCH, REAL_VOCAB, VOCAB
+from config import QWEN3_14B as M
+from config import QWEN3_14B_TILING as T
+
+BATCH = M.batch
+VOCAB = M.vocab
+REAL_VOCAB = M.real_vocab
+SAMPLED_IDS_PAD = M.sampled_ids_pad
 
 
-VOCAB_CHUNK = 512
-CHUNK_PAD = 512
+VOCAB_CHUNK = T.vocab_chunk
+CHUNK_PAD = T.vocab_chunk
 NUM_VOCAB_CHUNKS = VOCAB // VOCAB_CHUNK
 REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // VOCAB_CHUNK
 REAL_VOCAB_TAIL = REAL_VOCAB % VOCAB_CHUNK
 REAL_NUM_VOCAB_CHUNKS = REAL_NUM_FULL_VOCAB_CHUNKS + (1 if REAL_VOCAB_TAIL != 0 else 0)
-SAMPLED_IDS_PAD = 8
 TOPK = 16
 
 assert VOCAB % VOCAB_CHUNK == 0

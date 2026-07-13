@@ -13,15 +13,20 @@
 import pypto.language as pl
 
 from config import (
-    BATCH,
-    BATCH_TILE,
-    EPS,
-    FINAL_RMS_K_CHUNK,
-    HIDDEN,
-    HIDDEN_INV,
-    USER_BATCH_DYN,
-    VOCAB,
+    QWEN3_14B_DIMS as D,
+    QWEN3_14B as M,
 )
+
+USER_BATCH_DYN = D.user_batch
+
+BATCH = M.batch
+HIDDEN = M.hidden
+VOCAB = M.vocab
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+
+BATCH_TILE = 16
+FINAL_RMS_K_CHUNK = 128
 
 # Local overrides — config defaults (64/128) made cube tasks too small,
 # leaving cube cores at ~45% utilisation behind dispatch bubbles. Wider

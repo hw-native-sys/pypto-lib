@@ -12,31 +12,31 @@ import os
 
 import pypto.language as pl
 
-from config import (
-    BATCH,
-    EPS,
-    HALF_DIM,
-    HEAD_DIM,
-    HEAD_DIM_INV,
-    HIDDEN,
-    HIDDEN_INV,
-    INT8_AMAX_EPS,
-    INT8_SCALE_MAX,
-    INTERMEDIATE,
-    KV_HIDDEN,
-    MAX_SEQ as MODEL_MAX_SEQ,
-    NUM_KV_HEADS,
-    NUM_LAYERS,
-    Q_PER_KV,
-)
+from config import QWEN3_14B as M
+from config import QWEN3_14B_TILING as T
 from rms_lm_head import rms_lm_head  # LM head for the fused multi-layer decode_fwd
 
-MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", str(MODEL_MAX_SEQ)))
-ACTIVE_BATCH = BATCH
-ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
+BATCH = M.batch
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+NUM_LAYERS = M.num_layers
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
+INT8_SCALE_MAX = M.int8_scale_max
+INT8_AMAX_EPS = M.int8_amax_eps
 
-Q_HEAD_BATCH = Q_PER_KV
-Q_HEAD_PAD = ((Q_HEAD_BATCH + 15) // 16) * 16
+MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", str(M.max_seq)))
+ACTIVE_BATCH = BATCH
+
 RMSNORM_K_CHUNK = 256
 XG_BLOCKS = 5
 TN = 256
@@ -49,7 +49,7 @@ QKV_OK = 1
 QKV_K_SLICE = HIDDEN // QKV_OK
 QKV_K_CHUNKS = QKV_K_SLICE // TK
 
-BLOCK_SIZE = 128
+BLOCK_SIZE = T.block_size
 ATTN_TILE = 64
 PAGE_ATTN_PARTS = BLOCK_SIZE // ATTN_TILE
 MAX_CTX_BLOCKS = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE

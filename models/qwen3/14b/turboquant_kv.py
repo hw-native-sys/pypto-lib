@@ -23,12 +23,15 @@ import math as _math
 import pypto.language as pl
 
 from config import (
-    EPS,
-    HALF_DIM,
-    HEAD_DIM,
-    KV_HIDDEN,
-    NUM_KV_HEADS,
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
 )
+
+EPS = M.eps
+HEAD_DIM = M.head_dim
+HALF_DIM = M.half_dim
+KV_HIDDEN = M.kv_hidden
+NUM_KV_HEADS = M.num_kv_heads
 
 # ---------------------------------------------------------------------------
 # TQ constants
@@ -39,7 +42,7 @@ N_LEVELS = 16  # int4 -> 16 levels
 # Prefill-specific tiling
 # ---------------------------------------------------------------------------
 TOK_TILE = 16  # Token block size for prefill
-SEQ_TILE = 128  # Sequence tile for attention (used by QJL codebook gather)
+SEQ_TILE = T.seq_tile  # Sequence tile for attention (used by QJL codebook gather)
 CMP_TILE = 64  # Tile for K fused dequant (reduced for scope-separated dequant+matmul)
 CMP_TILE_SV = 64  # Smaller tile for V fused dequant (Vec buffer constraint)
 CMP_CHUNK = 32  # Sub-chunk for gather: 32 rows * 1B (UINT8) = 32-byte aligned
@@ -382,5 +385,3 @@ def turboquant_kv_quantize(
                     pl.UINT8, mode="trunc",
                 )
                 quant_v_temp = pl.assemble(quant_v_temp, v_packed_u8, [0, ki * HALF_DIM])
-
-

@@ -92,41 +92,50 @@ import torch
 from pypto.backend import BackendType, set_backend_type
 from pypto.runtime import RunConfig
 
-from config import KV_CACHE_ROWS_DYN, REAL_VOCAB, VOCAB  # vocab size for the fused decode_fwd LM head / logits
+from config import (
+    QWEN3_14B_DIMS as D,
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
+)  # vocab size for the fused decode_fwd LM head / logits
 from rms_lm_head import rms_lm_head_fp32  # LM head for the fused multi-layer decode_fwd
+
+KV_CACHE_ROWS_DYN = D.kv_cache_rows
+
+BATCH = M.batch
+NUM_HEADS = M.num_heads
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+VOCAB = M.vocab
+REAL_VOCAB = M.real_vocab
+NUM_LAYERS = M.num_layers
+SAMPLED_IDS_PAD = M.sampled_ids_pad
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Functional config — model architecture + workload.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Model architecture (Qwen3-14B, fixed by the checkpoint) ──
-NUM_HEADS = 40
-NUM_KV_HEADS = 8
-HEAD_DIM = 128
-INTERMEDIATE = 17408
 # MAX_SEQ is env-overridable for the e2e generate harness: it sizes the standalone
 # paged KV pool (CACHE_ROWS) and the RoPE tables, so a 512-token run can use a much
 # smaller pool than the 4096 micro-benchmark default (less KV memory).
-MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", "4096"))
-EPS = 1e-6  # RMSNorm epsilon
-
-# ── Workload (decode batch) ──
-BATCH = 16
+MAX_SEQ = int(os.environ.get("PTO2_MANUAL_MAX_SEQ", str(M.max_seq)))
 
 # ── Derived shapes — recomputed from the above, don't edit ──
-HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
-KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
-Q_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 5 (GQA ratio)
-HALF_DIM = HEAD_DIM // 2  # 64 (RoPE rotates lo/hi halves)
-ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
-HIDDEN_INV = 1.0 / HIDDEN
-HEAD_DIM_INV = 1.0 / HEAD_DIM  # per-head QK-norm RMSNorm denominator
 
 EMBED_HIDDEN_CHUNK = 256
-SAMPLE_VOCAB_CHUNK = 512
-SAMPLE_CHUNK_PAD = 512
+SAMPLE_VOCAB_CHUNK = T.vocab_chunk
+SAMPLE_CHUNK_PAD = T.vocab_chunk
 SAMPLE_TOPK = 16
-SAMPLED_IDS_PAD = 8
 SAMPLE_NUM_VOCAB_CHUNKS = VOCAB // SAMPLE_VOCAB_CHUNK
 SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // SAMPLE_VOCAB_CHUNK
 SAMPLE_REAL_VOCAB_TAIL = REAL_VOCAB % SAMPLE_VOCAB_CHUNK
@@ -138,8 +147,6 @@ assert SAMPLE_NUM_VOCAB_CHUNKS <= SAMPLE_CHUNK_PAD
 assert REAL_VOCAB <= VOCAB
 
 # Attention head grouping. Q_HEAD_BATCH = Q_PER_KV (one attn lane per KV head).
-Q_HEAD_BATCH = Q_PER_KV  # 5: Q heads bundled per attention task
-Q_HEAD_PAD = ((Q_HEAD_BATCH + 15) // 16) * 16  # 16: rounded up to matmul L0 inner-dim multiple of 16
 # Real-vs-padded handling for the fused-attn scratch: tiles stay PHYSICALLY
 # Q_HEAD_PAD (16) rows — the minimal cube M and a 32B-aligned size for the
 # col-major cur_mi/cur_li [.,1] FP32 tiles — while set_validshape marks only the
@@ -182,20 +189,20 @@ QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
 # ── Scope 2 · grouped-query attention (fused, PAGED) ──
-# SEQ_TILE = seq length per KV block. PINNED to the serving paged page_size (128):
+# SEQ_TILE = seq length per KV block. The serving KV-cache page_size must match
+# this kernel block_size:
 # decode reads KV from the PAGED pool via block_table, so one logical block must
-# map to exactly one physical page — i.e. SEQ_TILE == page_size — or a block would
-# straddle two pages whose physical ids are unrelated. prefill_fwd uses the same
-# 128 page; 128 is also the known-good L0B double-buffer cap. BLOCK_SIZE is an
+# map to exactly one physical page, or a block would straddle two pages whose
+# physical ids are unrelated. prefill_fwd uses the same tiling. BLOCK_SIZE is an
 # alias used by the paged cache-row arithmetic.
-SEQ_TILE = 128
-BLOCK_SIZE = SEQ_TILE  # paged page size (== serving runtime.page_size)
+SEQ_TILE = T.seq_tile
+BLOCK_SIZE = T.block_size
 MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # logical blocks per seq (32 @ 4096)
 # Worst-case physical page count for the standalone golden/smoke pool (one band
 # per (batch, block)); the kernel itself reads the pool size from k_cache's dynamic
 # dim, so this only sizes the test fixtures.
-MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
-NUM_PAGES = BATCH * MAX_BLOCKS_PER_SEQ
+DECODE_MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
+NUM_PAGES = BATCH * DECODE_MAX_BLOCKS_PER_SEQ
 CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE  # paged k_cache / v_cache rows (one layer)
 
 # ── Scope 2 · KV-block split (flash-decoding) for ragged load balance ──
@@ -1210,7 +1217,6 @@ def _greedy_sample_inline(
     return sampled_ids
 
 
-NUM_LAYERS = 40  # full Qwen3-14B depth, for the fused decode_fwd loop
 _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
 
 
@@ -1454,14 +1460,14 @@ def load_inputs(data_in_dir: Path) -> list[torch.Tensor]:
 
 def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Identity paging for the standalone harness: batch b's logical blocks map to
-    physical pages [b*MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
+    physical pages [b*DECODE_MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
     token's (pos=seq_len-1) physical row. Mirrors the serving runner's layout."""
-    block_table = torch.arange(BATCH * MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    block_table = torch.arange(BATCH * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
     slot_mapping = torch.empty(BATCH, dtype=torch.int32)
     for b in range(BATCH):
         pos = int(seq_lens[b].item()) - 1
         logical_block = pos // BLOCK_SIZE
-        phys_page = b * MAX_BLOCKS_PER_SEQ + logical_block
+        phys_page = b * DECODE_MAX_BLOCKS_PER_SEQ + logical_block
         slot_mapping[b] = phys_page * BLOCK_SIZE + (pos % BLOCK_SIZE)
     return block_table, slot_mapping
 
@@ -1648,7 +1654,7 @@ def golden_decode_layer(values: dict) -> None:
             k_lane = torch.empty(slen, HEAD_DIM)
             v_lane = torch.empty(slen, HEAD_DIM)
             for sb in range(n_blocks):
-                pbid = int(block_table[b * MAX_BLOCKS_PER_SEQ + sb].item())
+                pbid = int(block_table[b * DECODE_MAX_BLOCKS_PER_SEQ + sb].item())
                 row = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
                 lo = sb * BLOCK_SIZE
                 blk = min(BLOCK_SIZE, slen - lo)

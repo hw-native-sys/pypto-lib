@@ -37,44 +37,46 @@ already handles intra-batch sequence-length variation.
 import pypto.language as pl
 
 from config import (
-    ATTN_SCALE,
-    BATCH,
-    BATCH_TILE,
-    BLOCK_TABLE_FLAT_DYN,
-    EPS,
-    HALF_DIM,
-    HEAD_DIM,
-    HEAD_DIM_INV,
-    HIDDEN,
-    HIDDEN_INV,
-    INTERMEDIATE,
-    KV_CACHE_ROWS_DYN,
-    KV_HIDDEN,
-    LAYER_DYN,
-    LAYER_HIDDEN_ROWS_DYN,
-    LAYER_INTER_ROWS_DYN,
-    LM_HEAD_K_CHUNK,
-    MAX_SEQ as MODEL_MAX_SEQ,
-    NUM_HEADS,
-    NUM_KV_HEADS,
-    NUM_LAYERS,
-    Q_GROUPS,
-    Q_HEAD_BATCH,
-    Q_HEAD_PAD,
-    Q_PER_KV,
-    TOTAL_Q_GROUPS,
-    USER_BATCH_DYN,
-    VOCAB,
-    VOCAB_CHUNK,
+    QWEN3_14B_DIMS as D,
+    QWEN3_14B_TILING as T,
+    QWEN3_14B as M,
 )
 from rms_lm_head import rms_lm_head
 
+USER_BATCH_DYN = D.user_batch
+KV_CACHE_ROWS_DYN = D.kv_cache_rows
+BLOCK_TABLE_FLAT_DYN = D.block_table_flat
+LAYER_DYN = D.layer
+LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
+LAYER_INTER_ROWS_DYN = D.layer_inter_rows
 PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
+
+BATCH = M.batch
+MODEL_MAX_SEQ = M.max_seq
+NUM_HEADS = M.num_heads
+NUM_KV_HEADS = M.num_kv_heads
+HEAD_DIM = M.head_dim
+HIDDEN = M.hidden
+INTERMEDIATE = M.intermediate
+KV_HIDDEN = M.kv_hidden
+VOCAB = M.vocab
+NUM_LAYERS = M.num_layers
+EPS = M.eps
+HIDDEN_INV = M.hidden_inv
+HEAD_DIM_INV = M.head_dim_inv
+ATTN_SCALE = M.attn_scale
+HALF_DIM = M.half_dim
+Q_PER_KV = M.q_per_kv
+Q_HEAD_BATCH = M.q_head_batch
+Q_HEAD_PAD = M.q_head_pad
+Q_GROUPS = M.q_groups
+TOTAL_Q_GROUPS = M.total_q_groups
 
 # Single-layer prefill constants. Keep these local because config.py is shared
 # with the decode kernels and uses decode-tuned tiling constants.
 MAX_SEQ = MODEL_MAX_SEQ
 DEFAULT_TEST_MAX_SEQ = 128
+BATCH_TILE = 16
 # Cube K/N tiles sized to fill the 512B L2 cache line on every GM->L1 (MTE2)
 # load: bf16 => 256 elems * 2B = 512B. Below this the MTE2 DMA under-fills the
 # line (128 elems = 256B -> 2x over-fetch, 64 elems = 128B -> 4x), which made the
@@ -86,6 +88,8 @@ K_CHUNK = 256
 Q_OUT_CHUNK = 256
 KV_OUT_CHUNK = 256
 TOK_TILE = 64
+SEQ_TILE = T.seq_tile
+BLOCK_SIZE = T.block_size
 ROPE_SPMD_BLOCKS = 32
 ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
@@ -105,10 +109,10 @@ ATTN_PHASE_ACC_STAT_ROWS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GR
 ATTN_PHASE_FINALIZE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GROUPS
 QKPV_TOK_BATCH = 4
 QKPV_BATCH_ROWS = QKPV_TOK_BATCH * Q_HEAD_PAD
-SEQ_TILE = 128
 SB_BATCH = 64
-BLOCK_SIZE = SEQ_TILE
 MLP_OUT_CHUNK = 256  # 512B cache line: gate/up weight-N inner + down_proj activation inner
+LM_HEAD_K_CHUNK = 128
+VOCAB_CHUNK = 64
 DOWN_K_PARTS = 3
 HIDDEN_BLOCKS = HIDDEN // K_CHUNK
 Q_OUT_BLOCKS = HIDDEN // Q_OUT_CHUNK
