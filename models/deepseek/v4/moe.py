@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
+# ci: no-dep-gen  # CI marker: dispatch/combine full-occupancy pl.system.syncall (hard) -> dep_gen (DFX) trips 507018 (see hc_pre / pypto#1931)
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
 size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
 
@@ -62,6 +63,8 @@ N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
 N_LOCAL = N_EXPERTS_GLOBAL // N_RANKS
 N_ROUTES = T * TOPK
+# Full-occupancy AIV block count for the hard-syncall barriers (a2a3: 48 AIV).
+AIV_CORES = 48
 
 # recv_x/recv_aux laid out [expert, source, slot], flattened to
 # [N_LOCAL * RECV_MAX, D]. Lane (e, src, slot) flat row = e * RECV_MAX +
@@ -180,7 +183,13 @@ def dispatch(
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count, so the
     # padded lane layout the gather compacts is identical to the single-block push.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push") as _push_tid:
+    # Full-occupancy AIV launch so the folded dispatch_wait can use a fast hard
+    # (FFTS) barrier. Blocks with loc_e >= N_LOCAL match no expert (le != loc_e),
+    # so their push loop is naturally empty -- they only rendezvous at the barrier.
+    # One task for the whole cross-rank token exchange: scatter this rank's tokens
+    # to peers, handshake, then gather+compact the peers' tokens for local experts.
+    with pl.spmd(AIV_CORES, sync_start=True, name_hint="dispatch_exchange",
+                deps=[_meta_tid]) as _exch_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -220,51 +229,53 @@ def dispatch(
                     pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
                     pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
-    # Payload-arrival handshake in its own task, fenced on dispatch_push via deps so
-    # this rank's `data_arrived` notify to a peer fires only after every put to it
-    # has landed; then wait every source so the gather reads land-complete lanes.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid]) as _wait_tid:
-        for dst in pl.range(N_RANKS):
-            if dst != my_rank:
-                pld.system.notify(
-                    target=data_arrived,
-                    peer=dst,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=data_arrived,
-                    offsets=[src, 0],
-                    expected=moe_epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+        # Folded dispatch_wait: a full-occupancy hard (FFTS) barrier rendezvouses all
+        # AIV cores -- each TPUT self-drains (codegen emits a PIPE_ALL barrier after
+        # every put), so once every block reaches here all outgoing puts have landed
+        # and block 0 can notify peers without racing the data. Replaces the separate
+        # pl.at(dispatch_wait) task and its two runtime task-boundary stalls.
+        pl.system.syncall(mode="hard", core_type="aiv_only")
+        if loc_e == 0:
+            for dst in pl.range(N_RANKS):
+                if dst != my_rank:
+                    pld.system.notify(
+                        target=data_arrived,
+                        peer=dst,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=data_arrived,
+                        offsets=[src, 0],
+                        expected=moe_epoch,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-    # Gather lanes into the compact per-expert buffers: one SPMD block per local
-    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (payload landed) -- the
-    # local RAW edge on recv_x only orders after this rank's own outgoing puts, not
-    # the incoming ones. dispatch_meta and dispatch_push stay independent and can
-    # overlap. recv_x_out is this grid's output; expert_routed reads it in auto
-    # scope and orders after it.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid]) as _gather_tid:
-        e = pl.tile.get_block_idx()
-        e_base_row = e * RECV_MAX
-        b = pl.cast(0, pl.INDEX)
-        for src in pl.range(N_RANKS):
-            cnt = pl.read(recv_meta, [src, e])
-            n = pl.cast(cnt, pl.INDEX)
-            src_base_row = e_base_row + src * MAX_PER_SRC
-            for slot in pl.range(n):
-                in_row = src_base_row + slot
-                out_col = b + slot
-                out_row = e_base_row + out_col
-                recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
-                pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
-                pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
-                pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
-            b = b + n
+        # Second barrier: block 0's wait above means every source's payload has
+        # landed; rendezvous so all blocks see it, then gather in this same task --
+        # merges the former dispatch_gather (removes the push->gather task boundary).
+        # deps=[_meta_tid] on the launch orders the gather's recv_meta reads.
+        pl.system.syncall(mode="hard", core_type="aiv_only")
+        if loc_e < N_LOCAL:
+            e = loc_e
+            e_base_row = e * RECV_MAX
+            b = pl.cast(0, pl.INDEX)
+            for src in pl.range(N_RANKS):
+                cnt = pl.read(recv_meta, [src, e])
+                n = pl.cast(cnt, pl.INDEX)
+                src_base_row = e_base_row + src * MAX_PER_SRC
+                for slot in pl.range(n):
+                    in_row = src_base_row + slot
+                    out_col = b + slot
+                    out_row = e_base_row + out_col
+                    recv_x_out_flat[out_row : out_row + 1, :] = recv_x[in_row : in_row + 1, :]
+                    pl.write(recv_scale_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_SCALE]))
+                    pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
+                    pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
+                b = b + n
 
 
 # === Combine =================================================================
@@ -291,56 +302,63 @@ def combine(
     # cumsum table needed (same shape as dispatch_gather). Each route maps to a unique
     # (dst, loc_e) and a unique r_route, so the blocks and their cross-rank puts are
     # write-disjoint.
-    with pl.spmd(N_LOCAL, name_hint="combine") as _cscatter_tid:
+    # Full-occupancy AIV launch so the folded combine_wait can use a fast hard
+    # (FFTS) barrier: only the first N_LOCAL blocks scatter their expert's rows;
+    # the remaining blocks just rendezvous at the barrier.
+    with pl.spmd(AIV_CORES, sync_start=True, name_hint="combine") as _cscatter_tid:
         e = pl.tile.get_block_idx()
-        e_base_row = e * RECV_MAX
-        b = pl.cast(0, pl.INDEX)
-        for src in pl.range(N_RANKS):
-            n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
-            for slot in pl.range(n):
-                out_col = b + slot
-                r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
-                pld.tensor.put(
-                    dst=routed_y_buf,
-                    peer=src,
-                    src=recv_y_flat,
-                    dst_offsets=[r_route, 0],
-                    src_offsets=[e_base_row + out_col, 0],
-                    shape=[1, D],
-                )
-            b = b + n
+        if e < N_LOCAL:
+            e_base_row = e * RECV_MAX
+            b = pl.cast(0, pl.INDEX)
+            for src in pl.range(N_RANKS):
+                n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
+                for slot in pl.range(n):
+                    out_col = b + slot
+                    r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
+                    pld.tensor.put(
+                        dst=routed_y_buf,
+                        peer=src,
+                        src=recv_y_flat,
+                        dst_offsets=[r_route, 0],
+                        src_offsets=[e_base_row + out_col, 0],
+                        shape=[1, D],
+                    )
+                b = b + n
 
-    # Payload-arrival handshake in its own task, fenced on the scatter via deps so a
-    # peer is notified only after every put to it has landed. notify-then-wait is
-    # symmetric across ranks, so it cannot deadlock.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
-        for peer in pl.range(N_RANKS):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=combine_arrived,
-                    peer=peer,
-                    offsets=[my_rank, 0],
-                    value=1,
-                    op=pld.NotifyOp.AtomicAdd,
-                )
-        for src in pl.range(N_RANKS):
-            if src != my_rank:
-                pld.system.wait(
-                    signal=combine_arrived,
-                    offsets=[src, 0],
-                    expected=moe_epoch,
-                    cmp=pld.WaitCmp.Ge,
-                )
+        # Folded combine_wait: a full-occupancy hard (FFTS) barrier rendezvouses all
+        # AIV cores -- each TPUT self-drains (codegen emits a PIPE_ALL barrier after
+        # every put), so once every block reaches here all outgoing puts have landed
+        # and block 0 can notify peers without racing the data. Replaces the separate
+        # pl.at(combine_wait) task and its two runtime task-boundary stalls.
+        pl.system.syncall(mode="hard", core_type="aiv_only")
+        if e == 0:
+            for peer in pl.range(N_RANKS):
+                if peer != my_rank:
+                    pld.system.notify(
+                        target=combine_arrived,
+                        peer=peer,
+                        offsets=[my_rank, 0],
+                        value=1,
+                        op=pld.NotifyOp.AtomicAdd,
+                    )
+            for src in pl.range(N_RANKS):
+                if src != my_rank:
+                    pld.system.wait(
+                        signal=combine_arrived,
+                        offsets=[src, 0],
+                        expected=moe_epoch,
+                        cmp=pld.WaitCmp.Ge,
+                    )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so
-    # every peer's remote write into this rank's routed_y_buf has landed -- the local
-    # RAW edge alone would only order after this rank's own outgoing puts.
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on the combine
+    # scatter task, which now ends only after block 0's fold-in wait returns -- so
+    # every peer's remote write into this rank's routed_y_buf has landed.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+    with pl.spmd(T, name_hint="shared_routed", deps=[_cscatter_tid]) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
@@ -921,7 +939,7 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,
