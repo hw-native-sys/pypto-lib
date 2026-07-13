@@ -340,8 +340,8 @@ def _is_l3(compiled: Any) -> bool:
     return isinstance(compiled, DistributedCompiledProgram)
 
 
-# Fixed benchmark loop sizes — enough rounds to stabilise the median without
-# bloating daily-CI wall time (each round is a sub-ms register-once dispatch).
+# Fixed benchmark loop sizes shared by L2 and L3. L3 differs only in its
+# aggregation: each round contributes the fastest valid rank's Effective time.
 _BENCH_ROUNDS = 100
 _BENCH_WARMUP = 5
 
@@ -405,7 +405,10 @@ def _run_benchmark(
 
 
 def _report_effective(stats: Any) -> None:
-    """Print the ``effective_us (...)`` perf line the daily-CI collector greps.
+    """Print the max-rank ``effective_us (...)`` summary.
+
+    Daily CI consumes this line for L2. For L3 it remains a slowest-rank
+    diagnostic; :func:`_report_l3_fast_effective` prints the collected metric.
 
     The Effective window is the framework's post-graph-build execution window
     (``orch``∪``sched``, the old device-log "Total"), surfaced directly by
@@ -432,6 +435,47 @@ def _report_effective(stats: Any) -> None:
         )
     else:
         print("[RUN]   effective_us unavailable: no orch/sched spans captured", flush=True)
+
+
+def _l3_fast_effective_per_round(stats: Any) -> list[float]:
+    """Return each L3 round's fastest valid rank Effective time.
+
+    A zero means that rank emitted no usable orch/sched timing; reject the whole
+    sample rather than misreading the missing marker as an extremely fast card.
+    The same rule catches a rank absent from a round because ``per_rank`` fills
+    that position with zero.
+    """
+    rank_eff = stats.per_rank("effective")
+    n_rounds = len(stats.rounds_dispatches)
+    if not rank_eff or n_rounds == 0:
+        return []
+    if any(len(series) != n_rounds for series in rank_eff.values()):
+        return []
+
+    fast: list[float] = []
+    for round_idx in range(n_rounds):
+        values = [series[round_idx] for series in rank_eff.values()]
+        if any(value <= 0.0 for value in values):
+            return []
+        fast.append(min(values))
+    return fast
+
+
+def _report_l3_fast_effective(stats: Any) -> None:
+    """Print the fast-rank L3 metric consumed by Daily CI."""
+    fast = _l3_fast_effective_per_round(stats)
+    if not fast:
+        print(
+            "[RUN]   fast_effective_us unavailable: incomplete per-rank orch/sched timing",
+            flush=True,
+        )
+        return
+    print(
+        f"[RUN]   fast_effective_us ({len(fast)} rounds) "
+        f"min={min(fast):.1f} median={statistics.median(fast):.1f} "
+        f"mean={statistics.fmean(fast):.1f} max={max(fast):.1f}",
+        flush=True,
+    )
 
 
 def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
@@ -474,9 +518,8 @@ def _report_l3_per_rank(stats: Any) -> None:
     imbalance the headline (per-round max across ranks) hides. No-op for L2 and the
     flatten fallback (``per_rank`` returns ``{}``).
 
-    The per-rank lines deliberately use an ``eff_us`` token, *not* ``effective_us``,
-    so the daily-CI perf grep (which keys on ``effective_us ... max=``) matches only
-    the single headline line from :func:`_report_effective`, never these.
+    The per-rank lines deliberately use an ``eff_us`` token, so the Daily-CI
+    collector's explicit ``fast_effective_us`` match never selects them.
     """
     rank_eff = stats.per_rank("effective")
     if not rank_eff:
@@ -560,6 +603,7 @@ def _run_benchmark_l3(
     if stats is None:
         return None
     _report_effective(stats)
+    _report_l3_fast_effective(stats)
     _report_l3_per_rank(stats)
     _report_l3_detail(stats, compiled, resident=False)
     return stats
@@ -866,6 +910,7 @@ def _run_l3_resident(
         )
         return None
     _report_effective(stats)
+    _report_l3_fast_effective(stats)
     _report_l3_per_rank(stats)
     _report_l3_detail(stats, compiled, resident=True)
     return stats
