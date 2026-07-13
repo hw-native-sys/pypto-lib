@@ -55,7 +55,11 @@ def rms_lm_head(
 
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="final_rmsnorm",
+            allow_early_resolve=True,
+        ):
             sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
                 final_sq_k0 = kb * FINAL_RMS_K_CHUNK
@@ -96,7 +100,11 @@ def rms_lm_head(
     # so there is no split-K / atomic-add and the output is bit-identical to the
     # fan-out. M tiles (b0) are walked serially inside each block, mirroring the
     # final_rmsnorm loop above (BATCH == BATCH_TILE today, so it runs once).
-    for lm_core in pl.spmd(LM_HEAD_CORES, name_hint="lm_head"):
+    for lm_core in pl.spmd(
+        LM_HEAD_CORES,
+        name_hint="lm_head",
+        allow_early_resolve=True,
+    ):
         for b0 in pl.range(0, BATCH, BATCH_TILE):
             lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
@@ -139,7 +147,11 @@ def rms_lm_head_fp32(
 
     final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="final_rmsnorm",
+            allow_early_resolve=True,
+        ):
             sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
                 final_sq_k0 = kb * FINAL_RMS_K_CHUNK
@@ -167,7 +179,11 @@ def rms_lm_head_fp32(
                     [b0, final_norm_k0],
                 )
 
-    for lm_core in pl.spmd(LM_HEAD_CORES, name_hint="lm_head"):
+    for lm_core in pl.spmd(
+        LM_HEAD_CORES,
+        name_hint="lm_head",
+        allow_early_resolve=True,
+    ):
         for b0 in pl.range(0, BATCH, BATCH_TILE):
             lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
