@@ -46,7 +46,6 @@ ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 
 # tiling
-VALID_TOKEN_TILE = 8
 GATHER_FILL_TILE = 128
 ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
@@ -130,7 +129,6 @@ PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 NEG_INF = -1.0e20
 CACHE_INSERT_BLOCKS = 1
 
-assert T % VALID_TOKEN_TILE == 0
 assert T % 2 == 0
 assert H % 4 == 0
 assert QK_M_TILE % H_TILE == 0
@@ -163,7 +161,7 @@ def sparse_attn_swa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv_flat: pl.Tensor[[ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    swa_lens: pl.Tensor[[T], pl.INT32],
+    sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -176,17 +174,6 @@ def sparse_attn_swa(
     # SWA metadata already lowered each logical window row to a physical cache
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no MTP overlay path here.
-    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
-    for vb_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="swa_valid_bias"):
-        vb = vb_blk * VALID_TOKEN_TILE
-        v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
-        v_col_m = pl.col_expand(pl.full([VALID_TOKEN_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
-        v_lens = pl.cast(pl.reshape(swa_lens[vb : vb + VALID_TOKEN_TILE], [VALID_TOKEN_TILE, 1]), target_type=pl.FP32)
-        v_valid = pl.minimum(
-            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
-            1.0,
-        )
-        sparse_bias[vb : vb + VALID_TOKEN_TILE, 0 : ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
     swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
@@ -498,11 +485,21 @@ def sparse_attn_test(
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
+        v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
+        v_col_m = pl.col_expand(pl.full([T, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
+        v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
+        v_valid = pl.minimum(
+            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
+            1.0,
+        )
+        sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     sparse_attn_swa(
         q,
         ori_kv_flat,
         swa_indices,
-        swa_lens,
+        sparse_bias,
         attn_sink,
         freqs_cos,
         freqs_sin,

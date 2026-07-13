@@ -69,6 +69,7 @@ SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 # tiling
 SPARSE_ROPE_TILE = 16
 SPARSE_ROPE_INTERLEAVE_TILE = 2 * SPARSE_ROPE_TILE
+NEG_INF = -1.0e20
 
 @pl.jit.inline
 def attention_swa(
@@ -132,19 +133,29 @@ def attention_swa(
         q, kv, qr, qr_scale, late_dep,
     )
 
-    # Commit the current decode KV before attention. The SWA attention kernel
-    # reads every visible row through metadata-expanded physical cache indices.
+    # Commit current decode KV and build its additive padding mask in one task.
+    # The SWA attention kernel reads every visible row through metadata-expanded
+    # physical cache indices, so all cache writes must complete before it starts.
     kv_cache_flat = pl.reshape(kv_cache, [B * ORI_MAX_BLOCKS * BLOCK_SIZE, HEAD_DIM])
-    with pl.spmd(T, name_hint="swa_cache_insert"):
-        write_t = pl.tile.get_block_idx()
-        write_row_i64 = pl.read(swa_slot_mapping, [write_t])
-        if write_row_i64 >= 0:
-            write_row = pl.cast(write_row_i64, pl.INDEX)
-            kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+    sparse_bias = pl.create_tensor([T, WIN], dtype=pl.FP32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_cache_insert_valid_bias"):
+        for write_t in pl.range(T):
+            write_row_i64 = pl.read(swa_slot_mapping, [write_t])
+            if write_row_i64 >= 0:
+                write_row = pl.cast(write_row_i64, pl.INDEX)
+                kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
+        v_col = pl.cast(pl.arange(0, [1, WIN], dtype=pl.INT32), target_type=pl.FP32)
+        v_col_m = pl.col_expand(pl.full([T, WIN], dtype=pl.FP32, value=0.0), v_col)
+        v_lens = pl.cast(pl.reshape(swa_lens[0:T], [T, 1]), target_type=pl.FP32)
+        v_valid = pl.minimum(
+            pl.maximum(pl.neg(pl.row_expand_sub(v_col_m, v_lens)), 0.0),
+            1.0,
+        )
+        sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn_swa(
-        q, kv_cache_flat, swa_indices, swa_lens,
+        q, kv_cache_flat, swa_indices, sparse_bias,
         attn_sink, rope_cos_t, rope_sin_t,
         wo_a, wo_b, wo_b_scale, attn_out,
     )
