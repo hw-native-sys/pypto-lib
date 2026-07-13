@@ -145,7 +145,7 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 
 
 @pl.jit.inline
-def _sparse_attn_swa_project(
+def sparse_attn_swa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv_flat: pl.Tensor[[ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -155,11 +155,13 @@ def _sparse_attn_swa_project(
     freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    partials: pl.Tensor[[T_PAD, O_GROUPS * D], pl.INT32],
-    act_scale_dq: pl.Tensor[[O_GROUPS, T], pl.FP32],
-    proj_b_tids: pl.Array[O_GROUPS, pl.TASK_ID],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
-    """Build sparse attention and grouped INT32 output-projection partials."""
+    """Standalone sparse attention with a BF16 projected output."""
+    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
+    act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # SWA metadata already lowered each logical window row to a physical cache
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no MTP overlay path here.
@@ -412,40 +414,6 @@ def _sparse_attn_swa_project(
                             acc_b = pl.matmul_acc(acc_b, b_act, b_weight, b_trans=True)
                     partials = pl.assemble(partials, acc_b, [0, g * D + n0])
             proj_b_tids[g] = pb_tid
-
-
-@pl.jit.inline
-def sparse_attn_swa(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv_flat: pl.Tensor[[ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16],
-    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T, D], pl.BF16],
-):
-    """Standalone sparse attention with a BF16 projected output."""
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)
-    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    _sparse_attn_swa_project(
-        q,
-        ori_kv_flat,
-        swa_indices,
-        sparse_bias,
-        attn_sink,
-        freqs_cos,
-        freqs_sin,
-        wo_a,
-        wo_b,
-        partials,
-        act_scale_dq,
-        proj_b_tids,
-    )
 
     # Consolidate the eight grouped INT32 partials in one vector epilogue. Keep
     # the direct per-group task dependencies so there is no synthetic join task
