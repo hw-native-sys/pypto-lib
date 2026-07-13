@@ -82,13 +82,14 @@ def expert_routed(
         gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
         up_e = up_i32[flat_base : flat_base + RECV_MAX]
 
-        n_rows = pl.read(recv_expert_count, [local_i, 0])
-        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-
+        # Read the valid row count inside each stage so its scalar stays on the
+        # stage's cores instead of feeding every stage from the frame level.
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
+            gate_rows = pl.read(recv_expert_count, [local_i, 0])
+            gate_tiles = (gate_rows + RECV_TILE - 1) // RECV_TILE
             nb_idx = pl.tile.get_block_idx()
             n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for gate_t in pl.range(n_tiles):
+            for gate_t in pl.range(gate_tiles):
                 gate_t0 = gate_t * RECV_TILE
                 for ng in pl.range(MM_GATE_INNER):
                     n0 = n_base + ng * MM_INTER_TILE
@@ -105,9 +106,11 @@ def expert_routed(
                     )
 
         with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
+            up_rows = pl.read(recv_expert_count, [local_i, 0])
+            up_tiles = (up_rows + RECV_TILE - 1) // RECV_TILE
             ub_idx = pl.tile.get_block_idx()
             u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
-            for up_t in pl.range(n_tiles):
+            for up_t in pl.range(up_tiles):
                 up_t0 = up_t * RECV_TILE
                 for ug in pl.range(MM_GATE_INNER):
                     u0 = u_base + ug * MM_INTER_TILE
@@ -133,18 +136,17 @@ def expert_routed(
         gate_slab = gate_i32[e_flat_base : e_flat_base + RECV_MAX]
         up_slab = up_i32[e_flat_base : e_flat_base + RECV_MAX]
 
-        e_rows = pl.read(recv_expert_count, [local_e, 0])
-        e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
-
         h_tile_fp32 = pl.create_tensor([RECV_MAX, MOE_INTER], dtype=pl.FP32)
         h_tile_i8 = pl.create_tensor([RECV_MAX, MOE_INTER], dtype=pl.INT8)
 
         with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
+            act_rows = pl.read(recv_expert_count, [local_e, 0])
+            act_tiles = (act_rows + RECV_TILE - 1) // RECV_TILE
             ab_idx = pl.tile.get_block_idx()
             a_base = ab_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
-            for act_t in pl.range(e_tiles):
+            for act_t in pl.range(act_tiles):
                 act_t0 = act_t * RECV_TILE
-                valid_rows = pl.min(RECV_TILE, e_rows - act_t0)
+                valid_rows = pl.min(RECV_TILE, act_rows - act_t0)
                 for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
                     a0 = a_base + ag * ACT_INTER_TILE
                     gate_2d_i32 = gate_slab[act_t0 : act_t0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
@@ -169,7 +171,9 @@ def expert_routed(
                     h_tile_fp32[act_t0 : act_t0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE] = gated_masked
 
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
-            for quant_t in pl.range(e_tiles):
+            quant_rows = pl.read(recv_expert_count, [local_e, 0])
+            quant_tiles = (quant_rows + RECV_TILE - 1) // RECV_TILE
+            for quant_t in pl.range(quant_tiles):
                 quant_t0 = quant_t * RECV_TILE
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
@@ -194,9 +198,11 @@ def expert_routed(
                     )
 
         with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
+            w2_rows = pl.read(recv_expert_count, [local_e, 0])
+            w2_tiles = (w2_rows + RECV_TILE - 1) // RECV_TILE
             wb_idx = pl.tile.get_block_idx()
             d_base = wb_idx * (W2_INNER * D_OUT_TILE)
-            for w2_t in pl.range(e_tiles):
+            for w2_t in pl.range(w2_tiles):
                 w2_t0 = w2_t * RECV_TILE
                 for dg in pl.range(W2_INNER):
                     d0 = d_base + dg * D_OUT_TILE
