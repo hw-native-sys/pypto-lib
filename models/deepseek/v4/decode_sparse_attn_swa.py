@@ -47,6 +47,8 @@ ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 
 # tiling
 GATHER_FILL_TILE = 128
+GATHER_SPLITS = 4
+GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
 ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
@@ -130,6 +132,7 @@ NEG_INF = -1.0e20
 CACHE_INSERT_BLOCKS = 1
 
 assert T % 2 == 0
+assert WIN % GATHER_SPLITS == 0
 assert H % 4 == 0
 assert QK_M_TILE % H_TILE == 0
 assert H % QK_M_TILE == 0
@@ -177,10 +180,14 @@ def sparse_attn_swa(
 
     swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
     gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(T, name_hint="swa_gather_kv") as gather_tid:
-        g_t = pl.tile.get_block_idx()
+    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv") as gather_tid:
+        g_task = pl.tile.get_block_idx()
+        g_t = g_task // GATHER_SPLITS
+        g_split = g_task - g_t * GATHER_SPLITS
+        g_r0 = g_split * GATHER_ROWS_PER_TASK
         g_base = g_t * WIN
-        for g_r in pl.range(WIN):
+        for g_dr in pl.range(GATHER_ROWS_PER_TASK):
+            g_r = g_r0 + g_dr
             g_slot_i32 = pl.read(swa_indices, [g_t, g_r])
             g_dst = g_base + g_r
             if g_slot_i32 >= 0:
