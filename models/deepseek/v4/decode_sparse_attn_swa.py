@@ -59,8 +59,6 @@ H_TILE = 16
 # (its [64,128] softmax and co-resident QK+PV L0C accumulators overflow Vec/L0C).
 QK_M_TILE = 32
 ATTN_K_TILE = 128
-ROPE_TILE = 16
-ROPE_INTERLEAVE_TILE = 2 * ROPE_TILE
 # proj_a cube K-frag. 256 (not 128) keeps the B-cache-line floor: B is K-contiguous
 # under b_trans, so K*2B(bf16) = 512B == the a2a3 L2 line (K=128 was 256B, half a
 # line -> wasted MTE2 DMA). At 256 the cube's L0A/L0B operand staging hits 100%
@@ -177,7 +175,7 @@ def sparse_attn_swa(
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no MTP overlay path here.
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
-    for vb_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="swa_valid_bias"):
+    for vb_blk in pl.spmd(T // VALID_TOKEN_TILE, name_hint="swa_valid_bias", allow_early_resolve=True):
         vb = vb_blk * VALID_TOKEN_TILE
         v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
         v_col_m = pl.col_expand(pl.full([VALID_TOKEN_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), v_col)
@@ -260,21 +258,18 @@ def sparse_attn_swa(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
         cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+            pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
         cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
         cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
         cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+        cs_cos = pl.cast(freqs_cos[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, 0:HALF_ROPE], target_type=pl.FP32)
+        rope_cos_il[0:T, 0:ROPE_DIM] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, 0:ROPE_DIM] = pl.mul(pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
