@@ -88,7 +88,8 @@ def mtp_projection(
                     hidden_sq_sum,
                     pl.reshape(pl.row_sum(pl.mul(hidden_chunk, hidden_chunk)), [1, T_TILE]),
                 )
-            hidden_inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(hidden_sq_sum, D_INV), EPS)), [T_TILE, 1])
+            hidden_var = pl.add(pl.mul(hidden_sq_sum, D_INV), EPS)
+            hidden_inv = pl.reshape(pl.rsqrt(hidden_var, high_precision=True), [T_TILE, 1])
             hidden_inv_rms = pl.assemble(hidden_inv_rms, hidden_inv, [t0, 0])
             for hc in pl.range(HC_MULT):
                 prev_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
@@ -100,7 +101,8 @@ def mtp_projection(
                         prev_sq_sum,
                         pl.reshape(pl.row_sum(pl.mul(prev_chunk, prev_chunk)), [1, T_TILE]),
                     )
-                prev_inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(prev_sq_sum, D_INV), EPS)), [T_TILE, 1])
+                prev_var = pl.add(pl.mul(prev_sq_sum, D_INV), EPS)
+                prev_inv = pl.reshape(pl.rsqrt(prev_var, high_precision=True), [T_TILE, 1])
                 prev_inv_rms = pl.assemble(prev_inv_rms, pl.reshape(prev_inv, [1, T_TILE]), [hc, t0])
 
     for t0 in pl.parallel(0, t_dim, T_TILE):

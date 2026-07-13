@@ -197,7 +197,7 @@ def qkv_proj_rope(
             qr_g = pl.col_expand_mul(qr_rms_chunk, gamma_rms_chunk)
             qr_g_abs = pl.abs(qr_g)
             qr_amax_g = pl.maximum(qr_amax_g, pl.reshape(pl.row_max(qr_g_abs), [1, T_TILE]))
-        qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS))
+        qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS), high_precision=True)
         qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
         qr_amax_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         qr_amax_normed = pl.mul(qr_inv_rms, qr_amax_g)
@@ -269,7 +269,7 @@ def qkv_proj_rope(
                 q_head_sq_sum = pl.reshape(q_head_sq_row, [1, Q_ROPE_T_TILE])
                 q_head_sq_mean = pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM)
                 q_head_var = pl.add(q_head_sq_mean, EPS)
-                q_head_inv_rms = pl.rsqrt(q_head_var)
+                q_head_inv_rms = pl.rsqrt(q_head_var, high_precision=True)
                 q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [Q_ROPE_T_TILE, 1])
 
                 q_nope_normed = pl.row_expand_mul(q_head_dq[:, 0:NOPE_DIM], q_head_inv_rms_t)
@@ -334,7 +334,7 @@ def qkv_proj_rope(
             kv_sq_col0 = kb * KV_TILE
             kv_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, kv_sq_col0 : kv_sq_col0 + KV_TILE]
             kv_sq_sum = pl.add(kv_sq_sum, pl.reshape(pl.row_sum(pl.mul(kv_chunk, kv_chunk)), [1, KV_RMS_T_TILE]))
-        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS))
+        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS), high_precision=True)
         kv_inv_rms_t = pl.reshape(kv_inv_rms, [KV_RMS_T_TILE, 1])
 
         # NOPE writeback: rms-normalize columns [0:NOPE_DIM) with per-column gamma.

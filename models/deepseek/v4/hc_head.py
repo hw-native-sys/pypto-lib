@@ -96,7 +96,8 @@ def hc_head(
                 sq_sum,
                 pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]),
             )
-        inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), EPS)), [T_TILE, 1])
+        head_var = pl.add(pl.mul(sq_sum, HC_DIM_INV), EPS)
+        inv = pl.reshape(pl.rsqrt(head_var, high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
     # Split-K head projection: zero-seed mixes_raw, then dispatch

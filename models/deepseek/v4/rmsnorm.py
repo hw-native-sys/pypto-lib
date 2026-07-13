@@ -47,7 +47,7 @@ def rms_norm(
             rms_d0 = rms_db * D_TILE
             rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
             x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS))
+        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
