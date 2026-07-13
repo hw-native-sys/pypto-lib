@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Source-level checks for Qwen3 prefill manual runtime-scope nesting.
+"""Source-level checks for Qwen3 prefill cache layout and runtime scopes.
 
 The prefill kernels run under ``@pl.jit(auto_scope=False)`` /
 ``@pl.jit.inline(auto_scope=False)``, so runtime-scope *depth* is exactly the
@@ -77,6 +77,28 @@ def _called_names(node: ast.AST) -> set[str]:
     }
 
 
+def _reshape_targets(function: ast.FunctionDef) -> dict[str, str]:
+    targets = {}
+    for node in ast.walk(function):
+        if (
+            not isinstance(node, ast.Assign)
+            or len(node.targets) != 1
+            or not isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        if not isinstance(node.value, ast.Call):
+            continue
+        call = node.value
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "pl"
+            and call.func.attr == "reshape"
+        ):
+            targets[node.targets[0].id] = ast.unparse(call)
+    return targets
+
+
 def test_prefill_scopes_are_nested_four_deep() -> None:
     tree = _module()
 
@@ -107,3 +129,22 @@ def test_finalize_scope_is_the_only_scope_under_the_token_block() -> None:
         f"expected exactly one nested scope under the token block, found {len(nested_scopes)} "
         "(side-by-side scopes share a ring and do not isolate memory)"
     )
+
+
+def test_prefill_cache_uses_zero_copy_bsnd_views() -> None:
+    tree = _module()
+
+    for function_name in (
+        "_attention_phase_window",
+        "_attention_phase_window_full_single_block",
+        "prefill_layer",
+    ):
+        targets = _reshape_targets(_function(tree, function_name))
+        assert targets["k_cache_bsnd"] == "pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])"
+        assert targets["v_cache_bsnd"] == "pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])"
+
+    source = PREFILL_SOURCE.read_text(encoding="utf-8")
+    assert "(pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE" not in source
+    assert "(cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE" not in source
+    assert "k_cache_bsnd = k_cache.reshape(-1, kv_hidden)" in source
+    assert "v_cache_bsnd = v_cache.reshape(-1, kv_hidden)" in source

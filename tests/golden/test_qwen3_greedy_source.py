@@ -22,7 +22,8 @@ def _source(name: str) -> str:
 def test_fixed_batch_greedy_tie_break_reads_winning_chunk_from_local_slice() -> None:
     source = _source("decode_fwd.py")
 
-    assert "winning_logits = pl.slice(logits" in source
+    assert "winning_logits = pl.slice(" in source
+    assert "[pl.cast(b, pl.INDEX), chunk_base_idx]" in source
     assert "winning_logits, [0, pl.cast(scan_t, pl.INDEX)]" in source
     assert "val = pl.read(logits, [b, token_idx])" not in source
     assert "chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)" in source

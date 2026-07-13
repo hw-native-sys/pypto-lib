@@ -6,82 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-dep-gen  # CI marker: full-occupancy pl.system.syncall -> dep_gen (DFX) trips 507018 (pypto#1931)
-"""Qwen3-14B decode kernel — FP32 inter-layer carry + fused layer output.
+# ci: no-sim    # CI marker: external CCEC attention is A2/A3 onboard only
+# ci: no-dep-gen  # The external attention kernel requires an uninstrumented full mixed-core cohort.
+"""Qwen3-14B decode with FP32 inter-layer carry and direct CANN attention.
 
-The inter-layer hidden (hidden_states / out / cur / post_norm_partial) is carried
-as FP32. The layer output and the next layer's x*gamma are produced together by a
-single fused `dcr_xgamma` task (DOWN_ON-way), emitting `out` (the residual, for
-rms_recip + the residual stream) and `normed_out` (x*gamma, for the next layer's
-QKV) from the same in-register chunk — no GM round-trip for x_gamma.
+The projection, QK-norm, RoPE, output projection, MLP, and dependency topology
+follow the main implementation. The attention stage calls CANN
+FusedInferAttentionScore through ``pl.jit.extern``. Its public ABI matches vLLM:
+Q/O are active TND and the flat paged K/V buffers contain BSND bytes ordered as
+``[page, token, kv_head, dim]``.
 
-Why fuse: inside manual_scope, tensormap / auto-dep registration is suppressed —
-only explicit `deps=[tid]` edges apply — so the old DOWN_ON-way
-`down_cast_residual` PARTIAL writers (to `out_partial`) registered NO tensormap
-edge to the next layer's reader. `out_consolidate` re-emitted `out` as a single
-full-tensor writer in the auto-dep region to restore that edge. Carrying the
-residual-add out of manual_scope directly into that single consolidated writer
-drops both the `out_partial` scratch tensor and the extra copy task: the residual
-add (down_acc_all + post_norm_partial, both FP32) now writes `out` straight, as a
-single full-tensor auto-dep writer gated on the 85 down_proj TaskIds.
-
-FP32 boundaries:
-  * FIRST layer  — `copy_hidden` casts the external BF16 embed input -> FP32 once.
-  * LAST layer   — final RMSNorm consumes the FP32 carry directly, then casts only
-                   the normalized LM-head input to BF16 for the cube matmul.
-`decode_fwd` (single-dispatch, with LM head) and `decode_fwd_layers` (chunked, no
-LM head) share the one FP32-carry `_decode_layer`.
-Numerics differ from the BF16 baseline (more precise — no per-layer BF16 rounding),
-so the saved golden's argmax is the sanity check, not bit-equality.
-
--- original header --
-Qwen3-14B decode — FUSED attn + dense balance + gp-loop pl.pipeline.
-
-Same as the blocklevel variant but expresses the cube/vector software pipeline
-DECLARATIVELY: the per-head ``gp`` loop is a ``pl.pipeline(GP_SIZE, stage=2)``
-instead of a hand-unrolled QK0,QK1 -> softmax0,softmax1 -> SV0,SV1. The compiler
-should overlap iteration i+1's QK (AIC) with iteration i's softmax (AIV), the
-same implicit cube/vector overlap the manual unroll produced — but without the
-user having to write the unrolled program.
-
-
-EXPECTED / INTENT program (the dense block-level load balancer). NOTE: this does
-NOT compile on the current toolchain — the data-dependent ``pl.read`` scalar that
-feeds the store offset (``g_base + sb * Q_HEAD_PAD``) trips a PTO codegen
-limitation (``GetOrCreateTensorView`` / ptoas ``index vs i64``; see
-``KNOWN_ISSUES.md``). It is written to capture the desired structure; the
-affine fallback that DOES compile lives in
-``qwen3_manual_scope_fused_kvsplit_static.py`` (coprime-stride, ~1.9x balance).
-
-Derived from the static file; Scope 1 (RMSNorm + Q/K/V proj) and Scope 3
-(out_proj + MLP) are unchanged. Scope 2 uses BLOCK-LEVEL balancing:
-
-  1. ``fa_work_build`` (AIV prep task) compacts only the REAL seq-blocks of the
-     ragged batch into a gap-free work table — ``fa_work_table[w] = b*MCB + p``
-     for w in ``[0, fa_total)`` (prefix-sum cursor over per-batch block counts),
-     and writes ``fa_total`` (= total real blocks).
-  2. ``fa_fused`` (ONE mixed cube+vec root) grid-strides ``w`` over
-     ``[0, fa_total)`` with ``core = w % NUM_CORES``. Each step decodes one real
-     block ``(b, p)`` from the table and runs QK→softmax→SV. Because the table is
-     dense (no per-batch gaps, only real blocks), the ``fa_total / NUM_CORES``
-     equal-cost blocks distribute as evenly as integer packing allows (≈1.25x of
-     ideal) — independent of per-batch length skew, and free of the
-     index-stride/NUM_CORES resonance the affine layout suffered (8x→2x there;
-     this targets ~1.25x).
-  3. ``online_softmax`` is UNCHANGED — it reduces the per-block partials
-     (``all_oi_tmp`` / ``all_cur_mi`` / ``all_cur_li``) across ALL blocks of a
-     ``(b, kvh)`` lane; auto-dep on the shared scratch serializes it after the
-     contributing ``fa_fused`` blocks.
-
-A2/A3 NOTE: the fused root's C2V/V2C boundary still routes through a GM pipe
-buffer on 910B (``InjectGMPipeBuffer`` is backend-gated), so fusing does NOT
-avoid the AIC↔AIV GM round-trip on A2/A3 — the win here is load balance, not GM
-savings. (On A5 the L2-swimlane path keeps it on-chip.)
-
-Usage::
-
-    python qwen3_manual_scope_fused_kvsplit_blocklevel.py --smoke         # parser/passes
-    python qwen3_manual_scope_fused_kvsplit_blocklevel.py --platform a2a3 # device (expected to fail codegen)
+``decode_fwd`` accepts public batch 1 or 16 while keeping the model pipeline
+internally padded to 16 rows. The inter-layer residual remains FP32; BF16
+conversion occurs only at the external chunk boundaries and model-defined
+compute boundaries.
 """
 
 import argparse
@@ -98,6 +36,16 @@ from config import (
     QWEN3_14B_TILING as T,
     QWEN3_14B as M,
 )  # vocab size for the fused decode_fwd LM head / logits
+from paged_attention_cce import (
+    B1_BLOCK_DIM as PA_B1_BLOCK_DIM,
+    DEFAULT_BLOCK_DIM as PA_DEFAULT_BLOCK_DIM,
+    FLASH_DECODE_MIN_KV_SEQLEN as PA_FLASH_DECODE_MIN_KV_SEQLEN,
+    METADATA_BYTES as PA_METADATA_BYTES,
+    SUPPORTED_PLATFORMS as PA_SUPPORTED_PLATFORMS,
+    WORKSPACE_BYTES as PA_WORKSPACE_BYTES,
+    build_paged_attention_metadata,
+    paged_attention_cce,
+)
 from rms_lm_head import rms_lm_head_fp32  # LM head for the fused multi-layer decode_fwd
 
 KV_CACHE_ROWS_DYN = D.kv_cache_rows
@@ -147,12 +95,8 @@ assert VOCAB % SAMPLE_VOCAB_CHUNK == 0
 assert SAMPLE_NUM_VOCAB_CHUNKS <= SAMPLE_CHUNK_PAD
 assert REAL_VOCAB <= VOCAB
 
-# Attention head grouping. Q_HEAD_BATCH = Q_PER_KV (one attn lane per KV head).
-# Real-vs-padded handling for the fused-attn scratch: tiles stay PHYSICALLY
-# Q_HEAD_PAD (16) rows — the minimal cube M and a 32B-aligned size for the
-# col-major cur_mi/cur_li [.,1] FP32 tiles — while set_validshape marks only the
-# Q_HEAD_BATCH (5) real rows, so each tile.load / tile.store transfers 5 rows from
-# GM (rest auto-padded). Never shrink the tile (that trips alloc_tile alignment).
+# Q_HEAD_PAD keeps the QK-norm reduction column 32-byte aligned. Only the
+# Q_HEAD_BATCH real rows are stored into the compact TND query buffer.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -189,71 +133,14 @@ QKV_OK = 5  # split-K slices (atomic-add)  # 5 -> QKV_K_SLICE=1024 = normed slab
 QKV_K_SLICE = HIDDEN // QKV_OK  # 1280 K per split
 QKV_K_CHUNKS = QKV_K_SLICE // TK  # 5 inner TK chunks per split
 
-# ── Scope 2 · grouped-query attention (fused, PAGED) ──
-# SEQ_TILE = seq length per KV block. The serving KV-cache page_size must match
-# this kernel block_size:
-# decode reads KV from the PAGED pool via block_table, so one logical block must
-# map to exactly one physical page, or a block would straddle two pages whose
-# physical ids are unrelated. prefill_fwd uses the same tiling. BLOCK_SIZE is an
-# alias used by the paged cache-row arithmetic.
+# ── Scope 2 · direct CANN paged attention ──
 SEQ_TILE = T.seq_tile
 BLOCK_SIZE = T.block_size
-MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # logical blocks per seq (32 @ 4096)
-# Worst-case physical page count for the standalone golden/smoke pool (one band
-# per (batch, block)); the kernel itself reads the pool size from k_cache's dynamic
-# dim, so this only sizes the test fixtures.
-DECODE_MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
+assert SEQ_TILE == BLOCK_SIZE
+DECODE_MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 NUM_PAGES = BATCH * DECODE_MAX_BLOCKS_PER_SEQ
-CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE  # paged k_cache / v_cache rows (one layer)
+CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE
 
-# ── Scope 2 · KV-block split (flash-decoding) for ragged load balance ──
-# Each fa_fused lane (a Q-group pair) is split into contiguous KV partitions of
-# TOKENS_PER_SPLIT tokens. Smaller TOKENS_PER_SPLIT = finer load balance for
-# ragged seq_lens, at the cost of more fa_fused tasks
-# (BATCH * (NUM_KV_HEADS // 2) * KV_SPLITS).
-# Dispatch unit = ONE seq block (TOKENS_PER_SPLIT == SEQ_TILE). Every fa_fused
-# work item is then a single SEQ_TILE block (×2 heads) — equal cost regardless of
-# which batch/sequence it belongs to. The grid-stride over FA_WORK items thus
-# spreads equal-cost blocks across cores (cross-batch load balance), instead of
-# assigning whole variable-length partitions per (batch) lane. Larger
-# TOKENS_PER_SPLIT (256/512/…) = coarser units, less loop overhead, more skew.
-TOKENS_PER_SPLIT = SEQ_TILE  # 128: one seq block per work item
-BLOCKS_PER_SPLIT = TOKENS_PER_SPLIT // SEQ_TILE  # 1 SEQ_TILE block per work item
-KV_SPLITS = MAX_CTX_BLOCKS // BLOCKS_PER_SPLIT  # 32 = MAX_CTX_BLOCKS (one item per block)
-
-# GP_SIZE = number of KV heads bundled per fa_fused work item (the `gp` loop).
-# All bundled heads process the SAME block index, so an item stays equal-cost
-# (GP_SIZE head-blocks) and the per-item scalar setup — notably
-# pl.read(seq_lens, ...) — is amortized across GP_SIZE heads. Larger GP_SIZE =
-# fewer work items / fewer seq_lens reads, at a slightly coarser balance
-# granularity. Must divide NUM_KV_HEADS. GP_SIZE = NUM_KV_HEADS (8) bundles all
-# heads → one head-group per (batch, block).
-GP_SIZE = 8
-HEAD_GROUPS = NUM_KV_HEADS // GP_SIZE  # head-groups per (batch, block) (8//8 = 1)
-
-# ── Scope 2 · STATIC SPMD dispatch + BLOCK-LEVEL (dense) load balance ──
-# Launch a FIXED grid of NUM_CORES persistent blocks and grid-stride over the
-# work items inside each kernel (collapses per-item dispatch to ~NUM_CORES).
-#
-# Block-level balancing: the unit of work is ONE real seq-block (×GP_SIZE heads).
-# A separate AIV prep task (`fa_work_build`) compacts only the REAL blocks of the
-# ragged batch into a gap-free work table `fa_work_table[w] = b*MAX_CTX_BLOCKS + p`
-# (one entry per real block, w in [0, fa_total)), and writes `fa_total`. fa_fused
-# then grid-strides w in [0, fa_total) with core = w % NUM_CORES, so the
-# `total_real_blocks / NUM_CORES` equal-cost blocks distribute as evenly as
-# integer packing allows (≈1.25x vs ideal) — independent of per-batch length skew
-# and free of the index-stride/NUM_CORES resonance the affine layout suffered.
-NUM_CORES = 24
-FA_TABLE_CAP = BATCH * MAX_CTX_BLOCKS  # upper bound on real blocks (all seqs full)
-OS_WORK = BATCH * NUM_KV_HEADS  # online_softmax work items (128)
-
-# RoPE GROUPED by HEADS_PER_ROPE heads/grid (re-test @ swimlane level 2).
-HEADS_PER_ROPE = 4
-NUM_ROPE_GROUPS = NUM_KV_HEADS // HEADS_PER_ROPE
-ROPE_GROUP_CORES = 16
-ROPE_GROUP_ITEMS_PER_CORE = (HEADS_PER_ROPE * BATCH) // ROPE_GROUP_CORES
-# RoPE SINGLE spmd grid (fork): all NUM_KV_HEADS*BATCH items in ONE launch,
-# replacing the 2 grouped grids (per-grid scheduler overhead). 32 cores @ 4/core.
 ROPE_CORES = 32
 ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
 assert (NUM_KV_HEADS * BATCH) % ROPE_CORES == 0
@@ -266,18 +153,6 @@ K_TID_BASE = Q_ON * QKV_OK  # 50 — q tiles occupy [0, K_TID_BASE)
 V_TID_BASE = K_TID_BASE + KV_ON * QKV_OK  # 60 — k tiles in [K_TID_BASE, V_TID_BASE)
 RMS_TID_IDX = V_TID_BASE + KV_ON * QKV_OK  # 70 — v tiles in [V_TID_BASE, RMS_TID_IDX); rms_tid last
 ROPE_NDEPS = RMS_TID_IDX + 1  # 71
-WORK_TID_IDX = ROPE_NDEPS  # 71 — fa_work_build (fa_total block count); fa_fused folds rope in as phase 0
-# MLP/out accumulator-seed slots appended to the SAME rope_dep_tids array (deps= must
-# be one comprehension, not a mix). fa_fused gates on the 4 zero-fill seeds so the
-# ~305 downstream atomic-add tasks (out/gate/up/down_proj) can DROP their direct seed
-# edge — ordering stays correct transitively (seed -> fa_fused -> atomic-add), cutting
-# task-graph edges (AICPU dep-processing load). The seeds only dep on the prev layer,
-# so they finish long before fa_fused's rope chain — no critical-path delay.
-DOWN_SEED_IDX = WORK_TID_IDX + 1  # 72
-GATE_SEED_IDX = WORK_TID_IDX + 2  # 73
-UP_SEED_IDX = WORK_TID_IDX + 3  # 74
-OUT_SEED_IDX = WORK_TID_IDX + 4  # 75
-FA_NDEPS = OUT_SEED_IDX + 1  # 76 — rope deps + work_tid + 4 accumulator seeds
 
 # Fused QK-norm reduction alignment. The per-(KV head, batch) sum-of-squares emits a
 # col-major [rows, 1] tile; ptoas requires its column byte size (rows * sizeof(FP32))
@@ -327,13 +202,6 @@ assert HIDDEN % QKV_OK == 0, "OK must divide HIDDEN (K dim)"
 assert QKV_K_SLICE % TK == 0, "TK must divide the split-K slice"
 assert Q_ON == 10 and KV_ON == 2, "expected ON = 10 (Q) + 2 (K) + 2 (V)"
 assert TM == BATCH and N_SUB == 2 and QKV_K_CHUNKS == 4
-assert TOKENS_PER_SPLIT % SEQ_TILE == 0, "TOKENS_PER_SPLIT must be a multiple of SEQ_TILE"
-assert MAX_CTX_BLOCKS % BLOCKS_PER_SPLIT == 0, "BLOCKS_PER_SPLIT must divide MAX_CTX_BLOCKS"
-assert KV_SPLITS * BLOCKS_PER_SPLIT == MAX_CTX_BLOCKS
-assert NUM_KV_HEADS % GP_SIZE == 0, "GP_SIZE must divide NUM_KV_HEADS"
-assert HEAD_GROUPS * GP_SIZE == NUM_KV_HEADS
-assert GP_SIZE == NUM_KV_HEADS, "block-level work table encodes (b, block); needs HEAD_GROUPS == 1"
-assert FA_TABLE_CAP == BATCH * MAX_CTX_BLOCKS
 assert DOWN_TN % MLP_OUT_CHUNK == 0, "DOWN_TN must be a multiple of MLP_OUT_CHUNK"
 assert DOWN_ON * DOWN_TN == HIDDEN
 assert K_SPLITS * DOWN_TN == INTERMEDIATE
@@ -361,13 +229,16 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     wv: pl.Tensor,
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor,
-    block_table: pl.Tensor,
-    slot_mapping: pl.Tensor,
+    seq_lens: pl.Tensor[[D.user_batch], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[D.user_batch], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    pa_metadata: pl.Tensor[[PA_METADATA_BYTES], pl.UINT8],
+    pa_workspace: pl.Tensor[[PA_WORKSPACE_BYTES], pl.UINT8],
+    pa_tiling_tid: pl.Scalar[pl.TASK_ID],
     wo: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
@@ -401,7 +272,6 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     layer_cache_base = layer_idx * layer_cache_rows
     user_batch = pl.tensor.dim(seq_lens, 0)
-    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
@@ -417,7 +287,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # plus rms_tid, collected in ONE TASK_ID array so the spmd deps= can be a single
     # comprehension (the frontend requires deps to be one list/tuple/comprehension, not
     # a concatenation). Layout (offsets module-level): [q tiles | k tiles | v tiles | rms_tid].
-    rope_dep_tids = pl.array.create(FA_NDEPS, pl.TASK_ID)
+    rope_dep_tids = pl.array.create(ROPE_NDEPS, pl.TASK_ID)
     inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
     q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
@@ -441,25 +311,18 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # normed_in is now the `normed_in` PARAM (produced by prev dcr_xgamma / x_gamma_0).
 
     # ── Scope 2 allocations (hoisted before the manual scope). ──
-    all_q_padded = pl.create_tensor([BATCH * NUM_KV_HEADS * Q_HEAD_PAD, HEAD_DIM], dtype=pl.BF16)
+    q_tnd_flat = pl.create_tensor([BATCH * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
     attn_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    all_oi_tmp = pl.create_tensor(
-        [BATCH * NUM_KV_HEADS * MAX_CTX_BLOCKS * Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32
-    )
-    all_cur_mi = pl.create_tensor(
-        [BATCH * NUM_KV_HEADS * MAX_CTX_BLOCKS * Q_HEAD_PAD, 1], dtype=pl.FP32
-    )
-    all_cur_li = pl.create_tensor(
-        [BATCH * NUM_KV_HEADS * MAX_CTX_BLOCKS * Q_HEAD_PAD, 1], dtype=pl.FP32
-    )
-    # Block-level (dense) work list. `fa_work_table[w]` encodes the w-th REAL
-    # seq-block as `b * MAX_CTX_BLOCKS + p`; `fa_total[0]` holds the number of
-    # real blocks. Built once by the `fa_work_build` AIV task, consumed by
-    # fa_fused's grid-stride. Sized to the worst case (every sequence full).
-    fa_work_table = pl.create_tensor([FA_TABLE_CAP, 1], dtype=pl.INT32)
-    fa_total = pl.create_tensor([1, 1], dtype=pl.INT32)
 
     with pl.manual_scope():
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_out_seed") as attn_out_seed_tid:
+            for b in pl.range(user_batch, BATCH):
+                attn_out = pl.assemble(
+                    attn_out,
+                    pl.full([1, HIDDEN], dtype=pl.BF16, value=0.0),
+                    [b, 0],
+                )
+
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="rms_recip",
@@ -562,319 +425,213 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                         v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
                 rope_dep_tids[V_TID_BASE + v_nt * QKV_OK + v_ks] = v_tid
 
-        # ── Scope 2 prep: build the dense block-level work list on an AIV task. ──
-        # Inputs are external (seq_lens) — no deps.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build") as work_tid:
-            cursor = pl.read(seq_lens, [0]) * 0  # scalar 0 (INDEX)
-            for wb in pl.unroll(BATCH):
-                wb_ctx = (pl.read(seq_lens, [wb]) + (SEQ_TILE - 1)) // SEQ_TILE
-                for wp in pl.range(wb_ctx):
-                    # fa_work_table is INT32 (fixed-width for the host↔ptoas ABI; see
-                    # KNOWN_ISSUES "pl.INDEX GM tensor width mismatch") — cast the
-                    # index-typed encoding to match the tensor dtype.
-                    pl.tensor.write(
-                        fa_work_table, [cursor + wp, 0], pl.cast(wb * MAX_CTX_BLOCKS + wp, target_type=pl.INT32)
+        # QK-norm and RoPE retain the main implementation's fused arithmetic,
+        # but run as a standalone producer for the external CANN attention.
+        with pl.spmd(
+            ROPE_CORES,
+            name_hint="rope_qkv",
+            deps=[rope_dep_tids[i] for i in range(ROPE_NDEPS)],
+        ) as rope_tid:
+            rope_core = pl.get_block_idx()
+            q_red_pad = pl.full(
+                [1, (Q_HEAD_PAD - Q_PER_KV) * HEAD_DIM],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            k_red_pad = pl.full(
+                [1, (K_RED_ROWS - 1) * HEAD_DIM],
+                dtype=pl.FP32,
+                value=0.0,
+            )
+            for it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
+                g_idx = rope_core + it * ROPE_CORES
+                if g_idx < NUM_KV_HEADS * user_batch:
+                    ki = g_idx // user_batch
+                    b = g_idx - ki * user_batch
+                    ctx_len = pl.read(seq_lens, [b])
+                    inv_rms_b = pl.read(inv_rms_states, [b, 0])
+                    pos = ctx_len - 1
+                    wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+                    wr_slot_block = wr_slot // BLOCK_SIZE
+                    wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
+                    cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
+                    cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
+                    sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
+                    sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
+
+                    kv_col = ki * HEAD_DIM
+                    k_raw = pl.mul(
+                        pl.reshape(
+                            pl.concat(
+                                k_proj[b : b + 1, kv_col : kv_col + HEAD_DIM],
+                                k_red_pad,
+                            ),
+                            [K_RED_ROWS, HEAD_DIM],
+                        ),
+                        inv_rms_b,
                     )
-                cursor = cursor + wb_ctx
-            pl.tensor.write(fa_total, [0, 0], pl.cast(cursor, target_type=pl.INT32))
+                    k_ss = pl.row_sum(pl.mul(k_raw, k_raw))
+                    k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
+                    k_normed = pl.row_expand_mul(
+                        pl.col_expand_mul(k_raw, k_norm_w),
+                        k_inv,
+                    )
+                    k_full = k_normed[0:1, :]
+                    k_lo = k_full[:, 0:HALF_DIM]
+                    k_hi = k_full[:, HALF_DIM:HEAD_DIM]
+                    rot_lo = pl.sub(
+                        pl.col_expand_mul(k_lo, cos_lo),
+                        pl.col_expand_mul(k_hi, sin_lo),
+                    )
+                    rot_hi = pl.add(
+                        pl.col_expand_mul(k_hi, cos_hi),
+                        pl.col_expand_mul(k_lo, sin_hi),
+                    )
+                    cache_row = (
+                        layer_cache_base
+                        + (wr_slot_block * BLOCK_SIZE + wr_slot_offset) * NUM_KV_HEADS
+                        + ki
+                    )
+                    k_cache = pl.assemble(
+                        k_cache,
+                        pl.cast(pl.concat(rot_lo, rot_hi), target_type=pl.BF16),
+                        [cache_row, 0],
+                    )
+                    v_row_bf16 = pl.cast(
+                        pl.mul(
+                            v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM],
+                            inv_rms_b,
+                        ),
+                        target_type=pl.BF16,
+                    )
+                    v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
 
-        rope_dep_tids[WORK_TID_IDX] = work_tid  # fa_fused (now folds in rope) also waits on fa_work_build
+                    q_base = ki * Q_PER_KV
+                    q_raw = pl.mul(
+                        pl.reshape(
+                            pl.concat(
+                                q_proj[
+                                    b : b + 1,
+                                    q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM,
+                                ],
+                                q_red_pad,
+                            ),
+                            [Q_HEAD_PAD, HEAD_DIM],
+                        ),
+                        inv_rms_b,
+                    )
+                    q_ss = pl.row_sum(pl.mul(q_raw, q_raw))
+                    q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
+                    q_heads = pl.row_expand_mul(
+                        pl.col_expand_mul(q_raw, q_norm_w),
+                        q_inv,
+                    )
+                    q_lo = q_heads[:, 0:HALF_DIM]
+                    q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
+                    q_rot_lo = pl.sub(
+                        pl.col_expand_mul(q_lo, cos_lo),
+                        pl.col_expand_mul(q_hi, sin_lo),
+                    )
+                    q_rot_hi = pl.add(
+                        pl.col_expand_mul(q_hi, cos_hi),
+                        pl.col_expand_mul(q_lo, sin_hi),
+                    )
+                    q_row = b * NUM_HEADS + q_base
+                    q_tnd_flat = pl.assemble(
+                        q_tnd_flat,
+                        pl.cast(
+                            pl.concat(q_rot_lo, q_rot_hi)[0:Q_PER_KV, :],
+                            target_type=pl.BF16,
+                        ),
+                        [q_row, 0],
+                    )
 
-        # ── Scope 3b MLP/out accumulator seeds, HOISTED between rope and attn. ──
-        # gate/up/down/attn_proj accumulators are zeroed for the later split-K atomic-add
-        # tasks; the seeds have NO data dependency on rope or attention, so placing
-        # them here lets the scheduler overlap the (vector) zero-fills with the fa_fused
-        # cube/vector work. Their TASK_IDs are stashed into rope_dep_tids so fa_fused
-        # gates on all 4 seeds — the many atomic-add successors then DROP their direct
-        # seed edge (ordered transitively via fa_fused; see the *_SEED_IDX comment). The
-        # accumulator create_tensor calls move up with them (a seed must follow its
-        # tensor's allocation) — including attn_proj_fp32 (was allocated in Scope-3).
+        # The accumulator seeds are independent of RoPE and can overlap its work.
+        # The attention task carries their completion to the split-K consumers.
         down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
         gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
         attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="down_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="down_seed",
+            deps=[prev_out_tids[_si] for _si in range(DOWN_ON)],
+        ) as seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
                 zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
                 down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
-        rope_dep_tids[DOWN_SEED_IDX] = seed_tid
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as gate_seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="gate_seed",
+            deps=[prev_out_tids[_si] for _si in range(DOWN_ON)],
+        ) as gate_seed_tid:
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
                 gate_acc_all = pl.assemble(gate_acc_all, zero, [0, n0])
-        rope_dep_tids[GATE_SEED_IDX] = gate_seed_tid
 
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as up_seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="up_seed",
+            deps=[prev_out_tids[_si] for _si in range(DOWN_ON)],
+        ) as up_seed_tid:
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
                 zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
                 up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
-        rope_dep_tids[UP_SEED_IDX] = up_seed_tid
 
-        # out_seed zeros attn_proj_fp32 in OUT_TN-wide chunks so out_proj split-K tasks
-        # can atomic-add into it. Hoisted alongside the MLP seeds (was at the head of
-        # the Scope-3 block) so it too funnels through fa_fused.
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="out_seed", deps=[prev_out_tids[_si] for _si in range(DOWN_ON)]) as out_seed_tid:
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="out_seed",
+            deps=[prev_out_tids[_si] for _si in range(DOWN_ON)],
+        ) as out_seed_tid:
             for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
                 out_seed_n0 = nb * OUT_TN
                 out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
-                attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
-        rope_dep_tids[OUT_SEED_IDX] = out_seed_tid
+                attn_proj_fp32 = pl.assemble(
+                    attn_proj_fp32,
+                    out_zero,
+                    [0, out_seed_n0],
+                )
 
-        # fa_fused: ONE mixed cube+vec root (QK -> softmax -> SV), BLOCK-LEVEL dense
-        # static dispatch. Each grid-stride step processes exactly ONE real seq-block
-        # (×GP_SIZE heads), decoded from the dense work table. Because the table holds
-        # only real blocks, core = w % NUM_CORES distributes total_real_blocks evenly
-        # across cores (≈1.25x of ideal), independent of per-batch length skew.
+        q_tnd = pl.reshape(q_tnd_flat, [BATCH, NUM_HEADS, HEAD_DIM])
+        attn_out_tnd = pl.reshape(attn_out, [BATCH, NUM_HEADS, HEAD_DIM])
+        is_b1 = pl.cast(user_batch == 1, pl.INDEX)
+        has_flash_decode_length = pl.cast(
+            pl.tensor.read(seq_lens, [0]) >= PA_FLASH_DECODE_MIN_KV_SEQLEN,
+            pl.INDEX,
+        )
+        attention_core_num = PA_DEFAULT_BLOCK_DIM - is_b1 * (
+            has_flash_decode_length * (PA_DEFAULT_BLOCK_DIM - PA_B1_BLOCK_DIM)
+        )
         with pl.spmd(
-            NUM_CORES,
+            attention_core_num,
             name_hint="fa_fused",
-            # The two in-kernel hard pl.system.syncall barriers need every block co-resident
-            # at the FFTS barrier; without sync_start the runtime may dispatch blocks in
-            # waves and the barrier deadlocks on device (507018).
             sync_start=True,
-            # NOTE: no function-level UP_DOWN split here. Phase-1 (attn) and phase-2
-            # (online-softmax) are split PER-REGION instead (pl.split_aiv): phase-1 is a
-            # data-parallel UP_DOWN region (the compiler inserts aiv_shard / aic_gather,
-            # halving the 16-row softmax across both AIV lanes), phase-2 a task-parallel
-            # NONE region (both lanes, disjoint (b, kvh) work). A function-level pl.split
-            # cannot express this — it would also try to halve phase-2's un-halvable
-            # [5, 128] / [1, 640] reduction tiles ("even split dimension").
-            deps=[rope_dep_tids[i] for i in range(FA_NDEPS)],  # rope deps + work_tid + 4 accumulator seeds (funnel; see *_SEED_IDX)
-        ) as attn_done_tid:  # now also runs phase-2 softmax (writes attn_out) after the syncall
-            fa_core = pl.get_block_idx()
-            # ── Phase 0: QK-norm + RoPE, folded in (was the standalone rope_qkv grid).
-            # Pure in-kernel HBM sync: the syncall below publishes k_cache / v_cache /
-            # all_q_padded to every core before phase-1 reads them, replacing the old
-            # rope->fa dispatch + dep edge (one fewer grid dispatch -> less schedule
-            # overhead). 32 of the 48 AIV lanes run the UNCHANGED per-(KV head, batch)
-            # rope pipeline (identical tiles + pl.pipeline stage=2); lanes 32..47 idle.
-            # The conditional GM write relies on pypto's cross-half phi base-param repoint
-            # (ExpandMixedKernel, branch fix/split-aiv-gm-cross-half-view / PR #1894).
-            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                rope_lane = fa_core * 2 + aiv_id  # 0..47
-                if rope_lane < ROPE_CORES:        # lanes 0..31 carry the 4-item rope pipeline
-                    # Zero column-pads that grow one (KV head, batch) q/k row-slab up to a
-                    # 32B-aligned reduction row count (see K_RED_ROWS comment). Constant per item.
-                    q_red_pad = pl.full([1, (Q_HEAD_PAD - Q_PER_KV) * HEAD_DIM], dtype=pl.FP32, value=0.0)
-                    k_red_pad = pl.full([1, (K_RED_ROWS - 1) * HEAD_DIM], dtype=pl.FP32, value=0.0)
-                    for it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
-                        g_idx = rope_lane * ROPE_ITEMS_PER_CORE + it
-                        ki = g_idx // BATCH
-                        b = g_idx % BATCH
-                        ctx_len = pl.read(seq_lens, [b])
-                        inv_rms_b = pl.read(inv_rms_states, [b, 0])
-                        pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
-                        # Paged write target for this row's current token: slot_mapping[b]
-                        # decomposes into (physical page, in-page offset). Same scheme prefill
-                        # uses; one physical page == one SEQ_TILE/BLOCK_SIZE band of the pool.
-                        wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
-                        wr_slot_block = wr_slot // BLOCK_SIZE
-                        wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
-                        cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
-                        cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
-                        sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
-                        sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
-
-                        kv_col = ki * HEAD_DIM
-                        # FUSED QK-norm (K): read the raw k_proj row, scale by inv_rms[b], apply
-                        # gamma, fold in the per-row qk_inv reciprocal — all in-register — so
-                        # k_full is fully normed without a q/k_proj_norm GM round-trip. inv_rms
-                        # cancels (control experiment): it scales k_raw before BOTH the gamma mul
-                        # and the sum-of-squares, so the recip undoes it. RoPE then just rotates.
-                        # The single real row is column-padded to K_RED_ROWS so the col-major
-                        # sum-of-squares tile is 32B-aligned; the zero rows reduce to 0 (finite
-                        # recip, 0 after gamma) and are dropped — only row 0 (the head) is kept.
-                        k_raw = pl.mul(
-                            pl.reshape(
-                                pl.concat(k_proj[b : b + 1, kv_col : kv_col + HEAD_DIM], k_red_pad),
-                                [K_RED_ROWS, HEAD_DIM],
-                            ),
-                            inv_rms_b,
-                        )
-                        k_ss = pl.row_sum(pl.mul(k_raw, k_raw))
-                        k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-                        k_normed = pl.row_expand_mul(pl.col_expand_mul(k_raw, k_norm_w), k_inv)
-                        k_full = k_normed[0:1, :]
-                        k_lo = k_full[:, 0:HALF_DIM]
-                        k_hi = k_full[:, HALF_DIM:HEAD_DIM]
-                        rot_lo = pl.sub(pl.col_expand_mul(k_lo, cos_lo), pl.col_expand_mul(k_hi, sin_lo))
-                        rot_hi = pl.add(pl.col_expand_mul(k_hi, cos_hi), pl.col_expand_mul(k_lo, sin_hi))
-                        cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
-                        # Coalesce lo|hi into one [1, HEAD_DIM] row -> a single paged k_cache MTE3
-                        # write instead of two half-width ones (the store tail bounds makespan).
-                        rot = pl.concat(rot_lo, rot_hi)
-                        k_cache = pl.assemble(k_cache, pl.cast(rot, target_type=pl.BF16), [cache_row, 0])
-                        v_row_bf16 = pl.cast(
-                            pl.mul(v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM], inv_rms_b),
-                            target_type=pl.BF16,
-                        )
-                        v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
-
-                        q_base = ki * Q_PER_KV
-                        q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
-                        # FUSED QK-norm (Q) + BATCHED heads + free zero-pad. The Q_PER_KV heads of
-                        # this (KV head, batch) are one contiguous q_proj row-slab; column-pad it
-                        # with zeros up to the Q_HEAD_PAD physical rows of all_q_padded and reshape
-                        # to [Q_HEAD_PAD, HEAD_DIM]. Running the QK-norm (inv_rms scale + gamma +
-                        # the per-row qk_inv reciprocal) and RoPE over ALL Q_HEAD_PAD rows then:
-                        #   * keeps the col-major sum-of-squares tile 32B-aligned (Q_HEAD_PAD*4B);
-                        #     a [Q_PER_KV, 1]=20B reduction is not 32B-aligned and ptoas rejects it;
-                        #   * leaves rows Q_PER_KV.. as 0 (0 -> finite recip -> 0 after gamma; RoPE
-                        #     of 0 = 0), so ONE [Q_HEAD_PAD, HEAD_DIM] store replaces the old real +
-                        #     separate q_pad_zero stores.
-                        # qk_inv is a per-row reduction (each head row normed independently);
-                        # cos/sin [1, HALF_DIM] broadcast over rows.
-                        q_raw = pl.mul(
-                            pl.reshape(
-                                pl.concat(
-                                    q_proj[b : b + 1, q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM],
-                                    q_red_pad,
-                                ),
-                                [Q_HEAD_PAD, HEAD_DIM],
-                            ),
-                            inv_rms_b,
-                        )
-                        q_ss = pl.row_sum(pl.mul(q_raw, q_raw))
-                        q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-                        q_heads = pl.row_expand_mul(pl.col_expand_mul(q_raw, q_norm_w), q_inv)
-                        q_lo = q_heads[:, 0:HALF_DIM]
-                        q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
-                        q_rot_lo = pl.sub(pl.col_expand_mul(q_lo, cos_lo), pl.col_expand_mul(q_hi, sin_lo))
-                        q_rot_hi = pl.add(pl.col_expand_mul(q_hi, cos_hi), pl.col_expand_mul(q_lo, sin_hi))
-                        # Coalesce lo|hi -> one [Q_HEAD_PAD, HEAD_DIM] store (real rows + zero pad).
-                        q_rot = pl.concat(q_rot_lo, q_rot_hi)
-                        all_q_padded = pl.assemble(
-                            all_q_padded, pl.cast(q_rot, target_type=pl.BF16), [q_pad_row0, 0]
-                        )
-            pl.system.syncall(core_type="mix")
-            # Read the device-computed block count ON-DEVICE (inside the kernel) so
-            # `fa_total` enters fa_fused as an INPUT and the normal task auto-dep
-            # orders it after the `fa_work_build` producer. Reading it at
-            # orchestration scope instead lowers to a host get_tensor_data that does
-            # NOT wait for the producer (stale ~0 read → empty dispatch; see
-            # KNOWN_ISSUES). This mirrors the existing on-device fa_work_table read.
-            fa_total_blocks = pl.cast(pl.read(fa_total, [0, 0]), target_type=pl.INDEX)
-            # Grid-stride over the dense real-block list: core fa_core owns table
-            # entries fa_core, fa_core+NUM_CORES, … < fa_total_blocks.
-            # Phase-1 attn: cube QK/SV OUTSIDE a PER-HEAD split_aiv region; vector softmax
-            # on the UP_DOWN half via EXPLICIT aiv_shard (C->V, shards the QK Acc tile
-            # directly) + aic_gather (V->C, halves -> full for the SV cube). Region sits
-            # INSIDE the gp pipeline so each head's shard->softmax->gather overlaps cube work.
-            for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
-                fa_enc = pl.cast(pl.read(fa_work_table, [fa_w, 0]), target_type=pl.INDEX)
-                fa_b = fa_enc // MAX_CTX_BLOCKS
-                fa_p = fa_enc % MAX_CTX_BLOCKS
-                fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
-                fa_ctx_len = pl.read(seq_lens, [fa_b])
-                sb = fa_p
-                s0 = sb * SEQ_TILE
-                valid_len = pl.min(SEQ_TILE, fa_ctx_len - s0)
-                fa_pbid = pl.cast(pl.tensor.read(block_table, [fa_b * max_blocks_per_seq + sb]), pl.INDEX)
-
-                for gp in pl.pipeline(GP_SIZE, stage=3):
-                    gi = fa_hg * GP_SIZE + gp
-                    kvh = gi
-                    q_pad_row_g = fa_b * NUM_KV_HEADS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-                    q_padded = all_q_padded[q_pad_row_g : q_pad_row_g + Q_HEAD_PAD, :]
-                    g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-                    cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
-
-                    # QK matmul (cube) — OUTSIDE the split_aiv region.
-                    k_tile = k_cache[cache_row : cache_row + SEQ_TILE, :]
-                    raw_scores = pl.matmul(q_padded, k_tile, b_trans=True, out_dtype=pl.FP32)
-
-                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                        scores_h = pl.aiv_shard(raw_scores)  # tensor-level C->V half
-                        scores_scaled = pl.mul(scores_h, ATTN_SCALE)
-                        scores_valid = pl.set_validshape(scores_scaled, Q_HEAD_BATCH, valid_len)
-                        scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
-                        cur_mi = pl.row_max(scores)
-                        exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                        cur_li = pl.row_sum(exp_scores)
-                        exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                        mi_row = g_base + sb * Q_HEAD_PAD + aiv_id * (Q_HEAD_PAD // 2)
-                        all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [mi_row, 0])
-                        all_cur_li = pl.assemble(all_cur_li, cur_li, [mi_row, 0])
-                        exp_full = pl.aic_gather(exp_scores_bf16)  # tensor-level V->C full
-
-                    v_tile = v_cache[cache_row : cache_row + SEQ_TILE, :]
-                    oi_tmp = pl.matmul(exp_full, v_tile, out_dtype=pl.FP32)
-                    oi_tmp = pl.set_validshape(oi_tmp, Q_HEAD_BATCH, HEAD_DIM)
-                    all_oi_tmp = pl.assemble(all_oi_tmp, oi_tmp, [g_base + sb * Q_HEAD_PAD, 0])
-
-            # ── Phase 2: online-softmax cross-block reduction, FUSED in-kernel ──
-            # The per-block partials (all_oi_tmp / all_cur_mi / all_cur_li) of a
-            # (b, kvh) lane are produced by DIFFERENT cores — the dense work table
-            # spreads a lane's blocks across cores for load balance — so reducing a
-            # lane needs every core's phase-1 writes visible first. A hard cross-core
-            # barrier (pto::SYNCALL) provides exactly that: every participant must
-            # arrive before any proceeds.
-            #
-            # FULL-OCCUPANCY CONTRACT: the hard/FFTS form waits for ALL physical cores
-            # of the participant set. NUM_CORES (24) group blocks == 24 AIC + 48 AIV ==
-            # every 910B core, so the launch is full-occupancy; a partial launch (or a
-            # retune of NUM_CORES off the physical AIC count) leaves cores unreached and
-            # the wait never completes (AICore timeout 507018). core_type="mix" syncs
-            # both the AIC SV output (oi) and the AIV softmax output (mi/li).
-            #
-            # A2/A3 NOTE: partials still transit GM (cross-core data has no on-chip path
-            # on 910B), so this only removes the separate online_softmax dispatch + the
-            # fa->os dep edge — it does NOT save the partials' round-trip (that needs the
-            # A5 L2-resident path).
-            pl.system.syncall(core_type="mix")
-            # Phase-2 online_softmax as a TASK-PARALLEL dual-AIV region. pl.split_aiv
-            # with mode=NONE dispatches BOTH AIV lanes of every group block (no halving,
-            # no aiv_shard / aic_gather): each lane owns disjoint (b, kvh) work items via
-            # os_aiv = fa_core*2 + aiv_id, restoring the pre-fusion 48-way reduction
-            # parallelism (24 group blocks x 2 AIV) that the fused 24-way single-spmd loop
-            # gave up — without UP_DOWN's un-halvable [5,128] / [1,640] reduction tiles.
-            # The hard syncall above fences phase-1 (non-split attn) from phase-2.
-            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-                os_aiv = fa_core * 2 + aiv_id  # 0..47 global AIV-lane id
-                for os_spmd_idx in pl.range(os_aiv, OS_WORK, NUM_CORES * 2):
-                    os_b = os_spmd_idx // NUM_KV_HEADS
-                    os_gi = os_spmd_idx % NUM_KV_HEADS
-                    os_ctx_len = pl.read(seq_lens, [os_b])
-                    os_ctx_blocks = (os_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    os_kvh = os_gi  # Q_GROUPS=1
-                    os_q_base = os_kvh * Q_PER_KV
-                    os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_CTX_BLOCKS * Q_HEAD_PAD
-
-                    # Loop-carried accumulators: full Q_HEAD_PAD (16) rows. They can't be
-                    # valid-shaped because the recurrence (add / maximum) drops valid_shape,
-                    # which would break loop-carry type consistency. Only the per-block GM
-                    # reads below are trimmed to the 5 real rows via pl.slice valid_shape.
-                    oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                    mi = all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                    li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
-                    for sb in pl.pipeline(1, os_ctx_blocks, stage=2):
-                        rec = os_g_base + sb * Q_HEAD_PAD
-                        # Partial load: tile stays Q_HEAD_PAD (16) rows, GM transfer = the 5
-                        # real rows (valid_shape on the slice → tile.load valid_shapes).
-                        oi_tmp_valid = pl.slice(
-                            all_oi_tmp, [Q_HEAD_PAD, HEAD_DIM], [rec, 0], valid_shape=[Q_HEAD_BATCH, HEAD_DIM]
-                        )
-                        online_cur_mi = pl.slice(all_cur_mi, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                        online_cur_li = pl.slice(all_cur_li, [Q_HEAD_PAD, 1], [rec, 0], valid_shape=[Q_HEAD_BATCH, 1])
-                        mi_new = pl.maximum(mi, online_cur_mi)
-                        alpha = pl.exp(pl.sub(mi, mi_new))
-                        beta = pl.exp(pl.sub(online_cur_mi, mi_new))
-                        li = pl.add(pl.mul(alpha, li), pl.mul(beta, online_cur_li))
-                        oi = pl.add(pl.row_expand_mul(oi, alpha), pl.row_expand_mul(oi_tmp_valid, beta))
-                        mi = mi_new
-
-                    ctx = pl.row_expand_div(oi, li)
-                    ctx_valid = ctx[0:Q_HEAD_BATCH, :]
-                    ctx_flat_bf16 = pl.cast(
-                        pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16
-                    )
-                    attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
-
+            deps=[
+                rope_tid,
+                pa_tiling_tid,
+                attn_out_seed_tid,
+                seed_tid,
+                gate_seed_tid,
+                up_seed_tid,
+                out_seed_tid,
+            ],
+        ) as attn_done_tid:
+            attn_out_tnd = paged_attention_cce(
+                q_tnd,
+                k_cache,
+                v_cache,
+                block_table,
+                attn_out_tnd,
+                pa_workspace,
+                pa_metadata,
+                layer_cache_base,
+            )
+        attn_out = pl.reshape(attn_out_tnd, [BATCH, HIDDEN])
         # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all / attn_proj_fp32
         # are created earlier, alongside their hoisted seed tasks between rope and attn.)
         post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # raw residual h1 (add-back); FP32 (was BF16)
@@ -1121,95 +878,101 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
 @pl.jit.inline
 def _token_embed_inline(
-    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Tensor[[D.user_batch, SAMPLED_IDS_PAD], pl.INT32],
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-    for b in pl.spmd(BATCH, name_hint="token_embed"):
-        token_id = pl.read(sampled_ids, [b, 0])
-        token_row = pl.cast(token_id, target_type=pl.INDEX)
-        for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
-            hidden_chunk = pl.slice(embed_weight, [1, EMBED_HIDDEN_CHUNK], [token_row, k0])
-            next_hidden = pl.assemble(next_hidden, hidden_chunk, [b, k0])
+    next_hidden: pl.Tensor[[D.user_batch, HIDDEN], pl.BF16],
+) -> pl.Tensor[[D.user_batch, HIDDEN], pl.BF16]:
+    user_batch = pl.tensor.dim(sampled_ids, 0)
+    for b in pl.parallel(user_batch):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
+            token_id = pl.read(sampled_ids, [b, 0])
+            token_row = pl.cast(token_id, target_type=pl.INDEX)
+            for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                hidden_chunk = pl.slice(embed_weight, [1, EMBED_HIDDEN_CHUNK], [token_row, k0])
+                next_hidden = pl.assemble(next_hidden, hidden_chunk, [b, k0])
     return next_hidden
 
 
 @pl.jit.inline
 def _greedy_sample_inline(
-    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
-    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
-) -> pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]:
-    for b in pl.spmd(BATCH, name_hint="greedy_sample"):
-        idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
-        chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
-        chunk_vals[:, :] = pl.full([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32, value=-3.402823e38)
-        for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
-            c0 = c * SAMPLE_VOCAB_CHUNK
-            local_scores = logits[b : b + 1, c0 : c0 + SAMPLE_VOCAB_CHUNK]
-            if SAMPLE_REAL_VOCAB_TAIL != 0:
-                if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
-                    local_scores_valid = pl.set_validshape(local_scores, 1, SAMPLE_REAL_VOCAB_TAIL)
-                    local_scores_padded = pl.fillpad(local_scores_valid, pad_value=pl.PadValue.min)
-                    sorted_pairs = pl.sort32(local_scores_padded, idx_init)
+    logits: pl.Tensor[[D.user_batch, VOCAB], pl.FP32],
+    sampled_ids: pl.Tensor[[D.user_batch, SAMPLED_IDS_PAD], pl.INT32],
+) -> pl.Tensor[[D.user_batch, SAMPLED_IDS_PAD], pl.INT32]:
+    user_batch = pl.tensor.dim(logits, 0)
+    for b in pl.parallel(user_batch):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_sample"):
+            idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
+            chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
+            chunk_vals[:, :] = pl.full([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32, value=-3.402823e38)
+            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+                c0 = c * SAMPLE_VOCAB_CHUNK
+                local_scores = logits[b : b + 1, c0 : c0 + SAMPLE_VOCAB_CHUNK]
+                if SAMPLE_REAL_VOCAB_TAIL != 0:
+                    if c == SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS:
+                        local_scores_valid = pl.set_validshape(local_scores, 1, SAMPLE_REAL_VOCAB_TAIL)
+                        local_scores_padded = pl.fillpad(local_scores_valid, pad_value=pl.PadValue.min)
+                        sorted_pairs = pl.sort32(local_scores_padded, idx_init)
+                    else:
+                        sorted_pairs = pl.sort32(local_scores, idx_init)
                 else:
                     sorted_pairs = pl.sort32(local_scores, idx_init)
-            else:
-                sorted_pairs = pl.sort32(local_scores, idx_init)
-            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
-            sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
-            top_pairs = sorted_pairs[:, 0 : 2 * SAMPLE_TOPK]
-            top_vals = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-            best_val = pl.read(top_vals, [0, 0])
-            pl.write(chunk_vals, [0, c], best_val)
+                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
+                sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
+                top_pairs = sorted_pairs[:, 0 : 2 * SAMPLE_TOPK]
+                top_vals = pl.gather(top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                best_val = pl.read(top_vals, [0, 0])
+                pl.write(chunk_vals, [0, c], best_val)
 
-        chunk_sorted = pl.sort32(chunk_vals, idx_init)
-        chunk_sorted = pl.mrgsort(chunk_sorted, block_len=64)
-        chunk_sorted = pl.mrgsort(chunk_sorted, block_len=256)
-        chunk_top_pairs = chunk_sorted[:, 0 : 2 * SAMPLE_TOPK]
-        chunk_top_vals = pl.gather(chunk_top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-        best_val = pl.read(chunk_top_vals, [0, 0])
-        chunk_i32 = pl.cast(0, pl.INT32)
-        for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
-            scan_c = (SAMPLE_REAL_NUM_VOCAB_CHUNKS - 1) - c
-            val = pl.read(chunk_vals, [0, scan_c])
-            if val == best_val:
-                chunk_i32 = pl.cast(scan_c, pl.INT32)
+            chunk_sorted = pl.sort32(chunk_vals, idx_init)
+            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=64)
+            chunk_sorted = pl.mrgsort(chunk_sorted, block_len=256)
+            chunk_top_pairs = chunk_sorted[:, 0 : 2 * SAMPLE_TOPK]
+            chunk_top_vals = pl.gather(chunk_top_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+            best_val = pl.read(chunk_top_vals, [0, 0])
+            chunk_i32 = pl.cast(0, pl.INT32)
+            for c in pl.range(SAMPLE_REAL_NUM_VOCAB_CHUNKS):
+                scan_c = (SAMPLE_REAL_NUM_VOCAB_CHUNKS - 1) - c
+                val = pl.read(chunk_vals, [0, scan_c])
+                if val == best_val:
+                    chunk_i32 = pl.cast(scan_c, pl.INT32)
 
-        local_token = pl.cast(0, pl.INT32)
-        chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
-        chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
-        winning_logits = pl.slice(logits, [1, SAMPLE_VOCAB_CHUNK], [pl.cast(b, pl.INDEX), chunk_base_idx])
-        if SAMPLE_REAL_VOCAB_TAIL != 0:
-            if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
-                winning_logits_valid = pl.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
-                winning_logits_padded = pl.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
-                for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                    scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                    val = pl.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
-                    if val == best_val:
-                        local_token = pl.cast(scan_t, pl.INT32)
+            local_token = pl.cast(0, pl.INT32)
+            chunk_base = chunk_i32 * pl.cast(SAMPLE_VOCAB_CHUNK, target_type=pl.INT32)
+            chunk_base_idx = pl.cast(chunk_base, target_type=pl.INDEX)
+            winning_logits = pl.slice(
+                logits,
+                [1, SAMPLE_VOCAB_CHUNK],
+                [pl.cast(b, pl.INDEX), chunk_base_idx],
+            )
+            if SAMPLE_REAL_VOCAB_TAIL != 0:
+                if chunk_i32 == pl.cast(SAMPLE_REAL_NUM_FULL_VOCAB_CHUNKS, target_type=pl.INT32):
+                    winning_logits_valid = pl.set_validshape(winning_logits, 1, SAMPLE_REAL_VOCAB_TAIL)
+                    winning_logits_padded = pl.fillpad(winning_logits_valid, pad_value=pl.PadValue.min)
+                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                        val = pl.read(winning_logits_padded, [0, pl.cast(scan_t, pl.INDEX)])
+                        if val == best_val:
+                            local_token = pl.cast(scan_t, pl.INT32)
+                else:
+                    for t in pl.range(SAMPLE_VOCAB_CHUNK):
+                        scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
+                        val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
+                        if val == best_val:
+                            local_token = pl.cast(scan_t, pl.INT32)
             else:
                 for t in pl.range(SAMPLE_VOCAB_CHUNK):
                     scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
                     val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
                     if val == best_val:
                         local_token = pl.cast(scan_t, pl.INT32)
-        else:
-            for t in pl.range(SAMPLE_VOCAB_CHUNK):
-                scan_t = (SAMPLE_VOCAB_CHUNK - 1) - t
-                val = pl.read(winning_logits, [0, pl.cast(scan_t, pl.INDEX)])
-                if val == best_val:
-                    local_token = pl.cast(scan_t, pl.INT32)
-        token_id = chunk_base + local_token
-        if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
-            token_id = pl.cast(0, pl.INT32)
-        token_out = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
-        token_out[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
-        pl.write(token_out, [0, 0], token_id)
-        sampled_ids[b : b + 1, :] = token_out
+            token_id = chunk_base + local_token
+            if token_id >= pl.cast(REAL_VOCAB, target_type=pl.INT32):
+                token_id = pl.cast(0, pl.INT32)
+            token_out = pl.create_tensor([1, SAMPLED_IDS_PAD], dtype=pl.INT32)
+            token_out[:, :] = pl.full([1, SAMPLED_IDS_PAD], dtype=pl.INT32, value=0)
+            pl.write(token_out, [0, 0], token_id)
+            sampled_ids[b : b + 1, :] = token_out
     return sampled_ids
-
-
 _FWD_NLAYERS = NUM_LAYERS  # decode_fwd loop bound; overridable for layer-count tests
 
 
@@ -1221,9 +984,9 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     wv: pl.Tensor,
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor,
-    block_table: pl.Tensor,
-    slot_mapping: pl.Tensor,
+    seq_lens: pl.Tensor[[D.user_batch], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[D.user_batch], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -1235,11 +998,11 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
-    out: pl.Out[pl.Tensor],
+    out: pl.Out[pl.Tensor[[D.user_batch, VOCAB], pl.FP32]],
     embed_weight: pl.Tensor,
-    sampled_ids_in: pl.Tensor,
-    sampled_ids_out: pl.Out[pl.Tensor],
-    next_hidden: pl.Out[pl.Tensor],
+    sampled_ids_in: pl.Tensor[[D.user_batch, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids_out: pl.Out[pl.Tensor[[D.user_batch, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[D.user_batch, HIDDEN], pl.BF16]],
 ):
     # Device-side fused decode: embed the previous sampled token id, loop the inline
     # body over all _FWD_NLAYERS layers, run the LM head, then sample the next token
@@ -1261,8 +1024,30 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     # KV cache size (and the 1-page warm-up scratch). Bind dim-0 dynamic (mirroring
     # prefill_fwd) so the compiled program does not bake a fixed shape and reject any
     # non-batching-shaped pool.
+    seq_lens.bind_dynamic(0, D.user_batch)
+    block_table.bind_dynamic(0, D.block_table_flat)
+    slot_mapping.bind_dynamic(0, D.user_batch)
+    out.bind_dynamic(0, D.user_batch)
+    sampled_ids_in.bind_dynamic(0, D.user_batch)
+    sampled_ids_out.bind_dynamic(0, D.user_batch)
+    next_hidden.bind_dynamic(0, D.user_batch)
     k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
+    user_batch = pl.tensor.dim(seq_lens, 0)
+
+    pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
+    pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
+    pa_num_layers = pl.tensor.dim(input_rms_weight, 0)
+    pa_num_pages = pl.tensor.dim(k_cache, 0) // (pa_num_layers * BLOCK_SIZE * NUM_KV_HEADS)
+    pa_max_blocks = pl.tensor.dim(block_table, 0) // user_batch
+    pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
+    pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
+    pa_tiling_tid = build_paged_attention_metadata(
+        seq_lens,
+        pa_max_blocks_i32,
+        pa_num_pages_i32,
+        pa_metadata,
+    )
     next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
 
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
@@ -1278,7 +1063,15 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                 cur = pl.assemble(
                     cur,
                     pl.cast(
-                        pl.slice(next_hidden, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
+                        pl.fillpad(
+                            pl.slice(
+                                next_hidden,
+                                [BATCH, RMSNORM_K_CHUNK],
+                                [cb0, ck0],
+                                valid_shape=[user_batch, RMSNORM_K_CHUNK],
+                            ),
+                            pad_value=pl.PadValue.zero,
+                        ),
                         target_type=pl.FP32,
                     ),
                     [cb0, ck0],
@@ -1311,7 +1104,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
         next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache,
+            pa_metadata, pa_workspace, pa_tiling_tid, wo, w_gate, w_up, w_down,
             post_rms_weight, layer_next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
             carry_tids, carry_normed_tids,
         )
@@ -1347,7 +1141,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     post_rms_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ):
-    # Fused decode of _CHUNK_NLAYERS consecutive layers, output = hidden (NO LM head).
+    # Fused B16 decode of _CHUNK_NLAYERS consecutive layers, output = hidden
+    # (NO LM head). Dynamic public batching is provided by decode_fwd.
     # Used to run all 40 layers in a few dispatches instead of one — a single 40-layer
     # dispatch exceeds the device AICPU stream-sync timeout (PLATFORM_STREAM_SYNC_TIMEOUT
     # _MS=2000ms). Each layer's output is made visible to the next by _decode_layer's
@@ -1359,6 +1154,21 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     # BF16->FP32 at the chunk head (copy_hidden) and FP32->BF16 at the tail (copy_out),
     # mirroring decode_fwd's embed-in / lm-head-in casts. (Without these the BF16 cur
     # hits _decode_layer's FP32 x_gamma/rms_recip -> ptoas bfloat16 type error.)
+    user_batch = pl.tensor.dim(seq_lens, 0)
+    pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
+    pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
+    pa_num_layers = pl.tensor.dim(input_rms_weight, 0)
+    pa_num_pages = pl.tensor.dim(k_cache, 0) // (pa_num_layers * BLOCK_SIZE * NUM_KV_HEADS)
+    pa_max_blocks = pl.tensor.dim(block_table, 0) // user_batch
+    pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
+    pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
+    pa_tiling_tid = build_paged_attention_metadata(
+        seq_lens,
+        pa_max_blocks_i32,
+        pa_num_pages_i32,
+        pa_metadata,
+    )
+
     cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     carry_tids = pl.array.create(DOWN_ON, pl.TASK_ID)
     for cb0 in pl.parallel(0, BATCH, BATCH):
@@ -1399,7 +1209,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache, wo, w_gate, w_up, w_down,
+            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache,
+            pa_metadata, pa_workspace, pa_tiling_tid, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, normed, next_normed, i, next_gamma_idx,
             carry_tids, carry_normed_tids,
         )
@@ -1497,7 +1308,9 @@ def _smoke_inputs() -> list[torch.Tensor]:
 
 
 def _backend_type(platform: str) -> BackendType:
-    return BackendType.Ascend950 if platform.startswith("a5") else BackendType.Ascend910B
+    if platform not in PA_SUPPORTED_PLATFORMS:
+        raise ValueError(f"direct CANN decode attention does not support platform {platform!r}")
+    return BackendType.Ascend910B
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1567,8 +1380,7 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
     rope_cos = torch.cat([ang.cos(), ang.cos()], dim=1).float()
     rope_sin = torch.cat([ang.sin(), ang.sin()], dim=1).float()
 
-    # k_cache / v_cache are the PAGED pool (rows = NUM_PAGES * NUM_KV_HEADS *
-    # BLOCK_SIZE) the kernel reads/writes via block_table / slot_mapping.
+    # The flat cache buffers represent BSND bytes: [page, token, kv_head, dim].
     return {
         "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
         "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
@@ -1628,8 +1440,8 @@ def golden_decode_layer(values: dict) -> None:
     block_table = values["block_table"]
     rope_cos = values["rope_cos"].float()
     rope_sin = values["rope_sin"].float()
-    k_cache = values["k_cache"].float()
-    v_cache = values["v_cache"].float()
+    k_cache = values["k_cache"].view(NUM_PAGES * BLOCK_SIZE, KV_HIDDEN).float()
+    v_cache = values["v_cache"].view(NUM_PAGES * BLOCK_SIZE, KV_HIDDEN).float()
 
     attn_out = torch.zeros(BATCH, HIDDEN)
     for b in range(BATCH):
@@ -1641,18 +1453,17 @@ def golden_decode_layer(values: dict) -> None:
         v_cur = _bf16(v_heads[b])                                # [8,128]
         n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
         for kvh in range(NUM_KV_HEADS):
-            # Gather this (b, kvh) lane's past KV from the PAGED pool exactly as the
-            # kernel does: logical block sb -> physical page block_table[b*MBPS + sb],
-            # whose (page, kvh) tile starts at (pbid*NUM_KV_HEADS + kvh)*BLOCK_SIZE.
+            # Each physical page is [BLOCK_SIZE, KV_HIDDEN] in BSND order.
             k_lane = torch.empty(slen, HEAD_DIM)
             v_lane = torch.empty(slen, HEAD_DIM)
             for sb in range(n_blocks):
                 pbid = int(block_table[b * DECODE_MAX_BLOCKS_PER_SEQ + sb].item())
-                row = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+                row = pbid * BLOCK_SIZE
+                col = kvh * HEAD_DIM
                 lo = sb * BLOCK_SIZE
                 blk = min(BLOCK_SIZE, slen - lo)
-                k_lane[lo : lo + blk] = k_cache[row : row + blk]
-                v_lane[lo : lo + blk] = v_cache[row : row + blk]
+                k_lane[lo : lo + blk] = k_cache[row : row + blk, col : col + HEAD_DIM]
+                v_lane[lo : lo + blk] = v_cache[row : row + blk, col : col + HEAD_DIM]
             k_lane[p] = k_cur[kvh]                               # current token (kernel writes it first)
             v_lane[p] = v_cur[kvh]
             for j in range(Q_PER_KV):
@@ -1704,7 +1515,7 @@ if __name__ == "__main__":
         "--platform",
         type=str,
         default="a2a3",
-        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        choices=PA_SUPPORTED_PLATFORMS,
     )
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
@@ -1732,9 +1543,8 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
     parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="deprecated no-op: dep_gen is already forced off for this kernel "
-                             "(full-occupancy syncall is incompatible with dep_gen, pypto#1931); "
-                             "kept for CLI / CI back-compat.")
+                        help="deprecated no-op: dep_gen is already forced off for the direct "
+                             "CCE attention cohort; kept for CLI / CI back-compat.")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
                         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
                              "-> logits) against a host chain reference, instead of the default "
@@ -1786,10 +1596,8 @@ if __name__ == "__main__":
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
-                # dep_gen forced OFF: this kernel's full-occupancy pl.system.syncall
-                # is incompatible with dep_gen — the DFX instrumentation perturbs core
-                # occupancy and trips AICore timeout 507018 (pypto#1931). --no-dep-gen
-                # is kept as an accepted no-op for CLI / CI back-compat.
+                # The direct CCE attention launch requires an uninstrumented full
+                # mixed-core cohort. --no-dep-gen remains an accepted CLI no-op.
                 enable_dep_gen=False,
             ),
             rtol=3e-3,
