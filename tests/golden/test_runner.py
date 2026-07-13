@@ -1216,10 +1216,15 @@ class TestL3BenchmarkAggregation:
     """L3 Daily-CI timing averages each round's fastest valid rank."""
 
     class _Stats:
-        def __init__(self, rank_eff):
+        def __init__(self, rank_eff, rounds_dispatches=None):
             self._rank_eff = rank_eff
             n_rounds = len(next(iter(rank_eff.values()))) if rank_eff else 0
-            self.rounds_dispatches = [{} for _ in range(n_rounds)]
+            if rounds_dispatches is None:
+                self.rounds_dispatches = [
+                    {pid: [] for pid in rank_eff} for _ in range(n_rounds)
+                ]
+            else:
+                self.rounds_dispatches = rounds_dispatches
 
         def per_rank(self, metric):
             assert metric == "effective"
@@ -1227,7 +1232,7 @@ class TestL3BenchmarkAggregation:
 
     def test_fast_effective_takes_per_round_min_even_when_fast_rank_switches(self):
         stats = self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]})
-        assert _l3_fast_effective_per_round(stats) == [10.0, 5.0]
+        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [10.0, 5.0]
 
     @pytest.mark.parametrize(
         "rank_eff",
@@ -1238,14 +1243,31 @@ class TestL3BenchmarkAggregation:
         ],
     )
     def test_fast_effective_rejects_incomplete_rank_timing(self, rank_eff):
-        assert _l3_fast_effective_per_round(self._Stats(rank_eff)) == []
+        assert _l3_fast_effective_per_round(self._Stats(rank_eff), expected_rank_count=2) == []
+
+    def test_fast_effective_rejects_rank_missing_from_every_round(self):
+        stats = self._Stats({100: [10.0]})
+        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == []
+
+    def test_fast_effective_rejects_rank_missing_from_raw_round(self):
+        stats = self._Stats(
+            {100: [10.0], 101: [20.0]},
+            rounds_dispatches=[{100: []}],
+        )
+        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == []
 
     def test_fast_effective_report_has_dedicated_ci_token(self, capsys):
-        _report_l3_fast_effective(self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]}))
+        _report_l3_fast_effective(
+            self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]}),
+            expected_rank_count=2,
+        )
         assert "fast_effective_us (2 rounds) min=5.0 median=7.5 mean=7.5 max=10.0" in capsys.readouterr().out
 
     def test_fast_effective_report_marks_missing_timing_unavailable(self, capsys):
-        _report_l3_fast_effective(self._Stats({100: [10.0], 101: [0.0]}))
+        _report_l3_fast_effective(
+            self._Stats({100: [10.0], 101: [0.0]}),
+            expected_rank_count=2,
+        )
         assert "fast_effective_us unavailable" in capsys.readouterr().out
 
 

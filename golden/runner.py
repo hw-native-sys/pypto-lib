@@ -437,17 +437,24 @@ def _report_effective(stats: Any) -> None:
         print("[RUN]   effective_us unavailable: no orch/sched spans captured", flush=True)
 
 
-def _l3_fast_effective_per_round(stats: Any) -> list[float]:
+def _l3_fast_effective_per_round(stats: Any, expected_rank_count: int) -> list[float]:
     """Return each L3 round's fastest valid rank Effective time.
 
     A zero means that rank emitted no usable orch/sched timing; reject the whole
     sample rather than misreading the missing marker as an extremely fast card.
-    The same rule catches a rank absent from a round because ``per_rank`` fills
-    that position with zero.
+    Validate the observed rank count against the compiled distributed device
+    count so a rank missing from every round cannot silently disappear. Also
+    require every round to contain the same rank set; ``per_rank`` fills a rank
+    missing from only some rounds with zero, which the value check rejects.
     """
     rank_eff = stats.per_rank("effective")
     n_rounds = len(stats.rounds_dispatches)
     if not rank_eff or n_rounds == 0:
+        return []
+    observed_ranks = set(rank_eff)
+    if len(observed_ranks) != expected_rank_count:
+        return []
+    if any(set(ranks) != observed_ranks for ranks in stats.rounds_dispatches):
         return []
     if any(len(series) != n_rounds for series in rank_eff.values()):
         return []
@@ -461,9 +468,9 @@ def _l3_fast_effective_per_round(stats: Any) -> list[float]:
     return fast
 
 
-def _report_l3_fast_effective(stats: Any) -> None:
+def _report_l3_fast_effective(stats: Any, expected_rank_count: int) -> None:
     """Print the fast-rank L3 metric consumed by Daily CI."""
-    fast = _l3_fast_effective_per_round(stats)
+    fast = _l3_fast_effective_per_round(stats, expected_rank_count)
     if not fast:
         print(
             "[RUN]   fast_effective_us unavailable: incomplete per-rank orch/sched timing",
@@ -603,7 +610,7 @@ def _run_benchmark_l3(
     if stats is None:
         return None
     _report_effective(stats)
-    _report_l3_fast_effective(stats)
+    _report_l3_fast_effective(stats, len(compiled._distributed_config.device_ids))
     _report_l3_per_rank(stats)
     _report_l3_detail(stats, compiled, resident=False)
     return stats
@@ -910,7 +917,7 @@ def _run_l3_resident(
         )
         return None
     _report_effective(stats)
-    _report_l3_fast_effective(stats)
+    _report_l3_fast_effective(stats, len(compiled._distributed_config.device_ids))
     _report_l3_per_rank(stats)
     _report_l3_detail(stats, compiled, resident=True)
     return stats
