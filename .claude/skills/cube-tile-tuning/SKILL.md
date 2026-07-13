@@ -27,18 +27,21 @@ reports) and `docs/pypto-coding-style.md` §6 (mixed cube+vector vs. decoupled s
 
 | Tool | Role |
 |------|------|
-| `hint_l1_tile.py` | Analytic: enumerate `(TM,TN,TK,pin)` tile candidates for one matmul, ranked by DMA. **Directional only** — it doesn't know your bound pipe or the device's exact double-buffered L1 model. |
+| `hint_l1_tile.py` | Analytic: enumerate `(TM,TN,TK,pin)` tile candidates for one matmul, ranked by DMA (reports MAC- and DMA-waste; pass `--b-trans` for the K-contiguous weight layout). **Directional only** — it doesn't know your bound pipe or the device's exact double-buffered L1 model. |
 | `tile_budget.py` | Constraint: for a *chosen* tile, report which on-chip buffer (Acc/L0C, Mat/L1) it blows or has room in, and whether the K tile clears the cache-line floor. Prints the K↔N trade to escape a Mat wall. |
 
 Both are standalone (no PyPTO import). Run from the repo root; replace the dims/bytes
 with your matmul's (M is the row tile, N and K come from the weight):
 
 ```bash
-# Analytic candidates — example INT8 A&B, INT32 accumulator
+# Analytic candidates — example INT8 A&B, INT32 accumulator.
+# --b-trans models the weight as K-contiguous (B=[N,K], the real LLM-weight layout,
+# and what tile_budget.py assumes) so B's DMA and the K cache-line floor are costed
+# right; drop it only for a plain row-major B=[K,N].
 python .claude/skills/cube-tile-tuning/hint_l1_tile.py --M <M> --N <N> --K <K> \
-    --bytes-a 1 --bytes-b 1 --bytes-c 4              # rank by sequential DMA (wave-aware)
+    --bytes-a 1 --bytes-b 1 --bytes-c 4 --b-trans          # rank by sequential DMA (wave-aware)
 python .claude/skills/cube-tile-tuning/hint_l1_tile.py --M <M> --N <N> --K <K> \
-    --bytes-a 1 --bytes-b 1 --bytes-c 4 --no-wave-considered   # rank by total DMA only
+    --bytes-a 1 --bytes-b 1 --bytes-c 4 --b-trans --no-wave-considered   # rank by total DMA only
 
 # Constraint check for a chosen tile — --weights = weight operands held at once
 # (a two-weight fused scope = 2, a single-weight scope = 1; --accum defaults to it)
@@ -55,28 +58,51 @@ python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --
    weight = 1), and how many accumulators are live. M is usually the row/occupancy
    tile; N and K come from the weight.
 
-2. **Analytic pass — `hint_l1_tile.py`.** Run per matmul in the default wave-considered
-   mode and again with `--no-wave-considered`. Read it for *direction* (does it want
-   bigger N? pin A or B?), not as a target. It ignores your bound pipe and the exact L1
-   model, so it over-pushes TN and can suggest a sub-cache-line TK.
+2. **Analytic pass — `hint_l1_tile.py`.** Run per matmul with `--b-trans` (weight
+   matmuls store B as K-contiguous, the layout `tile_budget.py` also assumes) in the
+   default wave-considered mode and again with `--no-wave-considered`. Read it for
+   *direction* (does it want bigger N? pin A or B?), not as a target — it ignores your
+   bound pipe and the exact L1 model, so it over-pushes TN. Read the **DMA-waste** column
+   as the bandwidth-honest number (per-operand; with `--b-trans` a sub-cache-line TK
+   surfaces as a large DMA waste). Without `--b-trans` it models a plain B=[K,N] and can
+   suggest a sub-cache-line TK.
 
 3. **Read the memory report.** After any build, open
    `build_output/<case>/report/memory_after_AllocateMemoryAddr.txt`. Per function it
-   shows Mat (L1), Left/Right (L0A/L0B), Acc (L0C), Vec (UB) used vs. limit. An
-   under-used Acc means you have M/N room; a near-full Right/Mat means the weight tile
-   is the wall.
+   shows Mat (L1), Left/Right (L0A/L0B), Acc (L0C), Vec (UB) used vs. limit. **Only Mat
+   (L1), Acc (L0C), and Vec (UB) are user-tunable** — they respond directly to your
+   N/K/M tile and the vector frag. **Left/Right (L0A/L0B) are managed by the pypto compiler, not
+   DSL-level tiling:** pypto sub-tiles each L1 fragment through L0A/L0B on its own, so
+   Right/L0B routinely reads ~100% even when Mat/L1 has plenty of room — that is pypto
+   saturating its staging buffer, **not** a wall you set or can move from the DSL. Your
+   N/K/M tile sizes L1/L0C/UB; pypto derives the L0A/L0B staging underneath. Read the
+   L0A/L0B lines as information (pypto's chosen sub-tiling), never
+   as your budget. An under-used Acc means you have M/N room; a near-full **Mat (L1)**
+   means the weight tile is the wall.
 
 4. **The constraint model (the three walls).** Use `tile_budget.py`, or by hand:
 
    | wall | usage | budget (910B) | grows with |
    |------|-------|--------------|------------|
-   | **Acc** (L0C) | `M·N·bytes_out·n_accum` | 128 KB | M, N |
+   | **Acc** (L0C) *(soft †)* | `M·N·bytes_out·n_accum` | 128 KB | M, N |
    | **Mat** (L1) | `(N·n_weights + M)·K·bytes_in·dbuf` | 512 KB | **N, K, n_weights** |
    | **cache-line** | `K·bytes_in ≥ 512 B` | — | (a floor, not a budget) |
 
    Mat is almost always the wall when you grow N, because it scales with `N·K·weights`
    and is double-buffered. The Mat number is an estimate; the device compile is ground
    truth (it adds ~10-25% alignment) — `tile_budget.py` flags MARGINAL within 15%.
+
+   **† Acc (L0C) is a *soft* wall — the compiler tiles it.** When the `[M, N]` output
+   fragment exceeds L0C, pypto's `AutoTileMatmulL0` pass auto-tiles the output into
+   L0C-fitting sub-tiles; it does **not** fail (a Mat/L1 or UB overflow *is* hard). The
+   price is a per-output-tile FIXPIPE L0C→L1 **drain** — 910B: `~245` cycles fixed +
+   `bytes_out·m·n / 118` per tile, **fully exposed** on the wall (single L0C, no L0C
+   double-buffer emitter yet) — so `G = ⌈M·N·bytes_out / 128 KB⌉` output tiles cost
+   `≈ (G−1)·245` cycles + extra operand re-streaming *only if the cube is load-bound*
+   (MAD-bound → hidden). Auto-tiling covers a plain `tile.matmul`→store (direct-store)
+   and a chained matmul (Mat-scratch); it is **deferred** (`PH-AT-006`, Acc then hard)
+   for `tile.matmul_acc`, a Vec/PV left operand, or a mixed on-chip consumer. So size
+   M/N to L0C to *avoid drains*, not because bigger fails (that is Mat/UB).
 
 5. **Occupancy / row tile first.** The M tile that controls *weight re-streaming* is
    the dominant lever for grouped/MoE GEMM: size it so a typical group is one row-tile
@@ -102,7 +128,8 @@ python .claude/skills/cube-tile-tuning/tile_budget.py --M <M> --N <N> --K <K> --
    hits the Mat wall, **shrink the K tile to buy the room** — but keep
    `K·bytes_in ≥ 512 B` (the cache-line floor; B is K-contiguous under `b_trans`, so a
    short K wastes the DMA line). A wider N that forces a sub-cache-line K can be net
-   negative. `tile_budget.py` prints the exact `N≤… / K≤…` trade.
+   negative — `hint_l1_tile.py --b-trans` prices that penalty into DMA waste, and
+   `tile_budget.py` prints the exact `N≤… / K≤…` trade.
 
 8. **Empirical sweep — the truth.** Profile candidates with
    `python <kernel>.py -p a2a3 -d <dev> --enable-l2-swimlane`; the headline is
@@ -180,10 +207,17 @@ next round's variants (e.g. an L1/Mat overflow when pushing N says "trade K", no
 
 ## Pitfalls
 
-- **The hint tool is directional.** It over-pushes TN and can suggest TK below the
-  cache-line floor. Cross-check every candidate with `tile_budget.py`.
+- **The hint tool is directional.** It over-pushes TN, and *in its default
+  non-transposed mode* can suggest TK below the cache-line floor — pass `--b-trans` for
+  weight matmuls so it costs the K floor (matching `tile_budget.py`). Cross-check every
+  candidate with `tile_budget.py` regardless (it also walls Mat/Acc).
 - **`Mat` overflow ≠ UB overflow.** Growing a *cube* N-frag overflows L1/Mat (it holds
   the weights), not UB. Decoupling the vector frag does not help here — trade K.
+- **L0A/L0B (Left/Right) are managed by the pypto compiler, not DSL knobs.** A 100%-full
+  Right/L0B in the memory report is pypto saturating its double-buffered staging of the
+  L1 fragment — *not* a wall you set. Don't shrink your tile to "relieve" it. Tune only
+  against Mat (L1), Acc (L0C), and UB (Vec); the pypto compiler re-derives L0A/L0B for
+  whatever L1 tile you pick.
 - **A shared tile constant couples unrelated tasks.** If two tasks reuse one tiling
   name, the tighter-constrained one silently caps the other. Split the knob per task
   (step 6) *before* sweeping, or the sweep can't reach the better config at all.
