@@ -47,7 +47,7 @@ def rms_norm(
             rms_d0 = rms_db * D_TILE
             rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
             x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
-        x_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS)))
+        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS))
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
         for apply_db in pl.pipeline(D // D_TILE, stage=2):
             apply_d0 = apply_db * D_TILE
@@ -122,7 +122,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)

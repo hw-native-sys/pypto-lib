@@ -31,10 +31,6 @@ EPS = M.rms_norm_eps
 MAX_SEQ_LEN = M.max_position_embeddings
 
 # tiling
-ROPE_TILE = 64
-ROPE_PAIR_TILE = 32
-HEAD_TILE = 64
-Q_PROJ_OUT_TILE = 128   # qproj dequant N-tile (128 INT32 = 512B = 1 full L2 line)
 Q_PROJ_TILE = 128       # qproj K-tile (Q_LORA reduction); 8 slices -> deep stage=2 pipeline, double-buffered Mat fits
 QPROJ_MM_N_TILE = 1024  # full L2 lines per wq_b row (no over-fetch)
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
@@ -62,8 +58,6 @@ QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real ro
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 Q_ROPE_H_TILE = 4       # heads per fused qproj dequant/rms/rope task; cos/sin build amortizes over them
-Q_NOPE_FULL_TILES = NOPE_DIM // Q_PROJ_OUT_TILE
-Q_NOPE_TAIL = NOPE_DIM % Q_PROJ_OUT_TILE
 assert H % Q_ROPE_H_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
@@ -78,8 +72,6 @@ assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % KV_RMS_T_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % Q_ROPE_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % Q_ROPE_T_TILE == 0
-assert HEAD_DIM == 4 * Q_PROJ_OUT_TILE
-assert Q_NOPE_TAIL + ROPE_DIM == Q_PROJ_OUT_TILE
 
 
 @pl.jit.inline
@@ -127,12 +119,43 @@ def qkv_proj_rope(
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
     t_matmul = pl.max(t_dim, MATMUL_T_TILE)
 
-    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). TN=256 makes each wq_a
-    # row-read a full 512B L2 line (vs 128B sub-line at TN=64), but only leaves
-    # Q_LORA//256=4 N-groups -> too few to fill 24 cores. So split K into QR_OK
-    # slices dispatched as separate cores and atomic-add their partials into a
-    # zero-seeded output. The seed loop must land before the adds; the auto-dep
-    # on qr_fp32 (WAW: seed write -> atomic RMW) enforces that ordering.
+    # RoPE indices and interleaved cos/signed-sin rows are head-invariant.
+    # Prepare them once per token tile so the 16 Q head-group tasks do not each
+    # rebuild the same arange/cast/gather chain on their critical AIV path.
+    q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    for qrp_idx in pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare", allow_early_resolve=True):
+        qrp_t0 = qrp_idx * Q_ROPE_T_TILE
+        qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
+        qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
+        qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
+        qrp_half = pl.mul(qrp_col, 0.5)
+        qrp_dup_i32 = pl.cast(qrp_half, target_type=pl.INT32, mode="trunc")
+        qrp_dup_f = pl.cast(qrp_dup_i32, target_type=pl.FP32)
+        qrp_dup_idx = pl.cast(qrp_dup_f, target_type=pl.INT32)
+        qrp_lane = pl.sub(qrp_col, pl.mul(qrp_dup_f, 2.0))
+        qrp_next_col = pl.add(qrp_col, 1.0)
+        qrp_lane_offset = pl.mul(qrp_lane, 2.0)
+        qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
+        qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
+        qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
+        qrp_cos_rows = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
+        qrp_sin_rows = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
+        qrp_cos = pl.cast(qrp_cos_rows, target_type=pl.FP32)
+        qrp_sin = pl.cast(qrp_sin_rows, target_type=pl.FP32)
+        qrp_cos_il = pl.gather(qrp_cos, dim=-1, index=qrp_dup_idx)
+        qrp_sin_il = pl.gather(qrp_sin, dim=-1, index=qrp_dup_idx)
+        qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
+        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
+        q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
+        q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+
+    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
+    # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
+    # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
+    # before every atomic RMW.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
@@ -172,9 +195,9 @@ def qkv_proj_rope(
             gamma_rms_cast = pl.cast(gamma_cq[qr_rms_col0 : qr_rms_col0 + Q_LORA_TILE], target_type=pl.FP32)
             gamma_rms_chunk = pl.reshape(gamma_rms_cast, [1, Q_LORA_TILE])
             qr_g = pl.col_expand_mul(qr_rms_chunk, gamma_rms_chunk)
-            qr_g_abs = pl.maximum(qr_g, pl.neg(qr_g))
+            qr_g_abs = pl.abs(qr_g)
             qr_amax_g = pl.maximum(qr_amax_g, pl.reshape(pl.row_max(qr_g_abs), [1, T_TILE]))
-        qr_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS)))
+        qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS))
         qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
         qr_amax_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
         qr_amax_normed = pl.mul(qr_inv_rms, qr_amax_g)
@@ -219,90 +242,53 @@ def qkv_proj_rope(
                 q_proj_i32[t0 : t0 + QPROJ_M_TILE, w_col0 : w_col0 + QPROJ_MM_N_TILE] = col_acc
 
     # Fuse qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
-    # Each of the 16 vector tasks owns four heads and recomputes three NOPE tiles
-    # after the RMS pass, avoiding the q_proj_fp32 GM round trip.
+    # A full [token, head] tile fits in Vec UB, so dequantize each head once and
+    # retain it across the RMS reduction instead of rereading/recomputing NOPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
     q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
     for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
         hg = hg_idx * Q_ROPE_H_TILE
-        # In-kernel A3 index/sign build (per task, reused across the inner tg/h loop).
-        q_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        q_col = pl.col_expand_mul(q_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        q_dup_f = pl.cast(pl.cast(pl.mul(q_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        q_dup_idx = pl.cast(q_dup_f, target_type=pl.INT32)                                       # j>>1
-        q_lane = pl.sub(q_col, pl.mul(q_dup_f, 2.0))                                             # j%2
-        q_swap_idx = pl.cast(pl.sub(pl.add(q_col, 1.0), pl.mul(q_lane, 2.0)), target_type=pl.INT32)  # j^1
-        q_sign = pl.sub(pl.mul(q_lane, 2.0), 1.0)                                                # [-1,+1,...]
         for tg_idx in pl.range(t_dim // Q_ROPE_T_TILE):
             tg = tg_idx * Q_ROPE_T_TILE
             qr_scale_dq_t = qr_scale_view[tg : tg + Q_ROPE_T_TILE, :]
-            q_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
-            q_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + Q_ROPE_T_TILE, :], target_type=pl.FP32), dim=-1, index=q_dup_idx)
-            for h_inner in pl.range(Q_ROPE_H_TILE):
+            q_cos_il = q_rope_cos_il[tg : tg + Q_ROPE_T_TILE, :]
+            q_sin_signed = q_rope_sin_signed[tg : tg + Q_ROPE_T_TILE, :]
+            q_swap_idx = q_rope_swap_idx[tg : tg + Q_ROPE_T_TILE, :]
+            # Pipeline adjacent heads so the next head's GM reads overlap the
+            # current head's vector RMS/rotation work, as in Qwen's decode loop.
+            for h_inner in pl.pipeline(Q_ROPE_H_TILE, stage=2):
                 h = hg + h_inner
                 h0 = h * HEAD_DIM
-                q_head_sq_sum = pl.full([1, Q_ROPE_T_TILE], dtype=pl.FP32, value=0.0)
-                for q_nope_tile in pl.range(Q_NOPE_FULL_TILES):
-                    q_chunk_col = h0 + q_nope_tile * Q_PROJ_OUT_TILE
-                    q_head_acc_chunk = q_proj_i32[tg : tg + Q_ROPE_T_TILE, q_chunk_col : q_chunk_col + Q_PROJ_OUT_TILE]
-                    q_scale = pl.reshape(wq_b_scale[q_chunk_col : q_chunk_col + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
-                    q_acc_fp32 = pl.cast(q_head_acc_chunk, target_type=pl.FP32, mode="none")
-                    q_acc_row_scaled = pl.row_expand_mul(q_acc_fp32, qr_scale_dq_t)
-                    q_dq = pl.col_expand_mul(q_acc_row_scaled, q_scale)
-                    q_dq_sq = pl.mul(q_dq, q_dq)
-                    q_dq_sq_sum = pl.row_sum(q_dq_sq)
-                    q_dq_sq_row = pl.reshape(q_dq_sq_sum, [1, Q_ROPE_T_TILE])
-                    q_head_sq_sum = pl.add(q_head_sq_sum, q_dq_sq_row)
-
-                q_last_col = h0 + Q_NOPE_FULL_TILES * Q_PROJ_OUT_TILE
-                q_last_acc = q_proj_i32[tg : tg + Q_ROPE_T_TILE, q_last_col : q_last_col + Q_PROJ_OUT_TILE]
-                q_last_scale = pl.reshape(wq_b_scale[q_last_col : q_last_col + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
-                q_last_acc_fp32 = pl.cast(q_last_acc, target_type=pl.FP32, mode="none")
-                q_last_acc_scaled = pl.row_expand_mul(q_last_acc_fp32, qr_scale_dq_t)
-                q_last_dq = pl.col_expand_mul(q_last_acc_scaled, q_last_scale)
-                q_last_dq_sq = pl.mul(q_last_dq, q_last_dq)
-                q_last_dq_sq_sum = pl.row_sum(q_last_dq_sq)
-                q_last_dq_sq_row = pl.reshape(q_last_dq_sq_sum, [1, Q_ROPE_T_TILE])
-                q_head_sq_sum = pl.add(q_head_sq_sum, q_last_dq_sq_row)
+                q_head_acc = q_proj_i32[tg : tg + Q_ROPE_T_TILE, h0 : h0 + HEAD_DIM]
+                q_head_scale = pl.reshape(wq_b_scale[h0 : h0 + HEAD_DIM], [1, HEAD_DIM])
+                q_head_acc_fp32 = pl.cast(q_head_acc, target_type=pl.FP32, mode="none")
+                q_head_row_scaled = pl.row_expand_mul(q_head_acc_fp32, qr_scale_dq_t)
+                q_head_dq = pl.col_expand_mul(q_head_row_scaled, q_head_scale)
+                q_head_sq = pl.mul(q_head_dq, q_head_dq)
+                q_head_sq_row = pl.row_sum(q_head_sq)
+                q_head_sq_sum = pl.reshape(q_head_sq_row, [1, Q_ROPE_T_TILE])
                 q_head_sq_mean = pl.mul(q_head_sq_sum, 1.0 / HEAD_DIM)
                 q_head_var = pl.add(q_head_sq_mean, EPS)
-                q_head_std = pl.sqrt(q_head_var)
-                q_head_inv_rms = pl.recip(q_head_std)
+                q_head_inv_rms = pl.rsqrt(q_head_var)
                 q_head_inv_rms_t = pl.reshape(q_head_inv_rms, [Q_ROPE_T_TILE, 1])
 
-                for q_nope_tile in pl.range(Q_NOPE_FULL_TILES):
-                    q_chunk_col = h0 + q_nope_tile * Q_PROJ_OUT_TILE
-                    q_head_acc_chunk = q_proj_i32[tg : tg + Q_ROPE_T_TILE, q_chunk_col : q_chunk_col + Q_PROJ_OUT_TILE]
-                    q_scale = pl.reshape(wq_b_scale[q_chunk_col : q_chunk_col + Q_PROJ_OUT_TILE], [1, Q_PROJ_OUT_TILE])
-                    q_acc_fp32 = pl.cast(q_head_acc_chunk, target_type=pl.FP32, mode="none")
-                    q_acc_row_scaled = pl.row_expand_mul(q_acc_fp32, qr_scale_dq_t)
-                    q_dq = pl.col_expand_mul(q_acc_row_scaled, q_scale)
-                    q_dq_normed = pl.row_expand_mul(q_dq, q_head_inv_rms_t)
-                    q_dq_bf16 = pl.cast(q_dq_normed, target_type=pl.BF16, mode="rint")
-                    q_flat[tg : tg + Q_ROPE_T_TILE, q_chunk_col : q_chunk_col + Q_PROJ_OUT_TILE] = q_dq_bf16
-
-                q_last_nope = q_last_dq[:, 0:Q_NOPE_TAIL]
-                q_last_nope_normed = pl.row_expand_mul(q_last_nope, q_head_inv_rms_t)
-                q_last_nope_bf16 = pl.cast(q_last_nope_normed, target_type=pl.BF16, mode="rint")
-                q_flat[tg : tg + Q_ROPE_T_TILE, q_last_col : q_last_col + Q_NOPE_TAIL] = q_last_nope_bf16
+                q_nope_normed = pl.row_expand_mul(q_head_dq[:, 0:NOPE_DIM], q_head_inv_rms_t)
+                q_nope_bf16 = pl.cast(q_nope_normed, target_type=pl.BF16, mode="rint")
+                q_flat[tg : tg + Q_ROPE_T_TILE, h0 : h0 + NOPE_DIM] = q_nope_bf16
 
                 # RoPE writeback on columns [h0+NOPE_DIM:h0+HEAD_DIM), inv_rms folded after.
-                q_rope_chunk = q_last_dq[:, Q_NOPE_TAIL:Q_PROJ_OUT_TILE]
+                q_rope_chunk = q_head_dq[:, NOPE_DIM:HEAD_DIM]
                 q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
                 q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
-                q_rope_swapped_signed = pl.mul(q_rope_swapped, q_sign)
-                q_rope_delta = pl.mul(q_rope_swapped_signed, q_sin_il)
+                q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
                 q_rope_rot = pl.add(q_rope_base, q_rope_delta)
                 q_rope_normed = pl.row_expand_mul(q_rope_rot, q_head_inv_rms_t)
                 q_rope_bf16 = pl.cast(q_rope_normed, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
 
-    # Split-K kv_proj (same rationale as qr_proj): TN=256 makes each wkv row-read a
-    # full 512B L2 line (vs 128B at TN=64), but HEAD_DIM//256=2 N-groups -> too few
-    # to fill the cores, so split D into KV_OK slices and atomic-add the partials
-    # into a zero-seeded output. (hint_l1_tile M=128,N=512,K=4096 suggests OK=8, but
-    # KV_OK=4 keeps qr(8)+kv(8)=16 tasks under the 24 cores; kv is off the critical
-    # path so a larger OK only adds atomic contention without shortening decode.)
+    # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
+    # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
+    # contention without shortening decode.
     kv_fp32 = pl.create_tensor([T_MAX, HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
         for tc in pl.range(t_matmul // KV_M_TILE):
@@ -348,7 +334,7 @@ def qkv_proj_rope(
             kv_sq_col0 = kb * KV_TILE
             kv_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, kv_sq_col0 : kv_sq_col0 + KV_TILE]
             kv_sq_sum = pl.add(kv_sq_sum, pl.reshape(pl.row_sum(pl.mul(kv_chunk, kv_chunk)), [1, KV_RMS_T_TILE]))
-        kv_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS)))
+        kv_inv_rms = pl.rsqrt(pl.add(pl.mul(kv_sq_sum, 1.0 / HEAD_DIM), EPS))
         kv_inv_rms_t = pl.reshape(kv_inv_rms, [KV_RMS_T_TILE, 1])
 
         # NOPE writeback: rms-normalize columns [0:NOPE_DIM) with per-column gamma.
@@ -576,7 +562,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
-    parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2], default=0,
+    parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2, 4], default=0,
                         help="L2 swimlane level: 0=off, 1=per-kernel AICore timing "
                              "(prints the per-function Task Statistics table), 2=+AICPU timing.")
     parser.add_argument("--runtime-dir", type=str, default=None)
