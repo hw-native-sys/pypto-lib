@@ -83,9 +83,9 @@ _DECODE_ARGS = (
     _arg("wv", "bf16", ("L*H", "KVH")),
     _arg("q_norm_weight", "fp32", ("L", "D")),
     _arg("k_norm_weight", "fp32", ("L", "D")),
-    _arg("seq_lens", "int32", ("B",)),
+    _arg("seq_lens", "int32", ("USER_BATCH",)),
     _arg("block_table", "int32", ("BLOCK_TABLE_FLAT",)),
-    _arg("slot_mapping", "int32", ("B",)),
+    _arg("slot_mapping", "int32", ("USER_BATCH",)),
     _arg("rope_cos", "fp32", ("MAX_SEQ", "D")),
     _arg("rope_sin", "fp32", ("MAX_SEQ", "D")),
     _arg("k_cache", "bf16", ("KV_CACHE_ROWS", "D"), "inout"),
@@ -97,11 +97,11 @@ _DECODE_ARGS = (
     _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
-    _arg("out", "fp32", ("B", "VOCAB"), "out"),
+    _arg("out", "fp32", ("USER_BATCH", "VOCAB"), "out"),
     _arg("embed_weight", "bf16", ("VOCAB", "H")),
-    _arg("sampled_ids_in", "int32", ("B", "SAMPLED_IDS_PAD")),
-    _arg("sampled_ids", "int32", ("B", "SAMPLED_IDS_PAD"), "out"),
-    _arg("next_hidden", "bf16", ("B", "H"), "out"),
+    _arg("sampled_ids_in", "int32", ("USER_BATCH", "SAMPLED_IDS_PAD")),
+    _arg("sampled_ids", "int32", ("USER_BATCH", "SAMPLED_IDS_PAD"), "out"),
+    _arg("next_hidden", "bf16", ("USER_BATCH", "H"), "out"),
 )
 
 
@@ -200,7 +200,7 @@ def qwen3_decode_host(
     sampled_ids: pl.Out[pl.Tensor],
     next_hidden: pl.Out[pl.Tensor],
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
-    logits, sampled_ids, next_hidden = decode_fwd(
+    out, sampled_ids, next_hidden = decode_fwd(
         input_rms_weight,
         wq,
         wk,
@@ -227,7 +227,7 @@ def qwen3_decode_host(
         sampled_ids,
         next_hidden,
     )
-    return logits, sampled_ids, next_hidden
+    return out, sampled_ids, next_hidden
 
 
 @pl.jit.host
@@ -507,6 +507,10 @@ def get_qwen3_14b_contract() -> ModelContract:
             "num_layers": QWEN3_14B.num_layers,
             "sampled_ids_pad": QWEN3_14B.sampled_ids_pad,
             "vocab_pad_multiple": QWEN3_14B_TILING.vocab_chunk,
+            "kv_cache_layout": "BSND",
+            "supported_batch_sizes": "1,16",
+            "supported_platforms": "a2a3",
+            "compile_platforms": "a2a3,a2a3sim",
         },
         execution={"prefill": ("prefill",), "decode": ("decode",)},
         kernels={

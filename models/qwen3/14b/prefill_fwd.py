@@ -185,6 +185,9 @@ def _attention_phase_window(
     pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
     pl.Tensor[[ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], pl.FP32],
 ]:
+    cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
+    k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
+    v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
     cur_mi_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
     if finalize_tok > 0:
         block_ctx_len = chunk_start + p0 + final_ti0 + finalize_tok
@@ -215,11 +218,18 @@ def _attention_phase_window(
                                             pl.tensor.read(block_table, [block_table_idx]),
                                             pl.INDEX,
                                         )
-                                        cache_row0 = layer_cache_base + (
-                                            pbid * NUM_KV_HEADS + kvh
-                                        ) * BLOCK_SIZE
-                                        k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0])
-                                        v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0])
+                                        cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
+                                        cache_col = kvh * HEAD_DIM
+                                        k_tile = pl.slice(
+                                            k_cache_bsnd,
+                                            [SEQ_TILE, HEAD_DIM],
+                                            [cache_row0, cache_col],
+                                        )
+                                        v_tile = pl.slice(
+                                            v_cache_bsnd,
+                                            [SEQ_TILE, HEAD_DIM],
+                                            [cache_row0, cache_col],
+                                        )
                                         for dd in pl.pipeline(ATTN_TOK_GROUP, stage=3):
                                             if dd < attn_tok:
                                                 ti = attn_ti0 + dd
@@ -402,6 +412,9 @@ def _attention_phase_window_full_single_block(
     pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
     pl.Tensor[[ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], pl.FP32],
 ]:
+    cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
+    k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
+    v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
     for phase_core in pl.spmd(
         ATTN_PHASE_SPMD_BLOCKS,
         name_hint="qk_pv_skew_probe_spmd",
@@ -418,9 +431,10 @@ def _attention_phase_window_full_single_block(
                 pl.tensor.read(block_table, [block_table_idx]),
                 pl.INDEX,
             )
-            cache_row0 = layer_cache_base + (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
-            k_tile = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0])
-            v_tile = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM], [cache_row0, 0])
+            cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
+            cache_col = kvh * HEAD_DIM
+            k_tile = pl.slice(k_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
+            v_tile = pl.slice(v_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
             for dd0 in pl.pipeline(0, ATTN_TOK_GROUP, QKPV_TOK_BATCH, stage=3):
                 ti0 = attn_ti0 + dd0
                 ti1 = ti0 + 1
@@ -685,7 +699,10 @@ def prefill_layer(
     # determined by TOK_TILE (no batch-axis pad / trim needed).
     user_batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
-    layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
+    cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
+    k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
+    v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
+    layer_cache_rows = cache_token_rows // num_layers_actual
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
     layer_cache_base = layer_idx * layer_cache_rows
@@ -874,22 +891,21 @@ def prefill_layer(
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
                                     cache_row = (
-                                        layer_cache_base
-                                        + (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE
-                                        + cache_slot_offset
+                                        layer_cache_base + cache_slot_block * BLOCK_SIZE + cache_slot_offset
                                     )
-                                    k_cache = pl.assemble(
-                                        k_cache,
+                                    cache_col = ki * HEAD_DIM
+                                    k_cache_bsnd = pl.assemble(
+                                        k_cache_bsnd,
                                         pl.cast(rot_lo, target_type=pl.BF16),
-                                        [cache_row, 0],
+                                        [cache_row, cache_col],
                                     )
-                                    k_cache = pl.assemble(
-                                        k_cache,
+                                    k_cache_bsnd = pl.assemble(
+                                        k_cache_bsnd,
                                         pl.cast(rot_hi, target_type=pl.BF16),
-                                        [cache_row, HALF_DIM],
+                                        [cache_row, cache_col + HALF_DIM],
                                     )
-                                    v_cache = pl.assemble(
-                                        v_cache,
+                                    v_cache_bsnd = pl.assemble(
+                                        v_cache_bsnd,
                                         pl.cast(
                                             pl.reshape(
                                                 pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM]),
@@ -897,7 +913,7 @@ def prefill_layer(
                                             ),
                                             target_type=pl.BF16,
                                         ),
-                                        [cache_row, 0],
+                                        [cache_row, cache_col],
                                     )
                                     q_base = ki * Q_PER_KV
                                     q_block_raw = pl.reshape(
@@ -1575,7 +1591,9 @@ def golden_qwen3_14b_prefill(tensors):
     max_blocks_per_seq = block_table.shape[0] // batch
     num_layers = input_rms_weight.shape[0]
     intermediate_size = w_gate.shape[1]
-    layer_cache_rows = batch * max_blocks_per_seq * num_kv_heads * BLOCK_SIZE
+    layer_cache_rows = batch * max_blocks_per_seq * BLOCK_SIZE
+    k_cache_bsnd = k_cache.reshape(-1, kv_hidden)
+    v_cache_bsnd = v_cache.reshape(-1, kv_hidden)
 
     def tiled_lm_head(lhs, rhs_t, k_chunk, vocab_chunk):
         out = torch.zeros(lhs.shape[0], rhs_t.shape[0], dtype=torch.float32)
@@ -1651,8 +1669,9 @@ def golden_qwen3_14b_prefill(tensors):
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
                 for ki in range(num_kv_heads):
-                    cache_row = layer_cache_base + (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
-                    k_cache[cache_row, :] = k_rot[pos, ki, :]
+                    cache_row = layer_cache_base + slot_block * BLOCK_SIZE + slot_offset
+                    cache_col = ki * head_dim
+                    k_cache_bsnd[cache_row, cache_col:cache_col + head_dim] = k_rot[pos, ki, :]
 
             # V cache write.
             v_row_bf16 = v_proj_f.view(S, num_kv_heads, head_dim).to(torch.bfloat16)
@@ -1661,8 +1680,9 @@ def golden_qwen3_14b_prefill(tensors):
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
                 for ki in range(num_kv_heads):
-                    cache_row = layer_cache_base + (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
-                    v_cache[cache_row, :] = v_row_bf16[pos, ki, :]
+                    cache_row = layer_cache_base + slot_block * BLOCK_SIZE + slot_offset
+                    cache_col = ki * head_dim
+                    v_cache_bsnd[cache_row, cache_col:cache_col + head_dim] = v_row_bf16[pos, ki, :]
 
             # Q RoPE -> BF16.
             q_row = q_proj_f.view(S, num_heads, head_dim)
@@ -1689,10 +1709,17 @@ def golden_qwen3_14b_prefill(tensors):
                     v_padded = torch.zeros(padded_len, head_dim, dtype=torch.bfloat16)
                     for sb in range(max_blocks):
                         pbid = int(block_table[cache_base + sb].item())
-                        cache_row0 = layer_cache_base + (pbid * num_kv_heads + kvh) * BLOCK_SIZE
+                        cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
+                        cache_col = kvh * head_dim
                         s0 = sb * SEQ_TILE
-                        k_padded[s0:s0 + BLOCK_SIZE] = k_cache[cache_row0:cache_row0 + BLOCK_SIZE, :]
-                        v_padded[s0:s0 + BLOCK_SIZE] = v_cache[cache_row0:cache_row0 + BLOCK_SIZE, :]
+                        k_padded[s0:s0 + BLOCK_SIZE] = k_cache_bsnd[
+                            cache_row0:cache_row0 + BLOCK_SIZE,
+                            cache_col:cache_col + head_dim,
+                        ]
+                        v_padded[s0:s0 + BLOCK_SIZE] = v_cache_bsnd[
+                            cache_row0:cache_row0 + BLOCK_SIZE,
+                            cache_col:cache_col + head_dim,
+                        ]
 
                     oi = li = mi = None
 

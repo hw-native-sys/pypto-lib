@@ -1,0 +1,26 @@
+CANN-derived fused infer attention sources
+==========================================
+
+The sources under
+models/qwen3/14b/kernels/paged_attention_cce/vendor/fused_infer_attention_score/
+vendor the subset of CANN FusedInferAttentionScore required by Qwen3 decode.
+Their baseline is cann/ops-transformer v9.0.0, commit
+afe72144f9f2ac8441929035795db88a111b30c5:
+
+https://gitcode.com/cann/ops-transformer/tree/afe72144f9f2ac8441929035795db88a111b30c5
+
+The vendored subset originates from
+attention/fused_infer_attention_score/op_kernel/ in that tree.
+
+The generated tiling ABI in
+models/qwen3/14b/kernels/paged_attention_cce/generated/kernel_tiling/
+is derived from
+attention/fused_infer_attention_score/op_host/flash_attention_infer_tiling.h
+at the same baseline. The surrounding PyPTO integration and local adaptations
+provide the PTO topology, direct paged-KV pointers, runtime metadata and
+tiling, and flash-decode synchronization.
+
+The original CANN sources are Copyright (c) Huawei Technologies Co., Ltd.
+Subsequent PyPTO modifications are Copyright (c) 2026 PyPTO Contributors.
+These files are distributed under the CANN Open Software License Agreement
+Version 2.0 included in LICENSE.
