@@ -50,15 +50,16 @@ QKV_K_SLICE = HIDDEN // QKV_OK
 QKV_K_CHUNKS = QKV_K_SLICE // TK
 
 BLOCK_SIZE = T.block_size
-ATTN_TILE = 64
+ATTN_TILE = 16
 PAGE_ATTN_PARTS = BLOCK_SIZE // ATTN_TILE
 MAX_CTX_BLOCKS = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 MAX_ATTN_PARTS = MAX_CTX_BLOCKS * PAGE_ATTN_PARTS
-GP_SIZE = 8
+GP_SIZE = 1
+HEAD_GROUPS = NUM_KV_HEADS // GP_SIZE
 ROPE_CORES = 32
 ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
 NUM_CORES = 24
-FA_TABLE_CAP = BATCH * MAX_ATTN_PARTS
+FA_TABLE_CAP = BATCH * HEAD_GROUPS * MAX_ATTN_PARTS
 OS_WORK = BATCH * NUM_KV_HEADS
 
 K_SPLITS_OUT = 5
@@ -302,11 +303,11 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         cursor = pl.read(seq_lens, [0]) * 0  # scalar 0 (INDEX)
         for wb in pl.unroll(BATCH):
             wb_ctx = (pl.read(seq_lens, [wb]) + (ATTN_TILE - 1)) // ATTN_TILE
-            for wp in pl.range(wb_ctx):
-                pl.tensor.write(
-                    fa_work_table, [cursor + wp], pl.cast(wb * MAX_ATTN_PARTS + wp, target_type=pl.INT32)
-                )
-            cursor = cursor + wb_ctx
+            for whg in pl.unroll(HEAD_GROUPS):
+                for wp in pl.range(wb_ctx):
+                    work_id = (wb * HEAD_GROUPS + whg) * MAX_ATTN_PARTS + wp
+                    pl.tensor.write(fa_work_table, [cursor + wp], pl.cast(work_id, target_type=pl.INT32))
+                cursor = cursor + wb_ctx
         pl.tensor.write(fa_total, [0], pl.cast(cursor, target_type=pl.INT32))
 
     q_proj_norm = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
@@ -315,37 +316,35 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
     inv_rms_col = pl.reshape(inv_rms_states, [BATCH, 1])
 
-    for h in pl.parallel(NUM_KV_HEADS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_norm"):
-            q0 = h * Q_PER_KV * HEAD_DIM
-            q_chunk = pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0])
-            q_chunk = pl.row_expand_mul(q_chunk, inv_rms_col)
-            q_flat = pl.reshape(q_chunk, [BATCH * Q_PER_KV, HEAD_DIM])
-            q_g = pl.col_expand_mul(q_flat, q_norm_w)
-            q_ss = pl.row_sum(pl.mul(q_flat, q_flat))
-            q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-            q_g = pl.row_expand_mul(q_g, q_inv)
-            q_proj_norm = pl.assemble(
-                q_proj_norm,
-                pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]),
-                [0, q0],
-            )
+    for h in pl.spmd(NUM_KV_HEADS, name_hint="qk_norm"):
+        q0 = h * Q_PER_KV * HEAD_DIM
+        q_chunk = pl.slice(q_proj, [BATCH, Q_PER_KV * HEAD_DIM], [0, q0])
+        q_chunk = pl.row_expand_mul(q_chunk, inv_rms_col)
+        q_flat = pl.reshape(q_chunk, [BATCH * Q_PER_KV, HEAD_DIM])
+        q_g = pl.col_expand_mul(q_flat, q_norm_w)
+        q_ss = pl.row_sum(pl.mul(q_flat, q_flat))
+        q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
+        q_g = pl.row_expand_mul(q_g, q_inv)
+        q_proj_norm = pl.assemble(
+            q_proj_norm,
+            pl.reshape(q_g, [BATCH, Q_PER_KV * HEAD_DIM]),
+            [0, q0],
+        )
 
-            k0 = h * HEAD_DIM
-            k_chunk = pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0])
-            k_chunk = pl.row_expand_mul(k_chunk, inv_rms_col)
-            k_g = pl.col_expand_mul(k_chunk, k_norm_w)
-            k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
-            k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-            k_g = pl.row_expand_mul(k_g, k_inv)
-            k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
-    for h in pl.parallel(NUM_KV_HEADS):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="v_norm"):
-            v_norm_k0 = h * HEAD_DIM
-            v_norm_chunk = pl.row_expand_mul(
-                pl.slice(v_proj, [BATCH, HEAD_DIM], [0, v_norm_k0]), inv_rms_col
-            )
-            v_proj_norm = pl.assemble(v_proj_norm, v_norm_chunk, [0, v_norm_k0])
+        k0 = h * HEAD_DIM
+        k_chunk = pl.slice(k_proj, [BATCH, HEAD_DIM], [0, k0])
+        k_chunk = pl.row_expand_mul(k_chunk, inv_rms_col)
+        k_g = pl.col_expand_mul(k_chunk, k_norm_w)
+        k_ss = pl.row_sum(pl.mul(k_chunk, k_chunk))
+        k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
+        k_g = pl.row_expand_mul(k_g, k_inv)
+        k_proj_norm = pl.assemble(k_proj_norm, k_g, [0, k0])
+    for h in pl.spmd(NUM_KV_HEADS, name_hint="v_norm"):
+        v_norm_k0 = h * HEAD_DIM
+        v_norm_chunk = pl.row_expand_mul(
+            pl.slice(v_proj, [BATCH, HEAD_DIM], [0, v_norm_k0]), inv_rms_col
+        )
+        v_proj_norm = pl.assemble(v_proj_norm, v_norm_chunk, [0, v_norm_k0])
 
     for rope_core in pl.spmd(ROPE_CORES, name_hint="rope_qkv", allow_early_resolve=True):
         for rope_it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
@@ -438,7 +437,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             q_rot_hi = pl.add(pl.mul(q_hi, cos_hi_full), pl.mul(q_lo, sin_hi_full))
             q_rot = pl.concat(q_rot_lo, q_rot_hi)
             all_q_padded = pl.assemble(all_q_padded, pl.cast(q_rot, target_type=pl.BF16), [q_pad_row0, 0])
-            q_pad_zero = pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0), target_type=pl.BF16)
+            q_pad_zero = pl.cast(
+                pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                target_type=pl.BF16,
+            )
             all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
             pl.tensor.write(kv_ready, [b], pl.cast(ctx_len * 0 + 1, target_type=pl.INT32))
 
@@ -446,17 +448,23 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
     up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
 
-    for fa_core in pl.spmd(NUM_CORES, name_hint="fa_fused"):
+    for fa_core in pl.spmd(
+        NUM_CORES,
+        name_hint="fa_fused",
+        sync_start=True,
+        allow_early_resolve=True,
+    ):
         fa_total_blocks = pl.cast(pl.read(fa_total, [0]), target_type=pl.INDEX)
         for fa_w in pl.range(fa_core, fa_total_blocks, NUM_CORES):
             fa_enc = pl.cast(pl.read(fa_work_table, [fa_w]), target_type=pl.INDEX)
-            fa_b = fa_enc // MAX_ATTN_PARTS
+            fa_group = fa_enc // MAX_ATTN_PARTS
+            fa_b = fa_group // HEAD_GROUPS
+            fa_hg = fa_group - fa_b * HEAD_GROUPS
             fa_ready_raw = pl.read(kv_ready, [fa_b])
             fa_ready = pl.cast(fa_ready_raw, target_type=pl.INDEX)
             fa_part = fa_enc % MAX_ATTN_PARTS
             fa_p = fa_part // PAGE_ATTN_PARTS
             fa_page_part = fa_part - fa_p * PAGE_ATTN_PARTS
-            fa_hg = 0  # HEAD_GROUPS == 1 (GP_SIZE == NUM_KV_HEADS)
             fa_ctx_len = pl.read(seq_lens, [fa_b])
             sb = fa_p  # logical KV block index (no inner loop — old p_blocks was 1)
             s0 = fa_part * ATTN_TILE
@@ -478,7 +486,11 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     k_scale = pl.tensor.read(k_cache_scale, [cache_row + k_scale_ti, 0])
                     k_row_i8 = pl.slice(k_cache, [1, HEAD_DIM], [cache_row + k_scale_ti, 0])
                     k_row_fp32 = pl.cast(pl.cast(k_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                    k_tile_inline_deq = pl.assemble(k_tile_inline_deq, pl.cast(pl.mul(k_row_fp32, k_scale), target_type=pl.BF16), [k_scale_ti, 0])
+                    k_tile_inline_deq = pl.assemble(
+                        k_tile_inline_deq,
+                        pl.cast(pl.mul(k_row_fp32, k_scale), target_type=pl.BF16),
+                        [k_scale_ti, 0],
+                    )
                 raw_scores = pl.matmul(q_padded, k_tile_inline_deq, b_trans=True, out_dtype=pl.FP32)
                 scores_valid = pl.tensor.set_validshape(pl.mul(raw_scores, ATTN_SCALE), Q_HEAD_PAD, valid_len)
                 scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
@@ -493,30 +505,36 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     v_scale = pl.tensor.read(v_cache_scale, [cache_row + v_scale_ti, 0])
                     v_row_i8 = pl.slice(v_cache, [1, HEAD_DIM], [cache_row + v_scale_ti, 0])
                     v_row_fp32 = pl.cast(pl.cast(v_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                    v_tile_deq = pl.assemble(v_tile_deq, pl.cast(pl.mul(v_row_fp32, v_scale), target_type=pl.BF16), [v_scale_ti, 0])
+                    v_tile_deq = pl.assemble(
+                        v_tile_deq,
+                        pl.cast(pl.mul(v_row_fp32, v_scale), target_type=pl.BF16),
+                        [v_scale_ti, 0],
+                    )
                 oi_raw_deq = pl.matmul(exp_scores_bf16, v_tile_deq, out_dtype=pl.FP32)
                 oi_valid_deq = pl.tensor.set_validshape(oi_raw_deq, Q_HEAD_BATCH, HEAD_DIM)
                 all_oi_tmp = pl.assemble(all_oi_tmp, oi_valid_deq, [g_base + fa_part * Q_HEAD_PAD, 0])
                 all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + fa_part * Q_HEAD_PAD, 0])
                 all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + fa_part * Q_HEAD_PAD, 0])
-            pl.tensor.write(fa_done, [fa_w], pl.cast(1, target_type=pl.INT32))
+            pl.tensor.write(fa_done, [fa_enc], pl.cast(1, target_type=pl.INT32))
 
     for os_core in pl.spmd(NUM_CORES * 2, name_hint="online_softmax"):
         for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
             os_b = os_spmd_idx // NUM_KV_HEADS
             os_gi = os_spmd_idx % NUM_KV_HEADS
+            os_hg = os_gi // GP_SIZE
             os_ctx_len = pl.read(seq_lens, [os_b])
             os_ctx_blocks = (os_ctx_len + ATTN_TILE - 1) // ATTN_TILE
             os_kvh = os_gi  # Q_GROUPS=1
             os_q_base = os_kvh * Q_PER_KV
             os_g_base = (os_b * NUM_KV_HEADS + os_gi) * MAX_ATTN_PARTS * Q_HEAD_PAD
-            os_w_base = pl.cast(os_ctx_len * 0, target_type=pl.INDEX)
-            for os_prev_b in pl.range(os_b):
-                os_w_base = os_w_base + (pl.read(seq_lens, [os_prev_b]) + (ATTN_TILE - 1)) // ATTN_TILE
+            os_w_base = (os_b * HEAD_GROUPS + os_hg) * MAX_ATTN_PARTS
 
             os_done0 = pl.cast(pl.read(fa_done, [os_w_base]), target_type=pl.FP32)
             oi = all_oi_tmp[os_g_base : os_g_base + Q_HEAD_PAD, :]
-            mi = pl.add(all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :], pl.mul(os_done0, 0.0))
+            mi = pl.add(
+                all_cur_mi[os_g_base : os_g_base + Q_HEAD_PAD, :],
+                pl.mul(os_done0, 0.0),
+            )
             li = all_cur_li[os_g_base : os_g_base + Q_HEAD_PAD, :]
             for sb in pl.range(1, os_ctx_blocks):
                 rec = os_g_base + sb * Q_HEAD_PAD
@@ -804,6 +822,66 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
 
 @pl.jit
+def _decode_layer_test_entry(  # noqa: PLR0913 - mirrors the model layer signature
+    hidden_states: pl.Tensor,
+    input_rms_weight: pl.Tensor,
+    wq: pl.Tensor,
+    wk: pl.Tensor,
+    wv: pl.Tensor,
+    wq_scale: pl.Tensor,
+    wk_scale: pl.Tensor,
+    wv_scale: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    block_table: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    k_cache: pl.Tensor,
+    v_cache: pl.Tensor,
+    k_cache_scale: pl.Tensor,
+    v_cache_scale: pl.Tensor,
+    wo: pl.Tensor,
+    wo_scale: pl.Tensor,
+    w_gate: pl.Tensor,
+    w_up: pl.Tensor,
+    w_down: pl.Tensor,
+    post_rms_weight: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+):
+    return _decode_layer(
+        hidden_states,
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        wq_scale,
+        wk_scale,
+        wv_scale,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        k_cache_scale,
+        v_cache_scale,
+        wo,
+        wo_scale,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        out,
+        0,
+    )
+
+
+@pl.jit
 def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM head
     hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
@@ -855,3 +933,124 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
         )
     out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
+
+
+def _decode_layer_test_inputs(initialize: bool):
+    """Build one-layer inputs for CI compile and device smoke tests."""
+    import torch
+
+    torch.manual_seed(1234)
+
+    def tensor(shape, dtype, *, scale=1.0):
+        value = torch.empty(shape, dtype=dtype)
+        if not initialize:
+            return value
+        if dtype == torch.int8:
+            return torch.randint(-2, 3, shape, dtype=dtype)
+        return value.normal_(mean=0.0, std=scale)
+
+    seq_lens = torch.arange(1, BATCH + 1, dtype=torch.int32)
+    block_table = torch.arange(BATCH, dtype=torch.int32)
+    slot_mapping = torch.arange(BATCH, dtype=torch.int32) * BLOCK_SIZE + seq_lens - 1
+    cache_rows = BATCH * NUM_KV_HEADS * BLOCK_SIZE
+    weight_scale = 1.0 / INT8_SCALE_MAX
+
+    return [
+        tensor([BATCH, HIDDEN], torch.bfloat16, scale=0.1),
+        torch.ones([1, HIDDEN], dtype=torch.float32),
+        tensor([HIDDEN, HIDDEN], torch.int8),
+        tensor([HIDDEN, KV_HIDDEN], torch.int8),
+        tensor([HIDDEN, KV_HIDDEN], torch.int8),
+        torch.full([1, HIDDEN], weight_scale, dtype=torch.float32),
+        torch.full([1, KV_HIDDEN], weight_scale, dtype=torch.float32),
+        torch.full([1, KV_HIDDEN], weight_scale, dtype=torch.float32),
+        torch.ones([1, HEAD_DIM], dtype=torch.float32),
+        torch.ones([1, HEAD_DIM], dtype=torch.float32),
+        seq_lens,
+        block_table,
+        slot_mapping,
+        torch.ones([BLOCK_SIZE, HEAD_DIM], dtype=torch.float32),
+        torch.zeros([BLOCK_SIZE, HEAD_DIM], dtype=torch.float32),
+        tensor([cache_rows, HEAD_DIM], torch.int8),
+        tensor([cache_rows, HEAD_DIM], torch.int8),
+        torch.full([cache_rows, 1], weight_scale, dtype=torch.float32),
+        torch.full([cache_rows, 1], weight_scale, dtype=torch.float32),
+        tensor([HIDDEN, HIDDEN], torch.int8),
+        torch.full([1, HIDDEN], weight_scale, dtype=torch.float32),
+        tensor([HIDDEN, INTERMEDIATE], torch.bfloat16, scale=0.002),
+        tensor([HIDDEN, INTERMEDIATE], torch.bfloat16, scale=0.002),
+        tensor([INTERMEDIATE, HIDDEN], torch.bfloat16, scale=0.002),
+        torch.ones([1, HIDDEN], dtype=torch.float32),
+    ]
+
+
+def _patch_test_aicore_bitcast_helpers(work_dir) -> int:
+    """Make generated bitcast helpers callable from AICore test kernels."""
+    from pathlib import Path
+
+    needle = "static inline To ptoas_bitcast(From from) {"
+    replacement = "static __aicore__ inline To ptoas_bitcast(From from) {"
+    patched = 0
+    for cpp in Path(work_dir).rglob("*.cpp"):
+        try:
+            source = cpp.read_text()
+        except UnicodeDecodeError:
+            continue
+        if needle not in source:
+            continue
+        cpp.write_text(source.replace(needle, replacement))
+        patched += 1
+    return patched
+
+
+def _main() -> None:
+    import argparse
+
+    import torch
+    from pypto.backend import BackendType, set_backend_type
+    from pypto.runtime import RunConfig
+
+    parser = argparse.ArgumentParser(description="Compile or run one Qwen3-14B A8W8 decode layer.")
+    parser.add_argument(
+        "-p",
+        "--platform",
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    )
+    parser.add_argument("-d", "--device", type=int, default=0)
+    args = parser.parse_args()
+
+    backend_type = BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B
+    set_backend_type(backend_type)
+    compile_only = args.platform.endswith("sim")
+    inputs = _decode_layer_test_inputs(initialize=not compile_only)
+    out = torch.empty([BATCH, HIDDEN], dtype=torch.bfloat16)
+
+    if compile_only:
+        program = _decode_layer_test_entry.compile_for_test(*inputs, out)
+        print(f"Compiled A8W8 decode layer with {len(program.functions)} function(s).")
+        return
+
+    out.zero_()
+    run_config = RunConfig(
+        platform=args.platform,
+        device_id=args.device,
+        backend_type=backend_type,
+        enable_dep_gen=False,
+        dump_passes=False,
+    )
+    program = _decode_layer_test_entry.compile(*inputs, out, config=run_config)
+    patched = _patch_test_aicore_bitcast_helpers(program.output_dir)
+    print(f"Patched {patched} AICore bitcast helper(s).")
+    program(*inputs, out, config=run_config)
+    output = out.float()
+    if not torch.isfinite(output).all():
+        raise RuntimeError("A8W8 decode layer produced non-finite output")
+    print(
+        "A8W8 decode layer smoke passed: "
+        f"shape={tuple(out.shape)}, max_abs={output.abs().max().item():.6f}"
+    )
+
+
+if __name__ == "__main__":
+    _main()
