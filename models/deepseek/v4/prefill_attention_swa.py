@@ -28,7 +28,7 @@ from config import (
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
-from hc_post import golden_hc_post, hc_post
+from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
 from qkv_proj_rope import golden_qkv_proj_rope, materialize_rope_rows, qkv_proj_rope
 from rmsnorm import golden_rms_norm, rms_norm
@@ -211,7 +211,7 @@ def prefill_attention_swa(
         wo_a, wo_b, wo_b_scale, attn_out,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
     return kv_cache, x_out
 
 
@@ -362,12 +362,13 @@ def golden_prefill_attention_swa(tensors):
     tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post({
+    golden_hc_post_prefill({
         "x": attn_out.view(T, D),
         "residual": x_hc_flat,
         "post": post,
         "comb": comb,
         "y": y,
+        "num_tokens": tensors["num_tokens"],
     })
     tensors["x_out"][:] = y
 
@@ -523,9 +524,9 @@ def valid_ratio_reldiff(
 
     Mirrors decode_attention_swa's ``ratio_reldiff`` bar and prefill_layer's
     ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
-    ``T`` rows but only the leading ``num_tokens`` are active, so the trailing
-    padding rows (whose device scratch is undefined) are sliced off before the
-    relative-diff check.
+    ``T`` rows but only the leading ``num_tokens`` participate in attention
+    accuracy. The deterministic zero padding is sliced off so it cannot dilute
+    the active-token error ratio.
     """
     from golden import ratio_reldiff
 
@@ -541,6 +542,9 @@ def valid_ratio_reldiff(
         rtol,
         atol,
     ):
+        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
+        if tail_nonzero:
+            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
         return base_cmp(
             actual[:num_tokens],
             expected[:num_tokens],

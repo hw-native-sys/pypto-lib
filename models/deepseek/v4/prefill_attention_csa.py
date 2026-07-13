@@ -38,7 +38,7 @@ from prefill_compressor_ratio4 import (
     golden_prefill_compressor_ratio4,
     prefill_compressor_ratio4,
 )
-from hc_post import golden_hc_post, hc_post
+from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
 from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
@@ -283,7 +283,7 @@ def prefill_attention_csa(
         wo_a, wo_b, wo_b_scale, attn_out,
     )
 
-    hc_post(attn_out, x_hc, post, comb, x_out)
+    hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
     return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
 
 
@@ -511,12 +511,13 @@ def golden_prefill_attention_csa(tensors):
     tensors["kv_cache"][:] = kv_cache_in
 
     y = torch.zeros(T, HC_MULT, D, dtype=torch.float32)
-    golden_hc_post({
+    golden_hc_post_prefill({
         "x": attn_out,
         "residual": tensors["x_hc"],
         "post": post,
         "comb": comb,
         "y": y,
+        "num_tokens": tensors["num_tokens"],
     })
     tensors["x_out"][:] = y
 
@@ -923,15 +924,18 @@ def valid_ratio_reldiff(
 
     Mirrors decode_attention_csa's ``ratio_reldiff`` bar and prefill_layer's
     ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
-    ``T`` rows but only the leading ``num_tokens`` are active, so the trailing
-    padding rows (whose device scratch is undefined) are sliced off before the
-    relative-diff check.
+    ``T`` rows but only the leading ``num_tokens`` participate in attention
+    accuracy. The deterministic zero padding is sliced off so it cannot dilute
+    the active-token error ratio.
     """
     from golden import ratio_reldiff
 
     base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
 
     def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
+        if tail_nonzero:
+            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
         return base_cmp(
             actual[:num_tokens],
             expected[:num_tokens],

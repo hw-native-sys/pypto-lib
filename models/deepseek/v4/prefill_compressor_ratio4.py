@@ -47,7 +47,6 @@ CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLO
 CSA_STATE_BLOCK_NUM = CSA_STATE_MAX_BLOCKS
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
-PACKED_POOL_BLOCKS = MAX_CMP_WRITES * HEAD_BLOCKS
 PACKED_STATE_UPDATE_TILE = 16
 PACKED_RMS_TILE = 16
 
@@ -117,7 +116,10 @@ def prefill_compressor_ratio4(
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
 
-    for pool_idx in pl.spmd(PACKED_POOL_BLOCKS, name_hint="prefill_c4_softmax_pool"):
+    # A contiguous active prefix can close at most ceil(num_tokens / ratio)
+    # compressed rows, regardless of the absolute start-position alignment.
+    active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * HEAD_BLOCKS
+    for pool_idx in pl.spmd(active_pool_blocks, name_hint="prefill_c4_softmax_pool"):
         write_i = pool_idx // HEAD_BLOCKS
         hb = pool_idx - write_i * HEAD_BLOCKS
         h0 = hb * HEAD_CHUNK
