@@ -99,10 +99,7 @@ def test_loaded_kernel_modules_match_current_qwen3_files() -> None:
 
     assert sorted(loaded.functions) == ["decode_fwd", "greedy_sample_fwd", "prefill_fwd"]
     assert sorted(contract.kernels) == ["decode", "greedy_sample", "prefill"]
-    assert set(contract.kernels) <= {
-        name.removesuffix("_fwd")
-        for name in loaded.functions
-    }
+    assert set(contract.kernels) <= {name.removesuffix("_fwd") for name in loaded.functions}
     contract.validate_kernels(contract, loaded, model)
 
 
@@ -141,6 +138,26 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
 
     assert [tuple(arg.shape) for arg in greedy_args] == [(16, 512), (16, 8)]
     assert len(greedy_args) == len(inspect.signature(loaded.functions["greedy_sample_fwd"]._func).parameters)
+
+
+def test_decode_contract_uses_static_batch_sixteen() -> None:
+    contract = get_contract("qwen3", "14b")
+    decode_args = {arg.name: arg.shape for arg in contract.kernels["decode"].args}
+
+    assert contract.limits["batch"] == 16
+    assert decode_args["seq_lens"] == ("B",)
+    assert decode_args["slot_mapping"] == ("B",)
+    assert decode_args["out"] == ("B", "VOCAB")
+    assert decode_args["sampled_ids_in"] == ("B", "SAMPLED_IDS_PAD")
+    assert decode_args["sampled_ids"] == ("B", "SAMPLED_IDS_PAD")
+    assert decode_args["next_hidden"] == ("B", "H")
+
+    compile_args = contract.kernels["decode"].compile_args_builder(
+        _tiny_model_config(),
+        _runtime_config(),
+    )
+    assert compile_args[6].shape == (16,)
+    assert compile_args[-1].shape == (16, 8)
 
 
 def test_runtime_arg_builders_follow_host_order() -> None:
