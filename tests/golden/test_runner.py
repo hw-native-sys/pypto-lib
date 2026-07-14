@@ -1234,6 +1234,10 @@ class TestL3BenchmarkAggregation:
         stats = self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]})
         assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [10.0, 5.0]
 
+    def test_fast_effective_drops_incomplete_round_only(self):
+        stats = self._Stats({100: [10.0, 30.0], 101: [0.0, 5.0]})
+        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [5.0]
+
     @pytest.mark.parametrize(
         "rank_eff",
         [
@@ -1242,26 +1246,38 @@ class TestL3BenchmarkAggregation:
             {},
         ],
     )
-    def test_fast_effective_rejects_incomplete_rank_timing(self, rank_eff):
+    def test_fast_effective_returns_empty_without_complete_round(self, rank_eff):
         assert _l3_fast_effective_per_round(self._Stats(rank_eff), expected_rank_count=2) == []
 
     def test_fast_effective_rejects_rank_missing_from_every_round(self):
         stats = self._Stats({100: [10.0]})
         assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == []
 
-    def test_fast_effective_rejects_rank_missing_from_raw_round(self):
+    def test_fast_effective_drops_round_missing_rank_from_raw_data(self):
         stats = self._Stats(
-            {100: [10.0], 101: [20.0]},
-            rounds_dispatches=[{100: []}],
+            {100: [10.0, 30.0], 101: [20.0, 5.0]},
+            rounds_dispatches=[{100: []}, {100: [], 101: []}],
         )
-        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == []
+        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [5.0]
 
     def test_fast_effective_report_has_dedicated_ci_token(self, capsys):
         _report_l3_fast_effective(
             self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]}),
             expected_rank_count=2,
         )
-        assert "fast_effective_us (2 rounds) min=5.0 median=7.5 mean=7.5 max=10.0" in capsys.readouterr().out
+        assert (
+            "fast_effective_us (2 rounds) min=5.0 median=7.5 mean=7.5 max=10.0 valid_rounds=2/2"
+            in capsys.readouterr().out
+        )
+
+    def test_fast_effective_report_counts_dropped_rounds(self, capsys):
+        _report_l3_fast_effective(
+            self._Stats({100: [10.0, 30.0], 101: [0.0, 5.0]}),
+            expected_rank_count=2,
+        )
+        out = capsys.readouterr().out
+        assert "fast_effective_us (1 round)" in out
+        assert "valid_rounds=1/2" in out
 
     def test_fast_effective_report_marks_missing_timing_unavailable(self, capsys):
         _report_l3_fast_effective(

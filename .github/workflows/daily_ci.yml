@@ -200,8 +200,8 @@ jobs:
           # round's Effective window. L3 (multi-card) first selects each round's
           # fastest valid rank via `fast_effective_us`, then averages those values.
           # L3 is detected by the `l3=1` / `l3_resident=1` marker its benchmark
-          # emits. Missing/zero timing on any rank suppresses `fast_effective_us`,
-          # so an incomplete sample becomes `-` instead of a false fast-card time.
+          # emits. Missing/zero timing on any rank drops only that round from the
+          # aggregate; a case becomes `-` only when no complete round remains.
           extract_perf() {
             local out; out=$(cat)
             if printf '%s' "$out" | grep -qE 'l3=1|l3_resident=1'; then
