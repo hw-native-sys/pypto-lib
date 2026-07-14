@@ -879,7 +879,8 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
+    parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,
                         help="Reuse a prior run's data/{in,out} (skips golden recompute); "
                              "requires an unchanged spec set.")
@@ -890,6 +891,7 @@ if __name__ == "__main__":
         fn=attention_csa_test,
         specs=build_tensor_specs(args.start_pos),
         golden_fn=golden_attention_csa,
+        runtime_dir=args.runtime_dir,
         golden_data=args.golden_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
