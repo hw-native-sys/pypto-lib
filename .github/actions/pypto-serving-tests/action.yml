@@ -83,7 +83,7 @@ runs:
         run_cmd="$run_cmd PTO2_RING_TASK_WINDOW=$PTO2_RING_TASK_WINDOW"
         run_cmd="$run_cmd PTO2_RING_HEAP=$PTO2_RING_HEAP"
         run_cmd="$run_cmd python -m pytest tests/test_qwen3_accuracy.py -q -s"
-        task-submit --device "$DEVICE_ID" --timeout 1200 --max-time 1800 \
+        task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
           --run "$run_cmd"
 
     - name: Run pypto-serving DeepSeek V4 accuracy test
@@ -118,5 +118,5 @@ runs:
         run_cmd="$run_cmd SERVING_WORKER_STEP_TIMEOUT=$SERVING_WORKER_STEP_TIMEOUT"
         run_cmd="$run_cmd python -m pytest tests/test_deepseek_v4_accuracy.py -q -s"
         task-submit --device auto --device-num 8 --ignore-whitelist \
-          --timeout 1200 --max-time 1800 \
+          --timeout 3600 --max-time 1800 \
           --run "$run_cmd"

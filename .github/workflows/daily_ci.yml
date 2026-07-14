@@ -135,7 +135,10 @@ jobs:
     # install happen under ./dist-checkout to avoid colliding with any
     # container-owned workspace left on the shared runner.
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 60
+    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
+    # --max-time 900 run), or the job dies before task-submit's own timeout can
+    # ever fire — and the first queued case would eat the whole job budget.
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: dist-checkout
@@ -221,7 +224,7 @@ jobs:
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 1800 --max-time 900 \
+            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
               --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
@@ -248,7 +251,7 @@ jobs:
           # Higher world sizes (ep4/ep8) are added manually as dedicated wraps
           # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
           # own --device-num (card pool must provide that many cards), e.g.:
-          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 1800 --max-time 900 \
+          #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
           #     --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && \
           #       PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout \
           #       python models/deepseek/v4/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"

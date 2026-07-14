@@ -212,7 +212,10 @@ jobs:
     # fixed card id. Checkout / install happen under ./dist-checkout to avoid
     # colliding with any container-owned workspace left on the shared runner.
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 60
+    # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
+    # --max-time 600 run), or the job dies before task-submit's own timeout can
+    # ever fire — and the first queued case would eat the whole job budget.
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: dist-checkout
@@ -282,7 +285,7 @@ jobs:
             ndev=${ndev:-1}
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
-            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 1800 --max-time 600 \
+            task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 600 \
               --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout python $f -p a2a3 -d \$TASK_DEVICE"
             if [ $? -ne 0 ]; then
               failed+=("$f")
@@ -315,7 +318,9 @@ jobs:
       (needs.detect-changes.outputs.run_qwen_serving_tests == 'true' ||
        needs.detect-changes.outputs.run_deepseek_serving_tests == 'true')
     runs-on: [self-hosted, linux, arm64, npu]
-    timeout-minutes: 90
+    # A PR touching both models runs the qwen3 and deepseek task-submits back to
+    # back in this one job, each worst-casing at --timeout 3600 + --max-time 1800.
+    timeout-minutes: 180
     env:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
