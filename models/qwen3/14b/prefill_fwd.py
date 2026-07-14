@@ -21,8 +21,9 @@ Every batch-dependent kernel signature dim is a `pl.dynamic(...)` variable
 (`USER_BATCH_DYN` / `PREFILL_TOKENS_DYN` / `KV_CACHE_ROWS_DYN` /
 `BLOCK_TABLE_FLAT_DYN`), so a single compiled program serves any
 `user_batch <= host KV-cache capacity`. Host allocates the input/output
-hidden states and slot mapping as packed token-major tensors with leading
-dim `T = sum(chunk_lens)` (no `[batch, max_seq]` padding). `seq_lens`
+token ids and slot mapping as packed token-major tensors with leading dim
+`T = sum(chunk_lens)` (no `[batch, max_seq]` padding). The embedding table is
+gathered on device before the first transformer layer. `seq_lens`
 stores the absolute sequence length after the current chunk; `chunk_lens`
 and `chunk_offsets` identify each batch row's slice inside the packed chunk.
 
@@ -90,6 +91,7 @@ KV_OUT_CHUNK = 256
 TOK_TILE = 64
 SEQ_TILE = T.seq_tile
 BLOCK_SIZE = T.block_size
+EMBED_HIDDEN_CHUNK = K_CHUNK
 ROPE_SPMD_BLOCKS = 32
 ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
@@ -162,6 +164,8 @@ SILU_SPMD_BLOCKS = 24
 GATE_UP_SPMD_BLOCKS = 24
 UP_PROJ_CORE_SHIFT = MLP_BAND_BLOCKS - GATE_UP_SPMD_BLOCKS
 DOWN_PROJ_SPMD_BLOCKS = 24
+
+assert HIDDEN % EMBED_HIDDEN_CHUNK == 0
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1255,7 +1259,7 @@ def prefill_layer(
 
 @pl.jit(auto_scope=False)
 def prefill_fwd(
-    hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
+    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
@@ -1278,9 +1282,10 @@ def prefill_fwd(
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
     out: pl.Out[pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]],
 ) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
-    hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
+    input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
     seq_lens.bind_dynamic(0, USER_BATCH_DYN)
     chunk_lens.bind_dynamic(0, USER_BATCH_DYN)
     chunk_offsets.bind_dynamic(0, USER_BATCH_DYN)
@@ -1292,7 +1297,28 @@ def prefill_fwd(
 
     user_batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
-    prefill_tokens = pl.tensor.dim(hidden_states, 0)
+    prefill_tokens = pl.tensor.dim(input_ids, 0)
+
+    hidden_states = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
+    for p0 in pl.parallel(0, prefill_tokens, TOK_TILE):
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
+            valid_tok = pl.min(TOK_TILE, prefill_tokens - p0)
+            for ti in pl.range(TOK_TILE):
+                if ti < valid_tok:
+                    token_idx = p0 + ti
+                    token_id = pl.tensor.read(input_ids, [token_idx])
+                    token_row = pl.cast(token_id, target_type=pl.INDEX)
+                    for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                        hidden_chunk = pl.slice(
+                            embed_weight,
+                            [1, EMBED_HIDDEN_CHUNK],
+                            [token_row, k0],
+                        )
+                        hidden_states = pl.assemble(
+                            hidden_states,
+                            hidden_chunk,
+                            [token_idx, k0],
+                        )
 
     for layer_idx in pl.range(num_layers_actual):
         with pl.scope():
@@ -1410,8 +1436,8 @@ def build_tensor_specs(
     if total_tokens <= 0:
         raise ValueError("chunked prefill requires at least one token in the current chunk")
 
-    def init_hidden_states():
-        return torch.rand(total_tokens, hidden_size) - 0.5
+    def init_input_ids():
+        return torch.arange(total_tokens, dtype=torch.int32) % vocab
 
     def init_seq_lens():
         return seq_lens_values.clone()
@@ -1492,9 +1518,11 @@ def build_tensor_specs(
     def init_lm_head_weight():
         return (torch.rand(vocab, hidden_size) - 0.5) / hidden_size ** 0.5
 
+    def init_embed_weight():
+        return torch.rand(vocab, hidden_size) - 0.5
+
     return [
-        TensorSpec("hidden_states", [total_tokens, hidden_size], torch.bfloat16,
-                   init_value=init_hidden_states),
+        TensorSpec("input_ids", [total_tokens], torch.int32, init_value=init_input_ids),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
         TensorSpec("chunk_lens", [batch], torch.int32, init_value=init_chunk_lens),
         TensorSpec("chunk_offsets", [batch], torch.int32, init_value=init_chunk_offsets),
@@ -1536,6 +1564,8 @@ def build_tensor_specs(
                    init_value=init_final_norm_weight),
         TensorSpec("lm_head_weight", [vocab, hidden_size], torch.bfloat16,
                    init_value=init_lm_head_weight),
+        TensorSpec("embed_weight", [vocab, hidden_size], torch.bfloat16,
+                   init_value=init_embed_weight),
         TensorSpec("out", [batch, vocab], torch.float32, is_output=True),
     ]
 
@@ -1551,7 +1581,7 @@ def golden_qwen3_14b_prefill(tensors):
 
     import torch
 
-    hidden_states = tensors["hidden_states"]
+    input_ids = tensors["input_ids"]
     seq_lens = tensors["seq_lens"]
     chunk_lens = tensors["chunk_lens"]
     chunk_offsets = tensors["chunk_offsets"]
@@ -1574,11 +1604,12 @@ def golden_qwen3_14b_prefill(tensors):
     w_down = tensors["w_down"]
     final_norm_weight = tensors["final_norm_weight"]
     lm_head_weight = tensors["lm_head_weight"]
+    embed_weight = tensors["embed_weight"]
 
     batch = seq_lens.shape[0]
-    total_tokens = hidden_states.shape[0]
+    total_tokens = input_ids.shape[0]
     max_seq = rope_cos.shape[0]
-    hidden_size = hidden_states.shape[1]
+    hidden_size = embed_weight.shape[1]
     kv_hidden = wk.shape[1]
     head_dim = rope_cos.shape[1]
     num_kv_heads = kv_hidden // head_dim
@@ -1602,7 +1633,7 @@ def golden_qwen3_14b_prefill(tensors):
             out += lhs_chunk @ rhs_t[:, k0:k0 + k_chunk].float().T
         return out
 
-    hidden = hidden_states.clone()
+    hidden = embed_weight.index_select(0, input_ids.long()).clone()
     for layer_idx in range(num_layers):
         layer_hidden_base = layer_idx * hidden_size
         layer_inter_base = layer_idx * intermediate_size
