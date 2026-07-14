@@ -235,9 +235,9 @@ def sparse_attn_swa(
     # and store granularity.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_swap_idx = pl.create_tensor([HEADS_PER_GROUP, ROPE_DIM], dtype=pl.INT32)
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
-        swap_ones = pl.full([HEADS_PER_GROUP, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        swap_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         swap_range_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         swap_range = pl.cast(swap_range_i32, target_type=pl.FP32)
         swap_col = pl.col_expand_mul(swap_ones, swap_range)
@@ -272,50 +272,49 @@ def sparse_attn_swa(
             rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
             rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
-    # Specialize the one-block SWA merge to the output-projection group. Each
-    # group grid produces exactly the [T, O_GROUP_IN] slab consumed by proj_a[g]
-    # and exposes its own TaskId, so early groups can enter the cube pipeline
-    # while later AIV merge groups are still running.
-    merge_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
-    with pl.manual_scope():
-        for m_g in pl.parallel(O_GROUPS):
-            with pl.spmd(
-                T,
-                name_hint="merge_norm",
-                deps=[qk_tid, rope_tid],
-                allow_early_resolve=True,
-            ) as merge_tid:
-                m_t = pl.tile.get_block_idx()
-                m_h0 = m_g * HEADS_PER_GROUP
-                m_blk_base = m_t * H + m_h0
-                m_mi = sparse_blk_mi[m_blk_base : m_blk_base + HEADS_PER_GROUP, 0:1]
-                m_li = sparse_blk_li[m_blk_base : m_blk_base + HEADS_PER_GROUP, 0:1]
-                m_oi = sparse_blk_oi[m_blk_base : m_blk_base + HEADS_PER_GROUP, 0:HEAD_DIM]
+    # Flatten the one-block SWA merge over token/head tiles into a single
+    # 32-block grid, which fits in one AIV wave and avoids eight group-grid
+    # submissions. Each block writes two output-projection groups using the
+    # same contiguous per-group stores.
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
+                 allow_early_resolve=True) as merge_tid:
+        m_idx = pl.tile.get_block_idx()
+        m_t = m_idx // (H // H_TILE)
+        m_h_idx = m_idx - m_t * (H // H_TILE)
+        m_h0 = m_h_idx * H_TILE
+        m_blk_base = m_t * H + m_h0
+        m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0:1]
+        m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0:1]
+        m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0:HEAD_DIM]
 
-                n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + HEADS_PER_GROUP], [HEADS_PER_GROUP, 1])
-                n_sink_delta = pl.sub(n_sink, m_mi)
-                n_sink_exp = pl.exp(n_sink_delta)
-                n_denom = pl.add(m_li, n_sink_exp)
-                n_normalized = pl.row_expand_div(m_oi, n_denom)
-                n_full = n_normalized[0:HEADS_PER_GROUP, 0:HEAD_DIM]
-                n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+        n_sink = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        n_sink_delta = pl.sub(n_sink, m_mi)
+        n_sink_exp = pl.exp(n_sink_delta)
+        n_denom = pl.add(m_li, n_sink_exp)
+        n_normalized = pl.row_expand_div(m_oi, n_denom)
+        n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
+        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-                # Preserve the proven indexed interleaved rotation. Reshape the
-                # GM destination (whose row-major layout is defined), not the
-                # local 8x512 tile (whose physical tile layout is backend-owned).
-                m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-                m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
-                m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
-                m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
-                m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
-                m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
-                m_rot = pl.add(m_rope_cos, m_swap_sin)
-                n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-                n_pack_row = m_g * T + m_t
-                n_dst_head = n_pack_row * HEADS_PER_GROUP
-                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[:, 0:NOPE_DIM]
-                o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_bf16
-            merge_tids[m_g] = merge_tid
+        m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
+        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
+        m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
+        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
+        m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
+        m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
+        m_rot = pl.add(m_rope_cos, m_swap_sin)
+        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+
+        m_g0 = m_h0 // HEADS_PER_GROUP
+        for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):
+            m_src_h0 = m_sg * HEADS_PER_GROUP
+            n_pack_row = (m_g0 + m_sg) * T + m_t
+            n_dst_head = n_pack_row * HEADS_PER_GROUP
+            o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, 0:NOPE_DIM] = n_bf16[
+                m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:NOPE_DIM
+            ]
+            o_packed_heads[n_dst_head : n_dst_head + HEADS_PER_GROUP, NOPE_DIM:HEAD_DIM] = n_rope_bf16[
+                m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM
+            ]
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
@@ -328,7 +327,7 @@ def sparse_attn_swa(
     # groups are still in flight (a genuine proj_a<->proj_b back-to-back GEMM).
     #
     # manual_scope SUPPRESSES auto-dep, so every edge is explicit: proj_a[g]
-    # reads only its o_packed slab -> deps=[merge_tids[g]]; quant[g] deps on group
+    # reads only its o_packed slab -> deps=[merge_tid]; quant[g] deps on group
     # g's proj_a task; proj_b depends directly on quant[g] and writes a disjoint
     # group partial. proj_b_act combines those partials with their group row scales,
     # applies the per-channel weight scale, and is the consolidated attn_out writer.
@@ -348,12 +347,7 @@ def sparse_attn_swa(
             row_base_o = g * T
             out_col_g = g * O_LORA
 
-            with pl.spmd(
-                PA_NFRAGS,
-                name_hint="proj_a_mm",
-                deps=[merge_tids[g]],
-                allow_early_resolve=True,
-            ) as pa_tid:
+            with pl.spmd(PA_NFRAGS, name_hint="proj_a_mm", deps=[merge_tid], allow_early_resolve=True) as pa_tid:
                 nf = pl.tile.get_block_idx()
                 n0 = nf * PROJ_A_MM_N_TILE
                 xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
@@ -418,12 +412,8 @@ def sparse_attn_swa(
     # Consolidate the eight grouped INT32 partials in one vector epilogue. Keep
     # the direct per-group task dependencies so there is no synthetic join task
     # between the output-projection cubes and dequantization.
-    with pl.spmd(
-        PB_ACT_NREG * PB_ACT_TBLKS,
-        name_hint="proj_b_act",
-        deps=[proj_b_tids[i] for i in range(O_GROUPS)],
-        allow_early_resolve=True,
-    ) as _act_tid:
+    with pl.spmd(PB_ACT_NREG * PB_ACT_TBLKS, name_hint="proj_b_act",
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
         act_idx = pl.tile.get_block_idx()
         nreg = act_idx // PB_ACT_TBLKS
         tblk = act_idx - nreg * PB_ACT_TBLKS
