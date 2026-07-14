@@ -720,9 +720,11 @@ def golden_hc_pre(tensors):
         comb_t = comb_t / (comb_t.sum(-1, keepdim=True) + HC_EPS)
         comb_t = comb_t / (comb_t.sum(-2, keepdim=True) + HC_EPS)
 
-    y = torch.zeros(t_dim, D, dtype=torch.float32)
-    for h in range(HC_MULT):
-        y += x[:, h, :] * pre[:, h:h + 1]
+    y0 = x[:, 0, :] * pre[:, 0:1]
+    y1 = x[:, 1, :] * pre[:, 1:2]
+    y2 = x[:, 2, :] * pre[:, 2:3]
+    y3 = x[:, 3, :] * pre[:, 3:4]
+    y = (y0 + y1) + (y2 + y3)
 
     def _to_device_bf16(value):
         rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
