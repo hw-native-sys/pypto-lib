@@ -256,12 +256,16 @@ def dispatch(
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
-    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (payload landed) -- the
-    # local RAW edge on recv_x only orders after this rank's own outgoing puts, not
-    # the incoming ones. dispatch_meta and dispatch_push stay independent and can
-    # overlap. recv_x_out is this grid's output; expert_routed reads it in auto
-    # scope and orders after it.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid]) as _gather_tid:
+    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (incoming payload
+    # landed), _push_tid (this rank's own local-to-local puts into recv_x). The
+    # explicit _push_tid edge is required here: dispatch_wait now depends on
+    # dispatch_meta (not dispatch_push), so gather no longer transitively orders
+    # after the local push -- and the data_arrived barrier only covers *incoming*
+    # (src != my_rank) data, not this rank's own dst == my_rank puts. Without it,
+    # gather could read its own recv_x lane before push finishes writing it.
+    # recv_x_out is this grid's output; expert_routed reads it in auto scope and
+    # orders after it.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid, _push_tid]) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
