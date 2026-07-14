@@ -940,9 +940,10 @@ if __name__ == "__main__":
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None,
                         help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
                              "instead of regenerating inputs + recomputing golden.")
@@ -965,6 +966,7 @@ if __name__ == "__main__":
         ),
         golden_fn=golden_moe,
         golden_data=golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
