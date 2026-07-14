@@ -438,14 +438,14 @@ def _report_effective(stats: Any) -> None:
 
 
 def _l3_fast_effective_per_round(stats: Any, expected_rank_count: int) -> list[float]:
-    """Return each L3 round's fastest valid rank Effective time.
+    """Return the fastest rank Effective time for each complete L3 round.
 
-    A zero means that rank emitted no usable orch/sched timing; reject the whole
-    sample rather than misreading the missing marker as an extremely fast card.
-    Validate the observed rank count against the compiled distributed device
-    count so a rank missing from every round cannot silently disappear. Also
-    require every round to contain the same rank set; ``per_rank`` fills a rank
-    missing from only some rounds with zero, which the value check rejects.
+    A zero means that rank emitted no usable orch/sched timing. Drop that round
+    rather than misreading the missing marker as an extremely fast card or
+    discarding otherwise usable rounds. Validate the observed rank count against
+    the compiled distributed device count so a rank missing from every round
+    cannot silently disappear. ``per_rank`` fills a rank missing from only some
+    rounds with zero; the raw rank-set check rejects that round too.
     """
     rank_eff = stats.per_rank("effective")
     n_rounds = len(stats.rounds_dispatches)
@@ -454,16 +454,15 @@ def _l3_fast_effective_per_round(stats: Any, expected_rank_count: int) -> list[f
     observed_ranks = set(rank_eff)
     if len(observed_ranks) != expected_rank_count:
         return []
-    if any(set(ranks) != observed_ranks for ranks in stats.rounds_dispatches):
-        return []
-    if any(len(series) != n_rounds for series in rank_eff.values()):
-        return []
-
     fast: list[float] = []
     for round_idx in range(n_rounds):
+        if set(stats.rounds_dispatches[round_idx]) != observed_ranks:
+            continue
+        if any(round_idx >= len(series) for series in rank_eff.values()):
+            continue
         values = [series[round_idx] for series in rank_eff.values()]
         if any(value <= 0.0 for value in values):
-            return []
+            continue
         fast.append(min(values))
     return fast
 
@@ -471,16 +470,19 @@ def _l3_fast_effective_per_round(stats: Any, expected_rank_count: int) -> list[f
 def _report_l3_fast_effective(stats: Any, expected_rank_count: int) -> None:
     """Print the fast-rank L3 metric consumed by Daily CI."""
     fast = _l3_fast_effective_per_round(stats, expected_rank_count)
+    total_rounds = len(stats.rounds_dispatches)
     if not fast:
         print(
-            "[RUN]   fast_effective_us unavailable: incomplete per-rank orch/sched timing",
+            "[RUN]   fast_effective_us unavailable: no complete per-rank orch/sched rounds",
             flush=True,
         )
         return
+    round_label = "round" if len(fast) == 1 else "rounds"
     print(
-        f"[RUN]   fast_effective_us ({len(fast)} rounds) "
+        f"[RUN]   fast_effective_us ({len(fast)} {round_label}) "
         f"min={min(fast):.1f} median={statistics.median(fast):.1f} "
-        f"mean={statistics.fmean(fast):.1f} max={max(fast):.1f}",
+        f"mean={statistics.fmean(fast):.1f} max={max(fast):.1f} "
+        f"valid_rounds={len(fast)}/{total_rounds}",
         flush=True,
     )
 
