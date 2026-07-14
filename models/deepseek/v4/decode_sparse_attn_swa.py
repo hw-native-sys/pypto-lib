@@ -48,6 +48,11 @@ ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 # tiling
 GATHER_SPLITS = 4
 GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
+# Sub-tile probed for physical contiguity: a decode window is a run of consecutive
+# logical positions, so a sub-tile that stays inside one paged block maps to
+# consecutive cache rows and moves in ONE bulk DMA. Only a block-straddling or -1
+# sub-tile falls back to the per-row copy (~0.44us/row vs ~0.02us/row bulk).
+GATHER_RUN = 16
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
 # per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
@@ -120,6 +125,8 @@ NEG_INF = -1.0e20
 
 assert T % 2 == 0
 assert WIN % GATHER_SPLITS == 0
+assert GATHER_ROWS_PER_TASK % GATHER_RUN == 0, "bulk-copy runs must tile the gather task"
+assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
 assert H % 4 == 0
 assert QK_M_TILE % H_TILE == 0
 assert H % QK_M_TILE == 0
@@ -174,15 +181,31 @@ def sparse_attn_swa(
         g_split = g_task - g_t * GATHER_SPLITS
         g_r0 = g_split * GATHER_ROWS_PER_TASK
         g_base = g_t * WIN
-        for g_dr in pl.range(GATHER_ROWS_PER_TASK):
-            g_r = g_r0 + g_dr
-            g_slot_i32 = pl.read(swa_indices, [g_t, g_r])
-            g_dst = g_base + g_r
-            if g_slot_i32 >= 0:
-                g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+        # Probe each sub-tile's first/last slot: endpoints GATHER_RUN-1 apart mean
+        # the whole run sits in one paged block and moves as one bulk copy.
+        for g_sub in pl.range(GATHER_ROWS_PER_TASK // GATHER_RUN):
+            g_sr0 = g_r0 + g_sub * GATHER_RUN
+            g_sdst = g_base + g_sr0
+            g_first = pl.read(swa_indices, [g_t, g_sr0])
+            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
+            # A -1 slot anywhere in the run pins g_run_ok below the match value,
+            # so an invalid or block-straddling run takes the per-row path.
+            g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
+            if g_run_ok == GATHER_RUN - 1:
+                g_run_src = pl.cast(g_first, pl.INDEX)
+                swa_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM] = ori_kv_flat[
+                    g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
+                ]
             else:
-                swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full([1, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                for g_dr in pl.range(GATHER_RUN):
+                    g_dst = g_sdst + g_dr
+                    g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
+                    if g_slot_i32 >= 0:
+                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
+                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
+                    else:
+                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
+                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
     gather_tids[0] = gather_tid
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
