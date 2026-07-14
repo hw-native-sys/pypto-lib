@@ -197,6 +197,7 @@ def attention_hca(
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         cmp_cos, cmp_sin, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
+        late_dep,
     )
 
     # Sparse-index build fanned out over an SPMD (8 tokens/block) instead of one
