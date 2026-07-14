@@ -117,7 +117,7 @@ def build_paged_attention_metadata(
     metadata: pl.Tensor[[METADATA_BYTES], pl.UINT8],
 ):
     """Build runtime FAI metadata and return its scheduler dependency."""
-    with pl.spmd(1, name_hint="pa_tiling") as tiling_tid:
+    with pl.spmd(1, name_hint="pa_tiling", allow_early_resolve=True) as tiling_tid:
         metadata = paged_attention_tiling_cce(
             seq_lens,
             metadata,
