@@ -212,7 +212,7 @@ def sparse_attn_hca(
     # spread evenly. Invalid (-1) and padded lanes are zero-filled to match the
     # golden's zero rows; the NEG_INF bias then kills them in the softmax.
     hca_kv_flat = pl.create_tensor([T * PADDED_TOPK, HEAD_DIM], dtype=pl.BF16)
-    with pl.spmd(T * GATHER_SEGS, name_hint="hca_gather_kv") as gather_tid:
+    with pl.spmd(T * GATHER_SEGS, name_hint="hca_gather_kv", allow_early_resolve=True) as gather_tid:  # allow_early_resolve so qk_pv (deps=[gather_tid]) can pre-stage
         g_task = pl.tile.get_block_idx()
         g_t = g_task // GATHER_SEGS
         g_seg = g_task - g_t * GATHER_SEGS
@@ -350,7 +350,7 @@ def sparse_attn_hca(
     # segment is rotated in UB and packed straight into o_packed's rope columns.
     # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
     # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm") as merge_tid:
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:  # allow_early_resolve: completes proj_a_mm's producer set (proj_a_mm already flagged)
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)
