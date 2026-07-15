@@ -36,7 +36,8 @@ GATE_N_TILE = 16        # expert columns per gate spmd block
 assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
-GATE_D_TILE = 256
+GATE_D_TILE = 2048
+assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
@@ -88,9 +89,14 @@ def gate(
                 x_norm[t0 : t0 + T_TILE, an_d0 : an_d0 + D_TILE] = an_bf16
 
     # Per-token symmetric INT8 quant of x_norm (read the bf16 output directly;
-    # x_norm_gate_buf holds the same bf16 values widened to fp32).
+    # x_norm_gate_buf holds the same bf16 values widened to fp32). Early
+    # resolution lets the shared-expert chain pre-stage before dispatch_push.
     for t0 in pl.parallel(0, active_gate_tokens, T_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="x_norm_quant"):
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="x_norm_quant",
+            allow_early_resolve=True,
+        ):
             xn_amax = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
             for xq_a_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
                 xn_a_f32 = x_norm_gate_buf[t0 : t0 + T_TILE, xq_a_k : xq_a_k + QUANT_TILE]
@@ -136,7 +142,7 @@ def gate(
         n0 = nb * GATE_N_TILE
         gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
         gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
-        for kb in pl.range(0, D // GATE_D_TILE):
+        for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
             gd_kd = kb * GATE_D_TILE
             gd_x = x_norm_gate_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
             gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]

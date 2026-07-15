@@ -757,7 +757,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next_out
 
 
-def build_tensor_specs(layer_id=0, num_tokens=T):
+def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_weight
@@ -811,14 +811,31 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         return x.unsqueeze(0).expand(N_RANKS, -1).contiguous()
 
     def init_tid2eid():
+        if balanced_routing:
+            token_ids = torch.arange(VOCAB, dtype=torch.int64).unsqueeze(1)
+            topk_slots = torch.arange(TOPK, dtype=torch.int64).unsqueeze(0)
+            x = (token_ids * TOPK + topk_slots) % N_EXPERTS_GLOBAL
+            return x.to(torch.int32).unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
         # Distinct experts per token (sample without replacement) like real top-k,
         # so the route-keyed distributed combine stays unambiguous.
         x = torch.argsort(torch.rand(VOCAB, N_EXPERTS_GLOBAL), dim=1)[:, :TOPK].to(torch.int32)
         return x.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
     def init_input_ids():
+        if balanced_routing:
+            # Active tokens across ranks consume consecutive tid2eid rows, making
+            # their route ids one contiguous round-robin sequence over experts.
+            rank_starts = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1) * num_tokens
+            token_offsets = torch.arange(T, dtype=torch.int64).unsqueeze(0)
+            return rank_starts + token_offsets
         # Distinct per-rank token streams.
         return torch.randint(0, VOCAB, (N_RANKS, T), dtype=torch.int64)
+
+    if balanced_routing:
+        assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
+        active_routes = N_RANKS * max(0, min(T, num_tokens)) * TOPK
+        assert active_routes % N_EXPERTS_GLOBAL == 0, \
+            "balanced routing requires the active route count to divide evenly across experts"
 
     # Per-rank routed expert weights (different shards).
     routed_w1_i8_list = []
@@ -921,9 +938,12 @@ if __name__ == "__main__":
     parser.add_argument("--layer-id", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T,
                         help=f"active token count for MoE dispatch/combine (0..{T})")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--balanced-routing", action="store_true", default=False,
+                        help="use deterministic hash routes balanced evenly across all experts")
+    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None,
                         help="dir with cached in/{name}.pt + out/{name}.pt; reuses them "
                              "instead of regenerating inputs + recomputing golden.")
@@ -939,9 +959,14 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=l3_moe,
-        specs=build_tensor_specs(layer_id=args.layer_id, num_tokens=args.num_tokens),
+        specs=build_tensor_specs(
+            layer_id=args.layer_id,
+            num_tokens=args.num_tokens,
+            balanced_routing=args.balanced_routing,
+        ),
         golden_fn=golden_moe,
         golden_data=golden_data,
+        save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         compile_cfg=dict(
