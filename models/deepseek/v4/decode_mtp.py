@@ -34,7 +34,6 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_START_POS, FLASH as M
 from decode_attention_swa import (
-    B,
     BLOCK_SIZE,
     HEAD_DIM,
     H,
@@ -42,7 +41,7 @@ from decode_attention_swa import (
     O_GROUP_IN,
     O_GROUPS,
     O_LORA,
-    ORI_MAX_BLOCKS,
+    ORI_BLOCK_NUM,
     Q_LORA,
     ROPE_HEAD_DIM,
     T,
@@ -107,7 +106,7 @@ def mtp_decode_layer(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
@@ -259,7 +258,7 @@ def l3_mtp_decode_layer(
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, B * ORI_MAX_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],

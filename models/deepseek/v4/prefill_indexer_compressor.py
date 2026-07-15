@@ -13,6 +13,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
     FP32_NEG_INF,
     PREFILL_IDX_BLOCK_NUM,
     PREFILL_IDX_MAX_BLOCKS,
@@ -52,7 +53,8 @@ HEAD_TILE = 64
 T = B * S
 INNER_STATE_BLOCK_SIZE = 4
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
-INNER_STATE_BLOCK_NUM = INNER_STATE_MAX_BLOCKS
+INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
 PACKED_STATE_UPDATE_TILE = 16
@@ -62,8 +64,7 @@ PACKED_RMS_TILE = 16
 @pl.jit.inline
 def prefill_indexer_compressor(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -83,8 +84,10 @@ def prefill_indexer_compressor(
 ):
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    kv_state_flat = pl.reshape(kv_state, [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state_flat = pl.reshape(score_state, [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM])
+    compress_state_flat = pl.reshape(
+        compress_state,
+        [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -165,13 +168,13 @@ def prefill_indexer_compressor(
                     if prev_phys_block_raw >= 0:
                         prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
                         prev_state_row = prev_phys_block * INNER_STATE_BLOCK_SIZE + prev_state_intra
-                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
                             h0 : h0 + HEAD_CHUNK,
                         ]
-                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
-                            h0 : h0 + HEAD_CHUNK,
+                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_CHUNK,
                         ]
 
                 cur_abs = cur_start + pool_s
@@ -192,13 +195,13 @@ def prefill_indexer_compressor(
                 if cur_phys_block_raw >= 0:
                     cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
                     cur_state_row = cur_phys_block * INNER_STATE_BLOCK_SIZE + cur_state_intra
-                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
                         HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
-                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
-                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
+                        OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
 
             for pool_t in pl.range(T):
@@ -379,14 +382,17 @@ def prefill_indexer_compressor(
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
                 ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
                 pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
                     kv_proj_scratch[
                         update_t : update_t + 1,
                         update_o0 : update_o0 + OUT_TILE,
                     ],
                     pool_dep,
                 )
-                score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                compress_state_flat[
+                    state_row : state_row + 1,
+                    OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                ] = pl.add(
                     pl.add(
                         score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
                         ape_row,
@@ -396,17 +402,20 @@ def prefill_indexer_compressor(
 
     idx_kv_cache = pl.reshape(idx_kv_cache_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     idx_kv_scale = pl.reshape(idx_kv_scale_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1])
-    kv_state = pl.reshape(kv_state_flat, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state = pl.reshape(score_state_flat, [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM])
-    return idx_kv_cache, idx_kv_scale, kv_state, score_state
+    compress_state = pl.reshape(
+        compress_state_flat,
+        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
+    return idx_kv_cache, idx_kv_scale, compress_state
 
 
 @pl.jit
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[T, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
-    kv_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
-    score_state: pl.InOut[pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
+    compress_state: pl.InOut[
+        pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -424,7 +433,7 @@ def prefill_indexer_compressor_test(
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     prefill_indexer_compressor(
-        x, kv_state, score_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
+        x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
     )
@@ -451,7 +460,7 @@ def prefill_indexer_compressor_test(
                 # INT8 zero via the fp16->int8 cast (a direct pl.full INT8 hits an i8 texpands wall)
                 kv[kv_i : kv_i + 1, 0:HEAD_DIM] = pl.cast(
                     pl.full([1, HEAD_DIM], dtype=pl.FP16, value=0.0), target_type=pl.INT8, mode="trunc")
-    return kv, kv_state, score_state, idx_kv_cache, idx_kv_scale
+    return kv, compress_state, idx_kv_cache, idx_kv_scale
 
 
 def golden_prefill_indexer_compressor(tensors):
@@ -459,8 +468,12 @@ def golden_prefill_indexer_compressor(tensors):
 
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()   # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    kv_state_flat = tensors["kv_state"].view(INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM)
-    score_state_flat = tensors["score_state"].view(INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, OUT_DIM)
+    compress_state_flat = tensors["compress_state"].view(
+        INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE,
+        COMPRESS_STATE_DIM,
+    )
+    kv_state_flat = compress_state_flat[:, :OUT_DIM]
+    score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["inner_compress_state_block_table"]
     idx_kv_cache = tensors["idx_kv_cache"]        # C8: INT8 KV
     idx_kv_scale = tensors["idx_kv_scale"]        # C8: per-position FP32 dequant scale
@@ -572,8 +585,6 @@ def golden_prefill_indexer_compressor(tensors):
         kv_state_flat[dst_row] = kv_proj[t]
         score_state_flat[dst_row] = score_proj[t] + tensors["ape"][ape_slot]
     tensors["kv"][:] = kv
-    tensors["kv_state"][:] = kv_state_flat.view_as(tensors["kv_state"])
-    tensors["score_state"][:] = score_state_flat.view_as(tensors["score_state"])
     tensors["idx_kv_cache"][:] = idx_kv_cache
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
@@ -595,7 +606,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_inner_compress_state_block_table():
         table = torch.full((INNER_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(INNER_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % INNER_STATE_MAX_BLOCKS
+            table[block] = (block * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS
         return table
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -606,13 +617,13 @@ def build_tensor_specs(start_pos: int = START_POS):
         return int(table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
-    def init_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM)
-        flat = state.view(-1, OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+        flat = state.view(-1, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(OUT_DIM) - 0.5) * 0.05
+                flat[row] = (torch.rand(COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
     # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
@@ -675,8 +686,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv", [MAX_CMP_WRITES, HEAD_DIM], torch.int8, is_output=True),
-        TensorSpec("kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
-        TensorSpec("score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
@@ -725,8 +735,7 @@ if __name__ == "__main__":
         compare_fn={
             # C8: raw INT8 compressed rows (+/-1 LSB on the boundary rows the compressor rewrote).
             "kv": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),

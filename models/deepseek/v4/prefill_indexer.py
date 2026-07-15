@@ -17,6 +17,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
     FP32_NEG_INF,
     IDX_CACHE_MAX_BLOCKS,
     INT8_SCALE_MAX,
@@ -50,6 +51,7 @@ INNER_OVERLAP = COMPRESS_RATIO == 4
 INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
+INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 CACHE_TILE = 32
 
 # Index cache table width mirrors decode. The physical idx_kv_cache pool is
@@ -112,8 +114,9 @@ def prefill_indexer(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[
+        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -225,7 +228,7 @@ def prefill_indexer(
     # === inner compressor: build the paged compressed index KV cache ===
     prefill_indexer_compressor(
         x,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         freqs_cos, freqs_sin, hadamard,
         idx_kv_cache, idx_kv_scale, idx_block_table,
@@ -331,8 +334,7 @@ def golden_prefill_indexer_core(tensors):
     compressor_tensors = {
         "x": tensors["x"],
         "kv": torch.zeros(MAX_CMP_WRITES, IDX_HEAD_DIM, dtype=torch.bfloat16),
-        "kv_state": tensors["inner_kv_state"],
-        "score_state": tensors["inner_score_state"],
+        "compress_state": tensors["inner_compress_state"],
         "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
@@ -445,8 +447,9 @@ def prefill_indexer_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[
+        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
@@ -466,7 +469,7 @@ def prefill_indexer_test(
     prefill_indexer(
         x, qr, qr_scale, wq_b, wq_b_scale, weights_proj,
         cos, sin, freqs_cos, freqs_sin, hadamard,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         score, cmp_topk_indices,
@@ -531,7 +534,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_inner_compress_state_block_table():
         table = torch.full((INNER_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(INNER_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % INNER_STATE_MAX_BLOCKS
+            table[block] = (block * 17 + 3) % CSA_INNER_STATE_PHYSICAL_BLOCKS
         return table
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -551,13 +554,13 @@ def build_tensor_specs(start_pos: int = START_POS):
         while h.shape[0] < IDX_HEAD_DIM:
             h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
         return (h * (IDX_HEAD_DIM ** -0.5)).to(torch.bfloat16)
-    def init_inner_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
-        flat = state.view(-1, INNER_OUT_DIM)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM)
+        flat = state.view(-1, INNER_COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - INNER_STATE_LEN), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(INNER_OUT_DIM) - 0.5) * 0.05
+                flat[row] = (torch.rand(INNER_COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
     # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
@@ -654,8 +657,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("inner_kv_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
-        TensorSpec("inner_score_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], torch.float32, init_value=init_inner_state),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], torch.float32, init_value=init_inner_compress_state),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
