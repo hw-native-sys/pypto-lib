@@ -21,12 +21,15 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     BLOCK_SIZE,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    CSA_STATE_PHYSICAL_BLOCKS,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_IDX_BLOCK_NUM,
+    PREFILL_ORI_BLOCK_NUM,
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
@@ -88,11 +91,13 @@ O_GROUPS = M.o_groups
 O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 COFF = 2
 MAIN_OUT_DIM = COFF * HEAD_DIM
+MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
+INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
 ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-ORI_BLOCK_NUM = B * ORI_MAX_BLOCKS
+ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 SPARSE_ROPE_CHUNK = 16
@@ -113,7 +118,7 @@ PREFILL_ATTN_BLOCKS = (PREFILL_SPARSE_TOPK + PREFILL_ATTN_TILE - 1) // PREFILL_A
 SPARSE_PREFILL_SPARSE_PAD = PREFILL_ATTN_BLOCKS * PREFILL_ATTN_TILE
 
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-CSA_ORI_BLOCK_NUM = SPARSE_ORI_MAX_BLOCKS
+CSA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 
@@ -137,8 +142,9 @@ def prefill_attention_csa(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[
+        [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32
+    ],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -148,8 +154,9 @@ def prefill_attention_csa(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[
+        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -211,7 +218,7 @@ def prefill_attention_csa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     prefill_compressor_ratio4(
-        x_normed, cmp_kv_state, cmp_score_state, compress_state_block_table,
+        x_normed, compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
         freqs_cos, freqs_sin, cmp_kv,
         position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
@@ -232,7 +239,7 @@ def prefill_attention_csa(
         x_normed, qr, qr_scale,
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         idx_cos, idx_sin, freqs_cos, freqs_sin, hadamard_idx,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
         idx_score_unused, cmp_topk_indices,
@@ -284,7 +291,7 @@ def prefill_attention_csa(
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
-    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
+    return kv_cache, cmp_kv, compress_state, idx_kv_cache, idx_kv_scale, inner_compress_state, x_out
 
 
 @pl.jit
@@ -306,8 +313,9 @@ def prefill_attention_csa_test(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cmp_kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
-    cmp_score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[
+        [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32
+    ],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -317,8 +325,9 @@ def prefill_attention_csa_test(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    inner_kv_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
-    inner_score_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM], pl.FP32],
+    inner_compress_state: pl.Tensor[
+        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32
+    ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
@@ -346,10 +355,10 @@ def prefill_attention_csa_test(
         attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
         freqs_cos, freqs_sin,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_kv_state, cmp_score_state, compress_state_block_table,
+        compress_state, compress_state_block_table,
         hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        inner_kv_state, inner_score_state, inner_compress_state_block_table,
+        inner_compress_state, inner_compress_state_block_table,
         kv_cache, ori_block_table, ori_slot_mapping,
         cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table,
         position_ids, cmp_slot_mapping, idx_slot_mapping,
@@ -357,7 +366,7 @@ def prefill_attention_csa_test(
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out, num_tokens,
     )
-    return kv_cache, cmp_kv, cmp_kv_state, cmp_score_state, idx_kv_cache, idx_kv_scale, inner_kv_state, inner_score_state, x_out
+    return kv_cache, cmp_kv, compress_state, idx_kv_cache, idx_kv_scale, inner_compress_state, x_out
 
 
 def golden_prefill_attention_csa(tensors):
@@ -408,8 +417,7 @@ def golden_prefill_attention_csa(tensors):
 
     golden_prefill_compressor_ratio4({
         "x": x_normed.view(T, D),
-        "kv_state": tensors["cmp_kv_state"],
-        "score_state": tensors["cmp_score_state"],
+        "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
         "wkv": tensors["cmp_wkv"],
         "wgate": tensors["cmp_wgate"],
@@ -437,8 +445,7 @@ def golden_prefill_attention_csa(tensors):
         "freqs_cos": tensors["freqs_cos"],
         "freqs_sin": tensors["freqs_sin"],
         "hadamard": tensors["hadamard_idx"],
-        "inner_kv_state": tensors["inner_kv_state"],
-        "inner_score_state": tensors["inner_score_state"],
+        "inner_compress_state": tensors["inner_compress_state"],
         "inner_compress_state_block_table": tensors["inner_compress_state_block_table"],
         "inner_wkv": tensors["inner_wkv"],
         "inner_wgate": tensors["inner_wgate"],
@@ -523,11 +530,11 @@ def golden_prefill_attention_csa(tensors):
 
 
 @functools.lru_cache(maxsize=None)
-def _state_block_table(max_blocks):
+def _state_block_table(max_blocks, physical_blocks):
     """Constant scrambled state block table [max_blocks]."""
     import torch
     blocks = torch.arange(max_blocks, dtype=torch.int32)
-    return (blocks * 17 + 3) % max_blocks
+    return (blocks * 17 + 3) % physical_blocks
 
 
 def build_tensor_specs(
@@ -630,7 +637,7 @@ def build_tensor_specs(
         return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
     def init_cmp_norm_w():
         return 0.9666 + torch.randn(HEAD_DIM,) * 0.1929
-    state_table = _state_block_table(CSA_STATE_MAX_BLOCKS)
+    state_table = _state_block_table(CSA_STATE_MAX_BLOCKS, CSA_STATE_PHYSICAL_BLOCKS)
     def init_compress_state_block_table():
         return state_table.clone()
     def state_row(abs_pos):
@@ -639,21 +646,13 @@ def build_tensor_specs(
         block = abs_pos // CSA_STATE_BLOCK_SIZE
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
         return int(state_table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
-    def init_cmp_state():
-        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
-        flat = state.view(-1, MAIN_OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM)
+        flat = state.view(-1, MAIN_COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, context_len - MAIN_STATE_LEN), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
-        return state
-    def init_cmp_score_state():
-        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
-        flat = state.view(-1, MAIN_OUT_DIM)
-        for abs_pos in range(max(0, context_len - MAIN_STATE_LEN), context_len):
-            row = state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
+                flat[row] = (torch.rand(MAIN_COMPRESS_STATE_DIM,) - 0.5) * 0.05
         return state
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -671,7 +670,10 @@ def build_tensor_specs(
         return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
     def init_inner_norm_w():
         return 0.6850 + torch.randn(IDX_HEAD_DIM,) * 0.2610
-    inner_state_table = _state_block_table(INNER_STATE_MAX_BLOCKS)
+    inner_state_table = _state_block_table(
+        INNER_STATE_MAX_BLOCKS,
+        CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    )
     def init_inner_compress_state_block_table():
         return inner_state_table.clone()
     def inner_state_row(abs_pos):
@@ -680,21 +682,13 @@ def build_tensor_specs(
         block = abs_pos // INNER_STATE_BLOCK_SIZE
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
         return int(inner_state_table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
-    def init_inner_kv_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
-        flat = state.view(-1, INNER_OUT_DIM)
+    def init_inner_compress_state():
+        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM)
+        flat = state.view(-1, INNER_COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, context_len - INNER_STATE_LEN), context_len):
             row = inner_state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
-        return state
-    def init_inner_score_state():
-        state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM)
-        flat = state.view(-1, INNER_OUT_DIM)
-        for abs_pos in range(max(0, context_len - INNER_STATE_LEN), context_len):
-            row = inner_state_row(abs_pos)
-            if row >= 0:
-                flat[row] = (torch.rand(INNER_OUT_DIM,) - 0.5) * 0.05
+                flat[row] = (torch.rand(INNER_COMPRESS_STATE_DIM,) - 0.5) * 0.05
         return state
     # C8 historical index cache: completed compressed slots hold INT8 + a per-position dequant scale.
     # Build both from one bf16-rounded random draw so cache and scale stay consistent.
@@ -840,16 +834,10 @@ def build_tensor_specs(
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         TensorSpec(
-            "cmp_kv_state",
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
+            "compress_state",
+            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
             torch.float32,
-            init_value=init_cmp_state,
-        ),
-        TensorSpec(
-            "cmp_score_state",
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_OUT_DIM],
-            torch.float32,
-            init_value=init_cmp_score_state,
+            init_value=init_compress_state,
         ),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
@@ -861,16 +849,10 @@ def build_tensor_specs(
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
         TensorSpec(
-            "inner_kv_state",
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM],
+            "inner_compress_state",
+            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM],
             torch.float32,
-            init_value=init_inner_kv_state,
-        ),
-        TensorSpec(
-            "inner_score_state",
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_OUT_DIM],
-            torch.float32,
-            init_value=init_inner_score_state,
+            init_value=init_inner_compress_state,
         ),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,

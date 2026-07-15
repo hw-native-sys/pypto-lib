@@ -10,7 +10,13 @@
 
 import pypto.language as pl
 
-from config import FLASH as M, BLOCK_SIZE, FP32_NEG_INF, PREFILL_CMP_BLOCK_NUM
+from config import (
+    BLOCK_SIZE,
+    CSA_STATE_PHYSICAL_BLOCKS,
+    FLASH as M,
+    FP32_NEG_INF,
+    PREFILL_CMP_BLOCK_NUM,
+)
 
 # model config (mirrors decode_compressor_ratio4)
 EPS = M.rms_norm_eps
@@ -44,7 +50,8 @@ RMS_TILE = 16
 T = B * S
 CSA_STATE_BLOCK_SIZE = 4
 CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLOCK_SIZE
-CSA_STATE_BLOCK_NUM = CSA_STATE_MAX_BLOCKS
+CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
 PACKED_STATE_UPDATE_TILE = 16
@@ -54,8 +61,7 @@ PACKED_RMS_TILE = 16
 @pl.jit.inline
 def prefill_compressor_ratio4(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -71,8 +77,10 @@ def prefill_compressor_ratio4(
 ):
     cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    kv_state_flat = pl.reshape(kv_state, [CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state_flat = pl.reshape(score_state, [CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, OUT_DIM])
+    compress_state_flat = pl.reshape(
+        compress_state,
+        [CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
     cmp_kv_flat = pl.reshape(cmp_kv, [PREFILL_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -150,13 +158,13 @@ def prefill_compressor_ratio4(
                     if prev_phys_block_raw >= 0:
                         prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
                         prev_state_row = prev_phys_block * CSA_STATE_BLOCK_SIZE + prev_state_intra
-                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
                             h0 : h0 + HEAD_CHUNK,
                         ]
-                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                             prev_state_row : prev_state_row + 1,
-                            h0 : h0 + HEAD_CHUNK,
+                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_CHUNK,
                         ]
 
                 cur_abs = cur_start + pool_s
@@ -177,13 +185,13 @@ def prefill_compressor_ratio4(
                 if cur_phys_block_raw >= 0:
                     cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
                     cur_state_row = cur_phys_block * CSA_STATE_BLOCK_SIZE + cur_state_intra
-                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = kv_state_flat[
+                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
                         HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
-                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = score_state_flat[
+                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
                         cur_state_row : cur_state_row + 1,
-                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
+                        OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
 
             for pool_t in pl.range(T):
@@ -326,14 +334,17 @@ def prefill_compressor_ratio4(
                 for update_ob in pl.range(PACKED_PROJ_BLOCKS):
                     update_o0 = update_ob * OUT_TILE
                     ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                    kv_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                    compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
                         cmp4_kv_proj_scratch[
                             update_t : update_t + 1,
                             update_o0 : update_o0 + OUT_TILE,
                         ],
                         pool_dep,
                     )
-                    score_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                    compress_state_flat[
+                        state_row : state_row + 1,
+                        OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                    ] = pl.add(
                         pl.add(
                             cmp4_score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
                             ape_row,
@@ -342,9 +353,11 @@ def prefill_compressor_ratio4(
                     )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-    kv_state = pl.reshape(kv_state_flat, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state = pl.reshape(score_state_flat, [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM])
-    return cmp_kv, kv_state, score_state
+    compress_state = pl.reshape(
+        compress_state_flat,
+        [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
+    return cmp_kv, compress_state
 
 
 def golden_prefill_compressor_ratio4(tensors):
@@ -352,8 +365,12 @@ def golden_prefill_compressor_ratio4(tensors):
     import torch
 
     x = tensors["x"].view(T, D).float()
-    kv_state_flat = tensors["kv_state"].view(CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, OUT_DIM)
-    score_state_flat = tensors["score_state"].view(CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, OUT_DIM)
+    compress_state_flat = tensors["compress_state"].view(
+        CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE,
+        COMPRESS_STATE_DIM,
+    )
+    kv_state_flat = compress_state_flat[:, :OUT_DIM]
+    score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
     wkv = tensors["wkv"].float()
     wgate = tensors["wgate"].float()
@@ -452,15 +469,14 @@ def golden_prefill_compressor_ratio4(tensors):
         kv_state_flat[dst_row] = kv_proj[t]
         score_state_flat[dst_row] = score_proj[t] + tensors["ape"][ape_slot]
     tensors["cmp_kv"][:] = cmp_kv
-    tensors["kv_state"][:] = kv_state_flat.view_as(tensors["kv_state"])
-    tensors["score_state"][:] = score_state_flat.view_as(tensors["score_state"])
 
 
 @pl.jit
 def prefill_compressor_ratio4_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.InOut[pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
-    score_state: pl.InOut[pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
+    compress_state: pl.InOut[
+        pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -475,7 +491,7 @@ def prefill_compressor_ratio4_test(
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     return prefill_compressor_ratio4(
-        x, kv_state, score_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
+        x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
     )
 
@@ -493,7 +509,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_compress_state_block_table():
         table = torch.full((CSA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(CSA_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % CSA_STATE_MAX_BLOCKS
+            table[block] = (block * 17 + 3) % CSA_STATE_PHYSICAL_BLOCKS
         return table
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -504,13 +520,13 @@ def build_tensor_specs(start_pos: int = START_POS):
         return int(table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
-    def init_state():
-        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM)
-        flat = state.view(-1, OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
+        flat = state.view(-1, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - STATE_LEN), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = (torch.rand(OUT_DIM) - 0.5) * 0.05
+                flat[row] = (torch.rand(COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
     # Calibrated to the real DeepSeek-V4-Flash CSA (ratio-4) compressor (mean l8/l32 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
@@ -549,8 +565,7 @@ def build_tensor_specs(start_pos: int = START_POS):
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
-        TensorSpec("score_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("compress_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
@@ -594,8 +609,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
         compile_only=args.compile_only,
         compare_fn={
-            "kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
         },
     )

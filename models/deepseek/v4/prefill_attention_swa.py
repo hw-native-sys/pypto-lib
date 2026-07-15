@@ -78,7 +78,7 @@ START_POS = 0
 # prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
 SPARSE_TOPK = WIN + IDX_TOPK
 SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-SPARSE_ORI_BLOCK_NUM = B * SPARSE_ORI_MAX_BLOCKS
+SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 WRITEBACK_GUARD_TILE = 16
@@ -100,8 +100,8 @@ RMS_PIPE_STAGE = 1 if T >= 64 else 4
 
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN+t"
-assert SPARSE_ORI_BLOCK_NUM == B * SPARSE_ORI_MAX_BLOCKS
-assert SPARSE_ORI_MAX_BLOCKS == BLOCK_NUM
+assert SPARSE_ORI_BLOCK_NUM == BLOCK_NUM
+assert SPARSE_ORI_MAX_BLOCKS <= BLOCK_NUM
 
 
 @pl.jit.inline

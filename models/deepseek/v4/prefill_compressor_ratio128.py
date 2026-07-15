@@ -15,7 +15,15 @@ tokens.
 
 import pypto.language as pl
 
-from config import BLOCK_SIZE, FLASH as M, PREFILL_BATCH, PREFILL_SEQ, PREFILL_CMP_BLOCK_NUM, PREFILL_CMP_MAX_BLOCKS
+from config import (
+    BLOCK_SIZE,
+    FLASH as M,
+    HCA_STATE_PHYSICAL_BLOCKS,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
+    PREFILL_CMP_BLOCK_NUM,
+    PREFILL_CMP_MAX_BLOCKS,
+)
 
 
 B = PREFILL_BATCH
@@ -47,7 +55,8 @@ assert S == COMPRESS_RATIO, "ratio128 prefill compressor bring-up expects one fu
 
 HCA_STATE_BLOCK_SIZE = 8
 HCA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + HCA_STATE_BLOCK_SIZE - 1) // HCA_STATE_BLOCK_SIZE
-HCA_STATE_BLOCK_NUM = HCA_STATE_MAX_BLOCKS
+HCA_STATE_BLOCK_NUM = HCA_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 HCA_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
@@ -62,8 +71,7 @@ PACKED_C128_POOL_BLOCKS = MAX_CMP_WRITES * HEAD_BLOCKS
 @pl.jit.inline
 def prefill_compressor_ratio128(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
-    score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32],
+    compress_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -80,8 +88,10 @@ def prefill_compressor_ratio128(
     x_flat = x
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    kv_state_flat = pl.reshape(kv_state, [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state_flat = pl.reshape(score_state, [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM])
+    compress_state_flat = pl.reshape(
+        compress_state,
+        [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
     cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
@@ -140,8 +150,8 @@ def prefill_compressor_ratio128(
                 scatter_row = pl.cast(scatter_row_raw, pl.INDEX)
                 scatter_pos = pl.read(position_ids, [scatter_t])
                 scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
-                kv_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
-                score_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = pl.add(
+                compress_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
+                compress_state_flat[scatter_row : scatter_row + 1, OUT_DIM:COMPRESS_STATE_DIM] = pl.add(
                     score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM],
                     ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
                 )
@@ -173,13 +183,13 @@ def prefill_compressor_ratio128(
                 if pool_phys_block_raw >= 0:
                     pool_phys_block = pl.cast(pool_phys_block_raw, pl.INDEX)
                     pool_state_row = pool_phys_block * HCA_STATE_BLOCK_SIZE + pool_state_intra
-                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = kv_state_flat[
+                    pool_kv_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
                         pool_state_row : pool_state_row + 1,
                         h0 : h0 + HEAD_TILE,
                     ]
-                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = score_state_flat[
+                    pool_score_tile[pool_state_i : pool_state_i + 1, 0:HEAD_TILE] = compress_state_flat[
                         pool_state_row : pool_state_row + 1,
-                        h0 : h0 + HEAD_TILE,
+                        OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
                     ]
             # Vectorized softmax over all STATE_LEN slots (matches decode128): transpose the
             # assembled [STATE_LEN, HEAD_TILE] tile and do row_max/exp/sum/div + weighted sum,
@@ -260,16 +270,19 @@ def prefill_compressor_ratio128(
                     )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-    kv_state = pl.reshape(kv_state_flat, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM])
-    score_state = pl.reshape(score_state_flat, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM])
-    return cmp_kv, kv_state, score_state
+    compress_state = pl.reshape(
+        compress_state_flat,
+        [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+    )
+    return cmp_kv, compress_state
 
 
 @pl.jit
 def prefill_compressor_ratio128_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv_state: pl.InOut[pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
-    score_state: pl.InOut[pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], pl.FP32]],
+    compress_state: pl.InOut[
+        pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+    ],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -284,7 +297,7 @@ def prefill_compressor_ratio128_test(
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     return prefill_compressor_ratio128(
-        x, kv_state, score_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
+        x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
     )
 
@@ -295,8 +308,12 @@ def golden_prefill_compressor_ratio128(tensors):
     num_tokens = int(tensors["num_tokens"])
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()    # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
-    kv_state_flat = tensors["kv_state"].view(HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM)
-    score_state_flat = tensors["score_state"].view(HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, OUT_DIM)
+    compress_state_flat = tensors["compress_state"].view(
+        HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE,
+        COMPRESS_STATE_DIM,
+    )
+    kv_state_flat = compress_state_flat[:, :OUT_DIM]
+    score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
     cmp_kv_flat = tensors["cmp_kv"].view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
 
@@ -369,7 +386,7 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_compress_state_block_table():
         table = torch.full((HCA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(HCA_STATE_MAX_BLOCKS):
-            table[block] = (block * 17 + 3) % HCA_STATE_MAX_BLOCKS
+            table[block] = (block * 17 + 3) % HCA_STATE_PHYSICAL_BLOCKS
         return table
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -380,12 +397,12 @@ def build_tensor_specs(start_pos: int = START_POS):
         return int(table[block].item()) * HCA_STATE_BLOCK_SIZE + intra
     def init_x():
         return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
-    def init_state():
-        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM)
+    def init_compress_state():
+        state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         for abs_pos in range(max(0, start_pos - COMPRESS_RATIO), start_pos):
             row = state_row(abs_pos)
             if row >= 0:
-                state.view(-1, OUT_DIM)[row] = (torch.rand(OUT_DIM) - 0.5) * 0.05
+                state.view(-1, COMPRESS_STATE_DIM)[row] = (torch.rand(COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
     # Calibrated to the real DeepSeek-V4-Flash HCA (ratio-128) main compressor (mean l7/l9 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
@@ -421,8 +438,7 @@ def build_tensor_specs(start_pos: int = START_POS):
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
-        TensorSpec("score_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, OUT_DIM], torch.float32, init_value=init_state, is_output=True),
+        TensorSpec("compress_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
         TensorSpec("wgate", [OUT_DIM, D], torch.bfloat16, init_value=init_wgate),
@@ -476,8 +492,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         compare_fn={
             "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
-            "kv_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "score_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
+            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
         },
     )
     if not result.passed:

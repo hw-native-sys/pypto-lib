@@ -239,8 +239,8 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 8                  # B: requests per decode step
-DECODE_SEQ = 1                    # S: 1 token per step for serving
+DECODE_BATCH = 4                  # B: requests per decode step
+DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
@@ -254,24 +254,28 @@ C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 LM_HEAD_TP_SIZE = 8
 
-# Static paged-cache pools shared by decode and prefill kernels. Decode ori-KV
-# is a sliding-window ring, so it only needs enough physical pages to cover the
-# window plus the current decode chunk boundary. Its block table keeps vLLM-style
-# absolute logical block columns so long-context metadata can still address the
-# current window without allocating full-context KV pages.
-KV_ORI_MAX_BLOCKS = (FLASH.sliding_window + DECODE_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
+# Static paged-cache pools shared by decode and prefill kernels. ``*_BLOCK_NUM``
+# is the global physical-pool capacity and is deliberately independent from the
+# compute batch. Per-request ownership is expressed only by block tables.
 KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
+KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64
-DECODE_ORI_BLOCK_NUM = DECODE_BATCH * KV_ORI_MAX_BLOCKS
-DECODE_CMP_BLOCK_NUM = DECODE_BATCH * KV_CMP_MAX_BLOCKS
-DECODE_IDX_BLOCK_NUM = DECODE_BATCH * IDX_CACHE_MAX_BLOCKS
+ORI_KV_BLOCK_NUM = 128
+CMP_KV_BLOCK_NUM = 32
+IDX_KV_BLOCK_NUM = 64
+HCA_STATE_PHYSICAL_BLOCKS = 64
+CSA_STATE_PHYSICAL_BLOCKS = 65
+CSA_INNER_STATE_PHYSICAL_BLOCKS = 65
+DECODE_ORI_BLOCK_NUM = ORI_KV_BLOCK_NUM
+DECODE_CMP_BLOCK_NUM = CMP_KV_BLOCK_NUM
+DECODE_IDX_BLOCK_NUM = IDX_KV_BLOCK_NUM
 PREFILL_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
-PREFILL_ORI_BLOCK_NUM = PREFILL_BATCH * PREFILL_ORI_MAX_BLOCKS
+PREFILL_ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 PREFILL_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-PREFILL_CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM  # shared decode-batch physical pool
+PREFILL_CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM  # shared global physical pool
 PREFILL_IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
-PREFILL_IDX_BLOCK_NUM = DECODE_IDX_BLOCK_NUM  # shared decode-batch physical pool
+PREFILL_IDX_BLOCK_NUM = DECODE_IDX_BLOCK_NUM  # shared global physical pool
 
 # Int8 quantization constants
 INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |q| <= 127

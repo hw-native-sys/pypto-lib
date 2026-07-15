@@ -784,6 +784,7 @@ def build_tensor_specs(
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
+    from decode_metadata import block_table
     from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
 
@@ -834,19 +835,19 @@ def build_tensor_specs(
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
-        tbl = torch.full((B, ORI_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(ORI_MAX_BLOCKS):
-                tbl[b, j] = b * ORI_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=ORI_MAX_BLOCKS,
+            physical_blocks=ORI_BLOCK_NUM,
+        )
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
-        tbl = torch.full((B, CMP_MAX_BLOCKS), -1, dtype=torch.int32)
-        for b in range(B):
-            for j in range(CMP_MAX_BLOCKS):
-                tbl[b, j] = b * CMP_MAX_BLOCKS + j
-        return tbl
+        return block_table(
+            batch=B,
+            table_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
+        )
 
     def init_cmp_sparse_indices():
         """Build the compressed sparse index list."""

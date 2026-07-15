@@ -75,7 +75,7 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 COMPRESS_STATE_PHYSICAL_BLOCKS = 64
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
-COMPRESS_STATE_BLOCK_NUM = B * COMPRESS_STATE_PHYSICAL_BLOCKS
+COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
 SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
@@ -571,7 +571,6 @@ def build_tensor_specs(start_pos=None):
             position_ids_from_starts(init_start_pos(), seq=S),
             init_window_block_table(),
             block_size=BLOCK_SIZE,
-            window=WIN,
         ).reshape(-1).contiguous()
     def init_window_swa_metadata():
         return swa_indices_and_lens(

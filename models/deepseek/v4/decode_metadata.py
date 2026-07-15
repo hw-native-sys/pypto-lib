@@ -154,8 +154,11 @@ def block_table(
     physical_cols = table_cols % physical_blocks
     if permuted and physical_blocks > 1:
         physical_cols = (physical_cols * 7 + 3) % physical_blocks
-    batch_offsets = torch.arange(batch, dtype=torch.int32).unsqueeze(1) * physical_blocks
-    return batch_offsets + physical_cols.unsqueeze(0)
+    # The physical pool is global and does not grow with batch. Interleave the
+    # fixture's request-local logical pages inside that fixed pool; production
+    # serving supplies allocator-owned block tables under the same contract.
+    request_offsets = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
+    return (physical_cols.unsqueeze(0) * batch + request_offsets) % physical_blocks
 
 
 def ori_slot_mapping(
@@ -163,13 +166,16 @@ def ori_slot_mapping(
     table: torch.Tensor,
     *,
     block_size: int = BLOCK_SIZE,
-    window: int = M.sliding_window,
 ) -> torch.Tensor:
+    """Map absolute positions into the full paged ori-KV pool.
+
+    Sliding-window visibility is lowered separately by
+    :func:`swa_indices_and_lens`; it must not alias physical KV write rows.
+    """
     positions_i64 = positions.to(torch.int64)
     table_i64 = table.to(device=positions.device, dtype=torch.int64)
-    slot = positions_i64 % window
-    logical_blk = slot // block_size
-    intra = slot % block_size
+    logical_blk = positions_i64 // block_size
+    intra = positions_i64 % block_size
     in_bounds = logical_blk < table_i64.shape[1]
     clamped_blk = torch.clamp(logical_blk, max=table_i64.shape[1] - 1)
     blk = torch.gather(table_i64, 1, clamped_blk)
