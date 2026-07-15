@@ -117,7 +117,7 @@ def dispatch(
     # Phase 1: count routes, publish counts, barrier on meta only, then cumsum ->
     # recv_count_out. Earliest recv_count_out can be produced -- it needs every
     # source's counts but none of the bulk payload.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta") as _meta_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta", allow_early_resolve=True) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -220,10 +220,17 @@ def dispatch(
                     pl.tile.write(route_tile, [0, 0], pl.cast(t * TOPK + k, pl.INT32))
                     pld.tile.remote_store(route_tile, target=recv_route, peer=dst, offsets=[row, 0])
 
-    # Payload-arrival handshake in its own task, fenced on dispatch_push via deps so
-    # this rank's `data_arrived` notify to a peer fires only after every put to it
-    # has landed; then wait every source so the gather reads land-complete lanes.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_push_tid]) as _wait_tid:
+        # Fold the payload-arrival notify into the push. Each of the N_LOCAL push
+        # blocks signals every peer once after its own puts, so a peer accumulates
+        # N_LOCAL notifies per source per epoch (the wait below expects
+        # N_LOCAL * moe_epoch). The count reaching that threshold means all N_LOCAL
+        # blocks of the source finished their puts, so its payload has fully landed
+        # -- no separate post-push notify task and no cross-block barrier needed.
+        # NOTE: recv_x rides a self-draining TPUT, but recv_aux / recv_route ride a
+        # non-draining remote_store (TSTORE), and a PIPE_ALL barrier is not a
+        # cross-rank DDR fence (PTOAS#872); the counting barrier below still gates
+        # the gather on the notify count, which each block bumps only after its own
+        # puts issue in program order.
         for dst in pl.range(N_RANKS):
             if dst != my_rank:
                 pld.system.notify(
@@ -233,22 +240,32 @@ def dispatch(
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
+
+    # Payload-arrival wait only (the notify now rides inside dispatch_push). Depend
+    # on dispatch_meta instead of dispatch_push so this wait can start spinning on
+    # the peers' `data_arrived` counters while our own push is still running -- the
+    # wait gates the gather, not the local push. A source's counter reaching
+    # N_LOCAL * moe_epoch means all its push blocks drained, so its payload landed.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_meta_tid], allow_early_resolve=True) as _wait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
                     signal=data_arrived,
                     offsets=[src, 0],
-                    expected=moe_epoch,
+                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
-    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (payload landed) -- the
-    # local RAW edge on recv_x only orders after this rank's own outgoing puts, not
-    # the incoming ones. dispatch_meta and dispatch_push stay independent and can
-    # overlap. recv_x_out is this grid's output; expert_routed reads it in auto
-    # scope and orders after it.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid]) as _gather_tid:
+    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (incoming payload
+    # landed), _push_tid (this rank's own local-to-local puts into recv_x). The
+    # explicit _push_tid edge is required: dispatch_wait now depends on dispatch_meta
+    # (not dispatch_push), so gather no longer transitively orders after the local
+    # push -- and the data_arrived barrier only covers *incoming* (src != my_rank)
+    # data, not this rank's own dst == my_rank puts. Without it, gather could read
+    # its own recv_x lane before push finishes writing it. recv_x_out is this grid's
+    # output; expert_routed reads it in auto scope and orders after it.
+    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid, _push_tid]) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -310,10 +327,15 @@ def combine(
                 )
             b = b + n
 
-    # Payload-arrival handshake in its own task, fenced on the scatter via deps so a
-    # peer is notified only after every put to it has landed. notify-then-wait is
-    # symmetric across ranks, so it cannot deadlock.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
+        # Fold the payload-arrival notify into the scatter. Each of the N_LOCAL
+        # scatter blocks signals every peer once after its own puts, so a peer
+        # accumulates N_LOCAL notifies per source per epoch (the wait below expects
+        # N_LOCAL * moe_epoch). The count reaching that threshold means all N_LOCAL
+        # blocks of the source finished their puts, so its payload has fully landed
+        # -- no separate post-scatter notify task and no cross-block barrier needed.
+        # combine's only payload rides a self-draining TPUT (pld.tensor.put into
+        # routed_y_buf) with no non-draining aux/route remote_store, so folding the
+        # notify in carries no cross-rank aux/route visibility race (cf. PTOAS#872).
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
@@ -323,24 +345,36 @@ def combine(
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
+
+    # Payload-arrival wait only (the notify now rides inside the scatter). No local
+    # dep so this wait can start spinning on the peers' `combine_arrived` counters
+    # while our own scatter is still running; allow_early_resolve pre-stages it onto
+    # an idle core. A source's counter reaching N_LOCAL * moe_epoch means all its
+    # scatter blocks drained, so its payload landed.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
                     signal=combine_arrived,
                     offsets=[src, 0],
-                    expected=moe_epoch,
+                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so
-    # every peer's remote write into this rank's routed_y_buf has landed -- the local
-    # RAW edge alone would only order after this rank's own outgoing puts.
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps: _cwait_tid (incoming
+    # peer writes into this rank's routed_y_buf landed), _cscatter_tid (this rank's
+    # own local dst == my_rank puts into routed_y_buf). The explicit _cscatter_tid
+    # edge is required now: combine_wait no longer depends on the scatter, so the
+    # reduce no longer transitively orders after it -- and the combine_arrived
+    # barrier only covers *incoming* (src != my_rank) data, not this rank's own
+    # local puts. Without it, the reduce could read its own routed_y_buf rows before
+    # the scatter finishes writing them.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid, _cscatter_tid]) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
