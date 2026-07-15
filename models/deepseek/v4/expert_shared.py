@@ -248,12 +248,12 @@ def expert_shared(
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
         for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act"):
             d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
+            h_scale = pl.row_max(h_tile_scale_dq[:, :])
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):
                 d0 = d_base + dg * D_OUT_TILE_ACT
                 y_2d_i32 = y_i32[:, d0 : d0 + D_OUT_TILE_ACT]
                 w2_scale_chunk = pl.reshape(shared_w2_scale[d0 : d0 + D_OUT_TILE_ACT], [1, D_OUT_TILE_ACT])
                 y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                h_scale = pl.row_max(h_tile_scale_dq[:, :])
                 y_2d = pl.col_expand_mul(
                     pl.row_expand_mul(y_2d, h_scale), w2_scale_chunk
                 )

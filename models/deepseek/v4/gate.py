@@ -37,6 +37,7 @@ assert N_EXPERTS % GATE_N_TILE == 0
 T_PAD = ((T + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
 D_TILE = 256
 GATE_D_TILE = 2048
+assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
 QUANT_TILE = 256
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
