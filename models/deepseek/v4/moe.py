@@ -403,7 +403,6 @@ def moe(
         x_mixed, post_ffn, comb_ffn,
     )
 
-    x_norm = pl.create_tensor([T, D], dtype=pl.BF16)
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
@@ -411,7 +410,7 @@ def moe(
     gate(
         x_mixed, norm_w, gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,
-        x_norm, x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, indices, weights,
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -613,7 +612,6 @@ def golden_moe(tensors):
             "post":     src_post,
             "comb":     src_comb,
         })
-        src_x_norm = torch.zeros(T, D, dtype=torch.bfloat16)
         src_x_norm_i8 = torch.zeros(T, D, dtype=torch.int8)
         src_x_norm_scale = torch.zeros(T, 1, dtype=torch.float32)
         src_indices = torch.zeros(T, TOPK, dtype=torch.int32)
@@ -627,7 +625,6 @@ def golden_moe(tensors):
             "num_tokens":   tensors["num_tokens"],
             "tid2eid":      tensors["tid2eid"][src],
             "input_ids":    tensors["input_ids"][src],
-            "x_norm":       src_x_norm,
             "x_norm_i8":    src_x_norm_i8,
             "x_norm_scale": src_x_norm_scale,
             "indices":      src_indices,
