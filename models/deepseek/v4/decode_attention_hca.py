@@ -657,7 +657,17 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+             "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
+             "phases, 4=+orch phases; 0 (default) disables.",
+    )
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
