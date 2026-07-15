@@ -347,10 +347,15 @@ def prefill_layer_core(
             # rely on auto_scope + pl.range's sequential semantics so the
             # request-local cache/state RAW dependency is carried across tiles
             # (tile N's writeback ordered before tile N+1's gather).
-            x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0],
-                                 valid_shape=[valid_tok, HC_MULT, D])
+            # x_hc / position_ids stay full-[T]: they feed T_DYN children (hc_pre,
+            # hc_post, materialize_rope_rows) whose sibling tensors are full-[T],
+            # so a narrowing valid_shape would bind T_DYN to both valid_tok and T
+            # (rejected: no cross-call shape guard). num_tokens gates the tail.
+            # Slot/index mappings keep valid_shape: fixed-[T] params (no T_DYN),
+            # and it keeps padded -1 slots out of the cache scatters.
+            x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0])
             ori_slot_tile = pl.slice(ori_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
-            position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
+            position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base])
             hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
             hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
             csa_cmp_slot_tile = pl.slice(csa_cmp_slot_mapping, [TOK_TILE], [tile_base], valid_shape=[valid_tok])
