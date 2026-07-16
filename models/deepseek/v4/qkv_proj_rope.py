@@ -276,14 +276,21 @@ def qkv_proj_rope(
                 q_nope_bf16 = pl.cast(q_nope_normed, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 : h0 + NOPE_DIM] = q_nope_bf16
 
-                # RoPE writeback on columns [h0+NOPE_DIM:h0+HEAD_DIM), inv_rms folded after.
-                q_rope_chunk = q_head_dq[:, NOPE_DIM:HEAD_DIM]
+                # RoPE writeback on columns [h0+NOPE_DIM:h0+HEAD_DIM). Fold inv_rms in
+                # BEFORE the rotation (normalize-then-rotate), matching the kv path. This
+                # is mathematically equivalent to rotating then normalizing — inv_rms is a
+                # per-row scalar so inv_rms*(a*cos+b*sin) == (a*inv_rms)*cos+(b*inv_rms)*sin
+                # — but keeps the rotation intermediates small. Rotating the raw (large)
+                # dequantized values first produced large intermediates that lost precision
+                # on Ascend950 (A5), corrupting the query RoPE region; normalizing first
+                # avoids that without changing the result on A2A3.
+                q_rope_chunk_raw = q_head_dq[:, NOPE_DIM:HEAD_DIM]
+                q_rope_chunk = pl.row_expand_mul(q_rope_chunk_raw, q_head_inv_rms_t)
                 q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
                 q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
                 q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
                 q_rope_rot = pl.add(q_rope_base, q_rope_delta)
-                q_rope_normed = pl.row_expand_mul(q_rope_rot, q_head_inv_rms_t)
-                q_rope_bf16 = pl.cast(q_rope_normed, target_type=pl.BF16, mode="rint")
+                q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
                 q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
 
     # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
