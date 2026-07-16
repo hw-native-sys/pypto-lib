@@ -197,17 +197,17 @@ justifies.
 
 ---
 
-## 7. Localize the offending code with tensor dump + error-distribution
+## 7. Localize the offending code with args dump + error-distribution
 
 `error_distribution` (§6) tells you *how much* and *what shape* the output is
-off, but not *which stage*. Combine it with tensor dump to pin the exact op —
+off, but not *which stage*. Combine it with args dump to pin the exact op —
 to go from "the whole kernel is 0.4% off" to "the q-proj dequant is the
 source" (full dump procedure in [debugging.md](debugging.md) §2 and §5):
 
 1. Pin the inputs with `golden_data=<dir>` so every re-run sees identical
    tensors.
 2. Tag the suspect intermediates with `pl.dump_tag(t)` and run with
-   `enable_dump_tensor=1` (partial dump — keep it to a few tags to avoid the
+   `enable_dump_args=1` (partial dump — keep it to a few tags to avoid the
    full-dump AICPU timeouts).
 3. For each dumped intermediate, run `error_distribution` against its torch
    reference and walk them in dependency order. The **first** stage whose

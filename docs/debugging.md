@@ -14,7 +14,10 @@ CLI flag; a typical model `__main__` wires them up like:
 
 ```python
 parser.add_argument("--runtime-dir", type=str, default=None)
-parser.add_argument("--dump-tensor", action="store_true")
+parser.add_argument(
+    "--dump-args", nargs="?", const=1, default=0, type=int,
+    choices=(0, 1, 2, 3),
+)
 parser.add_argument("--enable-dep-gen", action="store_true")
 ...
 result = run_jit(
@@ -25,7 +28,7 @@ result = run_jit(
     runtime_cfg=dict(
         platform=args.platform, device_id=args.device,
         log_level="v5",                               # runtime log level; raise to v0 for hangs (§4)
-        enable_dump_tensor=args.dump_tensor,          # precision dump (§5)
+        enable_dump_args=args.dump_args,              # argument dump (§5)
         enable_dep_gen=args.enable_dep_gen,           # dependency graph (§6)
     ),
     rtol=1e-3, atol=1e-3,
@@ -151,16 +154,18 @@ often false timeouts — run the suspect test serially before deep-diving.
 
 ---
 
-## 5. Localize a precision mismatch with dump-tensor
+## 5. Localize a precision mismatch with args dump
 
-`enable_dump_tensor` writes
-`dfx_outputs/tensor_dump/{tensor_dump.json,tensor_dump.bin}` — the
-intermediate tensor values captured at kernel-task boundaries. Use it to turn a
-"the whole kernel is wrong" mismatch into "this one op is wrong".
+`enable_dump_args` writes
+`dfx_outputs/args_dump/{args_dump.json,args.bin}` — per-task tensor
+inputs/outputs and scalar inputs captured at kernel-task boundaries. Use it to
+turn a "the whole kernel is wrong" mismatch into "this one op is wrong".
 
-**Dump levels** (`runtime_cfg["enable_dump_tensor"]`): `0` off · `1` partial —
-only tensors you mark · `2` full — every task's inputs/outputs (heavy; can
-saturate the host collector / trip AICPU timeouts on large workloads).
+**Dump levels** (`runtime_cfg["enable_dump_args"]`): `0` off · `1` partial —
+only tensor arguments you mark · `2` full — every task's tensor payloads and
+scalar values (heavy; can saturate the host collector / trip AICPU timeouts on
+large workloads) · `3` full metadata only — every task's tensor/scalar
+metadata, but no tensor payload or `args.bin`.
 
 **The usual flow — tag the tensor, dump at level 1.** Mark the tensor of
 interest with `pl.dump_tag(t)` right where it's produced, then run with level
@@ -172,7 +177,7 @@ pl.dump_tag(h_tile_i8)          # capture this one tensor under partial dump
 ```
 
 ```python
-run_jit(..., runtime_cfg=dict(platform=..., enable_dump_tensor=1))
+run_jit(..., runtime_cfg=dict(platform=..., enable_dump_args=1))
 ```
 
 `pl.dump_tag` works on plain function args and on internal
@@ -184,15 +189,15 @@ over level `2` — it keeps the dump small and avoids the full-dump timeouts.
 Inspect the result with the viewer — with no filters it lists every captured
 tensor (task_id / stage / role / dtype / shape); add filters (`--task`,
 `--stage before|after`, `--role`, `--arg`, `-i N`) + `--export` to decode the
-chosen tensors to `tensor_dump/txt/` for element-wise comparison against torch:
+chosen tensors to `args_dump/txt/` for element-wise comparison against torch:
 
 ```bash
-python -m simpler_setup.tools.dump_viewer <build_output/.../dfx_outputs/tensor_dump>
+python -m simpler_setup.tools.dump_viewer <build_output/.../dfx_outputs/args_dump>
 ```
 
 Pass the dump dir **explicitly** — with no argument the viewer looks under
-`./outputs/*/tensor_dump`, but `run_jit` writes to
-`build_output/<...>/dfx_outputs/tensor_dump`.
+`./outputs/*/args_dump`, but `run_jit` writes to
+`build_output/<...>/dfx_outputs/args_dump`.
 
 This section is the dump *mechanism*. For the end-to-end
 precision-localization *workflow* — pairing this dump with the
@@ -224,6 +229,6 @@ read-dep and lets the downstream task race).
 | Need to reproduce on the same inputs | golden-data replay (§2) | `golden_data=` / `--golden-data` |
 | Iterating on generated `.cpp` / `.pto` | runtime-dir reuse (§3) | `runtime_dir=` / `--runtime-dir` |
 | Run hangs / deadlocks (§4) | device log | `runtime_cfg["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |
-| Precision mismatch, unknown stage (§5) | tensor dump | `enable_dump_tensor=` / `--dump-tensor` |
+| Precision mismatch, unknown stage (§5) | args dump | `enable_dump_args=` / `--dump-args [LEVEL]` |
 | Non-deterministic / raced result (§6) | dependency graph | `enable_dep_gen=` / `--enable-dep-gen` |
 | Regression vs. a known-good pypto commit | `bisect-precision` skill | — |
