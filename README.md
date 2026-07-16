@@ -53,7 +53,7 @@ full-model fused kernel.
 See [docs/debugging.md](docs/debugging.md) for the debugging workflow —
 reading pypto/ptoas errors, replaying failing data with `golden_data`,
 reusing a compile with `runtime_dir`, device logs for runtime hangs, and
-the dump-tensor / dep-gen DFX flags.
+the args-dump / dep-gen DFX flags.
 
 ## Performance tuning
 

@@ -956,6 +956,37 @@ class TestConfigForwarding:
         assert captured["device_id"] == 3
         assert captured["pto_isa_commit"] == "deadbeef"
 
+    def test_dump_args_forwarded_as_dfx_option(self, three_kinds_specs, tmp_path):
+        """enable_dump_args is bundled into the execute_compiled DFX options."""
+        compiled_dir = tmp_path / "build"
+        compiled_dir.mkdir()
+
+        captured: dict = {}
+        dfx = object()
+        dfx_opts = MagicMock(return_value=dfx)
+        runner_mod = types.ModuleType("pypto.runtime.runner")
+        runner_mod._DfxOpts = dfx_opts
+
+        def fake_execute(_work_dir, _tensors, **kwargs):
+            captured.update(kwargs)
+
+        compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
+        with (
+            compile_p,
+            exec_p,
+            patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
+        ):
+            r = run(
+                program=object(),
+                specs=three_kinds_specs,
+                runtime_cfg=dict(enable_dump_args=2),
+            )
+
+        assert r.passed, f"unexpected failure: {r.error}"
+        dfx_opts.assert_called_once_with(enable_dump_args=2)
+        assert captured["dfx"] is dfx
+        assert "enable_dump_args" not in captured
+
 
 def _set_mtime(path: Path, mtime: float) -> None:
     """Helper to force a file's mtime to a specific value."""

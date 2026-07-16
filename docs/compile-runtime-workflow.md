@@ -217,12 +217,17 @@ directory but can be enabled in any combination:
 | Kwarg | CLI flag | Artefact under `dfx_outputs/` |
 |-------|----------|-------------------------------|
 | `enable_l2_swimlane=True` | `--enable-l2-swimlane` | `l2_perf_records.json` → `merged_swimlane_*.json` |
-| `enable_dump_tensor=True` | `--dump-tensor` | `tensor_dump/{tensor_dump.json,bin}` |
+| `enable_dump_args=<N>` (int, `0`=off) | `--dump-args [N]` (bare = `1`) | `args_dump/{args_dump.json,args.bin}` |
 | `enable_pmu=<N>` (int, `0`=off) | `--enable-pmu [N]` (bare = `2`) | `pmu.csv` |
 | `enable_dep_gen=True` | `--enable-dep-gen` | `deps.json` → `deps_graph.html` |
 
 Enabling any flag auto-forces `save_kernels=True` so
 `build_output/<ProgramName>_<ts>/dfx_outputs/` survives the run.
+
+Args-dump level `1` captures only arguments selected with `pl.dump_tag` or a
+`dumps=` list; level `2` captures every task's tensor payloads and scalar
+values. Level `3` captures the same argument metadata without writing tensor
+payloads or `args.bin`.
 
 For L2 swimlane: open the generated `merged_swimlane_*.json` at
 [ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
