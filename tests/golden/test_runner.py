@@ -963,13 +963,19 @@ class TestConfigForwarding:
 
         captured: dict = {}
         dfx = object()
+        dfx_opts = MagicMock(return_value=dfx)
+        runner_mod = types.ModuleType("pypto.runtime.runner")
+        runner_mod._DfxOpts = dfx_opts
 
         def fake_execute(_work_dir, _tensors, **kwargs):
             captured.update(kwargs)
 
         compile_p, exec_p = _patch_compile_and_execute(compiled_dir, fake_execute=fake_execute)
-        with compile_p, exec_p, \
-             patch("pypto.runtime.runner._DfxOpts", return_value=dfx) as dfx_opts:
+        with (
+            compile_p,
+            exec_p,
+            patch.dict(sys.modules, {"pypto.runtime.runner": runner_mod}),
+        ):
             r = run(
                 program=object(),
                 specs=three_kinds_specs,

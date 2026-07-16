@@ -127,7 +127,7 @@ _DFX_FLAG_KEYS = (
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The four DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
+    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
     keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
     on unknown keys rather than us silently dropping them.
     """
