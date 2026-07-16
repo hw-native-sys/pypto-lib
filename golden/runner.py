@@ -117,7 +117,7 @@ def _backend_for_platform(platform: str) -> Any:
 
 _DFX_FLAG_KEYS = (
     "enable_l2_swimlane",
-    "enable_dump_tensor",
+    "enable_dump_args",
     "enable_pmu",
     "enable_dep_gen",
     "enable_scope_stats",
