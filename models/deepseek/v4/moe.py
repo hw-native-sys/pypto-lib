@@ -327,15 +327,10 @@ def combine(
                 )
             b = b + n
 
-        # Fold the payload-arrival notify into the scatter. Each of the N_LOCAL
-        # scatter blocks signals every peer once after its own puts, so a peer
-        # accumulates N_LOCAL notifies per source per epoch (the wait below expects
-        # N_LOCAL * moe_epoch). The count reaching that threshold means all N_LOCAL
-        # blocks of the source finished their puts, so its payload has fully landed
-        # -- no separate post-scatter notify task and no cross-block barrier needed.
-        # combine's only payload rides a self-draining TPUT (pld.tensor.put into
-        # routed_y_buf) with no non-draining aux/route remote_store, so folding the
-        # notify in carries no cross-rank aux/route visibility race (cf. PTOAS#872).
+    # Payload-arrival handshake in its own task, fenced on the scatter via deps so a
+    # peer is notified only after every put to it has landed. notify-then-wait is
+    # symmetric across ranks, so it cannot deadlock.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", deps=[_cscatter_tid]) as _cwait_tid:
         for peer in pl.range(N_RANKS):
             if peer != my_rank:
                 pld.system.notify(
@@ -345,36 +340,24 @@ def combine(
                     value=1,
                     op=pld.NotifyOp.AtomicAdd,
                 )
-
-    # Payload-arrival wait only (the notify now rides inside the scatter). No local
-    # dep so this wait can start spinning on the peers' `combine_arrived` counters
-    # while our own scatter is still running; allow_early_resolve pre-stages it onto
-    # an idle core. A source's counter reaching N_LOCAL * moe_epoch means all its
-    # scatter blocks drained, so its payload landed.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
                     signal=combine_arrived,
                     offsets=[src, 0],
-                    expected=pl.cast(moe_epoch * N_LOCAL, pl.INT32),
+                    expected=moe_epoch,
                     cmp=pld.WaitCmp.Ge,
                 )
 
-    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps: _cwait_tid (incoming
-    # peer writes into this rank's routed_y_buf landed), _cscatter_tid (this rank's
-    # own local dst == my_rank puts into routed_y_buf). The explicit _cscatter_tid
-    # edge is required now: combine_wait no longer depends on the scatter, so the
-    # reduce no longer transitively orders after it -- and the combine_arrived
-    # barrier only covers *incoming* (src != my_rank) data, not this rank's own
-    # local puts. Without it, the reduce could read its own routed_y_buf rows before
-    # the scatter finishes writing them.
+    # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so
+    # every peer's remote write into this rank's routed_y_buf has landed -- the local
+    # RAW edge alone would only order after this rank's own outgoing puts.
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid, _cscatter_tid]) as _reduce_tid:
+    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
