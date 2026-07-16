@@ -1303,7 +1303,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
         "hc_head_fn", "hc_head_scale", "hc_head_base",
-        "final_norm_w", "lm_head_weight",
+        "final_norm_w",
     ]
 
     specs = []
@@ -1321,13 +1321,6 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             specs.append(_make_hc_head_spec(name))
         elif name in FINAL_NORM_NAMES:
             specs.append(_make_final_norm_spec(name))
-        elif name == "lm_head_weight":
-            specs.append(TensorSpec(
-                name,
-                [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D],
-                torch.bfloat16,
-                init_value=init_lm_head_weight,
-            ))
         else:
             specs.append(_make_stacked_spec(name, base_specs))
 
@@ -1341,6 +1334,12 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec(
+        "lm_head_weight",
+        [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D],
+        torch.bfloat16,
+        init_value=init_lm_head_weight,
+    ))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec(
         "logits",
