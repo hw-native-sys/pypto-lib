@@ -174,8 +174,7 @@ def sparse_attn_swa(
     # before this function runs; there is no MTP overlay path here.
 
     swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
-    gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv") as gather_tid:
+    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv"):
         g_task = pl.tile.get_block_idx()
         g_t = g_task // GATHER_SPLITS
         g_split = g_task - g_t * GATHER_SPLITS
@@ -206,7 +205,6 @@ def sparse_attn_swa(
                     else:
                         swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
                             [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    gather_tids[0] = gather_tid
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -218,7 +216,7 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", allow_early_resolve=True):
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
@@ -259,7 +257,7 @@ def sparse_attn_swa(
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs") as rope_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
         swap_ones = pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         swap_range_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         swap_range = pl.cast(swap_range_i32, target_type=pl.FP32)
@@ -299,8 +297,7 @@ def sparse_attn_swa(
     # 32-block grid, which fits in one AIV wave and avoids eight group-grid
     # submissions. Each block writes two output-projection groups using the
     # same contiguous per-group stores.
-    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", deps=[qk_tid, rope_tid],
-                 allow_early_resolve=True) as merge_tid:
+    with pl.spmd(T * (H // H_TILE), name_hint="merge_norm", allow_early_resolve=True) as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
         m_h_idx = m_idx - m_t * (H // H_TILE)
