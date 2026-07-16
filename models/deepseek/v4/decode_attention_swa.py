@@ -109,39 +109,41 @@ assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 *
 assert T % KV_RMS_T_TILE == 0
 assert T % Q_ROPE_T_TILE == 0
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
+# attn_norm_xgamma is pure elementwise x*gamma (no reduction), so it parallelizes
+# to one token per core. A wide D-tile keeps the per-token pipeline short.
+XG_D_TILE = 1024
+assert D % XG_D_TILE == 0
 
 
 @pl.jit.inline
-def rms_norm(
+def attn_norm_xgamma(
     x: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
-    x_normed: pl.Tensor[[T, D], pl.BF16],
+    xg: pl.Tensor[[T, D], pl.BF16],
 ):
+    # Deferred attention RMSNorm for the qkv-only path (qwen3/gate-style): the
+    # per-token inv_rms is a positive scalar, and qkv_proj_rope re-RMSNorms BOTH
+    # the qr and kv projections downstream, so inv_rms cancels exactly. We store
+    # only xg = x*gamma and skip the sq_sum reduction + rsqrt + normalize pass
+    # entirely. Valid ONLY where x's sole consumer is qkv (SWA); the CSA/HCA
+    # compressor softmax gate is scale-sensitive and must keep the full rms_norm.
+    # One token per core (pl.spmd): pure elementwise x*gamma has no reduction, so
+    # each core just writes its own [1, XG_D_TILE] rows -- no 32B reduction-tile floor.
     t_dim = pl.tensor.dim(x, 0)
-    # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
-    # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
-    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
-        tg_idx = pl.tile.get_block_idx()
-        tg = tg_idx * T_TILE
-        x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
-        for rms_db in pl.pipeline(D // D_TILE, stage=2):
-            rms_d0 = rms_db * D_TILE
-            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
-            x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
-        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
-        x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // D_TILE, stage=2):
-            apply_d0 = apply_db * D_TILE
-            apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
-            norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE]), pl.FP32)
-            x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
-            x_normed[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE] = pl.cast(
-                x_normed_chunk,
+    norm_w_2d = pl.reshape(norm_w, [1, D])
+    with pl.spmd(t_dim, name_hint="attn_norm_xgamma", allow_early_resolve=True) as xg_tid:
+        tok = pl.tile.get_block_idx()
+        for xg_db in pl.pipeline(D // XG_D_TILE, stage=2):
+            xg_d0 = xg_db * XG_D_TILE
+            xg_x_chunk = pl.cast(x[tok : tok + 1, xg_d0 : xg_d0 + XG_D_TILE], target_type=pl.FP32)
+            norm_w_chunk = pl.cast(norm_w_2d[0:1, xg_d0 : xg_d0 + XG_D_TILE], target_type=pl.FP32)
+            xg[tok : tok + 1, xg_d0 : xg_d0 + XG_D_TILE] = pl.cast(
+                pl.col_expand_mul(xg_x_chunk, norm_w_chunk),
                 target_type=pl.BF16,
                 mode="rint",
             )
 
-    return rms_tid
+    return xg_tid
 
 
 @pl.jit.inline
@@ -473,8 +475,10 @@ def attention_swa(
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
     x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    # Deferred attention norm: qkv re-RMSNorms both qr and kv, so the per-token
+    # inv_rms cancels. Store only x*gamma; the sq_sum reduction + rsqrt are dropped.
+    rms_tid = attn_norm_xgamma(x_mixed, attn_norm_w, x_normed_t)
+    # Defers kv_proj_matmul one hop behind the norm so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
