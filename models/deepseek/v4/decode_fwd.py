@@ -461,6 +461,7 @@ def decode_fwd(
                 attn_sink_csa, wo_a_csa, wo_b_csa, wo_b_scale_csa,
                 x_attn_csa,
             )
+
         with pl.scope():
             moe(
                 x_attn_csa,
