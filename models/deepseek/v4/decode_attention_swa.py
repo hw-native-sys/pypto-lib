@@ -251,22 +251,23 @@ def qkv_proj_rope_swa(
             qr_g_abs = pl.abs(qr_g)
             qr_amax_g = pl.maximum(qr_amax_g, pl.reshape(pl.row_max(qr_g_abs), [1, T_TILE]))
         qr_inv_rms = pl.rsqrt(pl.add(pl.mul(qr_sq_sum, 1.0 / Q_LORA), EPS), high_precision=True)
-        qr_inv_rms_t = pl.reshape(qr_inv_rms, [T_TILE, 1])
+        # Deferred inv_rms: symmetric int8 quant of qr*gamma cancels the per-token
+        # inv_rms exactly, so the quant uses amax(qr*gamma) directly and inv_rms
+        # rides only qr_scale (dequant). Drops the row_expand_mul(inv_rms) in pass 2.
         qr_amax_floor = pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-        qr_amax_normed = pl.mul(qr_inv_rms, qr_amax_g)
-        qr_tile_amax = pl.maximum(qr_amax_floor, qr_amax_normed)
+        qr_tile_amax = pl.maximum(qr_amax_floor, qr_amax_g)
 
         qr_scale_quant_row = pl.div(pl.full([1, T_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), qr_tile_amax)
         qr_scale_quant_t = pl.reshape(qr_scale_quant_row, [T_TILE, 1])
-        qr_tile_scale_dq = pl.reshape(pl.recip(qr_scale_quant_row), [T_TILE, 1])
+        # dequant scale carries inv_rms: qr_scale = inv_rms / scale_quant = inv_rms*amax_g/SCALE_MAX.
+        qr_tile_scale_dq = pl.reshape(pl.mul(pl.recip(qr_scale_quant_row), qr_inv_rms), [T_TILE, 1])
         qr_scale_view[tg : tg + T_TILE, :] = qr_tile_scale_dq
 
         for qa in pl.pipeline(0, Q_LORA, QUANT_TILE, stage=2):
             qr_chunk = qr_fp32[tg : tg + T_TILE, qa : qa + QUANT_TILE]
             gamma_q_cast = pl.cast(gamma_cq[qa : qa + QUANT_TILE], target_type=pl.FP32)
             gamma_q_chunk = pl.reshape(gamma_q_cast, [1, QUANT_TILE])
-            qr_q_normed = pl.col_expand_mul(pl.row_expand_mul(qr_chunk, qr_inv_rms_t), gamma_q_chunk)
-            qr_q_scaled = pl.row_expand_mul(qr_q_normed, qr_scale_quant_t)
+            qr_q_scaled = pl.row_expand_mul(pl.col_expand_mul(qr_chunk, gamma_q_chunk), qr_scale_quant_t)
             qr_q_i32 = pl.cast(qr_q_scaled, target_type=pl.INT32, mode="rint")
             qr_q_half = pl.cast(qr_q_i32, target_type=pl.FP16, mode="round")
             qr_q_i8 = pl.cast(qr_q_half, target_type=pl.INT8, mode="trunc")
