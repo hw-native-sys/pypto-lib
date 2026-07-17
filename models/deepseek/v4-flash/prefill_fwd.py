@@ -17,10 +17,10 @@ program scales to EP 2 / 4 / 8.  The per-rank kernel hand-unrolls the model's
 layer schedule and calls ``prefill_attention_{swa,hca,csa}`` + ``moe`` directly
 (no ``prefill_layer`` wrapper).  Each attention / moe stage runs in its own
 ``pl.scope`` under ``auto_scope=False`` (matching ``decode_fwd``), and the final
-hidden state passes ``hc_head`` -> final ``rms_norm``.  The last active token is
-then projected by the shared device ``lm_head`` core; EP owner ranks publish one
-hidden row to TP ranks and receive one full-vocabulary logits row.  This is a
-kernel-only smoke driver and does not run a golden comparison.
+hidden state passes ``hc_head`` -> final ``rms_norm``. Selected hidden rows are
+then projected by the shared device ``lm_head`` core; the owner-major selected
+row contract reserves capacity for future packed multi-request logits. This is
+a kernel-only smoke driver and does not run a golden comparison.
 """
 
 import argparse
@@ -104,14 +104,14 @@ from prefill_attention_csa import (
 )
 from hc_head import hc_head
 from lm_head import (
+    MAX_LOGIT_ROWS,
     OWNER_SIZE as LM_HEAD_OWNER_SIZE,
-    PREFILL_LOGITS_ROWS,
     TP_SIZE as LM_HEAD_TP_SIZE,
     T_MAX as LM_HEAD_T_MAX,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
-    prefill_lm_head_owner_only_decoupled,
-    prefill_lm_head_tp_decoupled_worker,
+    lm_head_selected_owner_only_decoupled,
+    lm_head_selected_tp_decoupled_worker,
 )
 from rmsnorm import rms_norm
 
@@ -314,10 +314,10 @@ def prefill_fwd(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
+    nt: pl.Scalar[pl.INT32] = pl.read(num_tokens_per_owner, [my_rank])
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
@@ -789,8 +789,10 @@ def l3_prefill_fwd(
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    logits: pl.Out[pl.Tensor[[N_RANKS, PREFILL_LOGITS_ROWS, LM_HEAD_VOCAB], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -845,7 +847,7 @@ def l3_prefill_fwd(
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
-            r, num_tokens,
+            num_tokens_per_owner, r,
             device=r,
         )
 
@@ -856,15 +858,17 @@ def l3_prefill_fwd(
             logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
         )
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        prefill_lm_head_tp_decoupled_worker(
+        lm_head_selected_tp_decoupled_worker(
             hidden_out[r],
+            num_tokens_per_owner,
+            logit_row_indices,
+            num_logit_rows,
             lm_head_weight[r],
             logits[r],
             hidden_window,
             hidden_done,
             logits_window,
             logits_done,
-            num_tokens,
             r,
             device=r,
         )
@@ -876,14 +880,16 @@ def l3_prefill_fwd(
             logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
         )
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        prefill_lm_head_owner_only_decoupled(
+        lm_head_selected_owner_only_decoupled(
             hidden_out[r],
+            num_tokens_per_owner,
+            logit_row_indices,
+            num_logit_rows,
             logits[r],
             hidden_window,
             hidden_done,
             logits_window,
             logits_done,
-            num_tokens,
             r,
             device=r,
         )
@@ -1270,6 +1276,11 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     def init_lm_head_weight():
         return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
 
+    def init_logit_row_indices():
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, 0] = max(min(num_tokens, T), 1) - 1
+        return indices
+
     base_specs = {
         spec.name: spec
         for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=0)
@@ -1343,12 +1354,28 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec(
         "logits",
-        [N_RANKS, PREFILL_LOGITS_ROWS, LM_HEAD_VOCAB],
+        [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
         torch.float32,
         is_output=True,
     ))
-    from golden import ScalarSpec
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(TensorSpec(
+        "num_tokens_per_owner",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
+    ))
+    specs.append(TensorSpec(
+        "logit_row_indices",
+        [N_RANKS, MAX_LOGIT_ROWS],
+        torch.int32,
+        init_value=init_logit_row_indices,
+    ))
+    specs.append(TensorSpec(
+        "num_logit_rows",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.ones(N_RANKS, dtype=torch.int32),
+    ))
     return specs
 
 

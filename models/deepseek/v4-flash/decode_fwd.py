@@ -18,13 +18,14 @@ import pypto.language.distributed as pld
 from golden import run_jit
 from hc_head import hc_head
 from lm_head import (
+    MAX_LOGIT_ROWS,
     OWNER_SIZE as LM_HEAD_OWNER_SIZE,
     TP_SIZE as LM_HEAD_TP_SIZE,
     T_MAX as LM_HEAD_T_MAX,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
-    lm_head_owner_only_decoupled,
-    lm_head_tp_decoupled_worker,
+    lm_head_selected_owner_only_decoupled,
+    lm_head_selected_tp_decoupled_worker,
 )
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
@@ -262,9 +263,10 @@ def decode_fwd(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
+    nt = pl.read(num_tokens_per_owner, [my_rank])
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -361,7 +363,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
         attention_swa(
@@ -386,7 +388,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
@@ -479,7 +481,7 @@ def decode_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, num_tokens, my_rank, csa_moe_epoch,
+                csa_layer, nt, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -548,7 +550,7 @@ def decode_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, num_tokens, my_rank, hca_moe_epoch,
+                hca_layer, nt, my_rank, hca_moe_epoch,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -638,7 +640,7 @@ def decode_fwd(
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, num_tokens, my_rank, last_moe_epoch,
+            csa_layer_last, nt, my_rank, last_moe_epoch,
         )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
@@ -738,7 +740,9 @@ def l3_decode_fwd(
     lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, T, LM_HEAD_VOCAB], pl.FP32]],
-    num_tokens: pl.Scalar[pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -851,7 +855,7 @@ def l3_decode_fwd(
             hidden_out[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            r, num_tokens,
+            num_tokens_per_owner, r,
             device=r,
         )
 
@@ -860,8 +864,11 @@ def l3_decode_fwd(
         hidden_done = pld.window(hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_tp_decoupled_worker(
+        lm_head_selected_tp_decoupled_worker(
             hidden_out[r],
+            num_tokens_per_owner,
+            logit_row_indices,
+            num_logit_rows,
             lm_head_weight[r],
             logits[r],
             hidden_window,
@@ -877,8 +884,11 @@ def l3_decode_fwd(
         hidden_done = pld.window(hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         logits_window = pld.window(logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_owner_only_decoupled(
+        lm_head_selected_owner_only_decoupled(
             hidden_out[r],
+            num_tokens_per_owner,
+            logit_row_indices,
+            num_logit_rows,
             logits[r],
             hidden_window,
             hidden_done,
@@ -1386,10 +1396,16 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
 
     def init_lm_head_weight():
         return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+
+    def init_logit_row_indices():
+        active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, :active] = torch.arange(active, dtype=torch.int32)
+        return indices
 
     base_specs = {
         spec.name: spec
@@ -1430,7 +1446,26 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     specs.append(TensorSpec("lm_head_weight", [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("logits", [N_RANKS, T, LM_HEAD_VOCAB], torch.float32, is_output=True))
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(TensorSpec(
+        "num_tokens_per_owner",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
+    ))
+    specs.append(TensorSpec(
+        "logit_row_indices",
+        [N_RANKS, MAX_LOGIT_ROWS],
+        torch.int32,
+        init_value=init_logit_row_indices,
+    ))
+    specs.append(TensorSpec(
+        "num_logit_rows",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full(
+            (N_RANKS,), max(min(num_tokens, MAX_LOGIT_ROWS), 0), dtype=torch.int32,
+        ),
+    ))
     return specs
 
 
