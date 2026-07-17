@@ -717,7 +717,6 @@ def prefill_layer_window(
     post_norm_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.BF16)
     resid1_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32)
 
-    qkv_prev_tids = pl.array.create(2, pl.TASK_ID)
     with pl.scope():
         p0 = window_p0
 
@@ -775,12 +774,7 @@ def prefill_layer_window(
         q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
         k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
         v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
-        with pl.spmd(
-            Q_PROJ_SPMD_BLOCKS,
-            name_hint="q_proj_spmd",
-            deps=[qkv_prev_tids[0], qkv_prev_tids[1]],
-        ) as q_proj_tid:
-            q_core = pl.tile.get_block_idx()
+        for q_core in pl.spmd(Q_PROJ_SPMD_BLOCKS, name_hint="q_proj_spmd"):
             for ob in pl.range(q_core, Q_OUT_BLOCKS, Q_PROJ_SPMD_BLOCKS):
                 q0 = ob * Q_OUT_CHUNK
                 tile_a = pl.slice(normed_tile, [TOK_TILE, K_CHUNK], [0, 0])
@@ -793,12 +787,7 @@ def prefill_layer_window(
                     q_acc = pl.matmul_acc(q_acc, tile_a_i, tile_w_i)
                 q_proj_tile = pl.assemble(q_proj_tile, q_acc, [0, q0])
 
-        with pl.spmd(
-            KV_PROJ_SPMD_BLOCKS,
-            name_hint="kv_proj_spmd",
-            deps=[qkv_prev_tids[0], qkv_prev_tids[1]],
-        ) as kv_proj_tid:
-            kv_core = pl.tile.get_block_idx()
+        for kv_core in pl.spmd(KV_PROJ_SPMD_BLOCKS, name_hint="kv_proj_spmd"):
             for ob in pl.range(kv_core, KV_OUT_BLOCKS, KV_PROJ_SPMD_BLOCKS):
                 kv0 = ob * KV_OUT_CHUNK
 
@@ -1101,12 +1090,6 @@ def prefill_layer_window(
                             pl.cast(normed, target_type=pl.BF16),
                             [ti0, k0],
                         )
-
-        # Keep projection task IDs in this helper scope; the current window is
-        # independent of other windows, so no cross-window ordering is intended.
-        qkv_prev_tids[0] = q_proj_tid
-        qkv_prev_tids[1] = kv_proj_tid
-
 
     # ── Phase 2: fully-fused per-band MLP (gate -> up -> silu -> down) ──
     # For each (mt, band): compute gate/up (M=128, weight streamed once), SiLU on
