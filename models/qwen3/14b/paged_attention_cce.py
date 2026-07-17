@@ -16,6 +16,7 @@ import pypto.language as pl
 
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "paged_attention_cce"
 _ATTENTION_ENTRY = _KERNEL_DIR / "attention" / "entry.cpp"
+_ROPE_ONLY_ENTRY = _KERNEL_DIR / "rope_only" / "entry.cpp"
 _TILING_ENTRY = _KERNEL_DIR / "tiling" / "entry.cpp"
 
 
@@ -216,6 +217,82 @@ def qwen_decode_attention_cache_offset_test(
     return out
 
 
+# Stage 1 isolation kernel: runs ONLY the rope_qkv producer (Q/K norm + RoPE +
+# KV-cache writes), no attention. Used by test_rope_qkv_cce.py to validate the
+# C++ rope compute byte-exact against decode_fwd.py's rope_qkv before fusion.
+# Mixed + dual_aiv_dispatch so its AIV lane model (block_idx*2 + sub_block_id)
+# matches the fused kernel; AICs are a no-op (run_qwen_rope_qkv is vec-only).
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_ROPE_ONLY_ENTRY,
+    aiv_source=_ROPE_ONLY_ENTRY,
+    include_dirs=_CANN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def paged_attention_rope_only_cce(
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query: pl.Out[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+    cache_row_offset: pl.Scalar[pl.INDEX],
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def qwen_decode_rope_only_cce(
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query: pl.Out[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+) -> pl.Tensor:
+    """Stage 1 driver: run the fused-prologue rope_qkv in isolation (no attention).
+
+    ``cache_row_offset`` is fixed at 0 (single-layer, slot 0 base) so the driver
+    has no scalar parameter and the harness needs only tensor specs.
+    """
+    # sync_start=True is mandatory for a mixed + dual_aiv_dispatch extern: it makes
+    # all 24 AIC blocks (and their 2 AIV sub-lanes) launch atomically so the AIC/AIV
+    # pairing is coherent. Without it the dispatch 507018s on device.
+    with pl.spmd(
+        DEFAULT_BLOCK_DIM, name_hint="rope_only", allow_early_resolve=True, sync_start=True
+    ) as _rope_tid:
+        query = paged_attention_rope_only_cce(
+            q_proj,
+            k_proj,
+            v_proj,
+            inv_rms_states,
+            q_norm_weight,
+            k_norm_weight,
+            seq_lens,
+            slot_mapping,
+            rope_cos,
+            rope_sin,
+            query,
+            key_cache,
+            value_cache,
+            0,
+        )
+    return query
+
+
 __all__ = [
     "BATCH",
     "BLOCK_SIZE",
@@ -229,7 +306,9 @@ __all__ = [
     "WORKSPACE_BYTES",
     "build_paged_attention_metadata",
     "paged_attention_cce",
+    "paged_attention_rope_only_cce",
     "paged_attention_tiling_cce",
     "qwen_decode_attention_cache_offset_test",
     "qwen_decode_attention_cce",
+    "qwen_decode_rope_only_cce",
 ]
