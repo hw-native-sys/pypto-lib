@@ -1557,6 +1557,17 @@ if __name__ == "__main__":
                              "-> logits) against a host chain reference, instead of the default "
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
+    parser.add_argument("--decode-steps", type=int, default=1,
+                        help="under --validate-fwd, run this many decode steps for a device-cost "
+                             "timing sweep at growing context: each step feeds the previous step's "
+                             "sampled token back as input and grows the context by one (seq_lens += 1, "
+                             "slot_mapping advanced to the new token's KV slot). The context starts at "
+                             "MAX_SEQ (PTO2_MANUAL_MAX_SEQ) and grows to MAX_SEQ + decode_steps - 1; the "
+                             "paged KV pool (block_table / slot_mapping / kc / vc) is enlarged by "
+                             "decode_steps tokens up front so the growing seq_lens never overflow it. "
+                             "Read the device `Effective` span (kc/vc are re-uploaded per step, so it "
+                             "measures decode cost at growing context, not a correct generation). The "
+                             "host-ref argmax check is skipped for N > 1.")
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs + golden for replay (off: large fixtures)")
     args = parser.parse_args()
@@ -1659,6 +1670,51 @@ if __name__ == "__main__":
         # seq_lens / block_table / slot_mapping / rope tables are shared across layers
         # (NOT per-layer stacked); the PAGED KV pool kc/vc IS stacked N times (one
         # paged pool per layer, indexed by layer_cache_base).
+        _n_steps = args.decode_steps
+        if _n_steps < 1:
+            parser.error(f"--decode-steps must be >= 1, got {_n_steps}")
+        # Multi-step decode-timing sweep: grow the context from MAX_SEQ to
+        # MAX_SEQ + decode_steps - 1, one token per step. The paged KV pool
+        # (block_table / slot_mapping and the kc/vc pools, all runtime-dynamic in
+        # the kernel) is enlarged by decode_steps tokens up front so the growing
+        # seq_lens never overflow it, regardless of MAX_SEQ.
+        #
+        # This measures the device decode *cost* at growing context — read the
+        # device `Effective` span, not host wall-clock. kc/vc are plain host
+        # inputs (not InOut), so each dispatch re-uploads them and the on-device
+        # KV writes don't persist across steps; that is fine here because the
+        # per-step read cost tracks seq_lens exactly, and the argmax correctness
+        # check is skipped for N > 1. It is NOT a correct autoregressive
+        # generation (the KV content per step is the re-uploaded prefill KV).
+        if _n_steps > 1:
+            _grow_blocks = (MAX_SEQ + _n_steps + BLOCK_SIZE - 1) // BLOCK_SIZE
+            _grow_pages = BATCH * _grow_blocks
+            _grow_rows = _grow_pages * NUM_KV_HEADS * BLOCK_SIZE
+            bt = torch.arange(_grow_pages, dtype=torch.int32)
+            _pad_rows = _grow_rows - kc.shape[0]
+            if _pad_rows > 0:
+                kc = torch.cat(
+                    [kc, torch.empty([_pad_rows, HEAD_DIM], dtype=kc.dtype).normal_() * 0.01],
+                    dim=0,
+                ).contiguous()
+                vc = torch.cat(
+                    [vc, torch.empty([_pad_rows, HEAD_DIM], dtype=vc.dtype).normal_() * 0.02],
+                    dim=0,
+                ).contiguous()
+
+            def _grow_slot_mapping(seq_lens: torch.Tensor) -> torch.Tensor:
+                """slot_mapping over the enlarged pool (_grow_blocks pages per seq)."""
+                sm_ = torch.empty(BATCH, dtype=torch.int32)
+                for _b in range(BATCH):
+                    pos = int(seq_lens[_b].item()) - 1
+                    sm_[_b] = (_b * _grow_blocks + pos // BLOCK_SIZE) * BLOCK_SIZE + (pos % BLOCK_SIZE)
+                return sm_
+
+            sl = torch.full([BATCH], MAX_SEQ, dtype=torch.int32)
+            sm = _grow_slot_mapping(sl)
+            print(f"[stacked-fwd {N}L+LMhead] autoregressive decode: seq_lens {MAX_SEQ} -> "
+                  f"{MAX_SEQ + _n_steps - 1} over {_n_steps} steps "
+                  f"(KV pool enlarged to {_grow_blocks} pages/seq for {MAX_SEQ + _n_steps} tokens)")
         stacked = [
             stack0(irw, N), stack0(wq_, N), stack0(wk_, N), stack0(wv_, N),
             stack0(qn, N), stack0(kn, N), sl, bt, sm, rc, rs, stack0(kc, N), stack0(vc, N),
@@ -1673,15 +1729,27 @@ if __name__ == "__main__":
             embed_weight[b] = hs[b]
         sampled_ids_out = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
         next_hidden = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
-        decode_fwd(
-            *stacked,
-            logits,
-            embed_weight,
-            sampled_ids_in,
-            sampled_ids_out,
-            next_hidden,
-            config=run_cfg,
-        )
+        for _step in range(_n_steps):
+            decode_fwd(
+                *stacked,
+                logits,
+                embed_weight,
+                sampled_ids_in,
+                sampled_ids_out,
+                next_hidden,
+                config=run_cfg,
+            )
+            if _step + 1 < _n_steps:
+                # Feed the sampled token back and grow the context by one token:
+                # seq_lens += 1 and re-point slot_mapping to the new token's KV slot
+                # in the enlarged pool.
+                sampled_ids_in.copy_(sampled_ids_out)
+                sl.add_(1)
+                sm.copy_(_grow_slot_mapping(sl))
+        if _n_steps > 1:
+            print(f"[stacked-fwd {N}L+LMhead] {_n_steps}-step autoregressive decode complete "
+                  f"(host-ref argmax check skipped for --decode-steps > 1)")
+            raise SystemExit(0)
         # Perf-only mode: the L2 swimlane collector cannot register host buffers for a
         # second on-device program in the same process (the host-ref call below would
         # `init_l2_swimlane failed: 8`). decode_fwd already emitted the swimlane table,
