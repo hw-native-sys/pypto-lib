@@ -172,6 +172,7 @@ MLP_INNER_TK = 64
 MLP_K_SLICE = HIDDEN // K_SPLITS_MLP  # 1024 K per task
 MLP_N_SUB_K = MLP_K_SLICE // MLP_INNER_TK  # 16 inner K iters per task
 MLP_ON = INTERMEDIATE // MLP_TN  # 17 output N-blocks (= silu task count)
+GATE_UP_SPMD_N = 6  # critical-wave: n_out 0..5 → pl.spmd; n≥6 deferred via dummy
 
 # ── Scope 3b · silu (MLP_TN-wide tasks, inner pipe over MLP_OUT_CHUNK sub-tiles) ──
 MLP_OUT_CHUNK = 256  # silu inner-pipe sub-tile width
@@ -205,6 +206,7 @@ assert N_SPLITS_OUT * OUT_TN == HIDDEN
 assert K_SPLITS_OUT * OUT_TK == HIDDEN
 assert OUT_N_SUB_K * OUT_INNER_TK == OUT_TK
 assert N_PER_CAST_K * OUT_TN == MLP_K_SLICE
+assert GATE_UP_SPMD_N < MLP_ON
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -629,6 +631,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         gate_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         up_tids = pl.array.create(MLP_ON * K_SPLITS_MLP, pl.TASK_ID)
         cast_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
+        # Per-k task_dummy funnels for the deferred (non-critical) gate/up tiles.
+        # Filled in the k_split-keyed critical-wave loop, consumed by the
+        # [n_out outer, k_split inner] deferred-tile loop (symbolic pl.range
+        # indexing requires a pl.array, not a Python list).
+        gate_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
+        up_late_tids = pl.array.create(K_SPLITS_MLP, pl.TASK_ID)
         out_tids = pl.array.create(N_SPLITS_OUT * K_SPLITS_OUT, pl.TASK_ID)
 
         # 14e2635 critical-wave split: defer the first 26 tiles through an
@@ -741,15 +749,107 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             post_inv_rms_col = pl.reshape(post_inv_rms, [BATCH, 1])
             inv_rms_tile = pl.assemble(inv_rms_tile, post_inv_rms_col, [0, 0])
 
-        # Split-K gate + up interleaved.
-        for n_out in pl.parallel(MLP_ON):
+        # Split-K gate + up critical-wave (per cast / k_split), like out_proj:
+        #   * n_out ∈ [0, GATE_UP_SPMD_N) → pl.spmd(GATE_UP_SPMD_N, deps=[cast])
+        #   * n_out ∈ [GATE_UP_SPMD_N, MLP_ON) → task_dummy(cast) → pl.at
+        #
+        # EXPERIMENT: this is split into two loops so the deferred (non-critical)
+        # tiles run in the baseline [n_out outer, k_split inner] order:
+        #   Loop 1 (k_split-keyed, pl.unroll): the critical-wave SPMD dispatches
+        #     for the leading GATE_UP_SPMD_N tiles + the per-k task_dummy funnels
+        #     (gate_late_tids/up_late_tids).
+        #   Loop 2 (n_out outer / pl.parallel, k_split inner / pl.range): the
+        #     deferred tiles' gate/up matmuls, each depending on the funnel dummy
+        #     for its k_split.
+        # The two n-tile ranges write disjoint n0 columns of gate/up_acc_all
+        # (atomic-add over k), so the split is value-equivalent to the fused form.
+        #
+        # NOTE: Loop 1 still runs at the top level of a `pl.unroll` body, so it
+        # keeps the dedicated `gu_k0` (a bare `k0` would leak as a constant into
+        # the later down_proj `pl.parallel(DOWN_ON)` loop — orchestration codegen
+        # rejects the literal-init iter_arg). Loop 2 reassigns `k0` inside a real
+        # `pl.range` scope, so that leak does not apply there.
+        for k_split in pl.unroll(K_SPLITS_MLP):
+            gu_k0 = k_split * MLP_K_SLICE
+            gate_late_tids[k_split] = pl.system.task_dummy(deps=[cast_tids[k_split]])
+            up_late_tids[k_split] = pl.system.task_dummy(deps=[cast_tids[k_split]])
+
+            with pl.spmd(
+                GATE_UP_SPMD_N,
+                name_hint="gate_proj",
+                deps=[cast_tids[k_split]],
+            ) as gate_spmd_tid:
+                spmd_gate_n_out = pl.get_block_idx()
+                spmd_gate_n0 = spmd_gate_n_out * MLP_TN
+                spmd_gate_a0 = mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK]
+                spmd_gate_w0 = w_gate[
+                    layer_hidden_base + gu_k0 : layer_hidden_base + gu_k0 + MLP_INNER_TK,
+                    spmd_gate_n0 : spmd_gate_n0 + MLP_TN,
+                ]
+                spmd_gate_c_acc = pl.matmul(spmd_gate_a0, spmd_gate_w0, out_dtype=pl.FP32)
+                for spmd_gate_lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
+                    spmd_gate_ks_off = spmd_gate_lk * MLP_INNER_TK
+                    spmd_gate_a_k = mlp_norm_in[
+                        :, gu_k0 + spmd_gate_ks_off : gu_k0 + spmd_gate_ks_off + MLP_INNER_TK
+                    ]
+                    spmd_gate_w_k = w_gate[
+                        layer_hidden_base + gu_k0 + spmd_gate_ks_off : layer_hidden_base
+                        + gu_k0
+                        + spmd_gate_ks_off
+                        + MLP_INNER_TK,
+                        spmd_gate_n0 : spmd_gate_n0 + MLP_TN,
+                    ]
+                    spmd_gate_c_acc = pl.matmul_acc(spmd_gate_c_acc, spmd_gate_a_k, spmd_gate_w_k)
+                gate_acc_all = pl.assemble(
+                    gate_acc_all, spmd_gate_c_acc, [0, spmd_gate_n0], atomic=pl.AtomicType.Add
+                )
+            for spmd_n_out in pl.unroll(GATE_UP_SPMD_N):
+                gate_tids[spmd_n_out * K_SPLITS_MLP + k_split] = gate_spmd_tid
+
+            with pl.spmd(
+                GATE_UP_SPMD_N,
+                name_hint="up_proj",
+                deps=[cast_tids[k_split]],
+            ) as up_spmd_tid:
+                spmd_up_n_out = pl.get_block_idx()
+                spmd_up_n0 = spmd_up_n_out * MLP_TN
+                spmd_up_a0 = mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK]
+                spmd_up_w0 = w_up[
+                    layer_hidden_base + gu_k0 : layer_hidden_base + gu_k0 + MLP_INNER_TK,
+                    spmd_up_n0 : spmd_up_n0 + MLP_TN,
+                ]
+                spmd_up_c_acc = pl.matmul(spmd_up_a0, spmd_up_w0, out_dtype=pl.FP32)
+                for spmd_up_lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
+                    spmd_up_ks_off = spmd_up_lk * MLP_INNER_TK
+                    spmd_up_a_k = mlp_norm_in[
+                        :, gu_k0 + spmd_up_ks_off : gu_k0 + spmd_up_ks_off + MLP_INNER_TK
+                    ]
+                    spmd_up_w_k = w_up[
+                        layer_hidden_base + gu_k0 + spmd_up_ks_off : layer_hidden_base
+                        + gu_k0
+                        + spmd_up_ks_off
+                        + MLP_INNER_TK,
+                        spmd_up_n0 : spmd_up_n0 + MLP_TN,
+                    ]
+                    spmd_up_c_acc = pl.matmul_acc(spmd_up_c_acc, spmd_up_a_k, spmd_up_w_k)
+                up_acc_all = pl.assemble(
+                    up_acc_all, spmd_up_c_acc, [0, spmd_up_n0], atomic=pl.AtomicType.Add
+                )
+            for spmd_n_out in pl.unroll(GATE_UP_SPMD_N):
+                up_tids[spmd_n_out * K_SPLITS_MLP + k_split] = up_spmd_tid
+
+        # Deferred (non-critical) gate/up tiles n_out ∈ [GATE_UP_SPMD_N, MLP_ON),
+        # restored to the baseline [n_out outer, k_split inner] loop order. Each
+        # tile funnels its cast dependency through the per-k dummy so it carries a
+        # single edge to cast_tids[k_split] instead of one edge per tile.
+        for n_out in pl.parallel(GATE_UP_SPMD_N, MLP_ON):
             n0 = n_out * MLP_TN
             for k_split in pl.range(K_SPLITS_MLP):
                 k0 = k_split * MLP_K_SLICE
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="gate_proj",
-                    deps=[cast_tids[k_split]],  # gate_seed funneled via fa_fused (cast_tid -> out_proj -> fa_fused)
+                    deps=[gate_late_tids[k_split]],
                 ) as gate_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
                     w0 = w_gate[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
@@ -757,7 +857,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
                         a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_gate[layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                        w_k = w_gate[
+                            layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
+                            n0 : n0 + MLP_TN,
+                        ]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     gate_acc_all = pl.assemble(gate_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 gate_tids[n_out * K_SPLITS_MLP + k_split] = gate_tid
@@ -765,7 +868,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 with pl.at(
                     level=pl.Level.CORE_GROUP,
                     name_hint="up_proj",
-                    deps=[cast_tids[k_split]],  # up_seed funneled via fa_fused (cast_tid -> out_proj -> fa_fused)
+                    deps=[up_late_tids[k_split]],
                 ) as up_tid:
                     a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
                     w0 = w_up[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
@@ -773,7 +876,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
                         a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
-                        w_k = w_up[layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK, n0 : n0 + MLP_TN]
+                        w_k = w_up[
+                            layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
+                            n0 : n0 + MLP_TN,
+                        ]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     up_acc_all = pl.assemble(up_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
                 up_tids[n_out * K_SPLITS_MLP + k_split] = up_tid
