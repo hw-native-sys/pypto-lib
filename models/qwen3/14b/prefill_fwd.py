@@ -27,13 +27,12 @@ gathered on device before the first transformer layer. `seq_lens`
 stores the absolute sequence length after the current chunk; `chunk_lens`
 and `chunk_offsets` identify each batch row's slice inside the packed chunk.
 
-Unlike the decode path, prefill iterates the batch dim with step 1 (one
-batch element per outer iteration) and every matmul tile's M dim is
-governed by `TOK_TILE` (independent of batch). Therefore prefill does
-NOT need decode's `batch_padded` round-up + `valid_shape` zero-pad +
-vec-to-vec textract trim machinery on the batch axis. The per-token
-`valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)` + `valid_shape` pattern
-already handles intra-batch sequence-length variation.
+Unlike the decode path, prefill bounds hidden-state lifetime by processing
+128-token windows. Batch-1 uses a compact `[128, HIDDEN]` window so it does
+not pay for fake batch rows; larger batches use one fixed `[BATCH * 128,
+HIDDEN]` packed group per window to preserve the batch-16 prefill schedule.
+The per-token `valid_tok` + `valid_shape` pattern still handles sequence-length
+variation inside each window.
 """
 import pypto.language as pl
 
@@ -675,6 +674,8 @@ def prefill_layer(
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    group_p0: pl.Scalar[pl.INDEX],
+    active_prefill_tokens: pl.Scalar[pl.INDEX],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
@@ -720,7 +721,10 @@ def prefill_layer(
     # (post_norm, first-residual) for the whole packed token dim; phase 2 (after
     # the batch loop) runs gate/up/down as flat, band-grouped token-tile sweeps
     # so each weight streams from HBM once and is reused across every token tile.
-    prefill_tokens = pl.tensor.dim(hidden_states, 0)
+    # ``hidden_states`` may be a static-capacity group buffer
+    # ([BATCH * MLP_M_TILE, HIDDEN]). Drive token-tile work from the active
+    # packed rows so partial batches do not run fake MLP tiles.
+    prefill_tokens = active_prefill_tokens
     num_tok_tiles = (prefill_tokens + TOK_TILE - 1) // TOK_TILE
     num_m_tiles = (prefill_tokens + MLP_M_TILE - 1) // MLP_M_TILE
     # Pad to a multiple of MLP_M_TILE (>= num_tok_tiles*TOK_TILE), so both the
@@ -730,16 +734,21 @@ def prefill_layer(
     resid1_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32)
 
     for b in pl.parallel(0, user_batch, 1):
-        token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
+        original_token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX) + group_p0
+        token_base = pl.cast(b * MLP_M_TILE, pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
-        chunk_len_b = pl.tensor.read(chunk_lens, [b])
-        chunk_start = seq_len_b - chunk_len_b
+        full_chunk_len_b = pl.tensor.read(chunk_lens, [b])
+        group_p0_i32 = pl.cast(group_p0, pl.INT32)
+        chunk_start = seq_len_b - full_chunk_len_b
+        remaining_tok = full_chunk_len_b - group_p0_i32
+        chunk_len_b = pl.min(MLP_M_TILE, pl.max(remaining_tok, 0))
         tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
         qkv_prev_tids = pl.array.create(2, pl.TASK_ID)
         for p0_idx in pl.range(tok_blocks):
             with pl.scope():
                 p0 = p0_idx * TOK_TILE
                 token_p0 = token_base + p0
+                slot_token_p0 = original_token_base + p0
                 valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
 
                 # ── Scope 1: input RMSNorm + Q/K/V projection ──
@@ -855,7 +864,7 @@ def prefill_layer(
                         for rope_core in pl.spmd(ROPE_SPMD_BLOCKS, name_hint="rope_kv_cache"):
                             for rel_ti in pl.range(rope_core, finalize_tok, ROPE_SPMD_BLOCKS):
                                 ti = final_ti0 + rel_ti
-                                chunk_pos = p0 + ti
+                                chunk_pos = group_p0_i32 + p0 + ti
                                 pos = chunk_start + chunk_pos
                                 cos_row = pl.slice(rope_cos, [1, HEAD_DIM], [pos, 0])
                                 sin_row = pl.slice(rope_sin, [1, HEAD_DIM], [pos, 0])
@@ -863,7 +872,7 @@ def prefill_layer(
                                 cos_hi = pl.slice(cos_row, [1, HALF_DIM], [0, HALF_DIM])
                                 sin_lo = pl.slice(sin_row, [1, HALF_DIM], [0, 0])
                                 sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
-                                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [token_base + chunk_pos]), pl.INDEX)
+                                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [slot_token_p0 + ti]), pl.INDEX)
                                 cache_slot_block = cache_slot // BLOCK_SIZE
                                 cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
                                 q_block_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD
@@ -983,13 +992,13 @@ def prefill_layer(
                         b_i32 = pl.cast(b, pl.INT32)
                         max_blocks_i32 = pl.cast(max_blocks_per_seq, pl.INT32)
                         layer_cache_base_i32 = pl.cast(layer_cache_base, pl.INT32)
-                        p0_i32 = pl.cast(p0, pl.INT32)
+                        p0_i32 = group_p0_i32 + pl.cast(p0, pl.INT32)
                         final_ti0_i32 = pl.cast(final_ti0, pl.INT32)
                         finalize_tok_i32 = pl.cast(finalize_tok, pl.INT32)
 
                         cur_li_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
                         oi_tmp_phase = pl.create_tensor([ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
-                        block_ctx_len = chunk_start + p0 + final_ti0 + finalize_tok
+                        block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
                         block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
                         if block_ctx_blocks == 1:
                             if finalize_tok == FINALIZE_TOK_GROUP:
@@ -1139,38 +1148,39 @@ def prefill_layer(
     # scope-local buffers, so band0/band1 pipeline (band1's gate overlaps band0's
     # silu/down) and the atomic RMW does the cross-band down reduction with no
     # barrier; a final cast writes bf16 `out`.
-    mlp_out_acc = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32, manual_dep=True)
     down_n_blocks = HIDDEN // K_CHUNK
     band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
     silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
 
     # Seed + gate/up/silu/down + cast are FUSED into ONE per-m-tile scope. This is
-    # deliberate: mlp_out_acc is manual_dep=True (ALL of its auto RAW/WAR/WAW edges
+    # deliberate: mlp_out_acc_tile is manual_dep=True (ALL of its auto RAW/WAR/WAW edges
     # are OFF), so the two orderings we DO need -- seed -> down and down -> cast --
     # must be pinned with explicit TASK_ID deps, and an explicit dep may only name a
     # tid captured in an ENCLOSING scope (a tid from a sibling `for mt` loop is a
     # free var -> SSA verify fails). Keeping seed_tid / down_tid in the same m-tile
     # scope as their consumers is what makes those edges legal. The one edge we
     # SUPPRESS is band0 <-> band1 down: both bands dep only on seed_tid, never on
-    # each other, so their atomic-adds into mlp_out_acc run concurrently -- the
+    # each other, so their atomic-adds into mlp_out_acc_tile run concurrently -- the
     # atomic RMW makes the cross-band reduction order-independent (that WAW removal
     # is the whole point).
     for mt in pl.range(num_m_tiles):
         m0 = mt * MLP_M_TILE
         with pl.scope():
+            mlp_out_acc_tile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32, manual_dep=True)
+
             # Seed the accumulator with the first-residual (folds the MLP residual add).
             with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_out_seed_spmd") as seed_tid:
                 seed_core = pl.tile.get_block_idx()
                 for hb in pl.range(seed_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
-                    mlp_out_acc = pl.assemble(
-                        mlp_out_acc,
+                    mlp_out_acc_tile = pl.assemble(
+                        mlp_out_acc_tile,
                         pl.slice(resid1_all, [MLP_M_TILE, K_CHUNK], [m0, h0]),
-                        [m0, h0],
+                        [0, h0],
                     )
 
             # down_chain collects each band's down TASK_ID in THIS m-tile scope so the
-            # post-band cast can gate on ALL bands' atomic-adds (mlp_out_acc is
+            # post-band cast can gate on ALL bands' atomic-adds (mlp_out_acc_tile is
             # manual_dep, so the down -> cast edge is explicit, not auto-tracked). It
             # is NOT a serialization chain -- the bands never dep on each other.
             down_chain = pl.array.create(MLP_PROJ_BANDS, pl.TASK_ID)
@@ -1237,10 +1247,10 @@ def prefill_layer(
                                 msi = pl.slice(mlp_silu_b, [MLP_M_TILE, MLP_OUT_CHUNK], [0, c0])
                                 wdi = pl.slice(w_down, [MLP_OUT_CHUNK, K_CHUNK], [layer_inter_base + band_inter0 + c0, h0])
                                 down_acc = pl.matmul_acc(down_acc, msi, wdi)
-                            mlp_out_acc = pl.assemble(mlp_out_acc, down_acc, [m0, h0], atomic=pl.AtomicType.Add)
+                            mlp_out_acc_tile = pl.assemble(mlp_out_acc_tile, down_acc, [0, h0], atomic=pl.AtomicType.Add)
                     down_chain[mlp_band] = down_tid
 
-            # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc is manual_dep, so
+            # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc_tile is manual_dep, so
             # this read is gated on BOTH bands' down adds explicitly (auto-dep is off).
             # This is the only down -> consumer edge; it does NOT reintroduce any
             # band0 <-> band1 ordering.
@@ -1249,7 +1259,7 @@ def prefill_layer(
                 cast_core = pl.tile.get_block_idx()
                 for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
-                    acc_chunk = pl.slice(mlp_out_acc, [MLP_M_TILE, K_CHUNK], [m0, h0])
+                    acc_chunk = pl.slice(mlp_out_acc_tile, [MLP_M_TILE, K_CHUNK], [0, h0])
                     out_bf = pl.cast(acc_chunk, target_type=pl.BF16)
                     out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
                     out = pl.assemble(out, out_valid, [m0, h0])
@@ -1297,76 +1307,167 @@ def prefill_fwd(
 
     user_batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
-    prefill_tokens = pl.tensor.dim(input_ids, 0)
-
-    hidden_states = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
-    for p0 in pl.parallel(0, prefill_tokens, TOK_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
-            valid_tok = pl.min(TOK_TILE, prefill_tokens - p0)
-            for ti in pl.range(TOK_TILE):
-                if ti < valid_tok:
-                    token_idx = p0 + ti
-                    token_id = pl.tensor.read(input_ids, [token_idx])
-                    token_row = pl.cast(token_id, target_type=pl.INDEX)
-                    for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
-                        hidden_chunk = pl.slice(
-                            embed_weight,
-                            [1, EMBED_HIDDEN_CHUNK],
-                            [token_row, k0],
-                        )
-                        hidden_states = pl.assemble(
-                            hidden_states,
-                            hidden_chunk,
-                            [token_idx, k0],
-                        )
-
-    for layer_idx in pl.range(num_layers_actual):
-        with pl.scope():
-            layer_next_hidden = pl.create_tensor([prefill_tokens, HIDDEN], dtype=pl.BF16)
-            hidden_states = prefill_layer(
-                hidden_states,
-                seq_lens,
-                chunk_lens,
-                chunk_offsets,
-                input_rms_weight,
-                wq,
-                wk,
-                wv,
-                q_norm_weight,
-                k_norm_weight,
-                rope_cos,
-                rope_sin,
-                block_table,
-                slot_mapping,
-                k_cache,
-                v_cache,
-                wo,
-                post_rms_weight,
-                w_gate,
-                w_up,
-                w_down,
-                layer_next_hidden,
-                layer_idx,
-            )
 
     final_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gather_prefill_last_token"):
-            for bi in pl.range(BATCH_TILE):
-                b = b0 + bi
-                if b < user_batch:
-                    token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
+
+    max_chunk_len = pl.tensor.read(chunk_lens, [0])
+    for b in pl.range(1, user_batch):
+        max_chunk_len = pl.max(max_chunk_len, pl.tensor.read(chunk_lens, [b]))
+
+    group_blocks = (max_chunk_len + MLP_M_TILE - 1) // MLP_M_TILE
+    for p0_idx in pl.range(group_blocks):
+        # This runtime scope is the heap lifetime boundary for the window-local
+        # hidden buffers below; removing it keeps old windows live until function exit.
+        with pl.scope():
+            p0 = p0_idx * MLP_M_TILE
+            if user_batch == 1:
+                window_hidden = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
+                chunk_len_b = pl.tensor.read(chunk_lens, [0])
+                valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
+
+                with pl.spmd(MLP_M_TILE // TOK_TILE, name_hint="token_embed_single"):
+                    tile_rem = pl.tile.get_block_idx()
+                    local_p0 = tile_rem * TOK_TILE
+                    tile_valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
+                    for ti in pl.range(TOK_TILE):
+                        if ti < tile_valid_tok:
+                            token_idx = token_base + p0 + local_p0 + ti
+                            window_idx = local_p0 + ti
+                            token_id = pl.tensor.read(input_ids, [token_idx])
+                            token_row = pl.cast(token_id, target_type=pl.INDEX)
+                            for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                                hidden_chunk = pl.slice(
+                                    embed_weight,
+                                    [1, EMBED_HIDDEN_CHUNK],
+                                    [token_row, k0],
+                                )
+                                window_hidden = pl.assemble(
+                                    window_hidden,
+                                    hidden_chunk,
+                                    [window_idx, k0],
+                                )
+
+                for layer_idx in pl.range(num_layers_actual):
+                    with pl.scope():
+                        window_next = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                        window_hidden = prefill_layer(
+                            window_hidden,
+                            seq_lens,
+                            chunk_lens,
+                            chunk_offsets,
+                            pl.cast(p0, pl.INDEX),
+                            pl.cast(MLP_M_TILE, pl.INDEX),
+                            input_rms_weight,
+                            wq,
+                            wk,
+                            wv,
+                            q_norm_weight,
+                            k_norm_weight,
+                            rope_cos,
+                            rope_sin,
+                            block_table,
+                            slot_mapping,
+                            k_cache,
+                            v_cache,
+                            wo,
+                            post_rms_weight,
+                            w_gate,
+                            w_up,
+                            w_down,
+                            window_next,
+                            layer_idx,
+                        )
+                if chunk_len_b > 0:
+                    last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
+                    if p0_idx == last_group:
+                        local_last = valid_tok - 1
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_single"):
+                            for kb in pl.range(HIDDEN_BLOCKS):
+                                k0 = kb * K_CHUNK
+                                final_hidden_chunk = pl.slice(
+                                    window_hidden,
+                                    [1, K_CHUNK],
+                                    [local_last, k0],
+                                )
+                                final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [0, k0])
+            else:
+                group_hidden = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+
+                with pl.spmd(BATCH * (MLP_M_TILE // TOK_TILE), name_hint="token_embed_group"):
+                    tile_id = pl.tile.get_block_idx()
+                    b = tile_id // (MLP_M_TILE // TOK_TILE)
+                    tile_rem = tile_id - b * (MLP_M_TILE // TOK_TILE)
+                    local_p0 = tile_rem * TOK_TILE
+                    group_p0 = b * MLP_M_TILE + local_p0
+                    if b < user_batch:
+                        token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
+                        chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                        valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
+                        for ti in pl.range(TOK_TILE):
+                            if ti < valid_tok:
+                                token_idx = token_base + p0 + local_p0 + ti
+                                group_idx = group_p0 + ti
+                                token_id = pl.tensor.read(input_ids, [token_idx])
+                                token_row = pl.cast(token_id, target_type=pl.INDEX)
+                                for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                                    hidden_chunk = pl.slice(
+                                        embed_weight,
+                                        [1, EMBED_HIDDEN_CHUNK],
+                                        [token_row, k0],
+                                    )
+                                    group_hidden = pl.assemble(
+                                        group_hidden,
+                                        hidden_chunk,
+                                        [group_idx, k0],
+                                    )
+
+                for layer_idx in pl.range(num_layers_actual):
+                    with pl.scope():
+                        group_next = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                        group_hidden = prefill_layer(
+                            group_hidden,
+                            seq_lens,
+                            chunk_lens,
+                            chunk_offsets,
+                            pl.cast(p0, pl.INDEX),
+                            pl.cast(user_batch * MLP_M_TILE, pl.INDEX),
+                            input_rms_weight,
+                            wq,
+                            wk,
+                            wv,
+                            q_norm_weight,
+                            k_norm_weight,
+                            rope_cos,
+                            rope_sin,
+                            block_table,
+                            slot_mapping,
+                            k_cache,
+                            v_cache,
+                            wo,
+                            post_rms_weight,
+                            w_gate,
+                            w_up,
+                            w_down,
+                            group_next,
+                            layer_idx,
+                        )
+                for b in pl.parallel(0, user_batch, 1):
                     chunk_len_b = pl.tensor.read(chunk_lens, [b])
                     if chunk_len_b > 0:
-                        last_token = token_base + pl.cast(chunk_len_b, pl.INDEX) - 1
-                        for kb in pl.range(HIDDEN_BLOCKS):
-                            k0 = kb * K_CHUNK
-                            final_hidden_chunk = pl.slice(
-                                hidden_states,
-                                [1, K_CHUNK],
-                                [last_token, k0],
-                            )
-                            final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
+                        last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
+                        if p0_idx == last_group:
+                            valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
+                            local_last = b * MLP_M_TILE + valid_tok - 1
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_group"):
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    final_hidden_chunk = pl.slice(
+                                        group_hidden,
+                                        [1, K_CHUNK],
+                                        [local_last, k0],
+                                    )
+                                    final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
 
     out = rms_lm_head(final_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
@@ -1848,8 +1949,26 @@ if __name__ == "__main__":
                               "pl.dynamic() variable, so a single compiled "
                               "program serves any batch <= host KV-cache "
                               "capacity. Default: %(default)s"))
-    parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2, 3, 4], default=0,
-                        help="1 = enable L2 swimlane, 0 = disable (default)")
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        choices=[0, 1, 2, 3, 4],
+        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+             "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
+             "phases, 4=+orch phases; 0 (default) disables.",
+    )
+    parser.add_argument("--enable-scope-stats", action="store_true", default=False,
+                        help="enable PTO2 scope lifetime statistics")
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
+                        help="capture the task dependency graph to dfx_outputs/deps.json "
+                             "(render with simpler_setup.tools.deps_viewer). Opt-in AICPU-side "
+                             "DFX, off by default. Keep --num-layers small when capturing: the "
+                             "per-run SHM record buffer can overflow ('records dropped') on the "
+                             "full 40-layer graph.")
     parser.add_argument("--max-seq", type=int, default=DEFAULT_TEST_MAX_SEQ,
                         help="synthetic max sequence length, up to model MAX_SEQ")
     parser.add_argument("--use-max-seq", action="store_true", default=False,
@@ -1861,6 +1980,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--save-data", action="store_true", default=False,
                         help="persist inputs + golden for replay (off: large fixtures)")
+    parser.add_argument("--no-golden", action="store_true", default=False,
+                        help="skip host golden computation and output validation")
     args = parser.parse_args()
 
     result = run_jit(
@@ -1873,11 +1994,13 @@ if __name__ == "__main__":
             chunk_start=args.chunk_start,
             chunk_size=args.chunk_size,
         ),
-        golden_fn=golden_qwen3_14b_prefill,
+        golden_fn=None if args.no_golden else golden_qwen3_14b_prefill,
         runtime_cfg=dict(
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_scope_stats=args.enable_scope_stats,
+            enable_dep_gen=args.enable_dep_gen,
         ),
         rtol=5e-3,
         atol=5e-3,
