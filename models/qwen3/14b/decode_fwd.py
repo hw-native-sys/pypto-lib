@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim    # CI marker: external CCEC attention is A2/A3 onboard only
-# ci: no-dep-gen  # The external attention kernel requires an uninstrumented full mixed-core cohort.
 """Qwen3-14B decode with FP32 inter-layer carry and direct CANN attention.
 
 The projection, QK-norm, RoPE, output projection, MLP, and dependency topology
@@ -1549,9 +1548,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--smoke", action="store_true", default=False,
                         help="compile-only (no device); also the implicit behavior on *sim platforms.")
-    parser.add_argument("--no-dep-gen", action="store_true", default=False,
-                        help="deprecated no-op: dep_gen is already forced off for the direct "
-                             "CCE attention cohort; kept for CLI / CI back-compat.")
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
+                        help="capture the task dependency graph to dfx_outputs/deps.json "
+                             "(render with simpler_setup.tools.deps_viewer). Opt-in AICPU-side "
+                             "DFX, off by default. Keep --fwd-layers small when capturing: the "
+                             "per-run SHM record buffer can overflow ('records dropped') on the "
+                             "full 40-layer graph.")
     parser.add_argument("--validate-fwd", action="store_true", default=False,
                         help="validate the fused decode_fwd (N stacked layers + on-device LM head "
                              "-> logits) against a host chain reference, instead of the default "
@@ -1614,9 +1616,7 @@ if __name__ == "__main__":
                 platform=args.platform,
                 device_id=args.device,
                 enable_l2_swimlane=args.enable_l2_swimlane,
-                # The direct CCE attention launch requires an uninstrumented full
-                # mixed-core cohort. --no-dep-gen remains an accepted CLI no-op.
-                enable_dep_gen=False,
+                enable_dep_gen=args.enable_dep_gen,
             ),
             rtol=3e-3,
             atol=3e-3,
@@ -1636,18 +1636,19 @@ if __name__ == "__main__":
     else:
         random_values = random_inputs(full_seq=args.max_seq, seed=args.seed)
         inputs = [random_values[name] for name in INPUT_NAMES]
-    # dep_gen is force-disabled here: --validate-fwd runs two on-device programs in
-    # one process (decode_fwd, then the host-ref loop's decode_fwd_layers), and the
-    # dep_gen collector cannot register host buffers for the second program
-    # (`halHostRegister for dep_gen SHM failed: 8` -> `init_dep_gen failed: 8`). On
-    # this 40-layer graph dep_gen also overflows ("records dropped", no deps.json),
-    # so it provides nothing of value here regardless.
+    # dep_gen (--enable-dep-gen) is an AICPU-side DFX collector for the producer->
+    # consumer task graph; it does not reduce the AICore cohort, so it coexists with
+    # the full-occupancy attention op. --validate-fwd runs two on-device programs
+    # (decode_fwd, then the host-ref decode_fwd_layers), and each writes its own
+    # dfx_outputs/deps.json. The per-run SHM record buffer can overflow ("records
+    # dropped") on the full 40-layer --max-seq graph, so capture with a small
+    # --fwd-layers.
     run_cfg = RunConfig(
         platform=args.platform,
         device_id=args.device,
         backend_type=_backend_type(args.platform),
         enable_l2_swimlane=args.enable_l2_swimlane,
-        enable_dep_gen=False,
+        enable_dep_gen=args.enable_dep_gen,
         dump_passes=False,
     )
 
