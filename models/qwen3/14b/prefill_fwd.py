@@ -2458,23 +2458,22 @@ def prefill_fwd(
     group_blocks = (max_chunk_len + MLP_M_TILE - 1) // MLP_M_TILE
     for p0_idx in pl.range(group_blocks):
         with pl.scope():
-            group_hidden = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
             p0 = p0_idx * MLP_M_TILE
+            if user_batch == 1:
+                window_hidden = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
+                seq_len_b = pl.tensor.read(seq_lens, [0])
+                chunk_len_b = pl.tensor.read(chunk_lens, [0])
+                valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
 
-            with pl.spmd(BATCH * (MLP_M_TILE // TOK_TILE), name_hint="token_embed_group"):
-                tile_id = pl.tile.get_block_idx()
-                b = tile_id // (MLP_M_TILE // TOK_TILE)
-                tile_rem = tile_id - b * (MLP_M_TILE // TOK_TILE)
-                local_p0 = tile_rem * TOK_TILE
-                group_p0 = b * MLP_M_TILE + local_p0
-                if b < user_batch:
-                    token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
-                    chunk_len_b = pl.tensor.read(chunk_lens, [b])
-                    valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
+                with pl.spmd(MLP_M_TILE // TOK_TILE, name_hint="token_embed_single"):
+                    tile_rem = pl.tile.get_block_idx()
+                    local_p0 = tile_rem * TOK_TILE
+                    tile_valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
                     for ti in pl.range(TOK_TILE):
-                        if ti < valid_tok:
+                        if ti < tile_valid_tok:
                             token_idx = token_base + p0 + local_p0 + ti
-                            group_idx = group_p0 + ti
+                            window_idx = local_p0 + ti
                             token_id = pl.tensor.read(input_ids, [token_idx])
                             token_row = pl.cast(token_id, target_type=pl.INDEX)
                             for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
@@ -2483,57 +2482,133 @@ def prefill_fwd(
                                     [1, EMBED_HIDDEN_CHUNK],
                                     [token_row, k0],
                                 )
-                                group_hidden = pl.assemble(
-                                    group_hidden,
+                                window_hidden = pl.assemble(
+                                    window_hidden,
                                     hidden_chunk,
-                                    [group_idx, k0],
+                                    [window_idx, k0],
                                 )
 
-            for layer_idx in pl.range(num_layers_actual):
-                with pl.scope():
-                    group_next = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
-                    group_hidden = prefill_layer_group_direct(
-                        group_hidden,
-                        seq_lens,
-                        chunk_lens,
-                        chunk_offsets,
-                        pl.cast(p0, pl.INDEX),
-                        input_rms_weight,
-                        wq,
-                        wk,
-                        wv,
-                        q_norm_weight,
-                        k_norm_weight,
-                        rope_cos,
-                        rope_sin,
-                        block_table,
-                        slot_mapping,
-                        k_cache,
-                        v_cache,
-                        wo,
-                        post_rms_weight,
-                        w_gate,
-                        w_up,
-                        w_down,
-                        group_next,
-                        layer_idx,
-                    )
-            for b in pl.parallel(0, user_batch, 1):
-                chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                chunk_start = seq_len_b - chunk_len_b
+                for layer_idx in pl.range(num_layers_actual):
+                    with pl.scope():
+                        window_next = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                        window_hidden = prefill_layer_window(
+                            window_hidden,
+                            seq_lens,
+                            pl.cast(0, pl.INT32),
+                            token_base + p0,
+                            pl.cast(p0, pl.INT32),
+                            chunk_start,
+                            valid_tok,
+                            input_rms_weight,
+                            wq,
+                            wk,
+                            wv,
+                            q_norm_weight,
+                            k_norm_weight,
+                            rope_cos,
+                            rope_sin,
+                            block_table,
+                            slot_mapping,
+                            k_cache,
+                            v_cache,
+                            wo,
+                            post_rms_weight,
+                            w_gate,
+                            w_up,
+                            w_down,
+                            window_next,
+                            layer_idx,
+                        )
                 if chunk_len_b > 0:
                     last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
                     if p0_idx == last_group:
-                        valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
-                        local_last = b * MLP_M_TILE + valid_tok - 1
-                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_group"):
+                        local_last = valid_tok - 1
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_single"):
                             for kb in pl.range(HIDDEN_BLOCKS):
                                 k0 = kb * K_CHUNK
                                 final_hidden_chunk = pl.slice(
-                                    group_hidden,
+                                    window_hidden,
                                     [1, K_CHUNK],
                                     [local_last, k0],
                                 )
-                                final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
+                                final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [0, k0])
+            else:
+                group_hidden = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+
+                with pl.spmd(BATCH * (MLP_M_TILE // TOK_TILE), name_hint="token_embed_group"):
+                    tile_id = pl.tile.get_block_idx()
+                    b = tile_id // (MLP_M_TILE // TOK_TILE)
+                    tile_rem = tile_id - b * (MLP_M_TILE // TOK_TILE)
+                    local_p0 = tile_rem * TOK_TILE
+                    group_p0 = b * MLP_M_TILE + local_p0
+                    if b < user_batch:
+                        token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
+                        chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                        valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
+                        for ti in pl.range(TOK_TILE):
+                            if ti < valid_tok:
+                                token_idx = token_base + p0 + local_p0 + ti
+                                group_idx = group_p0 + ti
+                                token_id = pl.tensor.read(input_ids, [token_idx])
+                                token_row = pl.cast(token_id, target_type=pl.INDEX)
+                                for k0 in pl.range(0, HIDDEN, EMBED_HIDDEN_CHUNK):
+                                    hidden_chunk = pl.slice(
+                                        embed_weight,
+                                        [1, EMBED_HIDDEN_CHUNK],
+                                        [token_row, k0],
+                                    )
+                                    group_hidden = pl.assemble(
+                                        group_hidden,
+                                        hidden_chunk,
+                                        [group_idx, k0],
+                                    )
+
+                for layer_idx in pl.range(num_layers_actual):
+                    with pl.scope():
+                        group_next = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                        group_hidden = prefill_layer_group_direct(
+                            group_hidden,
+                            seq_lens,
+                            chunk_lens,
+                            chunk_offsets,
+                            pl.cast(p0, pl.INDEX),
+                            input_rms_weight,
+                            wq,
+                            wk,
+                            wv,
+                            q_norm_weight,
+                            k_norm_weight,
+                            rope_cos,
+                            rope_sin,
+                            block_table,
+                            slot_mapping,
+                            k_cache,
+                            v_cache,
+                            wo,
+                            post_rms_weight,
+                            w_gate,
+                            w_up,
+                            w_down,
+                            group_next,
+                            layer_idx,
+                        )
+                for b in pl.parallel(0, user_batch, 1):
+                    chunk_len_b = pl.tensor.read(chunk_lens, [b])
+                    if chunk_len_b > 0:
+                        last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
+                        if p0_idx == last_group:
+                            valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
+                            local_last = b * MLP_M_TILE + valid_tok - 1
+                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_group"):
+                                for kb in pl.range(HIDDEN_BLOCKS):
+                                    k0 = kb * K_CHUNK
+                                    final_hidden_chunk = pl.slice(
+                                        group_hidden,
+                                        [1, K_CHUNK],
+                                        [local_last, k0],
+                                    )
+                                    final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [b, k0])
 
     out = rms_lm_head(final_hidden, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
