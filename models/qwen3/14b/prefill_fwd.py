@@ -1949,10 +1949,26 @@ if __name__ == "__main__":
                               "pl.dynamic() variable, so a single compiled "
                               "program serves any batch <= host KV-cache "
                               "capacity. Default: %(default)s"))
-    parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2, 3, 4], default=0,
-                        help="1 = enable L2 swimlane, 0 = disable (default)")
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        nargs="?",
+        const=4,
+        default=0,
+        type=int,
+        metavar="PERF_LEVEL",
+        choices=[0, 1, 2, 3, 4],
+        help="Enable L2 swimlane perf capture at the given granularity level. Bare flag "
+             "= level 4 (full). Levels: 1=AICore timing, 2=+dispatch/fanout, 3=+sched "
+             "phases, 4=+orch phases; 0 (default) disables.",
+    )
     parser.add_argument("--enable-scope-stats", action="store_true", default=False,
                         help="enable PTO2 scope lifetime statistics")
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
+                        help="capture the task dependency graph to dfx_outputs/deps.json "
+                             "(render with simpler_setup.tools.deps_viewer). Opt-in AICPU-side "
+                             "DFX, off by default. Keep --num-layers small when capturing: the "
+                             "per-run SHM record buffer can overflow ('records dropped') on the "
+                             "full 40-layer graph.")
     parser.add_argument("--max-seq", type=int, default=DEFAULT_TEST_MAX_SEQ,
                         help="synthetic max sequence length, up to model MAX_SEQ")
     parser.add_argument("--use-max-seq", action="store_true", default=False,
@@ -1984,6 +2000,7 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_scope_stats=args.enable_scope_stats,
+            enable_dep_gen=args.enable_dep_gen,
         ),
         rtol=5e-3,
         atol=5e-3,
