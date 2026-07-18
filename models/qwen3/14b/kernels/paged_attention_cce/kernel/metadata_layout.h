@@ -28,11 +28,21 @@ constexpr uint32_t kBarrierSlotBytes = 512;
 constexpr uint32_t kBarrierSlotWords = kBarrierSlotBytes / sizeof(int32_t);
 constexpr uint32_t kBarrierSlotCount = 48;
 constexpr uint32_t kBarrierBytes = kBarrierSlotCount * kBarrierSlotBytes;
-constexpr uint32_t kMetadataBytes = 27840;
+// AIV rope-ready soft-barrier region, laid out right after the aligned FAI barrier.
+// After the AIV prologue writes q/k/v, the 48 AIV lanes soft-barrier over these
+// slots (args-based idx; the hardware get_subblockdim() is 0 in this launch, so
+// pto::SYNCALL's builtin indexing cannot be used). Each AIC polls the slots until
+// all 48 are non-zero. The soft barrier's DCCI+dsb gives the cross-core GM
+// visibility the AIC attention needs.
+constexpr uint32_t kRopeReadySlotBytes = 32;
+constexpr uint32_t kRopeReadySlotWords = kRopeReadySlotBytes / sizeof(int32_t);
+constexpr uint32_t kRopeReadySlotCount = 48;  // AIV lanes (DEFAULT_BLOCK_DIM * 2)
+constexpr uint32_t kRopeReadyBytes = kRopeReadySlotCount * kRopeReadySlotBytes;
+constexpr uint32_t kMetadataBytes = 29376;
 
 static_assert(
-    kBarrierAlignmentOffset + kBarrierAlignmentBytes - 1 + kBarrierBytes <= kMetadataBytes,
-    "metadata buffer does not cover the aligned barrier region"
+    kBarrierAlignmentOffset + kBarrierAlignmentBytes - 1 + kBarrierBytes + kRopeReadyBytes <= kMetadataBytes,
+    "metadata buffer does not cover the aligned FAI and RoPE-ready regions"
 );
 
 }  // namespace qwen_fai_metadata

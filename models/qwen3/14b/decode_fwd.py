@@ -468,127 +468,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     )
                 v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
 
-        # QK-norm and RoPE retain the main implementation's fused arithmetic,
-        # but run as a standalone producer for the external CANN attention.
-        with pl.spmd(
-            ROPE_CORES,
-            name_hint="rope_qkv",
-            deps=[q_proj_tid, k_proj_tid, v_proj_tid, rms_tid],
-        ) as rope_tid:
-            rope_core = pl.get_block_idx()
-            q_red_pad = pl.full(
-                [1, (Q_HEAD_PAD - Q_PER_KV) * HEAD_DIM],
-                dtype=pl.FP32,
-                value=0.0,
-            )
-            k_red_pad = pl.full(
-                [1, (K_RED_ROWS - 1) * HEAD_DIM],
-                dtype=pl.FP32,
-                value=0.0,
-            )
-            for it in pl.pipeline(ROPE_ITEMS_PER_CORE, stage=2):
-                g_idx = rope_core + it * ROPE_CORES
-                if g_idx < NUM_KV_HEADS * user_batch:
-                    ki = g_idx // user_batch
-                    b = g_idx - ki * user_batch
-                    ctx_len = pl.read(seq_lens, [b])
-                    inv_rms_b = pl.read(inv_rms_states, [b, 0])
-                    pos = ctx_len - 1
-                    wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
-                    wr_slot_block = wr_slot // BLOCK_SIZE
-                    wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
-                    cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
-                    cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
-                    sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
-                    sin_hi = rope_sin[pos : pos + 1, HALF_DIM:HEAD_DIM]
-
-                    kv_col = ki * HEAD_DIM
-                    k_raw = pl.mul(
-                        pl.reshape(
-                            pl.concat(
-                                k_proj[b : b + 1, kv_col : kv_col + HEAD_DIM],
-                                k_red_pad,
-                            ),
-                            [K_RED_ROWS, HEAD_DIM],
-                        ),
-                        inv_rms_b,
-                    )
-                    k_ss = pl.row_sum(pl.mul(k_raw, k_raw))
-                    k_inv = pl.recip(pl.sqrt(pl.add(pl.mul(k_ss, HEAD_DIM_INV), EPS)))
-                    k_normed = pl.row_expand_mul(
-                        pl.col_expand_mul(k_raw, k_norm_w),
-                        k_inv,
-                    )
-                    k_full = k_normed[0:1, :]
-                    k_lo = k_full[:, 0:HALF_DIM]
-                    k_hi = k_full[:, HALF_DIM:HEAD_DIM]
-                    rot_lo = pl.sub(
-                        pl.col_expand_mul(k_lo, cos_lo),
-                        pl.col_expand_mul(k_hi, sin_lo),
-                    )
-                    rot_hi = pl.add(
-                        pl.col_expand_mul(k_hi, cos_hi),
-                        pl.col_expand_mul(k_lo, sin_hi),
-                    )
-                    cache_row = (
-                        layer_cache_base
-                        + (wr_slot_block * BLOCK_SIZE + wr_slot_offset) * NUM_KV_HEADS
-                        + ki
-                    )
-                    k_cache = pl.assemble(
-                        k_cache,
-                        pl.cast(pl.concat(rot_lo, rot_hi), target_type=pl.BF16),
-                        [cache_row, 0],
-                    )
-                    v_row_bf16 = pl.cast(
-                        pl.mul(
-                            v_proj[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM],
-                            inv_rms_b,
-                        ),
-                        target_type=pl.BF16,
-                    )
-                    v_cache = pl.assemble(v_cache, v_row_bf16, [cache_row, 0])
-
-                    q_base = ki * Q_PER_KV
-                    q_raw = pl.mul(
-                        pl.reshape(
-                            pl.concat(
-                                q_proj[
-                                    b : b + 1,
-                                    q_base * HEAD_DIM : (q_base + Q_PER_KV) * HEAD_DIM,
-                                ],
-                                q_red_pad,
-                            ),
-                            [Q_HEAD_PAD, HEAD_DIM],
-                        ),
-                        inv_rms_b,
-                    )
-                    q_ss = pl.row_sum(pl.mul(q_raw, q_raw))
-                    q_inv = pl.recip(pl.sqrt(pl.add(pl.mul(q_ss, HEAD_DIM_INV), EPS)))
-                    q_heads = pl.row_expand_mul(
-                        pl.col_expand_mul(q_raw, q_norm_w),
-                        q_inv,
-                    )
-                    q_lo = q_heads[:, 0:HALF_DIM]
-                    q_hi = q_heads[:, HALF_DIM:HEAD_DIM]
-                    q_rot_lo = pl.sub(
-                        pl.col_expand_mul(q_lo, cos_lo),
-                        pl.col_expand_mul(q_hi, sin_lo),
-                    )
-                    q_rot_hi = pl.add(
-                        pl.col_expand_mul(q_hi, cos_hi),
-                        pl.col_expand_mul(q_lo, sin_hi),
-                    )
-                    q_row = b * NUM_HEADS + q_base
-                    q_tnd_flat = pl.assemble(
-                        q_tnd_flat,
-                        pl.cast(
-                            pl.concat(q_rot_lo, q_rot_hi)[0:Q_PER_KV, :],
-                            target_type=pl.BF16,
-                        ),
-                        [q_row, 0],
-                    )
-
+        # QK-norm + RoPE + KV-cache writes are fused into the mixed-core attention extern
+        # (paged_attention_cce); q_tnd / k_cache / v_cache are written by its AIV prologue (InOut).
         q_tnd = pl.reshape(q_tnd_flat, [BATCH, NUM_HEADS, HEAD_DIM])
         attn_out_tnd = pl.reshape(attn_out, [BATCH, NUM_HEADS, HEAD_DIM])
         attention_core_num = PA_DEFAULT_BLOCK_DIM
@@ -598,18 +479,31 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             sync_start=True,
             deps=[
-                rope_tid,
+                q_proj_tid,
+                k_proj_tid,
+                v_proj_tid,
+                rms_tid,
                 pa_tiling_tid,
                 attn_out_seed_tid,
                 mlp_out_seed_tid,
             ],
         ) as attn_done_tid:
             attn_out_tnd = paged_attention_cce(
+                q_proj,
+                k_proj,
+                v_proj,
+                inv_rms_states,
+                q_norm_w,
+                k_norm_w,
+                seq_lens,
+                slot_mapping,
+                rope_cos,
+                rope_sin,
+                block_table,
+                attn_out_tnd,
                 q_tnd,
                 k_cache,
                 v_cache,
-                block_table,
-                attn_out_tnd,
                 pa_workspace,
                 pa_metadata,
                 layer_cache_base,

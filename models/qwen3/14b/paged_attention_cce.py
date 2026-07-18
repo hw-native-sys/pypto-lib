@@ -16,6 +16,8 @@ import pypto.language as pl
 
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "paged_attention_cce"
 _ATTENTION_ENTRY = _KERNEL_DIR / "attention" / "entry.cpp"
+_ATTENTION_ONLY_ENTRY = _KERNEL_DIR / "attention_only" / "entry.cpp"
+_ROPE_ONLY_ENTRY = _KERNEL_DIR / "rope_only" / "entry.cpp"
 _TILING_ENTRY = _KERNEL_DIR / "tiling" / "entry.cpp"
 
 
@@ -64,10 +66,23 @@ KV_LENGTHS_OFFSET = CUMULATIVE_Q_OFFSET + BATCH * 8
 METADATA_PREFIX_BYTES = KV_LENGTHS_OFFSET + BATCH * 8
 BARRIER_SLOT_BYTES = 512
 BARRIER_PHYSICAL_LANES = DEFAULT_BLOCK_DIM * 2
+ROPE_READY_SLOT_BYTES = 32
+# AIV lanes that soft-barrier after the fused rope prologue (DEFAULT_BLOCK_DIM * 2 = 48).
+# Args-based indexing (get_block_idx*2 + get_sub_block_id); the hardware get_subblockdim()
+# is 0 in this launch, so pto::SYNCALL's builtin participant model cannot be used.
+ROPE_READY_PHYSICAL_LANES = DEFAULT_BLOCK_DIM * 2
 # The CCE wrapper aligns the barrier start at runtime, so reserve one slot of
-# alignment slack before the maximum 48 single-writer barrier slots.
+# alignment slack before the maximum 48 single-writer barrier slots. The
+# AIV RoPE-ready soft-barrier region follows the aligned FAI barrier.
 METADATA_BYTES = (
-    (METADATA_PREFIX_BYTES + BARRIER_SLOT_BYTES - 1 + BARRIER_PHYSICAL_LANES * BARRIER_SLOT_BYTES + 31)
+    (
+        METADATA_PREFIX_BYTES
+        + BARRIER_SLOT_BYTES
+        - 1
+        + BARRIER_PHYSICAL_LANES * BARRIER_SLOT_BYTES
+        + ROPE_READY_PHYSICAL_LANES * ROPE_READY_SLOT_BYTES
+        + 31
+    )
     // 32
     * 32
 )
@@ -85,6 +100,37 @@ MAX_BLOCKS_DYN = pl.dynamic("PA_MAX_BLOCKS_DYN")
     dual_aiv_dispatch=True,
 )
 def paged_attention_cce(
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    block_table: pl.Tensor,
+    # The extern return is the first writable tensor, so the real attention output
+    # must precede the query/cache state written by the fused rope prologue.
+    out: pl.Out[pl.Tensor],
+    query: pl.InOut[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+    workspace: pl.InOut[pl.Tensor],
+    metadata: pl.InOut[pl.Tensor],
+    cache_row_offset: pl.Scalar[pl.INDEX],
+) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_ATTENTION_ONLY_ENTRY,
+    aiv_source=_ATTENTION_ONLY_ENTRY,
+    include_dirs=_CANN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def paged_attention_only_cce(
     query: pl.Tensor,
     key_cache: pl.Tensor,
     value_cache: pl.Tensor,
@@ -158,7 +204,7 @@ def qwen_decode_attention_cce(
         sync_start=True,
         deps=[tiling_tid],
     ) as _attention_tid:
-        out = paged_attention_cce(
+        out = paged_attention_only_cce(
             query,
             key_cache,
             value_cache,
@@ -203,7 +249,7 @@ def qwen_decode_attention_cache_offset_test(
         sync_start=True,
         deps=[tiling_tid],
     ) as _attention_tid:
-        out = paged_attention_cce(
+        out = paged_attention_only_cce(
             query,
             key_cache,
             value_cache,
@@ -214,6 +260,82 @@ def qwen_decode_attention_cache_offset_test(
             cache_row_offset,
         )
     return out
+
+
+# Stage 1 isolation kernel: runs ONLY the rope_qkv producer (Q/K norm + RoPE +
+# KV-cache writes), no attention. Used by test_rope_qkv_cce.py to validate the
+# C++ rope compute byte-exact against decode_fwd.py's rope_qkv before fusion.
+# Mixed + dual_aiv_dispatch so its AIV lane model (block_idx*2 + sub_block_id)
+# matches the fused kernel; AICs are a no-op (run_qwen_rope_qkv is vec-only).
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_ROPE_ONLY_ENTRY,
+    aiv_source=_ROPE_ONLY_ENTRY,
+    include_dirs=_CANN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def paged_attention_rope_only_cce(
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query: pl.Out[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+    cache_row_offset: pl.Scalar[pl.INDEX],
+) -> pl.Tensor: ...
+
+
+@pl.jit
+def qwen_decode_rope_only_cce(
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    q_norm_weight: pl.Tensor,
+    k_norm_weight: pl.Tensor,
+    seq_lens: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    query: pl.Out[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+) -> pl.Tensor:
+    """Stage 1 driver: run the fused-prologue rope_qkv in isolation (no attention).
+
+    ``cache_row_offset`` is fixed at 0 (single-layer, slot 0 base) so the driver
+    has no scalar parameter and the harness needs only tensor specs.
+    """
+    # sync_start=True is mandatory for a mixed + dual_aiv_dispatch extern: it makes
+    # all 24 AIC blocks (and their 2 AIV sub-lanes) launch atomically so the AIC/AIV
+    # pairing is coherent. Without it the dispatch 507018s on device.
+    with pl.spmd(
+        DEFAULT_BLOCK_DIM, name_hint="rope_only", allow_early_resolve=True, sync_start=True
+    ) as _rope_tid:
+        query = paged_attention_rope_only_cce(
+            q_proj,
+            k_proj,
+            v_proj,
+            inv_rms_states,
+            q_norm_weight,
+            k_norm_weight,
+            seq_lens,
+            slot_mapping,
+            rope_cos,
+            rope_sin,
+            query,
+            key_cache,
+            value_cache,
+            0,
+        )
+    return query
 
 
 __all__ = [
@@ -229,7 +351,10 @@ __all__ = [
     "WORKSPACE_BYTES",
     "build_paged_attention_metadata",
     "paged_attention_cce",
+    "paged_attention_only_cce",
+    "paged_attention_rope_only_cce",
     "paged_attention_tiling_cce",
     "qwen_decode_attention_cache_offset_test",
     "qwen_decode_attention_cce",
+    "qwen_decode_rope_only_cce",
 ]

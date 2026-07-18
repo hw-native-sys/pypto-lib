@@ -58,6 +58,21 @@ static __aicore__ void clear_barrier(__gm__ int32_t *barrier) {
     dsb(DSB_DDR);
 }
 
+static __aicore__ __attribute__((always_inline)) __gm__ int32_t *rope_ready_data(__gm__ int32_t *barrier) {
+    return reinterpret_cast<__gm__ int32_t *>(
+        reinterpret_cast<__gm__ uint8_t *>(barrier) + qwen_fai_metadata::kBarrierBytes
+    );
+}
+
+static __aicore__ void clear_rope_ready(__gm__ int32_t *ready) {
+    for (uint32_t slot = 0; slot < qwen_fai_metadata::kRopeReadySlotCount; ++slot) {
+        __gm__ int32_t *slot_data = ready + slot * qwen_fai_metadata::kRopeReadySlotWords;
+        slot_data[0] = 0;
+        dcci(slot_data, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    }
+    dsb(DSB_DDR);
+}
+
 static __aicore__ void flush_metadata_prefix(__gm__ uint8_t *metadata) {
     uint64_t first_line =
         reinterpret_cast<uint64_t>(metadata) & ~(static_cast<uint64_t>(qwen_fai_metadata::kDcciLineBytes) - 1);
@@ -82,7 +97,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     uint32_t max_blocks_per_batch = static_cast<uint32_t>(args[2]);
     uint32_t num_blocks = static_cast<uint32_t>(args[3]);
 
-    clear_barrier(barrier_data(metadata));
+    __gm__ int32_t *barrier = barrier_data(metadata);
+    clear_barrier(barrier);
+    clear_rope_ready(rope_ready_data(barrier));
     if (batch == 0 || batch > qwen_fai_tiler::kMaxBatch) {
         return;
     }
