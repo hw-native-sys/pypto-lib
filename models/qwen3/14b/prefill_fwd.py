@@ -675,6 +675,7 @@ def prefill_layer(
     chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
     group_p0: pl.Scalar[pl.INDEX],
+    active_prefill_tokens: pl.Scalar[pl.INDEX],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
@@ -720,7 +721,10 @@ def prefill_layer(
     # (post_norm, first-residual) for the whole packed token dim; phase 2 (after
     # the batch loop) runs gate/up/down as flat, band-grouped token-tile sweeps
     # so each weight streams from HBM once and is reused across every token tile.
-    prefill_tokens = pl.tensor.dim(hidden_states, 0)
+    # ``hidden_states`` may be a static-capacity group buffer
+    # ([BATCH * MLP_M_TILE, HIDDEN]). Drive token-tile work from the active
+    # packed rows so partial batches do not run fake MLP tiles.
+    prefill_tokens = active_prefill_tokens
     num_tok_tiles = (prefill_tokens + TOK_TILE - 1) // TOK_TILE
     num_m_tiles = (prefill_tokens + MLP_M_TILE - 1) // MLP_M_TILE
     # Pad to a multiple of MLP_M_TILE (>= num_tok_tiles*TOK_TILE), so both the
@@ -1353,6 +1357,7 @@ def prefill_fwd(
                             chunk_lens,
                             chunk_offsets,
                             pl.cast(p0, pl.INDEX),
+                            pl.cast(MLP_M_TILE, pl.INDEX),
                             input_rms_weight,
                             wq,
                             wk,
@@ -1426,6 +1431,7 @@ def prefill_fwd(
                             chunk_lens,
                             chunk_offsets,
                             pl.cast(p0, pl.INDEX),
+                            pl.cast(user_batch * MLP_M_TILE, pl.INDEX),
                             input_rms_weight,
                             wq,
                             wk,
