@@ -16,6 +16,7 @@ import pypto.language as pl
 
 _KERNEL_DIR = Path(__file__).parent / "kernels" / "paged_attention_cce"
 _ATTENTION_ENTRY = _KERNEL_DIR / "attention" / "entry.cpp"
+_ATTENTION_ROPE_ENTRY = _KERNEL_DIR / "attention_rope" / "entry.cpp"
 _TILING_ENTRY = _KERNEL_DIR / "tiling" / "entry.cpp"
 
 
@@ -48,6 +49,13 @@ def _cann_include_dirs() -> tuple[Path, ...]:
 
 
 _CANN_INCLUDE_DIRS = _cann_include_dirs()
+
+# The fused rope+attention extern embeds the pypto-generated rope_qkv kernel,
+# which includes <pto/pto-inst.hpp>; add the pto-isa include root for it.
+_PTO_ISA_INCLUDE = Path(os.environ.get("PTO_ISA_ROOT", "")) / "include"
+_ROPE_INCLUDE_DIRS = _CANN_INCLUDE_DIRS + (
+    (_PTO_ISA_INCLUDE,) if _PTO_ISA_INCLUDE.is_dir() else ()
+)
 
 SUPPORTED_PLATFORMS = ("a2a3", "a2a3sim")
 BATCH = 16
@@ -92,6 +100,37 @@ def paged_attention_cce(
     out: pl.Out[pl.Tensor],
     workspace: pl.InOut[pl.Tensor],
     metadata: pl.InOut[pl.Tensor],
+    cache_row_offset: pl.Scalar[pl.INDEX],
+) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_ATTENTION_ROPE_ENTRY,
+    aiv_source=_ATTENTION_ROPE_ENTRY,
+    include_dirs=_ROPE_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def paged_attention_rope_cce(
+    # This single-result extern binds its return to the first Out/InOut
+    # parameter. Keep the real FAI output first instead of returning query.
+    out: pl.Out[pl.Tensor],
+    query: pl.InOut[pl.Tensor],
+    key_cache: pl.InOut[pl.Tensor],
+    value_cache: pl.InOut[pl.Tensor],
+    block_table: pl.Tensor,
+    workspace: pl.InOut[pl.Tensor],
+    metadata: pl.InOut[pl.Tensor],
+    q_proj: pl.Tensor,
+    k_proj: pl.Tensor,
+    v_proj: pl.Tensor,
+    q_norm_w: pl.Tensor,
+    k_norm_w: pl.Tensor,
+    rope_cos: pl.Tensor,
+    rope_sin: pl.Tensor,
+    inv_rms_states: pl.Tensor,
+    slot_mapping: pl.Tensor,
+    seq_lens: pl.Tensor,
     cache_row_offset: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor: ...
 
@@ -229,6 +268,7 @@ __all__ = [
     "WORKSPACE_BYTES",
     "build_paged_attention_metadata",
     "paged_attention_cce",
+    "paged_attention_rope_cce",
     "paged_attention_tiling_cce",
     "qwen_decode_attention_cache_offset_test",
     "qwen_decode_attention_cce",
