@@ -74,14 +74,18 @@ inputs:
     default: 'false'
   build-namespace:
     description: >-
-      Per-job discriminator for the pypto build tree. These jobs run concurrently
-      on the same self-hosted host; without isolation they sync + build into one
-      shared ci-cache/pypto-src dir and race — one job's `reset --hard` /
-      `rm -rf build` corrupts the other's in-flight libbacktrace configure,
-      surfacing as intermittent "C compiler cannot create executables" / "Unknown
-      BACKTRACE_ELF_SIZE" build failures. Each caller passes a unique value (the
-      simulator jobs pass their matrix.platform) so every job gets its own
-      pypto-src-<namespace> clone + build tree.
+      Per-job-type discriminator for the pypto build tree, which is stored at
+      ci-cache/pypto-src-<namespace>-<runner name>. Two jobs must never share one
+      tree: whoever syncs second runs `reset --hard` / `clean -ffdx` /
+      `rm -rf build` under the other's in-flight libbacktrace configure, which
+      surfaces as intermittent "C compiler cannot create executables" / "Unknown
+      BACKTRACE_ELF_SIZE" failures.
+
+      The runner name in the path covers concurrency (an instance runs one job at
+      a time, so each tree has a single writer); this input covers the rest. Job
+      types differ in what they build, so one instance alternating between them
+      would otherwise thrash a single tree — pass a distinct value per job type
+      (the simulator jobs pass their matrix.platform).
     required: true
 
 runs:
@@ -155,11 +159,22 @@ runs:
         # Every cache path derives from that one root, so no workflow has to name
         # an absolute path. These must be exported here rather than sit in the
         # caller's job-level `env:`, which is static and cannot see this step.
+        #
+        # PYPTO_SRC is additionally keyed by $RUNNER_NAME. CI_CACHE_ROOT is shared
+        # by every runner instance on the host (only _work is per-instance), so a
+        # tree keyed by job type alone is shared by concurrent runs of that job
+        # from different branches — each doing `reset --hard` / `clean -ffdx` /
+        # `rm -rf build` under the other. An instance runs one job at a time, so
+        # keying by it makes each tree single-writer by construction, without
+        # locking or giving up the cache. See issue #802.
+        #
+        # Only this tree needs it: ccache is built for concurrent access and is
+        # worth far more shared, and the ptoas archive is content-addressed.
         {
           echo "CCACHE_DIR=$CI_CACHE_ROOT/$CCACHE_NAME"
           echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
           echo "PTOAS_CACHE_DIR=$CI_CACHE_ROOT/ptoas"
-          echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE"
+          echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE-$RUNNER_NAME"
         } >> "$GITHUB_ENV"
         echo "runner config OK (checked: CI_CACHE_ROOT $required)"
         # Identity and storage of the host we landed on. These jobs run on a pool
