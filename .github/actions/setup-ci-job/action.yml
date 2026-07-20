@@ -29,8 +29,13 @@ description: >-
   Beyond those, the host is expected to provide (by name, not by path): a conda
   env `py310-lib` under CONDA_ROOT, and task-submit / npu-smi / ccache / git /
   curl on PATH. The `.env` makes the *locations* portable; these names are the
-  provisioning contract a runner has to satisfy to be usable at all. The build is
-  aarch64-only (it fetches ptoas-bin-aarch64 and reads PTOAS_SHA256_AARCH64).
+  provisioning contract a runner has to satisfy to be usable at all.
+
+  The CPU architecture is detected, not pinned: ptoas is fetched as
+  ptoas-bin-$(uname -m).tar.gz and checked against the matching
+  PTOAS_SHA256_<ARCH> in pypto's toolchain/versions.env, which is also where the
+  ptoas *version* is managed. So a new arch needs no change here — only an entry
+  upstream.
 
   The calling job must define the PTOAS_ROOT, PTO_ISA_ROOT, CMAKE_* and the
   non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
@@ -111,18 +116,32 @@ runs:
           fi
         done
         if [ "$bad" -ne 0 ]; then
-          echo "The runner declares its host layout in <runner-root>/.env, e.g.:"
+          # The runner's .env takes the whole rest of the line as the value: it
+          # supports neither inline comments nor quoting. Keep these samples bare
+          # so they can be pasted verbatim without smuggling in a trailing "#...".
+          echo "The runner declares its host layout in <runner-root>/.env."
+          echo "One KEY=VALUE per line, no quotes and no trailing comments:"
           echo "  CONDA_ROOT=/path/to/miniconda3"
-          echo "  CI_CACHE_ROOT=/path/to/ci-cache        # CI creates it if absent"
-          echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0 # device runners only"
+          echo "  CI_CACHE_ROOT=/path/to/ci-cache"
           echo "  PYPTO_QWEN3_MODEL_DIR=/path/to/Qwen3-14B"
           echo "  PYPTO_DSV4_MODEL_DIR=/path/to/dsv4-flash-w8a8"
-          echo "The runner service reads .env at startup — restart it after editing."
+          echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0"
+          echo "(CANN_ROOT is only needed on device runners; CI_CACHE_ROOT is"
+          echo " created if absent. The service reads .env at startup — restart"
+          echo " it after editing.)"
           exit 1
         fi
         for key in $required; do
           if [ ! -d "${!key}" ]; then
             echo "::error::$key points at a missing directory: ${!key}"
+            # A value carrying a trailing "#..." is the classic .env mistake:
+            # the runner does not strip inline comments, so the comment lands in
+            # the path. Say so outright instead of leaving a puzzling directory.
+            case "${!key}" in
+              *"#"*) echo "The value contains a '#'. The runner's .env has no"
+                     echo "inline comments — the rest of the line is part of the"
+                     echo "value. Put $key on a line of its own, bare." ;;
+            esac
             exit 1
           fi
         done
@@ -216,11 +235,26 @@ runs:
         fi
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
+        # PTOAS ships one release asset per arch, named ptoas-bin-<uname -m>.tar.gz,
+        # with a matching PTOAS_SHA256_<ARCH> in versions.env — so the arch is
+        # detected here rather than pinned, and only the version has to be managed
+        # (upstream, in pypto's versions.env). An unlisted arch is a hard error: a
+        # missing sha would otherwise silently skip the integrity check.
+        PTOAS_ARCH="$(uname -m)"
+        PTOAS_SHA256=$(sed -n "s/^PTOAS_SHA256_$(echo "$PTOAS_ARCH" | tr '[:lower:]' '[:upper:]')=//p" \
+          "$PYPTO_SRC/toolchain/versions.env" | tr -d '[:space:]')
+        if [ -z "$PTOAS_SHA256" ]; then
+          echo "::error::no PTOAS sha256 for arch '$PTOAS_ARCH' in pypto's toolchain/versions.env"
+          echo "Available:"
+          grep -E '^PTOAS_SHA256_' "$PYPTO_SRC/toolchain/versions.env" | sed 's/=.*//;s/^/  /'
+          exit 1
+        fi
         # Strip trailing CR/whitespace: a CRLF versions.env or pto_isa.pin would
         # otherwise leak a '\r' into the cache archive name and break the download.
         {
           echo "PTOAS_VERSION=$(grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env" | cut -d= -f2 | tr -d '[:space:]')"
-          echo "PTOAS_SHA256=$(sed -n 's/^PTOAS_SHA256_AARCH64=//p' "$PYPTO_SRC/toolchain/versions.env" | tr -d '[:space:]')"
+          echo "PTOAS_ARCH=$PTOAS_ARCH"
+          echo "PTOAS_SHA256=$PTOAS_SHA256"
           echo "PTO_ISA_COMMIT=$(tr -d '[:space:]' < "$PYPTO_SRC/runtime/pto_isa.pin")"
         } >> "$GITHUB_ENV"
 
@@ -366,16 +400,19 @@ runs:
       # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step.
       shell: bash
       run: |
-        CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+        # $PTOAS_ARCH keeps the cache entry arch-specific: the sha in the name
+        # already differs per arch, but naming the arch too keeps a shared cache
+        # dir readable and makes a wrong-arch entry obvious.
+        CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-${PTOAS_ARCH}-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
         download_ptoas() {
-          echo "Downloading ptoas ${PTOAS_VERSION}"
+          echo "Downloading ptoas ${PTOAS_VERSION} for ${PTOAS_ARCH}"
           mkdir -p "$PTOAS_CACHE_DIR"
           # Unique per-process temp file: a shared "$CACHE_ARCHIVE.tmp" would let
           # two concurrent cache-miss jobs clobber each other's download.
           local tmp
           tmp="$(mktemp "$CACHE_ARCHIVE.XXXXXX")"
           curl --fail --location --retry 3 --retry-all-errors \
-            https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-aarch64.tar.gz \
+            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${PTOAS_ARCH}.tar.gz" \
             -o "$tmp"
           echo "${PTOAS_SHA256}  $tmp" | sha256sum -c -
           mv "$tmp" "$CACHE_ARCHIVE"
