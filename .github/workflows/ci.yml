@@ -152,7 +152,12 @@ jobs:
         with:
           checkout-path: dist-checkout
           needs-device: 'false'
-          build-namespace: ${{ matrix.platform }}
+          # sim-<platform>, not <platform>: until this lands on main, the
+          # container-based sim jobs there still bind-mount ci-cache/pypto-src-
+          # <platform> and write it as root, so any main-based branch's CI would
+          # keep poisoning a tree this job then cannot write. A build tree cannot
+          # be shared by jobs running as different users.
+          build-namespace: sim-${{ matrix.platform }}
           pip-cache-name: pip-sim
 
       - name: Run ${{ matrix.platform }} tests
