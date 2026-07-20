@@ -318,14 +318,24 @@ def sparse_attn_swa(
         n_full = n_normalized[0:H_TILE, 0:HEAD_DIM]
         n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
 
-        m_rope = n_full[:, NOPE_DIM:HEAD_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[:, :])
-        m_cos_il = rope_cos_il[m_t : m_t + 1, 0:ROPE_DIM]
-        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0:ROPE_DIM]
-        m_rope_cos = pl.col_expand_mul(m_rope, m_cos_il)
-        m_swap_sin = pl.col_expand_mul(m_swapped, m_sin_signed)
-        m_rot = pl.add(m_rope_cos, m_swap_sin)
-        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+        # Per head-row inverse RoPE (1-row tiles). A5 gather lowering corrupts the
+        # [H_TILE, ROPE_DIM] gather for tiles >8 rows (only the first head of each
+        # 8-head group survived). Rotating one head-row at a time keeps every gather
+        # within a single FP32 vector box; result materialized to n_rope_bf16 so the
+        # existing pack loop is unchanged.
+        mr_ones = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        mr_col = pl.col_expand_mul(mr_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        mr_dup_f = pl.cast(pl.cast(pl.mul(mr_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        mr_lane = pl.sub(mr_col, pl.mul(mr_dup_f, 2.0))
+        mr_swap_idx = pl.cast(pl.sub(pl.add(mr_col, 1.0), pl.mul(mr_lane, 2.0)), target_type=pl.INT32)  # [1, ROPE_DIM]
+        mr_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
+        mr_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
+        n_rope_bf16 = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.BF16)
+        for n_hi in pl.range(H_TILE):
+            mr_row = n_full[n_hi : n_hi + 1, NOPE_DIM : HEAD_DIM]
+            mr_swapped = pl.gather(mr_row, dim=-1, index=mr_swap_idx)
+            mr_rot = pl.add(pl.mul(mr_row, mr_cos_il), pl.mul(mr_swapped, mr_sin_signed))
+            n_rope_bf16[n_hi : n_hi + 1, :] = pl.cast(mr_rot, target_type=pl.BF16, mode="rint")
 
         m_g0 = m_h0 // HEADS_PER_GROUP
         for m_sg in pl.unroll(H_TILE // HEADS_PER_GROUP):

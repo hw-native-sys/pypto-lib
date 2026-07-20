@@ -438,27 +438,31 @@ def sparse_attn(
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
         # swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16 (golden
         # also rounds inverse-RoPE to bf16) and packed into o_packed's rope columns.
-        m_col = pl.col_expand_mul(
-            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        m_dup_f = pl.cast(pl.cast(pl.mul(m_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        m_lane = pl.sub(m_col, pl.mul(m_dup_f, 2.0))                                              # j%2
-        m_swap_idx = pl.cast(pl.sub(pl.add(m_col, 1.0), pl.mul(m_lane, 2.0)), target_type=pl.INT32)  # j^1
-        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
-        m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
-        m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
-        n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
-
+        # Inverse RoPE per head-row (1-row [1, ROPE_DIM] tiles). On A5 the
+        # tensor.gather flat-index lowering miscompiles when the source tile spans
+        # more than one FP32 vector box (>8 rows); the old fused [H_TILE=16, ROPE_DIM]
+        # gather corrupted the ROPE columns of all heads except the first of each
+        # 8-head group. Unrolling to 1-row tiles keeps every gather in one vector
+        # box (qkv_proj_rope passes with its [8, ROPE_DIM] tile for the same reason).
+        mr_ones = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        mr_col = pl.col_expand_mul(mr_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        mr_dup_f = pl.cast(pl.cast(pl.mul(mr_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        mr_lane = pl.sub(mr_col, pl.mul(mr_dup_f, 2.0))                                            # j%2
+        mr_swap_idx = pl.cast(pl.sub(pl.add(mr_col, 1.0), pl.mul(mr_lane, 2.0)), target_type=pl.INT32)  # j^1
+        mr_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]                                       # [1, ROPE_DIM]
+        mr_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
         for n_hi in pl.range(H_TILE):
+            mr_row = n_full[n_hi : n_hi + 1, NOPE_DIM : HEAD_DIM]
+            mr_swapped = pl.gather(mr_row, dim=-1, index=mr_swap_idx)
+            mr_rot = pl.add(pl.mul(mr_row, mr_cos_il), pl.mul(mr_swapped, mr_sin_signed))
+            mr_bf16 = pl.cast(mr_rot, target_type=pl.BF16, mode="rint")
             n_gh = m_h0 + n_hi
             n_g = n_gh // HEADS_PER_GROUP
             n_hh = n_gh - n_g * HEADS_PER_GROUP
             n_pack_row = n_g * T + m_t
             n_col = n_hh * HEAD_DIM
             o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
-            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM]
+            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = mr_bf16
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
