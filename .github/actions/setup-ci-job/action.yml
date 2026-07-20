@@ -1,50 +1,149 @@
-name: Setup NPU device job (pypto-lib)
+name: Setup CI job (pypto-lib)
 description: >-
-  Shared setup for the self-hosted NPU device jobs (ci.yml `a2a3`,
-  daily_ci.yml `model-tests-a2a3`): resilient checkout into a per-job dir,
-  toolchain resolution from the cached pypto source, ptoas + pto-isa install,
-  a per-job conda venv + activate.sh, and a from-source build/install of pypto +
-  simpler. Unlike pypto (which builds itself), pypto-lib builds against a
-  separate pypto clone kept in a per-job ci-cache/pypto-src-<build-namespace>
-  dir (concurrent device jobs must not share one build tree — see the
-  build-namespace input); the toolchain pins (ptoas version/sha, pto-isa commit)
-  are read from that same clone so the installed pypto and the pins always match.
+  Shared setup for every self-hosted pypto-lib job — the simulator ones (ci.yml
+  `sim`, daily_ci.yml `model-tests-sim`) and the on-device ones (ci.yml `a2a3` /
+  `serving`, daily_ci.yml `model-tests-a2a3`). All of them run directly on the
+  host, as the same user, through this one action: resilient checkout into a
+  per-job dir, toolchain resolution from the cached pypto source, ptoas + pto-isa
+  install, a per-job conda venv + activate.sh, and a from-source build/install of
+  pypto + simpler. The device jobs differ only in that they additionally check the
+  NPU and source CANN's set_env.sh — see the needs-device input.
 
-  The calling job must define the ASCEND_HOME_PATH, PTOAS_ROOT, PTO_ISA_ROOT,
-  CCACHE_*, CMAKE_* and PIP_CACHE_DIR environment variables (identical across the
-  two device jobs); they are read from the job environment here. PTOAS_VERSION,
-  PTOAS_SHA256, PTO_ISA_COMMIT and CCACHE_NAMESPACE are resolved and exported by
-  this action.
+  Unlike pypto (which builds itself), pypto-lib builds against a separate pypto
+  clone kept in a per-job ci-cache/pypto-src-<build-namespace> dir (concurrent
+  jobs must not share one build tree — see the build-namespace input); the
+  toolchain pins (ptoas version/sha, pto-isa commit) are read from that same clone
+  so the installed pypto and the pins always match.
+
+  Each host describes its own layout in the runner's `.env` (the file in the
+  runner application's root dir, which the runner service loads into every job it
+  runs). That is where the absolute paths live — not in git — so no workflow names
+  one and a differently-laid-out host needs no repo change. The runner must set:
+
+    CONDA_ROOT             conda install to layer the per-job venv on
+    CI_CACHE_ROOT          dir CI may keep its caches in (created if absent)
+    CANN_ROOT              CANN toolkit — device runners only (needs-device)
+    PYPTO_QWEN3_MODEL_DIR  model weights — only the serving job reads these
+    PYPTO_DSV4_MODEL_DIR
+
+  Beyond those, the host is expected to provide (by name, not by path): a conda
+  env `py310-lib` under CONDA_ROOT, and task-submit / npu-smi / ccache / git /
+  curl on PATH. The `.env` makes the *locations* portable; these names are the
+  provisioning contract a runner has to satisfy to be usable at all. The build is
+  aarch64-only (it fetches ptoas-bin-aarch64 and reads PTOAS_SHA256_AARCH64).
+
+  The calling job must define the PTOAS_ROOT, PTO_ISA_ROOT, CMAKE_* and the
+  non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
+  the job environment here. PTOAS_VERSION, PTOAS_SHA256, PTO_ISA_COMMIT and
+  CCACHE_NAMESPACE are resolved and exported by this action, as is every cache
+  path (CCACHE_DIR, PIP_CACHE_DIR, PTOAS_CACHE_DIR, PYPTO_SRC) — they derive from
+  CI_CACHE_ROOT and so cannot live in the caller's static job-level `env:` block.
 
 inputs:
+  ccache-name:
+    description: >-
+      ccache dir under CI_CACHE_ROOT. Jobs share one ccache by default (a compile
+      cache is only useful when it is shared); serving passes its own so its
+      churn cannot LRU-evict the entries the a2a3/sim jobs depend on.
+    required: false
+    default: ccache
+  pip-cache-name:
+    description: >-
+      pip cache dir under CI_CACHE_ROOT. Unlike ccache, pip has no shared-umask
+      knob, so concurrent jobs each take their own dir rather than fight over
+      file ownership.
+    required: true
   checkout-path:
     description: >-
       Workspace-relative dir to check the repo out into (also the venv /
       activate.sh home). Isolates each job's tree on the shared self-hosted host.
     required: true
-  unset-ring:
+  needs-device:
     description: >-
-      When 'true', activate.sh unsets PTO2_RING_* (some multi-card HCCL paths
-      break with the runner's systemd ring-sizing env). Default 'false' keeps
-      them — the single- and multi-card model/example runs rely on the ring env.
+      When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
+      have activate.sh source CANN's set_env.sh, which wires up the Ascend/HCCL
+      host environment. When 'false' (the simulator jobs) both are skipped and
+      CANN_ROOT is not required in the runner config — the simulator needs no
+      driver, no card and no Ascend env.
     required: false
     default: 'false'
   build-namespace:
     description: >-
-      Per-job discriminator for the pypto build tree. The a2a3 and serving
-      device jobs run concurrently on the same self-hosted host; without
-      isolation they sync + build into one shared ci-cache/pypto-src dir and
-      race — one job's `reset --hard` / `rm -rf build` corrupts the other's
-      in-flight libbacktrace configure, surfacing as intermittent "C compiler
-      cannot create executables" / "Unknown BACKTRACE_ELF_SIZE" build failures.
-      Each caller passes a unique value so every job gets its own
-      pypto-src-<namespace> clone + build tree (mirrors the sim job's per-platform
-      pypto-src-${matrix.platform} isolation).
+      Per-job discriminator for the pypto build tree. These jobs run concurrently
+      on the same self-hosted host; without isolation they sync + build into one
+      shared ci-cache/pypto-src dir and race — one job's `reset --hard` /
+      `rm -rf build` corrupts the other's in-flight libbacktrace configure,
+      surfacing as intermittent "C compiler cannot create executables" / "Unknown
+      BACKTRACE_ELF_SIZE" build failures. Each caller passes a unique value (the
+      simulator jobs pass their matrix.platform) so every job gets its own
+      pypto-src-<namespace> clone + build tree.
     required: true
 
 runs:
   using: composite
   steps:
+    - name: Check runner config and derive cache paths
+      # The runner describes its own host layout in <runner-root>/.env, which the
+      # runner service loads into every job it runs — so these arrive as plain env
+      # vars and nothing here has to know an absolute path. First step on purpose:
+      # a runner missing its .env must fail here with an actionable message, not
+      # 40 minutes later as an opaque "conda: command not found" mid-build.
+      shell: bash
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        CCACHE_NAME: ${{ inputs.ccache-name }}
+        PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
+        BUILD_NAMESPACE: ${{ inputs.build-namespace }}
+      run: |
+        set -uo pipefail
+        # Prerequisites CI does not create, so they must already be there. The
+        # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
+        # dirs are only needed by the serving job, which checks its own.
+        required="CONDA_ROOT"
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          required="$required CANN_ROOT"
+        fi
+        bad=0
+        for key in $required CI_CACHE_ROOT; do
+          if [ -z "${!key:-}" ]; then
+            echo "::error::$key is not set — add it to this runner's .env"
+            bad=1
+          fi
+        done
+        if [ "$bad" -ne 0 ]; then
+          echo "The runner declares its host layout in <runner-root>/.env, e.g.:"
+          echo "  CONDA_ROOT=/path/to/miniconda3"
+          echo "  CI_CACHE_ROOT=/path/to/ci-cache        # CI creates it if absent"
+          echo "  CANN_ROOT=/usr/local/Ascend/cann-9.0.0 # device runners only"
+          echo "  PYPTO_QWEN3_MODEL_DIR=/path/to/Qwen3-14B"
+          echo "  PYPTO_DSV4_MODEL_DIR=/path/to/dsv4-flash-w8a8"
+          echo "The runner service reads .env at startup — restart it after editing."
+          exit 1
+        fi
+        for key in $required; do
+          if [ ! -d "${!key}" ]; then
+            echo "::error::$key points at a missing directory: ${!key}"
+            exit 1
+          fi
+        done
+        # CI_CACHE_ROOT is different in kind: CI owns everything under it, so it
+        # only has to be declared, not to pre-exist — a fresh host starts with an
+        # empty (or absent) cache and simply takes the miss.
+        if ! mkdir -p "$CI_CACHE_ROOT"; then
+          echo "::error::CI_CACHE_ROOT is not creatable: $CI_CACHE_ROOT"
+          exit 1
+        fi
+        # Every cache path derives from that one root, so no workflow has to name
+        # an absolute path. These must be exported here rather than sit in the
+        # caller's job-level `env:`, which is static and cannot see this step.
+        {
+          echo "CCACHE_DIR=$CI_CACHE_ROOT/$CCACHE_NAME"
+          echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
+          echo "PTOAS_CACHE_DIR=$CI_CACHE_ROOT/ptoas"
+          echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE"
+        } >> "$GITHUB_ENV"
+        echo "runner config OK (checked: CI_CACHE_ROOT $required)"
+
     # Self-hosted runners reuse the workspace across runs. A prior run — or a
     # force-pushed PR ref moving refs/remotes/pull/<n>/merge — can leave the
     # checkout dir with a stale submodule object store, so actions/checkout's
@@ -79,10 +178,10 @@ runs:
       # its runtime submodule (runtime/pto_isa.pin); read both.
       shell: bash
       run: |
-        # Per-job build tree: a2a3 and serving run concurrently on the same host,
-        # so they must NOT share one pypto-src dir (their concurrent sync/build
-        # races corrupt libbacktrace's configure). See build-namespace input.
-        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ inputs.build-namespace }}"
+        # $PYPTO_SRC is the per-job build tree exported by the loader step:
+        # ci-cache/pypto-src-<build-namespace>. These jobs run concurrently on the
+        # same host, so they must NOT share one pypto-src dir (their concurrent
+        # sync/build races corrupt libbacktrace's configure) — see build-namespace.
         # github.com clones/fetches over this runner's link drop mid-transfer
         # (GnuTLS recv error / early EOF), and there is no pypto gitcode mirror.
         # Tighten git's stall detection so a dead transfer aborts fast instead of
@@ -110,6 +209,7 @@ runs:
           git -C "$PYPTO_SRC" submodule foreach --recursive 'git reset --hard && git clean -ffdx' || true
         else
           echo "Cache miss — cloning pypto"
+          mkdir -p "$(dirname "$PYPTO_SRC")"
           # rm before each attempt so a retried clone never hits a partial dir.
           clone_pypto() { rm -rf "$PYPTO_SRC"; git clone --depth=1 https://github.com/hw-native-sys/pypto.git "$PYPTO_SRC"; }
           retry clone_pypto || exit 1
@@ -125,6 +225,7 @@ runs:
         } >> "$GITHUB_ENV"
 
     - name: Check NPU
+      if: ${{ inputs.needs-device == 'true' }}
       shell: bash
       run: npu-smi info
 
@@ -159,38 +260,59 @@ runs:
         git checkout "$PTO_ISA_COMMIT"
 
     - name: Bootstrap conda + per-job venv + write activate.sh
-      # Per-job venv layered on conda py310-lib; activate.sh lets each later step
+      # Per-job venv layered on the conda env; activate.sh lets each later step
       # (and every task-submit child) enter the env with a single
-      # `source activate.sh`. set_env.sh wires up the Ascend/HCCL host
-      # environment; LD_LIBRARY_PATH is prepended with $CONDA_PREFIX/lib because
-      # ptoas needs a newer GLIBCXX than the system.
+      # `source activate.sh`. For device jobs it also sources set_env.sh, which
+      # wires up the Ascend/HCCL host environment. LD_LIBRARY_PATH is prepended
+      # with $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        # Part of the runner's provisioning contract, like having task-submit and
+        # npu-smi on PATH: the host is expected to provide a conda env under this
+        # name. CONDA_ROOT says where conda lives; this says which env to use, and
+        # `python -m venv --system-site-packages` below layers the per-job venv on
+        # it, so its site-packages are an implicit dependency of every build here.
+        CONDA_ENV: py310-lib
       run: |
-        source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-        conda activate py310-lib
+        source "$CONDA_ROOT/etc/profile.d/conda.sh"
+        if ! conda activate "$CONDA_ENV"; then
+          echo "::error::conda env '$CONDA_ENV' not found under $CONDA_ROOT"
+          echo "This runner must provide it (see the action's provisioning notes)."
+          exit 1
+        fi
         # Explicit reset: don't rely solely on the checkout's `git clean -ffdx`
         # to have removed a prior run's venv — a stale venv would let `python -m
         # venv` reuse it and carry over old site-packages.
         rm -rf venv
         python -m venv venv --system-site-packages
-        cat > activate.sh <<'EOF'
-        source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-        conda activate py310-lib
+        # Bake the runner's roots in as literals rather than referencing
+        # $CANN_ROOT/$CONDA_ROOT at source time: activate.sh is also sourced by
+        # task-submit children, whose truncated env snapshot does not carry the
+        # job's GITHUB_ENV. Same reasoning as _PYPTO_ENV_DIR below.
+        {
+          echo "_PYPTO_CONDA_ROOT=$CONDA_ROOT"
+          echo "_PYPTO_CONDA_ENV=$CONDA_ENV"
+        } > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_CONDA_ROOT/etc/profile.d/conda.sh"
+        conda activate "$_PYPTO_CONDA_ENV"
         # Derive the venv from this script's own location instead of
         # $GITHUB_WORKSPACE: when activate.sh is sourced inside a task-submit
         # child, a truncated env snapshot could drop $GITHUB_WORKSPACE and point
         # the source at a wrong/absent path. BASH_SOURCE is snapshot-independent.
         _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         source "$_PYPTO_ENV_DIR/venv/bin/activate"
-        source /usr/local/Ascend/cann-9.0.0/set_env.sh
-        export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
         EOF
-        # Some multi-card HCCL paths break with the runner's systemd PTO2_RING_*
-        # env; append the unset only when the caller asks.
-        if [ "${{ inputs.unset-ring }}" = "true" ]; then
-          printf '%s\n' 'unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL' >> activate.sh
+        # The simulator needs no Ascend env, so only device jobs source set_env.sh.
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
         fi
+        printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"' >> activate.sh
 
     - name: Show ccache stats (before)
       shell: bash
@@ -203,7 +325,6 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       run: |
         source activate.sh
-        PYPTO_SRC="/home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ inputs.build-namespace }}"
         python -m pip install --upgrade pip
         pip install scikit-build-core nanobind cmake ninja
         # The from-source pypto / simpler builds compile native code (libbacktrace
@@ -242,9 +363,8 @@ runs:
       run: ccache -s || true
 
     - name: Install ptoas (local cache)
+      # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step.
       shell: bash
-      env:
-        PTOAS_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas
       run: |
         CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-aarch64-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
         download_ptoas() {

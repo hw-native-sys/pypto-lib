@@ -7,57 +7,58 @@ on:
 
 jobs:
   model-tests-sim:
-    # Simulator job: no device needed, so it runs on the CPU runner inside the
-    # ci-py310 container (mirrors pypto's codegen-tests setup, registry on port
-    # 5001). pypto/ptoas/pto-isa are installed by the setup-sim-job composite,
-    # exactly like the on-device a2a3 job — only the runner label and the lack of
-    # Ascend host env differ.
+    # Simulator job: no device needed, so it runs on the CPU runner — but on the
+    # host, through the same setup-ci-job composite as the a2a3 device job (same
+    # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
+    # the only difference: no npu-smi check and no Ascend env, which the simulator
+    # does not use.
     runs-on: [self-hosted, linux, arm64, cpu]
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         platform: [a2a3sim, a5sim]
+    defaults:
+      run:
+        working-directory: dist-checkout
     env:
-      PTOAS_ROOT: ${{ github.workspace }}/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/pto-isa
+      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /root/.cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the host-side a2a3 job (ci-runner) via the ci-cache mount;
-      # 000 keeps every cache file group/world-writable so root (this container)
-      # and ci-runner can both update and LRU-evict each other's entries.
+      # Shared with the a2a3 job; 000 keeps cache files mutually writable. Both
+      # jobs now run as ci-runner (no container root), but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-      PIP_CACHE_DIR: /root/.cache/pip
-    container:
-      image: localhost:5001/ci-py310:latest
-      # GitHub Actions containers do not inherit the host's large /dev/shm; they
-      # use Docker's 64MB default. Distributed model kernels call torch
-      # share_memory_() and overflow it. --shm-size gives each container its own
-      # tmpfs (sized on demand, not pre-allocated), avoiding the --ipc=host name
-      # clashes between the concurrent cpu-1..4 runners.
-      options: >-
-        --shm-size=128g
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-sim:/root/.cache/pip
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache:/root/.cache/ccache
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ptoas:/opt/ptoas-cache
-        -v /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pypto-src-${{ matrix.platform }}:/opt/pypto-src
 
     steps:
-      - name: Checkout pypto-lib
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves sibling
+        # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
         with:
+          sparse-checkout: .github/actions
+          clean: false
           persist-credentials: false
 
-      - name: Setup simulator job
-        uses: ./.github/actions/setup-sim-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: dist-checkout
+          needs-device: 'false'
+          build-namespace: ${{ matrix.platform }}
+          pip-cache-name: pip-sim
 
       - name: Run model tests (${{ matrix.platform }})
         shell: bash
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}/dist-checkout
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
@@ -72,6 +73,7 @@ jobs:
           # own fd-captured loop, then restores.
           PYPTO_RUNTIME_LOG: error
         run: |
+          source activate.sh
           : > results.tsv
           failed=()
           run_case() {
@@ -121,19 +123,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.platform }}
-          path: results.tsv
+          # upload-artifact resolves `path` against $GITHUB_WORKSPACE and ignores
+          # defaults.run.working-directory, so name the checkout dir explicitly.
+          path: dist-checkout/results.tsv
 
   model-tests-a2a3:
-    # No container: multi-card kernels use HCCL, which needs a host-only env
-    # (set_env.sh, HCCL plugin paths) — in docker the chip child silent-crashes
-    # in comm_init. So this job runs directly on the host like pypto's
-    # dist-system-tests. It holds NO card: every model run is wrapped in
-    # `task-submit --device "$DEVICE_ID"` (mechanism B), which borrows a card
-    # (or an N-card set for the multi-card `# ci: devices=N` files) from the
-    # host-level device queue and passes the lent set as $TASK_DEVICE. The
-    # backend controls whether DEVICE_ID is `auto` or a fixed card id. Checkout /
-    # install happen under ./dist-checkout to avoid colliding with any
-    # container-owned workspace left on the shared runner.
+    # Runs directly on the host like pypto's dist-system-tests — multi-card
+    # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
+    # paths); under docker the chip child silent-crashes in comm_init. It holds
+    # NO card: every model run is wrapped in `task-submit --device "$DEVICE_ID"`
+    # (mechanism B), which borrows a card (or an N-card set for the multi-card
+    # `# ci: devices=N` files) from the host-level device queue and passes the
+    # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
+    # or a fixed card id. Checkout / install happen under ./dist-checkout to
+    # isolate this job's tree on the shared runner.
     runs-on: [self-hosted, linux, arm64, npu]
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 900 run), or the job dies before task-submit's own timeout can
@@ -143,21 +146,18 @@ jobs:
       run:
         working-directory: dist-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container-side sim job (root) via the same ci-cache dir;
-      # 000 keeps cache files mutually writable across root and ci-runner.
+      # Shared with the sim job via the same ci-cache dir; 000 keeps cache files
+      # mutually writable. Both jobs now run as ci-runner, but the dir still holds
+      # root-owned entries from the container era, so keep the umask.
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: unlike ccache, pip has no shared-umask knob, so a shared
-      # pip cache would leave files owned by whichever job wrote first and block
-      # the other. The sim job uses ci-cache/pip-sim (see its bind mount).
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto-lib/ci-cache/pip-a2a3
 
     steps:
       - name: Fetch composite action definitions
@@ -171,11 +171,13 @@ jobs:
           clean: false
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: dist-checkout
+          needs-device: 'true'
           build-namespace: a2a3-daily
+          pip-cache-name: pip-a2a3
 
       - name: Run model tests (a2a3, via task-submit)
         shell: bash

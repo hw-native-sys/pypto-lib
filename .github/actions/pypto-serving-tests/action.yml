@@ -14,9 +14,6 @@ inputs:
   model-name:
     description: Serving model guard to run (qwen3-14b or deepseek-v4).
     required: true
-  model-dir:
-    description: Model directory used by the selected pypto-serving test.
-    required: true
   pto2-ring-dep-pool:
     description: PTO2_RING_DEP_POOL value for pypto-serving tests.
     required: false
@@ -33,6 +30,36 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Resolve model dir
+      # setup-ci-job loads the runner config and exports the model dirs;
+      # this only picks the one the selected guard needs and checks the weights
+      # are actually there. First step on purpose: fail here with an actionable
+      # message, not 40 minutes later inside pytest as an opaque
+      # "PYPTO_*_MODEL_DIR not set or not a directory".
+      id: model
+      shell: bash
+      env:
+        MODEL_NAME: ${{ inputs.model-name }}
+      run: |
+        set -uo pipefail
+        case "$MODEL_NAME" in
+          qwen3-14b)   key=PYPTO_QWEN3_MODEL_DIR; value="${PYPTO_QWEN3_MODEL_DIR:-}" ;;
+          deepseek-v4) key=PYPTO_DSV4_MODEL_DIR;  value="${PYPTO_DSV4_MODEL_DIR:-}" ;;
+          *) echo "::error::unknown model-name '$MODEL_NAME'"; exit 1 ;;
+        esac
+        if [ -z "$value" ]; then
+          echo "::error::$key is not set — add it to this runner's config"
+          echo "(the file named by setup-ci-job's runner-config input)"
+          exit 1
+        fi
+        if [ ! -d "$value" ]; then
+          echo "::error::$key points at a missing directory: $value"
+          echo "The $MODEL_NAME weights are not present on this runner."
+          exit 1
+        fi
+        echo "dir=$value" >> "$GITHUB_OUTPUT"
+        echo "$MODEL_NAME model dir resolved from the runner config"
+
     - name: Checkout pypto-serving
       uses: actions/checkout@v4
       with:
@@ -66,7 +93,7 @@ runs:
       if: ${{ inputs.model-name == 'qwen3-14b' }}
       shell: bash
       env:
-        PYPTO_QWEN3_MODEL_DIR: ${{ inputs.model-dir }}
+        PYPTO_QWEN3_MODEL_DIR: ${{ steps.model.outputs.dir }}
         PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
         PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
         PTO2_RING_HEAP: ${{ inputs.pto2-ring-heap }}
@@ -90,7 +117,7 @@ runs:
       if: ${{ inputs.model-name == 'deepseek-v4' }}
       shell: bash
       env:
-        PYPTO_DSV4_MODEL_DIR: ${{ inputs.model-dir }}
+        PYPTO_DSV4_MODEL_DIR: ${{ steps.model.outputs.dir }}
         PYPTO_RUNTIME_LOG: error
         PTO2_RING_DEP_POOL: ${{ inputs.pto2-ring-dep-pool }}
         PTO2_RING_TASK_WINDOW: ${{ inputs.pto2-ring-task-window }}
