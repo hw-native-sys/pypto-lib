@@ -117,7 +117,7 @@ def expert_shared(
             [SH_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0
         )
         h_tile_scale_dq = pl.create_tensor(
-            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32
+            [SH_M_TILE, SH_ROW_PAD], dtype=pl.FP32, manual_dep=True
         )
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,

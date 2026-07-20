@@ -163,6 +163,7 @@ def expert_routed(
                     h_tile_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated_masked
 
             h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
+            h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
                 eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
                 for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
@@ -173,7 +174,7 @@ def expert_routed(
                 eh_sq_row = pl.div(
                     pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
                 )
-                h_tile_scale_dq = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
+                h_tile_scale_dq[:, :] = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
                 eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
                 for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
                     eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]

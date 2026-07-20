@@ -93,6 +93,7 @@ def dispatch(
     recv_w_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.FP32],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     recv_count_out: pl.Tensor[[N_LOCAL, 1], pl.INT32],
+    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     # windows
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -169,7 +170,9 @@ def dispatch(
         for e in pl.range(N_LOCAL):
             acc = pl.const(0, pl.INT32)
             for src in pl.range(N_RANKS):
-                acc = acc + pl.read(recv_meta, [src, e])
+                count = pl.read(recv_meta, [src, e])
+                pl.write(recv_meta_local, [src, e], count)
+                acc = acc + count
             pl.write(recv_count_out, [e, 0], acc)
 
     # Phase 2: move the bulk payload (x / aux / route) to each destination lane.
@@ -257,21 +260,20 @@ def dispatch(
                 )
 
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
-    # expert. deps: _meta_tid (recv_meta counts), _wait_tid (incoming payload
-    # landed), _push_tid (this rank's own local-to-local puts into recv_x). The
+    # expert. deps: _wait_tid (incoming payload landed), _push_tid (this rank's
+    # own local-to-local puts into recv_x). The
     # explicit _push_tid edge is required: dispatch_wait now depends on dispatch_meta
     # (not dispatch_push), so gather no longer transitively orders after the local
     # push -- and the data_arrived barrier only covers *incoming* (src != my_rank)
     # data, not this rank's own dst == my_rank puts. Without it, gather could read
     # its own recv_x lane before push finishes writing it. recv_x_out is this grid's
     # output; expert_routed reads it in auto scope and orders after it.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_meta_tid, _wait_tid, _push_tid]) as _gather_tid:
+    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_wait_tid, _push_tid]) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
-            cnt = pl.read(recv_meta, [src, e])
-            n = pl.cast(cnt, pl.INDEX)
+            n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
             src_base_row = e_base_row + src * MAX_PER_SRC
             for slot in pl.range(n):
                 in_row = src_base_row + slot
@@ -287,13 +289,37 @@ def dispatch(
 # === Combine =================================================================
 # Push recv_y rows back to their origin rank keyed by r_route, barrier, then a
 # dense reduce ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k].
+@pl.jit.incore
+def shared_routed(
+    sh: pl.Tensor[[T, D], pl.BF16],
+    routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
+    ffn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    t = pl.tile.get_block_idx()
+    if t < active_tokens:
+        acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
+        for k in pl.range(TOPK):
+            r = t * TOPK + k
+            acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
+        ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
+    else:
+        ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+    return ffn_out
+
+
 @pl.jit.inline
 def combine(
     recv_y: pl.Tensor[[N_LOCAL, RECV_MAX, D], pl.BF16],
     recv_r_route_out: pl.Tensor[[N_LOCAL, RECV_MAX], pl.INT32],
     sh: pl.Tensor[[T, D], pl.BF16],
     ffn_out: pl.Tensor[[T, D], pl.BF16],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_meta_local: pl.Tensor[[N_RANKS, N_LOCAL], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[T * TOPK, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -313,7 +339,7 @@ def combine(
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
         for src in pl.range(N_RANKS):
-            n = pl.cast(pl.read(recv_meta, [src, e]), pl.INDEX)
+            n = pl.cast(pl.read(recv_meta_local, [src, e]), pl.INDEX)
             for slot in pl.range(n):
                 out_col = b + slot
                 r_route = pl.cast(pl.read(recv_r_route_out, [e, out_col]), pl.INDEX)
@@ -352,21 +378,20 @@ def combine(
     # ffn_out[t] = sh[t] + Sigma_k routed_y_buf[t*TOPK+k]. deps on combine_wait so
     # every peer's remote write into this rank's routed_y_buf has landed -- the local
     # RAW edge alone would only order after this rank's own outgoing puts.
-    active_tokens = pl.cast(num_tokens, pl.INDEX)
-    if active_tokens < 0:
-        active_tokens = pl.cast(0, pl.INDEX)
-    if active_tokens > T:
-        active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
-        t = pl.tile.get_block_idx()
-        if t < active_tokens:
-            acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
-            for k in pl.range(TOPK):
-                r = t * TOPK + k
-                acc = pl.add(acc, pl.cast(routed_y_buf[r:r + 1, :], target_type=pl.FP32))
-            ffn_out[t:t + 1, :] = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        else:
-            ffn_out[t:t + 1, :] = sh[t:t + 1, :]
+    # A direct call lets @pl.jit specialize the callable referenced by the
+    # spmd_submit below. This constant-false branch is removed before codegen.
+    if False:
+        _ffn_out_specialize = pl.create_tensor([T, D], dtype=pl.BF16)
+        shared_routed(sh, routed_y_buf, _ffn_out_specialize, num_tokens)
+    ffn_out, _reduce_tid = pl.spmd_submit(
+        self.shared_routed,  # noqa: F821 - materialized as a @pl.program method by @pl.jit
+        sh,
+        pl.no_dep(routed_y_buf),
+        ffn_out,
+        num_tokens,
+        core_num=T,
+        deps=[_cwait_tid],
+    )
 
 
 @pl.jit.inline(auto_scope=False)
@@ -413,7 +438,7 @@ def moe(
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
-    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
+    post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     hc_pre(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
@@ -421,7 +446,7 @@ def moe(
     )
 
     x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
-    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
     gate(
@@ -439,13 +464,14 @@ def moe(
     )
 
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
-    recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32)
-    recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32)
+    recv_scale_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
+    recv_w_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.FP32, manual_dep=True)
+    recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
+    recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
     dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
-        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out,
+        recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
     )
@@ -462,7 +488,7 @@ def moe(
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
         combine(
             recv_y, recv_r_route_out, sh,
-            ffn_out, recv_meta,
+            ffn_out, recv_meta_local,
             routed_y_buf, combine_arrived,
             num_tokens, my_rank, moe_epoch,
         )
