@@ -41,6 +41,14 @@ from config import (
     QWEN3_14B_TILING as T,
     QWEN3_14B as M,
 )
+from paged_attention_cce import (
+    CAUSAL_MASK_SIZE as PA_CAUSAL_MASK_SIZE,
+    DEFAULT_BLOCK_DIM as PA_DEFAULT_BLOCK_DIM,
+    METADATA_BYTES as PA_METADATA_BYTES,
+    WORKSPACE_BYTES as PA_WORKSPACE_BYTES,
+    build_paged_prefill_attention_metadata,
+    paged_prefill_attention_cce,
+)
 from rms_lm_head import rms_lm_head
 
 USER_BATCH_DYN = D.user_batch
@@ -689,6 +697,7 @@ def prefill_layer(
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
@@ -726,7 +735,6 @@ def prefill_layer(
     # ([BATCH * MLP_M_TILE, HIDDEN]). Drive token-tile work from the active
     # packed rows so partial batches do not run fake MLP tiles.
     prefill_tokens = active_prefill_tokens
-    num_tok_tiles = (prefill_tokens + TOK_TILE - 1) // TOK_TILE
     num_m_tiles = (prefill_tokens + MLP_M_TILE - 1) // MLP_M_TILE
     # Pad to a multiple of MLP_M_TILE (>= num_tok_tiles*TOK_TILE), so both the
     # phase-1 64-row writes and the phase-2 128-row MLP sweeps stay in bounds.
@@ -855,10 +863,7 @@ def prefill_layer(
 
                 # ── Scope 2: Q/K norm + RoPE + KV cache update + causal attention ──
                 attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                all_q_padded_tile = pl.create_tensor(
-                    [TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM],
-                    dtype=pl.BF16,
-                )
+                q_tnd_flat = pl.create_tensor([TOK_TILE * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
                 for final_ti0 in pl.range(0, valid_tok, FINALIZE_TOK_GROUP):
                     with pl.scope():
                         finalize_tok = pl.min(FINALIZE_TOK_GROUP, valid_tok - final_ti0)
@@ -876,7 +881,6 @@ def prefill_layer(
                                 cache_slot = pl.cast(pl.tensor.read(slot_mapping, [slot_token_p0 + ti]), pl.INDEX)
                                 cache_slot_block = cache_slot // BLOCK_SIZE
                                 cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
-                                q_block_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD
                                 for ki in pl.range(NUM_KV_HEADS):
                                     kv_col = ki * HEAD_DIM
                                     k_head_raw = pl.slice(k_proj_tile, [1, HEAD_DIM], [ti, kv_col])
@@ -966,92 +970,53 @@ def prefill_layer(
                                             ),
                                             [qi, 0],
                                         )
-                                    q_pad_row0 = q_block_row0 + ki * Q_HEAD_PAD
-                                    all_q_padded_tile = pl.assemble(
-                                        all_q_padded_tile,
-                                        pl.cast(q_rot_lo, target_type=pl.BF16),
-                                        [q_pad_row0, 0],
-                                    )
-                                    all_q_padded_tile = pl.assemble(
-                                        all_q_padded_tile,
-                                        pl.cast(q_rot_hi, target_type=pl.BF16),
-                                        [q_pad_row0, HALF_DIM],
-                                    )
-                                    all_q_padded_tile = pl.assemble(
-                                        all_q_padded_tile,
-                                        pl.cast(
-                                            pl.full(
-                                                [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM],
-                                                dtype=pl.FP32,
-                                                value=0.0,
-                                            ),
-                                            target_type=pl.BF16,
-                                        ),
-                                        [q_pad_row0 + Q_HEAD_BATCH, 0],
+                                    q_row = ti * NUM_HEADS + q_base
+                                    q_tnd_flat = pl.assemble(
+                                        q_tnd_flat,
+                                        pl.cast(pl.concat(q_rot_lo, q_rot_hi), target_type=pl.BF16),
+                                        [q_row, 0],
                                     )
 
-                        b_i32 = pl.cast(b, pl.INT32)
                         max_blocks_i32 = pl.cast(max_blocks_per_seq, pl.INT32)
-                        layer_cache_base_i32 = pl.cast(layer_cache_base, pl.INT32)
-                        p0_i32 = group_p0_i32 + pl.cast(p0, pl.INT32)
-                        final_ti0_i32 = pl.cast(final_ti0, pl.INT32)
                         finalize_tok_i32 = pl.cast(finalize_tok, pl.INT32)
 
-                        cur_li_phase = pl.create_tensor([ATTN_PHASE_ACC_STAT_ROWS, 1], dtype=pl.FP32)
-                        oi_tmp_phase = pl.create_tensor([ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
                         block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
-                        block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                        if block_ctx_blocks == 1:
-                            if finalize_tok == FINALIZE_TOK_GROUP:
-                                attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
-                                    attn_tile,
-                                    all_q_padded_tile,
-                                    block_table,
-                                    k_cache,
-                                    v_cache,
-                                    cur_li_phase,
-                                    oi_tmp_phase,
-                                    b_i32,
-                                    max_blocks_i32,
-                                    layer_cache_base_i32,
-                                    chunk_start,
-                                    p0_i32,
-                                    final_ti0_i32,
-                                )
-                            else:
-                                attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                    attn_tile,
-                                    all_q_padded_tile,
-                                    block_table,
-                                    k_cache,
-                                    v_cache,
-                                    cur_li_phase,
-                                    oi_tmp_phase,
-                                    b_i32,
-                                    max_blocks_i32,
-                                    layer_cache_base_i32,
-                                    chunk_start,
-                                    p0_i32,
-                                    final_ti0_i32,
-                                    finalize_tok_i32,
-                                )
-                        else:
-                            attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                attn_tile,
-                                all_q_padded_tile,
-                                block_table,
+                        q_lens = pl.create_tensor([1], dtype=pl.INT32)
+                        kv_lens = pl.create_tensor([1], dtype=pl.INT32)
+                        pl.tensor.write(q_lens, [0], finalize_tok_i32)
+                        pl.tensor.write(kv_lens, [0], pl.cast(block_ctx_len, pl.INT32))
+                        pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
+                        pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
+                        layer_blocks_i32 = pl.cast(layer_cache_rows // BLOCK_SIZE, pl.INT32)
+                        build_paged_prefill_attention_metadata(
+                            q_lens,
+                            kv_lens,
+                            max_blocks_i32,
+                            layer_blocks_i32,
+                            pa_metadata,
+                        )
+                        q_tnd = pl.reshape(q_tnd_flat, [TOK_TILE, NUM_HEADS, HEAD_DIM])
+                        attn_tnd = pl.create_tensor([TOK_TILE, NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
+                        block_table_offset = pl.cast(b * max_blocks_per_seq, pl.INDEX)
+                        cache_row_offset = pl.cast(layer_cache_base * NUM_KV_HEADS, pl.INDEX)
+                        with pl.spmd(
+                            PA_DEFAULT_BLOCK_DIM,
+                            name_hint="prefill_fa_fused",
+                            sync_start=True,
+                        ) as _attention_tid:
+                            attn_tnd = paged_prefill_attention_cce(
+                                q_tnd,
                                 k_cache,
                                 v_cache,
-                                cur_li_phase,
-                                oi_tmp_phase,
-                                b_i32,
-                                max_blocks_i32,
-                                layer_cache_base_i32,
-                                chunk_start,
-                                p0_i32,
-                                final_ti0_i32,
-                                finalize_tok_i32,
+                                block_table,
+                                attn_tnd,
+                                pa_workspace,
+                                pa_metadata,
+                                causal_mask,
+                                cache_row_offset,
+                                block_table_offset,
                             )
+                        attn_tile = pl.reshape(attn_tnd, [TOK_TILE, HIDDEN])
                 # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                 # Stage 3.1: Output projection + first residual.
                 out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
@@ -1286,6 +1251,7 @@ def prefill_fwd(
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
@@ -1371,6 +1337,7 @@ def prefill_fwd(
                             slot_mapping,
                             k_cache,
                             v_cache,
+                            causal_mask,
                             wo,
                             post_rms_weight,
                             w_gate,
@@ -1445,6 +1412,7 @@ def prefill_fwd(
                             slot_mapping,
                             k_cache,
                             v_cache,
+                            causal_mask,
                             wo,
                             post_rms_weight,
                             w_gate,
@@ -1623,6 +1591,12 @@ def build_tensor_specs(
     def init_embed_weight():
         return torch.rand(vocab, hidden_size) - 0.5
 
+    def init_causal_mask():
+        return torch.triu(
+            torch.ones((PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE), dtype=torch.int8),
+            diagonal=1,
+        )
+
     return [
         TensorSpec("input_ids", [total_tokens], torch.int32, init_value=init_input_ids),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
@@ -1652,6 +1626,8 @@ def build_tensor_specs(
                    init_value=init_k_cache),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
                    init_value=init_v_cache),
+        TensorSpec("causal_mask", [PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], torch.int8,
+                   init_value=init_causal_mask),
         TensorSpec("wo", [num_layers * hidden_size, hidden_size], torch.bfloat16,
                    init_value=init_wo),
         TensorSpec("post_rms_weight", [num_layers, hidden_size], torch.float32,

@@ -74,7 +74,13 @@ tensor_data(__gm__ int64_t *args, int32_t index) {
   return reinterpret_cast<GM_ADDR>(data);
 }
 
-template <bool IsFlashDecode, bool WithRope = false>
+template <
+    bool IsFlashDecode,
+    bool WithRope = false,
+    FaiKernel::MaskType Mask = FaiKernel::MaskType::NO_MASK,
+    int32_t MaskArgIndex = -1,
+    int32_t CacheRowOffsetArgIndex = 7,
+    int32_t BlockTableOffsetArgIndex = -1>
 static __aicore__ __attribute__((always_inline)) void
 run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   using namespace NpuArch;
@@ -120,7 +126,7 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   using PseShiftType = Gemm::GemmType<ElementQ, LayoutQ>;
   using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmax<
       Epilogue::LseMode::NONE, Epilogue::SinkMode::DISABLE,
-      static_cast<Epilogue::MaskMode>(FaiKernel::MaskType::NO_MASK), float>;
+      static_cast<Epilogue::MaskMode>(Mask), float>;
   using EpilogueOnlineSoftmax =
       Epilogue::Block::BlockEpilogue<DispatchPolicyOnlineSoftmax, PType, SType,
                                      MaskType, SinkType, PseShiftType>;
@@ -155,16 +161,12 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   using NonFdKernel =
       SplitFuse::FAInferKernel<BlockMmadQK, BlockMmadPV, EpilogueOnlineSoftmax,
                                EpilogueRescaleO, EpilogueInitOut, true,
-                               FaiKernel::MaskType::NO_MASK,
-                               FaiKernel::inputLayout::TND>;
+                               Mask, FaiKernel::inputLayout::TND>;
   using Kernel = std::conditional_t<IsFlashDecode, FdKernel, NonFdKernel>;
 
   GM_ADDR metadata = tensor_data<uint8_t>(args, 6);
-  // pypto packs tensors first, then the sole scalar last: the rope-fused ABI
-  // has 17 tensors so cache_row_offset is at args[17]; the attention-only ABI
-  // has 7 tensors so it is at args[7].
   uint64_t cache_row_offset =
-      static_cast<uint64_t>(WithRope ? args[17] : args[7]);
+      static_cast<uint64_t>(WithRope ? args[17] : args[CacheRowOffsetArgIndex]);
   uint64_t cache_byte_offset =
       cache_row_offset * kQwenFaiHeadDim * sizeof(uint16_t);
   constexpr int32_t query_arg = WithRope ? 1 : 0;
@@ -174,13 +176,22 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   constexpr int32_t out_arg = WithRope ? 0 : 4;
   GM_ADDR key = tensor_data<uint16_t>(args, key_arg) + cache_byte_offset;
   GM_ADDR value = tensor_data<uint16_t>(args, value_arg) + cache_byte_offset;
+  GM_ADDR block_table = tensor_data<int32_t>(args, block_table_arg);
+  if constexpr (BlockTableOffsetArgIndex >= 0) {
+    block_table +=
+        static_cast<uint64_t>(args[BlockTableOffsetArgIndex]) * sizeof(int32_t);
+  }
+  GM_ADDR mask = nullptr;
+  if constexpr (MaskArgIndex >= 0) {
+    mask = tensor_data<int8_t>(args, MaskArgIndex);
+  }
 
   FAIKernelParams params{tensor_data<uint16_t>(args, query_arg),
                          key,
                          value,
                          nullptr,
-                         nullptr,
-                         tensor_data<int32_t>(args, block_table_arg),
+                         mask,
+                         block_table,
                          metadata + qwen_fai_metadata::kCumulativeQOffset,
                          metadata + qwen_fai_metadata::kKvLengthsOffset,
                          tensor_data<uint16_t>(args, out_arg),

@@ -1056,7 +1056,7 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 (stackSeqCount - PRE_LAUNCH == 0),
-                                nowkvSIdx + 1 >= kvSLoopNumTotal,
+                                nowkvSIdx + 1 >= kvEnd,
                                 curStackTileMod,
                                 delStartRow,
                                 delEndRow,

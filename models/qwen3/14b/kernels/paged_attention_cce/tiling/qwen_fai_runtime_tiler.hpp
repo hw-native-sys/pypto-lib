@@ -59,14 +59,24 @@ struct BatchParams {
 
 QWEN_FAI_TILER_FUNCTION uint32_t min_u32(uint32_t lhs, uint32_t rhs) { return lhs < rhs ? lhs : rhs; }
 
+QWEN_FAI_TILER_FUNCTION uint32_t max_u32(uint32_t lhs, uint32_t rhs) { return lhs > rhs ? lhs : rhs; }
+
 QWEN_FAI_TILER_FUNCTION uint32_t ceil_div(uint32_t value, uint32_t divisor) { return (value + divisor - 1) / divisor; }
 
-QWEN_FAI_TILER_FUNCTION BatchParams get_batch_params(uint32_t batch_idx, const uint32_t *kv_seqlens) {
+QWEN_FAI_TILER_FUNCTION uint32_t get_qn_block_tile(uint32_t q_seqlen, uint32_t group_size) {
+    constexpr uint32_t n_split_helper = 2;
+    uint32_t qn_block_tile = q_seqlen != 0 ? (kQTileCeil / q_seqlen) / n_split_helper * n_split_helper : kQTileCeil;
+    qn_block_tile = min_u32(qn_block_tile, group_size);
+    qn_block_tile = max_u32(qn_block_tile, 1);
+    return qn_block_tile;
+}
+
+QWEN_FAI_TILER_FUNCTION BatchParams get_batch_params(uint32_t q_seqlen, uint32_t kv_seqlen) {
     constexpr uint32_t group_size = kNumHeads / kNumKvHeads;
     BatchParams params{};
-    params.q_seqlen = 1;
-    params.kv_seqlen = kv_seqlens[batch_idx];
-    params.qn_block_tile = min_u32(kQTileCeil, group_size);
+    params.q_seqlen = q_seqlen;
+    params.kv_seqlen = kv_seqlen;
+    params.qn_block_tile = get_qn_block_tile(params.q_seqlen, group_size);
     params.qn_blocks_per_group = ceil_div(group_size, params.qn_block_tile);
     params.qn_block_num = params.qn_blocks_per_group * kNumKvHeads;
     params.qs_block_tile = kQTileCeil;
@@ -76,6 +86,10 @@ QWEN_FAI_TILER_FUNCTION BatchParams get_batch_params(uint32_t batch_idx, const u
     return params;
 }
 
+QWEN_FAI_TILER_FUNCTION BatchParams get_batch_params(uint32_t batch_idx, const uint32_t *kv_seqlens) {
+    return get_batch_params(1, kv_seqlens[batch_idx]);
+}
+
 QWEN_FAI_TILER_FUNCTION void zero_tiling(FAInferTilingData &tiling) {
     uint32_t *words = reinterpret_cast<uint32_t *>(&tiling);
     for (uint32_t idx = 0; idx < sizeof(FAInferTilingData) / sizeof(uint32_t); ++idx) {
@@ -83,13 +97,17 @@ QWEN_FAI_TILER_FUNCTION void zero_tiling(FAInferTilingData &tiling) {
     }
 }
 
-QWEN_FAI_TILER_FUNCTION void
-fill_basic(FAInferTilingData &tiling, uint32_t batch, uint32_t max_blocks_per_batch, uint32_t num_blocks) {
+QWEN_FAI_TILER_FUNCTION void fill_basic(
+    FAInferTilingData &tiling, uint32_t batch, uint32_t max_blocks_per_batch, uint32_t num_blocks,
+    uint32_t max_q_seqlen, uint32_t max_kv_seqlen
+) {
     tiling.numHeads = kNumHeads;
     tiling.embeddingSize = kHeadDim;
     tiling.embeddingSizeV = kHeadDim;
     tiling.numBlocks = num_blocks;
     tiling.blockSize = kBlockSize;
+    tiling.maxQSeqlen = max_q_seqlen;
+    tiling.maxKvSeqlen = max_kv_seqlen;
     tiling.kvHeads = kNumKvHeads;
     tiling.batch = batch;
     tiling.maxNumBlocksPerBatch = max_blocks_per_batch;
@@ -104,6 +122,20 @@ QWEN_FAI_TILER_FUNCTION void fill_task_counts(FAInferTilingData &tiling, uint32_
     constexpr uint32_t tasks_per_batch = kNumKvHeads;
     tiling.firstBatchTaskNum = tasks_per_batch;
     tiling.totalTaskNum = tasks_per_batch * batch;
+}
+
+QWEN_FAI_TILER_FUNCTION void
+fill_task_counts(FAInferTilingData &tiling, const uint32_t *q_seqlens, const uint32_t *kv_seqlens, uint32_t batch) {
+    tiling.firstBatchTaskNum = 0;
+    tiling.totalTaskNum = 0;
+    for (uint32_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+        BatchParams params = get_batch_params(q_seqlens[batch_idx], kv_seqlens[batch_idx]);
+        uint32_t tasks = params.qn_block_num * params.qs_block_num;
+        if (batch_idx == 0) {
+            tiling.firstBatchTaskNum = tasks;
+        }
+        tiling.totalTaskNum += tasks;
+    }
 }
 
 QWEN_FAI_TILER_FUNCTION void init_core_info(FAInferTilingData &tiling, uint32_t planning_core_num) {
@@ -319,9 +351,12 @@ QWEN_FAI_TILER_FUNCTION void fill_workspace(FAInferTilingData &tiling) {
 }
 
 QWEN_FAI_TILER_FUNCTION void
-initialize_tiling(FAInferTilingData &tiling, uint32_t batch, uint32_t max_blocks_per_batch, uint32_t num_blocks) {
+initialize_tiling(
+    FAInferTilingData &tiling, uint32_t batch, uint32_t max_blocks_per_batch, uint32_t num_blocks,
+    uint32_t max_q_seqlen, uint32_t max_kv_seqlen
+) {
     zero_tiling(tiling);
-    fill_basic(tiling, batch, max_blocks_per_batch, num_blocks);
+    fill_basic(tiling, batch, max_blocks_per_batch, num_blocks, max_q_seqlen, max_kv_seqlen);
     fill_task_counts(tiling, batch);
 }
 
@@ -332,11 +367,41 @@ QWEN_FAI_TILER_FUNCTION bool build(
     if (batch == 0 || batch > kMaxBatch) {
         return false;
     }
+    uint32_t max_kv_seqlen = 0;
     for (uint32_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
         cumulative_q_lengths[batch_idx] = batch_idx + 1;
         kv_lengths[batch_idx] = kv_seqlens[batch_idx];
+        max_kv_seqlen = max_u32(max_kv_seqlen, kv_seqlens[batch_idx]);
     }
-    initialize_tiling(tiling, batch, max_blocks_per_batch, num_blocks);
+    initialize_tiling(tiling, batch, max_blocks_per_batch, num_blocks, 1, max_kv_seqlen);
+    fill_workspace(tiling);
+    return true;
+}
+
+QWEN_FAI_TILER_FUNCTION bool build_prefill(
+    const uint32_t *q_seqlens, const uint32_t *kv_seqlens, uint32_t batch, uint32_t max_blocks_per_batch,
+    uint32_t num_blocks, FAInferTilingData &tiling, int64_t *cumulative_q_lengths, int64_t *kv_lengths
+) {
+    if (batch == 0 || batch > kMaxBatch) {
+        return false;
+    }
+    int64_t q_sum = 0;
+    uint32_t max_q_seqlen = 0;
+    uint32_t max_kv_seqlen = 0;
+    for (uint32_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+        uint32_t q_len = q_seqlens[batch_idx];
+        uint32_t kv_len = kv_seqlens[batch_idx];
+        if (q_len == 0 || kv_len < q_len) {
+            return false;
+        }
+        q_sum += q_len;
+        cumulative_q_lengths[batch_idx] = q_sum;
+        kv_lengths[batch_idx] = kv_len;
+        max_q_seqlen = max_u32(max_q_seqlen, q_len);
+        max_kv_seqlen = max_u32(max_kv_seqlen, kv_len);
+    }
+    initialize_tiling(tiling, batch, max_blocks_per_batch, num_blocks, max_q_seqlen, max_kv_seqlen);
+    fill_task_counts(tiling, q_seqlens, kv_seqlens, batch);
     fill_workspace(tiling);
     return true;
 }
