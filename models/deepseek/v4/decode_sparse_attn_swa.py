@@ -323,11 +323,11 @@ def sparse_attn_swa(
         # 8-head group survived). Rotating one head-row at a time keeps every gather
         # within a single FP32 vector box; result materialized to n_rope_bf16 so the
         # existing pack loop is unchanged.
-        mr_ones = pl.full([1, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        mr_col = pl.col_expand_mul(mr_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        mr_dup_f = pl.cast(pl.cast(pl.mul(mr_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        mr_lane = pl.sub(mr_col, pl.mul(mr_dup_f, 2.0))
-        mr_swap_idx = pl.cast(pl.sub(pl.add(mr_col, 1.0), pl.mul(mr_lane, 2.0)), target_type=pl.INT32)  # [1, ROPE_DIM]
+        # Reuse the head-invariant swap index precomputed in the rope_cs task
+        # above: every row of rope_swap_idx is identical, so its first row is
+        # mathematically equal to the [1, ROPE_DIM] pattern rebuilt here. Slicing
+        # saves the redundant vector ops while keeping the gather tile 1-row.
+        mr_swap_idx = rope_swap_idx[0:1, :]  # [1, ROPE_DIM]
         mr_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         mr_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
         n_rope_bf16 = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.BF16)
