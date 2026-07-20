@@ -41,22 +41,14 @@ constexpr uint64_t kQwenFaiHeadDim = 128;
 // The generated RoPE body is specialized to the standalone 32-lane dispatch.
 constexpr uint32_t kQwenRopeCores = 32;
 
-// Global cube<->vector barrier that publishes phase-0's RoPE'd GM writes to
-// every core before the attention phase reads them. The FFTS flag-region base
-// is set by the simpler runtime at launch. AscendC::SyncAll<false> is the fused
-// (mixed AIC+AIV) all-core barrier; the default SyncAll() is AIV-only and never
-// releases the Cube cores.
+// Global cube<->vector barrier between phase-0 RoPE and the attention phase.
+// The FFTS flag-region base is set by the simpler runtime at launch.
+// AscendC::SyncAll<false> is the fused (mixed AIC+AIV) all-core barrier; the
+// default SyncAll() is AIV-only and never releases the Cube cores.
 static __aicore__ __attribute__((always_inline)) void qwen_fai_syncall_mix() {
   AscendC::PipeBarrier<PIPE_ALL>();
-  // Drain phase-0's MTE3 GM writes to DDR so they are globally visible before
-  // the cube cores' MTE2 reads in the attention phase. SyncAll synchronizes the
-  // cores but does not itself drain the write path; without this the attention
-  // reads stale q_tnd / paged K/V (the two-task scheduler boundary supplies
-  // this flush in the non-fused path).
-  dsb(DSB_DDR);
   // isAIVOnly=false: fused Cube+Vector whole-core barrier.
   AscendC::SyncAll<false>();
-  dsb(DSB_DDR);
 }
 
 static __aicore__ __attribute__((always_inline)) void

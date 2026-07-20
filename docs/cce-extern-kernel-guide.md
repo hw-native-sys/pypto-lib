@@ -180,6 +180,15 @@ need a **global** cube↔vector barrier, not a per-pair sync.
   macros. If you port a pto barrier by hand, guard it on the extern's `_C220_`
   macros or it silently compiles to a no-op. (Prefer `AscendC::SyncAll<false>`.)
 - The FFTS base is set by the runtime (§1); you do not `SetSyncBaseAddr` yourself.
+- Do not mechanically surround a mixed-core barrier with `dsb(DSB_DDR)`. The
+  C220 `SyncAllImpl` starts with `PipeBarrier<PIPE_ALL>`, but that implementation
+  detail is not a universal GM memory-model guarantee. The Qwen3 C220/CANN 9.0.0
+  MTE3/TSTORE-to-GM producer and MTE2 consumer path was validated without an
+  extra DDR barrier; its 40-layer evidence and exact decision boundary are
+  recorded in
+  [`2026-07-qwen3-fused-attention-sync-barrier.md`](investigations/2026-07-qwen3-fused-attention-sync-barrier.md).
+  Re-evaluate `dcci` and `dsb` whenever the producer uses the data cache or
+  direct scalar writes.
 
 For on-device measurement of arrival skew, collective service, and release
 skew, see [`incore-timestamp-profiling.md`](incore-timestamp-profiling.md).
