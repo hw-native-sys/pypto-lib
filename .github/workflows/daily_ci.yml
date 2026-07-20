@@ -20,10 +20,10 @@ jobs:
         platform: [a2a3sim, a5sim]
     defaults:
       run:
-        working-directory: dist-checkout
+        working-directory: checkout
     env:
-      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -38,7 +38,7 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
+        # but this job checks the repo out into ./checkout — sparse-fetch just
         # the action defs at the workspace root first (clean: false leaves sibling
         # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
         with:
-          checkout-path: dist-checkout
+          checkout-path: checkout
           needs-device: 'false'
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
@@ -58,7 +58,7 @@ jobs:
       - name: Run model tests (${{ matrix.platform }})
         shell: bash
         env:
-          PYTHONPATH: ${{ github.workspace }}/dist-checkout
+          PYTHONPATH: ${{ github.workspace }}/checkout
           PTO2_RING_DEP_POOL: 16384
           PTO2_RING_TASK_WINDOW: 16384
           PTO2_RING_HEAP: 1073741824
@@ -125,7 +125,7 @@ jobs:
           name: results-${{ matrix.platform }}
           # upload-artifact resolves `path` against $GITHUB_WORKSPACE and ignores
           # defaults.run.working-directory, so name the checkout dir explicitly.
-          path: dist-checkout/results.tsv
+          path: checkout/results.tsv
 
   model-tests-a2a3:
     # Runs directly on the host like pypto's dist-system-tests — multi-card
@@ -135,8 +135,9 @@ jobs:
     # (mechanism B), which borrows a card (or an N-card set for the multi-card
     # `# ci: devices=N` files) from the host-level device queue and passes the
     # lent set as $TASK_DEVICE. The backend controls whether DEVICE_ID is `auto`
-    # or a fixed card id. Checkout / install happen under ./dist-checkout to
-    # isolate this job's tree on the shared runner.
+    # or a fixed card id. Checkout / install happen under ./checkout rather
+    # than at the workspace root, so the root holds only the sparsely-fetched
+    # action defs and any second repo a job needs sits beside this one.
     runs-on: [self-hosted, linux, arm64, npu]
     # Must exceed a single task-submit's worst case (--timeout 3600 queue wait +
     # --max-time 900 run), or the job dies before task-submit's own timeout can
@@ -144,10 +145,10 @@ jobs:
     timeout-minutes: 120
     defaults:
       run:
-        working-directory: dist-checkout
+        working-directory: checkout
     env:
-      PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
-      PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
@@ -162,7 +163,7 @@ jobs:
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
-        # but this job checks the repo out into ./dist-checkout — sparse-fetch just
+        # but this job checks the repo out into ./checkout — sparse-fetch just
         # the action defs at the workspace root first (clean: false leaves sibling
         # subdir checkouts on this persistent runner untouched).
         uses: actions/checkout@v4
@@ -174,7 +175,7 @@ jobs:
       - name: Setup CI job
         uses: ./.github/actions/setup-ci-job
         with:
-          checkout-path: dist-checkout
+          checkout-path: checkout
           needs-device: 'true'
           build-namespace: a2a3-daily
           pip-cache-name: pip-a2a3
@@ -227,7 +228,7 @@ jobs:
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
             out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a2a3 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
             perf=$(printf '%s\n' "$out" | extract_perf)
@@ -254,8 +255,8 @@ jobs:
           # below — run_case borrows the marker's 2 cards, so ep4/ep8 need their
           # own --device-num (card pool must provide that many cards), e.g.:
           #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
-          #     --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && \
-          #       PYTHONPATH=$GITHUB_WORKSPACE/dist-checkout \
+          #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
+          #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
           #       python models/deepseek/v4/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
@@ -268,11 +269,11 @@ jobs:
         if: always()
         uses: ./.github/actions/kill-orphaned-tasks
         with:
-          checkout-path: dist-checkout
+          checkout-path: checkout
 
       - name: Clean up build artifacts
         if: always()
-        working-directory: dist-checkout
+        working-directory: checkout
         run: rm -rf build_output
 
       - name: Upload results artifact
@@ -280,7 +281,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: results-a2a3
-          path: dist-checkout/results.tsv
+          path: checkout/results.tsv
 
   summary:
     name: Aggregate results summary
