@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,6 +138,48 @@ def test_fused_attention_declares_real_output_first() -> None:
 
     assert output_like[0] == "out", (
         "single-result extern binds its return to the first Out/InOut parameter"
+    )
+
+
+def test_fused_attention_uses_standalone_rope_worker_count() -> None:
+    decode_source = _REPO_ROOT / "models" / "qwen3" / "14b" / "decode_fwd.py"
+    decode_tree = ast.parse(decode_source.read_text())
+    rope_cores = next(
+        node.value.value
+        for node in decode_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "ROPE_CORES"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+    )
+
+    kernel_dir = (
+        _REPO_ROOT
+        / "models"
+        / "qwen3"
+        / "14b"
+        / "kernels"
+        / "paged_attention_cce"
+        / "kernel"
+    )
+    fai_body = (kernel_dir / "fai_body.hpp").read_text()
+    assert f"constexpr uint32_t kQwenRopeCores = {rope_cores};" in fai_body
+    guarded_call = re.search(
+        r"uint32_t rope_lane = block_idx \* 2 \+ sub_block_idx;\s*"
+        r"if \(rope_lane < kQwenRopeCores\) \{\s*"
+        r"qwen_rope_gen::rope_qkv\(.*?"
+        r"static_cast<int32_t>\(rope_lane\),\s*"
+        r"static_cast<int32_t>\(kQwenRopeCores\)\);\s*\}",
+        fai_body,
+        flags=re.DOTALL,
+    )
+    assert guarded_call is not None
+
+    generated_rope = (kernel_dir / "rope_qkv_generated.hpp").read_text()
+    assert f"const int64_t v27 = {rope_cores};" in generated_rope, (
+        "update the fused lane guard when regenerating the specialized RoPE body"
     )
 
 

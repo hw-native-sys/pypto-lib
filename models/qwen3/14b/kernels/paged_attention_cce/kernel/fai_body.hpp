@@ -38,6 +38,8 @@
 #include "rope_qkv_generated.hpp"
 
 constexpr uint64_t kQwenFaiHeadDim = 128;
+// The generated RoPE body is specialized to the standalone 32-lane dispatch.
+constexpr uint32_t kQwenRopeCores = 32;
 
 // Global cube<->vector barrier that publishes phase-0's RoPE'd GM writes to
 // every core before the attention phase reads them. The FFTS flag-region base
@@ -49,8 +51,8 @@ static __aicore__ __attribute__((always_inline)) void qwen_fai_syncall_mix() {
   // Drain phase-0's MTE3 GM writes to DDR so they are globally visible before
   // the cube cores' MTE2 reads in the attention phase. SyncAll synchronizes the
   // cores but does not itself drain the write path; without this the attention
-  // reads stale q_tnd / paged K/V (the two-task scheduler boundary supplies this
-  // flush in the non-fused path).
+  // reads stale q_tnd / paged K/V (the two-task scheduler boundary supplies
+  // this flush in the non-fused path).
   dsb(DSB_DDR);
   // isAIVOnly=false: fused Cube+Vector whole-core barrier.
   AscendC::SyncAll<false>();
@@ -203,8 +205,8 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   uint32_t block_num = static_cast<uint32_t>(get_block_num(args));
 
   // Fold QK-norm + RoPE in as phase 0: the AIV lanes rotate Q/K and publish
-  // paged K plus projected V, then a global cube<->vec FFTS barrier makes those GM
-  // writes visible to every core before the attention phase reads them.
+  // paged K plus projected V, then a global cube<->vec FFTS barrier makes those
+  // GM writes visible to every core before the attention phase reads them.
   if constexpr (WithRope) {
 #ifdef __DAV_C220_VEC__
     // Drive the golden-correct pypto-generated rope_qkv (copied verbatim). The
@@ -212,25 +214,28 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
     // generated parameter order (k_cache, q_tnd, v_cache, seq_lens, inv_rms,
     // slot_mapping, rope_cos, rope_sin, k_proj, k_norm_w, v_proj, q_proj,
     // q_norm_w, layer_cache_base, KV_CACHE_ROWS, block_idx, block_num).
-    int64_t kv_cache_rows =
-        static_cast<int64_t>(reinterpret_cast<__gm__ Tensor *>(args[2])->shapes[0]);
-    qwen_rope_gen::rope_qkv(
-        reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 2)),
-        reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 1)),
-        reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 3)),
-        reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 16)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 14)),
-        reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 15)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 12)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 13)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 8)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 11)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 9)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 7)),
-        reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 10)),
-        static_cast<int64_t>(args[17]), kv_cache_rows,
-        static_cast<int32_t>(block_idx * 2 + sub_block_idx),
-        static_cast<int32_t>(block_num * 2));
+    int64_t kv_cache_rows = static_cast<int64_t>(
+        reinterpret_cast<__gm__ Tensor *>(args[2])->shapes[0]);
+    uint32_t rope_lane = block_idx * 2 + sub_block_idx;
+    if (rope_lane < kQwenRopeCores) {
+      qwen_rope_gen::rope_qkv(
+          reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 2)),
+          reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 1)),
+          reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 3)),
+          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 16)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 14)),
+          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 15)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 12)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 13)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 8)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 11)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 9)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 7)),
+          reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 10)),
+          static_cast<int64_t>(args[17]), kv_cache_rows,
+          static_cast<int32_t>(rope_lane),
+          static_cast<int32_t>(kQwenRopeCores));
+    }
 #endif
     qwen_fai_syncall_mix();
   }
