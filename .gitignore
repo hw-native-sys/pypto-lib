@@ -29,6 +29,9 @@ env/
 venv/
 ENV/
 
+# CI-generated g++-15 / gcc-15 shims, written next to the per-job venv
+toolchain-bin/
+
 # Testing / coverage / type-checking caches
 .pytest_cache/
 .tox/

@@ -321,6 +321,40 @@ runs:
         # venv` reuse it and carry over old site-packages.
         rm -rf venv
         python -m venv venv --system-site-packages
+        # simpler's sim toolchain invokes the host compiler as g++-15 / gcc-15
+        # (hardcoded in simpler_setup/toolchain.py), but the conda env ships them
+        # as plain g++ / gcc. Publish those names here instead of relying on a
+        # hand-made symlink on each host, so a fresh runner needs no extra step.
+        #
+        # It must be *this* env's compiler, not some other g++-15 on the box: the
+        # sim kernels compiled with it are dlopen'd into this env's python next to
+        # torch, so they have to link the libstdc++ that process already has.
+        #
+        # Wrappers rather than symlinks: conda's g++ is itself a symlink to the
+        # target-prefixed driver, and the GCC driver infers its target/sysroot
+        # from argv[0]; exec'ing the resolved path keeps argv[0] exactly as a
+        # direct `g++` call would leave it.
+        rm -rf toolchain-bin
+        mkdir -p toolchain-bin
+        for name in gcc g++; do
+          real="$(command -v "$name" || true)"
+          case "$real" in
+            "$CONDA_PREFIX"/*) ;;
+            *) echo "::error::'$name' resolves to '${real:-<nothing>}', which is not in the"
+               echo "conda env $CONDA_PREFIX. The sim toolchain must use the env's own"
+               echo "compiler so its output links the same libstdc++ as this python."
+               exit 1 ;;
+          esac
+          major="$("$real" -dumpversion | cut -d. -f1)"
+          if [ "$major" -lt 15 ]; then
+            echo "::error::$name in $CONDA_PREFIX is GCC $major; the sim kernels are"
+            echo "built with -std=c++23 and need GCC 15 or newer."
+            exit 1
+          fi
+          printf '#!/bin/sh\nexec "%s" "$@"\n' "$real" > "toolchain-bin/$name-15"
+          chmod +x "toolchain-bin/$name-15"
+        done
+        echo "g++-15 -> $(command -v g++) (GCC $("$PWD/toolchain-bin/g++-15" -dumpversion))"
         # Bake the runner's roots in as literals rather than referencing
         # $CANN_ROOT/$CONDA_ROOT at source time: activate.sh is also sourced by
         # task-submit children, whose truncated env snapshot does not carry the
@@ -341,6 +375,10 @@ runs:
         # the source at a wrong/absent path. BASH_SOURCE is snapshot-independent.
         _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        # The g++-15 / gcc-15 shims live next to the venv, so they reach every
+        # context that enters the env — including task-submit children, which a
+        # job-level $GITHUB_PATH entry would not survive.
+        export PATH="$_PYPTO_ENV_DIR/toolchain-bin:$PATH"
         EOF
         # The simulator needs no Ascend env, so only device jobs source set_env.sh.
         if [ "$NEEDS_DEVICE" = "true" ]; then
