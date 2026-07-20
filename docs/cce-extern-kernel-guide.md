@@ -181,6 +181,11 @@ need a **global** cube↔vector barrier, not a per-pair sync.
   macros or it silently compiles to a no-op. (Prefer `AscendC::SyncAll<false>`.)
 - The FFTS base is set by the runtime (§1); you do not `SetSyncBaseAddr` yourself.
 
+For on-device measurement of arrival skew, collective service, and release
+skew, see [`incore-timestamp-profiling.md`](incore-timestamp-profiling.md).
+Per-core barrier residence includes time spent waiting for late participants
+and is not the collective's intrinsic service time.
+
 ---
 
 ## 6. Compile & correctness checklist

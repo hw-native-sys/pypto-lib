@@ -268,6 +268,11 @@ Perfetto-viewable per-pipe swimlane with
 `python -m pypto.tools.clean_sim_trace <OPPROF_*> -o <out>`. See the skill's
 `SKILL.md` for the full flag reference and troubleshooting.
 
+For phase timing inside a multi-core extern on real hardware, use
+[`incore-timestamp-profiling.md`](incore-timestamp-profiling.md). It covers
+per-core on-device timestamps, collective-barrier interpretation, and exact
+partitions that reconcile internal phases with the L2 task total.
+
 ### Tuning rules
 
 #### 1. Fix tile-shape MTE hints from `perf_hints.log`
