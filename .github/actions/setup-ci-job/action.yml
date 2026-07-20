@@ -421,7 +421,11 @@ runs:
         if [ "$NEEDS_DEVICE" = "true" ]; then
           printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
         fi
-        printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"' >> activate.sh
+        # ${LD_LIBRARY_PATH:+:...} so an empty inherited value yields no trailing
+        # colon, which the loader would read as the current directory. The
+        # simulator jobs make that reachable: they never source CANN's
+        # set_env.sh, so LD_LIBRARY_PATH is often unset when activate.sh runs.
+        printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' >> activate.sh
 
     - name: Show ccache stats (before)
       shell: bash

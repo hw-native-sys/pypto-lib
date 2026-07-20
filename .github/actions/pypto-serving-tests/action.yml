@@ -48,8 +48,9 @@ runs:
           *) echo "::error::unknown model-name '$MODEL_NAME'"; exit 1 ;;
         esac
         if [ -z "$value" ]; then
-          echo "::error::$key is not set — add it to this runner's config"
-          echo "(the file named by setup-ci-job's runner-config input)"
+          echo "::error::$key is not set — add it to this runner's .env"
+          echo "(<runner-root>/.env, which setup-ci-job reads; restart the"
+          echo "runner service after editing it)"
           exit 1
         fi
         if [ ! -d "$value" ]; then
