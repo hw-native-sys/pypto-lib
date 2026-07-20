@@ -25,7 +25,9 @@ Files ending in `_draft.py` are works-in-progress and excluded from CI.
 - `docs/compile-runtime-workflow.md` — what `python <kernel>.py -p <platform>` does end-to-end (compile passes/codegen → input gen → golden → runtime → validate)
 - `docs/debugging.md` — debugging playbook: pypto/ptoas errors, `golden_data` replay, `runtime_dir` reuse, runtime-hang device logs, args-dump / dep-gen
 - `docs/performance-tuning.md` — L2 (inter-kernel) and L1/L0 (intra-kernel) tuning: swimlanes, PMU, buffer-occupancy / perf-hint reports
+- `docs/incore-timestamp-profiling.md` — on-device multi-core phase timestamps for fused extern kernels: per-core capture, barrier diagnostics, and exact L2-reconciled partitions
 - `docs/precision-tuning.md` — keeping a kernel numerically faithful: `pl.cast` rounding modes vs torch, dtype alignment, fp32 intermediates / no double-cast, quant schemes, the `error_distribution` threshold sweep, and real-weight testing
+- `docs/cce-extern-kernel-guide.md` — writing hand-written mixed (cube+vector) CCE kernels behind `pl.jit.extern`: the persistent-kernel runtime model, the tensors-first/scalars-last arg-packing trap, UB/`TPipe`, `SyncAll<false>` cross-core barriers, GM scalar coherency, and the on-device bisection methodology
 
 ## External Dependencies
 
