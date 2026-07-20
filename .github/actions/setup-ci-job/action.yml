@@ -162,6 +162,28 @@ runs:
           echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE"
         } >> "$GITHUB_ENV"
         echo "runner config OK (checked: CI_CACHE_ROOT $required)"
+        # Identity and storage of the host we landed on. These jobs run on a pool
+        # of self-hosted runners that are not necessarily identically provisioned,
+        # and every failure so far has been host state rather than code — so make
+        # the basics visible in every log instead of guessing from a symptom.
+        echo "host=$(hostname) user=$(id -un) uid=$(id -u) umask=$(umask)"
+        stat -c 'cache_root %n %U:%G mode=%a' "$CI_CACHE_ROOT" || true
+        findmnt -no SOURCE,FSTYPE,OPTIONS --target "$CI_CACHE_ROOT" 2>/dev/null \
+          | sed 's/^/cache_fs /' || true
+        df -h "$CI_CACHE_ROOT" | tail -1 | sed 's/^/cache_df /' || true
+        # Prove the cache root is actually usable before anything depends on it:
+        # a fresh dir, a file inside it, and removing both. The pypto sync failed
+        # writing into a directory it had just created, which no ownership check
+        # would have caught.
+        probe="$CI_CACHE_ROOT/.write-probe-$$"
+        if mkdir -p "$probe" && : > "$probe/f" && rm -rf "$probe"; then
+          echo "cache_write probe OK"
+        else
+          echo "::error::cannot create+write+remove under $CI_CACHE_ROOT"
+          stat -c '%n %U:%G mode=%a' "$probe" 2>/dev/null || true
+          rm -rf "$probe" 2>/dev/null || true
+          exit 1
+        fi
 
     # Self-hosted runners reuse the workspace across runs. A prior run — or a
     # force-pushed PR ref moving refs/remotes/pull/<n>/merge — can leave the
