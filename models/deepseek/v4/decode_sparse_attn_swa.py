@@ -242,7 +242,11 @@ def sparse_attn_swa(
                 qk_exp = pl.exp(pl.row_expand_sub(qk_scores, qk_mi))
                 qk_li = pl.row_sum(qk_exp)
                 qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
+                # [DIAGNOSTIC] force qk_exp_bf16 through GM before the PV cube, to break any
+                # composed-task fusion (exp->cast->cube) suspected of causing the PV drift.
+                _qk_exp_gm = pl.create_tensor([QK_M_TILE, ATTN_K_TILE], dtype=pl.BF16)
+                _qk_exp_gm[:, :] = qk_exp_bf16
+                qk_oi = pl.matmul(_qk_exp_gm, qk_kv, out_dtype=pl.FP32)
                 for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
                     qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
                     qk_r0 = qk_sub * H_TILE

@@ -215,7 +215,12 @@ def prefill_sparse_attn(
                     # li sums the FP32 exp; only the PV matmul uses the BF16 cast.
                     qk_li = pl.row_sum(qk_exp)
                     qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
-                    qk_oi = pl.matmul(qk_exp_bf16, qk_kv_v, out_dtype=pl.FP32)
+                    # Materialize qk_exp_bf16 to GM before the PV cube: the a5 codegen
+                    # mis-fuses the exp->cast->cube chain in this composed task, losing
+                    # ~15% precision. Forcing a GM round-trip breaks the fusion (fixes it).
+                    _qk_exp_gm = pl.create_tensor([QK_M_TILE, PREFILL_ATTN_TILE], dtype=pl.BF16)
+                    _qk_exp_gm[:, :] = qk_exp_bf16
+                    qk_oi = pl.matmul(_qk_exp_gm, qk_kv_v, out_dtype=pl.FP32)
                     for qk_sub in pl.unroll(QK_M_TILE // HEAD_TILE):
                         qk_h_idx = qk_hb * (QK_M_TILE // HEAD_TILE) + qk_sub
                         qk_r0 = qk_sub * HEAD_TILE
