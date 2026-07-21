@@ -324,7 +324,7 @@ def prefill_layer_tq(
                 sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
-                    if cache_slot_raw != -1:
+                    if cache_slot_raw >= 0:
                         cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
                         cache_slot_block = cache_slot // BLOCK_SIZE
                         cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE

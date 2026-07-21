@@ -408,7 +408,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 pl.full([1, HEAD_DIM], dtype=pl.INT32, value=127),
             )
             vq_i8 = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-            if wr_slot_raw != -1:
+            if wr_slot_raw >= 0:
                 wr_slot = pl.cast(wr_slot_raw, pl.INDEX)
                 wr_slot_block = wr_slot // BLOCK_SIZE
                 wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
