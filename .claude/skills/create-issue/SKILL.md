@@ -17,8 +17,15 @@ Background you decide where the issue belongs:
   it cannot be isolated to a single downstream repo. File it **in pypto-lib**
   using this repo's `.github/ISSUE_TEMPLATE/`.
 
+**An issue must be reproducible by someone who only has the public repos.** Many
+pypto-lib cases are local scratch files, `_draft.py`, or uncommitted edits — a
+bare path to one of those tells the reader nothing. Whenever the repro file is
+not on a branch they can fetch, the issue carries its **content** (inlined, or
+attached via the web UI). See Steps 3c–3d.
+
 ```
-reproduce on CURRENT env → collect versions → diagnose → check pin consistency
+reproduce on CURRENT env → make repro self-contained → collect versions
+                             → diagnose → check pin consistency
                                                               │
                                               match ──────────┤──────── mismatch
                                                               │            │
@@ -142,7 +149,72 @@ Capture stdout + stderr, the failing platform, and the **symptom class**:
 If the script **succeeds**, tell the user "The issue does not reproduce in the
 current environment" and ask whether to still file. If no → **stop**.
 
-### 3c: Diagnose the faulty component
+### 3c: Check whether the repro script is visible to the reader
+
+Many pypto-lib repro cases are **local-only** — a scratch kernel, a `_draft.py`,
+or an edit that has not been committed and pushed. A path like
+`models/qwen3/14b/bench_qk_compare.py` is **meaningless to whoever reads the
+issue** if that file does not exist on any branch they can fetch. Determine the
+visibility of every file the repro needs (the script plus any local helper
+modules / kernels it imports):
+
+```bash
+# tracked at all?
+git ls-files --error-unmatch <script> 2>/dev/null || echo "UNTRACKED"
+
+# tracked but with uncommitted edits?
+git diff --stat HEAD -- <script>
+
+# committed — but is that commit on a branch the reader can fetch?
+git branch -r --contains HEAD 2>/dev/null || echo "NOT ON ANY REMOTE BRANCH"
+```
+
+| Result | Reader can see it? | Action |
+|---|---|---|
+| Tracked, clean, and HEAD is on a pushed remote branch | yes | cite the path + commit; no need to inline |
+| Untracked / `_draft.py` / uncommitted edits / local-only branch | **no** | the issue **must carry the source** — see 3d |
+
+Never file an issue whose only pointer to the repro is a local path.
+
+### 3d: Make a local-only repro self-contained
+
+When 3c says the reader cannot see the file, do **one** of the following —
+inlining is the default; attach only when inlining is impossible:
+
+1. **Minimize, then inline.** Cut the case down to the smallest script that
+   still reproduces (strip unrelated layers/benches/variants, prefer `-p
+   <sim>` when the symptom survives there), re-run it to confirm it still
+   reproduces, and paste the **full source** into the issue body inside a
+   collapsed block:
+
+   ````markdown
+   <details>
+   <summary>Reproduction case — <code>repro_qk_mmad.py</code> (not committed; paste locally to run)</summary>
+
+   ```python
+   <full file content>
+   ```
+
+   </details>
+   ````
+
+   Repeat one `<details>` block per local-only file the case needs, and say in
+   the body where each file is expected to sit in the tree (imports depend on
+   it), e.g. "save as `models/qwen3/14b/repro_qk_mmad.py`".
+
+2. **Attach the file** — only when it is genuinely too large to inline
+   (roughly >500 lines, a binary, or a build/log artifact). `gh issue create`
+   **cannot upload attachments**, so this requires the GitHub web UI: create
+   the issue first, then drag-and-drop the file onto the issue page, and leave
+   a placeholder line in the body (`Reproduction case attached below.`) so it
+   is obvious the attachment is expected. Tell the user explicitly that they
+   must do this drag-and-drop step.
+
+Large supporting artifacts (full compile logs, generated IR / `.ptobc`,
+`build_output/` dumps, device logs) follow the same rule: inline the relevant
+excerpt in the body, and attach the full file via the web UI when it matters.
+
+### 3e: Diagnose the faulty component
 
 Map the error to the owning repo. **In pypto-lib the majority of downstream
 faults are pypto (compile/codegen) or simpler (runtime/hang).**
@@ -209,7 +281,7 @@ divergence in the issue.
 Build the Background block now — it leads **every** bug issue body, whichever repo
 it lands in:
 
-```markdown
+````markdown
 ## Background
 
 In pypto-lib, `<file path>` on `<platform>` has a <precision | performance | hang
@@ -220,6 +292,22 @@ hang">.
 Reproduce with:
 
     python <reproduction_script> -p <platform> -d <device>
+
+<If the repro file is committed AND pushed:>
+Repro case: `<path>` at pypto-lib `<commit>` (branch `<pushed branch>`).
+
+<If the repro file is local-only (Step 3c said the reader cannot see it) —
+inline it here, one collapsed block per file, per Step 3d:>
+The repro case is **not committed** — save the file below as `<path>` to run it.
+
+<details>
+<summary>Reproduction case — <code>&lt;filename&gt;</code></summary>
+
+```python
+<full file content>
+```
+
+</details>
 
 Reproduction environment:
 
@@ -236,11 +324,11 @@ Reproduction environment:
 Version mismatch (off pinned): <component> expected `<pin>`, actual `<installed>`.
 
 Diagnosis: **<pypto | simpler | ptoas | pto-isa | unclear>** — <brief reason>.
-```
+````
 
 ## Step 6: Route to the target repo
 
-Pick the destination from the Step 3c diagnosis. This step only **assembles the
+Pick the destination from the Step 3e diagnosis. This step only **assembles the
 body and picks the target** — the actual `gh issue create` happens once, in
 Step 9, after the Step 8 preview.
 
@@ -380,6 +468,11 @@ body in a code block for the user, and wait for confirmation or edits. Make the
 target repo explicit ("Filing to **hw-native-sys/simpler**"), since the routing
 in Step 6 may send it away from pypto-lib.
 
+Check the body once more for **dangling local references**: every file path it
+mentions must either be resolvable in a pushed branch of a repo the reader can
+fetch, or be accompanied by its inlined content / a stated attachment. If a path
+is neither, go back to Step 3d before creating.
+
 ## Step 9: Create
 
 Run the single `gh issue create` for the confirmed target:
@@ -398,9 +491,15 @@ EOF
 )"
 ```
 
-Display the resulting issue URL. For bug reports, prompt the user: "If you have
-relevant source files or build output, attach them to the issue via the GitHub
-web UI (drag-and-drop on the issue page)."
+Write the body to a temp file and pass `--body-file` when it carries inlined
+sources — a heredoc with nested code fences is easy to mangle, and `gh` rejects
+bodies over ~65k characters (if you hit that, minimize the repro further rather
+than truncating it).
+
+Display the resulting issue URL. If Step 3d chose **attachment** for any file,
+tell the user exactly which files still need to be drag-and-dropped onto the
+issue page — the issue is incomplete until they do. Otherwise, mention that any
+extra build output / device logs they want to add go on via the GitHub web UI.
 
 ## pypto-lib template field reference
 
@@ -418,6 +517,9 @@ web UI (drag-and-drop on the issue page)."
       5 current-env component versions collected
 - [ ] Reproduced on the current environment; symptom class + faulty component
       diagnosed
+- [ ] Repro-file visibility checked; any local-only / uncommitted file is
+      minimized and **inlined in the body** (or explicitly attached), never
+      referenced by bare local path
 - [ ] Versions checked against pins (like-for-like); on mismatch, aligned & re-run
       or divergence noted in Background
 - [ ] Background section written (symptom + reproduction env table + diagnosis)
