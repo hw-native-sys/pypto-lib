@@ -122,7 +122,6 @@ def expert_shared(
         for row_block in pl.spmd(
             SH_VALID_M // SH_ROWS_PER_BLOCK,
             name_hint="sh_gate_up_act_q",
-            allow_early_resolve=True,
         ):
             row0 = row_block * SH_ROWS_PER_BLOCK
             x_scale = pl.slice(
@@ -230,7 +229,6 @@ def expert_shared(
         for db_idx in pl.spmd(
             D // D_OUT_TILE,
             name_hint="sh_w2_mm",
-            allow_early_resolve=True,
         ):
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([SH_M_TILE, D_OUT_TILE], dtype=pl.INT32)
@@ -246,7 +244,11 @@ def expert_shared(
             y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
 
         # Dequant w2 output (per-row h scale x per-channel w2 scale) -> BF16.
-        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="sh_w2_act"):
+        for db_idx in pl.spmd(
+            D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+            name_hint="sh_w2_act",
+            allow_early_resolve=True,
+        ):
             d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
             h_scale = pl.row_max(h_tile_scale_dq[:, :])
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):

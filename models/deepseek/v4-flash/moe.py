@@ -108,13 +108,19 @@ def dispatch(
 ):
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
+    seed_dummy = pl.system.task_dummy(deps=[])
 
     # Meta and payload arrivals ride two independent windows (`arrived` /
     # `data_arrived`), so the two phases barrier separately and overlap freely.
 
     # Count routes, publish counts, barrier on meta, cumsum -> recv_count_out.
     # Needs every source's counts but none of the bulk payload.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_meta", allow_early_resolve=True) as _meta_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_meta",
+        deps=[seed_dummy],
+        allow_early_resolve=True,
+    ) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
             active_tokens = pl.cast(0, pl.INDEX)
@@ -176,7 +182,7 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push"):
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -249,7 +255,12 @@ def dispatch(
     # expert. deps on _wait_tid for the incoming payload; this rank's own
     # dst == my_rank puts are already ordered by the local RAW edges on
     # recv_x / recv_aux / recv_route.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_gather", deps=[_wait_tid]) as _gather_tid:
+    with pl.spmd(
+        N_LOCAL,
+        name_hint="dispatch_gather",
+        deps=[_wait_tid],
+        allow_early_resolve=True,
+    ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -350,7 +361,12 @@ def combine(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    with pl.spmd(T, name_hint="shared_routed", deps=[_cwait_tid]) as _reduce_tid:
+    with pl.spmd(
+        T,
+        name_hint="shared_routed",
+        deps=[_cwait_tid],
+        allow_early_resolve=True,
+    ) as _reduce_tid:
         t = pl.tile.get_block_idx()
         if t < active_tokens:
             acc = pl.cast(sh[t:t + 1, :], target_type=pl.FP32)
