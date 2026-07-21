@@ -25,9 +25,12 @@ REAL_NUM_FULL_VOCAB_CHUNKS = REAL_VOCAB // VOCAB_CHUNK
 REAL_VOCAB_TAIL = REAL_VOCAB % VOCAB_CHUNK
 REAL_NUM_VOCAB_CHUNKS = REAL_NUM_FULL_VOCAB_CHUNKS + (1 if REAL_VOCAB_TAIL != 0 else 0)
 TOPK = 32
-CHUNK_TOPK = 4
-CHUNK_TOPK_PAD = 8
-CANDIDATE_PAD = 2048
+TOPK_GROUP_WIDTH = 2048
+TOPK_NUM_FULL_GROUPS = REAL_VOCAB // TOPK_GROUP_WIDTH
+TOPK_GROUP_TAIL = REAL_VOCAB % TOPK_GROUP_WIDTH
+TOPK_NUM_GROUPS = TOPK_NUM_FULL_GROUPS + (1 if TOPK_GROUP_TAIL != 0 else 0)
+TOPK_CANDIDATE_PAD = 4096
+TOPK_FINAL_HALF = TOPK_CANDIDATE_PAD // 2
 GREEDY_CHUNK_PAD = VOCAB_CHUNK
 GREEDY_SORT_TOPK = 16
 FP32_NEG_INF = -3.402823e38
@@ -35,10 +38,31 @@ FP32_NEG_INF = -3.402823e38
 assert VOCAB % VOCAB_CHUNK == 0
 assert REAL_VOCAB <= VOCAB
 assert TOPK <= VOCAB_CHUNK
-assert CHUNK_TOPK <= TOPK
-assert CHUNK_TOPK <= CHUNK_TOPK_PAD
-assert REAL_NUM_VOCAB_CHUNKS * CHUNK_TOPK <= CANDIDATE_PAD
+assert VOCAB_CHUNK == 512
+assert TOPK_GROUP_WIDTH % VOCAB_CHUNK == 0
+assert TOPK_GROUP_TAIL == REAL_VOCAB_TAIL
+assert TOPK_NUM_GROUPS * TOPK <= TOPK_CANDIDATE_PAD
 assert NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
+
+
+@pl.jit.inline
+def _topk_group_pairs(
+    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
+    batch_idx: pl.Scalar[pl.INDEX],
+    group_idx: pl.Scalar[pl.INDEX],
+):
+    group_start = group_idx * TOPK_GROUP_WIDTH
+    scores = logits[batch_idx : batch_idx + 1, group_start : group_start + TOPK_GROUP_WIDTH]
+    indices = pl.arange(
+        pl.cast(group_start, target_type=pl.UINT32),
+        [1, TOPK_GROUP_WIDTH],
+        dtype=pl.UINT32,
+    )
+    pairs = pl.sort32(scores, indices)
+    pairs = pl.mrgsort(pairs, block_len=64)
+    pairs = pl.mrgsort(pairs, block_len=256)
+    pairs = pl.mrgsort(pairs, block_len=1024)
+    return pairs[:, 0 : 2 * TOPK]
 
 
 @pl.jit
@@ -131,68 +155,90 @@ def topk_select_fwd(
                     pl.write(topk_indices, [b, 0], token_id)
             else:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="topk_select"):
-                    candidate_vals = pl.create_tensor([1, CANDIDATE_PAD], dtype=pl.FP32)
-                    candidate_vals[:, :] = pl.full([1, CANDIDATE_PAD], dtype=pl.FP32, value=FP32_NEG_INF)
-                    candidate_ids = pl.create_tensor([1, CANDIDATE_PAD], dtype=pl.INT32)
-                    candidate_ids[:, :] = pl.full([1, CANDIDATE_PAD], dtype=pl.INT32, value=0)
+                    candidate_vals = pl.create_tensor([1, TOPK_CANDIDATE_PAD], dtype=pl.FP32)
+                    candidate_vals[:, :] = pl.full(
+                        [1, TOPK_CANDIDATE_PAD], dtype=pl.FP32, value=FP32_NEG_INF
+                    )
+                    candidate_ids = pl.create_tensor([1, TOPK_CANDIDATE_PAD], dtype=pl.INT32)
+                    candidate_ids[:, :] = pl.full([1, TOPK_CANDIDATE_PAD], dtype=pl.INT32, value=0)
 
-                    for c in pl.range(REAL_NUM_VOCAB_CHUNKS):
-                        c0 = c * VOCAB_CHUNK
-                        local_scores = logits[b : b + 1, c0 : c0 + VOCAB_CHUNK]
-                        idx_init = pl.arange(
-                            pl.cast(c0, target_type=pl.UINT32),
-                            [1, VOCAB_CHUNK],
-                            dtype=pl.UINT32,
-                        )
-                        if REAL_VOCAB_TAIL != 0:
-                            if c == REAL_NUM_FULL_VOCAB_CHUNKS:
-                                local_scores_valid = pl.set_validshape(local_scores, 1, REAL_VOCAB_TAIL)
-                                local_scores_padded = pl.fillpad(
-                                    local_scores_valid, pad_value=pl.PadValue.min
-                                )
-                                sorted_pairs = pl.sort32(local_scores_padded, idx_init)
-                            else:
-                                sorted_pairs = pl.sort32(local_scores, idx_init)
-                        else:
-                            sorted_pairs = pl.sort32(local_scores, idx_init)
-                        sorted_pairs = pl.mrgsort(sorted_pairs, block_len=64)
-                        sorted_pairs = pl.mrgsort(sorted_pairs, block_len=256)
-
-                        chunk_pairs = sorted_pairs[:, 0 : 2 * CHUNK_TOPK_PAD]
-                        topk_chunk_vals = pl.gather(chunk_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
-                        topk_chunk_idx = pl.gather(
-                            chunk_pairs,
+                    for g in pl.range(TOPK_NUM_FULL_GROUPS):
+                        group_pairs = _topk_group_pairs(logits, b, g)
+                        group_vals = pl.gather(group_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                        group_ids = pl.gather(
+                            group_pairs,
                             mask_pattern=pl.tile.MaskPattern.P1010,
                             output_dtype=pl.INT32,
                         )
-
-                        candidate_offset = c * CHUNK_TOPK
-                        for k in pl.range(CHUNK_TOPK):
+                        candidate_offset = g * TOPK
+                        for k in pl.range(TOPK):
                             pl.write(
                                 candidate_vals,
                                 [0, candidate_offset + k],
-                                pl.read(topk_chunk_vals, [0, k]),
+                                pl.read(group_vals, [0, k]),
                             )
                             pl.write(
                                 candidate_ids,
                                 [0, candidate_offset + k],
-                                pl.read(topk_chunk_idx, [0, k]),
+                                pl.read(group_ids, [0, k]),
                             )
 
-                    candidate_positions = pl.arange(0, [1, CANDIDATE_PAD], dtype=pl.UINT32)
+                    if TOPK_GROUP_TAIL != 0:
+                        tail_start = TOPK_NUM_FULL_GROUPS * TOPK_GROUP_WIDTH
+                        tail_scores_raw = logits[
+                            b : b + 1, tail_start : tail_start + VOCAB_CHUNK
+                        ]
+                        tail_scores = pl.fillpad(
+                            pl.set_validshape(tail_scores_raw, 1, TOPK_GROUP_TAIL),
+                            pad_value=pl.PadValue.min,
+                        )
+                        tail_indices = pl.arange(
+                            pl.cast(tail_start, target_type=pl.UINT32),
+                            [1, VOCAB_CHUNK],
+                            dtype=pl.UINT32,
+                        )
+                        tail_pairs = pl.sort32(tail_scores, tail_indices)
+                        tail_pairs = pl.mrgsort(tail_pairs, block_len=64)
+                        tail_pairs = pl.mrgsort(tail_pairs, block_len=256)
+                        tail_pairs = tail_pairs[:, 0 : 2 * TOPK]
+                        tail_vals = pl.gather(tail_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                        tail_ids = pl.gather(
+                            tail_pairs,
+                            mask_pattern=pl.tile.MaskPattern.P1010,
+                            output_dtype=pl.INT32,
+                        )
+                        tail_offset = TOPK_NUM_FULL_GROUPS * TOPK
+                        for k in pl.range(TOPK):
+                            pl.write(
+                                candidate_vals,
+                                [0, tail_offset + k],
+                                pl.read(tail_vals, [0, k]),
+                            )
+                            pl.write(
+                                candidate_ids,
+                                [0, tail_offset + k],
+                                pl.read(tail_ids, [0, k]),
+                            )
+
+                    candidate_positions = pl.arange(0, [1, TOPK_CANDIDATE_PAD], dtype=pl.UINT32)
                     candidate_sorted = pl.sort32(candidate_vals, candidate_positions)
                     candidate_sorted = pl.mrgsort(candidate_sorted, block_len=64)
                     candidate_sorted = pl.mrgsort(candidate_sorted, block_len=256)
                     candidate_sorted = pl.mrgsort(candidate_sorted, block_len=1024)
-                    candidate_pairs = candidate_sorted[:, 0 : 2 * TOPK]
-                    acc_vals = pl.gather(candidate_pairs, mask_pattern=pl.tile.MaskPattern.P0101)
+                    half0_pairs = candidate_sorted[:, 0 : 2 * TOPK]
+                    half1_pairs = candidate_sorted[
+                        :, 2 * TOPK_FINAL_HALF : 2 * TOPK_FINAL_HALF + 2 * TOPK
+                    ]
+                    candidate_pairs = pl.mrgsort(half0_pairs, half1_pairs)[:, 0 : 2 * TOPK]
+                    topk_values[b : b + 1, :] = pl.gather(
+                        candidate_pairs,
+                        mask_pattern=pl.tile.MaskPattern.P0101,
+                    )
                     selected_positions = pl.gather(
                         candidate_pairs,
                         mask_pattern=pl.tile.MaskPattern.P1010,
                         output_dtype=pl.INT32,
                     )
-
-                    topk_values[b : b + 1, :] = acc_vals
                     for k in pl.range(TOPK):
                         candidate_pos = pl.read(selected_positions, [0, k])
                         token_id = pl.read(
@@ -225,6 +271,9 @@ def build_tensor_specs(selection_k=TOPK):
         logits = torch.randn(BATCH, VOCAB, dtype=torch.float32)
         logits[:, REAL_VOCAB:] = -1000.0
         logits[0, 0:TOPK] = torch.arange(TOPK, 0, -1, dtype=torch.float32) + 1000.0
+        if BATCH > 1:
+            spread_ids = torch.arange(TOPK, dtype=torch.long) * (REAL_VOCAB // TOPK) + 7
+            logits[1, spread_ids] = torch.arange(TOPK, 0, -1, dtype=torch.float32) + 1000.0
         if REAL_VOCAB < VOCAB:
             logits[0, REAL_VOCAB] = 2000.0
         return logits
@@ -235,7 +284,7 @@ def build_tensor_specs(selection_k=TOPK):
             "sampling_control",
             [2],
             torch.int32,
-            init_value=lambda: torch.tensor([1, selection_k], dtype=torch.int32),
+            init_value=lambda: torch.tensor([2 if selection_k == TOPK else 1, selection_k], dtype=torch.int32),
         ),
         TensorSpec("topk_values", [BATCH, TOPK], torch.float32, is_output=True),
         TensorSpec("topk_indices", [BATCH, TOPK], torch.int32, is_output=True),
@@ -257,23 +306,7 @@ def golden_topk_select(tensors):
         tensors["topk_indices"][:active_batch, :1] = token_ids[:, None].to(torch.int32)
         return
 
-    values = []
-    indices = []
-    for c0 in range(0, REAL_VOCAB, VOCAB_CHUNK):
-        chunk = logits[:, c0 : min(c0 + VOCAB_CHUNK, REAL_VOCAB)]
-        chunk_vals, chunk_idx = torch.topk(
-            chunk,
-            min(CHUNK_TOPK, chunk.shape[-1]),
-            dim=-1,
-            largest=True,
-            sorted=True,
-        )
-        values.append(chunk_vals)
-        indices.append(chunk_idx + c0)
-    candidate_vals = torch.cat(values, dim=-1)
-    candidate_idx = torch.cat(indices, dim=-1)
-    vals, positions = torch.topk(candidate_vals, TOPK, dim=-1, largest=True, sorted=True)
-    idx = torch.gather(candidate_idx, dim=-1, index=positions)
+    vals, idx = torch.topk(logits, TOPK, dim=-1, largest=True, sorted=True)
     tensors["topk_values"][:active_batch] = vals
     tensors["topk_indices"][:active_batch] = idx.to(torch.int32)
 
