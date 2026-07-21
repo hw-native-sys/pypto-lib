@@ -1005,9 +1005,8 @@ def golden_decode_fwd_tq(tensors):
             sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
 
             slot = int(slot_mapping[b_idx].item())
-            if slot >= 0:
-                slot_block = slot // BLOCK_SIZE
-                slot_offset = slot % BLOCK_SIZE
+            slot_block = slot // BLOCK_SIZE
+            slot_offset = slot % BLOCK_SIZE
 
             # ── K: RoPE + L2 norm + normalize + rotate + quantize ──
             k_heads = k_proj[b_idx].view(num_kv_heads, head_dim)
