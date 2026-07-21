@@ -901,7 +901,6 @@ def prefill_layer(
                                         pl.col_expand_mul(k_hi, cos_hi),
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
-                                    cache_col = ki * HEAD_DIM
                                     if cache_slot_raw >= 0:
                                         cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
                                         cache_slot_block = cache_slot // BLOCK_SIZE
@@ -909,6 +908,7 @@ def prefill_layer(
                                         cache_row = (
                                             layer_cache_base + cache_slot_block * BLOCK_SIZE + cache_slot_offset
                                         )
+                                        cache_col = ki * HEAD_DIM
                                         k_cache_bsnd = pl.assemble(
                                             k_cache_bsnd,
                                             pl.cast(rot_lo, target_type=pl.BF16),
