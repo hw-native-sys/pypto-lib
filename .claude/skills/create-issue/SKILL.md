@@ -23,7 +23,7 @@ bare path to one of those tells the reader nothing. Whenever the repro file is
 not on a branch they can fetch, the issue carries its **content** (inlined, or
 attached via the web UI). See Steps 3c–3d.
 
-```
+```text
 reproduce on CURRENT env → make repro self-contained → collect versions
                              → diagnose → check pin consistency
                                                               │
@@ -158,21 +158,35 @@ issue** if that file does not exist on any branch they can fetch. Determine the
 visibility of every file the repro needs (the script plus any local helper
 modules / kernels it imports):
 
+Build the list of required files first — the entry script **plus every local
+module / kernel source it imports or references** (`grep` its imports, its
+`aic_source` / `aiv_source` / `include_dirs`, and any data file it opens). Every
+file on that list is checked, and every file on that list must end up visible;
+one invisible helper is enough to make the issue unreproducible.
+
 ```bash
 # tracked at all?
-git ls-files --error-unmatch <script> 2>/dev/null || echo "UNTRACKED"
+git ls-files --error-unmatch <file> 2>/dev/null || echo "UNTRACKED"
 
 # tracked but with uncommitted edits?
-git diff --stat HEAD -- <script>
+git diff --stat HEAD -- <file>
 
-# committed — but is that commit on a branch the reader can fetch?
-git branch -r --contains HEAD 2>/dev/null || echo "NOT ON ANY REMOTE BRANCH"
+# committed — but does that commit actually exist on the remote?
+# `git branch -r --contains` only reads LOCAL remote-tracking refs, which can be
+# stale; ask the remote itself, and confirm the branch still contains the commit.
+git ls-remote origin refs/heads/<branch>            # empty => branch not on remote
+git merge-base --is-ancestor HEAD origin/<branch> \
+  && echo "HEAD is on origin/<branch>" || echo "HEAD NOT PUSHED"
 ```
+
+Also confirm the remote is one the **reader** can reach: a commit pushed only to
+your personal fork, or to a private repo the issue's audience has no access to,
+is no more visible than an untracked file. When in doubt, treat it as invisible.
 
 | Result | Reader can see it? | Action |
 |---|---|---|
-| Tracked, clean, and HEAD is on a pushed remote branch | yes | cite the path + commit; no need to inline |
-| Untracked / `_draft.py` / uncommitted edits / local-only branch | **no** | the issue **must carry the source** — see 3d |
+| Tracked, clean, and the commit is fetchable from a remote the reader can access | yes | cite the path + commit; no need to inline |
+| Untracked / `_draft.py` / uncommitted edits / unpushed commit / fork-only or private remote | **no** | the issue **must carry the source** — see 3d |
 
 Never file an issue whose only pointer to the repro is a local path.
 
@@ -213,6 +227,41 @@ inlining is the default; attach only when inlining is impossible:
 Large supporting artifacts (full compile logs, generated IR / `.ptobc`,
 `build_output/` dumps, device logs) follow the same rule: inline the relevant
 excerpt in the body, and attach the full file via the web UI when it matters.
+
+Cover **every** file on the Step 3c list — each one gets a citation, an inline
+block, or a stated attachment. A case whose entry script is inlined but whose
+imported helper is only named by path is still unreproducible.
+
+#### Sanitize before publishing
+
+Inlining or attaching turns local content into a **public, permanently indexed**
+artifact. Before it goes in the body, scan every file you are about to publish
+and redact:
+
+- credentials & secrets — tokens, keys, passwords, `PRIVATE_KEY`, `.netrc` /
+  `~/.ssh` contents, anything read from a secrets env var;
+- internal-only identifiers — intranet hostnames / URLs, internal IPs, ticket or
+  device-farm IDs, unreleased product or customer names;
+- personal information — usernames, emails, and absolute paths that embed them
+  (`/data/<user>/…`, `/home/<user>/…`). This is also project rule 4 in
+  `.claude/CLAUDE.md`: **no private information in code or docs**;
+- proprietary third-party code — vendor sources you are not licensed to
+  redistribute. Reference these by upstream path/version instead of pasting them.
+
+```bash
+# quick sweep over the files about to be published
+grep -nEi 'password|passwd|secret|token|api[_-]?key|private[_-]?key|BEGIN [A-Z ]*PRIVATE KEY' <files>
+grep -nE '/home/[^/ ]+|/data/[^/ ]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' <files>
+```
+
+Replace hits with placeholders (`<user>`, `<internal-host>`, `<token>`) and keep
+the repro runnable. If a file cannot be published without losing something that
+must stay private, **do not publish it** — write a minimal clean-room repro that
+exercises the same code path instead, and say so in the issue.
+
+**Show the user the exact content to be published and get explicit approval
+before it is sent.** The Step 8 preview is that checkpoint — publishing source
+is not covered by a general "go ahead and file the issue".
 
 ### 3e: Diagnose the faulty component
 
@@ -297,13 +346,23 @@ Reproduce with:
 Repro case: `<path>` at pypto-lib `<commit>` (branch `<pushed branch>`).
 
 <If the repro file is local-only (Step 3c said the reader cannot see it) —
-inline it here, one collapsed block per file, per Step 3d:>
-The repro case is **not committed** — save the file below as `<path>` to run it.
+inline it here — one block per file on the Step 3c list, sanitized per 3d:>
+The repro case is **not committed** — save the files below at the paths shown to
+run it. Files required: `<path 1>`, `<path 2>`, …
 
 <details>
-<summary>Reproduction case — <code>&lt;filename&gt;</code></summary>
+<summary>Reproduction case — <code>&lt;filename&gt;</code> (save as <code>&lt;path&gt;</code>)</summary>
 
 ```python
+<full file content>
+```
+
+</details>
+
+<details>
+<summary>Helper — <code>&lt;filename&gt;</code> (save as <code>&lt;path&gt;</code>)</summary>
+
+```cpp
 <full file content>
 ```
 
@@ -468,10 +527,21 @@ body in a code block for the user, and wait for confirmation or edits. Make the
 target repo explicit ("Filing to **hw-native-sys/simpler**"), since the routing
 in Step 6 may send it away from pypto-lib.
 
+Then walk the **Step 3c required-file list** against the assembled body and
+confirm, file by file, that each one is either cited at a commit the reader can
+fetch, inlined, or explicitly attached. Imports that resolve through the package
+path rather than an explicit filename are the usual miss — check them by name,
+not by scanning the body for paths. If any file is unaccounted for, go back to
+Step 3d before creating.
+
 Check the body once more for **dangling local references**: every file path it
 mentions must either be resolvable in a pushed branch of a repo the reader can
-fetch, or be accompanied by its inlined content / a stated attachment. If a path
-is neither, go back to Step 3d before creating.
+fetch, or be accompanied by its inlined content / a stated attachment.
+
+When the body carries inlined source, this preview is also the **publication
+approval point** (Step 3d): show the user the actual content being published,
+confirm the sanitization sweep found nothing left to redact, and get an explicit
+go-ahead before creating.
 
 ## Step 9: Create
 
@@ -517,9 +587,13 @@ extra build output / device logs they want to add go on via the GitHub web UI.
       5 current-env component versions collected
 - [ ] Reproduced on the current environment; symptom class + faulty component
       diagnosed
-- [ ] Repro-file visibility checked; any local-only / uncommitted file is
-      minimized and **inlined in the body** (or explicitly attached), never
-      referenced by bare local path
+- [ ] Required-file list built (entry script + every local helper it imports);
+      visibility of each confirmed against the **remote**, not just local
+      remote-tracking refs
+- [ ] Every local-only / uncommitted file minimized and **inlined in the body**
+      (or explicitly attached), never referenced by bare local path
+- [ ] Published content sanitized (no secrets, internal hosts, usernames /
+      absolute paths, or proprietary vendor source) and user-approved
 - [ ] Versions checked against pins (like-for-like); on mismatch, aligned & re-run
       or divergence noted in Background
 - [ ] Background section written (symptom + reproduction env table + diagnosis)
