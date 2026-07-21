@@ -329,7 +329,7 @@ def build_qwen3_14b_decode_program():
                     rp_ctx_len = pl.tensor.read(seq_lens, [b, 0, 0, 0])
                     rp_pos = rp_ctx_len - 1
                     rp_slot = pl.tensor.read(slot_mapping, [b, 0, 0, 0])
-                    if rp_slot >= 0:
+                    if rp_slot != -1:
                         rp_slot_block = rp_slot // BLOCK_SIZE
                         rp_slot_offset = rp_slot - rp_slot_block * BLOCK_SIZE
 
@@ -378,7 +378,7 @@ def build_qwen3_14b_decode_program():
                         rp_k_rot_hi_bf16 = pl.tile.set_validshape(rp_k_rot_hi_bf16_pre, 1, HALF_DIM)
                         rp_k_rot_lo_blk = pl.tile.reshape(rp_k_rot_lo_bf16, [1, 1, 1, HALF_DIM])
                         rp_k_rot_hi_blk = pl.tile.reshape(rp_k_rot_hi_bf16, [1, 1, 1, HALF_DIM])
-                        if rp_slot >= 0:
+                        if rp_slot != -1:
                             pl.tile.store(rp_k_rot_lo_blk, [rp_slot_block, ki, rp_slot_offset, 0], k_cache)
                             pl.tile.store(rp_k_rot_hi_blk, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], k_cache)
 
@@ -395,7 +395,7 @@ def build_qwen3_14b_decode_program():
                         rp_v_hi_bf16_pre = pl.tile.cast(rp_v_hi, target_type=pl.BF16)
                         rp_v_hi_bf16 = pl.tile.set_validshape(rp_v_hi_bf16_pre, 1, HALF_DIM)
                         rp_v_hi_out = pl.tile.reshape(rp_v_hi_bf16, [1, 1, 1, HALF_DIM])
-                        if rp_slot >= 0:
+                        if rp_slot != -1:
                             pl.tile.store(rp_v_lo_out, [rp_slot_block, ki, rp_slot_offset, 0], v_cache)
                             pl.tile.store(rp_v_hi_out, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], v_cache)
 

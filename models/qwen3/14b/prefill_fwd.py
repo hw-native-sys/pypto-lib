@@ -901,7 +901,7 @@ def prefill_layer(
                                         pl.col_expand_mul(k_hi, cos_hi),
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
-                                    if cache_slot_raw >= 0:
+                                    if cache_slot_raw != -1:
                                         cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
                                         cache_slot_block = cache_slot // BLOCK_SIZE
                                         cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE

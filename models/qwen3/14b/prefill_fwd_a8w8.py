@@ -385,7 +385,7 @@ def prefill_layer(
                                     vq = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
                                     v_scale_value = v_amax_scalar / INT8_SCALE_MAX
                                     v_scale_out = pl.mul(pl.full([1, 8], dtype=pl.FP32, value=1.0), v_scale_value)
-                                    if cache_slot_raw >= 0:
+                                    if cache_slot_raw != -1:
                                         cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
                                         cache_slot_block = cache_slot // BLOCK_SIZE
                                         cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE

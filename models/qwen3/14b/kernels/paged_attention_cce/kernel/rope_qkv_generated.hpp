@@ -2,7 +2,7 @@
 // RoPE + QK-norm prologue: the pypto/ptoas-GENERATED rope_qkv kernel copied
 // from the decode_fwd rope_qkv scope codegen (golden-correct) and wrapped for
 // reuse inside the fused paged_attention_rope_cce extern. The KV cache write
-// sites carry a small hand-maintained slot_mapping < 0 no-write sentinel guard;
+// sites carry a small hand-maintained slot_mapping == -1 no-write sentinel guard;
 // keep sync/event flow and Q writes outside that guard. Regenerate from
 // decode_fwd rope_qkv, then re-apply the sentinel guard if the math changes.
 #ifndef PYPTO_QWEN_ROPE_QKV_GENERATED_HPP
@@ -659,7 +659,7 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       pipe_barrier(PIPE_MTE3);
-      if (v89 >= 0) {
+      if (v89 != -1) {
         // pto: %126, %118, %125, %127
         int64_t v91 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v89) * (uint64_t) v26)))) + (uint64_t) v84);
         // pto: %k_cache__iter_v3_pview
@@ -1198,7 +1198,7 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID5);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
       pipe_barrier(PIPE_MTE3);
-      if (v263 >= 0) {
+      if (v263 != -1) {
         // pto: %157, %149, %156, %158
         int64_t v265 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v263) * (uint64_t) v26)))) + (uint64_t) v258);
         // pto: %k_cache__phi_v6_pview

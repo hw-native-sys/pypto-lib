@@ -313,7 +313,7 @@ def decode_layer_tq(
 
         # Scatter row 0 results to per-head cache positions.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
-            if slot >= 0:
+            if slot != -1:
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot - slot_block * BLOCK_SIZE
                 for ki in pl.range(NUM_KV_HEADS):
@@ -1005,7 +1005,7 @@ def golden_decode_fwd_tq(tensors):
             sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
 
             slot = int(slot_mapping[b_idx].item())
-            if slot >= 0:
+            if slot != -1:
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
 
@@ -1029,13 +1029,13 @@ def golden_decode_fwd_tq(tensors):
                 v_vec = v_proj[b_idx, ki * head_dim : (ki + 1) * head_dim]
                 v_idx_u8, v_l2, _ = _quantize_row(v_vec, rot_matrix)
                 v_l2_norms.append(v_l2.item())
-                if slot >= 0:
+                if slot != -1:
                     quant_cache_row = layer_cmp_base + (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
                     quant_k_cache[quant_cache_row, :] = k_idx_u8
                     quant_v_cache[quant_cache_row, :] = v_idx_u8
 
             # Write K/V scales: [1] per (token, kvh) cache row.
-            if slot >= 0:
+            if slot != -1:
                 for ki in range(num_kv_heads):
                     quant_cache_row = layer_cmp_base + (slot_block * num_kv_heads + ki) * BLOCK_SIZE + slot_offset
                     quant_k_scales[quant_cache_row, 0] = k_l2_norms[ki]
