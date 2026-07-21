@@ -1005,8 +1005,6 @@ def golden_decode_fwd_tq(tensors):
             sin_lo, sin_hi = sin_row[:, :half], sin_row[:, half:]
 
             slot = int(slot_mapping[b_idx].item())
-            slot_block = 0
-            slot_offset = 0
             if slot >= 0:
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE

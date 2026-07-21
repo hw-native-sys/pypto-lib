@@ -329,8 +329,6 @@ def build_qwen3_14b_decode_program():
                     rp_ctx_len = pl.tensor.read(seq_lens, [b, 0, 0, 0])
                     rp_pos = rp_ctx_len - 1
                     rp_slot = pl.tensor.read(slot_mapping, [b, 0, 0, 0])
-                    rp_slot_block = 0
-                    rp_slot_offset = 0
                     if rp_slot >= 0:
                         rp_slot_block = rp_slot // BLOCK_SIZE
                         rp_slot_offset = rp_slot - rp_slot_block * BLOCK_SIZE
