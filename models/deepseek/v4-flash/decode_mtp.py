@@ -294,14 +294,14 @@ def l3_mtp_decode_layer(
     next_pre_hc_hidden: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
-    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
-    recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)
-    recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
-    arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    data_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
-    combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)

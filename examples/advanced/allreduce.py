@@ -85,8 +85,8 @@ def l3_allreduce(
     outputs: pl.Out[pl.Tensor[[N_RANKS, 1, SIZE], pl.FP32]],
 ):
     """Launch one chip orchestration per rank, sharing the window buffers."""
-    data_buf = pld.alloc_window_buffer(SIZE * 4)  # 1xSIZE x FP32 (4 bytes)
-    signal_buf = pld.alloc_window_buffer(N_RANKS * 4)  # NR x 1 x INT32
+    data_buf = pld.alloc_window_buffer([1, SIZE], dtype=pl.FP32)
+    signal_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         data = pld.window(data_buf, [1, SIZE], dtype=pl.FP32)

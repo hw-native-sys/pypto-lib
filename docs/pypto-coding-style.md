@@ -763,3 +763,26 @@ for idx in pl.spmd(T * OUT_DIM // (B_TILE * OUT_TILE), name_hint="kv_score_proj"
 The same principle applies to inner-loop scratch tensors: allocate inside
 the loop body (or directly above the inner `pl.at`) rather than at the
 top of the outer loop.
+
+### Use the shape+dtype form of `alloc_window_buffer` for single-view buffers
+
+When a window buffer backs exactly one `pld.window()` view (the common case),
+use the shape+dtype convenience overload so that shape, element type, and byte
+size stay in one place and can't drift apart:
+
+```python
+import pypto.language as pl
+import pypto.language.distributed as pld
+
+# good — shape + dtype stated once at the allocation, then repeated at window()
+recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+recv_x_buf    = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+for r in pl.range(pld.world_size()):
+    recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_x    = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+```
+
+The canonical byte form (`alloc_window_buffer(byte_count)`) is the escape
+hatch — use it only when the same buffer backs **multiple** `window()` views
+with different shapes or dtypes across loop iterations. Copy the shape and
+dtype directly from the `pld.window()` call; do not hand-compute byte counts.
