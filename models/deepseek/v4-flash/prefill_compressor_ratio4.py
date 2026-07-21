@@ -17,6 +17,7 @@ from config import (
     FP32_NEG_INF,
     PREFILL_CMP_BLOCK_NUM,
 )
+T_DYN = pl.dynamic("PREFILL_COMPRESSOR_RATIO4_T_DYN")
 
 # model config (mirrors decode_compressor_ratio4)
 EPS = M.rms_norm_eps
@@ -44,6 +45,7 @@ assert HEAD_DIM % HEAD_CHUNK == 0
 HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
 K_TILE = 512
 OUT_TILE = 32
+TOKEN_M_TILE = 16
 HEAD_TILE = 64
 RMS_TILE = 16
 
@@ -60,7 +62,7 @@ PACKED_RMS_TILE = 16
 
 @pl.jit.inline
 def prefill_compressor_ratio4(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     compress_state: pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -70,13 +72,14 @@ def prefill_compressor_ratio4(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     cmp_kv: pl.Tensor[[PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
-    cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+    num_tokens = pl.tensor.dim(x, 0)
+    matmul_tokens = ((num_tokens + TOKEN_M_TILE - 1) // TOKEN_M_TILE) * TOKEN_M_TILE
+    cmp4_kv_proj_scratch = pl.create_tensor([matmul_tokens, OUT_DIM], dtype=pl.FP32)
+    cmp4_score_proj_scratch = pl.create_tensor([matmul_tokens, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(
         compress_state,
         [CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
@@ -87,23 +90,31 @@ def prefill_compressor_ratio4(
 
     for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_c4_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // K_TILE, stage=2):
-            k0 = kb * K_TILE
-            x_tile = x[0:T, k0 : k0 + K_TILE]
-            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
-            # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/HCA layout.
-            wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        cmp4_kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        cmp4_score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+        for mt in pl.range(matmul_tokens // TOKEN_M_TILE):
+            m0 = mt * TOKEN_M_TILE
+            valid_rows = pl.min(TOKEN_M_TILE, num_tokens - m0)
+            kv_acc = pl.create_tensor([TOKEN_M_TILE, OUT_TILE], dtype=pl.FP32)
+            score_acc = pl.create_tensor([TOKEN_M_TILE, OUT_TILE], dtype=pl.FP32)
+            for kb in pl.pipeline(0, D // K_TILE, stage=2):
+                k0 = kb * K_TILE
+                x_tile = pl.slice(
+                    x,
+                    [TOKEN_M_TILE, K_TILE],
+                    [m0, k0],
+                    valid_shape=[valid_rows, K_TILE],
+                )
+                # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
+                # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/HCA layout.
+                wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
+                if k0 == 0:
+                    kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+                    score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
+                else:
+                    kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+                    score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+            cmp4_kv_proj_scratch[m0 : m0 + TOKEN_M_TILE, o0 : o0 + OUT_TILE] = kv_acc
+            cmp4_score_proj_scratch[m0 : m0 + TOKEN_M_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once. Depends only on the slot-mapping and
     # position inputs, so it overlaps the projection matmul, replacing the O(T) write-discovery
@@ -114,13 +125,12 @@ def prefill_compressor_ratio4(
         write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
-        for map_w in pl.range(T):
-            if map_w < num_tokens:
-                map_slot_raw = pl.read(cmp_slot_mapping, [map_w])
-                if map_slot_raw >= 0:
-                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_w]))
-                    pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
-                    map_seen = map_seen + 1
+        for map_w in pl.range(num_tokens):
+            map_slot_raw = pl.read(cmp_slot_mapping, [map_w])
+            if map_slot_raw >= 0:
+                pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_w]))
+                pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
+                map_seen = map_seen + 1
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
         write_dst_map[0:1, 0:MAX_CMP_WRITES] = write_dst_tile
 
@@ -194,28 +204,27 @@ def prefill_compressor_ratio4(
                         OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
 
-            for pool_t in pl.range(T):
-                if pool_t < num_tokens:
-                    pool_pos = pl.read(position_ids, [pool_t])
-                    if pool_pos <= write_pos:
-                        if pool_pos >= prev_start:
-                            if pool_pos < cur_start:
-                                pool_slot = pl.cast(pool_pos - prev_start, pl.INDEX)
-                                pool_col0 = h0
-                            else:
-                                pool_slot = pl.cast(COMPRESS_RATIO + pool_pos - cur_start, pl.INDEX)
-                                pool_col0 = HEAD_DIM + h0
-                            pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
-                            pool_ape = ape[pool_ape_slot : pool_ape_slot + 1, pool_col0 : pool_col0 + HEAD_CHUNK]
-                            pool_score = pl.add(
-                                cmp4_score_proj_scratch[pool_t : pool_t + 1, pool_col0 : pool_col0 + HEAD_CHUNK],
-                                pool_ape,
-                            )
-                            pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = cmp4_kv_proj_scratch[
-                                pool_t : pool_t + 1,
-                                pool_col0 : pool_col0 + HEAD_CHUNK,
-                            ]
-                            pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = pool_score
+            for pool_t in pl.range(num_tokens):
+                pool_pos = pl.read(position_ids, [pool_t])
+                if pool_pos <= write_pos:
+                    if pool_pos >= prev_start:
+                        if pool_pos < cur_start:
+                            pool_slot = pl.cast(pool_pos - prev_start, pl.INDEX)
+                            pool_col0 = h0
+                        else:
+                            pool_slot = pl.cast(COMPRESS_RATIO + pool_pos - cur_start, pl.INDEX)
+                            pool_col0 = HEAD_DIM + h0
+                        pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
+                        pool_ape = ape[pool_ape_slot : pool_ape_slot + 1, pool_col0 : pool_col0 + HEAD_CHUNK]
+                        pool_score = pl.add(
+                            cmp4_score_proj_scratch[pool_t : pool_t + 1, pool_col0 : pool_col0 + HEAD_CHUNK],
+                            pool_ape,
+                        )
+                        pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = cmp4_kv_proj_scratch[
+                            pool_t : pool_t + 1,
+                            pool_col0 : pool_col0 + HEAD_CHUNK,
+                        ]
+                        pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = pool_score
 
             init_slot = STATE_LEN - 1
             mi_buf = pl.create_tensor([1, HEAD_CHUNK], dtype=pl.FP32)
@@ -323,34 +332,33 @@ def prefill_compressor_ratio4(
     # of them; out-blocks are looped inside the task at the OUT_TILE width.
     # pool_dep keeps the (zero-weighted) ordering after the pool and is hoisted
     # to once per token.
-    for update_t in pl.spmd(T, name_hint="prefill_c4_state_update"):
-        if update_t < num_tokens:
-            state_row_raw = pl.read(state_slot_mapping, [update_t])
-            if state_row_raw >= 0:
-                state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
-                ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
-                pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
-                for update_ob in pl.range(PACKED_PROJ_BLOCKS):
-                    update_o0 = update_ob * OUT_TILE
-                    ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
-                    compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
-                        cmp4_kv_proj_scratch[
-                            update_t : update_t + 1,
-                            update_o0 : update_o0 + OUT_TILE,
-                        ],
-                        pool_dep,
-                    )
-                    compress_state_flat[
-                        state_row : state_row + 1,
-                        OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
-                    ] = pl.add(
-                        pl.add(
-                            cmp4_score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
-                            ape_row,
-                        ),
-                        pool_dep,
-                    )
+    for update_t in pl.spmd(num_tokens, name_hint="prefill_c4_state_update"):
+        state_row_raw = pl.read(state_slot_mapping, [update_t])
+        if state_row_raw >= 0:
+            state_row = pl.cast(state_row_raw, pl.INDEX)
+            update_pos = pl.read(position_ids, [update_t])
+            ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
+            pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
+            for update_ob in pl.range(PACKED_PROJ_BLOCKS):
+                update_o0 = update_ob * OUT_TILE
+                ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
+                compress_state_flat[state_row : state_row + 1, update_o0 : update_o0 + OUT_TILE] = pl.add(
+                    cmp4_kv_proj_scratch[
+                        update_t : update_t + 1,
+                        update_o0 : update_o0 + OUT_TILE,
+                    ],
+                    pool_dep,
+                )
+                compress_state_flat[
+                    state_row : state_row + 1,
+                    OUT_DIM + update_o0 : OUT_DIM + update_o0 + OUT_TILE,
+                ] = pl.add(
+                    pl.add(
+                        cmp4_score_proj_scratch[update_t : update_t + 1, update_o0 : update_o0 + OUT_TILE],
+                        ape_row,
+                    ),
+                    pool_dep,
+                )
 
     cmp_kv = pl.reshape(cmp_kv_flat, [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     compress_state = pl.reshape(
@@ -364,7 +372,8 @@ def golden_prefill_compressor_ratio4(tensors):
     """Packed token-major torch reference for ratio-4 prefill compressor."""
     import torch
 
-    x = tensors["x"].view(T, D).float()
+    num_tokens = tensors["x"].shape[0]
+    x = tensors["x"].view(num_tokens, D).float()
     compress_state_flat = tensors["compress_state"].view(
         CSA_STATE_BLOCK_NUM * CSA_STATE_BLOCK_SIZE,
         COMPRESS_STATE_DIM,
@@ -393,7 +402,7 @@ def golden_prefill_compressor_ratio4(tensors):
             return -1
         return phys_block * CSA_STATE_BLOCK_SIZE + intra
 
-    for token_id in range(int(tensors["num_tokens"])):
+    for token_id in range(num_tokens):
         dst_row = int(tensors["cmp_slot_mapping"][token_id].item())
         if dst_row < 0:
             continue
@@ -417,7 +426,7 @@ def golden_prefill_compressor_ratio4(tensors):
                 pool_kv[COMPRESS_RATIO + s] = kv_state_flat[cur_row, HEAD_DIM:OUT_DIM]
                 pool_score[COMPRESS_RATIO + s] = score_state_flat[cur_row, HEAD_DIM:OUT_DIM]
 
-        for t in range(int(tensors["num_tokens"])):
+        for t in range(num_tokens):
             pos = int(position_ids[t].item())
             if pos < prev_start or pos > write_pos:
                 continue
@@ -460,7 +469,7 @@ def golden_prefill_compressor_ratio4(tensors):
         normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
         cache_rows[dst_row] = normed.to(torch.bfloat16)[0]
 
-    for t in range(int(tensors["num_tokens"])):
+    for t in range(num_tokens):
         pos = int(tensors["position_ids"][t].item())
         dst_row = int(tensors["state_slot_mapping"][t].item())
         if dst_row < 0:
@@ -473,7 +482,7 @@ def golden_prefill_compressor_ratio4(tensors):
 
 @pl.jit
 def prefill_compressor_ratio4_test(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     compress_state: pl.InOut[
         pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -485,26 +494,31 @@ def prefill_compressor_ratio4_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     cmp_kv: pl.InOut[pl.Tensor[[PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
+    x.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    cmp_slot_mapping.bind_dynamic(0, T_DYN)
+    state_slot_mapping.bind_dynamic(0, T_DYN)
     return prefill_compressor_ratio4(
         x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        cmp_kv, position_ids, cmp_slot_mapping, state_slot_mapping,
     )
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
-        raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")
+    if num_tokens <= 0 or num_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
+    if start_pos < 0 or start_pos + num_tokens > MAX_SEQ_LEN:
+        raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - num_tokens}, got {start_pos}")
 
     def init_compress_state_block_table():
         table = torch.full((CSA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
@@ -519,7 +533,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         intra = abs_pos % CSA_STATE_BLOCK_SIZE
         return int(table[block].item()) * CSA_STATE_BLOCK_SIZE + intra
     def init_x():
-        return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
+        return ((torch.rand(num_tokens, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_compress_state():
         state = torch.zeros(CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         flat = state.view(-1, COMPRESS_STATE_DIM)
@@ -546,10 +560,10 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_cmp_kv():
         return torch.zeros(PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
     def init_position_ids():
-        return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
+        return torch.arange(start_pos, start_pos + num_tokens, dtype=torch.int32)
     def init_cmp_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        mapping = torch.full((num_tokens,), -1, dtype=torch.int64)
+        for t in range(num_tokens):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = (pos + 1) // COMPRESS_RATIO - 1
@@ -558,13 +572,13 @@ def build_tensor_specs(start_pos: int = START_POS):
                 mapping[t] = dst_row
         return mapping
     def init_state_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        mapping = torch.full((num_tokens,), -1, dtype=torch.int64)
+        for t in range(num_tokens):
             mapping[t] = state_row(start_pos + t)
         return mapping
 
     return [
-        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [num_tokens, D], torch.bfloat16, init_value=init_x),
         TensorSpec("compress_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
@@ -574,10 +588,9 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("cmp_kv", [PREFILL_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
-        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
-        ScalarSpec("num_tokens", torch.int32, T),
-        TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
-        TensorSpec("state_slot_mapping", [T], torch.int64, init_value=init_state_slot_mapping),
+        TensorSpec("position_ids", [num_tokens], torch.int32, init_value=init_position_ids),
+        TensorSpec("cmp_slot_mapping", [num_tokens], torch.int64, init_value=init_cmp_slot_mapping),
+        TensorSpec("state_slot_mapping", [num_tokens], torch.int64, init_value=init_state_slot_mapping),
     ]
 
 
@@ -597,13 +610,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense cmp_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T, help="Physical dynamic token dimension.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_compressor_ratio4_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_compressor_ratio4,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),

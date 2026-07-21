@@ -60,6 +60,7 @@ from moe import (
     moe,
 )
 from config import FLASH as MODEL_CONFIG
+from prefill_dynamic import PREFILL_TOKENS_DYN
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,
@@ -135,8 +136,6 @@ IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
 # Dynamic (batch-dependent) kernel-signature dims. Kept local to this file so
 # config.py and the fixed-T child kernels stay untouched (issue #591 §1).
 USER_BATCH_DYN = pl.dynamic("DEEPSEEK_PREFILL_USER_BATCH_DYN")
-PREFILL_TOKENS_DYN = pl.dynamic("DEEPSEEK_PREFILL_TOKENS_DYN")
-
 PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_CACHE_BLOCKS_DYN")
 PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_CACHE_BLOCKS_DYN")
 PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_CACHE_BLOCKS_DYN")
@@ -319,28 +318,25 @@ def prefill_layer_core(
             # is the exclusive prefix sum of tok_blocks over requests.
             moe_epoch = pl.cast(tile_ord_base + tile_id + 1, pl.INT32)
 
-            # Tile-local fixed-[T] inputs gathered from the packed buffers. The
-            # children only read the leading ``valid_tok`` rows, so the padded
-            # tail (when valid_tok < T) is ignored. No explicit per-tile pl.scope:
+            # Gather Attention inputs at their physical tail shape. MoE remains
+            # on its fixed-capacity compatibility contract below. No explicit
+            # per-tile pl.scope:
             # rely on auto_scope + pl.range's sequential semantics so the
             # global cache/state RAW dependency is carried across tiles
             # (tile N's writeback ordered before tile N+1's gather).
-            # Keep all child inputs at their fixed [T] capacity. In particular,
-            # x_hc / position_ids feed T_DYN children whose sibling tensors are
-            # full-[T], so narrowing them would bind T_DYN to two extents.
-            # num_tokens gates every padded tail row in the child kernels.
-            x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0])
-            ori_slot_tile = pl.slice(ori_slot_mapping, [TOK_TILE], [tile_base])
-            position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base])
-            hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [TOK_TILE], [tile_base])
-            hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [TOK_TILE], [tile_base])
-            csa_cmp_slot_tile = pl.slice(csa_cmp_slot_mapping, [TOK_TILE], [tile_base])
-            csa_idx_slot_tile = pl.slice(csa_idx_slot_mapping, [TOK_TILE], [tile_base])
-            csa_state_slot_tile = pl.slice(csa_state_slot_mapping, [TOK_TILE], [tile_base])
-            csa_inner_state_slot_tile = pl.slice(csa_inner_state_slot_mapping, [TOK_TILE], [tile_base])
+            x_hc_tile = pl.slice(x_hc, [valid_tok, HC_MULT, D], [tile_base, 0, 0])
+            ori_slot_tile = pl.slice(ori_slot_mapping, [valid_tok], [tile_base])
+            position_ids_tile = pl.slice(position_ids, [valid_tok], [tile_base])
+            hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [valid_tok], [tile_base])
+            hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [valid_tok], [tile_base])
+            csa_cmp_slot_tile = pl.slice(csa_cmp_slot_mapping, [valid_tok], [tile_base])
+            csa_idx_slot_tile = pl.slice(csa_idx_slot_mapping, [valid_tok], [tile_base])
+            csa_state_slot_tile = pl.slice(csa_state_slot_mapping, [valid_tok], [tile_base])
+            csa_inner_state_slot_tile = pl.slice(csa_inner_state_slot_mapping, [valid_tok], [tile_base])
             input_ids_tile = pl.slice(input_ids, [TOK_TILE], [tile_base])
 
-            x_attn_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
+            x_attn_storage = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
+            x_attn_valid = pl.slice(x_attn_storage, [valid_tok, HC_MULT, D], [0, 0, 0])
             if layer_id < 2:
                 prefill_attention_swa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -349,7 +345,7 @@ def prefill_layer_core(
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
                     position_ids_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
             elif layer_id % 2 == 1:
                 prefill_attention_hca(
@@ -362,7 +358,7 @@ def prefill_layer_core(
                     cmp_kv_req, cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
             else:
                 prefill_attention_csa(
@@ -380,12 +376,12 @@ def prefill_layer_core(
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
                     csa_state_slot_tile, csa_inner_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
 
             x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
             moe(
-                x_attn_tile,
+                x_attn_storage,
                 hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -777,16 +773,16 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
 
     for _r, _tid, ctx, valid, base in _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
         m = _tile_token_meta(kind, ctx, valid, torch)
-        pos[base:base + T] = m["position_ids"][:T]
-        ori_slot[base:base + T] = m["ori_slot_mapping"][:T]
+        pos[base:base + valid] = m["position_ids"][:valid]
+        ori_slot[base:base + valid] = m["ori_slot_mapping"][:valid]
         if kind == "hca":
-            hca_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            hca_state[base:base + T] = m["state_slot_mapping"][:T]
+            hca_cmp[base:base + valid] = m["cmp_slot_mapping"][:valid]
+            hca_state[base:base + valid] = m["state_slot_mapping"][:valid]
         elif kind == "csa":
-            csa_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            csa_idx[base:base + T] = m["idx_slot_mapping"][:T]
-            csa_state[base:base + T] = m["state_slot_mapping"][:T]
-            csa_inner[base:base + T] = m["inner_state_slot_mapping"][:T]
+            csa_cmp[base:base + valid] = m["cmp_slot_mapping"][:valid]
+            csa_idx[base:base + valid] = m["idx_slot_mapping"][:valid]
+            csa_state[base:base + valid] = m["state_slot_mapping"][:valid]
+            csa_inner[base:base + valid] = m["inner_state_slot_mapping"][:valid]
 
     return {
         "position_ids": pos,

@@ -20,6 +20,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+T_DYN = pl.dynamic("PREFILL_INDEXER_COMPRESSOR_T_DYN")
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -63,7 +64,7 @@ PACKED_RMS_TILE = 16
 
 @pl.jit.inline
 def prefill_indexer_compressor(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x_in: pl.Tensor[[T_DYN, D], pl.BF16],
     compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -77,11 +78,17 @@ def prefill_indexer_compressor(
     idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids_in: pl.Tensor[[T_DYN], pl.INT32],
+    idx_slot_mapping_in: pl.Tensor[[T_DYN], pl.INT64],
+    inner_state_slot_mapping_in: pl.Tensor[[T_DYN], pl.INT64],
 ):
+    num_tokens = pl.tensor.dim(x_in, 0)
+    x = pl.create_tensor([T, D], dtype=pl.BF16)
+    for pad_t in pl.spmd(T, name_hint="prefill_idx_compressor_dynamic_pad_x"):
+        x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        if pad_t < num_tokens:
+            x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+        pl.store(x_row, [pad_t, 0], x)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(
@@ -126,9 +133,9 @@ def prefill_indexer_compressor(
         map_seen = pl.cast(0, pl.INDEX)
         for map_w in pl.range(T):
             if map_w < num_tokens:
-                map_slot_raw = pl.read(idx_slot_mapping, [map_w])
+                map_slot_raw = pl.read(idx_slot_mapping_in, [map_w])
                 if map_slot_raw >= 0:
-                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids, [map_w]))
+                    pl.write(write_pos_tile, [0, map_seen], pl.read(position_ids_in, [map_w]))
                     pl.write(write_dst_tile, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
         write_pos_map[0:1, 0:MAX_CMP_WRITES] = write_pos_tile
@@ -206,7 +213,7 @@ def prefill_indexer_compressor(
 
             for pool_t in pl.range(T):
                 if pool_t < num_tokens:
-                    pool_pos = pl.read(position_ids, [pool_t])
+                    pool_pos = pl.read(position_ids_in, [pool_t])
                     if pool_pos <= write_pos:
                         if pool_pos >= prev_start:
                             pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
@@ -375,10 +382,10 @@ def prefill_indexer_compressor(
         update_t = update_idx // PACKED_PROJ_BLOCKS
         update_o0 = update_ob * OUT_TILE
         if update_t < num_tokens:
-            state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
+            state_row_raw = pl.read(inner_state_slot_mapping_in, [update_t])
             if state_row_raw >= 0:
                 state_row = pl.cast(state_row_raw, pl.INDEX)
-                update_pos = pl.read(position_ids, [update_t])
+                update_pos = pl.read(position_ids_in, [update_t])
                 ape_slot = pl.cast(update_pos % COMPRESS_RATIO, pl.INDEX)
                 ape_row = ape[ape_slot : ape_slot + 1, update_o0 : update_o0 + OUT_TILE]
                 pool_dep = pl.mul(pooled_kv[0:1, 0:OUT_TILE], 0.0)
@@ -411,7 +418,7 @@ def prefill_indexer_compressor(
 
 @pl.jit
 def prefill_indexer_compressor_test(
-    x: pl.Tensor[[T, D], pl.BF16],
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
     compress_state: pl.InOut[
         pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
@@ -427,14 +434,18 @@ def prefill_indexer_compressor_test(
     idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T_DYN], pl.INT32],
+    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
 ):
+    x.bind_dynamic(0, T_DYN)
+    position_ids.bind_dynamic(0, T_DYN)
+    idx_slot_mapping.bind_dynamic(0, T_DYN)
+    inner_state_slot_mapping.bind_dynamic(0, T_DYN)
+
     prefill_indexer_compressor(
         x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
+        hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids,
         idx_slot_mapping, inner_state_slot_mapping,
     )
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
@@ -444,8 +455,8 @@ def prefill_indexer_compressor_test(
             kv_i = kv_base + kv_dt
             src_row_raw = pl.cast(-1, pl.INT64)
             write_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
+            num_tokens = pl.tensor.dim(x, 0)
+            for scan_w in pl.range(num_tokens):
                     scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
                     if scan_slot_raw >= 0:
                         if write_seen == kv_i:
@@ -465,6 +476,8 @@ def prefill_indexer_compressor_test(
 
 def golden_prefill_indexer_compressor(tensors):
     import torch
+
+    num_tokens = tensors["x"].shape[0]
 
     kv_proj = tensors["x"].float() @ tensors["wkv"].float().t()   # wkv stored [OUT_DIM, D] for b_trans
     score_proj = tensors["x"].float() @ tensors["wgate"].float().t()
@@ -496,7 +509,7 @@ def golden_prefill_indexer_compressor(tensors):
         return phys_block * INNER_STATE_BLOCK_SIZE + intra
 
     write_i = 0
-    for token_id in range(int(tensors["num_tokens"])):
+    for token_id in range(num_tokens):
         dst_row = int(tensors["idx_slot_mapping"][token_id].item())
         if dst_row < 0:
             continue
@@ -520,7 +533,7 @@ def golden_prefill_indexer_compressor(tensors):
                 pool_kv[COMPRESS_RATIO + s] = kv_state_flat[cur_row, HEAD_DIM:OUT_DIM]
                 pool_score[COMPRESS_RATIO + s] = score_state_flat[cur_row, HEAD_DIM:OUT_DIM]
 
-        for t in range(int(tensors["num_tokens"])):
+        for t in range(num_tokens):
             pos = int(position_ids[t].item())
             if pos < prev_start or pos > write_pos:
                 continue
@@ -576,7 +589,7 @@ def golden_prefill_indexer_compressor(tensors):
             kv[write_i] = row_i8
         write_i += 1
 
-    for t in range(int(tensors["num_tokens"])):
+    for t in range(num_tokens):
         pos = int(tensors["position_ids"][t].item())
         dst_row = int(tensors["inner_state_slot_mapping"][t].item())
         if dst_row < 0:
@@ -589,17 +602,19 @@ def golden_prefill_indexer_compressor(tensors):
     tensors["idx_kv_scale"][:] = idx_kv_scale
 
 
-def build_tensor_specs(start_pos: int = START_POS):
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
     from rope_tables import build_deepseek_v4_rope_tables
 
     shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
-    if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
-        raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")
+    if num_tokens <= 0 or num_tokens > T:
+        raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
+    if start_pos < 0 or start_pos + num_tokens > MAX_SEQ_LEN:
+        raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - num_tokens}, got {start_pos}")
 
-    write_count = sum(1 for t in range(T) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
+    write_count = sum(1 for t in range(num_tokens) if (start_pos + t + 1) % COMPRESS_RATIO == 0)
     if write_count > MAX_CMP_WRITES:
         raise ValueError(f"fixture generated {write_count} compressed writes, cap is {MAX_CMP_WRITES}")
 
@@ -616,7 +631,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         intra = abs_pos % INNER_STATE_BLOCK_SIZE
         return int(table[block].item()) * INNER_STATE_BLOCK_SIZE + intra
     def init_x():
-        return ((torch.rand(T, D) - 0.5) * 0.1).to(torch.bfloat16)
+        return ((torch.rand(num_tokens, D) - 0.5) * 0.1).to(torch.bfloat16)
     def init_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
         flat = state.view(-1, COMPRESS_STATE_DIM)
@@ -666,10 +681,10 @@ def build_tensor_specs(start_pos: int = START_POS):
             return -1
         return phys_block * BLOCK_SIZE + intra
     def init_position_ids():
-        return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
+        return torch.arange(start_pos, start_pos + num_tokens, dtype=torch.int32)
     def init_idx_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        mapping = torch.full((num_tokens,), -1, dtype=torch.int64)
+        for t in range(num_tokens):
             pos = start_pos + t
             if (pos + 1) % COMPRESS_RATIO == 0:
                 dst_row = idx_row((pos + 1) // COMPRESS_RATIO - 1)
@@ -678,13 +693,13 @@ def build_tensor_specs(start_pos: int = START_POS):
                 mapping[t] = dst_row
         return mapping
     def init_inner_state_slot_mapping():
-        mapping = torch.full((T,), -1, dtype=torch.int64)
-        for t in range(T):
+        mapping = torch.full((num_tokens,), -1, dtype=torch.int64)
+        for t in range(num_tokens):
             mapping[t] = state_row(start_pos + t)
         return mapping
 
     return [
-        TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x", [num_tokens, D], torch.bfloat16, init_value=init_x),
         TensorSpec("kv", [MAX_CMP_WRITES, HEAD_DIM], torch.int8, is_output=True),
         TensorSpec("compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
@@ -698,10 +713,9 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
-        TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
-        ScalarSpec("num_tokens", torch.int32, T),
-        TensorSpec("idx_slot_mapping", [T], torch.int64, init_value=init_idx_slot_mapping),
-        TensorSpec("inner_state_slot_mapping", [T], torch.int64, init_value=init_inner_state_slot_mapping),
+        TensorSpec("position_ids", [num_tokens], torch.int32, init_value=init_position_ids),
+        TensorSpec("idx_slot_mapping", [num_tokens], torch.int64, init_value=init_idx_slot_mapping),
+        TensorSpec("inner_state_slot_mapping", [num_tokens], torch.int64, init_value=init_inner_state_slot_mapping),
     ]
 
 
@@ -721,13 +735,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
+    parser.add_argument("--num-tokens", type=int, default=T, help="Physical dynamic token dimension.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
     result = run_jit(
         fn=prefill_indexer_compressor_test,
-        specs=build_tensor_specs(args.start_pos),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_indexer_compressor,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
