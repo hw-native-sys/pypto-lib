@@ -119,7 +119,12 @@ CAST_K_SPMD = 2048  # cast K per spmd block: decode fans the BF16->FP32 cast ove
 # partials, filling idle cubes at small T (decode: 1 token-tile -> LINEAR_OK
 # cube tasks) and shortening each task's matmul_acc chain. Higher OK fills more
 # decode cubes; prefill (8 token-tiles) packs OK*8 tasks into waves of ~24.
-LINEAR_OK = 4
+# A/B 2026-07: raised 4 -> 8 to test whether a smaller/faster linear scope
+# advances the linear -> comb_sinkhorn handoff (comb_sinkhorn reads mixes_raw).
+# Each task's K halves (4096 -> 2048); K_CHUNK (256) and L0B pressure unchanged.
+# Counter-pressure: 2x atomic-add producers on the same mixes_raw[0:16,0:32]
+# tile at the handoff. Matches hc_head's LINEAR_OK = 8.
+LINEAR_OK = 8
 LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
