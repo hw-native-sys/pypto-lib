@@ -870,9 +870,6 @@ def prefill_layer(
                             [PREFILL_FA_QUERY_GROUP * NUM_HEADS, HEAD_DIM],
                             dtype=pl.BF16,
                         )
-                        q_zero = pl.full([NUM_HEADS, HEAD_DIM], dtype=pl.BF16, value=0.0)
-                        for qg in pl.range(PREFILL_FA_QUERY_GROUP):
-                            q_tnd_group_flat = pl.assemble(q_tnd_group_flat, q_zero, [qg * NUM_HEADS, 0])
                         for rope_core in pl.spmd(ROPE_SPMD_BLOCKS, name_hint="rope_kv_cache"):
                             for rel_ti in pl.range(rope_core, finalize_tok, ROPE_SPMD_BLOCKS):
                                 ti = final_ti0 + rel_ti
