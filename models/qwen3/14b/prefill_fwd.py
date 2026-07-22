@@ -98,13 +98,14 @@ KV_OUT_CHUNK = 256
 TOK_TILE = 64
 SEQ_TILE = T.seq_tile
 BLOCK_SIZE = T.block_size
+MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
 EMBED_HIDDEN_CHUNK = K_CHUNK
 ROPE_SPMD_BLOCKS = 32
 ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
 FINALIZE_SPMD_BLOCKS = 48
 FINALIZE_TOK_GROUP = TOK_TILE
-PREFILL_FA_QUERY_GROUP = 1
+PREFILL_FA_QUERY_GROUP = 16
 Q_HEAD_BATCH_PAD = 16
 ATTN_GI_SCORE_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_PAD
 ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
@@ -862,10 +863,14 @@ def prefill_layer(
 
                 # ── Scope 2: Q/K norm + RoPE + KV cache update + causal attention ──
                 attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
-                q_tnd_flat = pl.create_tensor([TOK_TILE * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
                 for final_ti0 in pl.range(0, valid_tok, PREFILL_FA_QUERY_GROUP):
                     with pl.scope():
                         finalize_tok = pl.min(PREFILL_FA_QUERY_GROUP, valid_tok - final_ti0)
+                        q_tnd_group_flat = pl.full(
+                            [PREFILL_FA_QUERY_GROUP * NUM_HEADS, HEAD_DIM],
+                            dtype=pl.BF16,
+                            value=0.0,
+                        )
                         for rope_core in pl.spmd(ROPE_SPMD_BLOCKS, name_hint="rope_kv_cache"):
                             for rel_ti in pl.range(rope_core, finalize_tok, ROPE_SPMD_BLOCKS):
                                 ti = final_ti0 + rel_ti
@@ -969,37 +974,52 @@ def prefill_layer(
                                             ),
                                             [qi, 0],
                                         )
-                                    q_row = ti * NUM_HEADS + q_base
-                                    q_tnd_flat = pl.assemble(
-                                        q_tnd_flat,
+                                    q_row = rel_ti * NUM_HEADS + q_base
+                                    q_tnd_group_flat = pl.assemble(
+                                        q_tnd_group_flat,
                                         pl.cast(pl.concat(q_rot_lo, q_rot_hi), target_type=pl.BF16),
                                         [q_row, 0],
                                     )
 
                         max_blocks_i32 = pl.cast(max_blocks_per_seq, pl.INT32)
-                        block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + 1
-                        q_lens = pl.create_tensor([1], dtype=pl.INT32)
-                        kv_lens = pl.create_tensor([1], dtype=pl.INT32)
-                        pl.tensor.write(q_lens, [0], pl.cast(1, target_type=pl.INT32))
-                        pl.tensor.write(kv_lens, [0], pl.cast(block_ctx_len, pl.INT32))
+                        group_num_blocks_i32 = pl.cast(PREFILL_FA_QUERY_GROUP * max_blocks_per_seq, pl.INT32)
+                        q_lens = pl.create_tensor([PREFILL_FA_QUERY_GROUP], dtype=pl.INT32)
+                        kv_lens = pl.create_tensor([PREFILL_FA_QUERY_GROUP], dtype=pl.INT32)
+                        block_table_group = pl.create_tensor(
+                            [PREFILL_FA_QUERY_GROUP * MAX_BLOCKS_PER_SEQ],
+                            dtype=pl.INT32,
+                        )
+                        for qg in pl.range(PREFILL_FA_QUERY_GROUP):
+                            pl.tensor.write(q_lens, [qg], pl.cast(1, target_type=pl.INT32))
+                            group_ti = pl.min(qg, finalize_tok - 1)
+                            block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + group_ti + 1
+                            pl.tensor.write(kv_lens, [qg], pl.cast(block_ctx_len, pl.INT32))
+                            for sb in pl.range(max_blocks_per_seq):
+                                src_block_idx = b * max_blocks_per_seq + sb
+                                dst_block_idx = qg * max_blocks_per_seq + sb
+                                pl.tensor.write(
+                                    block_table_group,
+                                    [dst_block_idx],
+                                    pl.tensor.read(block_table, [src_block_idx]),
+                                )
                         pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
                         pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
-                        layer_blocks_i32 = pl.cast(layer_cache_rows // BLOCK_SIZE, pl.INT32)
                         build_paged_prefill_attention_metadata(
                             q_lens,
                             kv_lens,
                             max_blocks_i32,
-                            layer_blocks_i32,
+                            group_num_blocks_i32,
                             pa_metadata,
                         )
-                        q_tnd_one_flat = pl.slice(
-                            q_tnd_flat,
-                            [NUM_HEADS, HEAD_DIM],
-                            [final_ti0 * NUM_HEADS, 0],
+                        q_tnd = pl.reshape(
+                            q_tnd_group_flat,
+                            [PREFILL_FA_QUERY_GROUP, NUM_HEADS, HEAD_DIM],
                         )
-                        q_tnd = pl.reshape(q_tnd_one_flat, [1, NUM_HEADS, HEAD_DIM])
-                        attn_tnd = pl.create_tensor([1, NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
-                        block_table_offset = pl.cast(b * max_blocks_per_seq, pl.INDEX)
+                        attn_tnd = pl.create_tensor(
+                            [PREFILL_FA_QUERY_GROUP, NUM_HEADS, HEAD_DIM],
+                            dtype=pl.BF16,
+                        )
+                        block_table_offset = pl.cast(0, pl.INDEX)
                         cache_row_offset = pl.cast(layer_cache_base * NUM_KV_HEADS, pl.INDEX)
                         with pl.spmd(
                             PA_DEFAULT_BLOCK_DIM,
@@ -1010,15 +1030,17 @@ def prefill_layer(
                                 q_tnd,
                                 k_cache,
                                 v_cache,
-                                block_table,
+                                block_table_group,
                                 attn_tnd,
                                 pa_workspace,
                                 pa_metadata,
                                 cache_row_offset,
                                 block_table_offset,
                             )
-                        attn_row = pl.reshape(attn_tnd, [1, HIDDEN])
-                        attn_tile = pl.assemble(attn_tile, attn_row, [final_ti0, 0])
+                        for rel_ti in pl.range(finalize_tok):
+                            attn_row_tnd = pl.slice(attn_tnd, [1, NUM_HEADS, HEAD_DIM], [rel_ti, 0, 0])
+                            attn_row = pl.reshape(attn_row_tnd, [1, HIDDEN])
+                            attn_tile = pl.assemble(attn_tile, attn_row, [final_ti0 + rel_ti, 0])
                 # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                 # Stage 3.1: Output projection + first residual.
                 out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
