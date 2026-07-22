@@ -199,19 +199,14 @@ jobs:
           set +e
           : > results.tsv
           failed=()
-          # Perf number per case is always a multi-round mean. L2 averages each
-          # round's Effective window. L3 (multi-card) first selects each round's
-          # fastest valid rank via `fast_effective_us`, then averages those values.
-          # L3 is detected by the `l3=1` / `l3_resident=1` marker its benchmark
-          # emits. Missing/zero timing on any rank drops only that round from the
-          # aggregate; a case becomes `-` only when no complete round remains.
+          # Perf number per case is the `effective_us (...) mean=` benchmark line:
+          # the multi-round mean of the Effective window. L2 is each round's window;
+          # L3 (multi-card) is the per-round max across ranks (slowest rank bounds
+          # the round), or the pooled per-dispatch mean when per-round segmentation
+          # falls back to flattened. A case becomes `-` only when no timing line was
+          # emitted (e.g. the run failed or the runtime lacks SIMPLER_PROFILING).
           extract_perf() {
-            local out; out=$(cat)
-            if printf '%s' "$out" | grep -qE 'l3=1|l3_resident=1'; then
-              printf '%s' "$out" | grep -oP 'fast_effective_us .*mean=\K[0-9.]+' | tail -1
-            else
-              printf '%s' "$out" | grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
-            fi
+            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
           }
           run_case() {
             local file="$1" label="$2"; shift 2
@@ -303,7 +298,7 @@ jobs:
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
 
           results = {p: {} for p in PLATFORMS}
-          perf = {}  # case -> a2a3 effective mean (us): L2 window, L3 per-round fast rank
+          perf = {}  # case -> a2a3 effective mean (us): L2 window, L3 per-round max across ranks
           root = pathlib.Path("results")
           for p in PLATFORMS:
               tsv = root / f"results-{p}" / "results.tsv"

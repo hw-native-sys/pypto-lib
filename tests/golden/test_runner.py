@@ -26,9 +26,7 @@ from golden.runner import (
     RunResult,
     _backend_for_platform,
     _format_stale_paths,
-    _l3_fast_effective_per_round,
     _maybe_reload_l3,
-    _report_l3_fast_effective,
     _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
@@ -1241,81 +1239,6 @@ class TestShareInPlace:
         assert tensors["b"].is_shared() and tensors["b"].is_contiguous()
         # An already-shared+contiguous tensor is left as the same object.
         assert tensors["a"] is a
-
-
-class TestL3BenchmarkAggregation:
-    """L3 Daily-CI timing averages each round's fastest valid rank."""
-
-    class _Stats:
-        def __init__(self, rank_eff, rounds_dispatches=None):
-            self._rank_eff = rank_eff
-            n_rounds = len(next(iter(rank_eff.values()))) if rank_eff else 0
-            if rounds_dispatches is None:
-                self.rounds_dispatches = [
-                    {pid: [] for pid in rank_eff} for _ in range(n_rounds)
-                ]
-            else:
-                self.rounds_dispatches = rounds_dispatches
-
-        def per_rank(self, metric):
-            assert metric == "effective"
-            return self._rank_eff
-
-    def test_fast_effective_takes_per_round_min_even_when_fast_rank_switches(self):
-        stats = self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]})
-        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [10.0, 5.0]
-
-    def test_fast_effective_drops_incomplete_round_only(self):
-        stats = self._Stats({100: [10.0, 30.0], 101: [0.0, 5.0]})
-        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [5.0]
-
-    @pytest.mark.parametrize(
-        "rank_eff",
-        [
-            {100: [10.0], 101: [0.0]},
-            {100: [10.0], 101: []},
-            {},
-        ],
-    )
-    def test_fast_effective_returns_empty_without_complete_round(self, rank_eff):
-        assert _l3_fast_effective_per_round(self._Stats(rank_eff), expected_rank_count=2) == []
-
-    def test_fast_effective_rejects_rank_missing_from_every_round(self):
-        stats = self._Stats({100: [10.0]})
-        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == []
-
-    def test_fast_effective_drops_round_missing_rank_from_raw_data(self):
-        stats = self._Stats(
-            {100: [10.0, 30.0], 101: [20.0, 5.0]},
-            rounds_dispatches=[{100: []}, {100: [], 101: []}],
-        )
-        assert _l3_fast_effective_per_round(stats, expected_rank_count=2) == [5.0]
-
-    def test_fast_effective_report_has_dedicated_ci_token(self, capsys):
-        _report_l3_fast_effective(
-            self._Stats({100: [10.0, 30.0], 101: [20.0, 5.0]}),
-            expected_rank_count=2,
-        )
-        assert (
-            "fast_effective_us (2 rounds) min=5.0 median=7.5 mean=7.5 max=10.0 valid_rounds=2/2"
-            in capsys.readouterr().out
-        )
-
-    def test_fast_effective_report_counts_dropped_rounds(self, capsys):
-        _report_l3_fast_effective(
-            self._Stats({100: [10.0, 30.0], 101: [0.0, 5.0]}),
-            expected_rank_count=2,
-        )
-        out = capsys.readouterr().out
-        assert "fast_effective_us (1 round)" in out
-        assert "valid_rounds=1/2" in out
-
-    def test_fast_effective_report_marks_missing_timing_unavailable(self, capsys):
-        _report_l3_fast_effective(
-            self._Stats({100: [10.0], 101: [0.0]}),
-            expected_rank_count=2,
-        )
-        assert "fast_effective_us unavailable" in capsys.readouterr().out
 
 
 class TestResidentPath:
