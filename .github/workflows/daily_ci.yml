@@ -91,7 +91,8 @@ jobs:
           # Run every model file once with no extra args. Files marked
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
-          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*draft*' \
+              ! -path 'models/deepseek/v4-pro/*' | sort); do
             # Shared modules (config.py, helper libs) have no __main__ guard —
             # they are imported by kernels, not run. Running them import-exits 0
             # and shows a misleading pass, so drop them from the report entirely
@@ -238,7 +239,8 @@ jobs:
             echo "::endgroup::"
           }
           # Run every model file once at its default world size (ep2 / 2-card).
-          for f in $(find models -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models -name '*.py' ! -name '*draft*' \
+              ! -path 'models/deepseek/v4-pro/*' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper libs):
             # they are imported, not run, so they don't belong in the report.
             if ! grep -q '__main__' "$f"; then
@@ -252,7 +254,7 @@ jobs:
           #   task-submit --device "$DEVICE_ID" --device-num 4 --timeout 3600 --max-time 900 \
           #     --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && \
           #       PYTHONPATH=$GITHUB_WORKSPACE/checkout \
-          #       python models/deepseek/v4/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
+          #       python models/deepseek/v4-flash/moe.py -p a2a3 --ep 4 -d \$TASK_DEVICE"
           if [ ${#failed[@]} -ne 0 ]; then
             echo "Failed cases (${#failed[@]}):"
             printf '  - %s\n' "${failed[@]}"
@@ -276,6 +278,142 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: results-a2a3
+          path: checkout/results.tsv
+
+  model-tests-a5:
+    # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
+    # DeepSeek V4-Pro variant (models/deepseek/v4-pro/). Mirrors
+    # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
+    # sweeps ONLY v4-pro: v4-pro is excluded from the a2a3/a2a3sim/a5sim
+    # sweeps above (it is the A5-targeted variant, so running it on 910B
+    # would be duplicate cost against the wrong backend). It goes through
+    # the same setup-ci-job as the other device jobs (needs-device:true);
+    # the A5 host's own runner .env supplies its CANN_ROOT / cache roots, so
+    # no A5-specific path is named here. NOTE: until the npu-a5 runner is
+    # registered this job stays queued; the summary job does not depend on
+    # it, so the existing daily report keeps producing and the A5 table
+    # fills in once it runs.
+    runs-on: [self-hosted, linux, arm64, npu-a5]
+    # v4-pro is roughly half the a2a3 sweep (no qwen3 / v3_2 / v4-flash), so
+    # 120 min is generous; keep parity with the other device job's ceiling.
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves
+        # sibling subdir checkouts on this persistent runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: a5-daily
+          pip-cache-name: pip-a5
+
+      - name: Run V4-Pro tests (a5, via task-submit)
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger — see the sim job for the full note.
+          PYPTO_RUNTIME_LOG: error
+          PYPTO_BENCH: '1'
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+        run: |
+          source activate.sh
+          set +e
+          : > results.tsv
+          failed=()
+          # Perf number per case is the `effective_us (...) mean=` benchmark line
+          # (same rule as the a2a3 job): the multi-round mean of the Effective
+          # window. L2 is each round's window; L3 (multi-card) is the per-round
+          # max across ranks, or the pooled per-dispatch mean when per-round
+          # segmentation falls back to flattened.
+          extract_perf() {
+            grep -oP 'effective_us .*mean=\K[0-9.]+' | tail -1
+          }
+          run_case() {
+            local file="$1" label="$2"; shift 2
+            echo "::group::${label}"
+            # Files needing multiple NPUs declare `# ci: devices=N` (N>1) near
+            # the top; borrow that many cards with --device-num N (defaults to
+            # single-card). $TASK_DEVICE is the lent set (single id, or
+            # comma-separated for N>1) and is passed straight to -d.
+            local ndev devnum_flag out rc perf
+            ndev=$(grep -oP '#\s*ci:\s*devices=\K[0-9]+' "$file" | head -1)
+            ndev=${ndev:-1}
+            devnum_flag=""
+            [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
+            out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
+            rc=$?
+            printf '%s\n' "$out"
+            perf=$(printf '%s\n' "$out" | extract_perf)
+            perf=${perf:--}
+            if [ "$rc" -ne 0 ]; then
+              failed+=("$label")
+              echo "::error file=${file}::FAIL (${label})"
+              printf '%s\tfail\t%s\n' "$label" "$perf" >> results.tsv
+            else
+              printf '%s\tpass\t%s\n' "$label" "$perf" >> results.tsv
+            fi
+            echo "::endgroup::"
+          }
+          # Sweep ONLY the V4-Pro variant — its dedicated A5 daily set.
+          for f in $(find models/deepseek/v4-pro -name '*.py' ! -name '*draft*' | sort); do
+            # Skip shared modules with no __main__ guard (config.py, helper
+            # libs): they are imported, not run.
+            if ! grep -q '__main__' "$f"; then
+              continue
+            fi
+            run_case "$f" "$f"
+          done
+          if [ ${#failed[@]} -ne 0 ]; then
+            echo "Failed cases (${#failed[@]}):"
+            printf '  - %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All V4-Pro A5 tests passed."
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-a5
           path: checkout/results.tsv
 
   summary:
@@ -322,4 +460,29 @@ jobs:
           for case in all_cases:
               cells = [ICON.get(results[p].get(case, "missing"), "?") for p in PLATFORMS]
               print(f"| `{case}` | {cells[0]} | {perf.get(case, '-')} | {cells[1]} | {cells[2]} |")
+
+          # Dedicated DeepSeek V4-Pro (A5) table. Best-effort: the summary job
+          # does not depend on model-tests-a5, so this artifact is only present
+          # when the npu-a5 runner actually ran (and finished) in this run.
+          a5_tsv = root / "results-a5" / "results.tsv"
+          print()
+          print("## DeepSeek V4-Pro (A5) Results")
+          print()
+          if not a5_tsv.exists():
+              print("_No `results-a5` artifact in this run — the `npu-a5` runner did "
+                    "not produce results (not registered yet, queued, or still running). "
+                    "See the `model-tests-a5` job._")
+          else:
+              print("| Case | a5 | a5 effective (us) |")
+              print("| ---- | -- | ----------------- |")
+              a5_rows = []
+              for line in a5_tsv.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  parts = line.split("\t")
+                  case, status = parts[0], parts[1]
+                  p = parts[2] if len(parts) >= 3 and parts[2] not in ("", "-") else "-"
+                  a5_rows.append((case, status, p))
+              for case, status, p in sorted(a5_rows):
+                  print(f"| `{case}` | {ICON.get(status, '?')} | {p} |")
           EOF

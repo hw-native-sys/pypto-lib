@@ -71,7 +71,7 @@ the large `PTO2_RING_*` sizes for every run and preserves them into each
 task-submit child; the `setup-npu-device-job` action exposes an `unset-ring`
 input to drop them if an HCCL path ever needs it. Running a multi-card
 kernel locally needs a real `set_env.sh`-sourced shell, e.g.
-`python models/deepseek/v4/moe.py -p a2a3 --ep 2 -d 0,1`.
+`python models/deepseek/v4-flash/moe.py -p a2a3 --ep 2 -d 0,1`.
 
 ## Phases inside `golden.run`
 

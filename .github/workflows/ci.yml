@@ -97,7 +97,7 @@ jobs:
           else
             echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           fi
-          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4/'; then
+          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4-(flash|pro)/'; then
             echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"

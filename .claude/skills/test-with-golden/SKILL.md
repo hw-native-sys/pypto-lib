@@ -42,7 +42,7 @@ that variation, and any fixture/quant change silently invalidates the cached
 If the kernel's `__main__` exposes a `--save-data` flag, use it:
 
 ```bash
-python models/deepseek/v4/decode_attention_swa.py -p a2a3 -d 0 --save-data
+python models/deepseek/v4-flash/decode_attention_swa.py -p a2a3 -d 0 --save-data
 ```
 
 **If the kernel has no `--save-data` flag, add it as part of this workflow.**
@@ -90,7 +90,7 @@ are both skipped (the run logs a `cache hit` for each); validation still runs
 against the cached `out/`:
 
 ```bash
-python models/deepseek/v4/decode_attention_swa.py -p a2a3 -d 0 \
+python models/deepseek/v4-flash/decode_attention_swa.py -p a2a3 -d 0 \
     --golden-data build_output/_jit_<program>_<timestamp>/data
 ```
 

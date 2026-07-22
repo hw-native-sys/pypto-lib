@@ -70,7 +70,7 @@ nothing to replay. When the snapshot exists, reproduce a failure on the
 re-run at that directory:
 
 ```bash
-python models/deepseek/v4/decode_attention_csa.py -p a2a3 -d 0 \
+python models/deepseek/v4-flash/decode_attention_csa.py -p a2a3 -d 0 \
     --golden-data build_output/_jit_attention_csa_test_20260602_020256/data
 ```
 
@@ -96,7 +96,7 @@ a generated kernel or the orchestration — and re-testing in seconds:
    build directory itself, **not** its `data/` subdir):
 
    ```bash
-   python models/deepseek/v4/decode_attention_csa.py -p a2a3 -d 0 \
+   python models/deepseek/v4-flash/decode_attention_csa.py -p a2a3 -d 0 \
        --runtime-dir build_output/_jit_attention_csa_test_20260602_020256
    ```
 
@@ -141,7 +141,7 @@ is on the device. Raise the runtime log verbosity and read the device log:
 
    ```bash
    export ASCEND_PROCESS_LOG_PATH=/device_log
-   python models/deepseek/v4/moe.py -p a2a3 -d 0
+   python models/deepseek/v4-flash/moe.py -p a2a3 -d 0
    ```
 
 3. Read the logs under `/device_log` to find the **last task that

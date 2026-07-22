@@ -12,7 +12,8 @@ models/          End-to-end LLM kernels organized by family
   qwen3/14b/       Qwen3-14B prefill + decode
   qwen3/32b/       Qwen3-32B decode
   deepseek/v3_2/   DeepSeek V3.2-EXP
-  deepseek/v4/     DeepSeek V4
+  deepseek/v4-flash/  DeepSeek V4-Flash
+  deepseek/v4-pro/    DeepSeek V4-Pro (A5)
 golden/          Test harness — compile, run on device, validate against torch
 tools/           Post-build utilities (e.g. kernel-insight export)
 tests/           Lint checks and golden-fn unit tests

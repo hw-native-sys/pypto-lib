@@ -804,16 +804,19 @@ if __name__ == "__main__":
     hc_pre = _bind_hc_pre()
     print(f"hc_pre implementation: {HC_PRE_IMPL}")
 
-    # hc_pre is specialized to Ascend 910B. The "syncall" body sets NUM_CORES=24 == the
-    # physical AIC count and its hard full-occupancy mix-syncall hangs (AICore timeout
-    # 507018) unless the launch fills every physical core; A5 (Ascend950) has a different
-    # core count. The "separate" body has no such barrier but is still 910B-tuned (tile
-    # sizes + device-only atomic-add). Either way, reject A5 rather than hang / mis-run;
-    # supporting it needs a backend-aware participant count + re-tuning/re-validation.
-    if args.platform in ("a5", "a5sim"):
+    # hc_pre "syncall" is specialized to Ascend 910B: it sets NUM_CORES=24 == the physical
+    # AIC count and its hard full-occupancy mix-syncall hangs (AICore timeout 507018) unless
+    # the launch fills every physical core; A5 (Ascend950) has a different AIC count (36), so
+    # the syncall impl is rejected on A5. The "separate" impl has no such barrier -- it uses
+    # data-derived pl.spmd(work_count) + CORE_GROUP + atomic-add (the same structural pattern
+    # as hc_head/hc_post, which already pass on A5), so it is core-count-agnostic and runs on
+    # A5. Its tile sizes are 910B-tuned (perf, not correctness); a5 perf may be suboptimal
+    # until re-swept, but precision is unaffected.
+    if args.platform in ("a5", "a5sim") and HC_PRE_IMPL == "syncall":
         raise SystemExit(
-            f"hc_pre is specialized to Ascend 910B (NUM_CORES={NUM_CORES} == physical AIC count); "
-            f"the {HC_PRE_IMPL!r} impl would hang / mis-run on {args.platform!r}. Run with -p a2a3."
+            f"hc_pre 'syncall' impl is specialized to Ascend 910B (NUM_CORES={NUM_CORES} == physical "
+            f"AIC count); its full-occupancy mix-syncall would hang (AICore timeout 507018) on "
+            f"{args.platform!r}. Re-run with --impl separate on {args.platform!r}, or -p a2a3."
         )
 
     modes_to_run = list(MODES.keys()) if args.mode == "all" else [args.mode]
