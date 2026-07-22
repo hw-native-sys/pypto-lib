@@ -312,17 +312,18 @@ jobs:
         working-directory: checkout
         run: rm -rf build_output
 
-  serving:
+  serving-qwen:
     needs: detect-changes
-    # PR-only: run one shared setup, then the guards selected by model changes.
+    # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
+    # its own job (serving-deepseek) so the two models schedule independently and
+    # the expensive 8-card borrow does not serialize behind the single-card run.
     if: >-
       github.event_name == 'pull_request' &&
-      (needs.detect-changes.outputs.run_qwen_serving_tests == 'true' ||
-       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true')
+      needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
-    # A PR touching both models runs the qwen3 and deepseek task-submits back to
-    # back in this one job, each worst-casing at --timeout 3600 + --max-time 1800.
-    timeout-minutes: 180
+    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
+    # plus setup/build headroom.
+    timeout-minutes: 120
     env:
       PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
@@ -353,15 +354,64 @@ jobs:
           pip-cache-name: pip-serving
 
       - name: Run pypto-serving Qwen3-14B tests
-        if: needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
         uses: ./.github/actions/pypto-serving-tests
         with:
           pypto-lib-checkout-path: checkout
           pypto-serving-checkout-path: serving-checkout
           model-name: qwen3-14b
 
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf serving-checkout/build_output
+
+  serving-deepseek:
+    needs: detect-changes
+    # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
+    # of `serving` so the 8-card borrow schedules independently of the single-card
+    # qwen3 run. Same setup contract as `serving`; gated by its own model guard.
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
+    runs-on: [self-hosted, linux, arm64, npu]
+    # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
+    # plus setup/build headroom.
+    timeout-minutes: 120
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache paths are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: serving
+          # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
+          ccache-name: ccache-serving
+          pip-cache-name: pip-serving
+
       - name: Run pypto-serving DeepSeek V4 tests
-        if: needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
         uses: ./.github/actions/pypto-serving-tests
         with:
           pypto-lib-checkout-path: checkout
