@@ -110,13 +110,16 @@ from lm_head import (
     T_MAX as LM_HEAD_T_MAX,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
-    lm_head_selected_owner_only_decoupled,
-    lm_head_selected_tp_decoupled_worker,
+    lm_head_finish_decoupled_worker,
+    lm_head_logits_route_decoupled_worker,
+    lm_head_selected_publish_decoupled_worker,
+    lm_head_tp_decoupled_worker,
 )
 from rmsnorm import rms_norm
 
 assert LM_HEAD_OWNER_SIZE == N_RANKS
 assert config.PREFILL_TOKENS == T
+
 
 # ---------------------------------------------------------------------------
 # Model layer schedule (DeepSeek-V4 Flash, 43 hidden layers):
@@ -136,6 +139,7 @@ CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
+LM_HEAD_COMM_EPOCH = LAST_MOE_EPOCH + 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
@@ -802,10 +806,9 @@ def l3_prefill_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    hidden_window_buf = pld.alloc_window_buffer([N_RANKS * LM_HEAD_T_MAX, D], dtype=pl.BF16)
-    hidden_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    logits_window_buf = pld.alloc_window_buffer([LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
-    logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    tp_logits_shards = pl.create_tensor(
+        [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
+    )
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -851,47 +854,40 @@ def l3_prefill_fwd(
             device=r,
         )
 
-    for r in pl.range(LM_HEAD_TP_SIZE):
-        hidden_window = pld.window(hidden_window_buf, [N_RANKS * LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        logits_window = pld.window(
-            logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
-        )
-        logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_selected_tp_decoupled_worker(
-            hidden_out[r],
-            num_tokens_per_owner,
-            logit_row_indices,
-            num_logit_rows,
-            lm_head_weight[r],
-            logits[r],
-            hidden_window,
-            hidden_done,
-            logits_window,
-            logits_done,
-            r,
-            device=r,
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_selected_publish_decoupled_worker(
+            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
+            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
         )
 
-    for r in pl.range(LM_HEAD_TP_SIZE, pld.world_size()):
-        hidden_window = pld.window(hidden_window_buf, [N_RANKS * LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        logits_window = pld.window(
-            logits_window_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_tp_decoupled_worker(
+            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
+            r, LM_HEAD_COMM_EPOCH, device=r,
         )
-        logits_done = pld.window(logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_selected_owner_only_decoupled(
-            hidden_out[r],
-            num_tokens_per_owner,
-            logit_row_indices,
-            num_logit_rows,
-            logits[r],
-            hidden_window,
-            hidden_done,
-            logits_window,
-            logits_done,
-            r,
-            device=r,
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_route_decoupled_worker(
+            tp_logits_shards[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_finish_decoupled_worker(
+            logits[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
