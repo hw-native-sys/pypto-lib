@@ -119,6 +119,10 @@ HCA_NUM_LAYERS = 20
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 # LM-head uses dedicated completion counters, independent of the MoE epochs.
 LM_HEAD_COMM_EPOCH = 1
+LM_HEAD_SHARED_DATA_BYTES = max(
+    N_LOCAL * RECV_MAX * D,
+    LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4,
+)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
@@ -753,7 +757,7 @@ def l3_decode_fwd(
     # MoE and LM-head run sequentially, so they can share data storage; keep
     # LM-head completion counters separate from the MoE epoch protocol below.
     recv_x_buf = pld.alloc_window_buffer(
-        [max(N_LOCAL * RECV_MAX * D, LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4)],
+        [LM_HEAD_SHARED_DATA_BYTES],
         dtype=pl.INT8,
     )
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
