@@ -18,6 +18,7 @@ _KERNEL_DIR = Path(__file__).parent / "kernels" / "paged_attention_cce"
 _ATTENTION_ENTRY = _KERNEL_DIR / "attention" / "entry.cpp"
 _ATTENTION_ROPE_ENTRY = _KERNEL_DIR / "attention_rope" / "entry.cpp"
 _PREFILL_ATTENTION_ENTRY = _KERNEL_DIR / "attention_prefill" / "entry.cpp"
+_PREFILL_ATTENTION_NOMASK_ENTRY = _KERNEL_DIR / "attention_prefill_nomask" / "entry.cpp"
 _TILING_ENTRY = _KERNEL_DIR / "tiling" / "entry.cpp"
 _PREFILL_TILING_ENTRY = _KERNEL_DIR / "tiling_prefill" / "entry.cpp"
 
@@ -155,6 +156,26 @@ def paged_prefill_attention_cce(
     workspace: pl.InOut[pl.Tensor],
     metadata: pl.InOut[pl.Tensor],
     causal_mask: pl.Tensor,
+    cache_row_offset: pl.Scalar[pl.INDEX],
+    block_table_offset: pl.Scalar[pl.INDEX],
+) -> pl.Tensor: ...
+
+
+@pl.jit.extern(
+    core_type="mixed",
+    aic_source=_PREFILL_ATTENTION_NOMASK_ENTRY,
+    aiv_source=_PREFILL_ATTENTION_NOMASK_ENTRY,
+    include_dirs=_CANN_INCLUDE_DIRS,
+    dual_aiv_dispatch=True,
+)
+def paged_prefill_attention_nomask_cce(
+    query: pl.Tensor,
+    key_cache: pl.Tensor,
+    value_cache: pl.Tensor,
+    block_table: pl.Tensor,
+    out: pl.Out[pl.Tensor],
+    workspace: pl.InOut[pl.Tensor],
+    metadata: pl.InOut[pl.Tensor],
     cache_row_offset: pl.Scalar[pl.INDEX],
     block_table_offset: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor: ...
@@ -382,6 +403,7 @@ __all__ = [
     "paged_attention_cce",
     "paged_attention_rope_cce",
     "paged_prefill_attention_cce",
+    "paged_prefill_attention_nomask_cce",
     "paged_prefill_attention_tiling_cce",
     "paged_attention_tiling_cce",
     "qwen_decode_attention_cache_offset_test",

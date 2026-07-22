@@ -42,12 +42,11 @@ from config import (
     QWEN3_14B as M,
 )
 from paged_attention_cce import (
-    CAUSAL_MASK_SIZE as PA_CAUSAL_MASK_SIZE,
     DEFAULT_BLOCK_DIM as PA_DEFAULT_BLOCK_DIM,
     METADATA_BYTES as PA_METADATA_BYTES,
     WORKSPACE_BYTES as PA_WORKSPACE_BYTES,
     build_paged_prefill_attention_metadata,
-    paged_prefill_attention_cce,
+    paged_prefill_attention_nomask_cce,
 )
 from rms_lm_head import rms_lm_head
 
@@ -105,11 +104,7 @@ ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
 FINALIZE_SPMD_BLOCKS = 48
 FINALIZE_TOK_GROUP = TOK_TILE
-CAUSAL_MASK_ROW_TILE = 16
-CAUSAL_MASK_COL_TILE = 128
-CAUSAL_MASK_COL_BLOCKS = PA_CAUSAL_MASK_SIZE // CAUSAL_MASK_COL_TILE
-CAUSAL_MASK_WORK_ITEMS = (PA_CAUSAL_MASK_SIZE // CAUSAL_MASK_ROW_TILE) * CAUSAL_MASK_COL_BLOCKS
-CAUSAL_MASK_INIT_SPMD_BLOCKS = 32
+PREFILL_FA_QUERY_GROUP = 1
 Q_HEAD_BATCH_PAD = 16
 ATTN_GI_SCORE_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_PAD
 ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
@@ -683,27 +678,6 @@ def _attention_phase_window_full_single_block(
 
 
 @pl.jit.inline(auto_scope=False)
-def init_prefill_causal_mask(
-    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
-) -> pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8]:
-    for mask_core in pl.spmd(CAUSAL_MASK_INIT_SPMD_BLOCKS, name_hint="init_prefill_causal_mask"):
-        for work_id in pl.range(mask_core, CAUSAL_MASK_WORK_ITEMS, CAUSAL_MASK_INIT_SPMD_BLOCKS):
-            row_block = work_id // CAUSAL_MASK_COL_BLOCKS
-            col_block = work_id - row_block * CAUSAL_MASK_COL_BLOCKS
-            row0 = row_block * CAUSAL_MASK_ROW_TILE
-            col0 = col_block * CAUSAL_MASK_COL_TILE
-            col_ids = pl.add(
-                pl.arange(0, [1, CAUSAL_MASK_COL_TILE], dtype=pl.INT32),
-                pl.cast(col0, pl.INT32),
-            )
-            for rel_row in pl.range(CAUSAL_MASK_ROW_TILE):
-                row_i32 = pl.cast(row0 + rel_row, pl.INT32)
-                mask_row = pl.cast(pl.cmp(col_ids, row_i32, cmp_type=4), target_type=pl.INT8)
-                causal_mask = pl.assemble(causal_mask, mask_row, [row0 + rel_row, col0])
-    return causal_mask
-
-
-@pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
@@ -723,7 +697,6 @@ def prefill_layer(
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
@@ -890,9 +863,9 @@ def prefill_layer(
                 # ── Scope 2: Q/K norm + RoPE + KV cache update + causal attention ──
                 attn_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.BF16)
                 q_tnd_flat = pl.create_tensor([TOK_TILE * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
-                for final_ti0 in pl.range(0, valid_tok, FINALIZE_TOK_GROUP):
+                for final_ti0 in pl.range(0, valid_tok, PREFILL_FA_QUERY_GROUP):
                     with pl.scope():
-                        finalize_tok = pl.min(FINALIZE_TOK_GROUP, valid_tok - final_ti0)
+                        finalize_tok = pl.min(PREFILL_FA_QUERY_GROUP, valid_tok - final_ti0)
                         for rope_core in pl.spmd(ROPE_SPMD_BLOCKS, name_hint="rope_kv_cache"):
                             for rel_ti in pl.range(rope_core, finalize_tok, ROPE_SPMD_BLOCKS):
                                 ti = final_ti0 + rel_ti
@@ -1004,12 +977,10 @@ def prefill_layer(
                                     )
 
                         max_blocks_i32 = pl.cast(max_blocks_per_seq, pl.INT32)
-                        finalize_tok_i32 = pl.cast(finalize_tok, pl.INT32)
-
-                        block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
+                        block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + 1
                         q_lens = pl.create_tensor([1], dtype=pl.INT32)
                         kv_lens = pl.create_tensor([1], dtype=pl.INT32)
-                        pl.tensor.write(q_lens, [0], finalize_tok_i32)
+                        pl.tensor.write(q_lens, [0], 1)
                         pl.tensor.write(kv_lens, [0], pl.cast(block_ctx_len, pl.INT32))
                         pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
                         pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
@@ -1021,16 +992,21 @@ def prefill_layer(
                             layer_blocks_i32,
                             pa_metadata,
                         )
-                        q_tnd = pl.reshape(q_tnd_flat, [TOK_TILE, NUM_HEADS, HEAD_DIM])
-                        attn_tnd = pl.create_tensor([TOK_TILE, NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
+                        q_tnd_one_flat = pl.slice(
+                            q_tnd_flat,
+                            [NUM_HEADS, HEAD_DIM],
+                            [final_ti0 * NUM_HEADS, 0],
+                        )
+                        q_tnd = pl.reshape(q_tnd_one_flat, [1, NUM_HEADS, HEAD_DIM])
+                        attn_tnd = pl.create_tensor([1, NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
                         block_table_offset = pl.cast(b * max_blocks_per_seq, pl.INDEX)
                         cache_row_offset = pl.cast(layer_cache_base * NUM_KV_HEADS, pl.INDEX)
                         with pl.spmd(
                             PA_DEFAULT_BLOCK_DIM,
-                            name_hint="prefill_fa_fused",
+                            name_hint="prefill_fa_nomask_fused",
                             sync_start=True,
                         ) as _attention_tid:
-                            attn_tnd = paged_prefill_attention_cce(
+                            attn_tnd = paged_prefill_attention_nomask_cce(
                                 q_tnd,
                                 k_cache,
                                 v_cache,
@@ -1038,11 +1014,11 @@ def prefill_layer(
                                 attn_tnd,
                                 pa_workspace,
                                 pa_metadata,
-                                causal_mask,
                                 cache_row_offset,
                                 block_table_offset,
                             )
-                        attn_tile = pl.reshape(attn_tnd, [TOK_TILE, HIDDEN])
+                        attn_row = pl.reshape(attn_tnd, [1, HIDDEN])
+                        attn_tile = pl.assemble(attn_tile, attn_row, [final_ti0, 0])
                 # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                 # Stage 3.1: Output projection + first residual.
                 out_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
@@ -1301,8 +1277,6 @@ def prefill_fwd(
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
 
     final_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    causal_mask = pl.create_tensor([PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], dtype=pl.INT8)
-    causal_mask = init_prefill_causal_mask(causal_mask)
 
     max_chunk_len = pl.tensor.read(chunk_lens, [0])
     for b in pl.range(1, user_batch):
@@ -1364,7 +1338,6 @@ def prefill_fwd(
                             slot_mapping,
                             k_cache,
                             v_cache,
-                            causal_mask,
                             wo,
                             post_rms_weight,
                             w_gate,
@@ -1439,7 +1412,6 @@ def prefill_fwd(
                             slot_mapping,
                             k_cache,
                             v_cache,
-                            causal_mask,
                             wo,
                             post_rms_weight,
                             w_gate,
