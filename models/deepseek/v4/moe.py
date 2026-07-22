@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+size: 2/4/8 run N-rank distributed; each rank keeps 16 experts."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
@@ -284,6 +284,7 @@ def dispatch(
                 pl.write(recv_w_out, [e, out_col], pl.read(recv_aux, [in_row, AUX_W]))
                 pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
             b = b + n
+    return _meta_tid, _gather_tid
 
 
 # === Combine =================================================================
@@ -469,7 +470,7 @@ def moe(
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
-    dispatch(
+    count_tid, gather_tid = dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
@@ -482,7 +483,7 @@ def moe(
             recv_x_out, recv_scale_out, recv_w_out, recv_count_out,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
-            recv_y,
+            recv_y, count_tid, gather_tid,
         )
 
         ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
