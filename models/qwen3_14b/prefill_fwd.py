@@ -134,7 +134,7 @@ SILU_OUT_CHUNK = 64
 SILU_OUT_BLOCKS = INTERMEDIATE // SILU_OUT_CHUNK
 DOWN_RESID_CHUNK = 64
 DOWN_RESID_BLOCKS = HIDDEN // DOWN_RESID_CHUNK
-MLP_PROJ_BANDS = 2
+MLP_PROJ_BANDS = 4
 MLP_BAND_BLOCKS = MLP_OUT_BLOCKS // MLP_PROJ_BANDS
 MLP_BAND_WIDTH = MLP_BAND_BLOCKS * MLP_OUT_CHUNK
 DOWN_PART_BLOCKS = (MLP_OUT_BLOCKS + DOWN_K_PARTS - 1) // DOWN_K_PARTS
@@ -152,17 +152,13 @@ DOWN_RESID_SPMD_BLOCKS = 20
 OUT_PROJ_SPMD_BLOCKS = 20
 SILU_SPMD_BLOCKS = 24
 # gate and up share ONE spmd so a core can pick up work from both projections.
-# Each projection has MLP_BAND_BLOCKS (34) N-tiles over GATE_UP_SPMD_BLOCKS (24)
-# cores, so H = 34 - 24 = 10 cores carry a 2nd tile per projection. If both
-# projections put their heavy tiles on the SAME cores (start = core), those 10
-# cores would run 4 tiles. Shifting up's core start by H moves up's heavy cores
-# (start < H) onto the gate-light cores, capping every core at 3 tiles:
-#   cores  0..9  -> 2 gate + 1 up = 3
-#   cores 10..13 -> 1 gate + 1 up = 2
-#   cores 14..23 -> 1 gate + 2 up = 3
+# Each projection has MLP_BAND_BLOCKS (17) N-tiles over GATE_UP_SPMD_BLOCKS (24)
+# cores. Gate uses cores 0..16; shifting up by 17 maps up's active cores to
+# 7..23, keeping the two projections interleaved without making any core carry
+# more than two matmul tiles in a band.
 GATE_UP_SPMD_BLOCKS = 24
-UP_PROJ_CORE_SHIFT = MLP_BAND_BLOCKS - GATE_UP_SPMD_BLOCKS
-DOWN_PROJ_SPMD_BLOCKS = 24
+UP_PROJ_CORE_SHIFT = MLP_BAND_BLOCKS % GATE_UP_SPMD_BLOCKS
+DOWN_PROJ_SPMD_BLOCKS = HIDDEN_BLOCKS
 
 assert HIDDEN % EMBED_HIDDEN_CHUNK == 0
 
@@ -1352,11 +1348,15 @@ def prefill_layer(
                     down_chain[mlp_band] = down_tid
 
             # Cast the FP32 accumulator to bf16 `out`. mlp_out_acc_tile is manual_dep, so
-            # this read is gated on BOTH bands' down adds explicitly (auto-dep is off).
+            # this read is gated on all bands' down adds explicitly (auto-dep is off).
             # This is the only down -> consumer edge; it does NOT reintroduce any
             # band0 <-> band1 ordering.
             valid_tt = pl.min(MLP_M_TILE, prefill_tokens - m0)
-            with pl.spmd(DOWN_RESID_SPMD_BLOCKS, name_hint="mlp_out_cast_spmd", deps=[down_chain[0], down_chain[1]]) as cast_tid:
+            with pl.spmd(
+                DOWN_RESID_SPMD_BLOCKS,
+                name_hint="mlp_out_cast_spmd",
+                deps=[down_chain[i] for i in range(MLP_PROJ_BANDS)],
+            ) as cast_tid:
                 cast_core = pl.tile.get_block_idx()
                 for hb in pl.range(cast_core, down_n_blocks, DOWN_RESID_SPMD_BLOCKS):
                     h0 = hb * K_CHUNK
