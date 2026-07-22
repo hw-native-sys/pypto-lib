@@ -153,11 +153,14 @@ OUT_PROJ_SPMD_BLOCKS = 20
 SILU_SPMD_BLOCKS = 24
 # gate and up share ONE spmd so a core can pick up work from both projections.
 # Each projection has MLP_BAND_BLOCKS (17) N-tiles over GATE_UP_SPMD_BLOCKS (24)
-# cores. Gate uses cores 0..16; shifting up by 17 maps up's active cores to
-# 7..23, keeping the two projections interleaved without making any core carry
-# more than two matmul tiles in a band.
+# cores. Within one band, shifting up by 17 maps up's active cores away from
+# gate's first 17 active cores. Across the four bands, rotate the physical core
+# start by 0/6/12/18 so the "2 matmul tiles" lanes move around: per MLP M-tile,
+# cores carry either 5 or 6 gate/up matmuls instead of repeating the same 10
+# heavy lanes every band.
 GATE_UP_SPMD_BLOCKS = 24
 UP_PROJ_CORE_SHIFT = MLP_BAND_BLOCKS % GATE_UP_SPMD_BLOCKS
+MLP_BAND_CORE_ROT_STEP = GATE_UP_SPMD_BLOCKS // MLP_PROJ_BANDS
 DOWN_PROJ_SPMD_BLOCKS = HIDDEN_BLOCKS
 
 assert HIDDEN % EMBED_HIDDEN_CHUNK == 0
@@ -1290,14 +1293,13 @@ def prefill_layer(
                     up_acc_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.FP32)
                     mlp_silu_b = pl.create_tensor([MLP_M_TILE, MLP_BAND_WIDTH], dtype=pl.BF16)
 
-                    # gate + up fused into ONE spmd(24): each core services a strided
-                    # slice of BOTH projections. gate starts at `core`; up starts at
-                    # `(core + UP_PROJ_CORE_SHIFT) % 24` so the two heavy-core sets are
-                    # disjoint and no core exceeds 3 N-tiles (see const comment). The
-                    # strided starts are bijections of the core over 0..23, so together
-                    # they still cover rel_ob 0..MLP_BAND_BLOCKS-1 exactly once each.
+                    # gate + up fused into ONE spmd(24): each physical core services a
+                    # rotated strided slice of BOTH projections. The per-band rotation
+                    # spreads heavy lanes across bands, while each rotated start remains
+                    # a bijection over 0..23 and still covers every rel_ob exactly once.
                     with pl.spmd(GATE_UP_SPMD_BLOCKS, name_hint="gate_up_proj_spmd") as gate_up_tid:
-                        gu_core = pl.tile.get_block_idx()
+                        band_core_rot = (mlp_band * MLP_BAND_CORE_ROT_STEP) % GATE_UP_SPMD_BLOCKS
+                        gu_core = (pl.tile.get_block_idx() + band_core_rot) % GATE_UP_SPMD_BLOCKS
                         for rel_ob in pl.range(gu_core, MLP_BAND_BLOCKS, GATE_UP_SPMD_BLOCKS):
                             o0 = (band_ob0 + rel_ob) * MLP_OUT_CHUNK
                             pc0 = pl.slice(post_norm_all, [MLP_M_TILE, K_CHUNK], [m0, 0])
