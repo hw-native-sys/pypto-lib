@@ -88,7 +88,7 @@ runs:
       working-directory: ${{ inputs.pypto-lib-checkout-path }}
       run: |
         source activate.sh
-        pip install transformers safetensors pytest fastapi uvicorn
+        pip install transformers safetensors pytest fastapi uvicorn msgspec
 
     - name: Run pypto-serving Qwen tests
       if: ${{ inputs.model-name == 'qwen3-14b' }}
