@@ -72,6 +72,7 @@ Q_HEAD_PAD = M.q_head_pad
 Q_GROUPS = M.q_groups
 TOTAL_Q_GROUPS = M.total_q_groups
 
+
 # Single-layer prefill constants. Keep these local because config.py is shared
 # with the decode kernels and uses decode-tuned tiling constants.
 MAX_SEQ = MODEL_MAX_SEQ
