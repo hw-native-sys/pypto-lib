@@ -74,7 +74,7 @@ N_LEVELS = 16  # int4 -> 16 levels
 # ---------------------------------------------------------------------------
 # Prefill-specific tiling constants (local, may differ from config.py)
 # ---------------------------------------------------------------------------
-MAX_SEQ = 128
+MAX_SEQ = M.max_seq  # rope_cos/sin ctx cap; was 128 (draft placeholder) -> long prompts >128 read OOB rope -> garbage
 BATCH_TILE = 16
 K_CHUNK = 128
 Q_OUT_CHUNK = 64
