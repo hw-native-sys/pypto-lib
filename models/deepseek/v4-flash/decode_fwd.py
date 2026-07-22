@@ -750,16 +750,19 @@ def l3_decode_fwd(
     num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    # MoE and LM-head run sequentially, so they can share data storage; keep
+    # LM-head completion counters separate from the MoE epoch protocol below.
+    recv_x_buf = pld.alloc_window_buffer(
+        [max(N_LOCAL * RECV_MAX * D, LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4)],
+        dtype=pl.INT8,
+    )
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    lm_head_hidden_buf = pld.alloc_window_buffer([LM_HEAD_T_MAX, D], dtype=pl.BF16)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    lm_head_logits_buf = pld.alloc_window_buffer([LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     tp_logits_shards = pl.create_tensor(
         [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
@@ -868,7 +871,7 @@ def l3_decode_fwd(
         )
 
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(lm_head_hidden_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_decode_selected_publish_decoupled_worker(
             hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
@@ -876,7 +879,7 @@ def l3_decode_fwd(
         )
 
     for r in pl.range(LM_HEAD_TP_SIZE):
-        hidden_window = pld.window(lm_head_hidden_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
         lm_head_tp_decoupled_worker(
             lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
@@ -884,7 +887,7 @@ def l3_decode_fwd(
         )
 
     for r in pl.range(LM_HEAD_TP_SIZE):
-        logits_window = pld.window(lm_head_logits_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
+        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_logits_route_decoupled_worker(
             tp_logits_shards[r], logits_window, logits_done,
@@ -892,7 +895,7 @@ def l3_decode_fwd(
         )
 
     for r in pl.range(pld.world_size()):
-        logits_window = pld.window(lm_head_logits_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
+        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head_finish_decoupled_worker(
             logits[r], logits_window, logits_done,
