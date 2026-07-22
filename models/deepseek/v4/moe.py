@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # hc_pre uses device-only atomic add and hard barriers
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
 size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""

@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: no-sim  # hc_pre uses device-only atomic add and hard barriers
 """DeepSeek-V4 HCA (Hierarchical Compressed Attention) decode orchestration — `compress_ratio == 128` path.
 Active in layers 3/5 of the model (2 of the 8 layers in demo). Has the main compressor (ratio=128,
 overlap=False) but NO indexer; the compressed-portion topk for sparse_attn comes from a deterministic
