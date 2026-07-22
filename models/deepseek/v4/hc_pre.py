@@ -293,8 +293,8 @@ def _hc_pre_syncall(
                     row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
                     row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
-                    row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-                    row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    row_max_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    row_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     row0_max = pl.row_max(row0_p, row_max_tmp)
                     row1_max = pl.row_max(row1_p, row_max_tmp)
                     row2_max = pl.row_max(row2_p, row_max_tmp)
@@ -321,7 +321,7 @@ def _hc_pre_syncall(
                     row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
                     row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
-                    row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+                    row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                     col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
                     col_sum = pl.add(col_sum, HC_EPS)
                     row0_cur = pl.div(row0_eff, col_sum)
@@ -528,8 +528,8 @@ def _hc_pre_separate(
         row2_p = pl.fillpad(row2, pad_value=pl.PadValue.min)
         row3_p = pl.fillpad(row3, pad_value=pl.PadValue.min)
 
-        row_max_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-        row_sum_tmp = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_max_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         row0_max = pl.row_max(row0_p, row_max_tmp)
         row1_max = pl.row_max(row1_p, row_max_tmp)
         row2_max = pl.row_max(row2_p, row_max_tmp)
@@ -556,7 +556,7 @@ def _hc_pre_separate(
         row2_eff = pl.fillpad(row2_valid, pad_value=pl.PadValue.zero)
         row3_eff = pl.fillpad(row3_valid, pad_value=pl.PadValue.zero)
 
-        row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+        row_sum_tmp_iter = pl.create_tile([COMB_T_TILE, HC_PAD], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
         col_sum = pl.add(pl.add(row0_eff, row1_eff), pl.add(row2_eff, row3_eff))
         col_sum = pl.add(col_sum, HC_EPS)
         row0_cur = pl.div(row0_eff, col_sum)
