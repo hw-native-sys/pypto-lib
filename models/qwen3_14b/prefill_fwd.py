@@ -110,6 +110,10 @@ ATTN_PHASE_ACC_STAT_ROWS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GR
 ATTN_PHASE_FINALIZE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GROUPS
 QKPV_PIPELINE_TOK_STEP = 1
 SB_BATCH = 64
+QKPV_PLAN_SB_BATCH = 2
+QKPV_PLAN_WORK_ITEMS = QKPV_PLAN_SB_BATCH * ATTN_PHASE_WORK_ITEMS
+QKPV_PARTIAL_SCORE_ROWS = QKPV_PLAN_SB_BATCH * ATTN_PHASE_ACC_SCORE_ROWS
+QKPV_PARTIAL_STAT_ROWS = QKPV_PLAN_SB_BATCH * ATTN_PHASE_ACC_STAT_ROWS
 MLP_OUT_CHUNK = 256  # 512B cache line: gate/up weight-N inner + down_proj activation inner
 LM_HEAD_K_CHUNK = 128
 VOCAB_CHUNK = 64
@@ -194,156 +198,267 @@ def _attention_phase_window(
     if finalize_tok > 0:
         block_ctx_len = chunk_start + p0 + final_ti0 + finalize_tok
         block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-        for sb_chunk in pl.range(0, block_ctx_blocks, SB_BATCH):
-            for si in pl.range(SB_BATCH):
-                sb = sb_chunk + si
-                if sb < block_ctx_blocks:
-                    for phase_core in pl.spmd(
-                        ATTN_PHASE_SPMD_BLOCKS,
-                        name_hint="qk_pv_online_phase_spmd",
-                        sync_start=True,
-                    ):
-                        for work_id in pl.range(phase_core, ATTN_PHASE_WORK_ITEMS, ATTN_PHASE_SPMD_BLOCKS):
-                            micro_id = work_id // ATTN_GI_BLOCKS
-                            gi_block = work_id - micro_id * ATTN_GI_BLOCKS
-                            gi0 = gi_block * ATTN_GI_GROUP
-                            attn_dt0 = micro_id * ATTN_TOK_GROUP
-                            if attn_dt0 < finalize_tok:
-                                attn_ti0 = final_ti0 + attn_dt0
-                                attn_tok = pl.min(ATTN_TOK_GROUP, finalize_tok - attn_dt0)
-                                for gg in pl.range(ATTN_GI_GROUP):
-                                    gi = gi0 + gg
-                                    if gi < TOTAL_Q_GROUPS:
-                                        kvh = gi // Q_GROUPS
-                                        block_table_idx = b * max_blocks_per_seq + sb
-                                        pbid = pl.cast(
-                                            pl.tensor.read(block_table, [block_table_idx]),
-                                            pl.INDEX,
-                                        )
-                                        cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
-                                        cache_col = kvh * HEAD_DIM
-                                        k_tile = pl.slice(
-                                            k_cache_bsnd,
-                                            [SEQ_TILE, HEAD_DIM],
-                                            [cache_row0, cache_col],
-                                        )
-                                        v_tile = pl.slice(
-                                            v_cache_bsnd,
-                                            [SEQ_TILE, HEAD_DIM],
-                                            [cache_row0, cache_col],
-                                        )
-                                        for dd in pl.pipeline(ATTN_TOK_GROUP, stage=3):
-                                            if dd < attn_tok:
-                                                ti = attn_ti0 + dd
-                                                chunk_pos = p0 + ti
-                                                pos = chunk_start + chunk_pos
-                                                ctx_len = pos + 1
-                                                ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                                                if sb < ctx_blocks:
-                                                    q_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-                                                    q_padded = pl.slice(
-                                                        all_q_padded_tile,
-                                                        [Q_HEAD_PAD, HEAD_DIM],
-                                                        [q_row0, 0],
-                                                    )
-                                                    raw_scores = pl.matmul(
-                                                        q_padded,
-                                                        k_tile,
-                                                        b_trans=True,
-                                                        out_dtype=pl.FP32,
-                                                    )
-                                                    s0 = sb * SEQ_TILE
-                                                    valid_len = pl.min(SEQ_TILE, ctx_len - s0)
-                                                    scores = pl.fillpad(
-                                                        pl.set_validshape(
-                                                            pl.mul(raw_scores, ATTN_SCALE),
-                                                            Q_HEAD_BATCH,
-                                                            valid_len,
-                                                        ),
-                                                        pad_value=pl.PadValue.min,
-                                                    )
-                                                    cur_mi = pl.row_max(scores)
-                                                    exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
-                                                    exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
-                                                    cur_li = pl.row_sum(
-                                                        pl.cast(exp_scores_bf16, target_type=pl.FP32),
-                                                    )
-                                                    oi_tmp = pl.matmul(
-                                                        exp_scores_bf16,
-                                                        v_tile,
-                                                        out_dtype=pl.FP32,
-                                                    )
-                                                    acc_exp_row0 = (
-                                                        micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
-                                                        + gi * ATTN_TOK_GROUP * Q_HEAD_PAD
-                                                        + dd * Q_HEAD_PAD
-                                                    )
-                                                    acc_li_row0 = (
-                                                        micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_BATCH_PAD
-                                                        + gi * ATTN_TOK_GROUP * Q_HEAD_BATCH_PAD
-                                                        + dd * Q_HEAD_BATCH_PAD
-                                                    )
-                                                    oi_tmp_sb = pl.slice(oi_tmp, [Q_HEAD_BATCH_PAD, HEAD_DIM], [0, 0])
-                                                    cur_mi_acc = pl.slice(cur_mi, [Q_HEAD_BATCH_PAD, 1], [0, 0])
-                                                    cur_li_acc = pl.slice(cur_li, [Q_HEAD_BATCH_PAD, 1], [0, 0])
-                                                    if sb == 0:
-                                                        oi_tmp_phase = pl.assemble(
-                                                            oi_tmp_phase,
-                                                            oi_tmp_sb,
-                                                            [acc_exp_row0, 0],
-                                                        )
-                                                        cur_li_phase = pl.assemble(
-                                                            cur_li_phase,
-                                                            cur_li_acc,
-                                                            [acc_li_row0, 0],
-                                                        )
-                                                        cur_mi_phase = pl.assemble(
-                                                            cur_mi_phase,
-                                                            cur_mi_acc,
-                                                            [acc_li_row0, 0],
-                                                        )
-                                                    else:
-                                                        prev_oi = pl.slice(
-                                                            oi_tmp_phase,
-                                                            [Q_HEAD_BATCH_PAD, HEAD_DIM],
-                                                            [acc_exp_row0, 0],
-                                                        )
-                                                        prev_li = pl.slice(
-                                                            cur_li_phase,
-                                                            [Q_HEAD_BATCH_PAD, 1],
-                                                            [acc_li_row0, 0],
-                                                        )
-                                                        prev_mi = pl.slice(
-                                                            cur_mi_phase,
-                                                            [Q_HEAD_BATCH_PAD, 1],
-                                                            [acc_li_row0, 0],
-                                                        )
-                                                        mi_new = pl.maximum(prev_mi, cur_mi_acc)
-                                                        alpha = pl.exp(pl.sub(prev_mi, mi_new))
-                                                        beta = pl.exp(pl.sub(cur_mi_acc, mi_new))
-                                                        li_new = pl.add(
-                                                            pl.mul(alpha, prev_li),
-                                                            pl.mul(beta, cur_li_acc),
-                                                        )
-                                                        oi_new = pl.add(
-                                                            pl.row_expand_mul(prev_oi, alpha),
-                                                            pl.row_expand_mul(oi_tmp_sb, beta),
-                                                        )
-                                                        oi_tmp_phase = pl.assemble(
-                                                            oi_tmp_phase,
-                                                            oi_new,
-                                                            [acc_exp_row0, 0],
-                                                        )
-                                                        cur_li_phase = pl.assemble(
-                                                            cur_li_phase,
-                                                            li_new,
-                                                            [acc_li_row0, 0],
-                                                        )
-                                                        cur_mi_phase = pl.assemble(
-                                                            cur_mi_phase,
-                                                            mi_new,
-                                                            [acc_li_row0, 0],
-                                                        )
+        qkpv_order = pl.create_tensor([QKPV_PLAN_WORK_ITEMS], dtype=pl.INT32)
+        qkpv_wcur = pl.create_tensor([1], dtype=pl.INT32)
+        partial_mi_phase = pl.create_tensor([QKPV_PARTIAL_STAT_ROWS, 1], dtype=pl.FP32)
+        partial_li_phase = pl.create_tensor([QKPV_PARTIAL_STAT_ROWS, 1], dtype=pl.FP32)
+        partial_oi_phase = pl.create_tensor([QKPV_PARTIAL_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
+        for sb_chunk in pl.range(0, block_ctx_blocks, QKPV_PLAN_SB_BATCH):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="qkpv_plan", allow_early_resolve=True) as qkpv_plan_tid:
+                pl.write(qkpv_wcur, [0], pl.cast(0, pl.INT32))
+                for plan_si in pl.unroll(QKPV_PLAN_SB_BATCH):
+                    plan_sb = sb_chunk + plan_si
+                    if plan_sb < block_ctx_blocks:
+                        for plan_work_id in pl.unroll(ATTN_PHASE_WORK_ITEMS):
+                            plan_micro_id = plan_work_id // ATTN_GI_BLOCKS
+                            plan_attn_dt0 = plan_micro_id * ATTN_TOK_GROUP
+                            if plan_attn_dt0 < finalize_tok:
+                                plan_w = pl.read(qkpv_wcur, [0])
+                                pl.write(
+                                    qkpv_order,
+                                    [plan_w],
+                                    pl.cast(plan_si * ATTN_PHASE_WORK_ITEMS + plan_work_id, pl.INT32),
+                                )
+                                pl.write(qkpv_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
+                for plan_si in pl.unroll(QKPV_PLAN_SB_BATCH):
+                    plan_sb = sb_chunk + plan_si
+                    for plan_work_id in pl.unroll(ATTN_PHASE_WORK_ITEMS):
+                        plan_micro_id = plan_work_id // ATTN_GI_BLOCKS
+                        plan_attn_dt0 = plan_micro_id * ATTN_TOK_GROUP
+                        if plan_sb >= block_ctx_blocks:
+                            plan_w = pl.read(qkpv_wcur, [0])
+                            pl.write(
+                                qkpv_order,
+                                [plan_w],
+                                pl.cast(plan_si * ATTN_PHASE_WORK_ITEMS + plan_work_id, pl.INT32),
+                            )
+                            pl.write(qkpv_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
+                        else:
+                            if plan_attn_dt0 >= finalize_tok:
+                                plan_w = pl.read(qkpv_wcur, [0])
+                                pl.write(
+                                    qkpv_order,
+                                    [plan_w],
+                                    pl.cast(plan_si * ATTN_PHASE_WORK_ITEMS + plan_work_id, pl.INT32),
+                                )
+                                pl.write(qkpv_wcur, [0], pl.cast(plan_w + 1, pl.INT32))
+
+            with pl.spmd(
+                ATTN_PHASE_SPMD_BLOCKS,
+                name_hint="qk_pv_partial_plan_spmd",
+                deps=[qkpv_plan_tid],
+                sync_start=True,
+            ) as qkpv_tid:
+                phase_core = pl.tile.get_block_idx()
+                qkpv_lane_iters = (
+                    QKPV_PLAN_WORK_ITEMS - phase_core + ATTN_PHASE_SPMD_BLOCKS - 1
+                ) // ATTN_PHASE_SPMD_BLOCKS
+                for qkpv_it in pl.range(qkpv_lane_iters):
+                    qkpv_flat = phase_core + qkpv_it * ATTN_PHASE_SPMD_BLOCKS
+                    qkpv_item = pl.cast(pl.read(qkpv_order, [qkpv_flat]), pl.INDEX)
+                    si = qkpv_item // ATTN_PHASE_WORK_ITEMS
+                    work_id = qkpv_item - si * ATTN_PHASE_WORK_ITEMS
+                    sb = sb_chunk + si
+                    if sb < block_ctx_blocks:
+                        micro_id = work_id // ATTN_GI_BLOCKS
+                        gi_block = work_id - micro_id * ATTN_GI_BLOCKS
+                        gi0 = gi_block * ATTN_GI_GROUP
+                        attn_dt0 = micro_id * ATTN_TOK_GROUP
+                        if attn_dt0 < finalize_tok:
+                            attn_ti0 = final_ti0 + attn_dt0
+                            attn_tok = pl.min(ATTN_TOK_GROUP, finalize_tok - attn_dt0)
+                            for gg in pl.range(ATTN_GI_GROUP):
+                                gi = gi0 + gg
+                                if gi < TOTAL_Q_GROUPS:
+                                    kvh = gi // Q_GROUPS
+                                    block_table_idx = b * max_blocks_per_seq + sb
+                                    pbid = pl.cast(
+                                        pl.tensor.read(block_table, [block_table_idx]),
+                                        pl.INDEX,
+                                    )
+                                    cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
+                                    cache_col = kvh * HEAD_DIM
+                                    k_tile = pl.slice(k_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
+                                    v_tile = pl.slice(v_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
+                                    for dd in pl.pipeline(ATTN_TOK_GROUP, stage=3):
+                                        if dd < attn_tok:
+                                            ti = attn_ti0 + dd
+                                            chunk_pos = p0 + ti
+                                            pos = chunk_start + chunk_pos
+                                            ctx_len = pos + 1
+                                            ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                                            if sb < ctx_blocks:
+                                                q_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
+                                                q_padded = pl.slice(
+                                                    all_q_padded_tile,
+                                                    [Q_HEAD_PAD, HEAD_DIM],
+                                                    [q_row0, 0],
+                                                )
+                                                raw_scores = pl.matmul(
+                                                    q_padded,
+                                                    k_tile,
+                                                    b_trans=True,
+                                                    out_dtype=pl.FP32,
+                                                )
+                                                s0 = sb * SEQ_TILE
+                                                valid_len = pl.min(SEQ_TILE, ctx_len - s0)
+                                                scores = pl.fillpad(
+                                                    pl.set_validshape(
+                                                        pl.mul(raw_scores, ATTN_SCALE),
+                                                        Q_HEAD_BATCH,
+                                                        valid_len,
+                                                    ),
+                                                    pad_value=pl.PadValue.min,
+                                                )
+                                                cur_mi = pl.row_max(scores)
+                                                exp_scores = pl.exp(pl.row_expand_sub(scores, cur_mi))
+                                                exp_scores_bf16 = pl.cast(exp_scores, target_type=pl.BF16)
+                                                cur_li = pl.row_sum(
+                                                    pl.cast(exp_scores_bf16, target_type=pl.FP32),
+                                                )
+                                                oi_tmp = pl.matmul(
+                                                    exp_scores_bf16,
+                                                    v_tile,
+                                                    out_dtype=pl.FP32,
+                                                )
+                                                acc_exp_row0 = (
+                                                    si * ATTN_PHASE_ACC_SCORE_ROWS
+                                                    + micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
+                                                    + gi * ATTN_TOK_GROUP * Q_HEAD_PAD
+                                                    + dd * Q_HEAD_PAD
+                                                )
+                                                acc_li_row0 = (
+                                                    si * ATTN_PHASE_ACC_STAT_ROWS
+                                                    + micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_BATCH_PAD
+                                                    + gi * ATTN_TOK_GROUP * Q_HEAD_BATCH_PAD
+                                                    + dd * Q_HEAD_BATCH_PAD
+                                                )
+                                                partial_oi_phase = pl.assemble(
+                                                    partial_oi_phase,
+                                                    pl.slice(oi_tmp, [Q_HEAD_BATCH_PAD, HEAD_DIM], [0, 0]),
+                                                    [acc_exp_row0, 0],
+                                                )
+                                                partial_mi_phase = pl.assemble(
+                                                    partial_mi_phase,
+                                                    pl.slice(cur_mi, [Q_HEAD_BATCH_PAD, 1], [0, 0]),
+                                                    [acc_li_row0, 0],
+                                                )
+                                                partial_li_phase = pl.assemble(
+                                                    partial_li_phase,
+                                                    pl.slice(cur_li, [Q_HEAD_BATCH_PAD, 1], [0, 0]),
+                                                    [acc_li_row0, 0],
+                                                )
+
+            with pl.spmd(
+                FINALIZE_SPMD_BLOCKS,
+                name_hint="qk_pv_partial_merge_spmd",
+                deps=[qkpv_tid],
+            ) as _merge_tid:
+                merge_core = pl.tile.get_block_idx()
+                for merge_work_id in pl.range(
+                    merge_core,
+                    ATTN_PHASE_FINALIZE_WORK_ITEMS,
+                    FINALIZE_SPMD_BLOCKS,
+                ):
+                    merge_micro_id = merge_work_id // (ATTN_TOK_GROUP * TOTAL_Q_GROUPS)
+                    merge_rem = merge_work_id - merge_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS
+                    merge_dd = merge_rem // TOTAL_Q_GROUPS
+                    merge_gi = merge_rem - merge_dd * TOTAL_Q_GROUPS
+                    merge_dt = merge_micro_id * ATTN_TOK_GROUP + merge_dd
+                    if merge_dt < finalize_tok:
+                        merge_ti = final_ti0 + merge_dt
+                        merge_chunk_pos = p0 + merge_ti
+                        merge_pos = chunk_start + merge_chunk_pos
+                        merge_ctx_len = merge_pos + 1
+                        merge_ctx_blocks = (merge_ctx_len + SEQ_TILE - 1) // SEQ_TILE
+                        acc_exp_row0 = (
+                            merge_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
+                            + merge_gi * ATTN_TOK_GROUP * Q_HEAD_PAD
+                            + merge_dd * Q_HEAD_PAD
+                        )
+                        acc_li_row0 = (
+                            merge_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_BATCH_PAD
+                            + merge_gi * ATTN_TOK_GROUP * Q_HEAD_BATCH_PAD
+                            + merge_dd * Q_HEAD_BATCH_PAD
+                        )
+                        for merge_si in pl.range(QKPV_PLAN_SB_BATCH):
+                            merge_sb = sb_chunk + merge_si
+                            if merge_sb < block_ctx_blocks and merge_sb < merge_ctx_blocks:
+                                part_exp_row0 = merge_si * ATTN_PHASE_ACC_SCORE_ROWS + acc_exp_row0
+                                part_li_row0 = merge_si * ATTN_PHASE_ACC_STAT_ROWS + acc_li_row0
+                                oi_tmp_sb = pl.slice(
+                                    partial_oi_phase,
+                                    [Q_HEAD_BATCH_PAD, HEAD_DIM],
+                                    [part_exp_row0, 0],
+                                )
+                                cur_mi_acc = pl.slice(
+                                    partial_mi_phase,
+                                    [Q_HEAD_BATCH_PAD, 1],
+                                    [part_li_row0, 0],
+                                )
+                                cur_li_acc = pl.slice(
+                                    partial_li_phase,
+                                    [Q_HEAD_BATCH_PAD, 1],
+                                    [part_li_row0, 0],
+                                )
+                                if merge_sb == 0:
+                                    oi_tmp_phase = pl.assemble(
+                                        oi_tmp_phase,
+                                        oi_tmp_sb,
+                                        [acc_exp_row0, 0],
+                                    )
+                                    cur_li_phase = pl.assemble(
+                                        cur_li_phase,
+                                        cur_li_acc,
+                                        [acc_li_row0, 0],
+                                    )
+                                    cur_mi_phase = pl.assemble(
+                                        cur_mi_phase,
+                                        cur_mi_acc,
+                                        [acc_li_row0, 0],
+                                    )
+                                else:
+                                    prev_oi = pl.slice(
+                                        oi_tmp_phase,
+                                        [Q_HEAD_BATCH_PAD, HEAD_DIM],
+                                        [acc_exp_row0, 0],
+                                    )
+                                    prev_li = pl.slice(
+                                        cur_li_phase,
+                                        [Q_HEAD_BATCH_PAD, 1],
+                                        [acc_li_row0, 0],
+                                    )
+                                    prev_mi = pl.slice(
+                                        cur_mi_phase,
+                                        [Q_HEAD_BATCH_PAD, 1],
+                                        [acc_li_row0, 0],
+                                    )
+                                    mi_new = pl.maximum(prev_mi, cur_mi_acc)
+                                    alpha = pl.exp(pl.sub(prev_mi, mi_new))
+                                    beta = pl.exp(pl.sub(cur_mi_acc, mi_new))
+                                    li_new = pl.add(
+                                        pl.mul(alpha, prev_li),
+                                        pl.mul(beta, cur_li_acc),
+                                    )
+                                    oi_new = pl.add(
+                                        pl.row_expand_mul(prev_oi, alpha),
+                                        pl.row_expand_mul(oi_tmp_sb, beta),
+                                    )
+                                    oi_tmp_phase = pl.assemble(
+                                        oi_tmp_phase,
+                                        oi_new,
+                                        [acc_exp_row0, 0],
+                                    )
+                                    cur_li_phase = pl.assemble(
+                                        cur_li_phase,
+                                        li_new,
+                                        [acc_li_row0, 0],
+                                    )
+                                    cur_mi_phase = pl.assemble(
+                                        cur_mi_phase,
+                                        mi_new,
+                                        [acc_li_row0, 0],
+                                    )
         for final_core in pl.spmd(FINALIZE_SPMD_BLOCKS, name_hint="attention_finalize_phase_spmd"):
             for final_work_id in pl.range(
                 final_core,
