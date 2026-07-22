@@ -34,7 +34,6 @@ HIDDEN]` packed group per window to preserve the batch-16 prefill schedule.
 The per-token `valid_tok` + `valid_shape` pattern still handles sequence-length
 variation inside each window.
 """
-
 import pypto.language as pl
 
 from config import (
@@ -873,9 +872,7 @@ def prefill_layer(
                                 cos_hi = pl.slice(cos_row, [1, HALF_DIM], [0, HALF_DIM])
                                 sin_lo = pl.slice(sin_row, [1, HALF_DIM], [0, 0])
                                 sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
-                                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [slot_token_p0 + ti]), pl.INDEX)
-                                cache_slot_block = cache_slot // BLOCK_SIZE
-                                cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
+                                cache_slot_raw = pl.tensor.read(slot_mapping, [slot_token_p0 + ti])
                                 q_block_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD
                                 for ki in pl.range(NUM_KV_HEADS):
                                     kv_col = ki * HEAD_DIM
@@ -904,31 +901,35 @@ def prefill_layer(
                                         pl.col_expand_mul(k_hi, cos_hi),
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
-                                    cache_row = (
-                                        layer_cache_base + cache_slot_block * BLOCK_SIZE + cache_slot_offset
-                                    )
-                                    cache_col = ki * HEAD_DIM
-                                    k_cache_bsnd = pl.assemble(
-                                        k_cache_bsnd,
-                                        pl.cast(rot_lo, target_type=pl.BF16),
-                                        [cache_row, cache_col],
-                                    )
-                                    k_cache_bsnd = pl.assemble(
-                                        k_cache_bsnd,
-                                        pl.cast(rot_hi, target_type=pl.BF16),
-                                        [cache_row, cache_col + HALF_DIM],
-                                    )
-                                    v_cache_bsnd = pl.assemble(
-                                        v_cache_bsnd,
-                                        pl.cast(
-                                            pl.reshape(
-                                                pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM]),
-                                                [1, HEAD_DIM],
+                                    if cache_slot_raw >= 0:
+                                        cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
+                                        cache_slot_block = cache_slot // BLOCK_SIZE
+                                        cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
+                                        cache_row = (
+                                            layer_cache_base + cache_slot_block * BLOCK_SIZE + cache_slot_offset
+                                        )
+                                        cache_col = ki * HEAD_DIM
+                                        k_cache_bsnd = pl.assemble(
+                                            k_cache_bsnd,
+                                            pl.cast(rot_lo, target_type=pl.BF16),
+                                            [cache_row, cache_col],
+                                        )
+                                        k_cache_bsnd = pl.assemble(
+                                            k_cache_bsnd,
+                                            pl.cast(rot_hi, target_type=pl.BF16),
+                                            [cache_row, cache_col + HALF_DIM],
+                                        )
+                                        v_cache_bsnd = pl.assemble(
+                                            v_cache_bsnd,
+                                            pl.cast(
+                                                pl.reshape(
+                                                    pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM]),
+                                                    [1, HEAD_DIM],
+                                                ),
+                                                target_type=pl.BF16,
                                             ),
-                                            target_type=pl.BF16,
-                                        ),
-                                        [cache_row, cache_col],
-                                    )
+                                            [cache_row, cache_col],
+                                        )
                                     q_base = ki * Q_PER_KV
                                     q_block_raw = pl.reshape(
                                         pl.slice(q_proj_tile, [1, Q_HEAD_BATCH * HEAD_DIM], [ti, q_base * HEAD_DIM]),
@@ -1799,6 +1800,8 @@ def golden_qwen3_14b_prefill(tensors):
             ], dim=-1).to(torch.bfloat16)
             for pos in range(S):
                 slot = int(slot_mapping[token_base + pos].item())
+                if slot < 0:
+                    continue
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
                 for ki in range(num_kv_heads):
@@ -1810,6 +1813,8 @@ def golden_qwen3_14b_prefill(tensors):
             v_row_bf16 = v_proj_f.view(S, num_kv_heads, head_dim).to(torch.bfloat16)
             for pos in range(S):
                 slot = int(slot_mapping[token_base + pos].item())
+                if slot < 0:
+                    continue
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
                 for ki in range(num_kv_heads):
