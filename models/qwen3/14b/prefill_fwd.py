@@ -980,7 +980,7 @@ def prefill_layer(
                         block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + 1
                         q_lens = pl.create_tensor([1], dtype=pl.INT32)
                         kv_lens = pl.create_tensor([1], dtype=pl.INT32)
-                        pl.tensor.write(q_lens, [0], 1)
+                        pl.tensor.write(q_lens, [0], pl.cast(1, target_type=pl.INT32))
                         pl.tensor.write(kv_lens, [0], pl.cast(block_ctx_len, pl.INT32))
                         pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
                         pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
