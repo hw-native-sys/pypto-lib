@@ -313,7 +313,11 @@ def prefill_layer_tq(
                 ctx_blocks = (ctx_len + SEQ_TILE - 1) // SEQ_TILE
 
                 # Scatter quantized K/V from temp tiles to cache.
-                cache_slot_raw = pl.tensor.read(slot_mapping, [token_base + pos])
+                cache_slot = pl.cast(
+                    pl.tensor.read(slot_mapping, [token_base + pos]), pl.INDEX,
+                )
+                cache_slot_block = cache_slot // BLOCK_SIZE
+                cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
 
                 # RoPE cos/sin for this position (used by Q RoPE).
                 cos_row = pl.slice(rope_cos, [1, HEAD_DIM], [pos, 0])
@@ -324,33 +328,29 @@ def prefill_layer_tq(
                 sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
 
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
-                    if cache_slot_raw >= 0:
-                        cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
-                        cache_slot_block = cache_slot // BLOCK_SIZE
-                        cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
-                        for ki in pl.range(NUM_KV_HEADS):
-                            fp_cache_row = (
+                    for ki in pl.range(NUM_KV_HEADS):
+                        fp_cache_row = (
                                 (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE
                                 + cache_slot_offset
-                            )
+                        )
+                        kv_col = ki * HALF_DIM
 
-                            # Quantized K/V: scatter to quant cache (absolute offset).
-                            # Attention reads dequantized K/V from this cache (no FP path).
-                            # Index temps are nibble-packed, so each head is HALF_DIM wide.
-                            cache_row = layer_cache_base + fp_cache_row
-                            kv_col = ki * HALF_DIM
-                            quant_k_row = pl.slice(quant_k_temp, [1, HALF_DIM], [ti, kv_col])
-                            quant_k_cache = pl.assemble(
-                                quant_k_cache, quant_k_row, [cache_row, 0],
-                            )
-                            k_scale = pl.read(k_scales_buf, [ti, ki])
-                            quant_k_scales = pl.write(quant_k_scales, [cache_row, 0], k_scale)
-                            quant_v_row = pl.slice(quant_v_temp, [1, HALF_DIM], [ti, kv_col])
-                            quant_v_cache = pl.assemble(
-                                quant_v_cache, quant_v_row, [cache_row, 0],
-                            )
-                            v_scale = pl.read(v_scales_buf, [ti, ki])
-                            quant_v_scales = pl.write(quant_v_scales, [cache_row, 0], v_scale)
+                        # Quantized K/V: scatter to quant cache (absolute offset).
+                        # Attention reads dequantized K/V from this cache (no FP path).
+                        # Index temps are nibble-packed, so each head is HALF_DIM wide.
+                        cache_row = layer_cache_base + fp_cache_row
+                        quant_k_row = pl.slice(quant_k_temp, [1, HALF_DIM], [ti, kv_col])
+                        quant_k_cache = pl.assemble(
+                            quant_k_cache, quant_k_row, [cache_row, 0],
+                        )
+                        k_scale = pl.read(k_scales_buf, [ti, ki])
+                        quant_k_scales = pl.write(quant_k_scales, [cache_row, 0], k_scale)
+                        quant_v_row = pl.slice(quant_v_temp, [1, HALF_DIM], [ti, kv_col])
+                        quant_v_cache = pl.assemble(
+                            quant_v_cache, quant_v_row, [cache_row, 0],
+                        )
+                        v_scale = pl.read(v_scales_buf, [ti, ki])
+                        quant_v_scales = pl.write(quant_v_scales, [cache_row, 0], v_scale)
                 # Q RoPE + pad (per-token, position-dependent).
                 all_q_padded = pl.create_tensor(
                     [TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM], dtype=pl.BF16,
@@ -1186,8 +1186,6 @@ def golden_qwen3_14b_prefill_tq(tensors):
             # Write compressed K/V to cache.
             for pos in range(S):
                 slot = int(slot_mapping[token_base + pos].item())
-                if slot < 0:
-                    continue
                 slot_block = slot // BLOCK_SIZE
                 slot_offset = slot % BLOCK_SIZE
                 for ki in range(num_kv_heads):

@@ -353,7 +353,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             b = g_idx % BATCH
             ctx_len = pl.read(seq_lens, [b])
             pos = ctx_len - 1  # absolute position -> RoPE cos/sin row (NOT the cache row)
-            wr_slot_raw = pl.tensor.read(slot_mapping, [b])
+            wr_slot = pl.cast(pl.tensor.read(slot_mapping, [b]), pl.INDEX)
+            wr_slot_block = wr_slot // BLOCK_SIZE
+            wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
             cos_lo = rope_cos[pos : pos + 1, 0:HALF_DIM]
             cos_hi = rope_cos[pos : pos + 1, HALF_DIM:HEAD_DIM]
             sin_lo = rope_sin[pos : pos + 1, 0:HALF_DIM]
@@ -364,6 +366,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             k_hi = k_full[:, HALF_DIM:HEAD_DIM]
             rot_lo = pl.sub(pl.mul(k_lo, cos_lo), pl.mul(k_hi, sin_lo))
             rot_hi = pl.add(pl.mul(k_hi, cos_hi), pl.mul(k_lo, sin_hi))
+            cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
             v_row_fp32 = v_proj_norm[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM]
             k_rot_fp32_lo = rot_lo
             k_rot_fp32_hi = rot_hi
@@ -393,6 +396,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 pl.full([1, HALF_DIM], dtype=pl.INT32, value=127),
             )
             kq_hi_i8 = pl.cast(pl.cast(kq_hi_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
+            k_cache = pl.assemble(k_cache, kq_lo_i8, [cache_row, 0])
+            k_cache = pl.assemble(k_cache, kq_hi_i8, [cache_row, HALF_DIM])
+            pl.tensor.write(k_cache_scale, [cache_row, 0], k_cache_scale_fp32)
             v_abs = pl.maximum(v_row_fp32, pl.neg(v_row_fp32))
             v_abs_groups = pl.reshape(v_abs, [16, 8])
             v_cache_amax_parts = pl.row_max(v_abs_groups)
@@ -408,16 +414,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 pl.full([1, HEAD_DIM], dtype=pl.INT32, value=127),
             )
             vq_i8 = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-            if wr_slot_raw >= 0:
-                wr_slot = pl.cast(wr_slot_raw, pl.INDEX)
-                wr_slot_block = wr_slot // BLOCK_SIZE
-                wr_slot_offset = wr_slot - wr_slot_block * BLOCK_SIZE
-                cache_row = layer_cache_base + (wr_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + wr_slot_offset
-                k_cache = pl.assemble(k_cache, kq_lo_i8, [cache_row, 0])
-                k_cache = pl.assemble(k_cache, kq_hi_i8, [cache_row, HALF_DIM])
-                pl.tensor.write(k_cache_scale, [cache_row, 0], k_cache_scale_fp32)
-                v_cache = pl.assemble(v_cache, vq_i8, [cache_row, 0])
-                pl.tensor.write(v_cache_scale, [cache_row, 0], v_cache_scale_fp32)
+            v_cache = pl.assemble(v_cache, vq_i8, [cache_row, 0])
+            pl.tensor.write(v_cache_scale, [cache_row, 0], v_cache_scale_fp32)
 
             q_base = ki * Q_PER_KV
             q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
