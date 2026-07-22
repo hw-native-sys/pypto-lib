@@ -359,9 +359,6 @@ jobs:
           pypto-lib-checkout-path: checkout
           pypto-serving-checkout-path: serving-checkout
           model-name: qwen3-14b
-          pto2-ring-dep-pool: "131072"
-          pto2-ring-task-window: "131072"
-          pto2-ring-heap: "4294967296"
 
       - name: Run pypto-serving DeepSeek V4 tests
         if: needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
