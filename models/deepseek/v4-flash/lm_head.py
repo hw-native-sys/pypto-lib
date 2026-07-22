@@ -494,7 +494,7 @@ def finish_logits_decoupled(
 @pl.jit.incore
 def select_hidden_rows(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
-    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE], pl.INT32],
     logit_row_indices: pl.Tensor[[OWNER_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[OWNER_SIZE], pl.INT32],
     selected_hidden: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, D], pl.BF16]],
@@ -502,7 +502,7 @@ def select_hidden_rows(
 ) -> pl.Tensor[[MAX_LOGIT_ROWS, D], pl.BF16]:
     hidden_rows = pl.tensor.dim(hidden_states, 0)
     active_tokens = pl.max(
-        pl.min(pl.read(num_tokens_per_owner, [owner_rank, 0]), hidden_rows), 0,
+        pl.min(pl.read(num_tokens_per_owner, [owner_rank]), hidden_rows), 0,
     )
     active_rows = pl.max(pl.min(pl.read(num_logit_rows, [owner_rank]), MAX_LOGIT_ROWS), 0)
     for row in pl.range(MAX_LOGIT_ROWS):
@@ -566,7 +566,7 @@ def lm_head_logits_route_decoupled_worker(
 @pl.jit
 def lm_head_selected_publish_decoupled_worker(
     hidden_states: pl.Tensor[[PREFILL_TOKENS, D], pl.BF16],
-    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE], pl.INT32],
     logit_row_indices: pl.Tensor[[OWNER_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[OWNER_SIZE], pl.INT32],
     hidden_window: pld.DistributedTensor[[T_MAX, D], pl.BF16],
@@ -587,7 +587,7 @@ def lm_head_selected_publish_decoupled_worker(
 @pl.jit
 def lm_head_decode_selected_publish_decoupled_worker(
     hidden_states: pl.Tensor[[DECODE_TOKENS, D], pl.BF16],
-    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE], pl.INT32],
     logit_row_indices: pl.Tensor[[OWNER_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[OWNER_SIZE], pl.INT32],
     hidden_window: pld.DistributedTensor[[T_MAX, D], pl.BF16],
@@ -652,7 +652,7 @@ def l3_prefill_lm_head(
     hidden_states: pl.Tensor[[OWNER_SIZE, PREFILL_TOKENS, D], pl.BF16],
     lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[OWNER_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[OWNER_SIZE], pl.INT32],
     logit_row_indices: pl.Tensor[[OWNER_SIZE, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[OWNER_SIZE], pl.INT32],
 ):
@@ -736,7 +736,7 @@ def golden_prefill_lm_head(tensors):
     for owner_rank in range(hidden.shape[0]):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
         active_tokens = max(
-            min(int(tensors["num_tokens_per_owner"][owner_rank, 0]), hidden.shape[1]), 0,
+            min(int(tensors["num_tokens_per_owner"][owner_rank]), hidden.shape[1]), 0,
         )
         active_rows = max(min(int(tensors["num_logit_rows"][owner_rank]), MAX_LOGIT_ROWS), 0)
         for row in range(active_rows):
@@ -834,9 +834,9 @@ def build_prefill_tensor_specs(num_tokens=PREFILL_TOKENS):
         ),
         TensorSpec(
             "num_tokens_per_owner",
-            [OWNER_SIZE, 1],
+            [OWNER_SIZE],
             torch.int32,
-            init_value=lambda: torch.full((OWNER_SIZE, 1), num_tokens, dtype=torch.int32),
+            init_value=lambda: torch.full((OWNER_SIZE,), num_tokens, dtype=torch.int32),
         ),
         TensorSpec(
             "logit_row_indices",

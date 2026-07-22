@@ -228,8 +228,8 @@ RESIDENT_CACHE_NAMES = frozenset(CACHE_NAMES)
 RESIDENT_CACHE_OUTPUT_NAMES = RESIDENT_CACHE_NAMES
 
 
-@pl.jit.inline(auto_scope=False)
-def prefill_fwd_core(
+@pl.jit(auto_scope=False)
+def prefill_fwd(
     x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
@@ -318,10 +318,10 @@ def prefill_fwd_core(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
+    nt: pl.Scalar[pl.INT32] = pl.read(num_tokens_per_owner, [my_rank])
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
@@ -710,382 +710,8 @@ def prefill_fwd_core(
     return x_out
 
 
-@pl.jit(auto_scope=False)
-def prefill_fwd(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
-    gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    cmp_kv: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_wgate: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_ape: pl.Tensor[[HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
-    hca_cmp_norm_w: pl.Tensor[[HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[pl.Tensor[[HCA_NUM_LAYERS * HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_cmp_wkv: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_wgate: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_cmp_norm_w: pl.Tensor[[CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_hadamard_idx: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    csa_inner_norm_w: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
-    idx_kv_cache: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[1], pl.FP32],
-    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    final_norm_w: pl.Tensor[[D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
-    gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
-    tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
-    return prefill_fwd_core(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        kv_cache,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        cmp_kv,
-        hca_cmp_wkv,
-        hca_cmp_wgate,
-        hca_cmp_ape,
-        hca_cmp_norm_w,
-        hca_compress_state,
-        csa_cmp_wkv,
-        csa_cmp_wgate,
-        csa_cmp_ape,
-        csa_cmp_norm_w,
-        csa_compress_state,
-        csa_hadamard_idx,
-        csa_idx_wq_b,
-        csa_idx_wq_b_scale,
-        csa_weights_proj,
-        csa_inner_wkv,
-        csa_inner_wgate,
-        csa_inner_ape,
-        csa_inner_norm_w,
-        csa_inner_compress_state,
-        idx_kv_cache,
-        idx_kv_scale,
-        hca_compress_state_block_table,
-        csa_compress_state_block_table,
-        csa_inner_compress_state_block_table,
-        freqs_cos,
-        freqs_sin,
-        ori_block_table,
-        cmp_block_table,
-        idx_block_table,
-        ori_slot_mapping,
-        position_ids,
-        input_ids,
-        hca_cmp_slot_mapping,
-        hca_state_slot_mapping,
-        csa_cmp_slot_mapping,
-        csa_idx_slot_mapping,
-        csa_state_slot_mapping,
-        csa_inner_state_slot_mapping,
-        hc_head_fn,
-        hc_head_scale,
-        hc_head_base,
-        final_norm_w,
-        pre_hc_hidden_out,
-        x_out,
-        recv_meta,
-        recv_x,
-        recv_aux,
-        recv_route,
-        arrived,
-        data_arrived,
-        routed_y_buf,
-        combine_arrived,
-        hc_ffn_fn,
-        hc_ffn_scale,
-        hc_ffn_base,
-        norm_w,
-        gate_w,
-        gate_bias,
-        tid2eid,
-        routed_w1,
-        routed_w1_scale,
-        routed_w3,
-        routed_w3_scale,
-        routed_w2,
-        routed_w2_scale,
-        shared_w1,
-        shared_w1_scale,
-        shared_w3,
-        shared_w3_scale,
-        shared_w2,
-        shared_w2_scale,
-        my_rank,
-        num_tokens,
-    )
-
-
-@pl.jit(auto_scope=False)
-def prefill_fwd_owner_tokens(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
-    hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
-    gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    cmp_kv: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_wgate: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_ape: pl.Tensor[[HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
-    hca_cmp_norm_w: pl.Tensor[[HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[pl.Tensor[[HCA_NUM_LAYERS * HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_cmp_wkv: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_wgate: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_cmp_norm_w: pl.Tensor[[CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_hadamard_idx: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    csa_inner_norm_w: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
-    idx_kv_cache: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
-    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[1], pl.FP32],
-    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    final_norm_w: pl.Tensor[[D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    hc_ffn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[FWD_NUM_LAYERS * D], pl.BF16],
-    gate_w: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
-    gate_bias: pl.Tensor[[FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
-    tid2eid: pl.Tensor[[FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    num_tokens: pl.Tensor[[1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
-    return prefill_fwd_core(
-        x_hc,
-        hc_attn_fn,
-        hc_attn_scale,
-        hc_attn_base,
-        attn_norm_w,
-        wq_a,
-        wq_b,
-        wq_b_scale,
-        wkv,
-        gamma_cq,
-        gamma_ckv,
-        kv_cache,
-        attn_sink,
-        wo_a,
-        wo_b,
-        wo_b_scale,
-        cmp_kv,
-        hca_cmp_wkv,
-        hca_cmp_wgate,
-        hca_cmp_ape,
-        hca_cmp_norm_w,
-        hca_compress_state,
-        csa_cmp_wkv,
-        csa_cmp_wgate,
-        csa_cmp_ape,
-        csa_cmp_norm_w,
-        csa_compress_state,
-        csa_hadamard_idx,
-        csa_idx_wq_b,
-        csa_idx_wq_b_scale,
-        csa_weights_proj,
-        csa_inner_wkv,
-        csa_inner_wgate,
-        csa_inner_ape,
-        csa_inner_norm_w,
-        csa_inner_compress_state,
-        idx_kv_cache,
-        idx_kv_scale,
-        hca_compress_state_block_table,
-        csa_compress_state_block_table,
-        csa_inner_compress_state_block_table,
-        freqs_cos,
-        freqs_sin,
-        ori_block_table,
-        cmp_block_table,
-        idx_block_table,
-        ori_slot_mapping,
-        position_ids,
-        input_ids,
-        hca_cmp_slot_mapping,
-        hca_state_slot_mapping,
-        csa_cmp_slot_mapping,
-        csa_idx_slot_mapping,
-        csa_state_slot_mapping,
-        csa_inner_state_slot_mapping,
-        hc_head_fn,
-        hc_head_scale,
-        hc_head_base,
-        final_norm_w,
-        pre_hc_hidden_out,
-        x_out,
-        recv_meta,
-        recv_x,
-        recv_aux,
-        recv_route,
-        arrived,
-        data_arrived,
-        routed_y_buf,
-        combine_arrived,
-        hc_ffn_fn,
-        hc_ffn_scale,
-        hc_ffn_base,
-        norm_w,
-        gate_w,
-        gate_bias,
-        tid2eid,
-        routed_w1,
-        routed_w1_scale,
-        routed_w3,
-        routed_w3_scale,
-        routed_w2,
-        routed_w2_scale,
-        shared_w1,
-        shared_w1_scale,
-        shared_w3,
-        shared_w3_scale,
-        shared_w2,
-        shared_w2_scale,
-        my_rank,
-        pl.read(num_tokens, [0]),
-    )
-
-
 @pl.jit.host
-def l3_prefill_fwd_with_lm_head(
+def l3_prefill_fwd(
     x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
@@ -1168,7 +794,7 @@ def l3_prefill_fwd_with_lm_head(
     lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
-    num_tokens_per_owner: pl.Tensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
@@ -1183,180 +809,6 @@ def l3_prefill_fwd_with_lm_head(
     tp_logits_shards = pl.create_tensor(
         [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
     )
-
-    for r in pl.range(pld.world_size()):
-        recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        prefill_fwd_owner_tokens(
-            x_hc[r],
-            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
-            wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r],
-            kv_cache[r], attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r], cmp_kv[r],
-            hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r], hca_cmp_norm_w[r],
-            hca_compress_state[r],
-            csa_cmp_wkv[r], csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r],
-            csa_compress_state[r],
-            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r],
-            csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
-            csa_inner_compress_state[r], idx_kv_cache[r], idx_kv_scale[r],
-            hca_compress_state_block_table[r], csa_compress_state_block_table[r],
-            csa_inner_compress_state_block_table[r],
-            freqs_cos[r], freqs_sin[r],
-            ori_block_table[r], cmp_block_table[r], idx_block_table[r],
-            ori_slot_mapping[r], position_ids[r], input_ids[r],
-            hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
-            csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
-            csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r],
-            hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
-            pre_hc_hidden_out[r],
-            hidden_out[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r],
-            gate_w[r], gate_bias[r], tid2eid[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
-            routed_w2[r], routed_w2_scale[r],
-            shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
-            shared_w2[r], shared_w2_scale[r],
-            num_tokens_per_owner[r], r,
-            device=r,
-        )
-
-    for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        lm_head_selected_publish_decoupled_worker(
-            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
-            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(LM_HEAD_TP_SIZE):
-        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        lm_head_tp_decoupled_worker(
-            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
-            r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(LM_HEAD_TP_SIZE):
-        logits_window = pld.window(
-            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
-        )
-        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_logits_route_decoupled_worker(
-            tp_logits_shards[r], logits_window, logits_done,
-            r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(pld.world_size()):
-        logits_window = pld.window(
-            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
-        )
-        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_finish_decoupled_worker(
-            logits[r], logits_window, logits_done,
-            r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-
-@pl.jit.host
-def l3_prefill_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
-    hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.BF16],
-    wq_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H * HEAD_DIM], pl.FP32],
-    wkv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
-    gamma_cq: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA], pl.BF16],
-    gamma_ckv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    attn_sink: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H], pl.FP32],
-    wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
-    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
-    hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
-    hca_cmp_norm_w: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
-    csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_cmp_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
-    csa_hadamard_idx: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
-    csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
-    csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
-    csa_weights_proj: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * D, IDX_N_HEADS], pl.BF16],
-    csa_inner_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
-    csa_inner_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
-    hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
-    hc_ffn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.BF16],
-    gate_w: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_EXPERTS_GLOBAL], pl.FP32],
-    tid2eid: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * VOCAB, TOPK], pl.INT32],
-    routed_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
-    shared_w2_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
-    hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
-    hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
-    final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
-    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
-):
-    recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
-    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
-    recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)
-    recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)
-    arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    data_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
-    routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)
-    combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -1398,10 +850,45 @@ def l3_prefill_fwd(
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
-            r, num_tokens,
+            num_tokens_per_owner, r,
             device=r,
         )
 
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_selected_publish_decoupled_worker(
+            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
+            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_tp_decoupled_worker(
+            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_route_decoupled_worker(
+            tp_logits_shards[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_finish_decoupled_worker(
+            logits[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1868,10 +1355,10 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         is_output=True,
     ))
     specs.append(TensorSpec(
-            "num_tokens_per_owner",
-            [N_RANKS, 1],
-            torch.int32,
-            init_value=lambda: torch.full((N_RANKS, 1), num_tokens, dtype=torch.int32),
+        "num_tokens_per_owner",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
     ))
     specs.append(TensorSpec(
         "logit_row_indices",
@@ -1921,7 +1408,7 @@ def main():
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
 
     result = run_jit(
-        fn=l3_prefill_fwd_with_lm_head,
+        fn=l3_prefill_fwd,
         specs=specs,
         golden_fn=None,
         compile_only=args.compile_only,
