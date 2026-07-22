@@ -105,6 +105,11 @@ ATTN_TOK_GROUP = 8
 ATTN_GI_GROUP = 1
 FINALIZE_SPMD_BLOCKS = 48
 FINALIZE_TOK_GROUP = TOK_TILE
+CAUSAL_MASK_ROW_TILE = 16
+CAUSAL_MASK_COL_TILE = 128
+CAUSAL_MASK_COL_BLOCKS = PA_CAUSAL_MASK_SIZE // CAUSAL_MASK_COL_TILE
+CAUSAL_MASK_WORK_ITEMS = (PA_CAUSAL_MASK_SIZE // CAUSAL_MASK_ROW_TILE) * CAUSAL_MASK_COL_BLOCKS
+CAUSAL_MASK_INIT_SPMD_BLOCKS = 32
 Q_HEAD_BATCH_PAD = 16
 ATTN_GI_SCORE_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_PAD
 ATTN_GI_STAT_ROWS = ATTN_TOK_GROUP * ATTN_GI_GROUP * Q_HEAD_BATCH_PAD
@@ -675,6 +680,27 @@ def _attention_phase_window_full_single_block(
                 [ti, q_base * HEAD_DIM],
             )
     return attn_tile, cur_li_phase, oi_tmp_phase
+
+
+@pl.jit.inline(auto_scope=False)
+def init_prefill_causal_mask(
+    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
+) -> pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8]:
+    for mask_core in pl.spmd(CAUSAL_MASK_INIT_SPMD_BLOCKS, name_hint="init_prefill_causal_mask"):
+        for work_id in pl.range(mask_core, CAUSAL_MASK_WORK_ITEMS, CAUSAL_MASK_INIT_SPMD_BLOCKS):
+            row_block = work_id // CAUSAL_MASK_COL_BLOCKS
+            col_block = work_id - row_block * CAUSAL_MASK_COL_BLOCKS
+            row0 = row_block * CAUSAL_MASK_ROW_TILE
+            col0 = col_block * CAUSAL_MASK_COL_TILE
+            col_ids = pl.add(
+                pl.arange(0, [1, CAUSAL_MASK_COL_TILE], dtype=pl.INT32),
+                pl.cast(col0, pl.INT32),
+            )
+            for rel_row in pl.range(CAUSAL_MASK_ROW_TILE):
+                row_i32 = pl.cast(row0 + rel_row, pl.INT32)
+                mask_row = pl.cast(pl.cmp(col_ids, row_i32, cmp_type=4), target_type=pl.INT8)
+                causal_mask = pl.assemble(causal_mask, mask_row, [row0 + rel_row, col0])
+    return causal_mask
 
 
 @pl.jit.inline(auto_scope=False)
@@ -1251,7 +1277,6 @@ def prefill_fwd(
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    causal_mask: pl.Tensor[[PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], pl.INT8],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
@@ -1276,6 +1301,8 @@ def prefill_fwd(
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
 
     final_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    causal_mask = pl.create_tensor([PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], dtype=pl.INT8)
+    causal_mask = init_prefill_causal_mask(causal_mask)
 
     max_chunk_len = pl.tensor.read(chunk_lens, [0])
     for b in pl.range(1, user_batch):
@@ -1591,12 +1618,6 @@ def build_tensor_specs(
     def init_embed_weight():
         return torch.rand(vocab, hidden_size) - 0.5
 
-    def init_causal_mask():
-        return torch.triu(
-            torch.ones((PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE), dtype=torch.int8),
-            diagonal=1,
-        )
-
     return [
         TensorSpec("input_ids", [total_tokens], torch.int32, init_value=init_input_ids),
         TensorSpec("seq_lens", [batch], torch.int32, init_value=init_seq_lens),
@@ -1626,8 +1647,6 @@ def build_tensor_specs(
                    init_value=init_k_cache),
         TensorSpec("v_cache", [cache_rows, head_dim], torch.bfloat16,
                    init_value=init_v_cache),
-        TensorSpec("causal_mask", [PA_CAUSAL_MASK_SIZE, PA_CAUSAL_MASK_SIZE], torch.int8,
-                   init_value=init_causal_mask),
         TensorSpec("wo", [num_layers * hidden_size, hidden_size], torch.bfloat16,
                    init_value=init_wo),
         TensorSpec("post_rms_weight", [num_layers, hidden_size], torch.float32,
