@@ -866,11 +866,13 @@ def prefill_layer(
                 for final_ti0 in pl.range(0, valid_tok, PREFILL_FA_QUERY_GROUP):
                     with pl.scope():
                         finalize_tok = pl.min(PREFILL_FA_QUERY_GROUP, valid_tok - final_ti0)
-                        q_tnd_group_flat = pl.full(
+                        q_tnd_group_flat = pl.create_tensor(
                             [PREFILL_FA_QUERY_GROUP * NUM_HEADS, HEAD_DIM],
                             dtype=pl.BF16,
-                            value=0.0,
                         )
+                        q_zero = pl.full([NUM_HEADS, HEAD_DIM], dtype=pl.BF16, value=0.0)
+                        for qg in pl.range(PREFILL_FA_QUERY_GROUP):
+                            q_tnd_group_flat = pl.assemble(q_tnd_group_flat, q_zero, [qg * NUM_HEADS, 0])
                         for rope_core in pl.spmd(ROPE_SPMD_BLOCKS, name_hint="rope_kv_cache"):
                             for rel_ti in pl.range(rope_core, finalize_tok, ROPE_SPMD_BLOCKS):
                                 ti = final_ti0 + rel_ti
