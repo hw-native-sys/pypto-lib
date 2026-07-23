@@ -330,9 +330,7 @@ def prefill_layer(
                                 all_q_padded = pl.assemble(
                                     all_q_padded, pl.cast(pl.full([Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM], dtype=pl.FP32, value=0.0), target_type=pl.BF16), [gi * Q_HEAD_PAD + Q_HEAD_BATCH, 0]
                                 )
-                        cache_slot = pl.cast(pl.tensor.read(slot_mapping, [token_base + chunk_pos]), pl.INDEX)
-                        cache_slot_block = cache_slot // BLOCK_SIZE
-                        cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
+                        cache_slot_raw = pl.tensor.read(slot_mapping, [token_base + chunk_pos])
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_kv_cache"):
                             for ki in pl.unroll(NUM_KV_HEADS):
                                     kv_col = ki * HEAD_DIM
@@ -346,7 +344,6 @@ def prefill_layer(
                                         pl.col_expand_mul(k_hi, cos_hi),
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
-                                    cache_row = layer_cache_base + (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + cache_slot_offset
                                     rot_abs_lo = pl.maximum(rot_lo, pl.neg(rot_lo))
                                     rot_abs_hi = pl.maximum(rot_hi, pl.neg(rot_hi))
                                     rot_abs_lo_groups = pl.reshape(rot_abs_lo, [8, 8])
@@ -370,11 +367,8 @@ def prefill_layer(
                                     )
                                     kq_lo = pl.cast(pl.cast(kq_lo_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
                                     kq_hi = pl.cast(pl.cast(kq_hi_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-                                    k_cache = pl.assemble(k_cache, kq_lo, [cache_row, 0])
-                                    k_cache = pl.assemble(k_cache, kq_hi, [cache_row, HALF_DIM])
                                     k_scale_value = k_amax_scalar / INT8_SCALE_MAX
                                     k_scale_out = pl.mul(pl.full([1, 8], dtype=pl.FP32, value=1.0), k_scale_value)
-                                    k_cache_scale = pl.assemble(k_cache_scale, k_scale_out, [cache_row, 0])
                                     v_row_f = pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM])
                                     v_abs = pl.maximum(v_row_f, pl.neg(v_row_f))
                                     v_abs_groups = pl.reshape(v_abs, [16, 8])
@@ -389,10 +383,22 @@ def prefill_layer(
                                         pl.full([1, HEAD_DIM], dtype=pl.INT32, value=127),
                                     )
                                     vq = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-                                    v_cache = pl.assemble(v_cache, vq, [cache_row, 0])
                                     v_scale_value = v_amax_scalar / INT8_SCALE_MAX
                                     v_scale_out = pl.mul(pl.full([1, 8], dtype=pl.FP32, value=1.0), v_scale_value)
-                                    v_cache_scale = pl.assemble(v_cache_scale, v_scale_out, [cache_row, 0])
+                                    if cache_slot_raw >= 0:
+                                        cache_slot = pl.cast(cache_slot_raw, pl.INDEX)
+                                        cache_slot_block = cache_slot // BLOCK_SIZE
+                                        cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
+                                        cache_row = (
+                                            layer_cache_base
+                                            + (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE
+                                            + cache_slot_offset
+                                        )
+                                        k_cache = pl.assemble(k_cache, kq_lo, [cache_row, 0])
+                                        k_cache = pl.assemble(k_cache, kq_hi, [cache_row, HALF_DIM])
+                                        k_cache_scale = pl.assemble(k_cache_scale, k_scale_out, [cache_row, 0])
+                                        v_cache = pl.assemble(v_cache, vq, [cache_row, 0])
+                                        v_cache_scale = pl.assemble(v_cache_scale, v_scale_out, [cache_row, 0])
                                     q_base = ki * Q_PER_KV
                                     for qi in pl.unroll(Q_HEAD_BATCH):
                                         q_col = (q_base + qi) * HEAD_DIM

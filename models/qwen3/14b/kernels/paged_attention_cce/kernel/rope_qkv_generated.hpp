@@ -1,9 +1,10 @@
 // Copyright (c) PyPTO Contributors. CANN Open Software License Agreement v2.0.
-// RoPE + QK-norm prologue: the pypto/ptoas-GENERATED rope_qkv kernel, copied
-// verbatim from the decode_fwd rope_qkv scope codegen (golden-correct) and
-// wrapped for reuse inside the fused paged_attention_rope_cce extern. Do not
-// hand-edit the generated body; regenerate from decode_fwd rope_qkv if the
-// math changes. VEC-only (pto Vec tiles); the caller guards the invocation.
+// RoPE + QK-norm prologue: the pypto/ptoas-GENERATED rope_qkv kernel copied
+// from the decode_fwd rope_qkv scope codegen (golden-correct) and wrapped for
+// reuse inside the fused paged_attention_rope_cce extern. The KV cache write
+// sites carry a small hand-maintained slot_mapping < 0 no-write sentinel guard;
+// keep sync/event flow and Q writes outside that guard. Regenerate from
+// decode_fwd rope_qkv, then re-apply the sentinel guard if the math changes.
 #ifndef PYPTO_QWEN_ROPE_QKV_GENERATED_HPP
 #define PYPTO_QWEN_ROPE_QKV_GENERATED_HPP
 
@@ -167,8 +168,6 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       int32_t v89 = v6[v85];
       // pto: %122
       int64_t v90 = (int64_t) ((uint64_t) v84 * (uint64_t) v38);
-      // pto: %126, %118, %125, %127
-      int64_t v91 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v89) * (uint64_t) v26)))) + (uint64_t) v84);
       // pto: %cos_lo_inline82__tile
       Tile<TileType::Vec, float, 1, 64, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v92 = Tile<TileType::Vec, float, 1, 64, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v37, v23);
       // pto: %cos_lo_inline82__tile
@@ -658,23 +657,29 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       pipe_barrier(PIPE_V);
       TCVT(v247, v245, v19, v18);
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
-      // pto: %k_cache__iter_v3_pview
-      pto::Shape<1, 1, 1, 1, 128> v249 = pto::Shape<1, 1, 1, 1, 128>();
-      // pto: %k_cache__iter_v3_pview
-      pto::Stride<128, 128, 128, 128, 1> v250 = pto::Stride<128, 128, 128, 128, 1>();
-      // pto: %k_cache__iter_v3_pview
-      GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v251 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v1 + ((v45 + v91 * v38) + v45 * v37), v249, v250);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       pipe_barrier(PIPE_MTE3);
-      TSTORE(v251, v182);
-      // pto: %v_cache__iter_v3_pview
-      pto::Shape<1, 1, 1, 1, 128> v252 = pto::Shape<1, 1, 1, 1, 128>();
-      // pto: %v_cache__iter_v3_pview
-      pto::Stride<128, 128, 128, 128, 1> v253 = pto::Stride<128, 128, 128, 128, 1>();
-      // pto: %v_cache__iter_v3_pview
-      GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v254 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v3 + ((v45 + v91 * v38) + v45 * v37), v252, v253);
-      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-      TSTORE(v254, v186);
+      if (v89 >= 0) {
+        // pto: %126, %118, %125, %127
+        int64_t v91 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v89) * (uint64_t) v26)))) + (uint64_t) v84);
+        // pto: %k_cache__iter_v3_pview
+        pto::Shape<1, 1, 1, 1, 128> v249 = pto::Shape<1, 1, 1, 1, 128>();
+        // pto: %k_cache__iter_v3_pview
+        pto::Stride<128, 128, 128, 128, 1> v250 = pto::Stride<128, 128, 128, 128, 1>();
+        // pto: %k_cache__iter_v3_pview
+        GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v251 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v1 + ((v45 + v91 * v38) + v45 * v37), v249, v250);
+        TSTORE(v251, v182);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        // pto: %v_cache__iter_v3_pview
+        pto::Shape<1, 1, 1, 1, 128> v252 = pto::Shape<1, 1, 1, 1, 128>();
+        // pto: %v_cache__iter_v3_pview
+        pto::Stride<128, 128, 128, 128, 1> v253 = pto::Stride<128, 128, 128, 128, 1>();
+        // pto: %v_cache__iter_v3_pview
+        GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v254 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v3 + ((v45 + v91 * v38) + v45 * v37), v252, v253);
+        TSTORE(v254, v186);
+      } else {
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+      }
       set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
       // pto: %q_tnd_flat_inline134__iter_v1_pview
       pto::Shape<1, 1, 1, 5, 128> v255 = pto::Shape<1, 1, 1, 5, 128>();
@@ -702,8 +707,6 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       int32_t v263 = v6[v259];
       // pto: %153
       int64_t v264 = (int64_t) ((uint64_t) v258 * (uint64_t) v38);
-      // pto: %157, %149, %156, %158
-      int64_t v265 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v263) * (uint64_t) v26)))) + (uint64_t) v258);
       // pto: %33
       Tile<TileType::Vec, float, 1, 64, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v266 = Tile<TileType::Vec, float, 1, 64, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v37, v23);
       // pto: %33
@@ -1193,23 +1196,29 @@ static __aicore__ void rope_qkv(__gm__ bfloat16_t* v1, __gm__ bfloat16_t* v2, __
       pipe_barrier(PIPE_V);
       TCVT(v421, v419, v19, v18);
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID5);
-      // pto: %k_cache__phi_v6_pview
-      pto::Shape<1, 1, 1, 1, 128> v423 = pto::Shape<1, 1, 1, 1, 128>();
-      // pto: %k_cache__phi_v6_pview
-      pto::Stride<128, 128, 128, 128, 1> v424 = pto::Stride<128, 128, 128, 128, 1>();
-      // pto: %k_cache__phi_v6_pview
-      GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v425 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v1 + ((v45 + v265 * v38) + v45 * v37), v423, v424);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID3);
       pipe_barrier(PIPE_MTE3);
-      TSTORE(v425, v356);
-      // pto: %v_cache__phi_v6_pview
-      pto::Shape<1, 1, 1, 1, 128> v426 = pto::Shape<1, 1, 1, 1, 128>();
-      // pto: %v_cache__phi_v6_pview
-      pto::Stride<128, 128, 128, 128, 1> v427 = pto::Stride<128, 128, 128, 128, 1>();
-      // pto: %v_cache__phi_v6_pview
-      GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v428 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v3 + ((v45 + v265 * v38) + v45 * v37), v426, v427);
-      wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID4);
-      TSTORE(v428, v360);
+      if (v263 >= 0) {
+        // pto: %157, %149, %156, %158
+        int64_t v265 = (int64_t) ((uint64_t) ((int64_t) ((uint64_t) v14 + (uint64_t) ((int64_t) ((uint64_t) ((int64_t) v263) * (uint64_t) v26)))) + (uint64_t) v258);
+        // pto: %k_cache__phi_v6_pview
+        pto::Shape<1, 1, 1, 1, 128> v423 = pto::Shape<1, 1, 1, 1, 128>();
+        // pto: %k_cache__phi_v6_pview
+        pto::Stride<128, 128, 128, 128, 1> v424 = pto::Stride<128, 128, 128, 128, 1>();
+        // pto: %k_cache__phi_v6_pview
+        GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v425 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v1 + ((v45 + v265 * v38) + v45 * v37), v423, v424);
+        TSTORE(v425, v356);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID4);
+        // pto: %v_cache__phi_v6_pview
+        pto::Shape<1, 1, 1, 1, 128> v426 = pto::Shape<1, 1, 1, 1, 128>();
+        // pto: %v_cache__phi_v6_pview
+        pto::Stride<128, 128, 128, 128, 1> v427 = pto::Stride<128, 128, 128, 128, 1>();
+        // pto: %v_cache__phi_v6_pview
+        GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND> v428 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, 1, 128>, pto::Stride<128, 128, 128, 128, 1>, pto::Layout::ND>(v3 + ((v45 + v265 * v38) + v45 * v37), v426, v427);
+        TSTORE(v428, v360);
+      } else {
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID4);
+      }
       set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
       // pto: %q_tnd_flat_inline134__phi_v4_pview
       pto::Shape<1, 1, 1, 5, 128> v429 = pto::Shape<1, 1, 1, 5, 128>();

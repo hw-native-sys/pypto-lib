@@ -329,8 +329,9 @@ def build_qwen3_14b_decode_program():
                     rp_ctx_len = pl.tensor.read(seq_lens, [b, 0, 0, 0])
                     rp_pos = rp_ctx_len - 1
                     rp_slot = pl.tensor.read(slot_mapping, [b, 0, 0, 0])
-                    rp_slot_block = rp_slot // BLOCK_SIZE
-                    rp_slot_offset = rp_slot - rp_slot_block * BLOCK_SIZE
+                    if rp_slot >= 0:
+                        rp_slot_block = rp_slot // BLOCK_SIZE
+                        rp_slot_offset = rp_slot - rp_slot_block * BLOCK_SIZE
 
                     # Load cos/sin lo and hi halves separately (each into its own
                     # TREG block) instead of loading the full HEAD_DIM row and
@@ -377,8 +378,9 @@ def build_qwen3_14b_decode_program():
                         rp_k_rot_hi_bf16 = pl.tile.set_validshape(rp_k_rot_hi_bf16_pre, 1, HALF_DIM)
                         rp_k_rot_lo_blk = pl.tile.reshape(rp_k_rot_lo_bf16, [1, 1, 1, HALF_DIM])
                         rp_k_rot_hi_blk = pl.tile.reshape(rp_k_rot_hi_bf16, [1, 1, 1, HALF_DIM])
-                        pl.tile.store(rp_k_rot_lo_blk, [rp_slot_block, ki, rp_slot_offset, 0], k_cache)
-                        pl.tile.store(rp_k_rot_hi_blk, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], k_cache)
+                        if rp_slot >= 0:
+                            pl.tile.store(rp_k_rot_lo_blk, [rp_slot_block, ki, rp_slot_offset, 0], k_cache)
+                            pl.tile.store(rp_k_rot_hi_blk, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], k_cache)
 
                         # V head copy -> v_cache (lo/hi MM_N blocks).
                         rp_v_lo_blk = pl.tile.load(v_proj, [rp_kv_blo, 0, b, 0], [1, 1, 1, HALF_DIM])
@@ -387,14 +389,15 @@ def build_qwen3_14b_decode_program():
                         rp_v_lo_bf16_pre = pl.tile.cast(rp_v_lo, target_type=pl.BF16)
                         rp_v_lo_bf16 = pl.tile.set_validshape(rp_v_lo_bf16_pre, 1, HALF_DIM)
                         rp_v_lo_out = pl.tile.reshape(rp_v_lo_bf16, [1, 1, 1, HALF_DIM])
-                        pl.tile.store(rp_v_lo_out, [rp_slot_block, ki, rp_slot_offset, 0], v_cache)
                         rp_v_hi_blk = pl.tile.load(v_proj, [rp_kv_blo + 1, 0, b, 0], [1, 1, 1, HALF_DIM])
                         rp_v_hi_pre = pl.tile.reshape(rp_v_hi_blk, [1, HALF_DIM])
                         rp_v_hi = pl.tile.set_validshape(rp_v_hi_pre, 1, HALF_DIM)
                         rp_v_hi_bf16_pre = pl.tile.cast(rp_v_hi, target_type=pl.BF16)
                         rp_v_hi_bf16 = pl.tile.set_validshape(rp_v_hi_bf16_pre, 1, HALF_DIM)
                         rp_v_hi_out = pl.tile.reshape(rp_v_hi_bf16, [1, 1, 1, HALF_DIM])
-                        pl.tile.store(rp_v_hi_out, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], v_cache)
+                        if rp_slot >= 0:
+                            pl.tile.store(rp_v_lo_out, [rp_slot_block, ki, rp_slot_offset, 0], v_cache)
+                            pl.tile.store(rp_v_hi_out, [rp_slot_block, ki, rp_slot_offset, HALF_DIM], v_cache)
 
                         # Q heads RoPE (one row per head) + zero pad -> all_q_padded.
                         rp_q_base = ki * Q_PER_KV
