@@ -34,8 +34,8 @@ from hc_head import (
     EPS as HC_HEAD_RMS_EPS,
     HC_DIM_INV as HC_HEAD_DIM_INV,
     HC_EPS as HC_HEAD_EPS,
-    LINEAR_K_CHUNK as HC_HEAD_LINEAR_K_CHUNK,
-    RMS_K_CHUNK as HC_HEAD_RMS_K_CHUNK,
+    LINEAR_K_TILE as HC_HEAD_LINEAR_K_TILE,
+    RMS_K_TILE as HC_HEAD_RMS_K_TILE,
     hc_head,
 )
 from moe import (
@@ -438,17 +438,17 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
     hc_head_fn = hc_head_fn.float()
 
     sq_sum = torch.zeros(token_count, 1, dtype=torch.float32)
-    for k0 in range(0, HC_DIM, HC_HEAD_RMS_K_CHUNK):
-        x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_RMS_K_CHUNK]
+    for k0 in range(0, HC_DIM, HC_HEAD_RMS_K_TILE):
+        x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_RMS_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_HEAD_DIM_INV + HC_HEAD_RMS_EPS)
 
     mix_cols = []
     for h in range(HC_MULT):
         mix_col = torch.zeros(token_count, 1, dtype=torch.float32)
-        for k0 in range(0, HC_DIM, HC_HEAD_LINEAR_K_CHUNK):
-            x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_CHUNK]
+        for k0 in range(0, HC_DIM, HC_HEAD_LINEAR_K_TILE):
+            x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_TILE]
+            w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_TILE]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1).reshape(token_count, HC_MULT)
