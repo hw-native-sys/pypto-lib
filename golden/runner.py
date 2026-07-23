@@ -340,10 +340,12 @@ def _is_l3(compiled: Any) -> bool:
     return isinstance(compiled, DistributedCompiledProgram)
 
 
-# Fixed benchmark loop sizes shared by L2 and L3. L3 differs only in its
+# Default benchmark loop sizes shared by L2 and L3, overridable per run via
+# PYPTO_BENCH_ROUNDS / PYPTO_BENCH_WARMUP (see :func:`_bench_loop_sizes`). Daily
+# CI pins the perf baseline by leaving both unset. L3 differs only in its
 # aggregation: each round contributes the fastest valid rank's Effective time.
-_BENCH_ROUNDS = 100
-_BENCH_WARMUP = 5
+_BENCH_ROUNDS_DEFAULT = 100
+_BENCH_WARMUP_DEFAULT = 5
 
 
 def _bench_enabled() -> bool:
@@ -352,11 +354,80 @@ def _bench_enabled() -> bool:
     Benchmarking is entirely env-driven so no model file needs a ``--benchmark``
     flag and ``run_jit`` needs no extra parameters: daily CI's a2a3 job sets
     ``PYPTO_BENCH=1`` and every ``run_jit`` call then times the kernel over
-    :data:`_BENCH_ROUNDS` rounds (:data:`_BENCH_WARMUP` warmup, discarded).
+    :func:`_bench_loop_sizes` rounds (warmup discarded).
     """
     import os
 
     return os.environ.get("PYPTO_BENCH", "").strip() not in ("", "0", "false", "False")
+
+
+def _bench_env_int(name: str, default: int, minimum: int) -> int:
+    """Read env var *name* as an int >= *minimum*, falling back to *default*.
+
+    A malformed or out-of-range value warns and uses the default rather than
+    raising: a mistyped tuning knob must not fail an otherwise good run.
+    """
+    import os
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = minimum - 1
+    if value < minimum:
+        print(
+            f"[RUN]   ignoring {name}={raw!r} (want an integer >= {minimum}); "
+            f"using {default}",
+            flush=True,
+        )
+        return default
+    return value
+
+
+def _bench_loop_sizes() -> tuple[int, int]:
+    """``(rounds, warmup)`` for this run, from the env or the defaults.
+
+    Overriding matters because one size does not fit every kernel: the
+    100-round default is ~0.1 s of device time for a decode step but minutes for
+    a long prefill or a multi-card L3 run, and while iterating on a kernel a
+    handful of rounds is usually enough. Both are read per run (not cached), so
+    a sweep can vary them between :func:`run_jit` calls in one process.
+
+    Daily CI sets neither, so its numbers stay comparable across runs. Warmup is
+    allowed to be 0; rounds must be at least 1.
+    """
+    return (
+        _bench_env_int("PYPTO_BENCH_ROUNDS", _BENCH_ROUNDS_DEFAULT, 1),
+        _bench_env_int("PYPTO_BENCH_WARMUP", _BENCH_WARMUP_DEFAULT, 0),
+    )
+
+
+def _resident_loop_sizes() -> tuple[int, int]:
+    """:func:`_bench_loop_sizes` with ``warmup`` forced to at least 1.
+
+    The resident L3 path spends its first warmup launch on the validation
+    dispatch, so unlike ``benchmark()``'s own loops it cannot honour
+    ``warmup=0``: that would emit ``rounds + 1`` dispatches per rank against a
+    declared ``rounds + 0``, which no longer segments evenly and drops the whole
+    run into the flatten fallback.
+    """
+    rounds, warmup = _bench_loop_sizes()
+    return rounds, max(warmup, 1)
+
+
+def _bench_raw_enabled() -> bool:
+    """True when ``PYPTO_BENCH_RAW`` is set truthy.
+
+    Opt-in companion to :func:`_bench_enabled`, off by default (the raw dump is
+    one line per rank holding every sample). Turn it on when a summary looks
+    suspicious — start-up drift, a bimodal rank, one card lagging — and the
+    individual samples are needed to see the shape.
+    """
+    import os
+
+    return os.environ.get("PYPTO_BENCH_RAW", "").strip() not in ("", "0", "false", "False")
 
 
 def _run_benchmark(
@@ -372,8 +443,8 @@ def _run_benchmark(
 
     L2 single-chip only: delegates to :func:`pypto.runtime.benchmark`, which
     opens one :class:`~pypto.runtime.ChipWorker`, registers *compiled* once, and
-    reads each launch's on-NPU ``device_wall_us`` from the runtime's
-    ``[STRACE]`` markers (simpler PR #1177). Args are reordered to the
+    reads each launch's on-NPU span tree from the runtime's ``[STRACE]``
+    markers (simpler PR #1177). Args are reordered to the
     orchestration parameter order exactly as :func:`_execute_via_runner` does.
     Returns the :class:`~pypto.runtime.BenchmarkStats`, or ``None`` when the
     runtime emits no markers (built without ``SIMPLER_PROFILING``).
@@ -401,6 +472,7 @@ def _run_benchmark(
     if stats is None:
         return None
     _report_effective(stats)
+    _report_raw_samples(stats)
     return stats
 
 
@@ -421,7 +493,7 @@ def _report_effective(stats: Any) -> None:
     """
     if stats.all_zero_device:
         print(
-            "[RUN]   effective_us unavailable: device_wall all 0 "
+            "[RUN]   effective_us unavailable: no device-domain spans "
             "(sim platform or non-profiling build)",
             flush=True,
         )
@@ -438,14 +510,43 @@ def _report_effective(stats: Any) -> None:
         print("[RUN]   effective_us unavailable: no orch/sched spans captured", flush=True)
 
 
+def _report_raw_samples(stats: Any) -> None:
+    """Print every measured dispatch's raw Effective sample, per rank.
+
+    No-op unless :func:`_bench_raw_enabled` (``PYPTO_BENCH_RAW``). Reads
+    :attr:`BenchmarkStats.invocations` — the flat per-dispatch list — rather than
+    the per-round grid, so it works for L2 (one rank, one dispatch per round),
+    for L3, and for the L3 flatten fallback where ``per_rank`` returns ``{}`` and
+    the summary lines are the least trustworthy.
+
+    Samples are in ``inv`` order (warmup already dropped), so the sequence shows
+    drift directly. The lines use a ``raw`` token and ``eff_us``, never
+    ``effective_us``, so the Daily-CI collector's match cannot select them.
+    """
+    if not _bench_raw_enabled() or not stats.invocations:
+        return
+    by_pid: dict[int, list[Any]] = {}
+    for iv in sorted(stats.invocations, key=lambda i: (i.pid, i.inv)):
+        by_pid.setdefault(iv.pid, []).append(iv)
+    head = (
+        f"[RUN]   raw samples: ranks={len(by_pid)} rounds={stats.rounds} warmup={stats.warmup}"
+    )
+    if stats.fallback_flattened:
+        head += " fallback_flattened=1"
+    print(head, flush=True)
+    for pid in sorted(by_pid):
+        eff = [round(iv.effective_us, 1) for iv in by_pid[pid]]
+        print(f"[RUN]     rank {pid} raw n={len(eff)} eff_us={eff}", flush=True)
+
+
 def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
     """Print an L3 context line complementing :func:`_report_effective`.
 
-    Surfaces the L3-only aggregates the new ``BenchmarkStats`` exposes: per-round
-    device wall (max across ranks), the cross-rank host-timeline ``union`` window,
-    and the host wall — plus the rank count and a ``fallback_flattened`` note when
-    per-round segmentation was not possible. The ``kernel=`` / ``l3_resident=1``
-    tokens are preserved for dashboards that grep them.
+    Surfaces the L3-only aggregates the new ``BenchmarkStats`` exposes: the
+    cross-rank host-timeline ``union`` window and the host wall — plus the rank
+    count and a ``fallback_flattened`` note when per-round segmentation was not
+    possible. The ``kernel=`` / ``l3_resident=1`` tokens are preserved for
+    dashboards that grep them.
     """
     import re
 
@@ -458,8 +559,6 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
         f"rounds={stats.rounds}",
         f"ranks={n_ranks}",
     ]
-    if stats.device_wall_us and any(stats.device_wall_us):
-        parts.append(f"device_wall_mean_us={statistics.fmean(stats.device_wall_us):.0f}")
     union = stats.per_round("union")
     if union:
         parts.append(f"host_union_mean_us={statistics.fmean(union):.0f}")
@@ -471,12 +570,12 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
 
 
 def _report_l3_per_rank(stats: Any) -> None:
-    """Print each rank's Effective / device-wall summary for an L3 run.
+    """Print each rank's Effective summary for an L3 run.
 
-    Uses ``BenchmarkStats.per_rank(...)`` — ``{pid: [per-round ...]}`` where each
-    round entry is that rank's summed dispatch metric — to surface the cross-card
-    imbalance the headline (per-round max across ranks) hides. No-op for L2 and the
-    flatten fallback (``per_rank`` returns ``{}``).
+    Uses ``BenchmarkStats.per_rank("effective")`` — ``{pid: [per-round ...]}``
+    where each round entry is that rank's summed dispatch Effective window — to
+    surface the cross-card imbalance the headline (per-round max across ranks)
+    hides. No-op for L2 and the flatten fallback (``per_rank`` returns ``{}``).
 
     The per-rank lines deliberately use an ``eff_us`` token, so the Daily-CI
     collector's ``effective_us`` match never selects them.
@@ -484,19 +583,17 @@ def _report_l3_per_rank(stats: Any) -> None:
     rank_eff = stats.per_rank("effective")
     if not rank_eff:
         return
-    rank_dev = stats.per_rank("device")
     for pid in sorted(rank_eff):
         eff = [e for e in rank_eff[pid] if e > 0.0]
-        dev = [d for d in rank_dev.get(pid, []) if d > 0.0]
-        cols: list[str] = []
-        if eff:
-            cols.append(
-                f"eff_us min={min(eff):.1f} median={statistics.median(eff):.1f} "
-                f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}"
-            )
-        if dev:
-            cols.append(f"device_wall_us mean={statistics.fmean(dev):.1f} max={max(dev):.1f}")
-        print(f"[RUN]     rank {pid}: {'  '.join(cols) if cols else '(no timing)'}", flush=True)
+        if not eff:
+            print(f"[RUN]     rank {pid}: (no timing)", flush=True)
+            continue
+        print(
+            f"[RUN]     rank {pid}: eff_us min={min(eff):.1f} "
+            f"median={statistics.median(eff):.1f} "
+            f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
+            flush=True,
+        )
 
 
 def _l3_ordered_args(
@@ -564,6 +661,7 @@ def _run_benchmark_l3(
         return None
     _report_effective(stats)
     _report_l3_per_rank(stats)
+    _report_raw_samples(stats)
     _report_l3_detail(stats, compiled, resident=False)
     return stats
 
@@ -694,7 +792,7 @@ def _run_l3_resident(
     validation via :func:`_readback_resident_outputs`.
 
     When :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused
-    for :data:`_BENCH_ROUNDS` timed rounds. This cannot go through
+    for :func:`_bench_loop_sizes` timed rounds. This cannot go through
     :func:`pypto.runtime.benchmark` — that owns its own ``prepare()``, and a
     resident buffer allocated on our worker is invisible to a second, separately
     forked one — so it mirrors ``benchmark``'s L3 path by hand: raise the runtime
@@ -823,6 +921,8 @@ def _run_l3_resident(
     )
     from pypto.runtime.log_config import configure_log, current_level  # noqa: PLC0415
 
+    rounds, warmup = _resident_loop_sizes()
+
     def _bench_dispatch(rt: Any, ordered: list[Any], resident_handles: list) -> None:
         # warmup[0] doubles as the validation dispatch: run once, validate its
         # output (a correctness gate — propagates), then complete warmup + rounds.
@@ -832,9 +932,9 @@ def _run_l3_resident(
         rt(*ordered, config=run_config)
         _validate_once(rt, resident_handles)
         try:
-            for _ in range(_BENCH_WARMUP - 1):
+            for _ in range(warmup - 1):
                 rt(*ordered, config=run_config)
-            for _ in range(_BENCH_ROUNDS):
+            for _ in range(rounds):
                 rt(*ordered, config=run_config)
         except Exception as e:  # noqa: BLE001 — benchmark rounds are never a correctness gate
             print(f"[RUN] benchmark rounds interrupted: {type(e).__name__}: {e}", flush=True)
@@ -859,7 +959,7 @@ def _run_l3_resident(
         configure_log(prior_level)
 
     stats = _parse_stats_from_strace(
-        log_text, rounds=_BENCH_ROUNDS, warmup=_BENCH_WARMUP, distributed=True
+        log_text, rounds=rounds, warmup=warmup, distributed=True
     )
     if not stats.host_wall_us:
         print(
@@ -870,6 +970,7 @@ def _run_l3_resident(
         return None
     _report_effective(stats)
     _report_l3_per_rank(stats)
+    _report_raw_samples(stats)
     _report_l3_detail(stats, compiled, resident=True)
     return stats
 
@@ -1121,17 +1222,18 @@ def run(
     # is None) cannot benchmark. Entirely env-gated via PYPTO_BENCH=1 (daily CI).
     bench = None
     if _bench_enabled():
+        rounds, warmup = _bench_loop_sizes()
         if compiled is None:
             print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
         elif _is_l3(compiled):
             bench = _run_benchmark_l3(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
         else:
             bench = _run_benchmark(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
 
     # Validate
@@ -1313,17 +1415,18 @@ def run_jit(
     # is None) cannot benchmark. Entirely env-gated via PYPTO_BENCH=1 (daily CI).
     bench = None
     if _bench_enabled():
+        rounds, warmup = _bench_loop_sizes()
         if compiled is None:
             print("[RUN]   benchmark skipped: no live CompiledProgram (runtime_dir replay)", flush=True)
         elif _is_l3(compiled):
             bench = _run_benchmark_l3(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
         else:
             bench = _run_benchmark(
                 compiled, specs, tensors, scalar_specs_eff, runtime_cfg,
-                _BENCH_ROUNDS, _BENCH_WARMUP,
+                rounds, warmup,
             )
 
     # Validate

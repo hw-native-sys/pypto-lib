@@ -23,6 +23,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -82,3 +84,16 @@ def _install_pypto_stubs() -> None:
 
 
 _install_pypto_stubs()
+
+
+# Bench knobs golden.runner reads from the environment. An exported PYPTO_BENCH
+# sends every run() down the benchmark path — which the stub pypto cannot serve —
+# and fails a couple of dozen unrelated tests, so clear them for the whole suite;
+# the tests that exercise these knobs set them explicitly via monkeypatch.
+_BENCH_ENV = ("PYPTO_BENCH", "PYPTO_BENCH_RAW", "PYPTO_BENCH_ROUNDS", "PYPTO_BENCH_WARMUP")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bench_env(monkeypatch):
+    for name in _BENCH_ENV:
+        monkeypatch.delenv(name, raising=False)

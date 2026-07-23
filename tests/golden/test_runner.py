@@ -25,8 +25,14 @@ from golden import ScalarSpec, TensorSpec, run
 from golden.runner import (
     RunResult,
     _backend_for_platform,
+    _bench_loop_sizes,
     _format_stale_paths,
     _maybe_reload_l3,
+    _report_effective,
+    _report_l3_detail,
+    _report_l3_per_rank,
+    _report_raw_samples,
+    _resident_loop_sizes,
     _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
@@ -1450,6 +1456,101 @@ class TestResidentPath:
                     atol=1e-5,
                     compare_fn={},
                 )
+
+
+class _FakeInv:
+    """Stand-in for a runtime ``TraceInvocation`` — only what the reporters read."""
+
+    def __init__(self, pid: int, inv: int, effective_us: float):
+        self.pid = pid
+        self.inv = inv
+        self.effective_us = effective_us
+
+
+class _FakeStats:
+    """Stand-in for ``BenchmarkStats`` — only what the reporters read.
+
+    Keeps the unit tests off the installed runtime (the CPU-only job runs with
+    conftest's stub ``pypto``).
+    """
+
+    rounds, warmup, fallback_flattened, all_zero_device = 2, 1, False, False
+    # Tuples, not lists: class-level state shared across tests must not be mutable.
+    host_wall_us = (300.0, 310.0)
+    invocations = (_FakeInv(11, 1, 100.44), _FakeInv(10, 0, 50.0),
+                   _FakeInv(10, 1, 51.0), _FakeInv(11, 0, 99.0))
+    rounds_dispatches = ({10: [], 11: []}, {10: [], 11: []})
+
+    def per_rank(self, _metric="device"):
+        return {10: [50.0, 51.0], 11: [99.0, 100.4]}
+
+    def per_round(self, metric="device"):
+        return [400.0, 410.0] if metric == "union" else [99.0, 100.4]
+
+
+class TestBenchLoopSizes:
+    """``PYPTO_BENCH_ROUNDS`` / ``PYPTO_BENCH_WARMUP`` override the defaults.
+
+    conftest's autouse ``_isolate_bench_env`` clears the knobs before each test.
+    """
+
+    def test_defaults_when_unset(self):
+        """Daily CI sets neither, so its perf baseline must stay 100/5."""
+        assert _bench_loop_sizes() == (100, 5)
+
+    def test_env_overrides_both(self, monkeypatch):
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "10")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "0")
+        assert _bench_loop_sizes() == (10, 0)
+
+    def test_invalid_value_warns_and_falls_back(self, monkeypatch, capsys):
+        """A mistyped knob must not fail an otherwise good run."""
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "abc")
+        assert _bench_loop_sizes() == (100, 5)
+        assert "ignoring PYPTO_BENCH_ROUNDS" in capsys.readouterr().out
+
+    def test_resident_clamps_warmup_to_one(self, monkeypatch):
+        """The resident path burns warmup[0] on validation, so warmup=0 would
+        emit rounds+1 dispatches against a declared rounds+0 and lose per-round
+        segmentation."""
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "7")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "0")
+        assert _resident_loop_sizes() == (7, 1)
+
+
+class TestBenchReports:
+    """The ``[RUN]`` benchmark report lines."""
+
+    def test_raw_samples_off_by_default(self, capsys):
+        _report_raw_samples(_FakeStats())
+        assert capsys.readouterr().out == ""
+
+    def test_raw_samples_lists_every_dispatch_per_rank(self, monkeypatch, capsys):
+        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
+        _report_raw_samples(_FakeStats())
+        lines = capsys.readouterr().out.splitlines()
+        assert "raw samples: ranks=2 rounds=2 warmup=1" in lines[0]
+        # One line per rank, ranks sorted, samples in inv order (not emission order).
+        assert "rank 10 raw n=2 eff_us=[50.0, 51.0]" in lines[1]
+        assert "rank 11 raw n=2 eff_us=[99.0, 100.4]" in lines[2]
+
+    def test_report_lines_stay_ci_safe(self, monkeypatch, capsys):
+        """Daily CI greps ``effective_us .*mean=`` and takes the last match, so
+        exactly one line may match it; device_wall is no longer reported at all.
+        See .github/workflows/daily_ci.yml.
+        """
+        import re
+
+        monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
+        stats = _FakeStats()
+        _report_effective(stats)
+        _report_l3_per_rank(stats)
+        _report_raw_samples(stats)
+        _report_l3_detail(stats, _FakeCompiled(Path("/x/moe_ep2_20260722_101010")), resident=True)
+        out = capsys.readouterr().out
+        assert re.findall(r"effective_us .*mean=([0-9.]+)", out) == ["99.7"]  # mean of [99.0, 100.4]
+        assert "device_wall" not in out
+        assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in out
 
 
 if __name__ == "__main__":
