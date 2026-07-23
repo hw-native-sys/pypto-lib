@@ -108,7 +108,6 @@ def dispatch(
 ):
     # Flat 2-D view kept outside the scope so it stays a tensor view, not a tile.
     recv_x_out_flat = pl.reshape(recv_x_out, [N_LOCAL * RECV_MAX, D])
-    seed_dummy = pl.system.task_dummy(deps=[])
 
     # Meta and payload arrivals ride two independent windows (`arrived` /
     # `data_arrived`), so the two phases barrier separately and overlap freely.
@@ -118,7 +117,6 @@ def dispatch(
     with pl.at(
         level=pl.Level.CORE_GROUP,
         name_hint="dispatch_meta",
-        deps=[seed_dummy],
         allow_early_resolve=True,
     ) as _meta_tid:
         active_tokens = pl.cast(num_tokens, pl.INDEX)
@@ -239,9 +237,13 @@ def dispatch(
                     op=pld.NotifyOp.AtomicAdd,
                 )
 
-    # Wait only (the notify rides inside dispatch_push). Depends on dispatch_meta,
-    # not dispatch_push, so it spins on the peers' counters while our own push runs.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", deps=[_meta_tid], allow_early_resolve=True) as _wait_tid:
+    # Wait only (the notify rides inside dispatch_push). The indices read is an
+    # anchor, not data: it deps this task on gate's route tasks, so the wait starts
+    # with dispatch_push instead of trailing dispatch_meta's spin. Anchor it to
+    # something -- an unanchored wait is dispatched immediately and spins holding a
+    # core group, so pipelined layers stack up spinners.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", allow_early_resolve=True) as _wait_tid:
+        _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
                 pld.system.wait(
@@ -254,11 +256,12 @@ def dispatch(
     # Gather lanes into the compact per-expert buffers: one SPMD block per local
     # expert. deps on _wait_tid for the incoming payload; this rank's own
     # dst == my_rank puts are already ordered by the local RAW edges on
-    # recv_x / recv_aux / recv_route.
+    # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
+    # manual_dep and so has no auto edge from the cumsum.
     with pl.spmd(
         N_LOCAL,
         name_hint="dispatch_gather",
-        deps=[_wait_tid],
+        deps=[_wait_tid, _meta_tid],
         allow_early_resolve=True,
     ) as _gather_tid:
         e = pl.tile.get_block_idx()
