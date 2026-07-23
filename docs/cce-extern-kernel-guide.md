@@ -184,9 +184,8 @@ need a **global** cube↔vector barrier, not a per-pair sync.
   C220 `SyncAllImpl` starts with `PipeBarrier<PIPE_ALL>`, but that implementation
   detail is not a universal GM memory-model guarantee. The Qwen3 C220/CANN 9.0.0
   MTE3/TSTORE-to-GM producer and MTE2 consumer path was validated without an
-  extra DDR barrier; its 40-layer evidence and exact decision boundary are
-  recorded in
-  [`2026-07-qwen3-fused-attention-sync-barrier.md`](investigations/2026-07-qwen3-fused-attention-sync-barrier.md).
+  extra DDR barrier over 40 layers
+  ([pypto-lib#796](https://github.com/hw-native-sys/pypto-lib/pull/796)).
   Re-evaluate `dcci` and `dsb` whenever the producer uses the data cache or
   direct scalar writes.
 
