@@ -64,11 +64,28 @@ class DeepSeekV4Config:
     beta_slow: int                           # rope_scaling.beta_slow
     original_max_position_embeddings: int    # rope_scaling.original_max_position_embeddings
 
-    # ---- precision / quantization (quantization_config.* flattened; unused by decode kernels) ----
+    # ---- precision / quantization (quantization_config.* flattened) ----
+    # Hybrid MXFP8–MXFP4 (950 Flash/Pro): dtype=fp8 + scale_fmt=ue8m0;
+    # shared experts / Linear W8A8 = MXFP8; routed experts use expert_dtype=fp4 (MXFP4).
     dtype: Literal["bf16", "fp8"]              # quantization_config.quant_method
     scale_fmt: Optional[Literal["ue8m0"]]     # quantization_config.scale_fmt
-    expert_dtype: Optional[Literal["fp4"]]    # MoE-expert weight dtype (None = same as `dtype`)
+    expert_dtype: Optional[Literal["fp4"]]    # MoE routed-expert weight dtype (None = MXFP8 like `dtype`)
     scale_dtype: Literal["fp32", "fp8"]       # dequant-scale storage dtype
+
+    @property
+    def is_hybrid_mx(self) -> bool:
+        """True when config matches AscendC Hybrid MXFP8–MXFP4 (ue8m0 scales)."""
+        return self.dtype == "fp8" and self.scale_fmt == "ue8m0"
+
+    @property
+    def shared_expert_mx_dtype(self) -> Literal["mxfp8"]:
+        """Shared-expert weights are always MXFP8 under Hybrid."""
+        return "mxfp8"
+
+    @property
+    def routed_expert_mx_dtype(self) -> Literal["mxfp8", "mxfp4"]:
+        """Routed-expert weights: MXFP4 when ``expert_dtype=='fp4'``, else MXFP8."""
+        return "mxfp4" if self.expert_dtype == "fp4" else "mxfp8"
 
     # ---- deployment (not consumed by the decode kernels) ----
     max_batch_size: int            # max supported batch size (cache sizing)
@@ -230,12 +247,18 @@ PRO = DeepSeekV4Config(
     original_max_position_embeddings=65536,
     dtype="fp8",
     scale_fmt="ue8m0",
-    expert_dtype=None,
+    expert_dtype="fp4",  # Hybrid Pro: routed MXFP4, shared MXFP8
     scale_dtype="fp8",
     max_batch_size=4,
 )
 
 PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
+
+# MX quantization constants (AscendC mxfp8/mxfp4 / KV C8)
+MX_BLOCK_K = 32           # Linear / MoE / FIA group size
+MX_KV_GROUP = 64          # main KV Cache C8 group size (not 32, not 128)
+FP8_E4M3_MAX = 448.0
+E8M0_BIAS = 127
 
 
 # Deployment constants

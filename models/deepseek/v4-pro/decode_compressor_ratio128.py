@@ -23,6 +23,14 @@ from config import (
     FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
 )
+from kv_c8_common import (
+    KV_C8_AMAX_EPS,
+    KV_C8_QUANT_TILE,
+    KV_C8_SCALE_TILE_COLS,
+    KV_SCALE_COLS,
+    LN2_F32,
+)
+from mx_quant_common import ATOL_RTOL, FP8_E4M3_MAX, MX_KV_GROUP, golden_kv_c8_quant_row_fp32_scale
 
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")
@@ -65,6 +73,8 @@ COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+KV_SCALE_COLS = HEAD_DIM // MX_KV_GROUP
+assert HEAD_DIM % MX_KV_GROUP == 0
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 
@@ -97,7 +107,8 @@ def compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN],
+    cmp_kv_scale: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, KV_SCALE_COLS], pl.FP32],
     position_ids: pl.Tensor[[B_DYN, S_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
@@ -225,6 +236,7 @@ def compressor_ratio128(
     kv_flat = pl.reshape(kv, [bs, HEAD_DIM])
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
+    cmp_kv_scale_flat = pl.reshape(cmp_kv_scale, [cmp_flat_rows, KV_SCALE_COLS])
 
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
@@ -278,6 +290,30 @@ def compressor_ratio128(
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
         normed_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
+        kv_fp8_blk = pl.create_tensor([KV_C8_QUANT_TILE, HEAD_DIM], dtype=pl.FP8E4M3FN)
+        scale_scratch_blk = pl.create_tensor([KV_C8_QUANT_TILE, KV_SCALE_COLS], dtype=pl.FP32)
+        row_bf16 = pl.cast(
+            pl.cast(normed_kv[0:KV_C8_QUANT_TILE, 0:HEAD_DIM], target_type=pl.BF16, mode="rint"),
+            target_type=pl.FP32,
+        )
+        ln2 = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=LN2_F32)
+        fp8_max = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=FP8_E4M3_MAX)
+        amax_eps = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=KV_C8_AMAX_EPS)
+        for g0 in pl.range(0, HEAD_DIM, MX_KV_GROUP):
+            gi = g0 // MX_KV_GROUP
+            chunk = row_bf16[0:KV_C8_QUANT_TILE, g0 : g0 + MX_KV_GROUP]
+            amax = pl.reshape(pl.row_max(pl.abs(chunk)), [1, KV_C8_QUANT_TILE])
+            amax = pl.maximum(amax, amax_eps)
+            ratio = pl.div(amax, fp8_max)
+            log2_ratio = pl.div(pl.log(ratio), ln2)
+            exp_i = pl.cast(log2_ratio, target_type=pl.INT32, mode="ceil")
+            exp_f = pl.cast(exp_i, target_type=pl.FP32)
+            scale_val = pl.exp(pl.mul(exp_f, ln2))
+            scale_col = pl.reshape(scale_val, [KV_C8_QUANT_TILE, 1])
+            q = pl.cast(pl.div(chunk, scale_col), target_type=pl.FP8E4M3FN, mode="rint")
+            kv_fp8_blk[0:KV_C8_QUANT_TILE, g0 : g0 + MX_KV_GROUP] = q
+            for ri in pl.range(KV_C8_QUANT_TILE):
+                pl.write(scale_scratch_blk, [ri, gi], pl.read(scale_col, [ri, 0]))
         for global_c_idx in pl.range(b_dim):
             first_pos_b = pl.read(position_ids, [global_c_idx, 0])
             pos_b = first_pos_b % COMPRESS_RATIO
@@ -288,7 +324,15 @@ def compressor_ratio128(
                 if cmp_row_i64 >= 0:
                     cmp_row = pl.cast(cmp_row_i64, target_type=pl.INDEX)
                     kv_flat[global_c_idx * s_dim : global_c_idx * s_dim + 1, :] = kv_row
-                    cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = pl.cast(kv_row, target_type=pl.BF16, mode="rint")
+                    cmp_kv_cache_flat[cmp_row : cmp_row + 1, :] = kv_fp8_blk[
+                        global_c_idx : global_c_idx + 1, :
+                    ]
+                    for gi in pl.range(KV_SCALE_COLS):
+                        pl.write(
+                            cmp_kv_scale_flat,
+                            [cmp_row, gi],
+                            pl.read(scale_scratch_blk, [global_c_idx, gi]),
+                        )
 
     kv = pl.reshape(kv_flat, [b_dim, s_dim, HEAD_DIM])
     return kv
@@ -306,7 +350,8 @@ def compressor_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    cmp_kv_cache: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv_cache: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    cmp_kv_scale: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, KV_SCALE_COLS], pl.FP32]],
     position_ids: pl.Tensor[[B_DYN, S_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
     state_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
@@ -321,6 +366,7 @@ def compressor_test(
     cos.bind_dynamic(0, B_DYN)
     sin.bind_dynamic(0, B_DYN)
     cmp_kv_cache.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
+    cmp_kv_scale.bind_dynamic(0, CMP_BLOCK_NUM_DYN)
     position_ids.bind_dynamic(0, B_DYN)
     position_ids.bind_dynamic(1, S_DYN)
     cmp_slot_mapping.bind_dynamic(0, B_DYN)
@@ -331,9 +377,9 @@ def compressor_test(
     late_dep = pl.system.task_dummy(deps=[])
     compressor_ratio128(
         x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, cos, sin,
-        cmp_kv_cache, position_ids, cmp_slot_mapping, state_slot_mapping, late_dep,
+        cmp_kv_cache, cmp_kv_scale, position_ids, cmp_slot_mapping, state_slot_mapping, late_dep,
     )
-    return kv, compress_state, cmp_kv_cache
+    return kv, compress_state, cmp_kv_cache, cmp_kv_scale
 
 
 def golden_compressor(tensors):
@@ -382,6 +428,7 @@ def golden_compressor(tensors):
     cos = tensors["cos"]
     sin = tensors["sin"]
     cmp_kv_cache = tensors["cmp_kv_cache"]
+    cmp_kv_scale = tensors["cmp_kv_scale"]
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
@@ -447,9 +494,13 @@ def golden_compressor(tensors):
             tensors["kv"][b : b + 1, 0:1, :] = kv_b
             cblk = cmp_row // BLOCK_SIZE
             intra_offset = cmp_row % BLOCK_SIZE
-            cmp_kv_cache[cblk, intra_offset, 0] = kv_b[0, 0]
+            row_bf16 = kv_b[0, 0].to(torch.bfloat16)
+            q, s = golden_kv_c8_quant_row_fp32_scale(row_bf16)
+            cmp_kv_cache[cblk, intra_offset, 0] = q
+            cmp_kv_scale[cblk, intra_offset, 0] = s
 
     tensors["cmp_kv_cache"][:] = cmp_kv_cache
+    tensors["cmp_kv_scale"][:] = cmp_kv_scale
 
 
 def build_tensor_specs(start_pos=None):
@@ -492,7 +543,9 @@ def build_tensor_specs(start_pos=None):
     def init_sin():
         return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_rope_positions())[1]
     def init_cmp_kv_cache():
-        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
+        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    def init_cmp_kv_scale():
+        return torch.zeros(CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS, dtype=torch.float32)
     def init_compress_state_block_table():
         return block_table(
             batch=B,
@@ -546,7 +599,8 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("cos", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_cos),
         TensorSpec("sin", [B, ROPE_HEAD_DIM // 2], torch.float32, init_value=init_sin),
-        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv_cache, is_output=True),
+        TensorSpec("cmp_kv_cache", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=init_cmp_kv_cache, is_output=True),
+        TensorSpec("cmp_kv_scale", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS], torch.float32, init_value=init_cmp_kv_scale, is_output=True),
         TensorSpec("position_ids", [B, S], torch.int32, init_value=init_position_ids),
         TensorSpec("cmp_slot_mapping", [B, S], torch.int64, init_value=init_cmp_slot_mapping),
         TensorSpec("state_slot_mapping", [B, S], torch.int64, init_value=init_state_slot_mapping),
@@ -564,6 +618,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch HCA set that includes the 8k point.")
+    parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -578,6 +633,7 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
+        compile_only=args.compile_only,
         rtol=1e-3,
         atol=1e-3,
         # Precision reference: AscendC torch.ops.custom.compressor —
@@ -585,7 +641,14 @@ if __name__ == "__main__":
         compare_fn={
             "kv":            ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            "cmp_kv_cache":   ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "cmp_kv_cache":   ratio_allclose(
+                atol=ATOL_RTOL["kv_c8"]["atol"], rtol=ATOL_RTOL["kv_c8"]["rtol"],
+                max_error_ratio=ATOL_RTOL["kv_c8"]["pct"],
+            ),
+            "cmp_kv_scale":   ratio_allclose(
+                atol=ATOL_RTOL["kv_c8"]["atol"], rtol=ATOL_RTOL["kv_c8"]["rtol"],
+                max_error_ratio=ATOL_RTOL["kv_c8"]["pct"],
+            ),
         },
     )
     if not result.passed:

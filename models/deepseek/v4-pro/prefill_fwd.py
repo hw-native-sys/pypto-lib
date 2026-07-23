@@ -213,7 +213,7 @@ RESIDENT_CACHE_OUTPUT_NAMES = RESIDENT_CACHE_NAMES
 
 @pl.jit(auto_scope=False)
 def prefill_fwd(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -272,7 +272,7 @@ def prefill_fwd(
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
@@ -305,7 +305,7 @@ def prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
-    hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    hidden: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
 
     # ===================== layer 0 : swa =================================
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
@@ -342,7 +342,7 @@ def prefill_fwd(
     shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
     shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
-    x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn0: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     with pl.scope():
         prefill_attention_swa(
             x_hc,
@@ -404,7 +404,7 @@ def prefill_fwd(
     shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
-    x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn1: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     with pl.scope():
         prefill_attention_swa(
             hidden,
@@ -490,8 +490,8 @@ def prefill_fwd(
         shared_w3_scale_csa: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer * MOE_INTER])
         shared_w2_csa: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer * D, 0])
         shared_w2_scale_csa: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer * D])
-        x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-        hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
+        hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         with pl.scope():
             prefill_attention_csa(
                 hidden,
@@ -567,7 +567,7 @@ def prefill_fwd(
         shared_w3_scale_hca: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [hca_layer * MOE_INTER])
         shared_w2_hca: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [hca_layer * D, 0])
         shared_w2_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [hca_layer * D])
-        x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+        x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
         with pl.scope():
             prefill_attention_hca(
                 hidden_mid,
@@ -652,7 +652,7 @@ def prefill_fwd(
     shared_w3_scale_last: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [csa_layer_last * MOE_INTER])
     shared_w2_last: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [csa_layer_last * D, 0])
     shared_w2_scale_last: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [csa_layer_last * D])
-    x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.BF16] = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     with pl.scope():
         prefill_attention_csa(
             hidden,
@@ -695,7 +695,7 @@ def prefill_fwd(
 
 @pl.jit.host
 def l3_prefill_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -773,7 +773,7 @@ def l3_prefill_fwd(
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
-    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
@@ -1194,7 +1194,7 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         else:
             tensor_specs.append(spec)
 
-    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    tensor_specs.append(TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
@@ -1272,7 +1272,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         if spec.name in RESIDENT_WEIGHT_NAMES or spec.name in RESIDENT_CACHE_NAMES:
             spec.resident = "stacked"
 
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     from golden import ScalarSpec
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))

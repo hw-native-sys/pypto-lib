@@ -1,0 +1,629 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Host-side MXFP8 / MXFP4 helpers aligned with AscendC Hybrid (block=32, e8m0).
+
+Mirrors ``cann-recipes-infer/module/quantization/mxfp8.py`` / ``mxfp4.py`` semantics
+for v4-pro golden / weight synthesis. Device kernels use ``pl.mx_quant`` /
+``pl.matmul_mx``; this module is for torch reference paths only.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+
+# AscendC Linear / MoE / FIA
+MX_BLOCK_K = 32
+# AscendC KV Cache C8 (shared-KV path)
+MX_KV_GROUP = 64
+
+FP8_E4M3_MAX = 448.0
+FP8_E5M2_MAX = 57344.0
+E8M0_BIAS = 127
+FP4_E2M1_MAX = 6.0
+
+# atol / rtol tables ported from AscendC operator golden conventions
+ATOL_RTOL: Dict[str, Dict[str, float]] = {
+    "li_bf16": {"atol": 1e-4, "rtol": 0.0, "eps": 1e-9, "pct": 0.005},
+    "li_fp16": {"atol": 2.5e-5, "rtol": 5e-3, "eps": 1e-9, "pct": 0.005},
+    "sas_bf16": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.005},
+    "fia_mxfp8": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.005},
+    "moe_mx": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.01},
+    "qkv_mxfp8": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.005},
+    "mtp_mxfp8": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.05},
+    "oproj_mxfp8": {"atol": 1e-4, "rtol": 7.8125e-3, "eps": 1e-9, "pct": 0.005},
+    "indexer_fp8": {"atol": 1e-4, "rtol": 5e-3, "eps": 1e-9, "pct": 0.005},
+    "kv_c8": {"atol": 1e-4, "rtol": 5e-3, "eps": 1e-9, "pct": 0.005},
+}
+
+
+def e8m0_uint8_to_float(scale_u8: torch.Tensor) -> torch.Tensor:
+    """Decode E8M0 bytes (bias 127) to positive power-of-two float32 scales."""
+    return torch.exp2(scale_u8.to(torch.float32) - float(E8M0_BIAS))
+
+
+def e8m0_float_to_uint8(scale_f: torch.Tensor) -> torch.Tensor:
+    """Encode positive float scales to E8M0 uint8 (round via ceil-log2 path upstream)."""
+    # Caller should already be on exponent grid; clamp to representable range.
+    exp = torch.round(torch.log2(scale_f.clamp_min(2.0 ** -127)))
+    return (exp + E8M0_BIAS).clamp(0, 255).to(torch.uint8)
+
+
+def e8m0_torch(scale_u8: torch.Tensor) -> torch.Tensor:
+    """View uint8 E8M0 payload as ``torch.float8_e8m0fnu`` (same bytes)."""
+    return scale_u8.contiguous().view(torch.float8_e8m0fnu)
+
+
+def float8_e8m0_to_uint8(scale: torch.Tensor) -> torch.Tensor:
+    return scale.view(torch.uint8)
+
+
+def _ceil_log2_scale(amax: torch.Tensor, dtype_max: float) -> torch.Tensor:
+    """AscendC-style shared exponent: ceil(log2(amax / dtype_max))."""
+    ratio = (amax / dtype_max).clamp_min(torch.finfo(torch.float32).tiny)
+    return torch.ceil(torch.log2(ratio))
+
+
+def dynamic_kv_c8_quant(
+    x: torch.Tensor,
+    block_k: int = MX_KV_GROUP,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """KV Cache C8 dynamic quant: ``float8_e4m3fn`` + ``float8_e8m0fnu`` per group-64."""
+    return dynamic_mx_quant_e4m3(x, block_k=block_k)
+
+
+def dequant_kv_c8(
+    weight_fp8: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_KV_GROUP,
+) -> torch.Tensor:
+    """Dequant KV C8 tensor with E8M0 scales (group=64 along last dim)."""
+    return dequant_mxfp8(weight_fp8, scale_e8m0, block_k=block_k)
+
+
+def dequant_kv_c8_fp32_scale(
+    weight_fp8: torch.Tensor,
+    scale_fp32: torch.Tensor,
+    block_k: int = MX_KV_GROUP,
+) -> torch.Tensor:
+    """Dequant KV C8 with **FP32** per-group scales ``2**exp`` (device interim layout)."""
+    w = weight_fp8.to(torch.float32)
+    scale = scale_fp32.to(torch.float32)
+    lead = w.shape[:-1]
+    k = w.shape[-1]
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by block_k={block_k}")
+    if scale.shape[-1] != k // block_k:
+        raise ValueError(
+            f"scale last dim {scale.shape[-1]} != K/block ({k // block_k})"
+        )
+    wb = w.reshape(*lead, k // block_k, block_k)
+    return (wb * scale.unsqueeze(-1)).reshape_as(w)
+
+
+def golden_kv_c8_quant_row(row_bf16: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one compressed KV row after BF16 round (host golden path)."""
+    return dynamic_kv_c8_quant(row_bf16.float())
+
+
+def golden_kv_c8_quant_row_fp32_scale(
+    row_bf16: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Golden KV C8 row + **FP32** per-group scale ``2**exp`` (device interim layout)."""
+    q, s_e8m0 = dynamic_kv_c8_quant(row_bf16.float())
+    s_u8 = float8_e8m0_to_uint8(s_e8m0)
+    s_fp32 = e8m0_uint8_to_float(s_u8)
+    return q, s_fp32
+
+
+def dynamic_mx_quant_e4m3(
+    x: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Host dynamic MX quant → ``float8_e4m3fn`` + ``float8_e8m0fnu`` scale.
+
+    ``x``: [..., K] with ``K % block_k == 0``.
+    Returns ``(q, scale)`` with ``q`` same shape as ``x``, ``scale`` [..., K/block_k].
+    """
+    if x.shape[-1] % block_k != 0:
+        raise ValueError(f"K={x.shape[-1]} must be divisible by block_k={block_k}")
+    xf = x.to(torch.float32)
+    lead = xf.shape[:-1]
+    k = xf.shape[-1]
+    xb = xf.reshape(*lead, k // block_k, block_k)
+    amax = xb.abs().amax(dim=-1)
+    exp = _ceil_log2_scale(amax, FP8_E4M3_MAX).clamp(-127, 127)
+    scale_val = torch.exp2(exp)
+    q = (xb / scale_val.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    scale_u8 = (exp + E8M0_BIAS).to(torch.uint8)
+    return q.reshape_as(x), e8m0_torch(scale_u8)
+
+
+def quantize_weight_mxfp8(
+    weight: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Static MXFP8 quant along last dim (in / K).
+
+    ``weight``: [..., out, in] or [out, in]; returns e4m3 weight + e8m0 scale [..., out, in/block].
+    """
+    return dynamic_mx_quant_e4m3(weight, block_k=block_k)
+
+
+def dequant_mxfp8(
+    weight_fp8: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Dequant MXFP8 tensor with E8M0 scales along the last dim."""
+    w = weight_fp8.to(torch.float32)
+    if scale_e8m0.dtype == torch.float8_e8m0fnu:
+        scale_u8 = float8_e8m0_to_uint8(scale_e8m0)
+    else:
+        scale_u8 = scale_e8m0.to(torch.uint8)
+    scale = e8m0_uint8_to_float(scale_u8)
+    lead = w.shape[:-1]
+    k = w.shape[-1]
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by block_k={block_k}")
+    if scale.shape[-1] != k // block_k:
+        raise ValueError(
+            f"scale last dim {scale.shape[-1]} != K/block ({k // block_k})"
+        )
+    wb = w.reshape(*lead, k // block_k, block_k)
+    return (wb * scale.unsqueeze(-1)).reshape_as(w)
+
+
+def pack_fp4_e2m1(weight_fp4_even_odd: torch.Tensor) -> torch.Tensor:
+    """Pack two FP4 e2m1 values per uint8 (low nibble = even index).
+
+    ``weight_fp4_even_odd``: float tensor of shape [..., N] with N even; values in FP4 grid.
+    Returns uint8 [..., N/2].
+    """
+    # Encode via float→uint8 nibbles using torch float4 if available; else manual.
+    w = weight_fp4_even_odd.to(torch.float32)
+    if w.shape[-1] % 2 != 0:
+        raise ValueError("FP4 pack requires even last dim")
+    # Map to e2m1 code via round-to-nearest on allowed levels.
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=w.device
+    )
+    codes_pos = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32, device=w.device)
+
+    def _encode(vals: torch.Tensor) -> torch.Tensor:
+        sign = (vals < 0).to(torch.int32) << 3
+        abs_v = vals.abs()
+        # nearest level index
+        idx = (abs_v.unsqueeze(-1) - levels).abs().argmin(dim=-1)
+        return (codes_pos[idx] | sign).to(torch.uint8)
+
+    lo = _encode(w[..., 0::2])
+    hi = _encode(w[..., 1::2])
+    return (lo | (hi << 4)).to(torch.uint8)
+
+
+def unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 FP4 pairs → float32 [..., 2*N]."""
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=packed.device
+    )
+    p = packed.to(torch.uint8)
+    lo = p & 0xF
+    hi = (p >> 4) & 0xF
+
+    def _decode(code: torch.Tensor) -> torch.Tensor:
+        sign = torch.where((code & 0x8) != 0, -1.0, 1.0)
+        mag = levels[(code & 0x7).long()]
+        return sign * mag
+
+    out = torch.stack((_decode(lo), _decode(hi)), dim=-1)
+    return out.reshape(*p.shape[:-1], p.shape[-1] * 2)
+
+
+def quantize_weight_mxfp4(
+    weight: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Static MXFP4 along last dim → packed uint8 [..., in/2] + e8m0 [..., in/block]."""
+    if weight.shape[-1] % block_k != 0:
+        raise ValueError("in dim must be divisible by block_k")
+    if weight.shape[-1] % 2 != 0:
+        raise ValueError("in dim must be even for FP4 pack")
+    wf = weight.to(torch.float32)
+    lead = wf.shape[:-1]
+    k = wf.shape[-1]
+    xb = wf.reshape(*lead, k // block_k, block_k)
+    amax = xb.abs().amax(dim=-1)
+    exp = _ceil_log2_scale(amax, FP4_E2M1_MAX).clamp(-127, 127)
+    scale_val = torch.exp2(exp)
+    q = xb / scale_val.unsqueeze(-1)
+    packed = pack_fp4_e2m1(q.reshape(*lead, k))
+    scale_u8 = (exp + E8M0_BIAS).to(torch.uint8)
+    return packed, e8m0_torch(scale_u8)
+
+
+def dequant_mxfp4(
+    packed: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Dequant packed MXFP4 + E8M0 → float32 [..., in]."""
+    w_fp4 = unpack_fp4_e2m1(packed)
+    if scale_e8m0.dtype == torch.float8_e8m0fnu:
+        scale_u8 = float8_e8m0_to_uint8(scale_e8m0)
+    else:
+        scale_u8 = scale_e8m0.to(torch.uint8)
+    scale = e8m0_uint8_to_float(scale_u8)
+    lead = w_fp4.shape[:-1]
+    k = w_fp4.shape[-1]
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by block_k={block_k}")
+    wb = w_fp4.reshape(*lead, k // block_k, block_k)
+    return (wb * scale.unsqueeze(-1)).reshape_as(w_fp4)
+
+
+# --- ISA ZZ / NN scale packing (pto-isa tmatmul_mx gen_data) ---
+
+
+def convert_x1_scale_format(
+    x1_mx_gm: np.ndarray, block_size: int = 16, c0_size_mx: int = 2
+) -> np.ndarray:
+    """Pack A-side E8M0 scales to MX_A_ZZ GM layout."""
+    m, k = x1_mx_gm.shape
+    pad_m = (block_size - m % block_size) % block_size
+    pad_k = (c0_size_mx - k % c0_size_mx) % c0_size_mx
+    if pad_m > 0 or pad_k > 0:
+        padded = np.pad(x1_mx_gm, ((0, pad_m), (0, pad_k)), mode="constant", constant_values=0)
+    else:
+        padded = x1_mx_gm
+    m_padded, k_padded = padded.shape
+    x1 = padded.reshape(
+        (int(m_padded / block_size), block_size, int(k_padded / c0_size_mx), c0_size_mx)
+    )
+    x1 = x1.transpose(0, 2, 1, 3)
+    return x1.reshape(x1.shape[0] * x1.shape[1], x1.shape[2] * x1.shape[3])
+
+
+def convert_x2_scale_format(
+    x2_mx_gm: np.ndarray, block_size: int = 16, c0_size_mx: int = 2
+) -> np.ndarray:
+    """Pack B-side E8M0 scales to MX_B_NN GM layout."""
+    k, n = x2_mx_gm.shape
+    pad_n = (block_size - n % block_size) % block_size
+    pad_k = (c0_size_mx - k % c0_size_mx) % c0_size_mx
+    if pad_n > 0 or pad_k > 0:
+        padded = np.pad(x2_mx_gm, ((0, pad_k), (0, pad_n)), mode="constant", constant_values=0)
+    else:
+        padded = x2_mx_gm
+    k_padded, n_padded = padded.shape
+    x2 = padded.reshape(
+        (int(k_padded / c0_size_mx), c0_size_mx, int(n_padded / 16), 16)
+    ).transpose(2, 0, 3, 1)
+    return x2.reshape(x2.shape[1] * x2.shape[3], x2.shape[0] * x2.shape[2])
+
+
+def unpack_x1_scale_format(
+    packed: np.ndarray, m: int, k: int, block_size: int = 16, c0_size_mx: int = 2
+) -> np.ndarray:
+    """Inverse of :func:`convert_x1_scale_format` (trim padding)."""
+    pad_m = (block_size - m % block_size) % block_size
+    pad_k = (c0_size_mx - k % c0_size_mx) % c0_size_mx
+    m_p, k_p = m + pad_m, k + pad_k
+    x = packed.reshape(
+        int(m_p / block_size), int(k_p / c0_size_mx), block_size, c0_size_mx
+    )
+    x = x.transpose(0, 2, 1, 3).reshape(m_p, k_p)
+    return x[:m, :k]
+
+
+def unpack_x2_scale_format(
+    packed: np.ndarray, k: int, n: int, block_size: int = 16, c0_size_mx: int = 2
+) -> np.ndarray:
+    """Inverse of :func:`convert_x2_scale_format` (trim padding)."""
+    pad_n = (block_size - n % block_size) % block_size
+    pad_k = (c0_size_mx - k % c0_size_mx) % c0_size_mx
+    k_p, n_p = k + pad_k, n + pad_n
+    # packed reshape matches convert output layout
+    x = packed.reshape(k_p // c0_size_mx, n_p // 16, c0_size_mx, 16)
+    # convert did transpose(2,0,3,1) on (k/c0, c0, n/16, 16) → (n/16, k/c0, 16, c0)
+    # packed stored as (k_p, n_p) with that order flattened as
+    # (k/c0 * c0, n/16 * 16) = (k_p, n_p) after reshape(shape[1]*shape[3], shape[0]*shape[2])
+    # Recover via inverse of that flatten:
+    tmp = packed.reshape(c0_size_mx, n_p // 16, k_p // c0_size_mx, 16)
+    # Actually use the known forward path inverse carefully:
+    fwd_in = np.zeros((k_p, n_p), dtype=packed.dtype)
+    # Brute-force safe inverse: scatter by replaying indices
+    src = np.arange(k_p * n_p, dtype=np.int64).reshape(k_p, n_p)
+    packed_idx = convert_x2_scale_format(src.astype(np.float64)).astype(np.int64)
+    flat_packed = packed.reshape(-1)
+    flat_out = np.empty(k_p * n_p, dtype=packed.dtype)
+    flat_out[packed_idx.reshape(-1)] = flat_packed
+    return flat_out.reshape(k_p, n_p)[:k, :n]
+
+
+def pack_scale_b_nn(scale_e8m0: torch.Tensor) -> torch.Tensor:
+    """Pack logical B-scale [K/32, N] to MX_B_NN bytes, viewed as float8_e8m0fnu."""
+    u8 = float8_e8m0_to_uint8(scale_e8m0).cpu().numpy()
+    packed = convert_x2_scale_format(u8)
+    assert packed.size == u8.size
+    return (
+        torch.from_numpy(np.ascontiguousarray(packed).reshape(-1).copy())
+        .view(torch.float8_e8m0fnu)
+        .reshape(scale_e8m0.shape)
+    )
+
+
+def unpack_scale_b_nn(packed_e8m0: torch.Tensor) -> torch.Tensor:
+    """Unpack MX_B_NN GM bytes back to logical [K/32, N] float8_e8m0fnu."""
+    k, n = packed_e8m0.shape
+    u8 = float8_e8m0_to_uint8(packed_e8m0).cpu().numpy().reshape(k, n)
+    logical = unpack_x2_scale_format(u8, k, n)
+    return (
+        torch.from_numpy(np.ascontiguousarray(logical).reshape(-1).copy())
+        .view(torch.float8_e8m0fnu)
+        .reshape(k, n)
+    )
+
+
+def dequant_mxfp8_b(
+    weight_fp8: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Dequant Right-matrix MXFP8 ``[K, N]`` with scale ``[K/block, N]``."""
+    bf = weight_fp8.to(torch.float32)
+    if scale_e8m0.dtype == torch.float8_e8m0fnu:
+        b_u8 = float8_e8m0_to_uint8(scale_e8m0)
+    else:
+        b_u8 = scale_e8m0.to(torch.uint8)
+    b_s = e8m0_uint8_to_float(b_u8)
+    k, n = bf.shape
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by block_k={block_k}")
+    if b_s.shape != (k // block_k, n):
+        raise ValueError(f"B scale shape {tuple(b_s.shape)} != ({k // block_k}, {n})")
+    bb = bf.reshape(k // block_k, block_k, n)
+    return (bb * b_s.unsqueeze(1)).reshape(k, n)
+
+
+def quantize_weight_mxfp8_kn(
+    weight_kn: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Static MXFP8 quant for Right-matrix ``[K, N]`` → e4m3 + e8m0 ``[K/block, N]``."""
+    if weight_kn.shape[0] % block_k != 0:
+        raise ValueError(f"K={weight_kn.shape[0]} must be divisible by {block_k}")
+    wf = weight_kn.to(torch.float32)
+    k, n = wf.shape
+    xb = wf.reshape(k // block_k, block_k, n)
+    amax = xb.abs().amax(dim=1)  # [K/block, N]
+    exp = _ceil_log2_scale(amax, FP8_E4M3_MAX).clamp(-127, 127)
+    scale_val = torch.exp2(exp)
+    q = (xb / scale_val.unsqueeze(1)).to(torch.float8_e4m3fn)
+    scale_u8 = (exp + E8M0_BIAS).to(torch.uint8)
+    return q.reshape(k, n), e8m0_torch(scale_u8)
+
+
+def mx_matmul_fp8(
+    a_fp8: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_fp8: torch.Tensor,
+    b_scale: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Host MX matmul: dequant A[M,K], B[K,N] then FP32 matmul → FP32 [M,N]."""
+    a = dequant_mxfp8(a_fp8, a_scale, block_k=block_k)
+    b = dequant_mxfp8_b(b_fp8, b_scale, block_k=block_k)
+    return a @ b
+
+
+def gen_mxfp8_weight_kn(
+    shape_kn: Tuple[int, int],
+    dequant_std: float,
+    chan_cv: float,
+    block_k: int = MX_BLOCK_K,
+    pack_nn: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Synthesize MXFP8 Right-weight ``[K, N]`` + E8M0 scale ``[K/block, N]``.
+
+    ``chan_cv`` injects per-output-channel (N) log-gain so magnitude spread matches
+    real checkpoints; ``dequant_std`` rescales dequantized FP32 std.
+    """
+    k, n = shape_kn
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by {block_k}")
+    W = torch.randn(k, n) * torch.exp(chan_cv * torch.randn(1, n))
+    w_kn, scale_kn = quantize_weight_mxfp8_kn(W, block_k=block_k)
+    w_dq = dequant_mxfp8_b(w_kn, scale_kn, block_k=block_k)
+    std = w_dq.std().clamp_min(1e-12)
+    W2 = w_dq * (dequant_std / std)
+    w_kn, scale_kn = quantize_weight_mxfp8_kn(W2, block_k=block_k)
+    if pack_nn:
+        scale_kn = pack_scale_b_nn(scale_kn)
+    return w_kn, scale_kn
+
+
+def shared_expert_mxfp8_golden(
+    x_bf16: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w3_fp8: torch.Tensor,
+    w3_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    swiglu_limit: float = 0.0,
+    block_k: int = MX_BLOCK_K,
+    scales_packed_nn: bool = True,
+) -> torch.Tensor:
+    """AscendC-style shared expert: dyn MX → GEMM → SwiGLU → dyn MX → down GEMM.
+
+    Weights are stored as Right matrices: w1/w3 ``[D, MOE_INTER]``, w2 ``[MOE_INTER, D]``,
+    with B-side scales ``[K/32, N]`` (optionally MX_B_NN packed).
+    """
+    import torch.nn.functional as F
+
+    def _b_scale(s: torch.Tensor) -> torch.Tensor:
+        return unpack_scale_b_nn(s) if scales_packed_nn else s
+
+    x_q, x_s = dynamic_mx_quant_e4m3(x_bf16, block_k=block_k)
+    gate = mx_matmul_fp8(x_q, x_s, w1_fp8, _b_scale(w1_scale), block_k=block_k)
+    up = mx_matmul_fp8(x_q, x_s, w3_fp8, _b_scale(w3_scale), block_k=block_k)
+    if swiglu_limit and swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+    h = F.silu(gate) * up
+    h_q, h_s = dynamic_mx_quant_e4m3(h, block_k=block_k)
+    out = mx_matmul_fp8(h_q, h_s, w2_fp8, _b_scale(w2_scale), block_k=block_k)
+    return out
+
+
+def fp4_floats_to_torch_x2(w_fp4: torch.Tensor) -> torch.Tensor:
+    """Encode logical FP4 float values as ``torch.float4_e2m1fn_x2`` (same shape).
+
+    Each element stores one FP4 value in the low nibble (high nibble 0). This keeps
+    ``pl.Tensor[..., pl.FP4]`` shapes identical to the FP8 case for ``matmul_mx``.
+    """
+    packed = pack_fp4_e2m1(
+        torch.stack((w_fp4, torch.zeros_like(w_fp4)), dim=-1).reshape(*w_fp4.shape[:-1], w_fp4.shape[-1] * 2)
+    )
+    # pack_fp4 on [..., 2N] → [..., N]; that is our same-shape encoding.
+    return packed.contiguous().view(torch.float4_e2m1fn_x2)
+
+
+def torch_x2_to_fp4_floats(w_x2: torch.Tensor) -> torch.Tensor:
+    """Decode ``float4_e2m1fn_x2`` (low-nibble encoding) → float32 FP4 values."""
+    u8 = w_x2.view(torch.uint8)
+    # Re-pack as (low, 0) pairs then unpack via shared helper by treating each
+    # byte as a packed pair with high nibble zero.
+    return unpack_fp4_e2m1(u8)[..., 0::2]
+
+
+def quantize_weight_mxfp4_kn(
+    weight_kn: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Static MXFP4 for Right-matrix ``[K, N]`` → float4_e2m1fn_x2 + e8m0 ``[K/block, N]``."""
+    if weight_kn.shape[0] % block_k != 0:
+        raise ValueError(f"K={weight_kn.shape[0]} must be divisible by {block_k}")
+    wf = weight_kn.to(torch.float32)
+    k, n = wf.shape
+    xb = wf.reshape(k // block_k, block_k, n)
+    amax = xb.abs().amax(dim=1)
+    exp = _ceil_log2_scale(amax, FP4_E2M1_MAX).clamp(-127, 127)
+    scale_val = torch.exp2(exp)
+    q = xb / scale_val.unsqueeze(1)
+    # Snap to FP4 grid
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=q.device
+    )
+    sign = torch.where(q < 0, -1.0, 1.0)
+    abs_q = q.abs()
+    idx = (abs_q.unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    q_grid = sign * levels[idx]
+    w_x2 = fp4_floats_to_torch_x2(q_grid.reshape(k, n))
+    scale_u8 = (exp + E8M0_BIAS).to(torch.uint8)
+    return w_x2, e8m0_torch(scale_u8)
+
+
+def dequant_mxfp4_b(
+    weight_x2: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Dequant Right-matrix MXFP4 ``[K, N]`` float4_x2 + scale ``[K/block, N]``."""
+    w = torch_x2_to_fp4_floats(weight_x2)
+    if scale_e8m0.dtype == torch.float8_e8m0fnu:
+        b_u8 = float8_e8m0_to_uint8(scale_e8m0)
+    else:
+        b_u8 = scale_e8m0.to(torch.uint8)
+    b_s = e8m0_uint8_to_float(b_u8)
+    k, n = w.shape
+    bb = w.reshape(k // block_k, block_k, n)
+    return (bb * b_s.unsqueeze(1)).reshape(k, n)
+
+
+def mx_matmul_fp8_fp4(
+    a_fp8: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_fp4_x2: torch.Tensor,
+    b_scale: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Host W4A8 MX matmul: FP8 A × FP4 B."""
+    a = dequant_mxfp8(a_fp8, a_scale, block_k=block_k)
+    b = dequant_mxfp4_b(b_fp4_x2, b_scale, block_k=block_k)
+    return a @ b
+
+
+def gen_mxfp4_weight_kn(
+    shape_kn: Tuple[int, int],
+    dequant_std: float,
+    block_k: int = MX_BLOCK_K,
+    pack_nn: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Synthesize MXFP4 Right-weight ``[K, N]`` float4_x2 + E8M0 ``[K/block, N]``."""
+    k, n = shape_kn
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by {block_k}")
+    W = torch.randn(k, n)
+    w_x2, scale_kn = quantize_weight_mxfp4_kn(W, block_k=block_k)
+    w_dq = dequant_mxfp4_b(w_x2, scale_kn, block_k=block_k)
+    std = w_dq.std().clamp_min(1e-12)
+    W2 = w_dq * (dequant_std / std)
+    w_x2, scale_kn = quantize_weight_mxfp4_kn(W2, block_k=block_k)
+    if pack_nn:
+        scale_kn = pack_scale_b_nn(scale_kn)
+    return w_x2, scale_kn
+
+
+def routed_expert_mx_golden(
+    recv_x_bf16: torch.Tensor,
+    recv_weights: torch.Tensor,
+    recv_expert_count: torch.Tensor,
+    w1_x2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w3_x2: torch.Tensor,
+    w3_scale: torch.Tensor,
+    w2_x2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    swiglu_limit: float = 0.0,
+    block_k: int = MX_BLOCK_K,
+    scales_packed_nn: bool = True,
+) -> torch.Tensor:
+    """AscendC W4A8MxFp4-style routed expert golden (per-expert dyn MX + SwiGLU).
+
+    Weights are Right matrices with FP4 payload; activations use MXFP8.
+    ``recv_weights`` scales the down-proj output (combine-ready).
+    """
+    import torch.nn.functional as F
+
+    def _b_scale(s: torch.Tensor) -> torch.Tensor:
+        return unpack_scale_b_nn(s) if scales_packed_nn else s
+
+    e, recv_max, d = recv_x_bf16.shape
+    out = torch.zeros(e, recv_max, d, dtype=torch.float32)
+    for ei in range(e):
+        n_rows = int(recv_expert_count[ei, 0].item())
+        if n_rows <= 0:
+            continue
+        x = recv_x_bf16[ei, :n_rows, :]
+        x_q, x_s = dynamic_mx_quant_e4m3(x, block_k=block_k)
+        gate = mx_matmul_fp8_fp4(x_q, x_s, w1_x2[ei], _b_scale(w1_scale[ei]), block_k)
+        up = mx_matmul_fp8_fp4(x_q, x_s, w3_x2[ei], _b_scale(w3_scale[ei]), block_k)
+        if swiglu_limit and swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+        h = F.silu(gate) * up
+        h_q, h_s = dynamic_mx_quant_e4m3(h, block_k=block_k)
+        y = mx_matmul_fp8_fp4(h_q, h_s, w2_x2[ei], _b_scale(w2_scale[ei]), block_k)
+        y = y * recv_weights[ei, :n_rows].reshape(-1, 1).float()
+        out[ei, :n_rows, :] = y
+    return out

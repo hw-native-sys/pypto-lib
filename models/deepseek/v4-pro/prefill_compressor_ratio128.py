@@ -24,6 +24,14 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
 )
+from kv_c8_common import (
+    KV_C8_AMAX_EPS,
+    KV_C8_QUANT_TILE,
+    KV_C8_SCALE_TILE_COLS,
+    KV_SCALE_COLS,
+    LN2_F32,
+)
+from mx_quant_common import ATOL_RTOL, FP8_E4M3_MAX, MX_KV_GROUP, golden_kv_c8_quant_row_fp32_scale
 
 
 B = PREFILL_BATCH
@@ -58,6 +66,8 @@ HCA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + HCA_STATE_BLOCK_SIZE - 1) // HCA_STATE_BLO
 HCA_STATE_BLOCK_NUM = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
+KV_SCALE_COLS = HEAD_DIM // MX_KV_GROUP
+assert HEAD_DIM % MX_KV_GROUP == 0
 HCA_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 HCA_KV_STORE_TILE = 16
@@ -79,7 +89,8 @@ def prefill_compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    cmp_kv_scale: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS], pl.FP32]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -93,6 +104,7 @@ def prefill_compressor_ratio128(
         [HCA_STATE_BLOCK_NUM * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
     cmp_kv_flat = pl.reshape(cmp_kv, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_scale_flat = pl.reshape(cmp_kv_scale, [HCA_CMP_BLOCK_NUM * BLOCK_SIZE, KV_SCALE_COLS])
     pooled_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
@@ -256,25 +268,53 @@ def prefill_compressor_ratio128(
         normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
+        quant_pad = pl.create_tensor([KV_C8_QUANT_TILE, HEAD_DIM], dtype=pl.FP32)
+        quant_pad[0:HCA_C128_RMS_TILE, 0:HEAD_DIM] = normed_kv_pad[
+            0:HCA_C128_RMS_TILE, 0:HEAD_DIM
+        ]
+        kv_fp8_blk = pl.create_tensor([KV_C8_QUANT_TILE, HEAD_DIM], dtype=pl.FP8E4M3FN)
+        scale_scratch_blk = pl.create_tensor([KV_C8_QUANT_TILE, KV_SCALE_COLS], dtype=pl.FP32)
+        row_bf16 = pl.cast(
+            pl.cast(quant_pad, target_type=pl.BF16, mode="rint"),
+            target_type=pl.FP32,
+        )
+        ln2 = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=LN2_F32)
+        fp8_max = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=FP8_E4M3_MAX)
+        amax_eps = pl.full([1, KV_C8_QUANT_TILE], dtype=pl.FP32, value=KV_C8_AMAX_EPS)
+        for g0 in pl.range(0, HEAD_DIM, MX_KV_GROUP):
+            gi = g0 // MX_KV_GROUP
+            chunk = row_bf16[0:KV_C8_QUANT_TILE, g0 : g0 + MX_KV_GROUP]
+            amax = pl.reshape(pl.row_max(pl.abs(chunk)), [1, KV_C8_QUANT_TILE])
+            amax = pl.maximum(amax, amax_eps)
+            ratio = pl.div(amax, fp8_max)
+            log2_ratio = pl.div(pl.log(ratio), ln2)
+            exp_i = pl.cast(log2_ratio, target_type=pl.INT32, mode="ceil")
+            exp_f = pl.cast(exp_i, target_type=pl.FP32)
+            scale_val = pl.exp(pl.mul(exp_f, ln2))
+            scale_col = pl.reshape(scale_val, [KV_C8_QUANT_TILE, 1])
+            q = pl.cast(pl.div(chunk, scale_col), target_type=pl.FP8E4M3FN, mode="rint")
+            kv_fp8_blk[0:KV_C8_QUANT_TILE, g0 : g0 + MX_KV_GROUP] = q
+            for ri in pl.range(KV_C8_QUANT_TILE):
+                pl.write(scale_scratch_blk, [ri, gi], pl.read(scale_col, [ri, 0]))
         for final_i in pl.range(MAX_CMP_WRITES):
             final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
             if final_cmp_row_raw >= 0:
                 final_cmp_row = pl.cast(final_cmp_row_raw, pl.INDEX)
-                for final_hb in pl.range(HEAD_BLOCKS):
-                    final_h0 = final_hb * HEAD_TILE
-                    final_chunk = normed_kv_pad[final_i : final_i + 1, final_h0 : final_h0 + HEAD_TILE]
-                    cmp_kv_flat[final_cmp_row : final_cmp_row + 1, final_h0 : final_h0 + HEAD_TILE] = pl.cast(
-                        final_chunk,
-                        target_type=pl.BF16,
-                        mode="rint",
+                cmp_kv_flat[final_cmp_row : final_cmp_row + 1, :] = kv_fp8_blk[
+                    final_i : final_i + 1, :
+                ]
+                for gi in pl.range(KV_SCALE_COLS):
+                    pl.write(
+                        cmp_kv_scale_flat,
+                        [final_cmp_row, gi],
+                        pl.read(scale_scratch_blk, [final_i, gi]),
                     )
 
-    cmp_kv = pl.reshape(cmp_kv_flat, [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
     compress_state = pl.reshape(
         compress_state_flat,
         [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    return cmp_kv, compress_state
+    return cmp_kv, cmp_kv_scale, compress_state
 
 
 @pl.jit
@@ -290,7 +330,8 @@ def prefill_compressor_ratio128_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    cmp_kv_scale: pl.InOut[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS], pl.FP32]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -298,7 +339,7 @@ def prefill_compressor_ratio128_test(
 ):
     return prefill_compressor_ratio128(
         x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        cmp_kv, cmp_kv_scale, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
     )
 
 
@@ -316,6 +357,7 @@ def golden_prefill_compressor_ratio128(tensors):
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["compress_state_block_table"]
     cmp_kv_flat = tensors["cmp_kv"].view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+    cmp_kv_scale_flat = tensors["cmp_kv_scale"].view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, KV_SCALE_COLS)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -358,7 +400,10 @@ def golden_prefill_compressor_ratio128(tensors):
         rot_even = even * cos - odd * sin
         rot_odd = even * sin + odd * cos
         normed[:, NOPE_HEAD_DIM:] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2)
-        cmp_kv_flat[dst_row] = normed[0]
+        row_bf16 = normed[0].to(torch.bfloat16)
+        q, s = golden_kv_c8_quant_row_fp32_scale(row_bf16)
+        cmp_kv_flat[dst_row] = q
+        cmp_kv_scale_flat[dst_row] = s
 
     for t in range(num_tokens):
         pos = int(tensors["position_ids"][t].item())
@@ -420,7 +465,9 @@ def build_tensor_specs(start_pos: int = START_POS):
     def init_freqs_sin():
         return shared_freqs_sin.clone()
     def init_cmp_kv():
-        return torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.bfloat16)
+        return torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    def init_cmp_kv_scale():
+        return torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS, dtype=torch.float32)
     def init_position_ids():
         return torch.arange(start_pos, start_pos + T, dtype=torch.int32)
     def init_cmp_slot_mapping():
@@ -446,7 +493,8 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_norm_w),
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
-        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
+        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=init_cmp_kv, is_output=True),
+        TensorSpec("cmp_kv_scale", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, KV_SCALE_COLS], torch.float32, init_value=init_cmp_kv_scale, is_output=True),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         ScalarSpec("num_tokens", torch.int32, num_tokens),
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
@@ -491,7 +539,14 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "cmp_kv": ratio_allclose(
+                atol=ATOL_RTOL["kv_c8"]["atol"], rtol=ATOL_RTOL["kv_c8"]["rtol"],
+                max_error_ratio=ATOL_RTOL["kv_c8"]["pct"],
+            ),
+            "cmp_kv_scale": ratio_allclose(
+                atol=ATOL_RTOL["kv_c8"]["atol"], rtol=ATOL_RTOL["kv_c8"]["rtol"],
+                max_error_ratio=ATOL_RTOL["kv_c8"]["pct"],
+            ),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
         },
     )

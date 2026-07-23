@@ -100,7 +100,7 @@ assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_
 
 @pl.jit
 def decode_layer(
-    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -186,7 +186,7 @@ def decode_layer(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.BF16]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -197,8 +197,8 @@ def decode_layer(
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
     if layer_id < 2:
         attention_swa(
             x_hc,
@@ -265,7 +265,7 @@ def decode_layer(
 
 @pl.jit.host
 def l3_decode_layer(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -354,7 +354,7 @@ def l3_decode_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16]],
     layer_id: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)
@@ -834,7 +834,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
             spec.resident = "stacked"
 
     specs.extend([
-        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True),
+        TensorSpec("x_next", [N_RANKS, T, HC_MULT, D], torch.bfloat16, is_output=True),
         ScalarSpec("layer_id", torch.int32, layer_id),
     ])
     return specs

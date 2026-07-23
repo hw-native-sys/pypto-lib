@@ -37,10 +37,10 @@ assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 @pl.jit.inline
 def hc_post(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
 ):
     t_dim = pl.tensor.dim(x, 0)
 
@@ -58,22 +58,21 @@ def hc_post(
             for in_h in pl.pipeline(HC_MULT, stage=4):
                 comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
                 res_d = in_h * D
-                # residual is already FP32 (hc stream is FP32 end-to-end): no cast, read straight.
-                res_row = residual_flat[t : t + 1, res_d : res_d + D]
+                res_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
                 weighted = pl.mul(res_row, comb_w)
                 y_row = pl.add(y_row, weighted)
-            # y is FP32 (feeds the next layer's hc_pre directly): no BF16 output cast.
-            y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+            y_out = pl.cast(y_row, target_type=pl.BF16, mode="rint")
+            y_flat[t : t + 1, out_h * D : out_h * D + D] = y_out
     return y
 
 
 @pl.jit.inline
 def hc_post_prefill(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     """Compute prefill active rows and deterministically pad the static tail."""
@@ -101,9 +100,9 @@ def hc_post_prefill(
                     for in_h in pl.pipeline(HC_MULT, stage=4):
                         comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
                         res_d = in_h * D
-                        res_row = residual_flat[t : t + 1, res_d : res_d + D]
+                        res_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)
                         y_row = pl.add(y_row, pl.mul(res_row, comb_w))
-                    y_flat[t : t + 1, out_h * D : out_h * D + D] = y_row
+                    y_flat[t : t + 1, out_h * D : out_h * D + D] = pl.cast(y_row, target_type=pl.BF16, mode="rint")
 
     inactive_tokens = t_dim - active_tokens
     if inactive_tokens > 0:
@@ -112,7 +111,7 @@ def hc_post_prefill(
             fill_tile = fill_block // HC_MULT
             out_h = fill_block % HC_MULT
             fill_t0 = active_tokens + fill_tile * INACTIVE_FILL_T_TILE
-            zero = pl.full([1, INACTIVE_FILL_D_TILE], dtype=pl.FP32, value=0.0)
+            zero = pl.full([1, INACTIVE_FILL_D_TILE], dtype=pl.BF16, value=0.0)
             for fill_dt in pl.range(INACTIVE_FILL_T_TILE):
                 fill_t = fill_t0 + fill_dt
                 if fill_t < t_dim:
@@ -125,10 +124,10 @@ def hc_post_prefill(
 @pl.jit
 def hc_post_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
-    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32],
+    residual: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
     post: pl.Tensor[[T_DYN, HC_MULT], pl.FP32],
     comb: pl.Tensor[[T_DYN, HC_MULT * HC_MULT], pl.FP32],
-    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.FP32]],
+    y: pl.Out[pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16]],
 ):
     x.bind_dynamic(0, T_DYN)
     residual.bind_dynamic(0, T_DYN)
@@ -156,7 +155,7 @@ def golden_hc_post(tensors):
         for in_h in range(HC_MULT):
             y_row = y_row + residual[:, in_h, :] * comb[:, in_h, out_h:out_h + 1]
         y_fp32[:, out_h, :] = y_row
-    y = y_fp32  # hc residual stream is FP32 end-to-end: no BF16 rounding
+    y = y_fp32.to(torch.bfloat16)
 
     tensors["y"][:] = y
 
@@ -185,10 +184,10 @@ def build_tensor_specs(B, S):
         return (c / c.sum(dim=-1, keepdim=True)).reshape(T, HC_MULT * HC_MULT)
     return [
         TensorSpec("x",        [T, D],                    torch.bfloat16, init_value=init_x),
-        TensorSpec("residual", [T, HC_MULT, D],           torch.float32,  init_value=init_residual),
+        TensorSpec("residual", [T, HC_MULT, D],           torch.bfloat16, init_value=init_residual),
         TensorSpec("post",     [T, HC_MULT],              torch.float32,  init_value=init_post),
         TensorSpec("comb",     [T, HC_MULT * HC_MULT],    torch.float32,  init_value=init_comb),
-        TensorSpec("y",        [T, HC_MULT, D],           torch.float32,  is_output=True),
+        TensorSpec("y",        [T, HC_MULT, D],           torch.bfloat16, is_output=True),
     ]
 
 
