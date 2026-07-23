@@ -5,17 +5,7 @@ description: Create or update a GitHub pull request after committing and pushing
 
 # GitHub Pull Request Workflow
 
-## Task Tracking
-
-Create tasks to track progress through this workflow:
-
-1. Prepare branch & commit
-2. Check for existing PR
-3. Fetch upstream & rebase
-4. Push to remote
-5. Create PR
-
-## Step 1: Check Current State
+## 1. Check state
 
 ```bash
 BRANCH_NAME=$(git branch --show-current)
@@ -29,128 +19,92 @@ fi
 git rev-list HEAD --not "$BASE_REF" --count
 ```
 
-A branch "needs a new branch" when it is effectively on main — either the branch
-name is `main`/`master`, **or** it has zero commits ahead of the base ref.
+A branch is **effectively on main** when its name is `main`/`master` **or** it has zero commits
+ahead of `$BASE_REF`.
 
-## Step 2: Route
-
-| Needs new branch? | Uncommitted changes? | Action |
-| ----------------- | -------------------- | ------ |
-| Yes | Yes | Create new branch, commit via `/git-commit`, then create PR |
+| Effectively on main? | Uncommitted? | Action |
+| -------------------- | ------------ | ------ |
+| Yes | Yes | New branch, commit via `/git-commit`, then PR |
 | Yes | No | Error — nothing to PR |
-| No | Yes | Commit on current branch via `/git-commit`, then create PR |
-| No | No | Already committed — proceed to push and create PR |
+| No | Yes | Commit via `/git-commit` on this branch, then PR |
+| No | No | Already committed — push and PR |
 
-### Create Branch (if needed)
+## 2. Branch (if needed)
 
-Auto-generate a branch name with a meaningful prefix. Do NOT ask the user.
+The name comes from the commit subject, which does not exist yet when the work is uncommitted:
+decide the `Type: subject` from the staged diff first (same rules as `/git-commit`), branch on it,
+then commit. Do NOT ask the user.
 
-| Prefix | Usage |
-| ------ | ----- |
-| `feat/` | new example or tensor function |
-| `fix/` | bug fix |
-| `docs/` | documentation changes |
-| `ci/` | CI/CD changes |
-| `refactor/` | restructuring |
+| Commit type | `Add:` | `Fix:` | `Perf:` | `Refactor:` | `Docs:` | `CI:` | `Chore:` |
+| ----------- | ------ | ------ | ------- | ----------- | ------- | ----- | -------- |
+| Prefix | `feat/` | `fix/` | `perf/` | `refactor/` | `docs/` | `ci/` | `chore/` |
+
+Slug = subject after `Type: `, lowercased, non-alphanumerics to hyphens, trailing hyphens
+stripped, truncated to 50 characters.
 
 ```bash
-git checkout -b <branch-name>
+git checkout -b <prefix><slug>
 ```
 
-### Commit (if uncommitted changes)
-
-Delegate to `/git-commit` skill.
-
-## Step 3: Check for Existing PR
+## 3. Existing PR?
 
 ```bash
 gh pr list --head "$BRANCH_NAME" --state open
 ```
 
-If PR already exists, display with `gh pr view` and exit.
+If one exists, show it with `gh pr view` and exit.
 
-## Step 4: Rebase and Push
+## 4. Rebase and push
 
 ```bash
-git fetch upstream 2>/dev/null || git fetch origin
 git rebase "$BASE_REF"
+git push --set-upstream origin "$BRANCH_NAME"      # first push
+git push --force-with-lease origin "$BRANCH_NAME"  # after a rebase — never --force
 ```
 
-**On conflicts**:
+On conflicts: resolve, `git add <file>`, `git rebase --continue`; `git rebase --abort` if stuck.
 
-```bash
-git status
-# Edit files, remove markers
-git add path/to/resolved/file
-git rebase --continue
-# If stuck: git rebase --abort
-```
-
-**Push**:
-
-```bash
-# First push
-git push --set-upstream origin "$BRANCH_NAME"
-
-# After rebase (use --force-with-lease, NOT --force)
-git push --force-with-lease origin "$BRANCH_NAME"
-```
-
-## Step 5: Create PR
-
-**Check gh CLI**:
+## 5. Create PR
 
 ```bash
 gh auth status
 ```
 
-**If gh NOT available or not authenticated**: Report to user and provide manual URL:
-`https://github.com/hw-native-sys/pypto-lib/compare/main...BRANCH_NAME`
+If `gh` is missing or unauthenticated, do not install it — give the user the manual URL
+`https://github.com/hw-native-sys/pypto-lib/compare/main...$BRANCH_NAME` and stop.
 
-**If gh available**:
+Read the PR's exact scope first; the body describes this and nothing else:
+
+```bash
+git log "$BASE_REF"..HEAD --format='%B'   # commits this PR adds
+git diff "$BASE_REF"...HEAD --stat        # files it touches
+```
 
 ```bash
 gh pr create \
-  --title "Brief description of changes" \
+  --base main \
+  --head "$BRANCH_NAME" \
+  --title "Type: concise description" \
   --body "$(cat <<'EOF'
 ## Summary
 - Key change 1
 - Key change 2
-
-## Related Issues
-Fixes #ISSUE_NUMBER (if applicable)
 EOF
 )"
 ```
 
-**Rules**:
-- Auto-generate title and body from commit messages
-- Keep title under 72 characters
-- Do NOT add AI co-author footers or branding
-- Use ONLY the `## Summary` and `## Related Issues` sections shown above. Do NOT add `## Test plan`, `## Test Plan`, or any other sections
+**Title** — the commit subject verbatim: `Type: description`, under 72 characters, one of the
+seven types in `/git-commit`. It becomes the squash-merge subject on `main`, so never the
+conventional-commit `feat(scope):` form.
 
-## Common Issues
+**Body**:
 
-| Issue | Solution |
-| ----- | -------- |
-| PR already exists | `gh pr view` then exit |
-| Merge conflicts | Resolve, `git add`, `git rebase --continue` |
-| Push rejected | `git push --force-with-lease` |
-| gh not authenticated | Tell user to run `gh auth login` |
-| Wrong upstream branch | Use `git rebase upstream/BRANCH` |
-
-## Checklist
-
-- [ ] Branch prepared (created from main if needed)
-- [ ] Changes committed via `/git-commit`
-- [ ] No existing PR for branch (exit if found)
-- [ ] Fetched upstream and rebased successfully
-- [ ] Pushed with `--force-with-lease`
-- [ ] PR created with clear title and summary
-- [ ] No AI co-author footers
-
-## Remember
-
-- Always rebase before creating PR
-- Use `--force-with-lease`, not `--force`
-- Don't auto-install gh CLI - let user do it
+- Derived **only** from `$BASE_REF..HEAD` — never from the conversation that produced it, from
+  commits already on `main`, or from tool output.
+- `## Summary` is the ONLY section. No `## Test plan`, `## Testing`, `## Validation`, `## Notes`,
+  `## Related Issues`, or any other heading.
+- Link an issue with a bare trailing `Fixes #123`, and only when a real issue number exists. Omit
+  the line otherwise — never a heading followed by `None` / `N/A` / `(if applicable)`.
+- Every bullet verifiable from the diff. No lint / `pre-commit` runs, syntax checks, commands
+  invoked, files read, debugging detours, irreproducible measurements, or follow-up ideas.
+- No AI co-author footers or branding.

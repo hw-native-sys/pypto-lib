@@ -5,100 +5,75 @@ description: Complete git commit workflow including pre-commit checks, staging, 
 
 # Git Commit Workflow
 
-## Task Tracking
-
-Create tasks to track progress through this workflow:
-
-1. Analyze changes & run pre-commit checks
-2. Stage changes & commit
-3. Post-commit verification
-
-## Prerequisites
-
-Check what changed to determine review needs:
+## 1. Review
 
 ```bash
-git diff --name-only
-git diff --cached --name-only
+git diff --name-only   # what changed
+git diff --staged      # review before committing
 ```
 
-| File Types Changed | Run Example Validation |
-| ------------------ | ---------------------- |
-| Python (`.py`) in `examples/` | Yes — run a related example |
-| Docs only (`.md`) | Skip |
-| Config only (`.yml`, `.json`, `.gitignore`) | Skip |
+Check what the hooks cannot: `import pypto.language as pl` (not other aliases), correct
+`pl.FunctionType` (InCore / Orchestration / Opaque), correct parameter directions (`pl.Out`,
+`pl.InOut`), no hardcoded absolute paths or private information. See `docs/pypto-coding-style.md`.
 
-## Pre-Commit Review
+If the change touches a kernel under `examples/` or `models/`, run it once before committing.
+Docs- or config-only changes need no run.
 
-Before committing, review changes against the coding style:
-
-```bash
-git diff --staged
-```
-
-Check for:
-- `import pypto.language as pl` (not other aliases)
-- Correct `pl.FunctionType` usage (InCore / Orchestration / Opaque)
-- Proper parameter directions (`pl.Out`, `pl.InOut`)
-- No hardcoded absolute paths or private information
-- Comments and docstrings in English
-
-## Pre-Commit Hooks
-
-This project uses pre-commit hooks. Verify these pass before committing:
-
-| Hook | What it checks |
-|------|----------------|
-| `ruff-check` | Python linting (pyflakes: unused imports, undefined names) |
-| `check-headers` | Copyright header format |
-| `check-english-only` | Code comments and docstrings are in English |
-
-Run all hooks:
+## 2. Hooks
 
 ```bash
 pre-commit run --all-files
 ```
 
-Or run individually:
+| Hook | What it checks |
+|------|----------------|
+| `ruff-check` | Python linting — runs with `--fix`, so re-stage what it rewrites |
+| `check-headers` | Copyright header format |
+| `check-english-only` | Code comments and docstrings are in English |
 
-```bash
-ruff check --config ruff.toml .
-python tests/lint/check_headers.py
-python tests/lint/check_english_only.py
-```
+**Never bypass.** No `--no-verify`, no `SKIP=...`. Any file the commit touches must leave it with
+zero violations, including violations that predate the change.
 
-## Stage Changes
+## 3. Stage
 
 Stage related changes together. Never stage build artifacts (`build_output/`, `__pycache__/`, `*.so`).
 
 ```bash
 git add path/to/file1.py path/to/file2.py
-git diff --staged  # Review before committing
 ```
 
-## Commit Message Format
+## 4. Message
 
-### Subject Line
+### Subject
 
-`Type: concise description` (under 72 characters, imperative mood, no period)
+`Type: concise description` — under 72 characters, imperative mood, no period.
 
-**Types**:
+**These seven types and no others**:
 
 | Type | Usage |
 | ---- | ----- |
-| **Add** | new example, model, or tensor function |
-| **Fix** | bug fix |
-| **Update** | enhancement to existing example or function |
+| **Add** | new example, model, tensor function, or capability on an existing one |
+| **Fix** | bug fix — correctness, precision, hang, or build failure |
+| **Perf** | speed / memory optimization with unchanged numerics |
 | **Refactor** | restructuring without behavior change |
 | **Docs** | documentation changes |
 | **CI** | CI/CD pipeline changes |
 | **Chore** | config, gitignore, tooling |
 
-### Body (required for multi-file changes)
+### Body
 
-Separate from subject by a blank line. Explain **what** changed and **why**. Use bullet points for multiple items. Wrap at 72 characters.
+Required for multi-file changes, optional for one-liners. Blank line after the subject, wrapped at
+72 characters, bullets for multiple items. Explain **what** changed and **why**.
 
-**Good examples**:
+**The body describes the staged diff, not the session that produced it** — it becomes the PR body
+and, after squash-merge, the permanent `git log` entry. Every line must be verifiable from
+`git diff --staged`. Never include: lint / `ruff` / `pre-commit` / syntax-compile runs, commands
+invoked, files read, the debugging path taken, measurements a reviewer cannot reproduce, or
+follow-up ideas absent from the diff.
+
+A `Perf:` body states the measured before -> after **and** the configuration measured on.
+
+**Good**:
 
 ```text
 Add: Qwen3-32B single-layer decode example
@@ -109,37 +84,33 @@ Add: Qwen3-32B single-layer decode example
 ```
 
 ```text
-Fix: softmax numerics in paged attention example
+Perf: fold RoPE into DeepSeek V4 gate FFN norm
 
-Row-max subtraction was applied after exponentiation,
-causing overflow for large logits.
+- Drop the fp32 widen buffer; quantize straight from the norm output
+- Fan the gate matmul over experts so GATE_N_TILE shrinks 16 -> 1
+
+Isolated gate latency 55 -> 46 us (decode, ep2, a2a3).
 ```
 
-**Simple changes (body optional)**:
+**Bad**:
 
 ```text
-Docs: clarify incore scope memory constraints
+x  Added new example.                # Past tense, has period
+x  fix bug / WIP                     # Lowercase type, not descriptive
+x  Update: tune MoE tile sizes       # 'Update' is not a type -- use Perf
+x  feat(dsv4): split v4 into two     # Conventional style -- use 'Add: ...'
+x  Perf: speed up SWA decode         # No before -> after number
+x  Fix: hc_pre scratch shapes        # ...body listing "ran ruff, ran pre-commit"
 ```
 
-## Co-Author Policy
+### Co-authors
 
-**❌ NEVER add AI assistants**: No Claude, ChatGPT, Cursor AI, etc.
-**✅ Only credit human contributors**: `Co-authored-by: Name <email>`
+Never credit AI assistants. Human contributors only: `Co-authored-by: Name <email>`.
 
-**Why?** AI tools are not collaborators. Commits reflect human authorship.
-
-## Post-Commit Verification
+## 5. Verify
 
 ```bash
-git log -1              # Check message
-git show HEAD --stat    # Verify staged files
+git log -1 && git show HEAD --stat
 ```
 
-## Checklist
-
-- [ ] Only relevant files staged (no build artifacts)
-- [ ] Code follows `docs/pypto-coding-style.md` conventions
-- [ ] No hardcoded paths or private information
-- [ ] Message format: `Type: description` (under 72 chars, imperative, no period)
-- [ ] Body included for multi-file changes (what + why)
-- [ ] No AI co-authors
+Amend only if not yet pushed: `git commit --amend`.
