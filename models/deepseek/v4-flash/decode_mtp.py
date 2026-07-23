@@ -223,7 +223,6 @@ def mtp_decode_layer(
         routed_y_buf,
         combine_arrived,
         pl.cast(MTP_LAYER_ID, pl.INT32),
-        num_tokens,
         my_rank,
         pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )

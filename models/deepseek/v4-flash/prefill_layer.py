@@ -60,6 +60,7 @@ from moe import (
     moe,
 )
 from config import FLASH as MODEL_CONFIG
+from prefill_dynamic import PREFILL_TOKENS_DYN
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,
@@ -121,6 +122,14 @@ TOK_TILE = T
 PREFILL_CHUNK_TOKENS = T
 DEFAULT_CHUNK_LENS = (T, T + T // 2)
 DEFAULT_USER_BATCH = len(DEFAULT_CHUNK_LENS)
+# Dynamic attention scopes need the larger inner-ring heaps, and the packed
+# layer scope keeps more than the default ring-3 heap live until scope_end.
+PREFILL_LAYER_RING_HEAP = (
+    0,
+    512 * 1024 * 1024,
+    2 * 1024 * 1024 * 1024,
+    512 * 1024 * 1024,
+)
 
 # Per-request contiguous block/state counts (each request owns one such slice; the
 # packed buffer dim0 is ``user_batch * <count>``). The cache/state block tables are
@@ -135,8 +144,6 @@ IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
 # Dynamic (batch-dependent) kernel-signature dims. Kept local to this file so
 # config.py and the fixed-T child kernels stay untouched (issue #591 §1).
 USER_BATCH_DYN = pl.dynamic("DEEPSEEK_PREFILL_USER_BATCH_DYN")
-PREFILL_TOKENS_DYN = pl.dynamic("DEEPSEEK_PREFILL_TOKENS_DYN")
-
 PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_CACHE_BLOCKS_DYN")
 PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_CACHE_BLOCKS_DYN")
 PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_CACHE_BLOCKS_DYN")
@@ -280,6 +287,8 @@ def prefill_layer_core(
     csa_compress_state_block_table.bind_dynamic(0, PREFILL_CSA_STATE_TABLE_DYN)
     csa_inner_compress_state.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
     csa_inner_compress_state_block_table.bind_dynamic(0, PREFILL_INNER_STATE_TABLE_DYN)
+    token_count = pl.tensor.dim(x_hc, 0)
+    x_attn = pl.create_tensor([token_count, HC_MULT, D], dtype=pl.FP32)
     user_batch = pl.tensor.dim(seq_lens, 0)
     for request_id in pl.range(user_batch):
         chunk_len_b = pl.tensor.read(chunk_lens, [request_id])
@@ -312,35 +321,29 @@ def prefill_layer_core(
             p0 = tile_id * TOK_TILE
             tile_base = chunk_base + p0
             valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
-            valid_n = pl.cast(valid_tok, pl.INT32)  # child num_tokens scalar (INT32)
             # Global execution ordinal of this MoE call (1-based). The done
             # windows are monotonic counters, so each serial MoE call needs a
             # unique, gap-free epoch == its execution order; chunk_tile_offsets
             # is the exclusive prefix sum of tok_blocks over requests.
             moe_epoch = pl.cast(tile_ord_base + tile_id + 1, pl.INT32)
 
-            # Tile-local fixed-[T] inputs gathered from the packed buffers. The
-            # children only read the leading ``valid_tok`` rows, so the padded
-            # tail (when valid_tok < T) is ignored. No explicit per-tile pl.scope:
+            # Gather Attention and MoE inputs at their physical tail shape. No
+            # explicit per-tile pl.scope:
             # rely on auto_scope + pl.range's sequential semantics so the
             # global cache/state RAW dependency is carried across tiles
             # (tile N's writeback ordered before tile N+1's gather).
-            # Keep all child inputs at their fixed [T] capacity. In particular,
-            # x_hc / position_ids feed T_DYN children whose sibling tensors are
-            # full-[T], so narrowing them would bind T_DYN to two extents.
-            # num_tokens gates every padded tail row in the child kernels.
-            x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0])
-            ori_slot_tile = pl.slice(ori_slot_mapping, [TOK_TILE], [tile_base])
-            position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base])
-            hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [TOK_TILE], [tile_base])
-            hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [TOK_TILE], [tile_base])
-            csa_cmp_slot_tile = pl.slice(csa_cmp_slot_mapping, [TOK_TILE], [tile_base])
-            csa_idx_slot_tile = pl.slice(csa_idx_slot_mapping, [TOK_TILE], [tile_base])
-            csa_state_slot_tile = pl.slice(csa_state_slot_mapping, [TOK_TILE], [tile_base])
-            csa_inner_state_slot_tile = pl.slice(csa_inner_state_slot_mapping, [TOK_TILE], [tile_base])
-            input_ids_tile = pl.slice(input_ids, [TOK_TILE], [tile_base])
+            x_hc_tile = pl.slice(x_hc, [valid_tok, HC_MULT, D], [tile_base, 0, 0])
+            ori_slot_tile = pl.slice(ori_slot_mapping, [valid_tok], [tile_base])
+            position_ids_tile = pl.slice(position_ids, [valid_tok], [tile_base])
+            hca_cmp_slot_tile = pl.slice(hca_cmp_slot_mapping, [valid_tok], [tile_base])
+            hca_state_slot_tile = pl.slice(hca_state_slot_mapping, [valid_tok], [tile_base])
+            csa_cmp_slot_tile = pl.slice(csa_cmp_slot_mapping, [valid_tok], [tile_base])
+            csa_idx_slot_tile = pl.slice(csa_idx_slot_mapping, [valid_tok], [tile_base])
+            csa_state_slot_tile = pl.slice(csa_state_slot_mapping, [valid_tok], [tile_base])
+            csa_inner_state_slot_tile = pl.slice(csa_inner_state_slot_mapping, [valid_tok], [tile_base])
+            input_ids_tile = pl.slice(input_ids, [valid_tok], [tile_base])
 
-            x_attn_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
+            x_attn_valid = pl.slice(x_attn, [valid_tok, HC_MULT, D], [tile_base, 0, 0])
             if layer_id < 2:
                 prefill_attention_swa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
@@ -349,7 +352,7 @@ def prefill_layer_core(
                     kv_cache_req, ori_block_table_req, ori_slot_tile,
                     position_ids_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
             elif layer_id % 2 == 1:
                 prefill_attention_hca(
@@ -362,7 +365,7 @@ def prefill_layer_core(
                     cmp_kv_req, cmp_block_table_req,
                     position_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
             else:
                 prefill_attention_csa(
@@ -380,12 +383,12 @@ def prefill_layer_core(
                     position_ids_tile, csa_cmp_slot_tile, csa_idx_slot_tile,
                     csa_state_slot_tile, csa_inner_state_slot_tile,
                     attn_sink, wo_a, wo_b, wo_b_scale,
-                    x_attn_tile, valid_n,
+                    x_attn_valid,
                 )
 
-            x_next_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
+            x_next_tile = pl.slice(x_next, [valid_tok, HC_MULT, D], [tile_base, 0, 0])
             moe(
-                x_attn_tile,
+                x_attn_valid,
                 hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
                 norm_w, gate_w, gate_bias, tid2eid, input_ids_tile,
                 routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -395,13 +398,9 @@ def prefill_layer_core(
                 x_next_tile,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                layer_id, valid_n, my_rank, moe_epoch,
+                layer_id, my_rank, moe_epoch,
             )
 
-            # Scatter the tile back into the padded physical output. Each
-            # request's physical span is rounded up to whole-T tiles, so a
-            # full-T write is safe even for a partial logical tail tile.
-            x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
     return x_next
 
 
@@ -736,7 +735,7 @@ def _attention_kind_for_layer(layer_id):
 
 
 def _tile_token_meta(kind, context_len, valid_tok, torch):
-    """Child-local [T] token metadata for one tile, via the fixed-T child builder.
+    """Child-local token metadata for one physical dynamic tile.
 
     Reuses the existing single-tile builders, which already encode the
     absolute-position paged-cache/state coordinate logic. ``context_len``
@@ -765,7 +764,7 @@ def _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
 
 
 def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, total_tokens, torch):
-    """Assemble rank-shared padded-physical [total_tokens, ...] metadata tensors."""
+    """Assemble rank-shared packed-physical [total_tokens, ...] metadata tensors."""
     pos = torch.zeros(total_tokens, dtype=torch.int32)
     ori_slot = torch.full((total_tokens,), -1, dtype=torch.int64)
     hca_cmp = torch.full((total_tokens,), -1, dtype=torch.int64)
@@ -777,16 +776,16 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
 
     for _r, _tid, ctx, valid, base in _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
         m = _tile_token_meta(kind, ctx, valid, torch)
-        pos[base:base + T] = m["position_ids"][:T]
-        ori_slot[base:base + T] = m["ori_slot_mapping"][:T]
+        pos[base:base + valid] = m["position_ids"][:valid]
+        ori_slot[base:base + valid] = m["ori_slot_mapping"][:valid]
         if kind == "hca":
-            hca_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            hca_state[base:base + T] = m["state_slot_mapping"][:T]
+            hca_cmp[base:base + valid] = m["cmp_slot_mapping"][:valid]
+            hca_state[base:base + valid] = m["state_slot_mapping"][:valid]
         elif kind == "csa":
-            csa_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            csa_idx[base:base + T] = m["idx_slot_mapping"][:T]
-            csa_state[base:base + T] = m["state_slot_mapping"][:T]
-            csa_inner[base:base + T] = m["inner_state_slot_mapping"][:T]
+            csa_cmp[base:base + valid] = m["cmp_slot_mapping"][:valid]
+            csa_idx[base:base + valid] = m["idx_slot_mapping"][:valid]
+            csa_state[base:base + valid] = m["state_slot_mapping"][:valid]
+            csa_inner[base:base + valid] = m["inner_state_slot_mapping"][:valid]
 
     return {
         "position_ids": pos,
@@ -801,7 +800,7 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
 
 
 def _resolve_batch(chunk_lens, start_positions, torch):
-    """Normalize batch config into logical lengths and padded physical offsets."""
+    """Normalize batch config into logical lengths and packed physical offsets."""
     chunk_lens_v = [int(c) for c in chunk_lens]
     for c in chunk_lens_v:
         if c <= 0:
@@ -816,9 +815,8 @@ def _resolve_batch(chunk_lens, start_positions, torch):
         )
     seq_lens_v = [start_positions[i] + chunk_lens_v[i] for i in range(len(chunk_lens_v))]
     tile_counts_v = [(c + T - 1) // T for c in chunk_lens_v]
-    padded_lens_v = [tc * T for tc in tile_counts_v]
     chunk_offsets_v, acc = [], 0
-    for c in padded_lens_v:
+    for c in chunk_lens_v:
         chunk_offsets_v.append(acc)
         acc += c
     total_tokens = acc
@@ -840,8 +838,8 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     the default covers ``DEFAULT_USER_BATCH`` requests with chunk lengths
     ``T`` and ``T + T//2``.
     ``start_positions`` the prior context length per request (default 0 = fresh
-    prefill, no cache history). Token tensors are physically padded to whole
-    ``T`` tiles; cache/state/tables are ``user_batch``-concatenated
+    prefill, no cache history). Token tensors are physically packed without
+    per-request padding; cache/state/tables are ``user_batch``-concatenated
     request-local slices.
     """
     import torch
@@ -1147,13 +1145,10 @@ def golden_prefill_layer(tensors):
         })
         attention_golden = golden_prefill_attention_csa
 
-    attn_specs = _KIND_BUILDER[kind](start_pos=0, num_tokens=T)
     x_next = tensors["x_next"]
 
-    def tile_buffer(packed_per_rank, rank, base, _valid, feature_shape, dtype):
-        buf = torch.zeros((T, *feature_shape), dtype=dtype)
-        buf[:] = packed_per_rank[rank, base:base + T]
-        return buf
+    def tile_buffer(packed_per_rank, rank, base, valid):
+        return packed_per_rank[rank, base:base + valid].clone()
 
     for request_id in range(batch):
         chunk_len = int(chunk_lens[request_id])
@@ -1174,8 +1169,10 @@ def golden_prefill_layer(tensors):
             p0 = tile_id * T
             valid = min(T, chunk_len - p0)
             base = chunk_base + p0
+            context_len = int(tensors["seq_lens"][0, request_id]) - chunk_len + p0
+            attn_specs = _KIND_BUILDER[kind](start_pos=context_len, num_tokens=valid)
 
-            x_attn_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
+            x_attn_tile = torch.zeros(N_RANKS, valid, HC_MULT, D, dtype=torch.float32)
             for rank in range(N_RANKS):
                 attn_tensors = {}
                 for spec in attn_specs:
@@ -1185,29 +1182,25 @@ def golden_prefill_layer(tensors):
                     if name == "x_out":
                         attn_tensors[name] = x_attn_tile[rank]
                     elif name == "x_hc":
-                        attn_tensors[name] = tile_buffer(tensors["x_hc"], rank, base, valid, (HC_MULT, D), torch.float32)
+                        attn_tensors[name] = tile_buffer(tensors["x_hc"], rank, base, valid)
                     elif name in _TOKEN_META_NAMES:
                         packed = mapped[name]
-                        attn_tensors[name] = tile_buffer(packed, rank, base, valid, tuple(packed.shape[2:]), packed.dtype)
+                        attn_tensors[name] = tile_buffer(packed, rank, base, valid)
                     elif name in _CACHE_STATE_NAMES:
                         attn_tensors[name] = req_views[_child_to_packed(kind, name)][rank]
                     else:
                         attn_tensors[name] = mapped[name][rank]
-                attn_tensors["num_tokens"] = valid
                 attention_golden(attn_tensors)
                 x_attn_tile[rank] = attn_tensors["x_out"]
 
             moe_tensors = dict(tensors)
             moe_tensors["x_hc"] = x_attn_tile
-            input_ids_tile = torch.zeros(N_RANKS, T, dtype=torch.int64)
-            input_ids_tile[:, :valid] = tensors["input_ids"][:, base:base + valid]
-            moe_tensors["input_ids"] = input_ids_tile
-            moe_tensors["num_tokens"] = valid
-            x_next_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+            moe_tensors["input_ids"] = tensors["input_ids"][:, base:base + valid].clone()
+            x_next_tile = torch.zeros(N_RANKS, valid, HC_MULT, D, dtype=tensors["x_next"].dtype)
             moe_tensors["x_next"] = x_next_tile
             golden_moe(moe_tensors)
 
-            x_next[:, base:base + valid] = x_next_tile[:, :valid]
+            x_next[:, base:base + valid] = x_next_tile
 
 
 def valid_ratio_reldiff(diff_thd, pct_thd):
@@ -1283,6 +1276,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            ring_heap=PREFILL_LAYER_RING_HEAP,
         ),
         rtol=1e-3,
         atol=1e-3,

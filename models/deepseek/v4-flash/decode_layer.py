@@ -257,7 +257,7 @@ def decode_layer(
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        layer_id, pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
+        layer_id, my_rank, pl.const(1, pl.INT32),
     )
     return x_next
 

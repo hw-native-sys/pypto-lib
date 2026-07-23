@@ -81,7 +81,7 @@ MTP_LAYER_ID = M.num_hidden_layers
 MTP_MOE_EPOCH = 1
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -151,30 +151,37 @@ def mtp_prefill_fwd(
     num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
+    token_count = pl.cast(num_tokens, pl.INDEX)
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_storage = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    x_attn_valid = pl.slice(x_attn_storage, [token_count, HC_MULT, D], [0, 0, 0])
 
-    mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        projected,
-    )
+    with pl.scope():
+        mtp_projection(
+            hidden_states, prev_hidden_states,
+            enorm_w, hnorm_w,
+            e_proj_w, e_proj_w_scale, e_proj_smooth,
+            h_proj_w, h_proj_w_scale, h_proj_smooth,
+            projected,
+        )
 
-    prefill_attention_swa(
-        projected,
-        hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        kv_cache, ori_block_table, ori_slot_mapping,
-        position_ids,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn, nt,
-    )
+    projected_valid = pl.slice(projected, [token_count, HC_MULT, D], [0, 0, 0])
+    ori_slot_mapping_valid = pl.slice(ori_slot_mapping, [token_count], [0])
+    position_ids_valid = pl.slice(position_ids, [token_count], [0])
+    with pl.scope():
+        prefill_attention_swa(
+            projected_valid,
+            hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            kv_cache, ori_block_table, ori_slot_mapping_valid,
+            position_ids_valid,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn_valid,
+        )
 
     moe(
-        x_attn,
+        x_attn_storage,
         hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
         norm_w, gate_w, gate_bias, tid2eid, input_ids,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
@@ -184,7 +191,7 @@ def mtp_prefill_fwd(
         pre_hc_hidden_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        pl.cast(MTP_LAYER_ID, pl.INT32), my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -496,7 +503,7 @@ def golden_mtp_prefill_fwd(tensors):
     x_attn = torch.zeros_like(projected)
     for rank in range(N_RANKS):
         golden_prefill_attention_swa({
-            "x_hc": projected[rank],
+            "x_hc": projected[rank, :num_tokens],
             "hc_attn_fn": tensors["hc_attn_fn"][rank],
             "hc_attn_scale": tensors["hc_attn_scale"][rank],
             "hc_attn_base": tensors["hc_attn_base"][rank],
@@ -511,13 +518,13 @@ def golden_mtp_prefill_fwd(tensors):
             "freqs_sin": tensors["freqs_sin"][rank],
             "kv_cache": tensors["kv_cache"][rank],
             "block_table": tensors["ori_block_table"][rank],
-            "ori_slot_mapping": tensors["ori_slot_mapping"][rank],
-            "position_ids": tensors["position_ids"][rank],
+            "ori_slot_mapping": tensors["ori_slot_mapping"][rank, :num_tokens],
+            "position_ids": tensors["position_ids"][rank, :num_tokens],
             "attn_sink": tensors["attn_sink"][rank],
             "wo_a": tensors["wo_a"][rank],
             "wo_b": tensors["wo_b"][rank],
             "wo_b_scale": tensors["wo_b_scale"][rank],
-            "x_out": x_attn[rank],
+            "x_out": x_attn[rank, :num_tokens],
             "num_tokens": num_tokens,
         })
 
