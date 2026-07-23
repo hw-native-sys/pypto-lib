@@ -255,6 +255,18 @@ full per-flag details.
 > a deprecated alias for `enable_l2_swimlane` / `--enable-l2-swimlane`.
 > It still works but emits a `DeprecationWarning` and will be removed.
 
+### 4b. Benchmark (opt-in, before validation)
+
+With `PYPTO_BENCH=1` in the environment, the harness re-dispatches the
+compiled program in a timed loop right after the correctness dispatch and
+before validation, and prints
+`[RUN]   effective_us (N rounds) min=… median=… mean=… max=…`. It is
+env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
+`PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop and `PYPTO_BENCH_RAW`
+dumps the per-dispatch samples. See
+[performance-tuning.md](performance-tuning.md#measuring--the-benchmark-loop-pypto_bench)
+for the output format, the multi-card breakdown, and what the number means.
+
 ### 5. Validate
 
 `golden.validation.validate_golden` compares each device output against
