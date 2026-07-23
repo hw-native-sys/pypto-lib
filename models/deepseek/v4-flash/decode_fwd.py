@@ -756,10 +756,7 @@ def l3_decode_fwd(
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     # MoE and LM-head run sequentially, so they can share data storage; keep
     # LM-head completion counters separate from the MoE epoch protocol below.
-    recv_x_buf = pld.alloc_window_buffer(
-        [LM_HEAD_SHARED_DATA_BYTES],
-        dtype=pl.INT8,
-    )
+    recv_x_buf = pld.alloc_window_buffer(LM_HEAD_SHARED_DATA_BYTES)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
