@@ -17,6 +17,18 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run_jit
 from hc_head import hc_head
+from lm_head import (
+    MAX_LOGIT_ROWS,
+    OWNER_SIZE as LM_HEAD_OWNER_SIZE,
+    TP_SIZE as LM_HEAD_TP_SIZE,
+    T_MAX as LM_HEAD_T_MAX,
+    VOCAB as LM_HEAD_VOCAB,
+    VOCAB_PER_TP,
+    lm_head_finish_decoupled_worker,
+    lm_head_decode_selected_publish_decoupled_worker,
+    lm_head_logits_route_decoupled_worker,
+    lm_head_tp_decoupled_worker,
+)
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
 
@@ -98,12 +110,19 @@ from moe import (
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 
+
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
 FWD_NUM_LAYERS = 43
 CSA_NUM_LAYERS = 21
 HCA_NUM_LAYERS = 20
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
+# LM-head uses dedicated completion counters, independent of the MoE epochs.
+LM_HEAD_COMM_EPOCH = 1
+LM_HEAD_SHARED_DATA_BYTES = max(
+    N_LOCAL * RECV_MAX * D,
+    LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4,
+)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
@@ -134,15 +153,12 @@ CACHE_POOL_NAMES = frozenset({
     "csa_compress_state", "csa_inner_compress_state", "hca_compress_state",
 })
 
-# Static weight parameters to keep device-resident, sharded per rank. Every host
-# param is a leading-dim-stacked ``[N_RANKS, *tail]`` tensor the orchestrator
-# slices as ``weight[r]`` and dispatches to ``device=r``; marking these
-# resident="stacked" makes the harness upload shard ``r`` to card ``r`` once and
-# reuse it across dispatches, skipping the per-dispatch H2D/D2H. Covers every
-# stacked attention / MoE weight, the replicated head/final-norm weights, and the
-# constant RoPE tables — but NOT the KV/compressor-state pools (``CACHE_POOL_NAMES``)
-# nor the per-step metadata (slot mappings, block tables, ids, kv_seq_lens,
-# position_ids, and the ``x_hc`` activation), which change per token.
+# Static weight parameters to keep device-resident, sharded per decode rank.
+# These are leading-dim-stacked ``[N_RANKS, *tail]`` tensors consumed as
+# ``weight[r]`` on ``device=r``.  ``lm_head_weight`` is intentionally excluded:
+# it is ``[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D]`` and only TP ranks consume it, so
+# it should not use the decode-world ``resident="stacked"`` contract until the
+# runner supports a TP-subset resident upload.
 RESIDENT_WEIGHT_NAMES = frozenset(
     [
         n
@@ -256,9 +272,12 @@ def decode_fwd(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
+    nt = pl.cast(0, pl.INT32)
+    for owner_rank in pl.range(N_RANKS):
+        nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -355,7 +374,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
         attention_swa(
@@ -380,7 +399,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
@@ -473,7 +492,7 @@ def decode_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, num_tokens, my_rank, csa_moe_epoch,
+                csa_layer, nt, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -542,7 +561,7 @@ def decode_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, num_tokens, my_rank, hca_moe_epoch,
+                hca_layer, nt, my_rank, hca_moe_epoch,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -632,7 +651,7 @@ def decode_fwd(
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, num_tokens, my_rank, last_moe_epoch,
+            csa_layer_last, nt, my_rank, last_moe_epoch,
         )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
@@ -729,17 +748,28 @@ def l3_decode_fwd(
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
+    logits: pl.Out[pl.Tensor[[N_RANKS, T, LM_HEAD_VOCAB], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    # MoE and LM-head run sequentially, so they can share data storage; keep
+    # LM-head completion counters separate from the MoE epoch protocol below.
+    recv_x_buf = pld.alloc_window_buffer(LM_HEAD_SHARED_DATA_BYTES)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    tp_logits_shards = pl.create_tensor(
+        [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
+    )
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -839,8 +869,40 @@ def l3_decode_fwd(
             hidden_out[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            r, num_tokens,
+            num_tokens_per_owner, r,
             device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_decode_selected_publish_decoupled_worker(
+            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
+            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_tp_decoupled_worker(
+            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
+        logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_route_decoupled_worker(
+            tp_logits_shards[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
+        logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_finish_decoupled_worker(
+            logits[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -1341,7 +1403,17 @@ def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     import torch
-    from golden import ScalarSpec, TensorSpec
+    from golden import TensorSpec
+
+    def init_lm_head_weight():
+        return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+
+    def init_logit_row_indices():
+        active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, :active] = torch.arange(active, dtype=torch.int32)
+        return indices
+
     base_specs = {
         spec.name: spec
         for spec in build_single_layer_tensor_specs(start_pos=start_pos, layer_id=0)
@@ -1378,8 +1450,29 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec("lm_head_weight", [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(TensorSpec("logits", [N_RANKS, T, LM_HEAD_VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec(
+        "num_tokens_per_owner",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
+    ))
+    specs.append(TensorSpec(
+        "logit_row_indices",
+        [N_RANKS, MAX_LOGIT_ROWS],
+        torch.int32,
+        init_value=init_logit_row_indices,
+    ))
+    specs.append(TensorSpec(
+        "num_logit_rows",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full(
+            (N_RANKS,), max(min(num_tokens, MAX_LOGIT_ROWS), 0), dtype=torch.int32,
+        ),
+    ))
     return specs
 
 
@@ -1387,6 +1480,7 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
+    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8], help="LM-head TP world size; must be <= --ep")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument(
         "--start-pos",
@@ -1401,6 +1495,14 @@ def main():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    assert args.tp <= args.ep, f"decode_fwd device lm_head requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
+    assert LM_HEAD_TP_SIZE == args.tp, (
+        f"import-time LM_HEAD_TP_SIZE must match --tp, got {LM_HEAD_TP_SIZE} vs {args.tp}"
+    )
+    assert LM_HEAD_OWNER_SIZE == args.ep and N_RANKS == args.ep, (
+        f"import-time owner/EP size must match --ep, got owner={LM_HEAD_OWNER_SIZE}, "
+        f"N_RANKS={N_RANKS}, args.ep={args.ep}"
+    )
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"

@@ -17,10 +17,10 @@ program scales to EP 2 / 4 / 8.  The per-rank kernel hand-unrolls the model's
 layer schedule and calls ``prefill_attention_{swa,hca,csa}`` + ``moe`` directly
 (no ``prefill_layer`` wrapper).  Each attention / moe stage runs in its own
 ``pl.scope`` under ``auto_scope=False`` (matching ``decode_fwd``), and the final
-hidden state passes ``hc_head`` -> final ``rms_norm`` -> TP-sharded ``lm_head``
-to produce full-vocabulary logits.  This is a kernel-only smoke driver: it does
-not run a golden comparison.  With ``lm_head`` composed in, ``--ep 2`` / TP=2
-only (mirrors ``decode_fwd``).
+hidden state passes ``hc_head`` -> final ``rms_norm``. Selected hidden rows are
+then projected by the shared device ``lm_head`` core; the owner-major selected
+row contract reserves capacity for future packed multi-request logits. This is
+a kernel-only smoke driver and does not run a golden comparison.
 """
 
 import argparse
@@ -103,7 +103,23 @@ from prefill_attention_csa import (
     prefill_attention_csa,
 )
 from hc_head import hc_head
+from lm_head import (
+    MAX_LOGIT_ROWS,
+    OWNER_SIZE as LM_HEAD_OWNER_SIZE,
+    TP_SIZE as LM_HEAD_TP_SIZE,
+    T_MAX as LM_HEAD_T_MAX,
+    VOCAB as LM_HEAD_VOCAB,
+    VOCAB_PER_TP,
+    lm_head_finish_decoupled_worker,
+    lm_head_logits_route_decoupled_worker,
+    lm_head_selected_publish_decoupled_worker,
+    lm_head_tp_decoupled_worker,
+)
 from rmsnorm import rms_norm
+
+assert LM_HEAD_OWNER_SIZE == N_RANKS
+assert config.PREFILL_TOKENS == T
+
 
 # ---------------------------------------------------------------------------
 # Model layer schedule (DeepSeek-V4 Flash, 43 hidden layers):
@@ -123,6 +139,7 @@ CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
+LM_HEAD_COMM_EPOCH = LAST_MOE_EPOCH + 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
@@ -301,10 +318,12 @@ def prefill_fwd(
     shared_w3_scale: pl.Tensor[[FWD_NUM_LAYERS * MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[FWD_NUM_LAYERS * D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = num_tokens
+    nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
+    for owner_rank in pl.range(N_RANKS):
+        nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
@@ -774,8 +793,12 @@ def l3_prefill_fwd(
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
+    lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    num_tokens: pl.Scalar[pl.INT32],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
+    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -785,6 +808,9 @@ def l3_prefill_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    tp_logits_shards = pl.create_tensor(
+        [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
+    )
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -826,8 +852,44 @@ def l3_prefill_fwd(
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
             shared_w2[r], shared_w2_scale[r],
-            r, num_tokens,
+            num_tokens_per_owner, r,
             device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_selected_publish_decoupled_worker(
+            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
+            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
+        hidden_done = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        lm_head_tp_decoupled_worker(
+            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(LM_HEAD_TP_SIZE):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_logits_route_decoupled_worker(
+            tp_logits_shards[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
+        )
+
+    for r in pl.range(pld.world_size()):
+        logits_window = pld.window(
+            recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32,
+        )
+        logits_done = pld.window(combine_arrived_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        lm_head_finish_decoupled_worker(
+            logits[r], logits_window, logits_done,
+            r, LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -1209,6 +1271,14 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
     import torch
     from golden import TensorSpec
 
+    def init_lm_head_weight():
+        return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+
+    def init_logit_row_indices():
+        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
+        indices[:, 0] = max(min(num_tokens, T), 1) - 1
+        return indices
+
     base_specs = {
         spec.name: spec
         for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=0)
@@ -1273,9 +1343,37 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
+    specs.append(TensorSpec(
+        "lm_head_weight",
+        [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D],
+        torch.bfloat16,
+        init_value=init_lm_head_weight,
+    ))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    from golden import ScalarSpec
-    specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(TensorSpec(
+        "logits",
+        [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB],
+        torch.float32,
+        is_output=True,
+    ))
+    specs.append(TensorSpec(
+        "num_tokens_per_owner",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
+    ))
+    specs.append(TensorSpec(
+        "logit_row_indices",
+        [N_RANKS, MAX_LOGIT_ROWS],
+        torch.int32,
+        init_value=init_logit_row_indices,
+    ))
+    specs.append(TensorSpec(
+        "num_logit_rows",
+        [N_RANKS],
+        torch.int32,
+        init_value=lambda: torch.ones(N_RANKS, dtype=torch.int32),
+    ))
     return specs
 
 
@@ -1284,6 +1382,8 @@ def main():
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
                         help="EP world size / rank count (parsed at import by moe).")
+    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8],
+                        help="LM-head TP world size; must be <= --ep.")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
@@ -1298,6 +1398,14 @@ def main():
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
+    assert args.tp <= args.ep, f"--tp must be <= --ep, got tp={args.tp}, ep={args.ep}"
+    assert LM_HEAD_TP_SIZE == args.tp, (
+        f"import-time LM_HEAD_TP_SIZE must match --tp, got {LM_HEAD_TP_SIZE} vs {args.tp}"
+    )
+    assert LM_HEAD_OWNER_SIZE == args.ep and N_RANKS == args.ep, (
+        f"import-time owner/EP size must match --ep, got owner={LM_HEAD_OWNER_SIZE}, "
+        f"N_RANKS={N_RANKS}, ep={args.ep}"
+    )
 
     specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
 
