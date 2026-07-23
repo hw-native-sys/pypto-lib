@@ -77,15 +77,15 @@ def prefill_layer(
     rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
     block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.INT8],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.INT8],
-    k_cache_scale: pl.Tensor[[KV_CACHE_ROWS_DYN, 8], pl.FP32],
-    v_cache_scale: pl.Tensor[[KV_CACHE_ROWS_DYN, 8], pl.FP32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.INT8],
     wo_scale: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
-    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.INT8],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.INT8],
+    w_gate_scale: pl.Tensor[[LAYER_DYN, INTERMEDIATE], pl.FP32],
+    w_up_scale: pl.Tensor[[LAYER_DYN, INTERMEDIATE], pl.FP32],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     out: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
@@ -347,52 +347,16 @@ def prefill_layer(
                                         pl.col_expand_mul(k_lo, sin_hi),
                                     )
                                     cache_row = layer_cache_base + (cache_slot_block * NUM_KV_HEADS + ki) * BLOCK_SIZE + cache_slot_offset
-                                    rot_abs_lo = pl.maximum(rot_lo, pl.neg(rot_lo))
-                                    rot_abs_hi = pl.maximum(rot_hi, pl.neg(rot_hi))
-                                    rot_abs_lo_groups = pl.reshape(rot_abs_lo, [8, 8])
-                                    rot_abs_hi_groups = pl.reshape(rot_abs_hi, [8, 8])
-                                    k_amax_lo_parts = pl.row_max(rot_abs_lo_groups)
-                                    k_amax_hi_parts = pl.row_max(rot_abs_hi_groups)
-                                    k_amax_scalar = INT8_AMAX_EPS
-                                    for part in pl.range(8):
-                                        k_amax_scalar = pl.max(k_amax_scalar, pl.tensor.read(k_amax_lo_parts, [part, 0]))
-                                        k_amax_scalar = pl.max(k_amax_scalar, pl.tensor.read(k_amax_hi_parts, [part, 0]))
-                                    k_scale_q_value = INT8_SCALE_MAX / k_amax_scalar
-                                    kq_lo_i32 = pl.cast(pl.mul(rot_lo, k_scale_q_value), target_type=pl.INT32, mode="rint")
-                                    kq_hi_i32 = pl.cast(pl.mul(rot_hi, k_scale_q_value), target_type=pl.INT32, mode="rint")
-                                    kq_lo_i32 = pl.minimum(
-                                        pl.maximum(kq_lo_i32, pl.full([1, HALF_DIM], dtype=pl.INT32, value=-127)),
-                                        pl.full([1, HALF_DIM], dtype=pl.INT32, value=127),
+                                    k_cache = pl.assemble(
+                                        k_cache, pl.cast(rot_lo, target_type=pl.BF16, mode="rint"), [cache_row, 0]
                                     )
-                                    kq_hi_i32 = pl.minimum(
-                                        pl.maximum(kq_hi_i32, pl.full([1, HALF_DIM], dtype=pl.INT32, value=-127)),
-                                        pl.full([1, HALF_DIM], dtype=pl.INT32, value=127),
+                                    k_cache = pl.assemble(
+                                        k_cache, pl.cast(rot_hi, target_type=pl.BF16, mode="rint"), [cache_row, HALF_DIM]
                                     )
-                                    kq_lo = pl.cast(pl.cast(kq_lo_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-                                    kq_hi = pl.cast(pl.cast(kq_hi_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-                                    k_cache = pl.assemble(k_cache, kq_lo, [cache_row, 0])
-                                    k_cache = pl.assemble(k_cache, kq_hi, [cache_row, HALF_DIM])
-                                    k_scale_value = k_amax_scalar / INT8_SCALE_MAX
-                                    k_scale_out = pl.mul(pl.full([1, 8], dtype=pl.FP32, value=1.0), k_scale_value)
-                                    k_cache_scale = pl.assemble(k_cache_scale, k_scale_out, [cache_row, 0])
                                     v_row_f = pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM])
-                                    v_abs = pl.maximum(v_row_f, pl.neg(v_row_f))
-                                    v_abs_groups = pl.reshape(v_abs, [16, 8])
-                                    v_amax_parts = pl.row_max(v_abs_groups)
-                                    v_amax_scalar = INT8_AMAX_EPS
-                                    for part in pl.range(16):
-                                        v_amax_scalar = pl.max(v_amax_scalar, pl.tensor.read(v_amax_parts, [part, 0]))
-                                    v_scale_q_value = INT8_SCALE_MAX / v_amax_scalar
-                                    vq_i32 = pl.cast(pl.mul(v_row_f, v_scale_q_value), target_type=pl.INT32, mode="rint")
-                                    vq_i32 = pl.minimum(
-                                        pl.maximum(vq_i32, pl.full([1, HEAD_DIM], dtype=pl.INT32, value=-127)),
-                                        pl.full([1, HEAD_DIM], dtype=pl.INT32, value=127),
+                                    v_cache = pl.assemble(
+                                        v_cache, pl.cast(v_row_f, target_type=pl.BF16, mode="rint"), [cache_row, 0]
                                     )
-                                    vq = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-                                    v_cache = pl.assemble(v_cache, vq, [cache_row, 0])
-                                    v_scale_value = v_amax_scalar / INT8_SCALE_MAX
-                                    v_scale_out = pl.mul(pl.full([1, 8], dtype=pl.FP32, value=1.0), v_scale_value)
-                                    v_cache_scale = pl.assemble(v_cache_scale, v_scale_out, [cache_row, 0])
                                     q_base = ki * Q_PER_KV
                                     for qi in pl.unroll(Q_HEAD_BATCH):
                                         q_col = (q_base + qi) * HEAD_DIM
@@ -439,25 +403,16 @@ def prefill_layer(
                                 chunk_cur_mi = pl.create_tensor([SB_BATCH * Q_HEAD_PAD, 1], dtype=pl.FP32)
                                 chunk_cur_li = pl.create_tensor([SB_BATCH * Q_HEAD_PAD, 1], dtype=pl.FP32)
 
-                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_dequant"):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_cache_load"):
                                     for qk_load_lane in pl.range(SB_BATCH):
                                         qk_load_sb = sb0 + qk_load_lane
                                         if qk_load_sb < ctx_blocks:
                                             qk_block_table_idx = b * max_blocks_per_seq + qk_load_sb
                                             qk_pbid = pl.cast(pl.tensor.read(block_table, [qk_block_table_idx]), pl.INDEX)
                                             qk_cache_row0 = layer_cache_base + (qk_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
-                                            qk_tile_i8 = pl.slice(k_cache, [SEQ_TILE, HEAD_DIM], [qk_cache_row0, 0])
-                                            qk_tile_bf16 = pl.cast(
-                                                pl.full([SEQ_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                                                target_type=pl.BF16,
+                                            qk_tile_bf16 = pl.slice(
+                                                k_cache, [SEQ_TILE, HEAD_DIM], [qk_cache_row0, 0]
                                             )
-                                            qk_valid_len = pl.min(SEQ_TILE, ctx_len - qk_load_sb * SEQ_TILE)
-                                            for qk_scale_ti in pl.range(qk_valid_len):
-                                                qk_scale_row = qk_cache_row0 + qk_scale_ti
-                                                qk_scale = pl.tensor.read(k_cache_scale, [qk_scale_row, 0])
-                                                qk_row_i8 = pl.slice(qk_tile_i8, [1, HEAD_DIM], [qk_scale_ti, 0])
-                                                qk_row_fp32 = pl.cast(pl.cast(qk_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                                                qk_tile_bf16 = pl.assemble(qk_tile_bf16, pl.cast(pl.mul(qk_row_fp32, qk_scale), target_type=pl.BF16), [qk_scale_ti, 0])
                                             chunk_k_tiles = pl.assemble(chunk_k_tiles, qk_tile_bf16, [qk_load_lane * SEQ_TILE, 0])
 
                                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="qk_matmul"):
@@ -489,25 +444,16 @@ def prefill_layer(
                                             chunk_cur_mi = pl.assemble(chunk_cur_mi, cur_mi, [softmax_sb_lane * Q_HEAD_PAD, 0])
                                             chunk_cur_li = pl.assemble(chunk_cur_li, cur_li, [softmax_sb_lane * Q_HEAD_PAD, 0])
 
-                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_dequant"):
+                                with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_cache_load"):
                                     for sv_load_lane in pl.range(SB_BATCH):
                                         sv_load_sb = sb0 + sv_load_lane
                                         if sv_load_sb < ctx_blocks:
                                             sv_block_table_idx = b * max_blocks_per_seq + sv_load_sb
                                             sv_pbid = pl.cast(pl.tensor.read(block_table, [sv_block_table_idx]), pl.INDEX)
                                             sv_cache_row0 = layer_cache_base + (sv_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
-                                            sv_tile_i8 = pl.slice(v_cache, [SEQ_TILE, HEAD_DIM], [sv_cache_row0, 0])
-                                            sv_tile_bf16 = pl.cast(
-                                                pl.full([SEQ_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                                                target_type=pl.BF16,
+                                            sv_tile_bf16 = pl.slice(
+                                                v_cache, [SEQ_TILE, HEAD_DIM], [sv_cache_row0, 0]
                                             )
-                                            sv_valid_len = pl.min(SEQ_TILE, ctx_len - sv_load_sb * SEQ_TILE)
-                                            for sv_scale_ti in pl.range(sv_valid_len):
-                                                sv_scale_row = sv_cache_row0 + sv_scale_ti
-                                                sv_scale = pl.tensor.read(v_cache_scale, [sv_scale_row, 0])
-                                                sv_row_i8 = pl.slice(sv_tile_i8, [1, HEAD_DIM], [sv_scale_ti, 0])
-                                                sv_row_fp32 = pl.cast(pl.cast(sv_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                                                sv_tile_bf16 = pl.assemble(sv_tile_bf16, pl.cast(pl.mul(sv_row_fp32, sv_scale), target_type=pl.BF16), [sv_scale_ti, 0])
                                             chunk_v_tiles = pl.assemble(chunk_v_tiles, sv_tile_bf16, [sv_load_lane * SEQ_TILE, 0])
 
                                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="sv_matmul"):
@@ -677,7 +623,16 @@ def prefill_layer(
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_proj_matmul"):
                             gate_proj_k0 = kb * K_CHUNK
                             gate_proj_tile_a_i = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, gate_proj_k0])
-                            gate_proj_tile_w_i = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + gate_proj_k0, mlp_out_o0])
+                            gate_proj_tile_w_i8 = pl.slice(w_gate, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + gate_proj_k0, mlp_out_o0])
+                            gate_w_scale = pl.slice(w_gate_scale, [1, MLP_OUT_CHUNK], [layer_idx, mlp_out_o0])
+                            gate_proj_tile_w_i = pl.cast(
+                                pl.col_expand_mul(
+                                    pl.cast(pl.cast(gate_proj_tile_w_i8, target_type=pl.FP16), target_type=pl.FP32),
+                                    gate_w_scale,
+                                ),
+                                target_type=pl.BF16,
+                                mode="rint",
+                            )
                             gate_partial = pl.matmul(gate_proj_tile_a_i, gate_proj_tile_w_i, out_dtype=pl.FP32)
                             gate_partials = pl.assemble(gate_partials, gate_partial, [kb * TOK_TILE, 0])
                             pl.tensor.write(gate_ready, [kb], pl.cast(kb * 0 + 1, target_type=pl.INT32))
@@ -697,7 +652,16 @@ def prefill_layer(
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="up_proj_matmul"):
                             up_proj_k0 = kb * K_CHUNK
                             up_proj_tile_a_i = pl.slice(post_norm_tile, [TOK_TILE, K_CHUNK], [0, up_proj_k0])
-                            up_proj_tile_w_i = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + up_proj_k0, mlp_out_o0])
+                            up_proj_tile_w_i8 = pl.slice(w_up, [K_CHUNK, MLP_OUT_CHUNK], [layer_hidden_base + up_proj_k0, mlp_out_o0])
+                            up_w_scale = pl.slice(w_up_scale, [1, MLP_OUT_CHUNK], [layer_idx, mlp_out_o0])
+                            up_proj_tile_w_i = pl.cast(
+                                pl.col_expand_mul(
+                                    pl.cast(pl.cast(up_proj_tile_w_i8, target_type=pl.FP16), target_type=pl.FP32),
+                                    up_w_scale,
+                                ),
+                                target_type=pl.BF16,
+                                mode="rint",
+                            )
                             up_partial = pl.matmul(up_proj_tile_a_i, up_proj_tile_w_i, out_dtype=pl.FP32)
                             up_partials = pl.assemble(up_partials, up_partial, [kb * TOK_TILE, 0])
                             pl.tensor.write(up_ready, [kb], pl.cast(kb * 0 + 1, target_type=pl.INT32))
@@ -791,15 +755,15 @@ def prefill_hidden_a8w8(
     rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
     block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
     slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.INT8],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.INT8],
-    k_cache_scale: pl.Tensor[[KV_CACHE_ROWS_DYN, 8], pl.FP32],
-    v_cache_scale: pl.Tensor[[KV_CACHE_ROWS_DYN, 8], pl.FP32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.INT8],
     wo_scale: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     post_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
-    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
-    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.BF16],
+    w_gate: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.INT8],
+    w_up: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, INTERMEDIATE], pl.INT8],
+    w_gate_scale: pl.Tensor[[LAYER_DYN, INTERMEDIATE], pl.FP32],
+    w_up_scale: pl.Tensor[[LAYER_DYN, INTERMEDIATE], pl.FP32],
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
@@ -816,8 +780,6 @@ def prefill_hidden_a8w8(
     slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
     k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
-    k_cache_scale.bind_dynamic(0, KV_CACHE_ROWS_DYN)
-    v_cache_scale.bind_dynamic(0, KV_CACHE_ROWS_DYN)
 
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     prefill_tokens = pl.tensor.dim(hidden_states, 0)
@@ -857,13 +819,13 @@ def prefill_hidden_a8w8(
             slot_mapping,
             k_cache,
             v_cache,
-            k_cache_scale,
-            v_cache_scale,
             wo,
             wo_scale,
             post_rms_weight,
             w_gate,
             w_up,
+            w_gate_scale,
+            w_up_scale,
             w_down,
             next_hidden,
             layer_idx,

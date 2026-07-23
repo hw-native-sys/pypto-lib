@@ -63,7 +63,7 @@ FA_TABLE_CAP = BATCH * HEAD_GROUPS * MAX_ATTN_PARTS
 OS_WORK = BATCH * NUM_KV_HEADS
 
 K_SPLITS_OUT = 5
-N_SPLITS_OUT = 40
+N_SPLITS_OUT = 20
 OUT_INNER_TK = 512
 OUT_TN = HIDDEN // N_SPLITS_OUT
 OUT_TK = HIDDEN // K_SPLITS_OUT
@@ -71,9 +71,8 @@ OUT_N_SUB_K = OUT_TK // OUT_INNER_TK
 
 K_CHUNK = 512
 MLP_TN = 256
-K_SPLITS_MLP = 5
+K_SPLITS_MLP = 1
 MLP_K_SLICE = HIDDEN // K_SPLITS_MLP
-MLP_GATE_UP_DEP_COUNT = K_SPLITS_MLP
 MLP_DUAL_L0_K = 64
 MLP_ON = INTERMEDIATE // MLP_TN
 
@@ -81,9 +80,10 @@ MLP_OUT_CHUNK = 256
 SILU_INNER_CHUNKS = MLP_TN // MLP_OUT_CHUNK
 
 DOWN_TN = 256
-DOWN_K_SLICE = 512
 DOWN_TK = 512
 DOWN_DUAL_L0_K = 64
+DOWN_K_SPLITS = 2
+DOWN_K_SLICE = INTERMEDIATE // DOWN_K_SPLITS
 DOWN_ON = HIDDEN // DOWN_TN
 DOWN_DUAL_PAIR = 2
 DOWN_DUAL_ON = DOWN_ON // DOWN_DUAL_PAIR
@@ -91,7 +91,7 @@ DOWN_DUAL_ON = DOWN_ON // DOWN_DUAL_PAIR
 assert Q_HEAD_PAD % 16 == 0 and Q_HEAD_PAD >= Q_HEAD_BATCH
 assert QKV_N_TILE % TN == 0 and HIDDEN % QKV_N_TILE == 0 and KV_HIDDEN % QKV_N_TILE == 0
 assert BLOCK_SIZE % ATTN_TILE == 0 and NUM_KV_HEADS % GP_SIZE == 0
-assert DOWN_TN == 256 and DOWN_TK == DOWN_K_SLICE == 512
+assert DOWN_TN == 256 and DOWN_TK == 512 and DOWN_K_SLICE % DOWN_DUAL_L0_K == 0
 assert N_SPLITS_OUT * OUT_TN == HIDDEN and K_SPLITS_OUT * OUT_TK == HIDDEN
 
 @pl.jit.inline
@@ -113,12 +113,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
     v_cache: pl.Tensor,
-    k_cache_scale: pl.Tensor,
-    v_cache_scale: pl.Tensor,
     wo: pl.Tensor,
     wo_scale: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
+    w_gate_scale: pl.Tensor,
+    w_up_scale: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
     out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
@@ -174,25 +174,31 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             act_quant_amax_abs_t = pl.maximum(act_quant_amax_f_t, pl.neg(act_quant_amax_f_t))
             act_quant_amax_row_t = pl.reshape(pl.row_max(act_quant_amax_abs_t), [1, BATCH])
             act_quant_amax_t = pl.maximum(act_quant_amax_t, act_quant_amax_row_t)
-        for act_quant_row_t in pl.range(BATCH):
+        act_quant_scale_q_row_t = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+        for act_quant_row_t in pl.unroll(BATCH):
             act_quant_row_amax_t = pl.tensor.read(act_quant_amax_t, [0, act_quant_row_t])
             act_quant_scale_q_t = INT8_SCALE_MAX / act_quant_row_amax_t
             pl.tensor.write(act_scales, [act_quant_row_t, 0], act_quant_row_amax_t / INT8_SCALE_MAX)
-            for act_quant_write_kb_t in pl.range(HIDDEN // RMSNORM_K_CHUNK):
-                act_quant_write_k0_t = act_quant_write_kb_t * RMSNORM_K_CHUNK
-                act_quant_write_bf16_t = pl.slice(
-                    normed_states, [1, RMSNORM_K_CHUNK], [act_quant_row_t, act_quant_write_k0_t]
-                )
-                act_quant_write_f_t = pl.cast(act_quant_write_bf16_t, target_type=pl.FP32)
-                act_quant_scaled_t = pl.mul(act_quant_write_f_t, act_quant_scale_q_t)
-                act_quant_i32_t = pl.cast(act_quant_scaled_t, target_type=pl.INT32, mode="rint")
-                act_quant_i32_t = pl.minimum(
-                    pl.maximum(act_quant_i32_t, pl.full([1, RMSNORM_K_CHUNK], dtype=pl.INT32, value=-127)),
-                    pl.full([1, RMSNORM_K_CHUNK], dtype=pl.INT32, value=127),
-                )
-                act_quant_half_t = pl.cast(act_quant_i32_t, target_type=pl.FP16, mode="round")
-                act_quant_i8_t = pl.cast(act_quant_half_t, target_type=pl.INT8, mode="trunc")
-                normed_i8 = pl.assemble(normed_i8, act_quant_i8_t, [act_quant_row_t, act_quant_write_k0_t])
+            pl.tensor.write(act_quant_scale_q_row_t, [0, act_quant_row_t], act_quant_scale_q_t)
+        act_quant_scale_q_col_t = pl.reshape(act_quant_scale_q_row_t, [BATCH, 1])
+        for act_quant_write_kb_t in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+            act_quant_write_k0_t = act_quant_write_kb_t * RMSNORM_K_CHUNK
+            act_quant_write_bf16_t = normed_states[
+                :, act_quant_write_k0_t : act_quant_write_k0_t + RMSNORM_K_CHUNK
+            ]
+            act_quant_write_f_t = pl.cast(act_quant_write_bf16_t, target_type=pl.FP32)
+            act_quant_scaled_t = pl.row_expand_mul(act_quant_write_f_t, act_quant_scale_q_col_t)
+            act_quant_i32_t = pl.cast(act_quant_scaled_t, target_type=pl.INT32, mode="rint")
+            act_quant_i32_t = pl.minimum(
+                pl.maximum(
+                    act_quant_i32_t,
+                    pl.full([BATCH, RMSNORM_K_CHUNK], dtype=pl.INT32, value=-127),
+                ),
+                pl.full([BATCH, RMSNORM_K_CHUNK], dtype=pl.INT32, value=127),
+            )
+            act_quant_half_t = pl.cast(act_quant_i32_t, target_type=pl.FP16, mode="round")
+            act_quant_i8_t = pl.cast(act_quant_half_t, target_type=pl.INT8, mode="trunc")
+            normed_i8 = pl.assemble(normed_i8, act_quant_i8_t, [0, act_quant_write_k0_t])
     for q_grid in pl.spmd(Q_ON * N_SUB, name_hint="q_proj_fused_dequant"):
         q_on = q_grid // N_SUB
         n_sub = q_grid - q_on * N_SUB
@@ -370,52 +376,15 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             v_row_fp32 = v_proj_norm[b : b + 1, ki * HEAD_DIM : (ki + 1) * HEAD_DIM]
             k_rot_fp32_lo = rot_lo
             k_rot_fp32_hi = rot_hi
-            k_rot_abs_lo = pl.maximum(k_rot_fp32_lo, pl.neg(k_rot_fp32_lo))
-            k_rot_abs_hi = pl.maximum(k_rot_fp32_hi, pl.neg(k_rot_fp32_hi))
-            k_rot_abs_lo_groups = pl.reshape(k_rot_abs_lo, [8, 8])
-            k_rot_abs_hi_groups = pl.reshape(k_rot_abs_hi, [8, 8])
-            k_cache_amax_lo_parts = pl.row_max(k_rot_abs_lo_groups)
-            k_cache_amax_hi_parts = pl.row_max(k_rot_abs_hi_groups)
-            k_cache_amax = INT8_AMAX_EPS
-            for part in pl.range(8):
-                k_cache_amax = pl.max(k_cache_amax, pl.tensor.read(k_cache_amax_lo_parts, [part, 0]))
-                k_cache_amax = pl.max(k_cache_amax, pl.tensor.read(k_cache_amax_hi_parts, [part, 0]))
-            k_cache_scale_q = INT8_SCALE_MAX / k_cache_amax
-            k_cache_scale_fp32 = k_cache_amax / INT8_SCALE_MAX
-            kq_lo_scaled = pl.mul(k_rot_fp32_lo, k_cache_scale_q)
-            kq_lo_i32 = pl.cast(kq_lo_scaled, target_type=pl.INT32, mode="rint")
-            kq_lo_i32 = pl.minimum(
-                pl.maximum(kq_lo_i32, pl.full([1, HALF_DIM], dtype=pl.INT32, value=-127)),
-                pl.full([1, HALF_DIM], dtype=pl.INT32, value=127),
+            k_cache = pl.assemble(
+                k_cache, pl.cast(k_rot_fp32_lo, target_type=pl.BF16, mode="rint"), [cache_row, 0]
             )
-            kq_lo_i8 = pl.cast(pl.cast(kq_lo_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-            kq_hi_scaled = pl.mul(k_rot_fp32_hi, k_cache_scale_q)
-            kq_hi_i32 = pl.cast(kq_hi_scaled, target_type=pl.INT32, mode="rint")
-            kq_hi_i32 = pl.minimum(
-                pl.maximum(kq_hi_i32, pl.full([1, HALF_DIM], dtype=pl.INT32, value=-127)),
-                pl.full([1, HALF_DIM], dtype=pl.INT32, value=127),
+            k_cache = pl.assemble(
+                k_cache, pl.cast(k_rot_fp32_hi, target_type=pl.BF16, mode="rint"), [cache_row, HALF_DIM]
             )
-            kq_hi_i8 = pl.cast(pl.cast(kq_hi_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-            k_cache = pl.assemble(k_cache, kq_lo_i8, [cache_row, 0])
-            k_cache = pl.assemble(k_cache, kq_hi_i8, [cache_row, HALF_DIM])
-            pl.tensor.write(k_cache_scale, [cache_row, 0], k_cache_scale_fp32)
-            v_abs = pl.maximum(v_row_fp32, pl.neg(v_row_fp32))
-            v_abs_groups = pl.reshape(v_abs, [16, 8])
-            v_cache_amax_parts = pl.row_max(v_abs_groups)
-            v_cache_amax = INT8_AMAX_EPS
-            for part in pl.range(16):
-                v_cache_amax = pl.max(v_cache_amax, pl.tensor.read(v_cache_amax_parts, [part, 0]))
-            v_cache_scale_q = INT8_SCALE_MAX / v_cache_amax
-            v_cache_scale_fp32 = v_cache_amax / INT8_SCALE_MAX
-            vq_scaled = pl.mul(v_row_fp32, v_cache_scale_q)
-            vq_i32 = pl.cast(vq_scaled, target_type=pl.INT32, mode="rint")
-            vq_i32 = pl.minimum(
-                pl.maximum(vq_i32, pl.full([1, HEAD_DIM], dtype=pl.INT32, value=-127)),
-                pl.full([1, HEAD_DIM], dtype=pl.INT32, value=127),
+            v_cache = pl.assemble(
+                v_cache, pl.cast(v_row_fp32, target_type=pl.BF16, mode="rint"), [cache_row, 0]
             )
-            vq_i8 = pl.cast(pl.cast(vq_i32, target_type=pl.FP16), target_type=pl.INT8, mode="trunc")
-            v_cache = pl.assemble(v_cache, vq_i8, [cache_row, 0])
-            pl.tensor.write(v_cache_scale, [cache_row, 0], v_cache_scale_fp32)
 
             q_base = ki * Q_PER_KV
             q_pad_row0 = b * NUM_KV_HEADS * Q_HEAD_PAD + ki * Q_HEAD_PAD
@@ -444,10 +413,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             all_q_padded = pl.assemble(all_q_padded, q_pad_zero, [q_pad_row0 + Q_HEAD_BATCH, 0])
             pl.tensor.write(kv_ready, [b], pl.cast(ctx_len * 0 + 1, target_type=pl.INT32))
 
-    down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+    down_acc_parts = pl.create_tensor([DOWN_K_SPLITS * BATCH, HIDDEN], dtype=pl.FP32, manual_dep=True)
     gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
     up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32, manual_dep=True)
-
     for fa_core in pl.spmd(
         NUM_CORES,
         name_hint="fa_fused",
@@ -481,17 +449,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 g_base = (fa_b * NUM_KV_HEADS + gi) * MAX_ATTN_PARTS * Q_HEAD_PAD
                 cache_row = layer_cache_base + (fa_pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE + fa_page_part * ATTN_TILE
 
-                k_tile_inline_deq = pl.create_tensor([ATTN_TILE, HEAD_DIM], dtype=pl.BF16)
-                for k_scale_ti in pl.range(ATTN_TILE):
-                    k_scale = pl.tensor.read(k_cache_scale, [cache_row + k_scale_ti, 0])
-                    k_row_i8 = pl.slice(k_cache, [1, HEAD_DIM], [cache_row + k_scale_ti, 0])
-                    k_row_fp32 = pl.cast(pl.cast(k_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                    k_tile_inline_deq = pl.assemble(
-                        k_tile_inline_deq,
-                        pl.cast(pl.mul(k_row_fp32, k_scale), target_type=pl.BF16),
-                        [k_scale_ti, 0],
-                    )
-                raw_scores = pl.matmul(q_padded, k_tile_inline_deq, b_trans=True, out_dtype=pl.FP32)
+                k_tile_bf16 = pl.slice(
+                    k_cache, [ATTN_TILE, HEAD_DIM], [cache_row, 0]
+                )
+                raw_scores = pl.matmul(q_padded, k_tile_bf16, b_trans=True, out_dtype=pl.FP32)
                 scores_valid = pl.tensor.set_validshape(pl.mul(raw_scores, ATTN_SCALE), Q_HEAD_PAD, valid_len)
                 scores = pl.fillpad(scores_valid, pad_value=pl.PadValue.min)
                 cur_mi = pl.row_max(scores)
@@ -500,19 +461,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 exp_scores_fp32 = pl.cast(exp_scores_bf16, target_type=pl.FP32)
                 cur_li = pl.row_sum(exp_scores_fp32)
 
-                v_tile_deq = pl.create_tensor([ATTN_TILE, HEAD_DIM], dtype=pl.BF16)
-                for v_scale_ti in pl.range(ATTN_TILE):
-                    v_scale = pl.tensor.read(v_cache_scale, [cache_row + v_scale_ti, 0])
-                    v_row_i8 = pl.slice(v_cache, [1, HEAD_DIM], [cache_row + v_scale_ti, 0])
-                    v_row_fp32 = pl.cast(pl.cast(v_row_i8, target_type=pl.FP16), target_type=pl.FP32)
-                    v_tile_deq = pl.assemble(
-                        v_tile_deq,
-                        pl.cast(pl.mul(v_row_fp32, v_scale), target_type=pl.BF16),
-                        [v_scale_ti, 0],
-                    )
-                oi_raw_deq = pl.matmul(exp_scores_bf16, v_tile_deq, out_dtype=pl.FP32)
-                oi_valid_deq = pl.tensor.set_validshape(oi_raw_deq, Q_HEAD_BATCH, HEAD_DIM)
-                all_oi_tmp = pl.assemble(all_oi_tmp, oi_valid_deq, [g_base + fa_part * Q_HEAD_PAD, 0])
+                v_tile_bf16 = pl.slice(
+                    v_cache, [ATTN_TILE, HEAD_DIM], [cache_row, 0]
+                )
+                oi_raw = pl.matmul(exp_scores_bf16, v_tile_bf16, out_dtype=pl.FP32)
+                oi_valid = pl.tensor.set_validshape(oi_raw, Q_HEAD_BATCH, HEAD_DIM)
+                all_oi_tmp = pl.assemble(all_oi_tmp, oi_valid, [g_base + fa_part * Q_HEAD_PAD, 0])
                 all_cur_mi = pl.assemble(all_cur_mi, cur_mi, [g_base + fa_part * Q_HEAD_PAD, 0])
                 all_cur_li = pl.assemble(all_cur_li, cur_li, [g_base + fa_part * Q_HEAD_PAD, 0])
             pl.tensor.write(fa_done, [fa_enc], pl.cast(1, target_type=pl.INT32))
@@ -560,6 +514,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # raw residual h1 (add-back)
     mlp_norm_in = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
+    mlp_norm_i8 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.INT8)
+    mlp_act_scales = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
     inv_rms_tile = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
     mlp_down_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
 
@@ -658,58 +614,94 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         post_inv_rms_col = pl.reshape(post_inv_rms, [BATCH, 1])
         inv_rms_tile = pl.assemble(inv_rms_tile, post_inv_rms_col, [0, 0])
 
-    silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
-    gate_up_seed_tids = pl.array.create(MLP_ON, pl.TASK_ID)
-    for n_out in pl.parallel(MLP_ON):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_up_seed") as gate_up_seed_tid:
-            gate_n0 = n_out * MLP_TN
-            zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
-            gate_acc_all = pl.assemble(gate_acc_all, zero, [0, gate_n0])
-            up_acc_all = pl.assemble(up_acc_all, zero, [0, gate_n0])
-        gate_up_seed_tids[n_out] = gate_up_seed_tid
+    # Quantize the post-attention RMSNorm numerator once.  The reciprocal RMS
+    # remains applied after gate/up dequantization, preserving the former
+    # BF16 path's operation order while allowing the two dominant MLP GEMMs to
+    # consume the checkpoint's native INT8 weights.
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="mlp_act_quant"):
+        mlp_amax_t = pl.full([1, BATCH], dtype=pl.FP32, value=INT8_AMAX_EPS)
+        for kb in pl.range(HIDDEN // K_CHUNK):
+            k0 = kb * K_CHUNK
+            chunk_f = pl.cast(mlp_norm_in[:, k0 : k0 + K_CHUNK], target_type=pl.FP32)
+            chunk_abs = pl.maximum(chunk_f, pl.neg(chunk_f))
+            mlp_amax_t = pl.maximum(
+                mlp_amax_t,
+                pl.reshape(pl.row_max(chunk_abs), [1, BATCH]),
+            )
+        quant_scale_rows = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+        for b in pl.unroll(BATCH):
+            row_amax = pl.tensor.read(mlp_amax_t, [0, b])
+            pl.tensor.write(mlp_act_scales, [b, 0], row_amax / INT8_SCALE_MAX)
+            pl.tensor.write(quant_scale_rows, [0, b], INT8_SCALE_MAX / row_amax)
+        quant_scale_col = pl.reshape(quant_scale_rows, [BATCH, 1])
+        for kb in pl.range(HIDDEN // K_CHUNK):
+            k0 = kb * K_CHUNK
+            chunk_f = pl.cast(mlp_norm_in[:, k0 : k0 + K_CHUNK], target_type=pl.FP32)
+            scaled = pl.row_expand_mul(chunk_f, quant_scale_col)
+            quant_i32 = pl.cast(scaled, target_type=pl.INT32, mode="rint")
+            quant_i32 = pl.minimum(
+                pl.maximum(quant_i32, pl.full([BATCH, K_CHUNK], dtype=pl.INT32, value=-127)),
+                pl.full([BATCH, K_CHUNK], dtype=pl.INT32, value=127),
+            )
+            quant_i8 = pl.cast(
+                pl.cast(quant_i32, target_type=pl.FP16, mode="round"),
+                target_type=pl.INT8,
+                mode="trunc",
+            )
+            mlp_norm_i8 = pl.assemble(mlp_norm_i8, quant_i8, [0, k0])
 
+    silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
     for n_out in pl.parallel(MLP_ON):
         gate_n0 = n_out * MLP_TN
-        gate_up_tile_tids = pl.array.create(MLP_GATE_UP_DEP_COUNT, pl.TASK_ID)
-        for k_split in pl.range(K_SPLITS_MLP):
-            gate_k0 = k_split * MLP_K_SLICE
-            with pl.at(
-                level=pl.Level.CORE_GROUP,
-                name_hint="gate_up_dual_proj",
-                deps=[gate_up_seed_tids[n_out]],
-                no_dep_args=[gate_acc_all, up_acc_all],
-            ) as gate_up_tid:
-                pyop_a_mat_0 = pl.tile.load(mlp_norm_in, [0, gate_k0], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
-                pyop_a_left_0 = pl.move(pyop_a_mat_0, target_memory=pl.MemorySpace.Left)
-                pyop_gate_w_mat_0 = pl.tile.load(w_gate, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                pyop_gate_w_right_0 = pl.move(pyop_gate_w_mat_0, target_memory=pl.MemorySpace.Right)
-                pyop_up_w_mat_0 = pl.tile.load(w_up, [layer_hidden_base + gate_k0, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                pyop_up_w_right_0 = pl.move(pyop_up_w_mat_0, target_memory=pl.MemorySpace.Right)
-                pyop_gate_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_gate_w_right_0)
-                pyop_up_c_acc = pl.tile.matmul(pyop_a_left_0, pyop_up_w_right_0)
-                for kk, (pyop_gate_acc_iter, pyop_up_acc_iter) in pl.pipeline(
-                    MLP_DUAL_L0_K,
-                    MLP_K_SLICE,
-                    MLP_DUAL_L0_K,
-                    stage=2,
-                    init_values=(pyop_gate_c_acc, pyop_up_c_acc),
-                ):
-                    pyop_a_mat_k = pl.tile.load(mlp_norm_in, [0, gate_k0 + kk], [BATCH, MLP_DUAL_L0_K], [ACTIVE_BATCH, MLP_DUAL_L0_K], target_memory=pl.MemorySpace.Mat)
-                    pyop_gate_w_mat_k = pl.tile.load(w_gate, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                    pyop_up_w_mat_k = pl.tile.load(w_up, [layer_hidden_base + gate_k0 + kk, gate_n0], [MLP_DUAL_L0_K, MLP_TN], [MLP_DUAL_L0_K, MLP_TN], target_memory=pl.MemorySpace.Mat)
-                    pyop_a_left_k = pl.move(pyop_a_mat_k, target_memory=pl.MemorySpace.Left)
-                    pyop_gate_w_right_k = pl.move(pyop_gate_w_mat_k, target_memory=pl.MemorySpace.Right)
-                    pyop_gate_next = pl.tile.matmul_acc(pyop_gate_acc_iter, pyop_a_left_k, pyop_gate_w_right_k)
-                    pyop_up_w_right_k = pl.move(pyop_up_w_mat_k, target_memory=pl.MemorySpace.Right)
-                    pyop_up_next = pl.tile.matmul_acc(pyop_up_acc_iter, pyop_a_left_k, pyop_up_w_right_k)
-                    pyop_gate_c_acc, pyop_up_c_acc = pl.yield_(pyop_gate_next, pyop_up_next)
-                gate_acc_all = pl.tile.store(pyop_gate_c_acc, [0, gate_n0], gate_acc_all, atomic=pl.AtomicType.Add)
-                up_acc_all = pl.tile.store(pyop_up_c_acc, [0, gate_n0], up_acc_all, atomic=pl.AtomicType.Add)
-            gate_up_tile_tids[k_split] = gate_up_tid
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
+            name_hint="gate_up_dual_proj",
+            no_dep_args=[gate_acc_all, up_acc_all],
+        ) as gate_up_tid:
+            gate_acc = pl.matmul(
+                pl.tensor.set_validshape(mlp_norm_i8[:, 0:TK], ACTIVE_BATCH, TK),
+                w_gate[layer_hidden_base : layer_hidden_base + TK, gate_n0 : gate_n0 + MLP_TN],
+                out_dtype=pl.INT32,
+            )
+            up_acc = pl.matmul(
+                pl.tensor.set_validshape(mlp_norm_i8[:, 0:TK], ACTIVE_BATCH, TK),
+                w_up[layer_hidden_base : layer_hidden_base + TK, gate_n0 : gate_n0 + MLP_TN],
+                out_dtype=pl.INT32,
+            )
+            for kk in pl.range(TK, HIDDEN, TK):
+                act_i8 = pl.tensor.set_validshape(
+                    mlp_norm_i8[:, kk : kk + TK], ACTIVE_BATCH, TK
+                )
+                gate_acc = pl.matmul_acc(
+                    gate_acc,
+                    act_i8,
+                    w_gate[layer_hidden_base + kk : layer_hidden_base + kk + TK, gate_n0 : gate_n0 + MLP_TN],
+                )
+                up_acc = pl.matmul_acc(
+                    up_acc,
+                    act_i8,
+                    w_up[layer_hidden_base + kk : layer_hidden_base + kk + TK, gate_n0 : gate_n0 + MLP_TN],
+                )
+            gate_scale = pl.reshape(
+                pl.slice(w_gate_scale, [1, MLP_TN], [layer_idx, gate_n0]), [1, MLP_TN]
+            )
+            up_scale = pl.reshape(
+                pl.slice(w_up_scale, [1, MLP_TN], [layer_idx, gate_n0]), [1, MLP_TN]
+            )
+            gate_fp32 = pl.row_expand_mul(
+                pl.col_expand_mul(pl.cast(gate_acc, target_type=pl.FP32), gate_scale),
+                mlp_act_scales,
+            )
+            up_fp32 = pl.row_expand_mul(
+                pl.col_expand_mul(pl.cast(up_acc, target_type=pl.FP32), up_scale),
+                mlp_act_scales,
+            )
+            gate_acc_all = pl.assemble(gate_acc_all, gate_fp32, [0, gate_n0])
+            up_acc_all = pl.assemble(up_acc_all, up_fp32, [0, gate_n0])
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="silu",
-            deps=[gate_up_tile_tids],
+            deps=[gate_up_tid],
             no_dep_args=[mlp_down_tile],
         ) as silu_tid:
             silu_inv_rms_chunk = inv_rms_tile[:, 0:1]
@@ -726,94 +718,101 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         silu_tids[n_out] = silu_tid
     silu_barrier = pl.system.task_dummy(deps=[silu_tids])
 
-    down_dual_tids = pl.array.create(DOWN_DUAL_ON, pl.TASK_ID)
+    down_dual_tids = pl.array.create(DOWN_DUAL_ON * DOWN_K_SPLITS, pl.TASK_ID)
     for n_pair in pl.parallel(DOWN_DUAL_ON):
         down_n0 = n_pair * DOWN_DUAL_PAIR * DOWN_TN
         down_n1 = down_n0 + DOWN_TN
-        with pl.at(
-            level=pl.Level.CORE_GROUP,
-            optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
-            no_dep_args=[down_acc_all],
-            name_hint="down_dual_proj",
-            deps=[silu_barrier],
-        ) as down_dual_tid:
-            down_a_mat_0 = pl.tile.load(
-                mlp_down_tile,
-                [0, 0],
-                [BATCH, DOWN_DUAL_L0_K],
-                [ACTIVE_BATCH, DOWN_DUAL_L0_K],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_a_left_0 = pl.move(down_a_mat_0, target_memory=pl.MemorySpace.Left)
-            down_w0_mat_0 = pl.tile.load(
-                w_down,
-                [layer_inter_base, down_n0],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_w0_right_0 = pl.move(down_w0_mat_0, target_memory=pl.MemorySpace.Right)
-            down_acc0 = pl.tile.matmul(down_a_left_0, down_w0_right_0)
-            down_w1_mat_0 = pl.tile.load(
-                w_down,
-                [layer_inter_base, down_n1],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                [DOWN_DUAL_L0_K, DOWN_TN],
-                target_memory=pl.MemorySpace.Mat,
-            )
-            down_w1_right_0 = pl.move(down_w1_mat_0, target_memory=pl.MemorySpace.Right)
-            down_acc1 = pl.tile.matmul(down_a_left_0, down_w1_right_0)
-            for down_k0, (down_acc0_iter, down_acc1_iter) in pl.pipeline(
-                DOWN_DUAL_L0_K,
-                INTERMEDIATE,
-                DOWN_DUAL_L0_K,
-                stage=2,
-                init_values=(down_acc0, down_acc1),
-            ):
-                down_a_mat = pl.tile.load(
+        for down_k_split in pl.range(DOWN_K_SPLITS):
+            down_k_base = down_k_split * DOWN_K_SLICE
+            down_part_row = down_k_split * BATCH
+            with pl.at(
+                level=pl.Level.CORE_GROUP,
+                optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)],
+                no_dep_args=[down_acc_parts],
+                name_hint="down_dual_proj",
+                deps=[silu_barrier],
+            ) as down_dual_tid:
+                down_a_mat_0 = pl.tile.load(
                     mlp_down_tile,
-                    [0, down_k0],
+                    [0, down_k_base],
                     [BATCH, DOWN_DUAL_L0_K],
                     [ACTIVE_BATCH, DOWN_DUAL_L0_K],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_a_left = pl.move(down_a_mat, target_memory=pl.MemorySpace.Left)
-                down_w0_mat = pl.tile.load(
+                down_a_left_0 = pl.move(down_a_mat_0, target_memory=pl.MemorySpace.Left)
+                down_w0_mat_0 = pl.tile.load(
                     w_down,
-                    [layer_inter_base + down_k0, down_n0],
+                    [layer_inter_base + down_k_base, down_n0],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_w0_right = pl.move(down_w0_mat, target_memory=pl.MemorySpace.Right)
-                down_next0 = pl.tile.matmul_acc(down_acc0_iter, down_a_left, down_w0_right)
-                down_w1_mat = pl.tile.load(
+                down_w0_right_0 = pl.move(down_w0_mat_0, target_memory=pl.MemorySpace.Right)
+                down_acc0 = pl.tile.matmul(down_a_left_0, down_w0_right_0)
+                down_w1_mat_0 = pl.tile.load(
                     w_down,
-                    [layer_inter_base + down_k0, down_n1],
+                    [layer_inter_base + down_k_base, down_n1],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     [DOWN_DUAL_L0_K, DOWN_TN],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                down_w1_right = pl.move(down_w1_mat, target_memory=pl.MemorySpace.Right)
-                down_next1 = pl.tile.matmul_acc(down_acc1_iter, down_a_left, down_w1_right)
-                down_acc0, down_acc1 = pl.yield_(down_next0, down_next1)
-            down_acc_all = pl.tile.store(down_acc0, [0, down_n0], down_acc_all)
-            down_acc_all = pl.tile.store(down_acc1, [0, down_n1], down_acc_all)
-        down_dual_tids[n_pair] = down_dual_tid
+                down_w1_right_0 = pl.move(down_w1_mat_0, target_memory=pl.MemorySpace.Right)
+                down_acc1 = pl.tile.matmul(down_a_left_0, down_w1_right_0)
+                for down_k0, (down_acc0_iter, down_acc1_iter) in pl.pipeline(
+                    DOWN_DUAL_L0_K,
+                    DOWN_K_SLICE,
+                    DOWN_DUAL_L0_K,
+                    stage=2,
+                    init_values=(down_acc0, down_acc1),
+                ):
+                    down_a_mat = pl.tile.load(
+                        mlp_down_tile,
+                        [0, down_k_base + down_k0],
+                        [BATCH, DOWN_DUAL_L0_K],
+                        [ACTIVE_BATCH, DOWN_DUAL_L0_K],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_a_left = pl.move(down_a_mat, target_memory=pl.MemorySpace.Left)
+                    down_w0_mat = pl.tile.load(
+                        w_down,
+                        [layer_inter_base + down_k_base + down_k0, down_n0],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_w0_right = pl.move(down_w0_mat, target_memory=pl.MemorySpace.Right)
+                    down_next0 = pl.tile.matmul_acc(down_acc0_iter, down_a_left, down_w0_right)
+                    down_w1_mat = pl.tile.load(
+                        w_down,
+                        [layer_inter_base + down_k_base + down_k0, down_n1],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        [DOWN_DUAL_L0_K, DOWN_TN],
+                        target_memory=pl.MemorySpace.Mat,
+                    )
+                    down_w1_right = pl.move(down_w1_mat, target_memory=pl.MemorySpace.Right)
+                    down_next1 = pl.tile.matmul_acc(down_acc1_iter, down_a_left, down_w1_right)
+                    down_acc0, down_acc1 = pl.yield_(down_next0, down_next1)
+                down_acc_parts = pl.tile.store(down_acc0, [down_part_row, down_n0], down_acc_parts)
+                down_acc_parts = pl.tile.store(down_acc1, [down_part_row, down_n1], down_acc_parts)
+            down_dual_tids[n_pair * DOWN_K_SPLITS + down_k_split] = down_dual_tid
 
     with pl.spmd(
         DOWN_ON,
         name_hint="down_cast_residual",
-        deps=[down_dual_tids[i] for i in range(DOWN_DUAL_ON)],
+        deps=[down_dual_tids[i] for i in range(DOWN_DUAL_ON * DOWN_K_SPLITS)],
     ) as _down_cast_tid:
         n_out = pl.tile.get_block_idx()
         down_cast_n0 = n_out * DOWN_TN
         resid_block_bf16 = post_norm_partial[:, down_cast_n0 : down_cast_n0 + DOWN_TN]
         resid_block = pl.cast(resid_block_bf16, target_type=pl.FP32)
-        acc_chunk_bf16 = pl.cast(
-            down_acc_all[:, down_cast_n0 : down_cast_n0 + DOWN_TN],
-            target_type=pl.BF16,
-        )
+        acc_chunk = down_acc_parts[0:BATCH, down_cast_n0 : down_cast_n0 + DOWN_TN]
+        for down_k_split in pl.unroll(1, DOWN_K_SPLITS):
+            down_part_row = down_k_split * BATCH
+            acc_chunk = pl.add(
+                acc_chunk,
+                down_acc_parts[down_part_row : down_part_row + BATCH, down_cast_n0 : down_cast_n0 + DOWN_TN],
+            )
+        acc_chunk_bf16 = pl.cast(acc_chunk, target_type=pl.BF16, mode="rint")
         acc_chunk = pl.cast(acc_chunk_bf16, target_type=pl.FP32)
         out_chunk = pl.add(acc_chunk, resid_block)
         out_bf16 = pl.cast(out_chunk, target_type=pl.BF16)
@@ -840,12 +839,12 @@ def _decode_layer_test_entry(  # noqa: PLR0913 - mirrors the model layer signatu
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
     v_cache: pl.Tensor,
-    k_cache_scale: pl.Tensor,
-    v_cache_scale: pl.Tensor,
     wo: pl.Tensor,
     wo_scale: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
+    w_gate_scale: pl.Tensor,
+    w_up_scale: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
@@ -868,12 +867,12 @@ def _decode_layer_test_entry(  # noqa: PLR0913 - mirrors the model layer signatu
         rope_sin,
         k_cache,
         v_cache,
-        k_cache_scale,
-        v_cache_scale,
         wo,
         wo_scale,
         w_gate,
         w_up,
+        w_gate_scale,
+        w_up_scale,
         w_down,
         post_rms_weight,
         out,
@@ -900,12 +899,12 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor,
     v_cache: pl.Tensor,
-    k_cache_scale: pl.Tensor,
-    v_cache_scale: pl.Tensor,
     wo: pl.Tensor,
     wo_scale: pl.Tensor,
     w_gate: pl.Tensor,
     w_up: pl.Tensor,
+    w_gate_scale: pl.Tensor,
+    w_up_scale: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
@@ -927,9 +926,10 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
             wq, wk, wv, wq_scale, wk_scale, wv_scale,
             q_norm_weight, k_norm_weight,
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
-            k_cache, v_cache, k_cache_scale, v_cache_scale,
+            k_cache, v_cache,
             wo, wo_scale,
-            w_gate, w_up, w_down, post_rms_weight, next_hidden, layer_idx,
+            w_gate, w_up, w_gate_scale, w_up_scale,
+            w_down, post_rms_weight, next_hidden, layer_idx,
         )
     out = rms_lm_head(cur, final_norm_weight, lm_head_weight, seq_lens, out)
     return out
@@ -971,14 +971,14 @@ def _decode_layer_test_inputs(initialize: bool):
         slot_mapping,
         torch.ones([BLOCK_SIZE, HEAD_DIM], dtype=torch.float32),
         torch.zeros([BLOCK_SIZE, HEAD_DIM], dtype=torch.float32),
-        tensor([cache_rows, HEAD_DIM], torch.int8),
-        tensor([cache_rows, HEAD_DIM], torch.int8),
-        torch.full([cache_rows, 1], weight_scale, dtype=torch.float32),
-        torch.full([cache_rows, 1], weight_scale, dtype=torch.float32),
+        tensor([cache_rows, HEAD_DIM], torch.bfloat16, scale=0.02),
+        tensor([cache_rows, HEAD_DIM], torch.bfloat16, scale=0.02),
         tensor([HIDDEN, HIDDEN], torch.int8),
         torch.full([1, HIDDEN], weight_scale, dtype=torch.float32),
-        tensor([HIDDEN, INTERMEDIATE], torch.bfloat16, scale=0.002),
-        tensor([HIDDEN, INTERMEDIATE], torch.bfloat16, scale=0.002),
+        tensor([HIDDEN, INTERMEDIATE], torch.int8),
+        tensor([HIDDEN, INTERMEDIATE], torch.int8),
+        torch.full([1, INTERMEDIATE], weight_scale, dtype=torch.float32),
+        torch.full([1, INTERMEDIATE], weight_scale, dtype=torch.float32),
         tensor([INTERMEDIATE, HIDDEN], torch.bfloat16, scale=0.002),
         torch.ones([1, HIDDEN], dtype=torch.float32),
     ]
