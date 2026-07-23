@@ -24,7 +24,7 @@ or ``--impl``); both are UNIFIED over decode + prefill and compute the identical
   * ``_hc_pre_syncall`` (default) -- the #684 fusion documented below: ONE full-occupancy
     ``pl.spmd(24)`` with 2 hard ``pl.system.syncall`` barriers, run with dep_gen OFF.
   * ``_hc_pre_separate`` -- the pre-#684 structure: each work-type is its OWN ``pl.spmd``
-    task (cast / rms / seed / linear / split_pre_post / write_post / comb_sinkhorn / mix_x),
+    task (cast / rms / linear / split_pre_post / write_post / comb_sinkhorn / mix_x),
     ordered by the runtime task graph (dep_gen ON), tile sizes aligned to the syncall path.
 The rest of this docstring describes the default ``_hc_pre_syncall`` fusion.
 
@@ -424,8 +424,8 @@ def _hc_pre_separate(
 
     Identical math to _hc_pre_syncall, but each work-type is its OWN pl.spmd task instead
     of one full-occupancy pl.spmd + hard pl.system.syncall barriers. The runtime task
-    graph orders the scopes by their GM read/write dependencies (seed -> linear atomic-add
-    -> split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
+    graph orders the scopes by their GM read/write dependencies (linear atomic-add ->
+    split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
     (the __main__ harness sets enable_dep_gen accordingly). Tile sizes are aligned to the
     tuned syncall version (D_CHUNK / D_SPMD / LINEAR_* / t_linear round-up); cross-barrier
     buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
@@ -445,7 +445,7 @@ def _hc_pre_separate(
     # x_flat directly. The 8->16 pad rows of the cube tile are never materialized -- the
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
-    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32, init_value=0)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
@@ -457,12 +457,6 @@ def _hc_pre_separate(
             sq_sum = pl.add(sq_sum, pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, T_TILE]))
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
-
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
 
     # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):

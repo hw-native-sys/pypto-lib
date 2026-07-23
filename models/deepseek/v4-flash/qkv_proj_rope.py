@@ -38,7 +38,6 @@ KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled fro
 QUANT_TILE = 256
 T_TILE = 8
 MATMUL_T_TILE = 16
-T_MAX = max(DECODE_BATCH * DECODE_SEQ, PREFILL_BATCH * PREFILL_SEQ)
 
 # Per-projection matmul tiles. Decoupled so each projection's M/N/K can be tuned
 # independently of one another AND of the downstream rms/rope granularity above
@@ -154,18 +153,9 @@ def qkv_proj_rope(
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
     # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
-    # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
-    # before every atomic RMW.
-    qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
-    qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
-        for tc in pl.range(t_matmul // QR_M_TILE):
-            ts0 = tc * QR_M_TILE
-            for nb in pl.range(Q_LORA // QR_N_TILE):
-                nseed0 = nb * QR_N_TILE
-                qr_fp32[ts0 : ts0 + QR_M_TILE, nseed0 : nseed0 + QR_N_TILE] = pl.full(
-                    [QR_M_TILE, QR_N_TILE], dtype=pl.FP32, value=0.0
-                )
+    # K partials into an AICPU-zeroed output.
+    qr_fp32 = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.FP32, init_value=0)
+    qr_i8_matmul = pl.create_tensor([t_matmul, Q_LORA], dtype=pl.INT8)
     for qbg_idx in pl.spmd((Q_LORA // QR_N_TILE) * QR_OK, name_hint="qr_proj_matmul", allow_early_resolve=True):
         q_a_col0 = (qbg_idx // QR_OK) * QR_N_TILE
         qr_k_base = (qbg_idx % QR_OK) * QR_K_SLICE
@@ -223,7 +213,7 @@ def qkv_proj_rope(
     # UN-MIXED qproj: keep the pure-matmul scope (cube, INT32 -> GM) separate from
     # downstream vector work. This lets the scheduler defer q dequant until AIV is free
     # instead of pinning it next to qproj and competing with the critical qr_proj AIV work.
-    q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
+    q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
     for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 2, name_hint="qproj_matmul", allow_early_resolve=True):
         hg = hg_idx * 2
         for h_inner in pl.range(2):
@@ -296,15 +286,7 @@ def qkv_proj_rope(
     # Split-K kv_proj uses four 128-column N-groups and KV_OK=4, again producing
     # 16 cube blocks. KV is off the critical path, so more K splits only add atomic
     # contention without shortening decode.
-    kv_fp32 = pl.create_tensor([T_MAX, HEAD_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_proj_seed"):
-        for tc in pl.range(t_matmul // KV_M_TILE):
-            kts0 = tc * KV_M_TILE
-            for nb in pl.range(HEAD_DIM // KV_N_TILE):
-                kvseed0 = nb * KV_N_TILE
-                kv_fp32[kts0 : kts0 + KV_M_TILE, kvseed0 : kvseed0 + KV_N_TILE] = pl.full(
-                    [KV_M_TILE, KV_N_TILE], dtype=pl.FP32, value=0.0
-                )
+    kv_fp32 = pl.create_tensor([t_matmul, HEAD_DIM], dtype=pl.FP32, init_value=0)
     # `late_dep` is a dummy barrier hung off the rms_norm TaskId: kv_proj is off the
     # critical path, so it resolves one hop after rms_norm and lets qr_proj_matmul
     # take the cores first.

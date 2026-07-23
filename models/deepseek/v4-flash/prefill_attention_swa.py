@@ -192,15 +192,11 @@ def prefill_attention_swa(
                             pl.write(idx_row, [0, win_col], row)
             swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
 
-    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_dummy_cmp_table"):
-        for dummy_blk in pl.range(SPARSE_CMP_MAX_BLOCKS):
-            pl.write(cmp_block_table_dummy, [dummy_blk], pl.cast(0, pl.INT32))
+    cmp_block_table_dummy = pl.create_tensor(
+        [SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0
+    )
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
-    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_empty_cmp_meta"):
-        for cmp_t in pl.range(T):
-            cmp_indices_dummy[cmp_t:cmp_t + 1, 0:IDX_TOPK] = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
+    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     prefill_sparse_attn(
         q, kv_cache, swa_indices,
