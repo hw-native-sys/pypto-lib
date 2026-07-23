@@ -29,7 +29,7 @@ or use the `/setup_env` skill), then run any example:
 
 ```bash
 python examples/beginner/hello_world.py -p a2a3sim   # simulator
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0   # real NPU, device 0
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 ```
 
 Every example accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`,
@@ -46,7 +46,7 @@ the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
 set.
 
 Existing kernels under `examples/intermediate/` are the best reference for
-single-stage patterns; `models/qwen3/14b/qwen3_14b_decode.py` shows a
+single-stage patterns; `models/qwen3/14b/decode_fwd.py` shows a
 full-model fused kernel.
 
 ## Debugging

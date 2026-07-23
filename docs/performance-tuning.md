@@ -98,7 +98,7 @@ Run the case with `--enable-l2-swimlane`. The runtime writes per-task L2
 records and a merged swimlane JSON under the build directory:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --enable-l2-swimlane
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
 ```
 
 ```
@@ -138,7 +138,7 @@ a dependency chain. Use `pl.parallel` whenever there is no carried state,
 and reserve `pl.range` for accumulators or stateful loops.
 
 ```python
-# qwen3_14b_decode.py: batch tile is independent — pl.parallel
+# decode_fwd.py: batch tile is independent — pl.parallel
 for b0 in pl.parallel(0, batch_padded, BATCH_TILE):
     ...
 ```
@@ -321,20 +321,24 @@ artifacts drive intra-kernel tuning:
 PMU counters per kernel:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --enable-pmu 2
+python models/deepseek/v4-flash/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
 # → build_output/<...>/dfx_outputs/pmu.csv
 ```
 
+Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
+captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run` / `run_jit`
+call (the harness bundles it into the runtime's DFX options).
+
 Per-kernel intra-core swimlane (MindStudio Insight / msprof simulator
-trace), exported after a normal run:
+trace), exported from an existing build directory:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0 --export-kernel-insight
+python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
 # → build_output/<...>/kernel_insight_all_funcs_<ts>/
 ```
 
-Or run the exporter directly on an existing build via
-[`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py).
+See [`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py)
+for driving a case run end-to-end (`--case`) instead of reusing a build.
 
 For ad-hoc, single-kernel profiling without a full model run, the
 `incore-profiling` skill
@@ -386,7 +390,7 @@ loop body `stage` times for ping-pong buffering, so MTE2 (load) overlaps
 with cube/vec compute on alternating tiles.
 
 ```python
-# qwen3_14b_decode.py — stage=4 used for the largest input-proj K dim
+# decode_fwd.py — stage=4 used for the largest input-proj K dim
 for kb in pl.pipeline(input_proj_k_blocks, stage=4):
     ...
 

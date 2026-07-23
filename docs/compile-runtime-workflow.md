@@ -241,8 +241,8 @@ directly on an existing build:
 python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
 ```
 
-or, for `models/qwen3/14b/qwen3_14b_decode.py`, append
-`--export-kernel-insight` to the normal run. The export root is written under
+or drive the case run end-to-end with `--case <kernel.py>` instead of
+`--build-dir`. The export root is written under
 `build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`, and the build
 directory also gets `latest_all_funcs_kernel_insight_export_root.txt` pointing
 at the latest export.

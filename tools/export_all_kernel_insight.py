@@ -16,13 +16,13 @@ Typical usage:
     --cann-set-env "$CANN_SET_ENV"
 
   python tools/export_all_kernel_insight.py \
-    --case models/qwen3/14b/qwen3_14b_decode.py \
+    --case models/qwen3/14b/decode_fwd.py \
     --task-submit --task-device auto \
     --run-env PTO2_RING_TASK_WINDOW=131072 \
     --run-env PTO2_RING_DEP_POOL=131072 \
     --run-env PTO2_RING_HEAP=536870912 \
     --cann-set-env "$CANN_SET_ENV" \
-    -- --runtime-profiling
+    -- --enable-l2-swimlane
 """
 
 from __future__ import annotations

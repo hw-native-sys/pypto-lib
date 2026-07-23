@@ -11,11 +11,12 @@ Use it directly on an existing build:
 python tools/export_all_kernel_insight.py --build-dir build_output/Qwen3Decode_<timestamp>
 ```
 
-For Qwen3-14B decode, the same export can be requested as part of the normal
-case run:
+Or let the tool run the case first and export from the build it produces:
 
 ```bash
-python models/qwen3/14b/qwen3_14b_decode.py --max-seq --enable-l2-swimlane --enable-pmu 2 --export-kernel-insight
+python tools/export_all_kernel_insight.py \
+  --case models/qwen3/14b/decode_fwd.py \
+  -- --max-seq --enable-l2-swimlane
 ```
 
 Output is written under the selected build directory as

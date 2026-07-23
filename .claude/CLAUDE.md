@@ -51,7 +51,7 @@ Use the `/setup_env` skill, or refer to `.claude/skills/setup_env/SKILL.md`.
 python examples/beginner/hello_world.py -p a2a3sim
 
 # Run a model on real NPU device 0
-python models/qwen3/14b/qwen3_14b_decode.py -p a2a3 -d 0
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
 ```
 
 Every script accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`.
