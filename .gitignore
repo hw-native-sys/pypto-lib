@@ -63,3 +63,6 @@ Thumbs.db
 
 # Project-specific
 KNOWN_ISSUES.md
+
+# msprof
+PROF_*
