@@ -184,7 +184,11 @@ def expert_routed(
                     h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
 
             y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-            with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
+            with pl.spmd(
+                D // (W2_INNER * D_OUT_TILE),
+                name_hint="exp_w2_mm",
+                allow_early_resolve=True,
+            ):
                 wb_idx = pl.tile.get_block_idx()
                 d_base = wb_idx * (W2_INNER * D_OUT_TILE)
                 for dg in pl.range(W2_INNER):
@@ -200,7 +204,11 @@ def expert_routed(
                     y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
 
             recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-            with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
+            with pl.spmd(
+                D // (W2_ACT_INNER * D_OUT_TILE_ACT),
+                name_hint="exp_w2_act",
+                allow_early_resolve=True,
+            ):
                 db_idx = pl.tile.get_block_idx()
                 act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
                 w_col_blk = pl.reshape(

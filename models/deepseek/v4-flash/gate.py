@@ -127,6 +127,8 @@ def gate(
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
         pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
+    seed_dummy = pl.system.task_dummy(deps=[])
+
     # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
     # cancels here (symmetric quant is invariant to a positive per-token scalar),
     # so x_norm_i8 = quant(xg). Early resolution lets the shared-expert chain
@@ -135,6 +137,7 @@ def gate(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="x_norm_quant",
+            deps=[seed_dummy],
             allow_early_resolve=True,
         ):
             xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]

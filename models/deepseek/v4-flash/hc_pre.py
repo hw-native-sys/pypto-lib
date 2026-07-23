@@ -448,7 +448,7 @@ def _hc_pre_separate(
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
-    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms"):
+    for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
         t0 = t * T_TILE
         sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for kb in pl.pipeline(HC_DIM // RMS_K_CHUNK, stage=4):
@@ -460,12 +460,12 @@ def _hc_pre_separate(
 
     # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
     # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
         for ts0 in pl.range(0, t_linear, T_TILE):
             mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
 
     # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
-    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear"):
+    for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
@@ -485,7 +485,7 @@ def _hc_pre_separate(
     # 32B tile, 4 cols valid -- a bare 4-wide slice allocs a 16B tile ptoas rejects). comb gate
     # lives in comb_sinkhorn.
     pre_val_store = pl.create_tensor([t_linear, HC_PAD], dtype=pl.FP32)
-    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post"):
+    for ob in pl.spmd(t_dim // T_TILE, name_hint="split_pre_post", allow_early_resolve=True):
         t0 = ob * T_TILE
         inv_col = inv_rms[t0:t0 + T_TILE, 0:1]
 
@@ -507,7 +507,7 @@ def _hc_pre_separate(
     # 20-iter Sinkhorn (column-first) -> comb. inv_rms is already a [t_linear,1] column buffer,
     # so the [T_TILE,1] inv tile loads directly (no transpose / no spill); the 4 comb groups
     # load pad-capable from mixes_raw at cols 8/12/16/20, then inv_rms * scale2 + group bias.
-    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn"):
+    for ob in pl.spmd(t_dim // COMB_T_TILE, name_hint="comb_sinkhorn", allow_early_resolve=True):
         t0 = ob * COMB_T_TILE
         inv_col_t = pl.load(inv_rms, [t0, 0], [COMB_T_TILE, 1], target_memory=pl.MemorySpace.Vec)
         comb_off = HC_MULT * 2
@@ -590,7 +590,7 @@ def _hc_pre_separate(
         pl.store(row3_out, [t0, 3 * HC_MULT], comb)
 
     # mix_x: x_mixed = sum_h pre[:,h]*x[:,h,:], fanned over D (D/D_SPMD tasks per tile).
-    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x"):
+    for blk in pl.spmd((t_dim // T_TILE) * (D // D_SPMD), name_hint="mix_x", allow_early_resolve=True):
         t0 = (blk // (D // D_SPMD)) * T_TILE
         d_base = (blk % (D // D_SPMD)) * D_SPMD
         pre_tile_t = pl.transpose(pre_val_store[t0:t0 + T_TILE, 0:HC_PAD], axis1=0, axis2=1)
