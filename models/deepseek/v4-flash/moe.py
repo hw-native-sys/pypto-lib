@@ -549,14 +549,14 @@ def l3_moe(
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
-    recv_meta_buf = pld.alloc_window_buffer(N_RANKS * N_LOCAL * 4)  # INT32
-    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)  # INT8 (b8 fixed in ptoas v0.45)
-    recv_aux_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * AUX_PAD * 4)  # FP32
-    recv_route_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * IDX_PAD * 4)  # INT32
-    arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)  # INT32 (meta arrival)
-    data_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)  # INT32 (payload arrival)
-    routed_y_buf_buf = pld.alloc_window_buffer(N_ROUTES * D * 2)  # BF16
-    combine_arrived_buf = pld.alloc_window_buffer(N_RANKS * 4)  # INT32
+    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+    recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)

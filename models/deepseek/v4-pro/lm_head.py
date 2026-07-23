@@ -331,10 +331,10 @@ def l3_lm_head(
     lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[TP_SIZE, T, VOCAB], pl.FP32]],
 ):
-    hidden_window_buf = pld.alloc_window_buffer(TP_SIZE * T_MAX * D * 2)
-    hidden_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
-    logits_window_buf = pld.alloc_window_buffer(T_MAX * VOCAB * 4)
-    logits_done_buf = pld.alloc_window_buffer(TP_SIZE * 4)
+    hidden_window_buf = pld.alloc_window_buffer([TP_SIZE * T_MAX, D], dtype=pl.BF16)
+    hidden_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    logits_window_buf = pld.alloc_window_buffer([T_MAX, VOCAB], dtype=pl.FP32)
+    logits_done_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         hidden_window = pld.window(hidden_window_buf, [TP_SIZE * T_MAX, D], dtype=pl.BF16)
