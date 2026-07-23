@@ -103,7 +103,7 @@ ATTN_PHASE_MICRO_GROUPS = (FINALIZE_TOK_GROUP + ATTN_TOK_GROUP - 1) // ATTN_TOK_
 ATTN_GI_BLOCKS = (TOTAL_Q_GROUPS + ATTN_GI_GROUP - 1) // ATTN_GI_GROUP
 ATTN_PHASE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_GI_BLOCKS
 ATTN_PHASE_SPMD_BLOCKS = 24
-FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK = True
+FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK = False
 FUSE_OUT_PROJ_IN_ROPE_QKPV = True
 ATTN_PHASE_SCORE_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_SCORE_ROWS
 ATTN_PHASE_STAT_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_STAT_ROWS
@@ -1010,6 +1010,7 @@ def _rope_qkpv_out_single_block_fused(
     wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     cur_li_phase: pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
     oi_tmp_phase: pl.Tensor[[ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], pl.FP32],
+    fused_ready_deps: pl.Array[3, pl.TASK_ID],
     b: pl.Scalar[pl.INT32],
     max_blocks_per_seq: pl.Scalar[pl.INT32],
     layer_cache_base: pl.Scalar[pl.INT32],
@@ -1031,6 +1032,7 @@ def _rope_qkpv_out_single_block_fused(
     with pl.spmd(
         ATTN_PHASE_SPMD_BLOCKS,
         name_hint="rope_qkpv_out_fused_spmd",
+        deps=[fused_ready_deps[0], fused_ready_deps[1], fused_ready_deps[2]],
         sync_start=True,
     ) as fused_tid:
         phase_core = pl.tile.get_block_idx()
@@ -1462,6 +1464,7 @@ def prefill_layer(
                     q_proj_tile = pl.create_tensor([TOK_TILE, HIDDEN], dtype=pl.FP32)
                     k_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
                     v_proj_tile = pl.create_tensor([TOK_TILE, KV_HIDDEN], dtype=pl.FP32)
+                    fused_qkpv_deps = pl.array.create(3, pl.TASK_ID)
                     if p0_idx == 0:
                         with pl.spmd(
                             Q_PROJ_SPMD_BLOCKS,
@@ -1513,6 +1516,9 @@ def prefill_layer(
                                         tile_wv_i = pl.slice(wv, [K_CHUNK, KV_OUT_CHUNK], [layer_hidden_base + k0, kv0])
                                         v_acc = pl.matmul_acc(v_acc, tile_a_i, tile_wv_i)
                                     v_proj_tile = pl.assemble(v_proj_tile, v_acc, [0, kv0])
+                        fused_qkpv_deps[0] = rms_recip_tid
+                        fused_qkpv_deps[1] = q_proj_tid
+                        fused_qkpv_deps[2] = kv_proj_tid
                     else:
                         qkv_late = pl.system.task_dummy(deps=[x_gamma_tid])
                         with pl.spmd(
@@ -1612,6 +1618,7 @@ def prefill_layer(
                                                     wo,
                                                     cur_li_phase,
                                                     oi_tmp_phase,
+                                                    fused_qkpv_deps,
                                                     b_i32,
                                                     max_blocks_i32,
                                                     layer_cache_base_i32,
