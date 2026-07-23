@@ -321,7 +321,9 @@ def prefill_fwd(
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
-    nt: pl.Scalar[pl.INT32] = pl.read(num_tokens_per_owner, [my_rank])
+    nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
+    for owner_rank in pl.range(N_RANKS):
+        nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
