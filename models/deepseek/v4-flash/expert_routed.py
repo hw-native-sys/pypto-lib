@@ -65,6 +65,7 @@ def expert_routed(
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
     recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
+    recv_x_flat = pl.reshape(recv_x, [N_LOCAL_EXPERTS * RECV_MAX, D])
 
     # gate (w1) / up (w3) INT32 accumulators for every (expert, row-tile), flat
     # row-addressed so they survive the parallel nest that produces them.
@@ -87,6 +88,7 @@ def expert_routed(
 
         for t in pl.parallel(n_tiles):
             t0 = t * RECV_TILE
+            flat_t0 = flat_base + t0
 
             with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
                 nb_idx = pl.tile.get_block_idx()
@@ -95,7 +97,7 @@ def expert_routed(
                     n0 = n_base + ng * MM_INTER_TILE
                     gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
+                        x_k = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, k0 : k0 + K_TILE]
                         w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
                         if k0 == 0:
                             gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
@@ -112,7 +114,7 @@ def expert_routed(
                     u0 = u_base + ug * MM_INTER_TILE
                     up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
                     for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_u = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, uk0 : uk0 + K_TILE]
+                        x_u = recv_x_flat[flat_t0 : flat_t0 + RECV_TILE, uk0 : uk0 + K_TILE]
                         w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
                         if uk0 == 0:
                             up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
