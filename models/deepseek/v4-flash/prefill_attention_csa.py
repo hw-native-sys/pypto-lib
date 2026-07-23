@@ -67,7 +67,7 @@ from prefill_sparse_attn import (
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
-CSA_T_DYN = pl.dynamic("PREFILL_CSA_T_DYN")
+CSA_T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
@@ -198,14 +198,10 @@ def prefill_attention_csa(
         rope_cos_t,
         rope_sin_t,
     )
-    q_storage = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv_storage = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = pl.slice(q_storage, [num_tokens, H, HEAD_DIM], [0, 0, 0])
-    kv = pl.slice(kv_storage, [num_tokens, HEAD_DIM], [0, 0])
-    qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
-    qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
+    q = pl.create_tensor([num_tokens, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([num_tokens, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([num_tokens, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([num_tokens, 1], dtype=pl.FP32)
     qkv_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
@@ -228,26 +224,21 @@ def prefill_attention_csa(
     )
     # Half-width FP32 cos/sin rows for the indexer Q-RoPE: gather freqs at each token's position
     # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
-    idx_cos_storage = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
-    idx_sin_storage = pl.create_tensor([T, HALF_ROPE], dtype=pl.FP32)
+    idx_cos = pl.create_tensor([num_tokens, HALF_ROPE], dtype=pl.FP32)
+    idx_sin = pl.create_tensor([num_tokens, HALF_ROPE], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
         for idx_t in pl.range(num_tokens):
             idx_pos = pl.cast(pl.read(position_ids, [idx_t]), pl.INDEX)
-            idx_cos_storage[idx_t : idx_t + 1, :] = pl.cast(
+            idx_cos[idx_t : idx_t + 1, :] = pl.cast(
                 pl.slice(freqs_cos, [1, HALF_ROPE], [idx_pos, 0]),
                 target_type=pl.FP32,
             )
-            idx_sin_storage[idx_t : idx_t + 1, :] = pl.cast(
+            idx_sin[idx_t : idx_t + 1, :] = pl.cast(
                 pl.slice(freqs_sin, [1, HALF_ROPE], [idx_pos, 0]),
                 target_type=pl.FP32,
             )
-    idx_cos = pl.slice(idx_cos_storage, [num_tokens, HALF_ROPE], [0, 0])
-    idx_sin = pl.slice(idx_sin_storage, [num_tokens, HALF_ROPE], [0, 0])
-
-    cmp_topk_indices_storage = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    idx_score_unused_storage = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    cmp_topk_indices = pl.slice(cmp_topk_indices_storage, [num_tokens, IDX_TOPK], [0, 0])
-    idx_score_unused = pl.slice(idx_score_unused_storage, [num_tokens, INDEXER_SCORE_CAP], [0, 0])
+    cmp_topk_indices = pl.create_tensor([num_tokens, IDX_TOPK], dtype=pl.INT32)
+    idx_score_unused = pl.create_tensor([num_tokens, INDEXER_SCORE_CAP], dtype=pl.FP32)
     prefill_indexer(
         x_normed, qr, qr_scale,
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,

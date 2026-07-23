@@ -20,7 +20,7 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
-T_DYN = pl.dynamic("PREFILL_INDEXER_COMPRESSOR_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -83,14 +83,15 @@ def prefill_indexer_compressor(
     inner_state_slot_mapping_in: pl.Tensor[[T_DYN], pl.INT64],
 ):
     num_tokens = pl.tensor.dim(x_in, 0)
-    x = pl.create_tensor([T, D], dtype=pl.BF16)
-    for pad_t in pl.spmd(T, name_hint="prefill_idx_compressor_dynamic_pad_x"):
+    work_tokens = ((num_tokens + PACKED_RMS_TILE - 1) // PACKED_RMS_TILE) * PACKED_RMS_TILE
+    x = pl.create_tensor([work_tokens, D], dtype=pl.BF16)
+    for pad_t in pl.spmd(work_tokens, name_hint="prefill_idx_compressor_dynamic_pad_x"):
         x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
         if pad_t < num_tokens:
             x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
         pl.store(x_row, [pad_t, 0], x)
-    kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
+    kv_proj_scratch = pl.create_tensor([work_tokens, OUT_DIM], dtype=pl.FP32)
+    score_proj_scratch = pl.create_tensor([work_tokens, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(
         compress_state,
         [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
@@ -101,26 +102,30 @@ def prefill_indexer_compressor(
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_kv_score_proj"):
-        o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, D // K_TILE, stage=2):
+    proj_col_blocks = PACKED_PROJ_BLOCKS
+    proj_tasks = (work_tokens // PACKED_RMS_TILE) * proj_col_blocks
+    for proj_idx in pl.spmd(proj_tasks, name_hint="prefill_idx_c4_kv_score_proj"):
+        o_block = proj_idx % proj_col_blocks
+        t_block = proj_idx // proj_col_blocks
+        o0 = o_block * OUT_TILE
+        t0 = t_block * PACKED_RMS_TILE
+        x_tile = x[t0 : t0 + PACKED_RMS_TILE, 0:K_TILE]
+        wkv_tile = wkv[o0 : o0 + OUT_TILE, 0:K_TILE]
+        wgate_tile = wgate[o0 : o0 + OUT_TILE, 0:K_TILE]
+        kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
+        score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
+        for kb in pl.pipeline(1, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x[0:T, k0 : k0 + K_TILE]
+            x_tile = x[t0 : t0 + PACKED_RMS_TILE, k0 : k0 + K_TILE]
             # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load
             # (K-contiguous long bursts) instead of ND2NZ strided; mirrors the main
             # compressor (prefill_compressor_ratio4) and the decode indexer compressor.
             wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
-            if k0 == 0:
-                kv_acc = pl.matmul(x_tile, wkv_tile, out_dtype=pl.FP32, b_trans=True)
-                score_acc = pl.matmul(x_tile, wgate_tile, out_dtype=pl.FP32, b_trans=True)
-            else:
-                kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
-                score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+            kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
+            score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
+        kv_proj_scratch[t0 : t0 + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = kv_acc
+        score_proj_scratch[t0 : t0 + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once. Input-only deps, so it overlaps the
     # projection matmul, replacing the O(T) write-discovery scan repeated in pool / rmsnorm_rope /
@@ -131,7 +136,7 @@ def prefill_indexer_compressor(
         write_pos_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=0)
         write_dst_tile = pl.full([1, MAX_CMP_WRITES], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
-        for map_w in pl.range(T):
+        for map_w in pl.range(num_tokens):
             if map_w < num_tokens:
                 map_slot_raw = pl.read(idx_slot_mapping_in, [map_w])
                 if map_slot_raw >= 0:
@@ -211,7 +216,7 @@ def prefill_indexer_compressor(
                         OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_CHUNK,
                     ]
 
-            for pool_t in pl.range(T):
+            for pool_t in pl.range(num_tokens):
                 if pool_t < num_tokens:
                     pool_pos = pl.read(position_ids_in, [pool_t])
                     if pool_pos <= write_pos:
@@ -377,7 +382,7 @@ def prefill_indexer_compressor(
                 ]
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
 
-    for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
+    for update_idx in pl.spmd(num_tokens * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
         update_ob = update_idx % PACKED_PROJ_BLOCKS
         update_t = update_idx // PACKED_PROJ_BLOCKS
         update_o0 = update_ob * OUT_TILE

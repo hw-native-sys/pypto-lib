@@ -24,7 +24,7 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
 )
-T_DYN = pl.dynamic("PREFILL_COMPRESSOR_RATIO128_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 
 B = PREFILL_BATCH

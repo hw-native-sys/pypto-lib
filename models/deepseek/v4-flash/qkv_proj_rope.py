@@ -13,7 +13,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
-T_DYN = pl.dynamic("QKV_PROJ_ROPE_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 
 # model config

@@ -32,7 +32,7 @@ from prefill_indexer_compressor import (
     golden_prefill_indexer_compressor,
     prefill_indexer_compressor,
 )
-T_DYN = pl.dynamic("PREFILL_INDEXER_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 # model config (mirrors decode_indexer)
 D = M.hidden_size
@@ -134,47 +134,59 @@ def prefill_indexer(
     inner_state_slot_mapping_in: pl.Tensor[[T_DYN], pl.INT64],
 ):
     num_tokens = pl.tensor.dim(x_in, 0)
-    x = pl.create_tensor([T, D], dtype=pl.BF16)
-    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
-    cos = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    sin = pl.create_tensor([T, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
-    score = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    for pad_t in pl.spmd(T, name_hint="prefill_indexer_dynamic_pad_x"):
+    work_tokens = ((num_tokens + TOPK_TILE - 1) // TOPK_TILE) * TOPK_TILE
+    x = pl.create_tensor([work_tokens, D], dtype=pl.BF16)
+    qr = pl.create_tensor([work_tokens, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([work_tokens, 1], dtype=pl.FP32)
+    cos = pl.create_tensor([work_tokens, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    sin = pl.create_tensor([work_tokens, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    score = pl.create_tensor([work_tokens, INDEXER_SCORE_CAP], dtype=pl.FP32)
+    cmp_topk_indices = pl.create_tensor([work_tokens, IDX_TOPK], dtype=pl.INT32)
+    for pad_t in pl.spmd(work_tokens, name_hint="prefill_indexer_dynamic_pad_x"):
         x_row = pl.tile.full([1, D], dtype=pl.BF16, value=0.0)
+        qr_row_i16 = pl.tile.full([1, Q_LORA], dtype=pl.INT16, value=0)
+        qr_row = pl.cast(qr_row_i16, target_type=pl.INT8, mode="trunc")
+        cos_row = pl.tile.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        sin_row = pl.tile.full([1, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        qr_scale_value = 0.0
         if pad_t < num_tokens:
             x_row = pl.load(x_in, [pad_t, 0], [1, D], target_memory=pl.MemorySpace.Vec)
+            qr_row = pl.load(qr_in, [pad_t, 0], [1, Q_LORA], target_memory=pl.MemorySpace.Vec)
+            cos_row = pl.load(cos_in, [pad_t, 0], [1, ROPE_HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
+            sin_row = pl.load(sin_in, [pad_t, 0], [1, ROPE_HEAD_DIM // 2], target_memory=pl.MemorySpace.Vec)
+            qr_scale_value = pl.read(qr_scale_in, [pad_t, 0])
         pl.store(x_row, [pad_t, 0], x)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_indexer_dynamic_pad_meta"):
-        qr[:, :] = pl.slice(qr_in, [T, Q_LORA], [0, 0], valid_shape=[num_tokens, Q_LORA])
-        qr_scale[:, :] = pl.slice(qr_scale_in, [T, 1], [0, 0], valid_shape=[num_tokens, 1])
-        cos[:, :] = pl.slice(cos_in, [T, ROPE_HEAD_DIM // 2], [0, 0], valid_shape=[num_tokens, ROPE_HEAD_DIM // 2])
-        sin[:, :] = pl.slice(sin_in, [T, ROPE_HEAD_DIM // 2], [0, 0], valid_shape=[num_tokens, ROPE_HEAD_DIM // 2])
+        pl.store(qr_row, [pad_t, 0], qr)
+        pl.store(cos_row, [pad_t, 0], cos)
+        pl.store(sin_row, [pad_t, 0], sin)
+        pl.write(qr_scale, [pad_t, 0], qr_scale_value)
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
-    qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_idx_qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+    qr_proj = pl.create_tensor([work_tokens, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
+    qr_col_blocks = IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE
+    qr_tasks = (work_tokens // QR_PROJ_ROW_TILE) * qr_col_blocks
+    for idx in pl.spmd(qr_tasks, name_hint="prefill_idx_qr_proj"):
+        o_block = idx % qr_col_blocks
+        r_block = idx // qr_col_blocks
+        o0 = o_block * Q_OUT_TILE
+        r0 = r_block * QR_PROJ_ROW_TILE
+        qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, 0:Q_TILE]
+        wq_tile = wq_b[0:Q_TILE, o0 : o0 + Q_OUT_TILE]
+        qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+        for kb in pl.pipeline(1, Q_LORA // Q_TILE, stage=2):
             q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
+            qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            if q0 == 0:
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-            else:
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
-            scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
-            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
-            qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
+        acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
+        scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
+        qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
+        qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
 
     # === Q RoPE (A3 interleaved swap-gather), one task per token (its IDX_N_HEADS rows + cos/sin) ===
-    qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
-    qr_rope_out = pl.create_tensor([T * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
-    for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="prefill_idx_qr_rope"):
+    qr_proj_flat = pl.reshape(qr_proj, [work_tokens * IDX_N_HEADS, IDX_HEAD_DIM])
+    qr_rope_out = pl.create_tensor([work_tokens * IDX_N_HEADS, ROPE_HEAD_DIM], dtype=pl.BF16)
+    for idx in pl.spmd(work_tokens * IDX_N_HEADS // ROPE_ROW_BLOCK, name_hint="prefill_idx_qr_rope"):
         o0 = idx * ROPE_ROW_BLOCK
         token_idx = idx  # ROPE_ROW_BLOCK == IDX_N_HEADS, so one task == one token
         cos_b = cos[token_idx : token_idx + 1, 0 : ROPE_HEAD_DIM // 2]
@@ -198,9 +210,9 @@ def prefill_indexer(
             qr_rope_out[r0 : r0 + ROPE_ROW_TILE, :] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
 
     # === Q Hadamard rotation + per-row INT8 quant (mirrors decode_indexer qr_hadamard_quant) ===
-    qr_hadamard_i8 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
-    qr_hadamard_scale_dq = pl.create_tensor([T * IDX_N_HEADS, 1], dtype=pl.FP32)
-    for idx in pl.spmd(T * IDX_N_HEADS // QH_QUANT_BLOCK, name_hint="prefill_idx_qr_hadamard_quant"):
+    qr_hadamard_i8 = pl.create_tensor([work_tokens * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.INT8)
+    qr_hadamard_scale_dq = pl.create_tensor([work_tokens * IDX_N_HEADS, 1], dtype=pl.FP32)
+    for idx in pl.spmd(work_tokens * IDX_N_HEADS // QH_QUANT_BLOCK, name_hint="prefill_idx_qr_hadamard_quant"):
         o0 = idx * QH_QUANT_BLOCK
         for ro in pl.range(0, QH_QUANT_BLOCK, QH_QUANT_ROW_TILE):
             qh_nope = pl.cast(
@@ -229,8 +241,8 @@ def prefill_indexer(
                 qr_hadamard_i8[o0 + ro : o0 + ro + QH_QUANT_ROW_TILE, h1 : h1 + HEAD_DIM_TILE] = qh_i8
 
     # === weights projection: (x @ weights_proj) * WEIGHTS_SCALE ===
-    weights = pl.create_tensor([T, IDX_N_HEADS], dtype=pl.FP32)
-    for idx in pl.spmd(T // WEIGHTS_ROW_TILE, name_hint="prefill_idx_weights_proj"):
+    weights = pl.create_tensor([work_tokens, IDX_N_HEADS], dtype=pl.FP32)
+    for idx in pl.spmd(work_tokens // WEIGHTS_ROW_TILE, name_hint="prefill_idx_weights_proj"):
         wrow0 = idx * WEIGHTS_ROW_TILE
         weights_acc = pl.create_tensor([WEIGHTS_ROW_TILE, IDX_N_HEADS], dtype=pl.FP32)
         for db in pl.pipeline(0, D // D_TILE, stage=2):
@@ -245,7 +257,7 @@ def prefill_indexer(
 
     # === inner compressor: build the paged compressed index KV cache ===
     prefill_indexer_compressor(
-        x,
+        x_in,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         freqs_cos, freqs_sin, hadamard,
@@ -260,9 +272,9 @@ def prefill_indexer(
     # accumulation, then dequantizes and reduces in FP32. Runtime guards skip blocks beyond context.
     kv_cache_i8_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM])
     kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
-    score_wide = pl.create_tensor([T, SORT_LEN], dtype=pl.FP32)                                  # wide sort scratch
+    score_wide = pl.create_tensor([work_tokens, SORT_LEN], dtype=pl.FP32)                         # wide sort scratch
 
-    for si in pl.parallel(0, T, SCORE_INIT_TILE):
+    for si in pl.parallel(0, work_tokens, SCORE_INIT_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_init"):
             score_wide[si : si + SCORE_INIT_TILE, :] = pl.full([SCORE_INIT_TILE, SORT_LEN], dtype=pl.FP32, value=FP32_NEG_INF)
 
@@ -278,8 +290,7 @@ def prefill_indexer(
                 # both from the paged cache directly (no score-time re-quant).
                 kv_q_i8_full = kv_cache_i8_flat[kv_row0 : kv_row0 + CACHE_TILE, 0 : IDX_HEAD_DIM]
                 kv_cache_scale_dq = kv_scale_flat[kv_row0 : kv_row0 + CACHE_TILE, :]
-                for t in pl.range(T):
-                    if t < num_tokens:
+                for t in pl.range(num_tokens):
                         q_s0 = t * IDX_N_HEADS
                         qr_hadamard_tile = qr_hadamard_i8[q_s0 : q_s0 + IDX_N_HEADS, 0:IDX_HEAD_DIM]
                         score_acc_s = pl.matmul(kv_q_i8_full, qr_hadamard_tile, out_dtype=pl.INT32, b_trans=True)
@@ -299,12 +310,16 @@ def prefill_indexer(
                         score_wide[t : t + 1, cache0 : cache0 + CACHE_TILE] = weighted_valid_t
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
-    score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
+    score_out_flat = pl.reshape(score, [work_tokens, INDEXER_SCORE_CAP])
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
-        score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
+        for score_t0 in pl.range(0, work_tokens, TOPK_TILE):
+            score_out_flat[score_t0 : score_t0 + TOPK_TILE, :] = score_wide[
+                score_t0 : score_t0 + TOPK_TILE,
+                0:INDEXER_SCORE_CAP,
+            ]
 
     # === top-k per token over the visible (causally reachable) compressed positions ===
-    for topk_idx in pl.spmd(T // TOPK_TILE, name_hint="prefill_idx_topk"):
+    for topk_idx in pl.spmd(work_tokens // TOPK_TILE, name_hint="prefill_idx_topk"):
         t0 = topk_idx * TOPK_TILE
         for ti in pl.range(TOPK_TILE):
             t = t0 + ti

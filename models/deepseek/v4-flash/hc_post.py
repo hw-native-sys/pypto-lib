@@ -15,7 +15,7 @@ Supports both decode and prefill batch/sequence sizes via dynamic-shape tensors.
 import pypto.language as pl
 
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
-T_DYN = pl.dynamic("HC_POST_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 # model config
 D = M.hidden_size

@@ -191,7 +191,7 @@ def mtp_prefill_fwd(
         pre_hc_hidden_out,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        pl.cast(MTP_LAYER_ID, pl.INT32), my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)

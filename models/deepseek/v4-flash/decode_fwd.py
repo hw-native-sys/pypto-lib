@@ -355,7 +355,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
         attention_swa(
@@ -380,7 +380,7 @@ def decode_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), my_rank, pl.cast(2, pl.INT32),
         )
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
@@ -473,7 +473,7 @@ def decode_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, num_tokens, my_rank, csa_moe_epoch,
+                csa_layer, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -542,7 +542,7 @@ def decode_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, num_tokens, my_rank, hca_moe_epoch,
+                hca_layer, my_rank, hca_moe_epoch,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -632,7 +632,7 @@ def decode_fwd(
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, num_tokens, my_rank, last_moe_epoch,
+            csa_layer_last, my_rank, last_moe_epoch,
         )
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():

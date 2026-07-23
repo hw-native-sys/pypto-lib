@@ -68,12 +68,12 @@ def test_attention_contract_uses_physical_token_shapes_below_compatibility_bound
         assert "num_tokens = pl.tensor.dim(x_hc, 0)" in source
 
 
-def test_attention_composition_boundaries_use_fixed_capacity_backing() -> None:
+def test_attention_composition_boundaries_use_physical_dynamic_storage() -> None:
     common_storage = {
-        "q": "[T, H, HEAD_DIM]",
-        "kv": "[T, HEAD_DIM]",
-        "qr": "[T, Q_LORA]",
-        "qr_scale": "[T, 1]",
+        "q": "[num_tokens, H, HEAD_DIM]",
+        "kv": "[num_tokens, HEAD_DIM]",
+        "qr": "[num_tokens, Q_LORA]",
+        "qr_scale": "[num_tokens, 1]",
     }
     for filename in (
         "prefill_attention_swa.py",
@@ -82,21 +82,21 @@ def test_attention_composition_boundaries_use_fixed_capacity_backing() -> None:
     ):
         source = ast.unparse(_function(filename, filename.removesuffix(".py")))
         for name, storage_shape in common_storage.items():
-            assert f"{name}_storage = pl.create_tensor({storage_shape}" in source
-            assert f"{name} = pl.slice({name}_storage, [num_tokens" in source
+            assert f"{name} = pl.create_tensor({storage_shape}" in source
+            assert f"{name}_storage" not in source
 
     csa_source = ast.unparse(_function("prefill_attention_csa.py", "prefill_attention_csa"))
     for name, storage_shape in {
-        "idx_cos": "[T, HALF_ROPE]",
-        "idx_sin": "[T, HALF_ROPE]",
-        "cmp_topk_indices": "[T, IDX_TOPK]",
-        "idx_score_unused": "[T, INDEXER_SCORE_CAP]",
+        "idx_cos": "[num_tokens, HALF_ROPE]",
+        "idx_sin": "[num_tokens, HALF_ROPE]",
+        "cmp_topk_indices": "[num_tokens, IDX_TOPK]",
+        "idx_score_unused": "[num_tokens, INDEXER_SCORE_CAP]",
     }.items():
-        assert f"{name}_storage = pl.create_tensor({storage_shape}" in csa_source
-        assert f"{name} = pl.slice({name}_storage, [num_tokens" in csa_source
+        assert f"{name} = pl.create_tensor({storage_shape}" in csa_source
+        assert f"{name}_storage" not in csa_source
 
 
-def test_dynamic_token_symbols_are_module_local() -> None:
+def test_attention_leaf_modules_share_dynamic_token_contract() -> None:
     symbols = {
         "hc_pre.py": "T_DYN",
         "hc_post.py": "T_DYN",
@@ -136,8 +136,8 @@ def test_dynamic_token_symbols_are_module_local() -> None:
             and isinstance(node.value.args[0], ast.Constant)
         }
         assert len(module_dynamics) == 1, filename
-        assert dynamic_names.isdisjoint(module_dynamics), filename
         dynamic_names.update(module_dynamics)
+    assert dynamic_names == {"PREFILL_ATTENTION_T_DYN"}
 
     for path in MODEL.glob("*.py"):
         assert "dynamic_shapes" not in path.read_text(encoding="utf-8"), path.name
@@ -198,7 +198,7 @@ def test_all_attention_call_arities_match_leaf_contracts() -> None:
     assert len(calls) == 12
 
 
-def test_fixed_capacity_parents_isolate_dynamic_attention_outputs_from_moe() -> None:
+def test_prefill_parents_forward_attention_outputs_to_moe() -> None:
     for filename in ("prefill_fwd.py", "prefill_mtp.py"):
         tree = _tree(filename)
         for node in ast.walk(tree):
@@ -223,21 +223,13 @@ def test_fixed_capacity_parents_isolate_dynamic_attention_outputs_from_moe() -> 
         assert ast.unparse(call.args[-1]) == "x_attn_valid"
 
     output_pairs = {
-        "prefill_fwd.py": (
-            ("x_attn0_valid", "x_attn0_storage", "token_count"),
-            ("x_attn1_valid", "x_attn1_storage", "token_count"),
-            ("x_attn_csa_valid", "x_attn_csa_storage", "token_count"),
-            ("x_attn_hca_valid", "x_attn_hca_storage", "token_count"),
-            ("x_attn_last_valid", "x_attn_last_storage", "token_count"),
-        ),
         "prefill_mtp.py": (("x_attn_valid", "x_attn_storage", "token_count"),),
-        "prefill_layer.py": (("x_attn_valid", "x_attn_storage", "valid_tok"),),
     }
     for filename, pairs in output_pairs.items():
         source = (MODEL / filename).read_text(encoding="utf-8")
         tree = ast.parse(source)
         for dynamic_name, storage_name, token_extent in pairs:
-            storage_extent = "TOK_TILE" if filename == "prefill_layer.py" else "T"
+            storage_extent = "T"
             assert f"{storage_name} = pl.create_tensor([{storage_extent}, HC_MULT, D], dtype=pl.FP32)" in source
             assert (
                 f"{dynamic_name} = pl.slice({storage_name}, [{token_extent}, HC_MULT, D], [0, 0, 0])"
@@ -262,11 +254,80 @@ def test_fixed_capacity_parents_isolate_dynamic_attention_outputs_from_moe() -> 
                 for node in ast.walk(tree)
             )
 
+    full_source = (MODEL / "prefill_fwd.py").read_text(encoding="utf-8")
+    full_tree = ast.parse(full_source)
+    for dynamic_name, storage_name in (
+        ("x_attn0_valid", "x_attn0_storage"),
+        ("x_attn1_valid", "x_attn1_storage"),
+        ("x_attn_csa_valid", "x_attn_csa_storage"),
+        ("x_attn_hca_valid", "x_attn_hca_storage"),
+        ("x_attn_last_valid", "x_attn_last_storage"),
+    ):
+        assert f"{storage_name} = pl.create_tensor([token_count, HC_MULT, D], dtype=pl.FP32)" in full_source
+        assert f"{dynamic_name} = {storage_name}" in full_source
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"prefill_attention_swa", "prefill_attention_hca", "prefill_attention_csa"}
+            and isinstance(node.args[-1], ast.Name)
+            and node.args[-1].id == dynamic_name
+            for node in ast.walk(full_tree)
+        )
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "moe"
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == storage_name
+            for node in ast.walk(full_tree)
+        )
 
-def test_full_prefill_sizes_both_active_runtime_rings() -> None:
-    source = (MODEL / "prefill_fwd.py").read_text(encoding="utf-8")
+    layer_source = (MODEL / "prefill_layer.py").read_text(encoding="utf-8")
+    assert "token_count = pl.tensor.dim(x_hc, 0)" in layer_source
+    assert "x_attn = pl.create_tensor([token_count, HC_MULT, D], dtype=pl.FP32)" in layer_source
+    assert "x_attn_valid = pl.slice(x_attn, [valid_tok, HC_MULT, D], [tile_base, 0, 0])" in layer_source
+    assert "x_next_tile = pl.slice(x_next, [valid_tok, HC_MULT, D], [tile_base, 0, 0])" in layer_source
+    assert "input_ids_tile = pl.slice(input_ids, [valid_tok], [tile_base])" in layer_source
+    assert "pl.create_tensor([TOK_TILE, HC_MULT, D]" not in layer_source
+    assert "valid_n" not in layer_source
 
-    assert "PREFILL_RING_HEAP = (0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 0)" in source
+
+def test_full_prefill_uses_physical_dynamic_token_shape_without_scalar_length() -> None:
+    per_rank = _function("prefill_fwd.py", "prefill_fwd")
+    host = _function("prefill_fwd.py", "l3_prefill_fwd")
+    per_rank_source = ast.unparse(per_rank)
+    host_source = ast.unparse(host)
+
+    assert "num_tokens" not in {arg.arg for arg in per_rank.args.args}
+    assert "num_tokens" not in {arg.arg for arg in host.args.args}
+    assert "token_count = pl.tensor.dim(x_hc, 0)" in per_rank_source
+    assert "pl.create_tensor([T, HC_MULT, D]" not in per_rank_source
+    assert "pl.create_tensor([T, D]" not in per_rank_source
+    assert "PREFILL_FWD_TOKENS_DYN" in per_rank_source
+    assert "PREFILL_FWD_TOKENS_DYN" in host_source
+
+    fixture_source = ast.unparse(_function("prefill_fwd.py", "build_tensor_specs"))
+    assert "[N_RANKS, num_tokens, HC_MULT, D]" in fixture_source
+    assert "[N_RANKS, num_tokens, D]" in fixture_source
+    assert "ScalarSpec('num_tokens'" not in fixture_source
+
+
+def test_prefill_drivers_size_active_runtime_rings() -> None:
+    expected = "(0, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024, 512 * 1024 * 1024)"
+
+    for filename, name in (
+        ("prefill_layer.py", "PREFILL_LAYER_RING_HEAP"),
+        ("prefill_fwd.py", "PREFILL_RING_HEAP"),
+    ):
+        assignment = next(
+            node
+            for node in _tree(filename).body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        assert ast.unparse(assignment.value) == expected
 
 
 def test_full_prefill_reuses_fixed_capacity_buffers_across_layer_pairs() -> None:
@@ -618,6 +679,17 @@ def test_packed_layer_metadata_copies_only_valid_tail_rows() -> None:
 
     assert "base + T" not in source
     assert source.count("base + valid") == 8
+
+
+def test_packed_layer_fixture_uses_contiguous_physical_request_offsets() -> None:
+    resolve_source = ast.unparse(_function("prefill_layer.py", "_resolve_batch"))
+    golden_source = ast.unparse(_function("prefill_layer.py", "golden_prefill_layer"))
+
+    assert "for c in chunk_lens_v" in resolve_source
+    assert "padded_lens_v" not in resolve_source
+    assert "attn_tensors['num_tokens']" not in golden_source
+    assert "moe_tensors['num_tokens']" not in golden_source
+    assert "torch.zeros((T" not in golden_source
 
 
 def test_hc_pre_materializes_post_as_a_vec_tile_before_store() -> None:

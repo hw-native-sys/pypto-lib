@@ -53,7 +53,7 @@ from prefill_sparse_attn import (
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
-HCA_T_DYN = pl.dynamic("PREFILL_HCA_T_DYN")
+HCA_T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
@@ -159,14 +159,10 @@ def prefill_attention_hca(
         rope_sin_t,
     )
 
-    q_storage = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
-    kv_storage = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
-    qr_storage = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
-    qr_scale_storage = pl.create_tensor([T, 1], dtype=pl.FP32)
-    q = pl.slice(q_storage, [num_tokens, H, HEAD_DIM], [0, 0, 0])
-    kv = pl.slice(kv_storage, [num_tokens, HEAD_DIM], [0, 0])
-    qr = pl.slice(qr_storage, [num_tokens, Q_LORA], [0, 0])
-    qr_scale = pl.slice(qr_scale_storage, [num_tokens, 1], [0, 0])
+    q = pl.create_tensor([num_tokens, H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([num_tokens, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([num_tokens, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([num_tokens, 1], dtype=pl.FP32)
     qkv_proj_rope(
         x_normed, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,

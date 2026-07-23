@@ -17,7 +17,7 @@ from config import (
     FP32_NEG_INF,
     PREFILL_CMP_BLOCK_NUM,
 )
-T_DYN = pl.dynamic("PREFILL_COMPRESSOR_RATIO4_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 # model config (mirrors decode_compressor_ratio4)
 EPS = M.rms_norm_eps

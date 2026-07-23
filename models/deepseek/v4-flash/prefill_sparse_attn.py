@@ -28,7 +28,7 @@ from config import (
     PREFILL_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
-T_DYN = pl.dynamic("PREFILL_SPARSE_ATTN_T_DYN")
+T_DYN = pl.dynamic("PREFILL_ATTENTION_T_DYN")
 
 # Prefill target shape. T is fixed at 128.
 B = PREFILL_BATCH
