@@ -300,7 +300,7 @@ def sparse_attn_hca(
             qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
             qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
             qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
-            qk_scores = pl.add(qk_scaled, pl.col_expand(pl.full([QK_M_TILE, ATTN_K_TILE], dtype=pl.FP32, value=0.0), qk_bias_row))
+            qk_scores = pl.col_expand_add(qk_scaled, qk_bias_row)
             qk_mi = pl.row_max(qk_scores)
             # Invalid lanes (NEG_INF bias, zero kv rows) exp to ~0; all-invalid
             # blocks die in the merge alpha/beta -- no mask multiply needed.

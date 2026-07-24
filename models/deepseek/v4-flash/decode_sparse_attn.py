@@ -364,14 +364,17 @@ def sparse_attn(
                         sparse_blk_li[qk_row : qk_row + H_TILE, 0 : 1] = qk_li[qk_r0 : qk_r0 + H_TILE, 0 : 1]
                         sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
             else:
-                qk_oi_zero = pl.full([H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
+                # Keep the empty-block zero tile to one row. A full
+                # [H_TILE, HEAD_DIM] Vec tile fragments the 64 KiB c2v
+                # reserve-buffer hole under PTOAS.
+                qk_oi_zero_row = pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0)
                 for qk_h_idx in pl.range(H // H_TILE):
                     qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
                     qk_row = qk_blk_base + qk_sb * H_TILE
                     for qk_hr in pl.range(H_TILE):
                         pl.write(sparse_blk_mi, [qk_row + qk_hr, 0], -3.0e38)
                         pl.write(sparse_blk_li, [qk_row + qk_hr, 0], 0.0)
-                    sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi_zero
+                        sparse_blk_oi[qk_row + qk_hr : qk_row + qk_hr + 1, 0 : HEAD_DIM] = qk_oi_zero_row
 
     # Precompute the head-invariant interleaved cos and sign*sin once: they depend
     # only on (token, column), not head, so building them per head would repeat the
