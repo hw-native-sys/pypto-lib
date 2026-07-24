@@ -60,7 +60,6 @@ ROPE_CORES = 32
 ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
 NUM_CORES = 24
 FA_TABLE_CAP = BATCH * HEAD_GROUPS * MAX_ATTN_PARTS
-OS_WORK = BATCH * NUM_KV_HEADS
 
 K_SPLITS_OUT = 5
 N_SPLITS_OUT = 20
@@ -107,6 +106,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    active_batch: pl.Tensor,
     block_table: pl.Tensor,
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
@@ -307,7 +307,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="fa_work_build"):
         cursor = pl.read(seq_lens, [0]) * 0  # scalar 0 (INDEX)
-        for wb in pl.unroll(BATCH):
+        active_batch_count = pl.cast(pl.read(active_batch, [0]), target_type=pl.INDEX)
+        for wb in pl.range(active_batch_count):
             wb_ctx = (pl.read(seq_lens, [wb]) + (ATTN_TILE - 1)) // ATTN_TILE
             for whg in pl.unroll(HEAD_GROUPS):
                 for wp in pl.range(wb_ctx):
@@ -472,7 +473,9 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             pl.tensor.write(fa_done, [fa_enc], pl.cast(1, target_type=pl.INT32))
 
     for os_core in pl.spmd(NUM_CORES * 2, name_hint="online_softmax"):
-        for os_spmd_idx in pl.range(os_core, OS_WORK, NUM_CORES * 2):
+        os_active_batch = pl.cast(pl.read(active_batch, [0]), target_type=pl.INDEX)
+        os_work = os_active_batch * NUM_KV_HEADS
+        for os_spmd_idx in pl.range(os_core, os_work, NUM_CORES * 2):
             os_b = os_spmd_idx // NUM_KV_HEADS
             os_gi = os_spmd_idx % NUM_KV_HEADS
             os_hg = os_gi // GP_SIZE
@@ -510,6 +513,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             ctx_valid = ctx[0:Q_HEAD_BATCH, :]
             ctx_flat_bf16 = pl.cast(pl.reshape(ctx_valid, [1, Q_HEAD_BATCH * HEAD_DIM]), target_type=pl.BF16)
             attn_out = pl.assemble(attn_out, ctx_flat_bf16, [os_b, os_q_base * HEAD_DIM])
+            if os_b == 0:
+                for pad_b in pl.range(os_active_batch, BATCH):
+                    attn_out = pl.assemble(
+                        attn_out,
+                        ctx_flat_bf16,
+                        [pad_b, os_q_base * HEAD_DIM],
+                    )
 
     attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
     post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # raw residual h1 (add-back)
@@ -833,6 +843,7 @@ def _decode_layer_test_entry(  # noqa: PLR0913 - mirrors the model layer signatu
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    active_batch: pl.Tensor,
     block_table: pl.Tensor,
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
@@ -861,6 +872,7 @@ def _decode_layer_test_entry(  # noqa: PLR0913 - mirrors the model layer signatu
         q_norm_weight,
         k_norm_weight,
         seq_lens,
+        active_batch,
         block_table,
         slot_mapping,
         rope_cos,
@@ -893,6 +905,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
     seq_lens: pl.Tensor,
+    active_batch: pl.Tensor,
     block_table: pl.Tensor,
     slot_mapping: pl.Tensor,
     rope_cos: pl.Tensor,
@@ -925,7 +938,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
             cur, input_rms_weight,
             wq, wk, wv, wq_scale, wk_scale, wv_scale,
             q_norm_weight, k_norm_weight,
-            seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
+            seq_lens, active_batch, block_table, slot_mapping, rope_cos, rope_sin,
             k_cache, v_cache,
             wo, wo_scale,
             w_gate, w_up, w_gate_scale, w_up_scale,
@@ -950,6 +963,7 @@ def _decode_layer_test_inputs(initialize: bool):
         return value.normal_(mean=0.0, std=scale)
 
     seq_lens = torch.arange(1, BATCH + 1, dtype=torch.int32)
+    active_batch = torch.tensor([BATCH], dtype=torch.int32)
     block_table = torch.arange(BATCH, dtype=torch.int32)
     slot_mapping = torch.arange(BATCH, dtype=torch.int32) * BLOCK_SIZE + seq_lens - 1
     cache_rows = BATCH * NUM_KV_HEADS * BLOCK_SIZE
@@ -967,6 +981,7 @@ def _decode_layer_test_inputs(initialize: bool):
         torch.ones([1, HEAD_DIM], dtype=torch.float32),
         torch.ones([1, HEAD_DIM], dtype=torch.float32),
         seq_lens,
+        active_batch,
         block_table,
         slot_mapping,
         torch.ones([BLOCK_SIZE, HEAD_DIM], dtype=torch.float32),
