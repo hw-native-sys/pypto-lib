@@ -457,8 +457,10 @@ def sparse_attn(
             n_hh = n_gh - n_g * HEADS_PER_GROUP
             n_pack_row = n_g * T + m_t
             n_col = n_hh * HEAD_DIM
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
-            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM]
+            # one HEAD_DIM-wide store per head row instead of two: concat the nope and
+            # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
+            n_full_bf16 = pl.concat(n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM], n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM])
+            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
