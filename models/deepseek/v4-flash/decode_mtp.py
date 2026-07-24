@@ -42,6 +42,7 @@ from decode_attention_swa import (
     O_GROUPS,
     O_LORA,
     ORI_BLOCK_NUM,
+    ORI_BLOCK_NUM_DYN,
     Q_LORA,
     ROPE_HEAD_DIM,
     T,
@@ -106,7 +107,7 @@ def mtp_decode_layer(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[T], pl.INT64],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
@@ -258,7 +259,7 @@ def l3_mtp_decode_layer(
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     swa_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     swa_indices: pl.Tensor[[N_RANKS, T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[N_RANKS, T], pl.INT32],
@@ -464,7 +465,7 @@ def _mtp_head_specs():
     }
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
+def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=ORI_BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
 
@@ -525,6 +526,33 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
             specs.append(mtp_head_specs[name])
         elif name in moe_specs:
             specs.append(moe_specs[name])
+        elif name == "kv_cache":
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM],
+                swa_specs[name].dtype,
+                init_value=lambda: torch.zeros(
+                    N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM, dtype=swa_specs[name].dtype
+                ),
+                is_output=swa_specs[name].is_output,
+            ))
+        elif name in {"swa_slot_mapping", "swa_indices"}:
+            def init_dynamic_metadata(name=name):
+                values = []
+                for _ in range(N_RANKS):
+                    value = swa_specs[name].init_value().clone()
+                    valid = value >= 0
+                    value[valid] = value[valid].remainder(ori_block_num * BLOCK_SIZE)
+                    values.append(value)
+                return torch.stack(values, dim=0).contiguous()
+
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, *swa_specs[name].shape],
+                swa_specs[name].dtype,
+                init_value=init_dynamic_metadata,
+                is_output=swa_specs[name].is_output,
+            ))
         else:
             specs.append(
                 _ranked_spec(
@@ -635,6 +663,7 @@ def main():
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=DECODE_START_POS)
     parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -646,7 +675,11 @@ def main():
 
     result = run_jit(
         fn=l3_mtp_decode_layer,
-        specs=build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens),
+        specs=build_tensor_specs(
+            start_pos=args.start_pos,
+            num_tokens=args.num_tokens,
+            ori_block_num=args.ori_block_num,
+        ),
         golden_fn=golden_mtp_decode_layer,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,

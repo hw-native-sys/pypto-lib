@@ -142,6 +142,15 @@ LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 LM_HEAD_COMM_EPOCH = LAST_MOE_EPOCH + 1
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
+# Physical cache pools are runtime-sized.  The first dimension of each
+# stacked cache is the per-layer pool size multiplied by its layer count.
+FWD_ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+FWD_CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+FWD_IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
+FWD_HCA_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
+FWD_CSA_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
+FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
 # the 43-layer prefill scope is open. Keep the other rings on their defaults.
 PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
@@ -241,22 +250,22 @@ def prefill_fwd(
     wkv: pl.Tensor[[FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[FWD_NUM_LAYERS * H], pl.FP32],
     wo_a: pl.Tensor[[FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
-    cmp_kv: pl.InOut[pl.Tensor[[FWD_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[FWD_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_wkv: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[pl.Tensor[[HCA_NUM_LAYERS * HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
+    hca_compress_state: pl.InOut[pl.Tensor[[FWD_HCA_STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_cmp_wkv: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
+    csa_compress_state: pl.InOut[pl.Tensor[[FWD_CSA_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_hadamard_idx: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -265,9 +274,9 @@ def prefill_fwd(
     csa_inner_wgate: pl.Tensor[[CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
-    idx_kv_cache: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    csa_inner_compress_state: pl.InOut[pl.Tensor[[FWD_INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[FWD_IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[FWD_IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
@@ -324,6 +333,20 @@ def prefill_fwd(
     nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
+    ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
+    cmp_block_num = pl.tensor.dim(cmp_kv, 0) // FWD_NUM_LAYERS
+    hca_state_block_num = pl.tensor.dim(hca_compress_state, 0) // HCA_NUM_LAYERS
+    csa_state_block_num = pl.tensor.dim(csa_compress_state, 0) // CSA_NUM_LAYERS
+    inner_state_block_num = pl.tensor.dim(csa_inner_compress_state, 0) // CSA_NUM_LAYERS
+    idx_block_num = pl.tensor.dim(idx_kv_cache, 0) // CSA_NUM_LAYERS
+    # Keep the hand-written layer schedule readable while making every cache
+    # slice use the runtime per-layer pool size.
+    CSA_ORI_BLOCK_NUM = ori_block_num
+    CSA_CMP_BLOCK_NUM = cmp_block_num
+    HCA_STATE_BLOCK_NUM = hca_state_block_num
+    CSA_STATE_BLOCK_NUM = csa_state_block_num
+    INNER_STATE_BLOCK_NUM = inner_state_block_num
+    PREFILL_IDX_BLOCK_NUM = idx_block_num
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
     # ===================== layer 0 : swa =================================
@@ -725,22 +748,22 @@ def l3_prefill_fwd(
     wkv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, HEAD_DIM], pl.BF16],
     gamma_cq: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * Q_LORA], pl.BF16],
     gamma_ckv: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     attn_sink: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * D], pl.FP32],
-    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, FWD_CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     hca_cmp_wkv: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_MAIN_OUT_DIM, D], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, HCA_NUM_LAYERS * HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
+    hca_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_HCA_STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * HEAD_DIM], pl.BF16],
-    csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
+    csa_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_CSA_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, CSA_COMPRESS_STATE_DIM], pl.FP32]],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -749,9 +772,9 @@ def l3_prefill_fwd(
     csa_inner_wgate: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_OUT_DIM, D], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * IDX_HEAD_DIM], pl.BF16],
-    csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, CSA_NUM_LAYERS * PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    csa_inner_compress_state: pl.InOut[pl.Tensor[[N_RANKS, FWD_INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, CSA_INNER_COMPRESS_STATE_DIM], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, FWD_IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
@@ -908,7 +931,7 @@ def _layer_count(name):
     return 1
 
 
-def _make_stacked_spec(name, base_specs):
+def _make_stacked_spec(name, base_specs, cache_block_nums=None):
     import torch
     from golden import TensorSpec
 
@@ -917,6 +940,8 @@ def _make_stacked_spec(name, base_specs):
     packed_shape = [spec.shape[0], count * spec.shape[1], *spec.shape[2:]]
 
     def init_value():
+        if cache_block_nums and name in cache_block_nums:
+            return torch.zeros(packed_shape, dtype=spec.dtype)
         if name == "tid2eid":
             token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
             topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
@@ -937,7 +962,7 @@ def _make_stacked_spec(name, base_specs):
     )
 
 
-def _make_shared_spec(name, base_specs, start_pos):
+def _make_shared_spec(name, base_specs, start_pos, cache_block_nums=None):
     import torch
     from golden import TensorSpec
 
@@ -967,7 +992,21 @@ def _make_shared_spec(name, base_specs, start_pos):
             out[mask] = ((pos[mask] + 1) // CSA_COMPRESS_RATIO) - 1
             return ranked(out)
         if name in ("ori_block_table", "cmp_block_table", "idx_block_table"):
-            out = torch.arange(spec.shape[-1], dtype=spec.dtype)
+            physical_blocks = {
+                "ori_block_table": cache_block_nums["kv_cache"],
+                "cmp_block_table": cache_block_nums["cmp_kv"],
+                "idx_block_table": cache_block_nums["idx_kv_cache"],
+            }[name]
+            out = torch.arange(spec.shape[-1], dtype=spec.dtype) % physical_blocks
+            return ranked(out)
+        if name in ("hca_compress_state_block_table", "csa_compress_state_block_table",
+                    "csa_inner_compress_state_block_table"):
+            state_name = {
+                "hca_compress_state_block_table": "hca_compress_state",
+                "csa_compress_state_block_table": "csa_compress_state",
+                "csa_inner_compress_state_block_table": "csa_inner_compress_state",
+            }[name]
+            out = torch.arange(spec.shape[-1], dtype=spec.dtype) % cache_block_nums[state_name]
             return ranked(out)
         # Any remaining shared metadata: smoke zeros.
         return torch.zeros(list(spec.shape), dtype=spec.dtype)
@@ -1267,7 +1306,16 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
     ]
 
 
-def build_tensor_specs(start_pos=0, num_tokens=T):
+def build_tensor_specs(
+    start_pos=0,
+    num_tokens=T,
+    ori_block_num=CSA_ORI_BLOCK_NUM,
+    cmp_block_num=CSA_CMP_BLOCK_NUM,
+    idx_block_num=PREFILL_IDX_BLOCK_NUM,
+    hca_state_block_num=HCA_STATE_BLOCK_NUM,
+    csa_state_block_num=CSA_STATE_BLOCK_NUM,
+    inner_state_block_num=INNER_STATE_BLOCK_NUM,
+):
     import torch
     from golden import TensorSpec
 
@@ -1315,6 +1363,15 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
         "final_norm_w",
     ]
 
+    cache_block_nums = {
+        "kv_cache": ori_block_num,
+        "cmp_kv": cmp_block_num,
+        "idx_kv_cache": idx_block_num,
+        "idx_kv_scale": idx_block_num,
+        "hca_compress_state": hca_state_block_num,
+        "csa_compress_state": csa_state_block_num,
+        "csa_inner_compress_state": inner_state_block_num,
+    }
     specs = []
     for name in ordered_names:
         if name == "x_hc":
@@ -1325,13 +1382,13 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
 
             specs.append(TensorSpec(name, list(base.shape), base.dtype, init_value=init_x_hc, is_output=False))
         elif name in SHARED_NAMES:
-            specs.append(_make_shared_spec(name, base_specs, start_pos))
+            specs.append(_make_shared_spec(name, base_specs, start_pos, cache_block_nums))
         elif name in HC_HEAD_NAMES:
             specs.append(_make_hc_head_spec(name))
         elif name in FINAL_NORM_NAMES:
             specs.append(_make_final_norm_spec(name))
         else:
-            specs.append(_make_stacked_spec(name, base_specs))
+            specs.append(_make_stacked_spec(name, base_specs, cache_block_nums))
 
     # Shard the static weight parameters per rank and keep them device-resident
     # (child_memory): each shard uploaded once to its card and reused across
@@ -1389,6 +1446,12 @@ def main():
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T // 2,
                         help=f"Active token rows for MoE routing/combine; default is T // 2={T // 2}.")
+    parser.add_argument("--ori-block-num", type=int, default=CSA_ORI_BLOCK_NUM)
+    parser.add_argument("--cmp-block-num", type=int, default=CSA_CMP_BLOCK_NUM)
+    parser.add_argument("--idx-block-num", type=int, default=PREFILL_IDX_BLOCK_NUM)
+    parser.add_argument("--hca-state-block-num", type=int, default=HCA_STATE_BLOCK_NUM)
+    parser.add_argument("--csa-state-block-num", type=int, default=CSA_STATE_BLOCK_NUM)
+    parser.add_argument("--inner-state-block-num", type=int, default=INNER_STATE_BLOCK_NUM)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -1407,7 +1470,16 @@ def main():
         f"N_RANKS={N_RANKS}, ep={args.ep}"
     )
 
-    specs = build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens)
+    specs = build_tensor_specs(
+        start_pos=args.start_pos,
+        num_tokens=args.num_tokens,
+        ori_block_num=args.ori_block_num,
+        cmp_block_num=args.cmp_block_num,
+        idx_block_num=args.idx_block_num,
+        hca_state_block_num=args.hca_state_block_num,
+        csa_state_block_num=args.csa_state_block_num,
+        inner_state_block_num=args.inner_state_block_num,
+    )
 
     result = run_jit(
         fn=l3_prefill_fwd,

@@ -54,6 +54,8 @@ T = B * S
 INNER_STATE_BLOCK_SIZE = 4
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = CSA_INNER_STATE_PHYSICAL_BLOCKS
+STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
@@ -64,7 +66,7 @@ PACKED_RMS_TILE = 16
 @pl.jit.inline
 def prefill_indexer_compressor(
     x: pl.Tensor[[T, D], pl.BF16],
-    compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -74,22 +76,24 @@ def prefill_indexer_compressor(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
+    state_block_num = pl.tensor.dim(compress_state, 0)
+    idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(
         compress_state,
-        [INNER_STATE_BLOCK_NUM * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
+        [state_block_num * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, HEAD_DIM])
+    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -363,7 +367,7 @@ def prefill_indexer_compressor(
                 # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
                 pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [final_dt, 0]))
             else:
-                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + final_i
+                keepalive_row = idx_block_num * BLOCK_SIZE - MAX_CMP_WRITES + final_i
                 idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
                     keepalive_row : keepalive_row + 1,
                     0:HEAD_DIM,
@@ -400,12 +404,8 @@ def prefill_indexer_compressor(
                     pool_dep,
                 )
 
-    idx_kv_cache = pl.reshape(idx_kv_cache_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
-    idx_kv_scale = pl.reshape(idx_kv_scale_flat, [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1])
-    compress_state = pl.reshape(
-        compress_state_flat,
-        [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
-    )
+    # Writes through the flattened views already update the caller-owned buffers.
+    # Avoid a dynamic reshape-back here because this inline kernel is nested.
     return idx_kv_cache, idx_kv_scale, compress_state
 
 
@@ -414,7 +414,7 @@ def prefill_indexer_compressor_test(
     x: pl.Tensor[[T, D], pl.BF16],
     kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
     compress_state: pl.InOut[
-        pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
@@ -424,20 +424,22 @@ def prefill_indexer_compressor_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
+    idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
+    idx_cache_rows = idx_block_num * BLOCK_SIZE
     prefill_indexer_compressor(
         x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
         hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, HEAD_DIM])
     for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
         kv_base = kv_block * PACKED_RMS_TILE
         for kv_dt in pl.range(PACKED_RMS_TILE):
