@@ -61,12 +61,11 @@ SCORE_LEN = IDX_KV_LEN
 # tiling
 CACHE_TILE = 64
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
-# matmul/reduce tile over contiguous GM scratch, not the paged KV cache
-MAT_TILE = 512
+# REDUCE_TILE tiles the paged C8 cache one 128-row page per fused matmul+reduce step.
 REDUCE_TILE = 128
-# score_kv_quant / score_reduce fan the cache-tile loop across NSPLIT extra lanes: T * NSPLIT.
-QUANT_NSPLIT = 4
-REDUCE_NSPLIT = 4
+# the fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes: T * NSPLIT.
+# T*NSPLIT=16 mixed blocks map to 16 AIC + 32 AIV (1:2), one clean wave on the 24+48 chip.
+REDUCE_NSPLIT = 2
 Q_TILE = 256
 # Q_OUT_TILE is the per-task N granularity (sets idx_qr_proj task count); MM_N_TILE
 # is the Mat-safe cube N-tile. Q_OUT_TILE fans Q_OUT_TILE // MM_N_TILE cube ops per
@@ -258,31 +257,14 @@ def indexer(
     idx_block_table_flat = pl.reshape(idx_block_table, [B * IDX_CACHE_MAX_BLOCKS])
     score_flat = pl.reshape(score, [T, SCORE_LEN])
 
-    # No score_init: reduce writes the valid region; the tail is never read (topk re-masks).
-    # Two GM-handoff stages: matmul (cube, reads paged C8 directly) -> reduce (vec).
-    score_acc_gm = pl.create_tensor([T * IDX_KV_LEN, IDX_N_HEADS], dtype=pl.INT32)
-
-    # read paged C8 KV one page per tile, matmul with the per-step-quantized query
-    for tg in pl.spmd(T, name_hint="score_mat", allow_early_resolve=True):
-        b = tg // S
-        s = tg - b * S
-        clen_b = pl.read(kv_seq_lens, [b]) // COMPRESS_RATIO
-        cblk_b = (clen_b + BLOCK_SIZE - 1) // BLOCK_SIZE
-        qb = b * S * IDX_N_HEADS
-        qr_full = qr_hadamard_i8[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
-        for cb in pl.pipeline(0, cblk_b, stage=2):
-            cache0 = cb * BLOCK_SIZE
-            idx_blk_id = pl.cast(
-                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
-                pl.INDEX,
-            )
-            kv0 = idx_blk_id * BLOCK_SIZE
-            base = tg * IDX_KV_LEN + cache0
-            kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + BLOCK_SIZE, :]
-            score_acc_mat = pl.matmul(kv_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
-            score_acc_gm[base : base + BLOCK_SIZE, :] = score_acc_mat
-
-    for unit in pl.spmd(T * REDUCE_NSPLIT, name_hint="score_reduce", allow_early_resolve=True):
+    # No score_init: the loop writes the valid region; the tail is never read (topk re-masks).
+    # Fused mixed cube+vector: the per-page C8 matmul feeds the relu/weight/head-sum reduce
+    # on chip, so cube page i+1 pipelines against vector page i (no score_acc_gm handoff).
+    # slot_num=2: the cube->vector pipe defaults to an 8-slot ring (8 * 32KB = 256KB > UB);
+    # a depth-2 ring (64KB) fits alongside the FP32 epilogue. Deeper rings (>=3) would cut the
+    # handoff stalls but overflow Vec.
+    for unit in pl.spmd(T * REDUCE_NSPLIT, name_hint="score", allow_early_resolve=True,
+                        optimizations=[pl.split(pl.SplitMode.NONE, slot_num=2)]):
         tg = unit // REDUCE_NSPLIT
         split = unit - tg * REDUCE_NSPLIT
         b = tg // S
@@ -293,6 +275,7 @@ def indexer(
         cblk_t = (visible_len_t + REDUCE_TILE - 1) // REDUCE_TILE
         tb = b * S
         qb = b * S * IDX_N_HEADS
+        qr_full = qr_hadamard_i8[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, 0 : IDX_HEAD_DIM]
         qh_scale_s = pl.reshape(qr_hadamard_scale_dq[qb + s * IDX_N_HEADS : qb + (s + 1) * IDX_N_HEADS, :], [1, IDX_N_HEADS])
         weights_row_s = pl.reshape(weights[tb + s : tb + s + 1, :], [1, IDX_N_HEADS])
         lane_iters = (cblk_t - split + REDUCE_NSPLIT - 1) // REDUCE_NSPLIT
@@ -300,26 +283,23 @@ def indexer(
             cb = split + cb_local * REDUCE_NSPLIT
             cache0 = cb * REDUCE_TILE
             valid_len = pl.min(REDUCE_TILE, visible_len_t - cache0)
-            base = tg * IDX_KV_LEN + cache0
             idx_blk_id = pl.cast(
                 pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
                 pl.INDEX,
             )
             kv0 = idx_blk_id * BLOCK_SIZE
-            score_acc_red = score_acc_gm[base : base + REDUCE_TILE, :]
+            kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + BLOCK_SIZE, :]
+            score_acc_red = pl.matmul(kv_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
             kv_dq_red = kv_scale_flat[kv0 : kv0 + REDUCE_TILE, :]  # paged per-position dequant scale
             score_tile_red = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")
-            # per-position dequant kv_dq_red applied after the head-sum
             score_tile_red = pl.col_expand_mul(score_tile_red, qh_scale_s)
-            relu_score_red = pl.maximum(score_tile_red, pl.full([REDUCE_TILE, IDX_N_HEADS], dtype=pl.FP32, value=0.0))
+            relu_score_red = pl.maximum(score_tile_red, 0.0)
             weighted_score_red = pl.col_expand_mul(relu_score_red, weights_row_s)
+            # per-position dequant kv_dq_red applied after the head-sum
             weighted_score_row = pl.mul(pl.row_sum(weighted_score_red), kv_dq_red)
             weighted_score_s = pl.reshape(weighted_score_row, [1, REDUCE_TILE])
             weighted_score_valid_s = pl.fillpad(pl.set_validshape(weighted_score_s, 1, valid_len), pad_value=pl.PadValue.min)
-            weighted_score_valid_s = pl.maximum(
-                weighted_score_valid_s,
-                pl.full([1, REDUCE_TILE], dtype=pl.FP32, value=FP32_NEG_INF),
-            )
+            weighted_score_valid_s = pl.maximum(weighted_score_valid_s, FP32_NEG_INF)
             score_flat[tb + s : tb + s + 1, cache0 : cache0 + REDUCE_TILE] = weighted_score_valid_s
 
     topk_idxs_flat = pl.reshape(topk_idxs, [T, SCORE_LEN])
