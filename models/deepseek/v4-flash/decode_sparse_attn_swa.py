@@ -44,6 +44,8 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # kernel-local
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
+ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
+ORI_CACHE_ROWS_DYN = pl.dynamic("ORI_CACHE_ROWS_DYN")
 
 # tiling
 GATHER_SPLITS = 4
@@ -154,7 +156,7 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 @pl.jit.inline
 def sparse_attn_swa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv_flat: pl.Tensor[[ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -166,6 +168,8 @@ def sparse_attn_swa(
     attn_out: pl.Tensor[[T, D], pl.BF16],
 ):
     """Standalone sparse attention with a BF16 projected output."""
+    ori_block_num = pl.tensor.dim(ori_kv, 0)
+    ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
     partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
     act_scale_dq = pl.create_tensor([O_GROUPS, T], dtype=pl.FP32)
     proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
@@ -463,7 +467,7 @@ def sparse_attn_swa(
 @pl.jit
 def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
-    ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     swa_lens: pl.Tensor[[T], pl.INT32],
     attn_sink: pl.Tensor[[H], pl.FP32],
@@ -474,7 +478,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    ori_kv_flat = pl.reshape(ori_kv, [ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    ori_block_num = pl.tensor.dim(ori_kv, 0)
     sparse_bias = pl.create_tensor([T, PADDED_TOPK], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
         v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)
@@ -487,7 +491,7 @@ def sparse_attn_test(
         sparse_bias[0:T, 0:ATTN_K_TILE] = pl.mul(pl.sub(v_valid, 1.0), -NEG_INF)
     sparse_attn_swa(
         q,
-        ori_kv_flat,
+        ori_kv,
         swa_indices,
         sparse_bias,
         attn_sink,

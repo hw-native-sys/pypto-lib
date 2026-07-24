@@ -60,6 +60,7 @@ from moe import (
 from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
 from prefill_attention_swa import (
     BLOCK_NUM,
+    BLOCK_NUM_DYN,
     BLOCK_SIZE,
     H,
     HEAD_DIM,
@@ -105,7 +106,7 @@ def mtp_prefill_fwd(
     gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -217,7 +218,7 @@ def l3_mtp_prefill_fwd(
     gamma_ckv: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[N_RANKS, BLOCK_NUM], pl.INT32],
     ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
@@ -381,7 +382,7 @@ def _mtp_head_specs():
     ]
 
 
-def build_tensor_specs(start_pos=0, num_tokens=T):
+def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
 
@@ -420,6 +421,37 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
             specs.append(mtp_head[name])
         elif name in moe_specs and name not in base:
             specs.append(_ranked(moe_specs[name], torch))
+        elif name == "kv_cache":
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM],
+                base[name].dtype,
+                init_value=lambda: torch.zeros(
+                    N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM, dtype=base[name].dtype
+                ),
+                is_output=True,
+            ))
+        elif name == "ori_block_table":
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, BLOCK_NUM],
+                base[name].dtype,
+                init_value=lambda: torch.arange(BLOCK_NUM, dtype=base[name].dtype)
+                .remainder(ori_block_num)
+                .view(1, BLOCK_NUM)
+                .expand(N_RANKS, -1)
+                .contiguous(),
+            ))
+        elif name == "ori_slot_mapping":
+            slot_init = base[name].init_value
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, T],
+                base[name].dtype,
+                init_value=lambda: torch.remainder(
+                    slot_init().view(1, T), ori_block_num * BLOCK_SIZE
+                ).expand(N_RANKS, -1).contiguous(),
+            ))
         else:
             specs.append(_ranked(base[name], torch))
 
@@ -559,6 +591,7 @@ def main():
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
@@ -571,7 +604,11 @@ def main():
 
     result = run_jit(
         fn=l3_mtp_prefill_fwd,
-        specs=build_tensor_specs(start_pos=args.start_pos, num_tokens=args.num_tokens),
+        specs=build_tensor_specs(
+            start_pos=args.start_pos,
+            num_tokens=args.num_tokens,
+            ori_block_num=args.ori_block_num,
+        ),
         golden_fn=golden_mtp_prefill_fwd,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
