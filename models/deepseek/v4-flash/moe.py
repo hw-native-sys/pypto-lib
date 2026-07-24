@@ -33,7 +33,7 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -41,9 +41,19 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
-from hc_pre import hc_pre
+from hc_pre import (
+    HC_PAD,
+    LINEAR_T_TILE,
+    MIX_PAD,
+    hc_pre_moe_producers,
+)
 from hc_post import hc_post
-from gate import gate
+from gate import T_PAD as GATE_T_PAD, gate
+from moe_fused_cce import (
+    FUSED_AIV_CORES,
+    SYNC_WORKSPACE_SLOTS,
+    split_mix_ffn_norm_cce,
+)
 from expert_shared import expert_shared
 from expert_routed import expert_routed
 
@@ -427,19 +437,67 @@ def moe(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(
+    hc_inv_rms = pl.create_tensor([LINEAR_T_TILE, 1], dtype=pl.FP32)
+    mixes_raw = pl.create_tensor(
+        [LINEAR_T_TILE, MIX_PAD],
+        dtype=pl.FP32,
+        init_value=0,
+    )
+    hc_pre_rms_tid, hc_pre_linear_tid = hc_pre_moe_producers(
         x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
+        hc_inv_rms, mixes_raw, comb_ffn,
     )
 
-    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
+    xg_buf = pl.create_tensor([GATE_T_PAD, D], dtype=pl.FP32)
+    gate_inv_rms_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
+    pre_val_store = pl.create_tensor(
+        [LINEAR_T_TILE, HC_PAD],
+        dtype=pl.FP32,
+    )
+    sync_workspace = pl.create_tensor(
+        [SYNC_WORKSPACE_SLOTS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
+    x_flat = pl.reshape(x_hc, [T, HC_DIM])
+    scale0 = pl.read(hc_ffn_scale, [0])
+    scale1 = pl.read(hc_ffn_scale, [1])
+    with pl.spmd(
+        FUSED_AIV_CORES,
+        name_hint="split_mix_ffn_norm",
+        deps=[hc_pre_linear_tid, hc_pre_rms_tid],
+        allow_early_resolve=True,
+    ) as fused_pre_tid:
+        x_mixed = split_mix_ffn_norm_cce(
+            x_mixed,
+            hc_inv_rms,
+            hc_ffn_base,
+            mixes_raw,
+            pre_val_store,
+            post_ffn,
+            x_flat,
+            norm_w,
+            xg_buf,
+            gate_inv_rms_buf,
+            x_norm_scale,
+            xn_scale_buf,
+            sync_workspace,
+            scale0,
+            scale1,
+            num_tokens,
+        )
+
+    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
     gate(
-        x_mixed, norm_w, gate_w, gate_bias,
+        xg_buf, gate_inv_rms_buf, xn_scale_buf,
+        gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,
         x_norm_i8, x_norm_scale, indices, weights,
+        fused_pre_tid,
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
