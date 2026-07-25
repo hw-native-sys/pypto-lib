@@ -123,9 +123,6 @@ HCA_NUM_LAYERS = 20
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 # LM-head uses dedicated completion counters, independent of the MoE epochs.
 LM_HEAD_COMM_EPOCH = 1
-# recv_x_buf is shared by the MoE recv window and the LM-head hidden window;
-# the two run sequentially. logits_window has its own buffer.
-LM_HEAD_SHARED_DATA_BYTES = max(N_LOCAL * RECV_MAX * D, MAX_LOGIT_ROWS * D * 2)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
@@ -158,10 +155,9 @@ CACHE_POOL_NAMES = frozenset({
 
 # Static weight parameters to keep device-resident, sharded per decode rank.
 # These are leading-dim-stacked ``[N_RANKS, *tail]`` tensors consumed as
-# ``weight[r]`` on ``device=r``.  ``lm_head_weight`` is intentionally excluded:
-# it is ``[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D]`` and only TP ranks consume it, so
-# it should not use the decode-world ``resident="stacked"`` contract until the
-# runner supports a TP-subset resident upload.
+# ``weight[r]`` on ``device=r``.  ``lm_head_weight`` is excluded here because the
+# fixture builds it directly: every DP rank carries a copy of vocab shard
+# ``r % LM_HEAD_TP_SIZE``, since resident arguments are handed out per rank.
 RESIDENT_WEIGHT_NAMES = frozenset(
     [
         n
@@ -757,25 +753,25 @@ def l3_decode_fwd(
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
-    lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
-    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     # MoE and LM-head run sequentially, so they can share data storage; keep
     # LM-head completion counters separate from the MoE epoch protocol below.
-    recv_x_buf = pld.alloc_window_buffer(LM_HEAD_SHARED_DATA_BYTES)
+    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    # Dedicated: a peer's route writes this while that peer may still be reading
-    # its hidden_window out of recv_x_buf, so the two must not alias.
+    # The LM head owns every window and counter it touches: a peer routes into
+    # logits_window while still reading its own hidden_window.
+    lm_head_hidden_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -818,15 +814,15 @@ def l3_decode_fwd(
     # groups. Every card is both an owner and a TP rank, so the single lm_head
     # dispatch runs on the full world and every peer stays inside its own group.
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(recv_x_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_window = pld.window(lm_head_hidden_window_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head(
-            hidden_out[r], lm_head_weight[r % LM_HEAD_TP_SIZE], num_tokens_per_owner,
-            logit_row_indices, num_logit_rows, logits[r], hidden_window, hidden_done,
-            logits_window, logits_done, r, r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
-            r % LM_HEAD_TP_SIZE, LM_HEAD_COMM_EPOCH, device=r,
+            hidden_out[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -1385,7 +1381,8 @@ def build_tensor_specs(
     from golden import TensorSpec
 
     def init_lm_head_weight():
-        return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
 
     def init_logit_row_indices():
         active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
@@ -1444,7 +1441,7 @@ def build_tensor_specs(
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("lm_head_weight", [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
+    specs.append(TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
     specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
     specs.append(TensorSpec(
@@ -1459,14 +1456,6 @@ def build_tensor_specs(
         torch.int32,
         init_value=init_logit_row_indices,
     ))
-    specs.append(TensorSpec(
-        "num_logit_rows",
-        [N_RANKS],
-        torch.int32,
-        init_value=lambda: torch.full(
-            (N_RANKS,), max(min(num_tokens, MAX_LOGIT_ROWS), 0), dtype=torch.int32,
-        ),
-    ))
     return specs
 
 
@@ -1474,7 +1463,7 @@ def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
-    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8], help="LM-head TP world size; must be <= --ep")
+    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16], help="LM-head TP world size; must be <= --ep")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument(
         "--start-pos",

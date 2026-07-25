@@ -52,10 +52,9 @@ def _parse_int_argv(name, default=None):
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
-# --dp is optional and defaults to a single TP group. The composed decode_fwd /
-# prefill_fwd drivers and pypto-serving spell this same world --ep, where the
-# attention-DP and MoE expert-parallel rank counts coincide.
-DP_SIZE: int = _parse_int_argv("--dp") or _parse_int_argv("--ep") or TP_SIZE
+# --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
+# The kernel itself carries no DP extent, so composed callers never pass it.
+DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
 # Rows. logit_row_indices picks the sources; unused rows stay zero.
@@ -86,15 +85,12 @@ assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZ
 def lm_head(
     hidden_states: pl.Tensor[[T_DYN, D], pl.BF16],
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
-    num_tokens_per_owner: pl.Tensor[[DP_SIZE], pl.INT32],
-    logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-    num_logit_rows: pl.Tensor[[DP_SIZE], pl.INT32],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
     logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
     hidden_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, D], pl.BF16],
     hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
     logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
-    my_rank: pl.Scalar[pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     tp_rank: pl.Scalar[pl.INT32],
     done_epoch: pl.Scalar[pl.INT32],
@@ -110,21 +106,20 @@ def lm_head(
     # version, which then needs a comm ctx materialized at that level.
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_dispatch"):
         hidden_rows = pl.tensor.dim(hidden_states, 0)
-        owner_tokens = pl.read(num_tokens_per_owner, [my_rank])
-        active_tokens = pl.max(pl.min(owner_tokens, hidden_rows), 0)
-        active_rows = pl.max(pl.min(pl.read(num_logit_rows, [my_rank]), MAX_LOGIT_ROWS), 0)
         for row in pl.range(MAX_LOGIT_ROWS):
-            source_row_raw = pl.read(logit_row_indices, [my_rank, row])
+            source_row_raw = pl.read(logit_row_indices, [row])
+            # Clamp so the load address is always inside hidden_states even if a
+            # caller hands over a stale index; the -1 guard below decides whether
+            # the row is actually used.
+            safe_raw = pl.max(pl.min(source_row_raw, hidden_rows - 1), 0)
             for kb in pl.range(D // HIDDEN_COMM_TILE):
                 k0 = kb * HIDDEN_COMM_TILE
                 zero_tile = pl.full([1, HIDDEN_COMM_TILE], dtype=pl.BF16, value=0.0)
                 selected_hidden[row : row + 1, k0 : k0 + HIDDEN_COMM_TILE] = zero_tile
-                if row < active_rows:
-                    if source_row_raw >= 0:
-                        if source_row_raw < active_tokens:
-                            source_row = pl.cast(source_row_raw, target_type=pl.INDEX)
-                            src = hidden_states[source_row : source_row + 1, k0 : k0 + HIDDEN_COMM_TILE]
-                            selected_hidden[row : row + 1, k0 : k0 + HIDDEN_COMM_TILE] = src
+                if source_row_raw >= 0:
+                    source_row = pl.cast(safe_raw, target_type=pl.INDEX)
+                    src = hidden_states[source_row : source_row + 1, k0 : k0 + HIDDEN_COMM_TILE]
+                    selected_hidden[row : row + 1, k0 : k0 + HIDDEN_COMM_TILE] = src
 
         for kb in pl.range(D // HIDDEN_COMM_TILE):
             k0 = kb * HIDDEN_COMM_TILE
@@ -259,11 +254,9 @@ def lm_head(
 @pl.jit.host
 def l3_lm_head(
     hidden_states: pl.Tensor[[DP_SIZE, TEST_TOKENS, D], pl.BF16],
-    lm_head_weight: pl.Tensor[[TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[DP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     logits: pl.Out[pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS, VOCAB], pl.FP32]],
-    num_tokens_per_owner: pl.Tensor[[DP_SIZE], pl.INT32],
     logit_row_indices: pl.Tensor[[DP_SIZE, MAX_LOGIT_ROWS], pl.INT32],
-    num_logit_rows: pl.Tensor[[DP_SIZE], pl.INT32],
 ):
     # Windows are group-local: every card publishes only its own selected rows
     # and receives only its own full-vocabulary logits.
@@ -278,10 +271,9 @@ def l3_lm_head(
         logits_window = pld.window(logits_window_buf, [MAX_LOGIT_ROWS, VOCAB], dtype=pl.FP32)
         logits_done = pld.window(logits_done_buf, [TP_SIZE, 1], dtype=pl.INT32)
         lm_head(
-            hidden_states[r], lm_head_weight[r % TP_SIZE], num_tokens_per_owner,
-            logit_row_indices, num_logit_rows, logits[r], hidden_window, hidden_done,
-            logits_window, logits_done, r, r // TP_SIZE * TP_SIZE, r % TP_SIZE,
-            DONE_VALUE, device=r,
+            hidden_states[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // TP_SIZE * TP_SIZE, r % TP_SIZE, DONE_VALUE, device=r,
         )
 
 
@@ -291,17 +283,15 @@ def golden_lm_head(tensors):
     hidden = tensors["hidden_states"].float()
     # Card r holds shard r % TP_SIZE, so concatenating shards in index order
     # reproduces the global vocabulary order every owner assembles.
-    full_weight = tensors["lm_head_weight"].float().reshape(TP_SIZE * VOCAB_PER_TP, D)
+    weight = tensors["lm_head_weight"].float()
+    full_weight = torch.cat([weight[tp] for tp in range(TP_SIZE)], dim=0)
     full_logits = []
     for owner_rank in range(DP_SIZE):
         selected = torch.zeros((MAX_LOGIT_ROWS, D), dtype=torch.float32)
-        active_tokens = max(
-            min(int(tensors["num_tokens_per_owner"][owner_rank]), hidden.shape[1]), 0,
-        )
-        active_rows = max(min(int(tensors["num_logit_rows"][owner_rank]), MAX_LOGIT_ROWS), 0)
-        for row in range(active_rows):
+        for row in range(MAX_LOGIT_ROWS):
             source_row = int(tensors["logit_row_indices"][owner_rank, row])
-            if 0 <= source_row < active_tokens:
+            if source_row >= 0:
+                source_row = min(source_row, hidden.shape[1] - 1)
                 selected[row].copy_(hidden[owner_rank, source_row])
         full_logits.append(torch.matmul(selected, full_weight.t()))
     tensors["logits"][:] = torch.stack(full_logits, dim=0)
@@ -317,7 +307,8 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
         return (torch.randn(DP_SIZE, TEST_TOKENS, D) * 0.1).to(torch.bfloat16)
 
     def init_lm_head_weight():
-        return (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        shards = (torch.randn(TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        return torch.stack([shards[r % TP_SIZE] for r in range(DP_SIZE)], dim=0)
 
     def init_logit_row_indices():
         indices = torch.full((DP_SIZE, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
@@ -331,11 +322,11 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             torch.bfloat16,
             init_value=init_hidden_states,
         ),
-        # Leading dim is TP_SIZE while the world is DP_SIZE (card r consumes
-        # shard r % TP_SIZE), so the resident="stacked" contract does not apply.
+        # One vocab shard per DP rank: card r carries a copy of shard
+        # r % TP_SIZE, matching how resident args are handed out per rank.
         TensorSpec(
             "lm_head_weight",
-            [TP_SIZE, VOCAB_PER_TP, D],
+            [DP_SIZE, VOCAB_PER_TP, D],
             torch.bfloat16,
             init_value=init_lm_head_weight,
         ),
@@ -346,22 +337,10 @@ def build_tensor_specs(num_tokens=TEST_TOKENS):
             is_output=True,
         ),
         TensorSpec(
-            "num_tokens_per_owner",
-            [DP_SIZE],
-            torch.int32,
-            init_value=lambda: torch.full((DP_SIZE,), num_tokens, dtype=torch.int32),
-        ),
-        TensorSpec(
             "logit_row_indices",
             [DP_SIZE, MAX_LOGIT_ROWS],
             torch.int32,
             init_value=init_logit_row_indices,
-        ),
-        TensorSpec(
-            "num_logit_rows",
-            [DP_SIZE],
-            torch.int32,
-            init_value=lambda: torch.full((DP_SIZE,), active, dtype=torch.int32),
         ),
     ]
 

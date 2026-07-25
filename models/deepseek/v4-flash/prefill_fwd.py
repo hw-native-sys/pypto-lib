@@ -136,9 +136,6 @@ LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 # The LM head owns its barrier counters, so its epoch restarts at 1 rather
 # than continuing the MoE numbering.
 LM_HEAD_COMM_EPOCH = 1
-# recv_x_buf is shared by the MoE recv window and the LM-head hidden window;
-# the two run sequentially. logits_window has its own buffer.
-LM_HEAD_SHARED_DATA_BYTES = max(N_LOCAL * RECV_MAX * D, MAX_LOGIT_ROWS * D * 2)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # Physical cache pools are runtime-sized.  The first dimension of each
@@ -815,18 +812,18 @@ def l3_prefill_fwd(
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
-    lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
+    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
-    num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer(LM_HEAD_SHARED_DATA_BYTES)
-    # Dedicated: a peer's route writes this while that peer may still be reading
-    # its hidden_window out of recv_x_buf, so the two must not alias. The barrier
+    recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
+    # The LM head owns every window and counter it touches: a peer routes into
+    # logits_window while still reading its own hidden_window, and the barrier
     # counters stay independent of the MoE epoch protocol.
+    lm_head_hidden_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -874,15 +871,15 @@ def l3_prefill_fwd(
     # groups. Every card is both an owner and a TP rank, so the single lm_head
     # dispatch runs on the full world and every peer stays inside its own group.
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(recv_x_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_window = pld.window(lm_head_hidden_window_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         lm_head(
-            hidden_out[r], lm_head_weight[r % LM_HEAD_TP_SIZE], num_tokens_per_owner,
-            logit_row_indices, num_logit_rows, logits[r], hidden_window, hidden_done,
-            logits_window, logits_done, r, r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
-            r % LM_HEAD_TP_SIZE, LM_HEAD_COMM_EPOCH, device=r,
+            hidden_out[r], lm_head_weight[r], logit_row_indices[r], logits[r],
+            hidden_window, hidden_done, logits_window, logits_done,
+            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -1285,17 +1282,26 @@ def build_tensor_specs(
     hca_state_block_num=HCA_STATE_BLOCK_NUM,
     csa_state_block_num=CSA_STATE_BLOCK_NUM,
     inner_state_block_num=INNER_STATE_BLOCK_NUM,
+    active_ranks=N_RANKS,
 ):
     import torch
     from golden import TensorSpec
 
     def init_lm_head_weight():
-        return (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
+        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
 
+    # Serving batches one request per rank, so idle ranks carry zero tokens and
+    # an all -1 index row. active_ranks reproduces that skew.
     def init_logit_row_indices():
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[:, 0] = max(min(num_tokens, T), 1) - 1
+        indices[:active_ranks, 0] = max(min(num_tokens, T), 1) - 1
         return indices
+
+    def init_num_tokens_per_owner():
+        counts = torch.zeros(N_RANKS, dtype=torch.int32)
+        counts[:active_ranks] = num_tokens
+        return counts
 
     base_specs = {
         spec.name: spec
@@ -1372,7 +1378,7 @@ def build_tensor_specs(
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(TensorSpec(
         "lm_head_weight",
-        [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D],
+        [N_RANKS, VOCAB_PER_TP, D],
         torch.bfloat16,
         init_value=init_lm_head_weight,
     ))
@@ -1387,19 +1393,13 @@ def build_tensor_specs(
         "num_tokens_per_owner",
         [N_RANKS],
         torch.int32,
-        init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
+        init_value=init_num_tokens_per_owner,
     ))
     specs.append(TensorSpec(
         "logit_row_indices",
         [N_RANKS, MAX_LOGIT_ROWS],
         torch.int32,
         init_value=init_logit_row_indices,
-    ))
-    specs.append(TensorSpec(
-        "num_logit_rows",
-        [N_RANKS],
-        torch.int32,
-        init_value=lambda: torch.ones(N_RANKS, dtype=torch.int32),
     ))
     return specs
 
@@ -1409,11 +1409,13 @@ def main():
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
                         help="EP world size / rank count (parsed at import by moe).")
-    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8],
+    parser.add_argument("--tp", type=int, default=LM_HEAD_TP_SIZE, choices=[2, 4, 8, 16],
                         help="LM-head TP world size; must be <= --ep.")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--start-pos", type=int, default=0)
+    parser.add_argument("--active-ranks", type=int, default=N_RANKS,
+                        help="Ranks carrying tokens; the rest stay idle as in single-request serving.")
     parser.add_argument("--num-tokens", type=int, default=T // 2,
                         help=f"Active token rows for MoE routing/combine; default is T // 2={T // 2}.")
     parser.add_argument("--ori-block-num", type=int, default=CSA_ORI_BLOCK_NUM)
@@ -1449,6 +1451,7 @@ def main():
         hca_state_block_num=args.hca_state_block_num,
         csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
+        active_ranks=args.active_ranks,
     )
 
     result = run_jit(

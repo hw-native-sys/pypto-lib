@@ -252,7 +252,6 @@ MOE_TOKENS = DECODE_TOKENS
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
 C4A_COMPRESSOR_BLOCK_SIZE = 4             # ratio-4 compressor state page size
 C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
-LM_HEAD_TP_SIZE = 8
 
 # Static paged-cache pools shared by decode and prefill kernels. ``*_BLOCK_NUM``
 # is the global physical-pool capacity and is deliberately independent from the
