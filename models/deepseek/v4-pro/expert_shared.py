@@ -26,8 +26,10 @@ import pypto.language as pl
 from config import FLASH as M, MOE_TOKENS, MX_BLOCK_K
 from mx_quant_common import (
     ATOL_RTOL,
+    dynamic_mx_quant_e4m3,
     gen_mxfp8_weight_kn,
-    shared_expert_mxfp8_golden,
+    mx_matmul_fp8,
+    unpack_scale_b_nn_tiled,
 )
 
 
@@ -56,18 +58,38 @@ MM_INTER_TILE = 128   # along MOE_INTER (N) for gate/up
 ACT_INTER_TILE = 256  # AIV SwiGLU chunk
 D_OUT_TILE = 128      # along D for down proj
 
+# Per-SPMD × per-K-chunk GM slots for A-scale staging (ND store → mx_a_zz).
+_GATE_SPMD = MOE_INTER // MM_INTER_TILE
+_GATE_K_CHUNKS = D // K_TILE
+_DOWN_SPMD = D // D_OUT_TILE
+_DOWN_K_CHUNKS = MOE_INTER // K_TILE
+_KS = K_TILE // MX_BLOCK_K
+# Tiled MX_B_NN: each (K-chunk, N-tile) independently convert_x2'd; col offset 0.
+_W13_SCALE_ROWS = _GATE_SPMD * _GATE_K_CHUNKS * _KS
+_W2_SCALE_ROWS = _DOWN_SPMD * _DOWN_K_CHUNKS * _KS
+_MX_WS_SLOTS = N_MTILES * max(
+    _GATE_SPMD * _GATE_K_CHUNKS,
+    _DOWN_SPMD * _DOWN_K_CHUNKS,
+)
+assert _GATE_K_CHUNKS == 32 and _DOWN_K_CHUNKS == 16  # pl.unroll literals below
+
 
 @pl.jit.inline
 def expert_shared(
     x_local: pl.Tensor[[T, D], pl.BF16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[D_SCALE, MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[_W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[D_SCALE, MOE_INTER], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[_W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[INTER_SCALE, D], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[_W2_SCALE_ROWS, D_OUT_TILE], pl.FP8E8M0],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
+    # Left-scale: store flat tquant exp to per-slot GM → mx_a_zz (AND2ZZ)
+    # → LeftScale. Direct Mat ND→LeftScale is numerically wrong.
+    mx_scale_ws = pl.create_tensor(
+        [_MX_WS_SLOTS * SH_M_TILE, K_TILE // MX_BLOCK_K], dtype=pl.FP8E8M0
+    )
     for mt in pl.parallel(N_MTILES):
         ts0 = mt * SH_M_TILE
 
@@ -77,79 +99,142 @@ def expert_shared(
         # gate (w1): dyn MX quant(x) @ w1  → FP32
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_gate_mm"):
             n0 = nb_idx * MM_INTER_TILE
-            gate_acc = pl.create_tile(
-                [SH_M_TILE, MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            # Peel K=0 with matmul_mx (init Acc); pl.unroll remaining so Acc SSA chains.
+            k0 = 0
+            x_tile = pl.load(
+                x_local, [ts0, k0], [SH_M_TILE, K_TILE],
+                valid_shapes=[SH_VALID_M, K_TILE], target_memory=pl.Mem.Vec,
             )
-            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+            x_q, x_s = pl.mx_quant(pl.cast(x_tile, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3")
+            w_tile = pl.load(shared_w1, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+            ws_tile = pl.load(
+                shared_w1_scale,
+                [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                [_KS, MM_INTER_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
+            )
+            srow = (mt * _GATE_SPMD * _GATE_K_CHUNKS + nb_idx * _GATE_K_CHUNKS) * SH_M_TILE
+            la = pl.move(
+                pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                target_memory=pl.Mem.Left,
+            )
+            la = pl.set_validshape(la, SH_VALID_M, K_TILE)
+            pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+            las = pl.move(
+                pl.load(
+                    mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                    target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                ),
+                target_memory=pl.Mem.LeftScale,
+            )
+            las = pl.tget_scale_addr(las, la)
+            las = pl.set_validshape(las, SH_VALID_M, _KS)
+            rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+            rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+            gate_acc = pl.matmul_mx(la, las, rb, rbs)
+            for db in pl.unroll(31):  # _GATE_K_CHUNKS - 1
+                k0 = (db + 1) * K_TILE
                 x_tile = pl.load(
-                    x_local,
-                    [ts0, k0],
-                    [SH_M_TILE, K_TILE],
-                    valid_shapes=[SH_VALID_M, K_TILE],
-                    target_memory=pl.Mem.Vec,
+                    x_local, [ts0, k0], [SH_M_TILE, K_TILE],
+                    valid_shapes=[SH_VALID_M, K_TILE], target_memory=pl.Mem.Vec,
                 )
-                x_f = pl.cast(x_tile, target_type=pl.FP32, mode="none")
-                x_q, x_s = pl.mx_quant(x_f, mode="mxfp8_e4m3")
-                w_tile = pl.load(
-                    shared_w1, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat
-                )
+                x_q, x_s = pl.mx_quant(pl.cast(x_tile, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3")
+                w_tile = pl.load(shared_w1, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
                 ws_tile = pl.load(
                     shared_w1_scale,
-                    [k0 // MX_BLOCK_K, n0],
-                    [K_TILE // MX_BLOCK_K, MM_INTER_TILE],
-                    target_memory=pl.Mem.Mat,
-                    mx_layout="mx_b_nn",
+                    [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, MM_INTER_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
                 )
-                la = pl.move(
-                    pl.move(x_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left
+                srow = (
+                    mt * _GATE_SPMD * _GATE_K_CHUNKS + nb_idx * _GATE_K_CHUNKS + (db + 1)
+                ) * SH_M_TILE
+                la2 = pl.move(
+                    pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
                 )
-                las = pl.move(
-                    pl.move(x_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                la2 = pl.set_validshape(la2, SH_VALID_M, K_TILE)
+                pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las2 = pl.move(
+                    pl.load(
+                        mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                        target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
                 )
-                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
-                rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                las = pl.tget_scale_addr(las, la)
-                rbs = pl.tget_scale_addr(rbs, rb)
-                gate_acc = pl.matmul_mx_acc(gate_acc, la, las, rb, rbs)
+                las2 = pl.tget_scale_addr(las2, la2)
+                las2 = pl.set_validshape(las2, SH_VALID_M, _KS)
+                rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                gate_acc = pl.matmul_mx_acc(gate_acc, la2, las2, rb2, rbs2)
             pl.store(gate_acc, [0, n0], gate_fp32)
 
         # up (w3)
         for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="sh_up_mm"):
             n0 = nb_idx * MM_INTER_TILE
-            up_acc = pl.create_tile(
-                [SH_M_TILE, MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            k0 = 0
+            x_tile = pl.load(
+                x_local, [ts0, k0], [SH_M_TILE, K_TILE],
+                valid_shapes=[SH_VALID_M, K_TILE], target_memory=pl.Mem.Vec,
             )
-            for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+            x_q, x_s = pl.mx_quant(pl.cast(x_tile, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3")
+            w_tile = pl.load(shared_w3, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+            ws_tile = pl.load(
+                shared_w3_scale,
+                [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                [_KS, MM_INTER_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
+            )
+            srow = (mt * _GATE_SPMD * _GATE_K_CHUNKS + nb_idx * _GATE_K_CHUNKS) * SH_M_TILE
+            la = pl.move(
+                pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                target_memory=pl.Mem.Left,
+            )
+            la = pl.set_validshape(la, SH_VALID_M, K_TILE)
+            pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+            las = pl.move(
+                pl.load(
+                    mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                    target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                ),
+                target_memory=pl.Mem.LeftScale,
+            )
+            las = pl.tget_scale_addr(las, la)
+            las = pl.set_validshape(las, SH_VALID_M, _KS)
+            rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+            rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+            up_acc = pl.matmul_mx(la, las, rb, rbs)
+            for db in pl.unroll(31):
+                k0 = (db + 1) * K_TILE
                 x_tile = pl.load(
-                    x_local,
-                    [ts0, k0],
-                    [SH_M_TILE, K_TILE],
-                    valid_shapes=[SH_VALID_M, K_TILE],
-                    target_memory=pl.Mem.Vec,
+                    x_local, [ts0, k0], [SH_M_TILE, K_TILE],
+                    valid_shapes=[SH_VALID_M, K_TILE], target_memory=pl.Mem.Vec,
                 )
-                x_f = pl.cast(x_tile, target_type=pl.FP32, mode="none")
-                x_q, x_s = pl.mx_quant(x_f, mode="mxfp8_e4m3")
-                w_tile = pl.load(
-                    shared_w3, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat
-                )
+                x_q, x_s = pl.mx_quant(pl.cast(x_tile, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3")
+                w_tile = pl.load(shared_w3, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
                 ws_tile = pl.load(
                     shared_w3_scale,
-                    [k0 // MX_BLOCK_K, n0],
-                    [K_TILE // MX_BLOCK_K, MM_INTER_TILE],
-                    target_memory=pl.Mem.Mat,
-                    mx_layout="mx_b_nn",
+                    [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, MM_INTER_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
                 )
-                la = pl.move(
-                    pl.move(x_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left
+                srow = (
+                    mt * _GATE_SPMD * _GATE_K_CHUNKS + nb_idx * _GATE_K_CHUNKS + (db + 1)
+                ) * SH_M_TILE
+                la2 = pl.move(
+                    pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
                 )
-                las = pl.move(
-                    pl.move(x_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                la2 = pl.set_validshape(la2, SH_VALID_M, K_TILE)
+                pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las2 = pl.move(
+                    pl.load(
+                        mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                        target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
                 )
-                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
-                rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                las = pl.tget_scale_addr(las, la)
-                rbs = pl.tget_scale_addr(rbs, rb)
-                up_acc = pl.matmul_mx_acc(up_acc, la, las, rb, rbs)
+                las2 = pl.tget_scale_addr(las2, la2)
+                las2 = pl.set_validshape(las2, SH_VALID_M, _KS)
+                rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                up_acc = pl.matmul_mx_acc(up_acc, la2, las2, rb2, rbs2)
             pl.store(up_acc, [0, n0], up_fp32)
 
         # SwiGLU → h_fp32 (full intermediate)
@@ -186,35 +271,65 @@ def expert_shared(
         # down (w2): dyn MX quant(h) @ w2 → BF16
         for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="sh_w2_mm"):
             d0 = db_idx * D_OUT_TILE
-            y_acc = pl.create_tile(
-                [SH_M_TILE, D_OUT_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
+            k0 = 0
+            h_tile = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, K_TILE], target_memory=pl.Mem.Vec)
+            h_q, h_s = pl.mx_quant(h_tile, mode="mxfp8_e4m3")
+            w_tile = pl.load(shared_w2, [k0, d0], [K_TILE, D_OUT_TILE], target_memory=pl.Mem.Mat)
+            ws_tile = pl.load(
+                shared_w2_scale,
+                [db_idx * _DOWN_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                [_KS, D_OUT_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
             )
-            for k0 in pl.pipeline(0, MOE_INTER, K_TILE, stage=2):
-                h_tile = pl.load(
-                    h_tile_fp32, [0, k0], [SH_M_TILE, K_TILE], target_memory=pl.Mem.Vec
-                )
+            srow = (mt * _DOWN_SPMD * _DOWN_K_CHUNKS + db_idx * _DOWN_K_CHUNKS) * SH_M_TILE
+            la = pl.move(
+                pl.move(pl.tile.reinterpret_view(h_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                target_memory=pl.Mem.Left,
+            )
+            la = pl.set_validshape(la, SH_VALID_M, K_TILE)
+            pl.store(pl.tile.reinterpret_view(h_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+            las = pl.move(
+                pl.load(
+                    mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                    target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                ),
+                target_memory=pl.Mem.LeftScale,
+            )
+            las = pl.tget_scale_addr(las, la)
+            las = pl.set_validshape(las, SH_VALID_M, _KS)
+            rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+            rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+            y_acc = pl.matmul_mx(la, las, rb, rbs)
+            for kb in pl.unroll(15):  # _DOWN_K_CHUNKS - 1
+                k0 = (kb + 1) * K_TILE
+                h_tile = pl.load(h_tile_fp32, [0, k0], [SH_M_TILE, K_TILE], target_memory=pl.Mem.Vec)
                 h_q, h_s = pl.mx_quant(h_tile, mode="mxfp8_e4m3")
-                w_tile = pl.load(
-                    shared_w2, [k0, d0], [K_TILE, D_OUT_TILE], target_memory=pl.Mem.Mat
-                )
+                w_tile = pl.load(shared_w2, [k0, d0], [K_TILE, D_OUT_TILE], target_memory=pl.Mem.Mat)
                 ws_tile = pl.load(
                     shared_w2_scale,
-                    [k0 // MX_BLOCK_K, d0],
-                    [K_TILE // MX_BLOCK_K, D_OUT_TILE],
-                    target_memory=pl.Mem.Mat,
-                    mx_layout="mx_b_nn",
+                    [db_idx * _DOWN_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, D_OUT_TILE], target_memory=pl.Mem.Mat, mx_layout="mx_b_nn",
                 )
-                la = pl.move(
-                    pl.move(h_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left
+                srow = (
+                    mt * _DOWN_SPMD * _DOWN_K_CHUNKS + db_idx * _DOWN_K_CHUNKS + (kb + 1)
+                ) * SH_M_TILE
+                la2 = pl.move(
+                    pl.move(pl.tile.reinterpret_view(h_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
                 )
-                las = pl.move(
-                    pl.move(h_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                la2 = pl.set_validshape(la2, SH_VALID_M, K_TILE)
+                pl.store(pl.tile.reinterpret_view(h_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las2 = pl.move(
+                    pl.load(
+                        mx_scale_ws, [srow, 0], [SH_M_TILE, _KS],
+                        target_memory=pl.Mem.Mat, mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
                 )
-                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
-                rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                las = pl.tget_scale_addr(las, la)
-                rbs = pl.tget_scale_addr(rbs, rb)
-                y_acc = pl.matmul_mx_acc(y_acc, la, las, rb, rbs)
+                las2 = pl.tget_scale_addr(las2, la2)
+                las2 = pl.set_validshape(las2, SH_VALID_M, _KS)
+                rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                y_acc = pl.matmul_mx_acc(y_acc, la2, las2, rb2, rbs2)
             y_bf16 = pl.cast(y_acc, target_type=pl.BF16, mode="rint")
             pl.store(y_bf16, [ts0, d0], sh)
 
@@ -225,11 +340,11 @@ def expert_shared(
 def expert_shared_test(
     x_local: pl.Tensor[[T, D], pl.BF16],
     shared_w1: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w1_scale: pl.Tensor[[D_SCALE, MOE_INTER], pl.FP8E8M0],
+    shared_w1_scale: pl.Tensor[[_W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
     shared_w3: pl.Tensor[[D, MOE_INTER], pl.FP8E4M3FN],
-    shared_w3_scale: pl.Tensor[[D_SCALE, MOE_INTER], pl.FP8E8M0],
+    shared_w3_scale: pl.Tensor[[_W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
     shared_w2: pl.Tensor[[MOE_INTER, D], pl.FP8E4M3FN],
-    shared_w2_scale: pl.Tensor[[INTER_SCALE, D], pl.FP8E8M0],
+    shared_w2_scale: pl.Tensor[[_W2_SCALE_ROWS, D_OUT_TILE], pl.FP8E8M0],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     expert_shared(
@@ -242,35 +357,55 @@ def expert_shared_test(
     return sh
 
 
-def gen_shared_weight(shape, dequant_std, chan_cv):
-    """Synthesize shared-expert MXFP8 weight + E8M0 scale (AscendC block=32).
-
-    ``shape`` is the historical ``[out, in]`` layout. Returns Right-matrix storage
-    ``(w_kn [in, out] float8_e4m3fn, scale_kn [in/32, out] float8_e8m0fnu)`` with
-    MX_B_NN packing applied to the scale buffer for device TLoad.
-    """
+def gen_shared_weight(shape, dequant_std, chan_cv, n_tile, k_tile=K_TILE):
+    """Synthesize shared-expert MXFP8 weight + tiled MX_B_NN scale."""
     out, inn = shape
     return gen_mxfp8_weight_kn(
-        (inn, out), dequant_std=dequant_std, chan_cv=chan_cv, pack_nn=True
+        (inn, out),
+        dequant_std=dequant_std,
+        chan_cv=chan_cv,
+        pack_nn=True,
+        n_tile=n_tile,
+        k_tile=k_tile,
     )
 
 
 def golden_expert_shared(tensors):
-    """Torch reference matching AscendC shared MXFP8 FFN (dyn MX → GEMM → SwiGLU → …)."""
+    """Torch reference: per-K-tile dyn MX + tiled MX_B_NN unpack (matches device)."""
     import torch
+    import torch.nn.functional as F
 
-    sh = shared_expert_mxfp8_golden(
-        x_bf16=tensors["x_local"],
-        w1_fp8=tensors["shared_w1"],
-        w1_scale=tensors["shared_w1_scale"],
-        w3_fp8=tensors["shared_w3"],
-        w3_scale=tensors["shared_w3_scale"],
-        w2_fp8=tensors["shared_w2"],
-        w2_scale=tensors["shared_w2_scale"],
-        swiglu_limit=SWIGLU_LIMIT,
-        scales_packed_nn=True,
-    )
-    tensors["sh"][:] = sh.to(torch.bfloat16)
+    def _b_scale(s, n_tile, logical_k, logical_n):
+        return unpack_scale_b_nn_tiled(
+            s,
+            k_tile_rows=_KS,
+            n_tile=n_tile,
+            logical_k=logical_k // MX_BLOCK_K,
+            logical_n=logical_n,
+        )
+
+    def mx_matmul_act_tiled(x_f, w, w_s, k_tile):
+        acc = None
+        for k0 in range(0, x_f.shape[-1], k_tile):
+            xq, xs = dynamic_mx_quant_e4m3(x_f[..., k0 : k0 + k_tile])
+            part = mx_matmul_fp8(
+                xq, xs, w[k0 : k0 + k_tile], w_s[k0 // MX_BLOCK_K : (k0 + k_tile) // MX_BLOCK_K]
+            )
+            acc = part if acc is None else acc + part
+        return acc
+
+    x = tensors["x_local"].float()
+    w1_s = _b_scale(tensors["shared_w1_scale"], MM_INTER_TILE, D, MOE_INTER)
+    w3_s = _b_scale(tensors["shared_w3_scale"], MM_INTER_TILE, D, MOE_INTER)
+    w2_s = _b_scale(tensors["shared_w2_scale"], D_OUT_TILE, MOE_INTER, D)
+    gate = mx_matmul_act_tiled(x, tensors["shared_w1"], w1_s, K_TILE)
+    up = mx_matmul_act_tiled(x, tensors["shared_w3"], w3_s, K_TILE)
+    if SWIGLU_LIMIT and SWIGLU_LIMIT > 0:
+        gate = gate.clamp(max=SWIGLU_LIMIT)
+        up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+    h = F.silu(gate) * up
+    out = mx_matmul_act_tiled(h, tensors["shared_w2"], w2_s, K_TILE)
+    tensors["sh"][:] = out.to(torch.bfloat16)
 
 
 def build_tensor_specs():
@@ -281,26 +416,33 @@ def build_tensor_specs():
 
     # Real MXFP8 grid (block=32); chan_cv reproduces per-output-channel magnitude spread.
     SHARED_DEQUANT_STD = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
-    sw1, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
-    sw3, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
-    sw2, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
+    sw1, sw1_s = gen_shared_weight(
+        (MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50, n_tile=MM_INTER_TILE
+    )
+    sw3, sw3_s = gen_shared_weight(
+        (MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50, n_tile=MM_INTER_TILE
+    )
+    sw2, sw2_s = gen_shared_weight(
+        (D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33, n_tile=D_OUT_TILE
+    )
 
     return [
         TensorSpec("x_local", [T, D], torch.bfloat16, init_value=lambda: x_local_bf16),
         TensorSpec("shared_w1", [D, MOE_INTER], torch.float8_e4m3fn, init_value=lambda: sw1),
         TensorSpec(
-            "shared_w1_scale", [D_SCALE, MOE_INTER], torch.float8_e8m0fnu, init_value=lambda: sw1_s
+            "shared_w1_scale", [_W13_SCALE_ROWS, MM_INTER_TILE], torch.float8_e8m0fnu, init_value=lambda: sw1_s
         ),
         TensorSpec("shared_w3", [D, MOE_INTER], torch.float8_e4m3fn, init_value=lambda: sw3),
         TensorSpec(
-            "shared_w3_scale", [D_SCALE, MOE_INTER], torch.float8_e8m0fnu, init_value=lambda: sw3_s
+            "shared_w3_scale", [_W13_SCALE_ROWS, MM_INTER_TILE], torch.float8_e8m0fnu, init_value=lambda: sw3_s
         ),
         TensorSpec("shared_w2", [MOE_INTER, D], torch.float8_e4m3fn, init_value=lambda: sw2),
         TensorSpec(
-            "shared_w2_scale", [INTER_SCALE, D], torch.float8_e8m0fnu, init_value=lambda: sw2_s
+            "shared_w2_scale", [_W2_SCALE_ROWS, D_OUT_TILE], torch.float8_e8m0fnu, init_value=lambda: sw2_s
         ),
         TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
     ]
+
 
 
 if __name__ == "__main__":

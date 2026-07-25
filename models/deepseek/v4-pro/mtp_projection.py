@@ -63,6 +63,12 @@ assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 assert D % MX_BLOCK_K == 0
 assert D_CHUNK % MX_BLOCK_K == 0
 
+# Worst-case concurrent linear tiles (prefill) × N-blocks × K-chunks.
+_T_LINEAR_MAX = (
+    ((PREFILL_BATCH * PREFILL_SEQ + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
+)
+_MX_WS_SLOTS = (_T_LINEAR_MAX // LINEAR_T_TILE) * OUT_BLOCKS * D_BLOCKS
+
 
 @pl.jit.inline
 def mtp_projection(
@@ -86,6 +92,9 @@ def mtp_projection(
     hidden_inv_rms = pl.create_tensor([t_linear, 1], dtype=pl.FP32)
     prev_inv_rms = pl.create_tensor([HC_MULT, t_linear], dtype=pl.FP32)
     out_pad = pl.create_tensor([t_linear, HC_DIM], dtype=pl.FP32)
+    mx_scale_ws = pl.create_tensor(
+        [_MX_WS_SLOTS * LINEAR_T_TILE, D_CHUNK // MX_BLOCK_K], dtype=pl.FP8E8M0
+    )
 
     for t0 in pl.parallel(0, t_dim, T_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_rms"):
@@ -139,13 +148,14 @@ def mtp_projection(
 
     for t0 in pl.parallel(0, t_linear, LINEAR_T_TILE):
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)
+        tc = t0 // LINEAR_T_TILE
         for nb in pl.parallel(0, OUT_BLOCKS, 1):
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_projection_linear"):
                 n0 = nb * OUT_CHUNK
                 e_acc = pl.create_tile(
                     [LINEAR_T_TILE, OUT_CHUNK], dtype=pl.FP32, target_memory=pl.Mem.Acc
                 )
-                for k0 in pl.pipeline(0, D, D_CHUNK, stage=2):
+                for k0 in pl.range(0, D, D_CHUNK):
                     hidden_tile = pl.load(
                         hidden_norm,
                         [t0, k0],
@@ -167,15 +177,29 @@ def mtp_projection(
                         target_memory=pl.Mem.Mat,
                         mx_layout="mx_b_nn",
                     )
+                    srow = (
+                        (tc * OUT_BLOCKS + nb) * D_BLOCKS + k0 // D_CHUNK
+                    ) * LINEAR_T_TILE
                     e_la = pl.move(
-                        pl.move(hidden_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left
+                        pl.move(pl.tile.reinterpret_view(hidden_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
                     )
+                    e_la = pl.set_validshape(e_la, LINEAR_T_TILE, D_CHUNK)
+                    pl.store(pl.tile.reinterpret_view(hidden_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
                     e_las = pl.move(
-                        pl.move(hidden_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [LINEAR_T_TILE, D_CHUNK // MX_BLOCK_K],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
                     )
+                    e_las = pl.tget_scale_addr(e_las, e_la)
+                    e_las = pl.set_validshape(e_las, LINEAR_T_TILE, D_CHUNK // MX_BLOCK_K)
                     e_rb = pl.move(e_w_tile, target_memory=pl.Mem.Right)
                     e_rbs = pl.move(e_ws_tile, target_memory=pl.Mem.RightScale)
-                    e_las = pl.tget_scale_addr(e_las, e_la)
                     e_rbs = pl.tget_scale_addr(e_rbs, e_rb)
                     e_acc = pl.matmul_mx_acc(e_acc, e_la, e_las, e_rb, e_rbs)
 
@@ -185,7 +209,7 @@ def mtp_projection(
                     h_acc = pl.create_tile(
                         [LINEAR_T_TILE, OUT_CHUNK], dtype=pl.FP32, target_memory=pl.Mem.Acc
                     )
-                    for k0 in pl.pipeline(0, D, D_CHUNK, stage=2):
+                    for k0 in pl.range(0, D, D_CHUNK):
                         prev_tile = pl.load(
                             prev_norm,
                             [t0, prev_base + k0],
@@ -207,15 +231,29 @@ def mtp_projection(
                             target_memory=pl.Mem.Mat,
                             mx_layout="mx_b_nn",
                         )
+                        srow = (
+                            (tc * OUT_BLOCKS + nb) * D_BLOCKS + k0 // D_CHUNK
+                        ) * LINEAR_T_TILE
                         h_la = pl.move(
-                            pl.move(prev_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left
+                            pl.move(pl.tile.reinterpret_view(prev_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                            target_memory=pl.Mem.Left,
                         )
+                        h_la = pl.set_validshape(h_la, LINEAR_T_TILE, D_CHUNK)
+                        pl.store(pl.tile.reinterpret_view(prev_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
                         h_las = pl.move(
-                            pl.move(prev_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                            pl.load(
+                                mx_scale_ws,
+                                [srow, 0],
+                                [LINEAR_T_TILE, D_CHUNK // MX_BLOCK_K],
+                                target_memory=pl.Mem.Mat,
+                                mx_layout="mx_a_zz",
+                            ),
+                            target_memory=pl.Mem.LeftScale,
                         )
+                        h_las = pl.tget_scale_addr(h_las, h_la)
+                        h_las = pl.set_validshape(h_las, LINEAR_T_TILE, D_CHUNK // MX_BLOCK_K)
                         h_rb = pl.move(h_w_tile, target_memory=pl.Mem.Right)
                         h_rbs = pl.move(h_ws_tile, target_memory=pl.Mem.RightScale)
-                        h_las = pl.tget_scale_addr(h_las, h_la)
                         h_rbs = pl.tget_scale_addr(h_rbs, h_rb)
                         h_acc = pl.matmul_mx_acc(h_acc, h_la, h_las, h_rb, h_rbs)
                     acc = pl.add(e_acc, h_acc)

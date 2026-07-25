@@ -54,6 +54,14 @@ assert RECV_MAX % RECV_TILE == 0
 assert D % MX_BLOCK_K == 0 and MOE_INTER % MX_BLOCK_K == 0
 assert SWIGLU_LIMIT > 0.0
 
+_GATE_SPMD = MOE_INTER // MM_INTER_TILE
+_GATE_K_CHUNKS = D // K_TILE
+_DOWN_SPMD = D // D_OUT_TILE
+_DOWN_K_CHUNKS = MOE_INTER // K_TILE
+# Concurrent: all local experts × recv tiles × SPMD × K-chunks
+_MX_PHASE_SLOTS = max(_GATE_SPMD * _GATE_K_CHUNKS, _DOWN_SPMD * _DOWN_K_CHUNKS)
+_MX_WS_SLOTS = N_LOCAL_EXPERTS * (RECV_MAX // RECV_TILE) * _MX_PHASE_SLOTS
+
 
 @pl.jit.inline
 def expert_routed(
@@ -68,6 +76,9 @@ def expert_routed(
     routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, INTER_SCALE, D], pl.FP8E8M0],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
+    mx_scale_ws = pl.create_tensor(
+        [_MX_WS_SLOTS * RECV_TILE, K_TILE // MX_BLOCK_K], dtype=pl.FP8E8M0
+    )
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
         e_rows = pl.read(recv_expert_count, [local_e, 0])
         e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
@@ -87,6 +98,8 @@ def expert_routed(
 
         for tt in pl.parallel(e_tiles):
             tt0 = tt * RECV_TILE
+            # Static slot base (worst-case RECV_MAX tiles) for concurrent experts × tiles.
+            tile_base = (local_e * (RECV_MAX // RECV_TILE) + tt) * _MX_PHASE_SLOTS
 
             gate_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
             up_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
@@ -96,7 +109,7 @@ def expert_routed(
                 gate_acc = pl.create_tile(
                     [RECV_TILE, MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
                 )
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                for k0 in pl.range(0, D, K_TILE):
                     x_tile = pl.load(
                         recv_x,
                         [local_e, tt0, k0],
@@ -120,13 +133,29 @@ def expert_routed(
                         target_memory=pl.Mem.Mat,
                         mx_layout="mx_b_nn",
                     )
-                    la = pl.move(pl.move(x_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left)
-                    las = pl.move(
-                        pl.move(x_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                    srow = (
+                        tile_base + nb_idx * _GATE_K_CHUNKS + k0 // K_TILE
+                    ) * RECV_TILE
+                    la = pl.move(
+                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
                     )
+                    la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, K_TILE // MX_BLOCK_K],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las = pl.tget_scale_addr(las, la)
+                    las = pl.set_validshape(las, RECV_TILE, K_TILE // MX_BLOCK_K)
                     rb = pl.move(w_2d, target_memory=pl.Mem.Right)
                     rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                    las = pl.tget_scale_addr(las, la)
                     rbs = pl.tget_scale_addr(rbs, rb)
                     gate_acc = pl.matmul_mx_acc(gate_acc, la, las, rb, rbs)
                 pl.store(gate_acc, [0, n0], gate_fp32)
@@ -136,7 +165,7 @@ def expert_routed(
                 up_acc = pl.create_tile(
                     [RECV_TILE, MM_INTER_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
                 )
-                for k0 in pl.pipeline(0, D, K_TILE, stage=2):
+                for k0 in pl.range(0, D, K_TILE):
                     x_tile = pl.load(
                         recv_x,
                         [local_e, tt0, k0],
@@ -159,13 +188,29 @@ def expert_routed(
                         target_memory=pl.Mem.Mat,
                         mx_layout="mx_b_nn",
                     )
-                    la = pl.move(pl.move(x_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left)
-                    las = pl.move(
-                        pl.move(x_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                    srow = (
+                        tile_base + nb_idx * _GATE_K_CHUNKS + k0 // K_TILE
+                    ) * RECV_TILE
+                    la = pl.move(
+                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
                     )
+                    la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, K_TILE // MX_BLOCK_K],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las = pl.tget_scale_addr(las, la)
+                    las = pl.set_validshape(las, RECV_TILE, K_TILE // MX_BLOCK_K)
                     rb = pl.move(w_2d, target_memory=pl.Mem.Right)
                     rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                    las = pl.tget_scale_addr(las, la)
                     rbs = pl.tget_scale_addr(rbs, rb)
                     up_acc = pl.matmul_mx_acc(up_acc, la, las, rb, rbs)
                 pl.store(up_acc, [0, n0], up_fp32)
@@ -186,7 +231,7 @@ def expert_routed(
                 y_acc = pl.create_tile(
                     [RECV_TILE, D_OUT_TILE], dtype=pl.FP32, target_memory=pl.Mem.Acc
                 )
-                for k0 in pl.pipeline(0, MOE_INTER, K_TILE, stage=2):
+                for k0 in pl.range(0, MOE_INTER, K_TILE):
                     h_tile = pl.load(
                         h_tile_fp32, [0, k0], [RECV_TILE, K_TILE], target_memory=pl.Mem.Vec
                     )
@@ -206,13 +251,29 @@ def expert_routed(
                         target_memory=pl.Mem.Mat,
                         mx_layout="mx_b_nn",
                     )
-                    la = pl.move(pl.move(h_q, target_memory=pl.Mem.Mat), target_memory=pl.Mem.Left)
-                    las = pl.move(
-                        pl.move(h_s, target_memory=pl.Mem.Mat), target_memory=pl.Mem.LeftScale
+                    srow = (
+                        tile_base + db_idx * _DOWN_K_CHUNKS + k0 // K_TILE
+                    ) * RECV_TILE
+                    la = pl.move(
+                        pl.move(pl.tile.reinterpret_view(h_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
                     )
+                    la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(h_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, K_TILE // MX_BLOCK_K],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las = pl.tget_scale_addr(las, la)
+                    las = pl.set_validshape(las, RECV_TILE, K_TILE // MX_BLOCK_K)
                     rb = pl.move(w_2d, target_memory=pl.Mem.Right)
                     rbs = pl.move(ws_tile, target_memory=pl.Mem.RightScale)
-                    las = pl.tget_scale_addr(las, la)
                     rbs = pl.tget_scale_addr(rbs, rb)
                     y_acc = pl.matmul_mx_acc(y_acc, la, las, rb, rbs)
                 # Apply routing weights then store BF16.
