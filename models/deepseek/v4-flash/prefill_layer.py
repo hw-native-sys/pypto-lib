@@ -7,26 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2 # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 packed (request-aware) chunked prefill single layer with MoE EP2.
+"""DeepSeek-V4 Flash single-request prefill layer with MoE EP2.
 
-This is the Qwen-style packed-prefill variant of ``prefill_layer.py``. The packed
-``prefill_layer_core`` expands the batch and sequence dimensions internally: it
-loops over requests and over fixed-``T`` token tiles, builds tile-local ``[T, ...]``
-inputs from the packed buffers, and directly calls the existing fixed-``T`` child
-kernels (``prefill_attention_{swa,hca,csa}`` and ``moe``) per tile, scattering valid
-rows back into the packed output.
-
-Coordinate system (shared by JIT and golden, see issue #591):
-  * packed token buffers : global packed row (``chunk_offsets[r] + tile_id*T + t``)
-  * cache/state/tables   : request-local (each request owns a contiguous slice)
-  * sparse-index overlay : tile-local (``WIN + t`` for the current tile's tokens)
-  * position_ids         : absolute position (``chunk_start + tile_id*T + t``)
-
-All tile-local metadata (slot mappings, sparse indices, positions) is produced on
-the host by reusing the child ``build_*_tensor_specs(start_pos=tile_ctx,
-num_tokens=valid)`` builders, which already encode the absolute-position ring /
-overlay / compressed / state formulas for a single ``[T]`` tile. The kernel just
-gathers the precomputed packed metadata per tile.
+The layer intentionally supports only one fresh 128-token prompt
+(``B=1, S=128``). Multi-request packing, chunked prefill, and long-sequence
+continuation are outside this standalone layer's contract.
 """
 
 import pypto.language as pl
@@ -59,7 +44,7 @@ from moe import (
     golden_moe,
     moe,
 )
-from config import FLASH as MODEL_CONFIG
+from config import FLASH as MODEL_CONFIG, PREFILL_BATCH, PREFILL_SEQ
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,
@@ -114,17 +99,14 @@ assert SWA_BLOCK_SIZE == BLOCK_SIZE, "SWA/HCA/CSA must share the PyPTO block siz
 assert SWA_ORI_BLOCK_NUM == HCA_ORI_BLOCK_NUM == CSA_ORI_BLOCK_NUM
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM
 
-# ``T`` is the fixed child-kernel token-tile capacity (Qwen's ``TOK_TILE``). It is
-# NOT the packed token total. The packed prefill only ever feeds the children a
-# fixed ``[T, ...]`` tile at a time.
+# The standalone layer is deliberately fixed to one full child-kernel tile.
 TOK_TILE = T
-PREFILL_CHUNK_TOKENS = T
-DEFAULT_CHUNK_LENS = (T, T + T // 2)
-DEFAULT_USER_BATCH = len(DEFAULT_CHUNK_LENS)
+USER_BATCH = 1
 
-# Per-request contiguous block/state counts (each request owns one such slice; the
-# packed buffer dim0 is ``user_batch * <count>``). The cache/state block tables are
-# request-local so the children see block ids starting at 0 inside their slice.
+assert PREFILL_BATCH == USER_BATCH, "prefill_layer requires B=1"
+assert PREFILL_SEQ == TOK_TILE == 128, "prefill_layer requires S=128"
+
+# Fixed cache/state/table capacities for the one supported request.
 ORI_CACHE_BLOCKS = CSA_ORI_BLOCK_NUM
 CMP_CACHE_BLOCKS = CSA_CMP_BLOCK_NUM
 IDX_CACHE_BLOCKS = PREFILL_IDX_BLOCK_NUM
@@ -132,34 +114,9 @@ ORI_TABLE_BLOCKS = SPARSE_ORI_MAX_BLOCKS
 CMP_TABLE_BLOCKS = SPARSE_CMP_MAX_BLOCKS
 IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
 
-# Dynamic (batch-dependent) kernel-signature dims. Kept local to this file so
-# config.py and the fixed-T child kernels stay untouched (issue #591 §1).
-USER_BATCH_DYN = pl.dynamic("DEEPSEEK_PREFILL_USER_BATCH_DYN")
-PREFILL_TOKENS_DYN = pl.dynamic("DEEPSEEK_PREFILL_TOKENS_DYN")
-
-PREFILL_ORI_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_CACHE_BLOCKS_DYN")
-PREFILL_CMP_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_CACHE_BLOCKS_DYN")
-PREFILL_IDX_CACHE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_CACHE_BLOCKS_DYN")
-
-PREFILL_ORI_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_ORI_BLOCK_TABLE_DYN")
-PREFILL_CMP_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_CMP_BLOCK_TABLE_DYN")
-PREFILL_IDX_BLOCK_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_IDX_BLOCK_TABLE_DYN")
-
-PREFILL_HCA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_BLOCKS_DYN")
-PREFILL_CSA_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_BLOCKS_DYN")
-PREFILL_INNER_STATE_BLOCKS_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_BLOCKS_DYN")
-PREFILL_HCA_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_HCA_STATE_TABLE_DYN")
-PREFILL_CSA_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_CSA_STATE_TABLE_DYN")
-PREFILL_INNER_STATE_TABLE_DYN = pl.dynamic("DEEPSEEK_PREFILL_INNER_STATE_TABLE_DYN")
-
-
 @pl.jit
 def prefill_layer_core(
-    x_hc: pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_tile_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    x_hc: pl.Tensor[[T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -177,18 +134,18 @@ def prefill_layer_core(
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[
-        [PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, 2 * HCA_MAIN_OUT_DIM],
+        [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, 2 * HCA_MAIN_OUT_DIM],
         pl.FP32,
     ]],
-    hca_compress_state_block_table: pl.Tensor[[PREFILL_HCA_STATE_TABLE_DYN], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[
-        pl.Tensor[[PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, 2 * CSA_MAIN_OUT_DIM], pl.FP32]
+        pl.Tensor[[CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, 2 * CSA_MAIN_OUT_DIM], pl.FP32]
     ],
-    csa_compress_state_block_table: pl.Tensor[[PREFILL_CSA_STATE_TABLE_DYN], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -198,24 +155,24 @@ def prefill_layer_core(
     csa_inner_ape: pl.Tensor[[CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.InOut[
-        pl.Tensor[[PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, 2 * INNER_OUT_DIM], pl.FP32]
+        pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, 2 * INNER_OUT_DIM], pl.FP32]
     ],
-    csa_inner_compress_state_block_table: pl.Tensor[[PREFILL_INNER_STATE_TABLE_DYN], pl.INT32],
-    kv_cache: pl.InOut[pl.Tensor[[PREFILL_ORI_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[PREFILL_ORI_BLOCK_TABLE_DYN], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    cmp_kv: pl.InOut[pl.Tensor[[PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_block_table: pl.Tensor[[PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
-    position_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
+    csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.InOut[pl.Tensor[[ORI_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    ori_block_table: pl.Tensor[[ORI_TABLE_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_block_table: pl.Tensor[[CMP_TABLE_BLOCKS], pl.INT32],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[IDX_TABLE_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    hca_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
     attn_sink: pl.Tensor[[H], pl.FP32],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
@@ -227,7 +184,7 @@ def prefill_layer_core(
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT64],
+    input_ids: pl.Tensor[[T], pl.INT64],
     routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -240,7 +197,7 @@ def prefill_layer_core(
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -251,46 +208,11 @@ def prefill_layer_core(
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     layer_id: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]:
-    x_hc.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    ori_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    position_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    hca_cmp_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    hca_state_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    csa_cmp_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    csa_idx_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    csa_state_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    csa_inner_state_slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    x_next.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    seq_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_offsets.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_tile_offsets.bind_dynamic(0, USER_BATCH_DYN)
-    kv_cache.bind_dynamic(0, PREFILL_ORI_CACHE_BLOCKS_DYN)
-    ori_block_table.bind_dynamic(0, PREFILL_ORI_BLOCK_TABLE_DYN)
-    cmp_kv.bind_dynamic(0, PREFILL_CMP_CACHE_BLOCKS_DYN)
-    cmp_block_table.bind_dynamic(0, PREFILL_CMP_BLOCK_TABLE_DYN)
-    idx_kv_cache.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
-    idx_kv_scale.bind_dynamic(0, PREFILL_IDX_CACHE_BLOCKS_DYN)
-    idx_block_table.bind_dynamic(0, PREFILL_IDX_BLOCK_TABLE_DYN)
-    hca_compress_state.bind_dynamic(0, PREFILL_HCA_STATE_BLOCKS_DYN)
-    hca_compress_state_block_table.bind_dynamic(0, PREFILL_HCA_STATE_TABLE_DYN)
-    csa_compress_state.bind_dynamic(0, PREFILL_CSA_STATE_BLOCKS_DYN)
-    csa_compress_state_block_table.bind_dynamic(0, PREFILL_CSA_STATE_TABLE_DYN)
-    csa_inner_compress_state.bind_dynamic(0, PREFILL_INNER_STATE_BLOCKS_DYN)
-    csa_inner_compress_state_block_table.bind_dynamic(0, PREFILL_INNER_STATE_TABLE_DYN)
-    user_batch = pl.tensor.dim(seq_lens, 0)
-    for request_id in pl.range(user_batch):
-        chunk_len_b = pl.tensor.read(chunk_lens, [request_id])
-        chunk_base = pl.cast(pl.tensor.read(chunk_offsets, [request_id]), pl.INDEX)
-        tile_ord_base = pl.cast(pl.tensor.read(chunk_tile_offsets, [request_id]), pl.INDEX)
-        tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
+    for request_id in pl.range(USER_BATCH):
         ridx = pl.cast(request_id, pl.INDEX)
 
-        # All requests address the same fixed-capacity global physical pools.
-        # Request ownership is carried exclusively by the request-local block
-        # tables and lowered slot mappings below.
+        # The single request addresses the fixed-capacity physical pools.
         kv_cache_req = kv_cache
         ori_block_table_req = pl.slice(ori_block_table, [ORI_TABLE_BLOCKS], [ridx * ORI_TABLE_BLOCKS])
         cmp_kv_req = cmp_kv
@@ -308,27 +230,12 @@ def prefill_layer_core(
         csa_inner_state_table_req = pl.slice(csa_inner_compress_state_block_table, [INNER_STATE_MAX_BLOCKS],
                                              [ridx * INNER_STATE_MAX_BLOCKS])
 
-        for tile_id in pl.range(tok_blocks):
-            p0 = tile_id * TOK_TILE
-            tile_base = chunk_base + p0
-            valid_tok = pl.min(TOK_TILE, chunk_len_b - p0)
-            valid_n = pl.cast(valid_tok, pl.INT32)  # child num_tokens scalar (INT32)
-            # Global execution ordinal of this MoE call (1-based). The done
-            # windows are monotonic counters, so each serial MoE call needs a
-            # unique, gap-free epoch == its execution order; chunk_tile_offsets
-            # is the exclusive prefix sum of tok_blocks over requests.
-            moe_epoch = pl.cast(tile_ord_base + tile_id + 1, pl.INT32)
+        for tile_id in pl.range(1):
+            tile_base = tile_id * TOK_TILE
+            valid_n = pl.cast(TOK_TILE, pl.INT32)
+            moe_epoch = pl.cast(1, pl.INT32)
 
-            # Tile-local fixed-[T] inputs gathered from the packed buffers. The
-            # children only read the leading ``valid_tok`` rows, so the padded
-            # tail (when valid_tok < T) is ignored. No explicit per-tile pl.scope:
-            # rely on auto_scope + pl.range's sequential semantics so the
-            # global cache/state RAW dependency is carried across tiles
-            # (tile N's writeback ordered before tile N+1's gather).
-            # Keep all child inputs at their fixed [T] capacity. In particular,
-            # x_hc / position_ids feed T_DYN children whose sibling tensors are
-            # full-[T], so narrowing them would bind T_DYN to two extents.
-            # num_tokens gates every padded tail row in the child kernels.
+            # The only supported request is exactly one full child-kernel tile.
             x_hc_tile = pl.slice(x_hc, [TOK_TILE, HC_MULT, D], [tile_base, 0, 0])
             ori_slot_tile = pl.slice(ori_slot_mapping, [TOK_TILE], [tile_base])
             position_ids_tile = pl.slice(position_ids, [TOK_TILE], [tile_base])
@@ -398,20 +305,14 @@ def prefill_layer_core(
                 layer_id, valid_n, my_rank, moe_epoch,
             )
 
-            # Scatter the tile back into the padded physical output. Each
-            # request's physical span is rounded up to whole-T tiles, so a
-            # full-T write is safe even for a partial logical tail tile.
+            # Write the one full tile to the fixed output.
             x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
     return x_next
 
 
 @pl.jit.host
 def l3_prefill_layer(
-    x_hc: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32],
-    seq_lens: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
-    chunk_tile_offsets: pl.Tensor[[N_RANKS, USER_BATCH_DYN], pl.INT32],
+    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -429,18 +330,18 @@ def l3_prefill_layer(
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
     hca_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     hca_compress_state: pl.InOut[pl.Tensor[
-        [N_RANKS, PREFILL_HCA_STATE_BLOCKS_DYN, HCA_STATE_BLOCK_SIZE, 2 * HCA_MAIN_OUT_DIM],
+        [N_RANKS, HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, 2 * HCA_MAIN_OUT_DIM],
         pl.FP32,
     ]],
-    hca_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_HCA_STATE_TABLE_DYN], pl.INT32],
+    hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_cmp_wkv: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, CSA_MAIN_OUT_DIM, D], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
     csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     csa_compress_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_BLOCKS_DYN, CSA_STATE_BLOCK_SIZE, 2 * CSA_MAIN_OUT_DIM], pl.FP32]
+        pl.Tensor[[N_RANKS, CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, 2 * CSA_MAIN_OUT_DIM], pl.FP32]
     ],
-    csa_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_CSA_STATE_TABLE_DYN], pl.INT32],
+    csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_hadamard_idx: pl.Tensor[[N_RANKS, IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
     csa_idx_wq_b: pl.Tensor[[N_RANKS, Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     csa_idx_wq_b_scale: pl.Tensor[[N_RANKS, IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
@@ -450,24 +351,24 @@ def l3_prefill_layer(
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     csa_inner_norm_w: pl.Tensor[[N_RANKS, IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.InOut[
-        pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_BLOCKS_DYN, INNER_STATE_BLOCK_SIZE, 2 * INNER_OUT_DIM], pl.FP32]
+        pl.Tensor[[N_RANKS, INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, 2 * INNER_OUT_DIM], pl.FP32]
     ],
-    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, PREFILL_INNER_STATE_TABLE_DYN], pl.INT32],
-    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_ORI_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    ori_block_table: pl.Tensor[[N_RANKS, PREFILL_ORI_BLOCK_TABLE_DYN], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_CMP_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_block_table: pl.Tensor[[N_RANKS, PREFILL_CMP_BLOCK_TABLE_DYN], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, PREFILL_IDX_CACHE_BLOCKS_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[N_RANKS, PREFILL_IDX_BLOCK_TABLE_DYN], pl.INT32],
-    position_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT32],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
+    csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.InOut[pl.Tensor[[N_RANKS, ORI_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    ori_block_table: pl.Tensor[[N_RANKS, ORI_TABLE_BLOCKS], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    cmp_kv: pl.InOut[pl.Tensor[[N_RANKS, CMP_CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_block_table: pl.Tensor[[N_RANKS, CMP_TABLE_BLOCKS], pl.INT32],
+    idx_kv_cache: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[N_RANKS, IDX_CACHE_BLOCKS, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[N_RANKS, IDX_TABLE_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
+    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
     attn_sink: pl.Tensor[[N_RANKS, H], pl.FP32],
     wo_a: pl.Tensor[[N_RANKS, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[N_RANKS, D, O_GROUPS * O_LORA], pl.INT8],
@@ -479,7 +380,7 @@ def l3_prefill_layer(
     gate_w: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN], pl.INT64],
+    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
     routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -492,7 +393,7 @@ def l3_prefill_layer(
     shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    x_next: pl.Out[pl.Tensor[[N_RANKS, PREFILL_TOKENS_DYN, HC_MULT, D], pl.FP32]],
+    x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -515,7 +416,6 @@ def l3_prefill_layer(
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         prefill_layer_core(
             x_hc[rank],
-            seq_lens[rank], chunk_lens[rank], chunk_offsets[rank], chunk_tile_offsets[rank],
             hc_attn_fn[rank], hc_attn_scale[rank], hc_attn_base[rank],
             attn_norm_w[rank], wq_a[rank], wq_b[rank], wq_b_scale[rank],
             wkv[rank], gamma_cq[rank], gamma_ckv[rank], freqs_cos[rank], freqs_sin[rank],
@@ -552,10 +452,6 @@ def l3_prefill_layer(
 
 HOST_TENSOR_ORDER = (
     "x_hc",
-    "seq_lens",
-    "chunk_lens",
-    "chunk_offsets",
-    "chunk_tile_offsets",
     "hc_attn_fn",
     "hc_attn_scale",
     "hc_attn_base",
@@ -634,7 +530,7 @@ HOST_TENSOR_ORDER = (
 
 
 # ---------------------------------------------------------------------------
-# Host-side packed metadata builder, tensor specs, and golden reference.
+# Host-side fixed metadata builder, tensor specs, and golden reference.
 # ---------------------------------------------------------------------------
 
 _KIND_BUILDER = {
@@ -643,7 +539,7 @@ _KIND_BUILDER = {
     "csa": build_csa_attention_tensor_specs,
 }
 
-# Child-local token-metadata tensors (gathered per tile from the packed buffers).
+# Child-local token-metadata tensors gathered for the fixed tile.
 _TOKEN_META_NAMES = {
     "position_ids", "ori_slot_mapping",
     "cmp_slot_mapping", "state_slot_mapping", "idx_slot_mapping", "inner_state_slot_mapping",
@@ -656,8 +552,7 @@ _CACHE_STATE_NAMES = {
     "inner_compress_state", "inner_compress_state_block_table",
 }
 
-# Global cache/state pools and packed per-request tables (packed-name ->
-# child-local name, or source-kind mappings for namespaced state tensors).
+# Global cache/state pools and child-local mappings.
 _PACKED_CACHE_SPECS = {
     "kv_cache": "kv_cache",
     "ori_block_table": "ori_block_table",
@@ -706,7 +601,7 @@ def _req_block_count(kind, child_name):
 
 
 def _child_to_packed(kind, child_name):
-    """Map a child-local cache/state name to its packed-buffer name for this kind."""
+    """Map a child-local cache/state name to the layer-level tensor name."""
     if child_name in ("block_table", "ori_block_table"):
         return "ori_block_table"
     if child_name in ("kv_cache", "cmp_kv", "cmp_block_table", "idx_kv_cache", "idx_kv_scale", "idx_block_table"):
@@ -750,43 +645,26 @@ def _tile_token_meta(kind, context_len, valid_tok, torch):
     return meta
 
 
-def _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
-    """Yield (request_id, tile_id, context_len, valid_tok, physical_base) per tile."""
-    for r in range(len(chunk_lens_v)):
-        seq_len = int(seq_lens_v[r])
-        chunk_len = int(chunk_lens_v[r])
-        base = int(chunk_offsets_v[r])
-        chunk_start = seq_len - chunk_len
-        tok_blocks = (chunk_len + T - 1) // T
-        for tile_id in range(tok_blocks):
-            p0 = tile_id * T
-            valid = min(T, chunk_len - p0)
-            yield r, tile_id, chunk_start + p0, valid, base + p0
+def _fixed_token_metadata(kind, torch):
+    """Build rank-shared metadata for one fresh 128-token prompt."""
+    meta = _tile_token_meta(kind, context_len=0, valid_tok=T, torch=torch)
+    pos = meta["position_ids"][:T]
+    ori_slot = meta["ori_slot_mapping"][:T]
+    hca_cmp = torch.full((T,), -1, dtype=torch.int64)
+    hca_state = torch.full((T,), -1, dtype=torch.int64)
+    csa_cmp = torch.full((T,), -1, dtype=torch.int64)
+    csa_idx = torch.full((T,), -1, dtype=torch.int64)
+    csa_state = torch.full((T,), -1, dtype=torch.int64)
+    csa_inner = torch.full((T,), -1, dtype=torch.int64)
 
-
-def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, total_tokens, torch):
-    """Assemble rank-shared padded-physical [total_tokens, ...] metadata tensors."""
-    pos = torch.zeros(total_tokens, dtype=torch.int32)
-    ori_slot = torch.full((total_tokens,), -1, dtype=torch.int64)
-    hca_cmp = torch.full((total_tokens,), -1, dtype=torch.int64)
-    hca_state = torch.full((total_tokens,), -1, dtype=torch.int64)
-    csa_cmp = torch.full((total_tokens,), -1, dtype=torch.int64)
-    csa_idx = torch.full((total_tokens,), -1, dtype=torch.int64)
-    csa_state = torch.full((total_tokens,), -1, dtype=torch.int64)
-    csa_inner = torch.full((total_tokens,), -1, dtype=torch.int64)
-
-    for _r, _tid, ctx, valid, base in _iter_request_tiles(seq_lens_v, chunk_lens_v, chunk_offsets_v):
-        m = _tile_token_meta(kind, ctx, valid, torch)
-        pos[base:base + T] = m["position_ids"][:T]
-        ori_slot[base:base + T] = m["ori_slot_mapping"][:T]
-        if kind == "hca":
-            hca_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            hca_state[base:base + T] = m["state_slot_mapping"][:T]
-        elif kind == "csa":
-            csa_cmp[base:base + T] = m["cmp_slot_mapping"][:T]
-            csa_idx[base:base + T] = m["idx_slot_mapping"][:T]
-            csa_state[base:base + T] = m["state_slot_mapping"][:T]
-            csa_inner[base:base + T] = m["inner_state_slot_mapping"][:T]
+    if kind == "hca":
+        hca_cmp = meta["cmp_slot_mapping"][:T]
+        hca_state = meta["state_slot_mapping"][:T]
+    elif kind == "csa":
+        csa_cmp = meta["cmp_slot_mapping"][:T]
+        csa_idx = meta["idx_slot_mapping"][:T]
+        csa_state = meta["state_slot_mapping"][:T]
+        csa_inner = meta["inner_state_slot_mapping"][:T]
 
     return {
         "position_ids": pos,
@@ -800,59 +678,13 @@ def _packed_token_metadata(kind, seq_lens_v, chunk_lens_v, chunk_offsets_v, tota
     }
 
 
-def _resolve_batch(chunk_lens, start_positions, torch):
-    """Normalize batch config into logical lengths and padded physical offsets."""
-    chunk_lens_v = [int(c) for c in chunk_lens]
-    for c in chunk_lens_v:
-        if c <= 0:
-            raise ValueError(f"chunk_lens must be positive, got {chunk_lens_v}")
-    if start_positions is None:
-        start_positions = [0] * len(chunk_lens_v)
-    start_positions = [int(s) for s in start_positions]
-    if len(start_positions) != len(chunk_lens_v):
-        raise ValueError(
-            f"start_positions length must match chunk_lens length, "
-            f"got {len(start_positions)} and {len(chunk_lens_v)}"
-        )
-    seq_lens_v = [start_positions[i] + chunk_lens_v[i] for i in range(len(chunk_lens_v))]
-    tile_counts_v = [(c + T - 1) // T for c in chunk_lens_v]
-    padded_lens_v = [tc * T for tc in tile_counts_v]
-    chunk_offsets_v, acc = [], 0
-    for c in padded_lens_v:
-        chunk_offsets_v.append(acc)
-        acc += c
-    total_tokens = acc
-    tile_offsets_v, tacc = [], 0
-    for tc in tile_counts_v:
-        tile_offsets_v.append(tacc)
-        tacc += tc
-    return (torch.tensor(seq_lens_v, dtype=torch.int32),
-            torch.tensor(chunk_lens_v, dtype=torch.int32),
-            torch.tensor(chunk_offsets_v, dtype=torch.int32),
-            torch.tensor(tile_offsets_v, dtype=torch.int32),
-            total_tokens)
-
-
-def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_positions=None):
-    """Packed batch tensor specs for the chunked prefill layer.
-
-    ``chunk_lens`` lists the current-chunk length per request;
-    the default covers ``DEFAULT_USER_BATCH`` requests with chunk lengths
-    ``T`` and ``T + T//2``.
-    ``start_positions`` the prior context length per request (default 0 = fresh
-    prefill, no cache history). Token tensors are physically padded to whole
-    ``T`` tiles; cache/state/tables are ``user_batch``-concatenated
-    request-local slices.
-    """
+def build_tensor_specs(layer_id=2):
+    """Build tensor specs for one fresh 128-token request."""
     import torch
     from golden import ScalarSpec, TensorSpec
 
     kind = _attention_kind_for_layer(layer_id)
-    seq_lens_t, chunk_lens_t, chunk_offsets_t, tile_offsets_t, total_tokens = _resolve_batch(
-        chunk_lens, start_positions, torch)
-    batch = len(chunk_lens_t)
-    seq_lens_list = [int(v) for v in seq_lens_t]
-    chunk_lens_list = [int(v) for v in chunk_lens_t]
+    total_tokens = T
 
     def kind_specs(build_fn):
         return {s.name: s for s in build_fn(start_pos=0, num_tokens=T) if isinstance(s, TensorSpec)}
@@ -874,7 +706,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         return init
 
     # Per-rank weight tensors (same selection as prefill_layer.py minus token +
-    # cache/state tensors, which are rebuilt as packed/per-request below).
+    # cache/state tensors, which are rebuilt for the standalone layer below).
     weight_specs = [
         ("hc_attn_fn", active["hc_attn_fn"]),
         ("hc_attn_scale", active["hc_attn_scale"]),
@@ -913,24 +745,15 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     tensor_specs = [TensorSpec(name, [N_RANKS, *src.shape], src.dtype, init_value=ranked_init(src))
                     for name, src in weight_specs]
 
-    # Packed token tensors. Metadata is rank-shared; x_hc/input_ids carry per-rank data.
-    meta = _packed_token_metadata(kind, seq_lens_list, chunk_lens_list,
-                                  [int(c) for c in chunk_offsets_t], total_tokens, torch)
-    chunk_offsets_list = [int(c) for c in chunk_offsets_t]
+    # Token metadata is rank-shared; x_hc/input_ids carry per-rank data.
+    meta = _fixed_token_metadata(kind, torch)
 
     def init_x_hc():
-        x = torch.zeros(N_RANKS, total_tokens, HC_MULT, D, dtype=torch.bfloat16)
-        for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list):
-            x[:, base:base + chunk_len] = ((torch.rand(N_RANKS, chunk_len, HC_MULT, D) - 0.5) / 10.0).to(
-                torch.bfloat16)
-        return x
+        return (torch.rand(N_RANKS, T, HC_MULT, D, dtype=torch.float32) - 0.5) / 10.0
 
     def init_input_ids():
-        ids = torch.zeros(N_RANKS, total_tokens, dtype=torch.int64)
-        for rank in range(N_RANKS):
-            for base, chunk_len in zip(chunk_offsets_list, chunk_lens_list):
-                ids[rank, base:base + chunk_len] = (torch.arange(chunk_len, dtype=torch.int64) + base + rank) % VOCAB
-        return ids.contiguous()
+        ids = [((torch.arange(T, dtype=torch.int64) + rank) % VOCAB) for rank in range(N_RANKS)]
+        return torch.stack(ids, dim=0).contiguous()
 
     tensor_specs.append(TensorSpec("x_hc", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, init_value=init_x_hc))
     tensor_specs.append(TensorSpec("input_ids", [N_RANKS, total_tokens], torch.int64, init_value=init_input_ids))
@@ -943,7 +766,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
         tensor_specs.append(TensorSpec(name, [N_RANKS, total_tokens], torch.int64, init_value=replicate(meta[name])))
 
     def resolve_cache_src(packed_name, info):
-        """Resolve (source spec, source kind, child-local name) for a packed cache."""
+        """Resolve (source spec, source kind, child-local name) for a layer cache."""
         if isinstance(info, tuple):
             sk, cn = info
             return src_by_kind[sk][cn], sk, cn
@@ -956,93 +779,26 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
             return csa[cn], kind, cn
         return active[cn], kind, cn  # kv_cache
 
-    # Fixed-capacity global cache/state pools plus request-local block tables.
-    # With start_positions=0 the mutable pools are zero (no history).
+    # Fixed-capacity cache/state pools and tables for the fresh request.
     for packed_name, info in _PACKED_CACHE_SPECS.items():
-        if isinstance(info, tuple) and len(info) == 3:
-            src_kind, kv_name, score_name = info
-            kv_src = src_by_kind[src_kind][kv_name]
-            score_src = src_by_kind[src_kind][score_name]
+        src, _, _ = resolve_cache_src(packed_name, info)
+        value = _spec_value(src, torch)
 
-            def make_merged_init(
-                src_kind=src_kind,
-                kv_name=kv_name,
-                score_name=score_name,
-                kv_src=kv_src,
-                score_src=score_src,
-            ):
-                def init():
-                    blocks = []
-                    for r in range(batch):
-                        cs = seq_lens_list[r] - chunk_lens_list[r]
-                        kv_spec, score_spec = kv_src, score_src
-                        if cs > 0:
-                            rspecs = {
-                                s.name: s
-                                for s in _KIND_BUILDER[src_kind](start_pos=cs, num_tokens=T)
-                                if isinstance(s, TensorSpec)
-                            }
-                            kv_spec = rspecs[kv_name]
-                            score_spec = rspecs[score_name]
-                        blocks.append(
-                            torch.cat(
-                                [_spec_value(kv_spec, torch), _spec_value(score_spec, torch)],
-                                dim=-1,
-                            )
-                        )
-                    # One fixed global pool, independent from user batch. The
-                    # fixture starts from the first request's seeded state;
-                    # request separation is provided by the block tables.
-                    pool = blocks[0].contiguous()
-                    return torch.stack([pool.clone() for _ in range(N_RANKS)], dim=0).contiguous()
-
-                return init
-
-            merged_dim = kv_src.shape[-1] + score_src.shape[-1]
-            tensor_specs.append(
-                TensorSpec(
-                    packed_name,
-                    [N_RANKS, kv_src.shape[0], *kv_src.shape[1:-1], merged_dim],
-                    kv_src.dtype,
-                    init_value=make_merged_init(),
-                    is_output=True,
-                )
-            )
-            continue
-
-        src, src_kind, child_name = resolve_cache_src(packed_name, info)
-        per_req = _spec_value(src, torch)
-        is_history = packed_name in _HISTORY_CACHE_NAMES
-
-        def make_init(per_req=per_req, is_history=is_history, src_kind=src_kind, child_name=child_name):
+        def make_init(value=value):
             def init():
-                blocks = []
-                for r in range(batch):
-                    cs = seq_lens_list[r] - chunk_lens_list[r]
-                    rspec = None
-                    if is_history and cs > 0:
-                        rspecs = {s.name: s for s in _KIND_BUILDER[src_kind](start_pos=cs, num_tokens=T)
-                                  if isinstance(s, TensorSpec)}
-                        rspec = rspecs.get(child_name)
-                    blocks.append(_spec_value(rspec, torch) if rspec is not None else per_req.clone())
-                if is_history:
-                    pool = blocks[0].contiguous()
-                else:
-                    pool = torch.cat(blocks, dim=0).contiguous()
-                return torch.stack([pool.clone() for _ in range(N_RANKS)], dim=0).contiguous()
+                return torch.stack([value.clone() for _ in range(N_RANKS)], dim=0).contiguous()
+
             return init
 
-        dim0 = src.shape[0] if is_history else batch * src.shape[0]
-        tensor_specs.append(TensorSpec(packed_name, [N_RANKS, dim0, *src.shape[1:]],
-                                       src.dtype, init_value=make_init(),
-                                       is_output=packed_name in _HISTORY_CACHE_NAMES))
-
-    # Batch metadata.
-    tensor_specs.append(TensorSpec("seq_lens", [N_RANKS, batch], torch.int32, init_value=replicate(seq_lens_t)))
-    tensor_specs.append(TensorSpec("chunk_lens", [N_RANKS, batch], torch.int32, init_value=replicate(chunk_lens_t)))
-    tensor_specs.append(TensorSpec("chunk_offsets", [N_RANKS, batch], torch.int32, init_value=replicate(chunk_offsets_t)))
-    tensor_specs.append(TensorSpec("chunk_tile_offsets", [N_RANKS, batch], torch.int32,
-                                   init_value=replicate(tile_offsets_t)))
+        tensor_specs.append(
+            TensorSpec(
+                packed_name,
+                [N_RANKS, *src.shape],
+                src.dtype,
+                init_value=make_init(),
+                is_output=packed_name in _HISTORY_CACHE_NAMES,
+            )
+        )
 
     # MoE weight tensors (per rank). tid2eid keeps its hash-table init.
     for spec in build_moe_tensor_specs(layer_id=layer_id):
@@ -1063,8 +819,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     tensor_specs.append(TensorSpec("x_next", [N_RANKS, total_tokens, HC_MULT, D], torch.float32, is_output=True))
 
     # Keep static weight parameters device-resident (child_memory), sharded per
-    # rank. Dynamic cache/state/table tensors must stay as host tensors because
-    # the generated orchestration reads their ``.shape`` to bind dynamic sizes.
+    # rank. Cache/state/table tensors remain host tensors for output validation.
     RESIDENT_WEIGHT_NAMES = frozenset([
         # Attention core weights + RoPE tables
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
@@ -1092,30 +847,21 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
     tensor_by_name = {spec.name: spec for spec in tensor_specs}
     missing = [name for name in HOST_TENSOR_ORDER if name not in tensor_by_name]
     if missing:
-        raise ValueError(f"missing packed prefill layer tensor specs: {missing}")
+        raise ValueError(f"missing prefill layer tensor specs: {missing}")
     return [tensor_by_name[name] for name in HOST_TENSOR_ORDER] + [
         ScalarSpec("layer_id", torch.int32, layer_id),
     ]
 
 
 def golden_prefill_layer(tensors):
-    """Reference for packed chunked prefill: request/tile loop mirroring the kernel.
-
-    For each request, the global cache/state pools are reused across its tiles
-    (so a tile reads what earlier tiles wrote) while tables remain request-local. Each tile
-    runs the active attention child golden per rank, then one collective MoE golden,
-    then scatters the valid rows back into the packed ``x_next``.
-    """
+    """Reference for the fixed one-request, one-tile prefill layer."""
     import torch
     from golden import TensorSpec
 
     layer_id = int(tensors["layer_id"])
     kind = _attention_kind_for_layer(layer_id)
-    chunk_lens = tensors["chunk_lens"][0]
-    chunk_offsets = tensors["chunk_offsets"][0]
-    batch = chunk_lens.shape[0]
 
-    # Map child-local attention tensor names -> packed names (un-namespacing).
+    # Map child-local attention tensor names to layer-level names.
     mapped = dict(tensors)
     if kind == "swa":
         mapped["block_table"] = tensors["ori_block_table"]
@@ -1155,11 +901,7 @@ def golden_prefill_layer(tensors):
         buf[:] = packed_per_rank[rank, base:base + T]
         return buf
 
-    for request_id in range(batch):
-        chunk_len = int(chunk_lens[request_id])
-        chunk_base = int(chunk_offsets[request_id])
-        tok_blocks = (chunk_len + T - 1) // T
-
+    for request_id in range(USER_BATCH):
         # Global mutable pool views plus request-local table views.
         req_views = {}
         for packed_name, info in _PACKED_CACHE_SPECS.items():
@@ -1170,10 +912,9 @@ def golden_prefill_layer(tensors):
             cnt = _req_block_count(kind, child_name)
             req_views[packed_name] = tensors[packed_name][:, request_id * cnt:(request_id + 1) * cnt]
 
-        for tile_id in range(tok_blocks):
-            p0 = tile_id * T
-            valid = min(T, chunk_len - p0)
-            base = chunk_base + p0
+        for tile_id in range(1):
+            valid = T
+            base = tile_id * T
 
             x_attn_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
             for rank in range(N_RANKS):
@@ -1203,7 +944,7 @@ def golden_prefill_layer(tensors):
             input_ids_tile[:, :valid] = tensors["input_ids"][:, base:base + valid]
             moe_tensors["input_ids"] = input_ids_tile
             moe_tensors["num_tokens"] = valid
-            x_next_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.bfloat16)
+            x_next_tile = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
             moe_tensors["x_next"] = x_next_tile
             golden_moe(moe_tensors)
 
@@ -1211,28 +952,10 @@ def golden_prefill_layer(tensors):
 
 
 def valid_ratio_reldiff(diff_thd, pct_thd):
-    """Relative-diff comparator over logical token rows, ignoring padded tails."""
-    import torch
+    """Relative-diff comparator for the fixed 128 logical token rows."""
     from golden import ratio_reldiff
 
-    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
-
-    def cmp(actual, expected, **kwargs):
-        inputs = kwargs.get("inputs", {})
-        chunk_lens = inputs.get("chunk_lens")
-        chunk_offsets = inputs.get("chunk_offsets")
-        if chunk_lens is None or chunk_offsets is None:
-            return base_cmp(actual, expected, **kwargs)
-
-        lens = chunk_lens[0].cpu().to(torch.int64)
-        offsets = chunk_offsets[0].cpu().to(torch.int64)
-        mask = torch.zeros(actual.shape[1], dtype=torch.bool)
-        for chunk_len, base in zip(lens.tolist(), offsets.tolist()):
-            mask[base:base + chunk_len] = True
-        return base_cmp(actual[:, mask], expected[:, mask], **kwargs)
-
-    cmp.__name__ = "valid_ratio_reldiff"
-    return cmp
+    return ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
 
 
 if __name__ == "__main__":
@@ -1250,10 +973,6 @@ if __name__ == "__main__":
                         help=f"comma-separated device ids; need at least {N_RANKS}")
     parser.add_argument("--layer-id", type=int, default=2,
                         help="Layer id selects attention by MODEL_CONFIG.compress_ratios[layer_id].")
-    parser.add_argument("--chunk-lens", type=str, default=",".join(str(c) for c in DEFAULT_CHUNK_LENS),
-                        help="Comma-separated per-request logical chunk lengths.")
-    parser.add_argument("--start-positions", type=str, default=None,
-                        help="Comma-separated per-request prior context lengths; defaults to all zeros.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -1261,16 +980,10 @@ if __name__ == "__main__":
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
-    chunk_lens = tuple(int(x) for x in args.chunk_lens.split(","))
-    start_positions = None if args.start_positions is None else tuple(int(x) for x in args.start_positions.split(","))
 
     result = run_jit(
         fn=l3_prefill_layer,
-        specs=build_tensor_specs(
-            layer_id=args.layer_id,
-            chunk_lens=chunk_lens,
-            start_positions=start_positions,
-        ),
+        specs=build_tensor_specs(layer_id=args.layer_id),
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
         compile_cfg=dict(
@@ -1288,11 +1001,10 @@ if __name__ == "__main__":
         atol=1e-3,
         compare_fn={
             # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
-            # --chunk-lens 128,192
-            # swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
+            # B=1, S=128 single-request prefill.
             "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # Packed CSA runs preserve the standalone child-kernel precision
+            # CSA runs preserve the standalone child-kernel precision
             # contracts: sparse BF16 cache rows may differ by one ULP, C8 rows
             # by one LSB, and only a small fraction of recurrent-state values
             # cross the strict pointwise FP32 threshold.
