@@ -19,16 +19,10 @@ from golden import run_jit
 from hc_head import hc_head
 from lm_head import (
     MAX_LOGIT_ROWS,
-    OWNER_LOGIT_ROWS,
-    OWNER_SIZE as LM_HEAD_OWNER_SIZE,
     TP_SIZE as LM_HEAD_TP_SIZE,
-    T_MAX as LM_HEAD_T_MAX,
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
-    lm_head_finish_decoupled_worker,
-    lm_head_decode_selected_publish_decoupled_worker,
-    lm_head_logits_route_decoupled_worker,
-    lm_head_tp_decoupled_worker,
+    lm_head,
 )
 from pypto.ir.distributed_compiled_program import DistributedConfig
 from rmsnorm import rms_norm
@@ -129,10 +123,9 @@ HCA_NUM_LAYERS = 20
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 # LM-head uses dedicated completion counters, independent of the MoE epochs.
 LM_HEAD_COMM_EPOCH = 1
-LM_HEAD_SHARED_DATA_BYTES = max(
-    N_LOCAL * RECV_MAX * D,
-    LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4,
-)
+# recv_x_buf is shared by the MoE recv window and the LM-head hidden window;
+# the two run sequentially. logits_window has its own buffer.
+LM_HEAD_SHARED_DATA_BYTES = max(N_LOCAL * RECV_MAX * D, MAX_LOGIT_ROWS * D * 2)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 CSA_LAYER_STACKED_NAMES = [
@@ -766,7 +759,7 @@ def l3_decode_fwd(
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], pl.BF16],
     hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    logits: pl.Out[pl.Tensor[[N_RANKS, T, LM_HEAD_VOCAB], pl.FP32]],
+    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
@@ -781,9 +774,11 @@ def l3_decode_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    lm_head_hidden_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    # Dedicated: a peer's route writes this while that peer may still be reading
+    # its hidden_window out of recv_x_buf, so the two must not alias.
+    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    tp_logits_shards = pl.create_tensor([LM_HEAD_TP_SIZE, OWNER_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -795,128 +790,43 @@ def l3_decode_fwd(
         routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         decode_fwd(
-            x_hc[r],
-            hc_attn_fn[r],
-            hc_attn_scale[r],
-            hc_attn_base[r],
-            attn_norm_w[r],
-            wq_a[r],
-            wq_b[r],
-            wq_b_scale[r],
-            wkv[r],
-            gamma_cq[r],
-            gamma_ckv[r],
-            kv_cache[r],
-            attn_sink[r],
-            wo_a[r],
-            wo_b[r],
-            wo_b_scale[r],
-            hca_cmp_wkv[r],
-            hca_cmp_wgate[r],
-            hca_cmp_ape[r],
-            hca_cmp_norm_w[r],
-            hca_compress_state[r],
-            csa_cmp_wkv[r],
-            csa_cmp_wgate[r],
-            csa_cmp_ape[r],
-            csa_cmp_norm_w[r],
-            csa_compress_state[r],
-            csa_idx_wq_b[r],
-            csa_idx_wq_b_scale[r],
-            csa_weights_proj[r],
-            csa_hadamard_idx[r],
-            csa_inner_wkv[r],
-            csa_inner_wgate[r],
-            csa_inner_ape[r],
-            csa_inner_norm_w[r],
-            csa_inner_compress_state[r],
-            cmp_kv[r],
-            idx_kv_cache[r],
-            idx_kv_scale[r],
-            hc_ffn_fn[r],
-            hc_ffn_scale[r],
-            hc_ffn_base[r],
-            norm_w[r],
-            gate_w[r],
-            gate_bias[r],
-            tid2eid[r],
-            routed_w1[r],
-            routed_w1_scale[r],
-            routed_w3[r],
-            routed_w3_scale[r],
-            routed_w2[r],
-            routed_w2_scale[r],
-            shared_w1[r],
-            shared_w1_scale[r],
-            shared_w3[r],
-            shared_w3_scale[r],
-            shared_w2[r],
-            shared_w2_scale[r],
-            freqs_cos[r],
-            freqs_sin[r],
-            block_table[r],
-            ori_slot_mapping[r],
-            window_swa_indices[r],
-            window_swa_lens[r],
-            swa_slot_mapping[r],
-            swa_indices[r],
-            swa_lens[r],
-            hca_cmp_slot_mapping[r],
-            hca_state_slot_mapping[r],
-            csa_cmp_slot_mapping[r],
-            csa_idx_slot_mapping[r],
-            csa_state_slot_mapping[r],
-            csa_inner_state_slot_mapping[r],
-            position_ids[r],
-            kv_seq_lens[r],
-            hca_compress_state_block_table[r],
-            csa_compress_state_block_table[r],
-            csa_inner_compress_state_block_table[r],
-            cmp_block_table[r],
-            idx_block_table[r],
-            input_ids[r],
-            hc_head_fn[r],
-            hc_head_scale[r],
-            hc_head_base[r],
-            final_norm_w[r],
-            pre_hc_hidden_out[r],
-            hidden_out[r],
-            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-            routed_y_buf, combine_arrived,
-            num_tokens_per_owner, r,
+            x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
+            wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], kv_cache[r], attn_sink[r],
+            wo_a[r], wo_b[r], wo_b_scale[r], hca_cmp_wkv[r], hca_cmp_wgate[r], hca_cmp_ape[r],
+            hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r], csa_cmp_wgate[r],
+            csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r], csa_idx_wq_b[r],
+            csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r], csa_inner_wkv[r],
+            csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
+            csa_inner_compress_state[r], cmp_kv[r], idx_kv_cache[r], idx_kv_scale[r],
+            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r],
+            tid2eid[r], routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
+            routed_w2[r], routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
+            shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], freqs_cos[r], freqs_sin[r],
+            block_table[r], ori_slot_mapping[r], window_swa_indices[r], window_swa_lens[r],
+            swa_slot_mapping[r], swa_indices[r], swa_lens[r], hca_cmp_slot_mapping[r],
+            hca_state_slot_mapping[r], csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r],
+            csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r], position_ids[r],
+            kv_seq_lens[r], hca_compress_state_block_table[r], csa_compress_state_block_table[r],
+            csa_inner_compress_state_block_table[r], cmp_block_table[r], idx_block_table[r],
+            input_ids[r], hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
+            pre_hc_hidden_out[r], hidden_out[r], recv_meta, recv_x, recv_aux, recv_route, arrived,
+            data_arrived, routed_y_buf, combine_arrived, num_tokens_per_owner, r,
             device=r,
         )
 
+    # Grouped LM head: the N_RANKS DP world is cut into N_RANKS // LM_HEAD_TP_SIZE
+    # groups. Every card is both an owner and a TP rank, so the single lm_head
+    # dispatch runs on the full world and every peer stays inside its own group.
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        lm_head_decode_selected_publish_decoupled_worker(
-            hidden_out[r], num_tokens_per_owner, logit_row_indices, num_logit_rows,
-            hidden_window, hidden_done, r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(LM_HEAD_TP_SIZE):
-        hidden_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, D], dtype=pl.BF16)
-        hidden_done = pld.window(lm_head_hidden_done_buf, [N_RANKS, 1], dtype=pl.INT32)
-        lm_head_tp_decoupled_worker(
-            lm_head_weight[r], hidden_window, hidden_done, tp_logits_shards[r],
-            r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(LM_HEAD_TP_SIZE):
-        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
+        hidden_window = pld.window(recv_x_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+        logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_logits_route_decoupled_worker(
-            tp_logits_shards[r], logits_window, logits_done,
-            r, LM_HEAD_COMM_EPOCH, device=r,
-        )
-
-    for r in pl.range(pld.world_size()):
-        logits_window = pld.window(recv_x_buf, [LM_HEAD_T_MAX, LM_HEAD_VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head_finish_decoupled_worker(
-            logits[r], logits_window, logits_done,
-            r, LM_HEAD_COMM_EPOCH, device=r,
+        lm_head(
+            hidden_out[r], lm_head_weight[r % LM_HEAD_TP_SIZE], num_tokens_per_owner,
+            logit_row_indices, num_logit_rows, logits[r], hidden_window, hidden_done,
+            logits_window, logits_done, r, r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
+            r % LM_HEAD_TP_SIZE, LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -1536,7 +1446,7 @@ def build_tensor_specs(
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
     specs.append(TensorSpec("lm_head_weight", [LM_HEAD_TP_SIZE, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
     specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("logits", [N_RANKS, T, LM_HEAD_VOCAB], torch.float32, is_output=True))
+    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
     specs.append(TensorSpec(
         "num_tokens_per_owner",
         [N_RANKS],
@@ -1586,13 +1496,13 @@ def main():
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
     assert args.tp <= args.ep, f"decode_fwd device lm_head requires --tp <= --ep, got tp={args.tp}, ep={args.ep}"
+    assert args.ep % args.tp == 0, (
+        f"grouped LM head needs --ep % --tp == 0, got ep={args.ep}, tp={args.tp}"
+    )
     assert LM_HEAD_TP_SIZE == args.tp, (
         f"import-time LM_HEAD_TP_SIZE must match --tp, got {LM_HEAD_TP_SIZE} vs {args.tp}"
     )
-    assert LM_HEAD_OWNER_SIZE == args.ep and N_RANKS == args.ep, (
-        f"import-time owner/EP size must match --ep, got owner={LM_HEAD_OWNER_SIZE}, "
-        f"N_RANKS={N_RANKS}, args.ep={args.ep}"
-    )
+    assert N_RANKS == args.ep, f"import-time N_RANKS must match --ep, got {N_RANKS} vs {args.ep}"
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
