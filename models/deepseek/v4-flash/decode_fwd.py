@@ -19,6 +19,7 @@ from golden import run_jit
 from hc_head import hc_head
 from lm_head import (
     MAX_LOGIT_ROWS,
+    OWNER_LOGIT_ROWS,
     OWNER_SIZE as LM_HEAD_OWNER_SIZE,
     TP_SIZE as LM_HEAD_TP_SIZE,
     T_MAX as LM_HEAD_T_MAX,
@@ -767,9 +768,7 @@ def l3_decode_fwd(
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    tp_logits_shards = pl.create_tensor(
-        [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
-    )
+    tp_logits_shards = pl.create_tensor([LM_HEAD_TP_SIZE, OWNER_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)

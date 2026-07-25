@@ -105,6 +105,7 @@ from prefill_attention_csa import (
 from hc_head import hc_head
 from lm_head import (
     MAX_LOGIT_ROWS,
+    OWNER_LOGIT_ROWS,
     OWNER_SIZE as LM_HEAD_OWNER_SIZE,
     TP_SIZE as LM_HEAD_TP_SIZE,
     T_MAX as LM_HEAD_T_MAX,
@@ -140,6 +141,7 @@ FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
 LM_HEAD_COMM_EPOCH = LAST_MOE_EPOCH + 1
+LM_HEAD_SHARED_DATA_BYTES = max(N_LOCAL * RECV_MAX * D, LM_HEAD_T_MAX * LM_HEAD_VOCAB * 4)
 assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
 
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
@@ -801,16 +803,14 @@ def l3_prefill_fwd(
     num_logit_rows: pl.Tensor[[N_RANKS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_x_buf = pld.alloc_window_buffer(LM_HEAD_SHARED_DATA_BYTES)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
     arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    tp_logits_shards = pl.create_tensor(
-        [LM_HEAD_TP_SIZE, N_RANKS * LM_HEAD_T_MAX, VOCAB_PER_TP], dtype=pl.FP32,
-    )
+    tp_logits_shards = pl.create_tensor([LM_HEAD_TP_SIZE, OWNER_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
