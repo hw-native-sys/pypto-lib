@@ -63,6 +63,15 @@ MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
 PACKED_STATE_UPDATE_TILE = 16
 PACKED_RMS_TILE = 16
+# A5 FP32 tgather / 16-row Mat mul corrupt rows beyond the first few (decode hides
+# this with B<=8 real rows in an RMS_PAD_TILE=16 box). Prefill packs only this many
+# live writes into each 16-row tile.
+TRUSTED_RMS_ROWS = 4
+ROPE_GATHER_T_TILE = 4
+assert PACKED_RMS_TILE % ROPE_GATHER_T_TILE == 0
+assert TRUSTED_RMS_ROWS <= PACKED_RMS_TILE
+assert MAX_CMP_WRITES % TRUSTED_RMS_ROWS == 0
+NUM_RMS_BATCHES = MAX_CMP_WRITES // TRUSTED_RMS_ROWS
 
 
 @pl.jit.inline
@@ -80,6 +89,9 @@ def prefill_indexer_compressor(
     # C8 indexer cache: FP8 e4m3 KV (quant-on-write) + per-position FP32 dequant scale.
     idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    # Dense compressed-order FP8 rows for the harness (written with cache; no A5-hostile
+    # idx_slot_mapping rescan). Production callers may pass a throwaway buffer.
+    kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.FP8E4M3FN]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -95,8 +107,6 @@ def prefill_indexer_compressor(
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
-    normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
-    final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
     for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
@@ -275,79 +285,90 @@ def prefill_indexer_compressor(
             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_CHUNK] = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_rmsnorm_rope"):
-        final_base = final_block * PACKED_RMS_TILE
+    # Pack TRUSTED_RMS_ROWS live writes into each 16-row box (rows 0..TRUSTED-1);
+    # pad the rest with zeros — same A5-safe pattern as decode B<=8 in RMS_PAD_TILE=16.
+    rms_pooled = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32)
+    rms_normed = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.BF16)
+    rms_final = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32)
+
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_rmsnorm_rope"):
+        box = batch * PACKED_RMS_TILE
+        write_base = batch * TRUSTED_RMS_ROWS
+        rms_pooled[box : box + PACKED_RMS_TILE, 0:HEAD_DIM] = pl.full(
+            [PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0
+        )
         cos_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        for final_dt in pl.range(PACKED_RMS_TILE):
-            final_i = final_base + final_dt
-            write_slot_raw = pl.read(write_dst_map, [0, final_i])
+        for dt in pl.range(TRUSTED_RMS_ROWS):
+            wi = write_base + dt
+            rms_pooled[box + dt : box + dt + 1, 0:HEAD_DIM] = pooled_kv[wi : wi + 1, 0:HEAD_DIM]
+            write_slot_raw = pl.read(write_dst_map, [0, wi])
             if write_slot_raw >= 0:
-                write_pos = pl.read(write_pos_map, [0, final_i])
+                write_pos = pl.read(write_pos_map, [0, wi])
                 cmp_pos = pl.cast(write_pos + 1 - COMPRESS_RATIO, pl.INDEX)
-                cos_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                cos_b[dt : dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
                     freqs_cos[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
-                sin_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                sin_b[dt : dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
                     freqs_sin[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
         partial_sq = pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_chunk = rms_pooled[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, PACKED_RMS_TILE]))
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [PACKED_RMS_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
         for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_norm_chunk = rms_pooled[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
-                normed_chunk,
-                target_type=pl.BF16,
-                mode="rint",
+            rms_normed[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
+                normed_chunk, target_type=pl.BF16, mode="rint"
             )
-        kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        kv_rope_norm = rms_pooled[box : box + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
-        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
-        rope_ones = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
-            rope_rot,
-            target_type=pl.BF16,
-            mode="rint",
+        rope_ones = pl.full([ROPE_GATHER_T_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(
+            rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
         )
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
+        for rope_r0 in pl.range(0, PACKED_RMS_TILE, ROPE_GATHER_T_TILE):
+            rn = rope_normed[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0:ROPE_HEAD_DIM]
+            cos_s = cos_b[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0 : ROPE_HEAD_DIM // 2]
+            sin_s = sin_b[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0 : ROPE_HEAD_DIM // 2]
+            cos_il = pl.gather(cos_s, dim=-1, index=rope_dup_idx)
+            sin_il = pl.gather(sin_s, dim=-1, index=rope_dup_idx)
+            swapped = pl.gather(rn, dim=-1, index=rope_swap_idx)
+            rope_rot = pl.add(pl.mul(rn, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+            rms_normed[box + rope_r0 : box + rope_r0 + ROPE_GATHER_T_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
+                rope_rot, target_type=pl.BF16, mode="rint"
+            )
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_hadamard"):
-        final_base = final_block * PACKED_RMS_TILE
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_kv_hadamard"):
+        box = batch * PACKED_RMS_TILE
         for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
             final_acc = pl.matmul(
-                normed_kv[final_base : final_base + PACKED_RMS_TILE, 0:HEAD_DIM],
+                rms_normed[box : box + PACKED_RMS_TILE, 0:HEAD_DIM],
                 hadamard[0:HEAD_DIM, o0 : o0 + OUT_TILE],
                 out_dtype=pl.FP32,
             )
-            final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
+            rms_final[box : box + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write"):
-        final_base = final_block * PACKED_RMS_TILE
-        # C8 quant-on-write: per-row FP8 e4m3 quant of the bf16-rounded block + FP32 dequant scale
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_cache_write"):
+        box = batch * PACKED_RMS_TILE
+        write_base = batch * TRUSTED_RMS_ROWS
         kv_blk_f32 = pl.cast(
-            pl.cast(final_kv[final_base : final_base + PACKED_RMS_TILE, 0:HEAD_DIM], target_type=pl.BF16, mode="rint"),
-            target_type=pl.FP32)
+            pl.cast(rms_final[box : box + PACKED_RMS_TILE, 0:HEAD_DIM], target_type=pl.BF16, mode="rint"),
+            target_type=pl.FP32,
+        )
         kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, PACKED_RMS_TILE])
         kv_amax = pl.maximum(kv_amax, pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS))
         kv_scale_q_row = pl.div(pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=FP8_E4M3_MAX), kv_amax)
@@ -355,21 +376,25 @@ def prefill_indexer_compressor(
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [PACKED_RMS_TILE, 1])
         kv_scaled = pl.row_expand_mul(kv_blk_f32, kv_scale_q_col)
         kv_fp8_blk = pl.cast(kv_scaled, target_type=pl.FP8E4M3FN, mode="rint")
-        for final_dt in pl.range(PACKED_RMS_TILE):
-            final_i = final_base + final_dt
-            dst_row_raw = pl.read(write_dst_map, [0, final_i])
+        for dt in pl.range(TRUSTED_RMS_ROWS):
+            wi = write_base + dt
+            dst_row_raw = pl.read(write_dst_map, [0, wi])
             if dst_row_raw >= 0:
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
-                idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_fp8_blk[final_dt : final_dt + 1, :]
-                # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
-                pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [final_dt, 0]))
+                idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_fp8_blk[dt : dt + 1, :]
+                pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [dt, 0]))
+                kv[wi : wi + 1, 0:HEAD_DIM] = kv_fp8_blk[dt : dt + 1, :]
             else:
-                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + final_i
+                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + wi
                 idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
-                    keepalive_row : keepalive_row + 1,
-                    0:HEAD_DIM,
+                    keepalive_row : keepalive_row + 1, 0:HEAD_DIM
                 ]
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
+                kv[wi : wi + 1, 0:HEAD_DIM] = pl.cast(
+                    pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                    target_type=pl.FP8E4M3FN,
+                    mode="trunc",
+                )
 
     for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
         update_ob = update_idx % PACKED_PROJ_BLOCKS
@@ -435,33 +460,9 @@ def prefill_indexer_compressor_test(
 ):
     prefill_indexer_compressor(
         x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
+        hadamard, idx_kv_cache, idx_kv_scale, kv, idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
-        kv_base = kv_block * PACKED_RMS_TILE
-        for kv_dt in pl.range(PACKED_RMS_TILE):
-            kv_i = kv_base + kv_dt
-            src_row_raw = pl.cast(-1, pl.INT64)
-            write_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if write_seen == kv_i:
-                            src_row_raw = scan_slot_raw
-                        write_seen = write_seen + 1
-            if src_row_raw >= 0:
-                src_row = pl.cast(src_row_raw, pl.INDEX)
-                # C8 readback: raw FP8 cache rows in compressed order (dequant scale checked separately).
-                kv[kv_i : kv_i + 1, 0:HEAD_DIM] = idx_kv_cache_flat[src_row : src_row + 1, 0:HEAD_DIM]
-            else:
-                kv[kv_i : kv_i + 1, 0:HEAD_DIM] = pl.cast(
-                    pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0),
-                    target_type=pl.FP8E4M3FN,
-                    mode="trunc",
-                )
     return kv, compress_state, idx_kv_cache, idx_kv_scale
 
 
