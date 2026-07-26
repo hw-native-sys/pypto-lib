@@ -136,8 +136,9 @@ def expert_routed(
                     srow = (
                         tile_base + nb_idx * _GATE_K_CHUNKS + k0 // K_TILE
                     ) * RECV_TILE
+                    # mx_quant(mode="mxfp4") already returns packed FP4 (!pto.f4E2M1x2).
                     la = pl.move(
-                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        pl.move(x_q, target_memory=pl.Mem.Mat),
                         target_memory=pl.Mem.Left,
                     )
                     la = pl.set_validshape(la, RECV_TILE, K_TILE)
@@ -191,8 +192,9 @@ def expert_routed(
                     srow = (
                         tile_base + nb_idx * _GATE_K_CHUNKS + k0 // K_TILE
                     ) * RECV_TILE
+                    # mx_quant(mode="mxfp4") already returns packed FP4 (!pto.f4E2M1x2).
                     la = pl.move(
-                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        pl.move(x_q, target_memory=pl.Mem.Mat),
                         target_memory=pl.Mem.Left,
                     )
                     la = pl.set_validshape(la, RECV_TILE, K_TILE)
@@ -254,8 +256,9 @@ def expert_routed(
                     srow = (
                         tile_base + db_idx * _DOWN_K_CHUNKS + k0 // K_TILE
                     ) * RECV_TILE
+                    # mx_quant(mode="mxfp4") already returns packed FP4 (!pto.f4E2M1x2).
                     la = pl.move(
-                        pl.move(pl.tile.reinterpret_view(h_q, pl.FP4), target_memory=pl.Mem.Mat),
+                        pl.move(h_q, target_memory=pl.Mem.Mat),
                         target_memory=pl.Mem.Left,
                     )
                     la = pl.set_validshape(la, RECV_TILE, K_TILE)

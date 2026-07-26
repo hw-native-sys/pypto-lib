@@ -95,7 +95,13 @@ QPROJ_K_CHUNKS = Q_LORA // Q_PROJ_TILE  # =8; peel 1 + unroll 7
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 Q_ROPE_H_TILE = 4       # heads per fused qproj dequant/rms/rope task; cos/sin build amortizes over them
+# A5 FP32 index-form tgather: one vector box is <=8 rows; an 8-row gather
+# corrupts the last row (every t%8==7 on board). ST covers 4-row and 16-row
+# (multi-box) swap gathers; slice RoPE gathers into 4-row subtiles.
+ROPE_GATHER_T_TILE = 4
 assert H % Q_ROPE_H_TILE == 0
+assert Q_ROPE_T_TILE % ROPE_GATHER_T_TILE == 0
+assert KV_RMS_T_TILE % ROPE_GATHER_T_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 assert DECODE_BATCH * DECODE_SEQ <= MATMUL_T_TILE
@@ -215,13 +221,14 @@ def qkv_proj_rope(
     # RoPE indices and interleaved cos/signed-sin rows are head-invariant.
     # Prepare them once per token tile so the 16 Q head-group tasks do not each
     # rebuild the same arange/cast/gather chain on their critical AIV path.
+    # Gather in ROPE_GATHER_T_TILE (=4) subtiles — see ROPE_GATHER_T_TILE note.
     q_rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
     q_rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
     with pl.spmd(t_dim // Q_ROPE_T_TILE, name_hint="q_rope_prepare") as _qrope_prep_tid:
         qrp_idx = pl.tile.get_block_idx()
         qrp_t0 = qrp_idx * Q_ROPE_T_TILE
-        qrp_ones = pl.full([Q_ROPE_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        qrp_ones = pl.full([ROPE_GATHER_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         qrp_idx_i32 = pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32)
         qrp_idx_fp32 = pl.cast(qrp_idx_i32, target_type=pl.FP32)
         qrp_col = pl.col_expand_mul(qrp_ones, qrp_idx_fp32)
@@ -235,16 +242,20 @@ def qkv_proj_rope(
         qrp_swap_f = pl.sub(qrp_next_col, qrp_lane_offset)
         qrp_swap_idx = pl.cast(qrp_swap_f, target_type=pl.INT32)
         qrp_sign = pl.sub(pl.mul(qrp_lane, 2.0), 1.0)
-        qrp_cos_rows = rope_cos_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_sin_rows = rope_sin_view[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :]
-        qrp_cos = pl.cast(qrp_cos_rows, target_type=pl.FP32)
-        qrp_sin = pl.cast(qrp_sin_rows, target_type=pl.FP32)
-        qrp_cos_il = pl.gather(qrp_cos, dim=-1, index=qrp_dup_idx)
-        qrp_sin_il = pl.gather(qrp_sin, dim=-1, index=qrp_dup_idx)
-        qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
-        q_rope_cos_il[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_cos_il
-        q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
-        q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
+        for qrp_sub in pl.range(Q_ROPE_T_TILE // ROPE_GATHER_T_TILE):
+            qrp_s0 = qrp_t0 + qrp_sub * ROPE_GATHER_T_TILE
+            qrp_cos = pl.cast(
+                rope_cos_view[qrp_s0 : qrp_s0 + ROPE_GATHER_T_TILE, :], target_type=pl.FP32
+            )
+            qrp_sin = pl.cast(
+                rope_sin_view[qrp_s0 : qrp_s0 + ROPE_GATHER_T_TILE, :], target_type=pl.FP32
+            )
+            qrp_cos_il = pl.gather(qrp_cos, dim=-1, index=qrp_dup_idx)
+            qrp_sin_il = pl.gather(qrp_sin, dim=-1, index=qrp_dup_idx)
+            qrp_sin_signed = pl.mul(qrp_sin_il, qrp_sign)
+            q_rope_cos_il[qrp_s0 : qrp_s0 + ROPE_GATHER_T_TILE, :] = qrp_cos_il
+            q_rope_sin_signed[qrp_s0 : qrp_s0 + ROPE_GATHER_T_TILE, :] = qrp_sin_signed
+            q_rope_swap_idx[qrp_s0 : qrp_s0 + ROPE_GATHER_T_TILE, :] = qrp_swap_idx
 
     # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). dyn MX(x) @ wq_a MX → FP32.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
@@ -565,12 +576,21 @@ def qkv_proj_rope(
 
                 q_rope_chunk_raw = q_head_dq[:, NOPE_DIM:HEAD_DIM]
                 q_rope_chunk = pl.row_expand_mul(q_rope_chunk_raw, q_head_inv_rms_t)
-                q_rope_swapped = pl.gather(q_rope_chunk, dim=-1, index=q_swap_idx)
-                q_rope_base = pl.mul(q_rope_chunk, q_cos_il)
-                q_rope_delta = pl.mul(q_rope_swapped, q_sin_signed)
-                q_rope_rot = pl.add(q_rope_base, q_rope_delta)
-                q_rope_bf16 = pl.cast(q_rope_rot, target_type=pl.BF16, mode="rint")
-                q_flat[tg : tg + Q_ROPE_T_TILE, h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM] = q_rope_bf16
+                # 4-row gather subtiles (A5 tgather 8-row last-row corruption).
+                for q_sub in pl.range(Q_ROPE_T_TILE // ROPE_GATHER_T_TILE):
+                    q_s0 = q_sub * ROPE_GATHER_T_TILE
+                    q_chunk_s = q_rope_chunk[q_s0 : q_s0 + ROPE_GATHER_T_TILE, :]
+                    q_swapped_s = pl.gather(
+                        q_chunk_s, dim=-1, index=q_swap_idx[q_s0 : q_s0 + ROPE_GATHER_T_TILE, :]
+                    )
+                    q_rot_s = pl.add(
+                        pl.mul(q_chunk_s, q_cos_il[q_s0 : q_s0 + ROPE_GATHER_T_TILE, :]),
+                        pl.mul(q_swapped_s, q_sin_signed[q_s0 : q_s0 + ROPE_GATHER_T_TILE, :]),
+                    )
+                    q_flat[
+                        tg + q_s0 : tg + q_s0 + ROPE_GATHER_T_TILE,
+                        h0 + NOPE_DIM : h0 + NOPE_DIM + ROPE_DIM,
+                    ] = pl.cast(q_rot_s, target_type=pl.BF16, mode="rint")
 
     # Split-K kv_proj: dyn MX(x) @ wkv MX → FP32. KV is off the critical path.
     kv_fp32 = pl.create_tensor([T_MAX, HEAD_DIM], dtype=pl.FP32)
@@ -734,19 +754,36 @@ def qkv_proj_rope(
         gamma_rope = pl.reshape(gamma_rope_cast, [1, ROPE_DIM])
         kv_rope_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
         kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_inv_rms_t), gamma_rope)
-        kv_ones = pl.full([KV_RMS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
+        # Indices are row-invariant; build once on the 4-row gather tile.
+        kv_ones = pl.full([ROPE_GATHER_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
         kv_col = pl.col_expand_mul(kv_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
         kv_dup_f = pl.cast(pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
         kv_dup_idx = pl.cast(kv_dup_f, target_type=pl.INT32)                                       # j>>1
         kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))                                            # j%2
         kv_swap_idx = pl.cast(pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0)), target_type=pl.INT32)  # j^1
         kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        kv_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
-        kv_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
-        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx)
-        kv_rope_rot = pl.add(pl.mul(kv_rope_norm_chunk, kv_cos_il), pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il))
-        kv_rope_i16 = pl.cast(kv_rope_rot, target_type=pl.BF16, mode="rint")
-        kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
+        for kv_sub in pl.range(KV_RMS_T_TILE // ROPE_GATHER_T_TILE):
+            kv_s0 = kv_sub * ROPE_GATHER_T_TILE
+            kv_tg_s = tg + kv_s0
+            kv_norm_s = kv_rope_norm_chunk[kv_s0 : kv_s0 + ROPE_GATHER_T_TILE, :]
+            kv_cos_il = pl.gather(
+                pl.cast(rope_cos_view[kv_tg_s : kv_tg_s + ROPE_GATHER_T_TILE, :], target_type=pl.FP32),
+                dim=-1,
+                index=kv_dup_idx,
+            )
+            kv_sin_il = pl.gather(
+                pl.cast(rope_sin_view[kv_tg_s : kv_tg_s + ROPE_GATHER_T_TILE, :], target_type=pl.FP32),
+                dim=-1,
+                index=kv_dup_idx,
+            )
+            kv_swapped = pl.gather(kv_norm_s, dim=-1, index=kv_swap_idx)
+            kv_rope_rot = pl.add(
+                pl.mul(kv_norm_s, kv_cos_il),
+                pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il),
+            )
+            kv_view[kv_tg_s : kv_tg_s + ROPE_GATHER_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = pl.cast(
+                kv_rope_rot, target_type=pl.BF16, mode="rint"
+            )
 
     return q
 
