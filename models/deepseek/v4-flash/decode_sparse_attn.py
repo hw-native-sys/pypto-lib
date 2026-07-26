@@ -386,7 +386,20 @@ def sparse_attn(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    # The j^1 lane-swap index for merge_norm's rotation gather is a pure constant
+    # (no token/head dependence), so it is built once here instead of rebuilding
+    # the same arange/cast chain on each of the T*(H//H_TILE) merge blocks. Shaped
+    # [H_TILE, ROPE_DIM] because gather's index must match its source rows.
+    rope_swap_idx = pl.create_tensor([H_TILE, ROPE_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
+        sw_col = pl.col_expand_mul(
+            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                           # j%2
+        rope_swap_idx[0:H_TILE, 0:ROPE_DIM] = pl.cast(
+            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)              # j^1
+
         cs_col = pl.col_expand_mul(
             pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -417,20 +430,17 @@ def sparse_attn(
         m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
         m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
 
-        # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
-        # single block's stats directly instead of an empty merge loop.
-        if SPARSE_BLOCKS > 1:
-            for m_sb in pl.range(1, SPARSE_BLOCKS):
-                m_row = m_blk_base + m_sb * H_TILE
-                m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                m_mi = m_mi_new
+        for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
+            m_row = m_blk_base + m_sb * H_TILE
+            m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
+            m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
+            m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
+            m_mi_new = pl.maximum(m_mi, m_cur_mi)
+            m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
+            m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
+            m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
+            m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
+            m_mi = m_mi_new
 
         n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
@@ -440,31 +450,23 @@ def sparse_attn(
 
         # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
-        # swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16 (golden
-        # also rounds inverse-RoPE to bf16) and packed into o_packed's rope columns.
-        m_col = pl.col_expand_mul(
-            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        m_dup_f = pl.cast(pl.cast(pl.mul(m_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        m_lane = pl.sub(m_col, pl.mul(m_dup_f, 2.0))                                              # j%2
-        m_swap_idx = pl.cast(pl.sub(pl.add(m_col, 1.0), pl.mul(m_lane, 2.0)), target_type=pl.INT32)  # j^1
+        # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
+        # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
+        # o_packed's rope columns.
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
+        m_swapped = pl.gather(m_rope, dim=-1, index=rope_swap_idx[0:H_TILE, 0:ROPE_DIM])
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+        n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
 
-        for n_hi in pl.range(H_TILE):
-            n_gh = m_h0 + n_hi
-            n_g = n_gh // HEADS_PER_GROUP
-            n_hh = n_gh - n_g * HEADS_PER_GROUP
-            n_pack_row = n_g * T + m_t
-            n_col = n_hh * HEAD_DIM
+        for n_hi in pl.unroll(H_TILE):
+            n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T + m_t
+            n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # one HEAD_DIM-wide store per head row instead of two: concat the nope and
             # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
-            n_full_bf16 = pl.concat(n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM], n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM])
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16
+            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
