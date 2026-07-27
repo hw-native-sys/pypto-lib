@@ -77,6 +77,7 @@ from moe import (
     TOPK as MOE_TOPK,
     VOCAB as MOE_VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    clear_moe_signals,
     golden_moe,
     moe,
 )
@@ -238,6 +239,7 @@ def mtp_decode_layer(
         my_rank,
         pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
+    clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(next_pre_hc_hidden, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
     rms_norm(x_head, mtp_norm_w, hidden_out)

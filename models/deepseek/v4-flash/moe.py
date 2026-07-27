@@ -78,6 +78,26 @@ assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 
 
+@pl.jit.inline
+def clear_moe_signals(
+    completion_anchor: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+):
+    """Clear this rank's MoE signal windows after its final MoE completes."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_signal_clear"):
+        # The final MoE output depends on this rank observing every peer's final
+        # meta, payload, and combine notify. No peer can issue another MoE notify
+        # to this rank in the current forward after this dependency is satisfied.
+        _completion_anchor = pl.read(completion_anchor, [0, 0, 0])
+        zero = pl.cast(0, pl.INT32)
+        for src in pl.range(N_RANKS):
+            pl.write(arrived, [src, 0], zero)
+            pl.write(data_arrived, [src, 0], zero)
+            pl.write(combine_arrived, [src, 0], zero)
+
+
 # === Dispatch ================================================================
 # Lane push, count publish, arrival wait, and cumsum gather run in one
 # pl.at(CORE_GROUP) so program order stays push -> notify -> wait -> gather.
@@ -538,6 +558,7 @@ def moe_test(
         routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
 
 

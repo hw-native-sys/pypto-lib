@@ -63,6 +63,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    clear_moe_signals,
     golden_moe,
     moe,
 )
@@ -197,6 +198,7 @@ def mtp_prefill_fwd(
         routed_y_buf, combine_arrived,
         pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
     )
+    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
 
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
     hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)

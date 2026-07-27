@@ -41,6 +41,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    clear_moe_signals,
     golden_moe,
     moe,
 )
@@ -307,6 +308,7 @@ def prefill_layer_core(
 
             # Write the one full tile to the fixed output.
             x_next = pl.assemble(x_next, x_next_tile, [tile_base, 0, 0])
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
 
 

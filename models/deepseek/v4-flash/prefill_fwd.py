@@ -55,6 +55,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    clear_moe_signals,
     moe,
 )
 from config import FLASH as MODEL_CONFIG
@@ -725,6 +726,7 @@ def prefill_fwd(
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
+    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)

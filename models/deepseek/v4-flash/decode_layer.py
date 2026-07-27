@@ -90,6 +90,7 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
+    clear_moe_signals,
     golden_moe,
     moe,
 )
@@ -259,6 +260,7 @@ def decode_layer(
         routed_y_buf, combine_arrived,
         layer_id, pl.const(T, pl.INT32), my_rank, pl.const(1, pl.INT32),
     )
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
 
 
