@@ -687,6 +687,72 @@ def mx_matmul_fp8_fp4(
     return a @ b
 
 
+def dynamic_mx_quant_e2m1(
+    x: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Host dynamic MXFP4 act quant → float4_x2 (low-nibble) + E8M0 scale.
+
+    Matches device ``pl.mx_quant(..., mode=\"mxfp4\")`` along the last dim:
+    per-block abs-max → E8M0 with ``E2M1_EMAX``, snap to FP4 grid, pack as
+    ``float4_e2m1fn_x2`` with the same element shape as ``x``.
+    """
+    if x.shape[-1] % block_k != 0:
+        raise ValueError(f"K={x.shape[-1]} must be divisible by block_k={block_k}")
+    xf = x.to(torch.float32)
+    lead = xf.shape[:-1]
+    k = xf.shape[-1]
+    xb = xf.reshape(*lead, k // block_k, block_k)
+    amax = xb.abs().amax(dim=-1)
+    scale_u8, inv = _ocp_e8m0_and_inv_scale(amax, E2M1_EMAX)
+    q = xb * inv.unsqueeze(-1)
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=q.device
+    )
+    sign = torch.where(q < 0, -1.0, 1.0)
+    abs_q = q.abs()
+    idx = (abs_q.unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    q_grid = (sign * levels[idx]).reshape_as(x)
+    return fp4_floats_to_torch_x2(q_grid), e8m0_torch(scale_u8)
+
+
+def dequant_mxfp4_a(
+    a_x2: torch.Tensor,
+    scale_e8m0: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Dequant Left-matrix MXFP4 ``[..., K]`` float4_x2 + scale ``[..., K/block]``."""
+    a = torch_x2_to_fp4_floats(a_x2)
+    if scale_e8m0.dtype == torch.float8_e8m0fnu:
+        s_u8 = float8_e8m0_to_uint8(scale_e8m0)
+    else:
+        s_u8 = scale_e8m0.to(torch.uint8)
+    scale = e8m0_uint8_to_float(s_u8)
+    lead = a.shape[:-1]
+    k = a.shape[-1]
+    if k % block_k != 0:
+        raise ValueError(f"K={k} must be divisible by block_k={block_k}")
+    if scale.shape[-1] != k // block_k:
+        raise ValueError(
+            f"scale last dim {scale.shape[-1]} != K/block ({k // block_k})"
+        )
+    ab = a.reshape(*lead, k // block_k, block_k)
+    return (ab * scale.unsqueeze(-1)).reshape_as(a)
+
+
+def mx_matmul_fp4(
+    a_fp4_x2: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_fp4_x2: torch.Tensor,
+    b_scale: torch.Tensor,
+    block_k: int = MX_BLOCK_K,
+) -> torch.Tensor:
+    """Host W4A4 MX matmul: FP4 A × FP4 B (temporary until PTOAS mixed W4A8)."""
+    a = dequant_mxfp4_a(a_fp4_x2, a_scale, block_k=block_k)
+    b = dequant_mxfp4_b(b_fp4_x2, b_scale, block_k=block_k)
+    return a @ b
+
+
 def gen_mxfp4_weight_kn(
     shape_kn: Tuple[int, int],
     dequant_std: float,
@@ -722,10 +788,10 @@ def routed_expert_mx_golden(
     block_k: int = MX_BLOCK_K,
     scales_packed_nn: bool = True,
 ) -> torch.Tensor:
-    """AscendC W4A8MxFp4-style routed expert golden (per-expert dyn MX + SwiGLU).
+    """Routed expert golden for legacy W4A4 (MXFP4×MXFP4) fixtures.
 
-    Weights are Right matrices with FP4 payload; activations use MXFP8.
-    ``recv_weights`` scales the down-proj output (combine-ready).
+    Prefer :func:`routed_expert_mxfp8_golden` for the current A5 device path
+    (temporary MXFP8 until FP4 Mat→Right EmitC is fixed).
     """
     import torch.nn.functional as F
 
@@ -739,15 +805,96 @@ def routed_expert_mx_golden(
         if n_rows <= 0:
             continue
         x = recv_x_bf16[ei, :n_rows, :]
-        x_q, x_s = dynamic_mx_quant_e4m3(x, block_k=block_k)
-        gate = mx_matmul_fp8_fp4(x_q, x_s, w1_x2[ei], _b_scale(w1_scale[ei]), block_k)
-        up = mx_matmul_fp8_fp4(x_q, x_s, w3_x2[ei], _b_scale(w3_scale[ei]), block_k)
+        x_q, x_s = dynamic_mx_quant_e2m1(x, block_k=block_k)
+        gate = mx_matmul_fp4(x_q, x_s, w1_x2[ei], _b_scale(w1_scale[ei]), block_k)
+        up = mx_matmul_fp4(x_q, x_s, w3_x2[ei], _b_scale(w3_scale[ei]), block_k)
         if swiglu_limit and swiglu_limit > 0:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(-swiglu_limit, swiglu_limit)
         h = F.silu(gate) * up
-        h_q, h_s = dynamic_mx_quant_e4m3(h, block_k=block_k)
-        y = mx_matmul_fp8_fp4(h_q, h_s, w2_x2[ei], _b_scale(w2_scale[ei]), block_k)
+        h_q, h_s = dynamic_mx_quant_e2m1(h, block_k=block_k)
+        y = mx_matmul_fp4(h_q, h_s, w2_x2[ei], _b_scale(w2_scale[ei]), block_k)
         y = y * recv_weights[ei, :n_rows].reshape(-1, 1).float()
         out[ei, :n_rows, :] = y
     return out
+
+
+def routed_expert_mxfp8_golden(
+    recv_x_bf16: torch.Tensor,
+    recv_weights: torch.Tensor,
+    recv_expert_count: torch.Tensor,
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w3_fp8: torch.Tensor,
+    w3_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    swiglu_limit: float = 0.0,
+    block_k: int = MX_BLOCK_K,
+    k_tile: int | None = None,
+    n_tile_w13: int | None = None,
+    n_tile_w2: int | None = None,
+    scales_packed_nn: bool = True,
+) -> torch.Tensor:
+    """Routed expert golden for temporary W8A8 (MXFP8×MXFP8) device path.
+
+    When ``k_tile`` / ``n_tile_*`` are set, B-scales are tiled MX_B_NN
+    (``pack_scale_b_nn_tiled``) and activations are re-quantized per K-tile
+    (matches ``expert_routed`` / ``expert_shared``). Otherwise full-matrix
+    ``pack_scale_b_nn`` + single full-K quant is used.
+    ``recv_weights`` scales the down-proj output (combine-ready).
+    """
+    import torch.nn.functional as F
+
+    def _b_scale(s: torch.Tensor, n_tile: int | None, logical_k: int, logical_n: int) -> torch.Tensor:
+        if not scales_packed_nn:
+            return s
+        if k_tile is not None and n_tile is not None:
+            return unpack_scale_b_nn_tiled(
+                s,
+                k_tile_rows=k_tile // block_k,
+                n_tile=n_tile,
+                logical_k=logical_k // block_k,
+                logical_n=logical_n,
+            )
+        return unpack_scale_b_nn(s)
+
+    def _mx_mm(x_f: torch.Tensor, w: torch.Tensor, w_s: torch.Tensor) -> torch.Tensor:
+        if k_tile is None:
+            xq, xs = dynamic_mx_quant_e4m3(x_f, block_k=block_k)
+            return mx_matmul_fp8(xq, xs, w, w_s, block_k=block_k)
+        acc = None
+        for k0 in range(0, x_f.shape[-1], k_tile):
+            xq, xs = dynamic_mx_quant_e4m3(x_f[..., k0 : k0 + k_tile], block_k=block_k)
+            part = mx_matmul_fp8(
+                xq,
+                xs,
+                w[k0 : k0 + k_tile],
+                w_s[k0 // block_k : (k0 + k_tile) // block_k],
+                block_k=block_k,
+            )
+            acc = part if acc is None else acc + part
+        return acc
+
+    e, recv_max, d = recv_x_bf16.shape
+    moe_inter = w1_fp8.shape[-1]
+    out = torch.zeros(e, recv_max, d, dtype=torch.float32)
+    for ei in range(e):
+        n_rows = int(recv_expert_count[ei, 0].item())
+        if n_rows <= 0:
+            continue
+        x = recv_x_bf16[ei, :n_rows, :].float()
+        w1_s = _b_scale(w1_scale[ei], n_tile_w13, d, moe_inter)
+        w3_s = _b_scale(w3_scale[ei], n_tile_w13, d, moe_inter)
+        w2_s = _b_scale(w2_scale[ei], n_tile_w2, moe_inter, d)
+        gate = _mx_mm(x, w1_fp8[ei], w1_s)
+        up = _mx_mm(x, w3_fp8[ei], w3_s)
+        if swiglu_limit and swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+        h = F.silu(gate) * up
+        y = _mx_mm(h, w2_fp8[ei], w2_s)
+        y = y * recv_weights[ei, :n_rows].reshape(-1, 1).float()
+        out[ei, :n_rows, :] = y
+    return out
+
