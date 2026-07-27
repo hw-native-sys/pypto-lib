@@ -18,6 +18,7 @@ import pypto.language.distributed as pld
 from golden import run_jit
 from hc_head import hc_head
 from lm_head import (
+    GROUP_LOGIT_ROWS,
     MAX_LOGIT_ROWS,
     TP_SIZE as LM_HEAD_TP_SIZE,
     VOCAB as LM_HEAD_VOCAB,
@@ -771,7 +772,7 @@ def l3_decode_fwd(
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     # The LM head owns every window and counter it touches: a peer routes into
     # logits_window while still reading its own hidden_window.
-    lm_head_hidden_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * D * 2)
+    lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
     lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
     lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -814,7 +815,7 @@ def l3_decode_fwd(
     # groups. Every card is both an owner and a TP rank, so the single lm_head
     # dispatch runs on the full world and every peer stays inside its own group.
     for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(lm_head_hidden_window_buf, [MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+        hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
