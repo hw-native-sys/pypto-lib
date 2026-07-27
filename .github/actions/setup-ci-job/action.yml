@@ -298,7 +298,7 @@ runs:
     - name: Check NPU
       if: ${{ inputs.needs-device == 'true' }}
       shell: bash
-      run: npu-smi info
+      run: task-submit --run "npu-smi info"
 
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
     # stale objects compiled against the old ISA headers (see issue #1139):

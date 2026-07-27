@@ -12,7 +12,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # NOTE: every pre-existing job below is temporarily disabled (`if: false`,
+  # kept as `false && <original expr>` where a condition already existed) while
+  # the newly added A5 CI server is being brought up. The only job that runs is
+  # `a5-runner-smoke`, which just proves the npu-a5 runner can be picked up.
+  # To re-enable, drop the `if: false` / `false &&` prefixes.
   pre-commit:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,6 +31,7 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -52,6 +59,7 @@ jobs:
         run: pytest tests/golden -v
 
   detect-changes:
+    if: false
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
@@ -106,7 +114,10 @@ jobs:
 
   sim:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: >-
+      false &&
+      (github.event_name != 'pull_request' ||
+      needs.detect-changes.outputs.has_changes == 'true')
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
@@ -202,7 +213,10 @@ jobs:
 
   a2a3:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: >-
+      false &&
+      (github.event_name != 'pull_request' ||
+      needs.detect-changes.outputs.has_changes == 'true')
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -318,6 +332,7 @@ jobs:
     # its own job (serving-deepseek) so the two models schedule independently and
     # the expensive 8-card borrow does not serialize behind the single-card run.
     if: >-
+      false &&
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
@@ -376,6 +391,7 @@ jobs:
     # of `serving` so the 8-card borrow schedules independently of the single-card
     # qwen3 run. Same setup contract as `serving`; gated by its own model guard.
     if: >-
+      false &&
       github.event_name == 'pull_request' &&
       needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
@@ -430,3 +446,84 @@ jobs:
       - name: Clean up build artifacts
         if: always()
         run: rm -rf serving-checkout/build_output
+
+  a5-runner-smoke:
+    # Bring-up smoke test for the newly added A5 CI server. Structurally a copy
+    # of daily_ci.yml's `model-tests-a5` (same runner labels, same setup-ci-job
+    # contract, same cleanup/report steps), with the actual V4-Pro sweep step
+    # replaced by a plain `echo` — the point here is only to prove the npu-a5
+    # runner gets picked up and the whole setup path (checkout, conda venv,
+    # activate.sh, caches, device check) completes. Every other job in this
+    # workflow is disabled while this bring-up is in progress.
+    runs-on: [self-hosted, linux, arm64, npu-a5]
+    # Keep parity with the daily A5 job's ceiling.
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      # The cache *paths* are exported by setup-ci-job from the runner config's
+      # CI_CACHE_ROOT — a static job-level env: cannot see a step's output.
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
+        # but this job checks the repo out into ./checkout — sparse-fetch just
+        # the action defs at the workspace root first (clean: false leaves
+        # sibling subdir checkouts on this persistent runner untouched).
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: a5-smoke
+          pip-cache-name: pip-a5
+
+      - name: Run V4-Pro tests (a5, via task-submit)
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger — see daily_ci.yml for the full note.
+          PYPTO_RUNTIME_LOG: error
+          PYPTO_BENCH: '1'
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+        run: |
+          echo "Do something"
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Clean up build artifacts
+        if: always()
+        working-directory: checkout
+        run: rm -rf build_output
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-a5-smoke
+          # The smoke step emits no results.tsv, so tolerate its absence rather
+          # than warning on every run; restore the default once this job runs a
+          # real sweep.
+          if-no-files-found: ignore
+          path: checkout/results.tsv
