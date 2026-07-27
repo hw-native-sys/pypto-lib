@@ -58,7 +58,20 @@ _ROPE_INCLUDE_DIRS = _CANN_INCLUDE_DIRS + (
 )
 
 SUPPORTED_PLATFORMS = ("a2a3", "a2a3sim")
-BATCH = 16
+# METADATA_BATCH_SLOTS is the PHYSICAL slot count of the metadata length arrays.
+# It must stay in lockstep with kernel/metadata_layout.h's
+# `kLengthArrayBytes = 16 * sizeof(int64_t)` and with qwen_fai_tiler::kMaxBatch,
+# because tiling/entry.cpp unconditionally writes all 16 slots (zeros past the
+# actual batch) and the barrier region starts right after them. It is NOT the
+# model's batch: shrinking it to track a smaller runtime batch would move
+# kKvLengthsOffset / kBarrierAlignmentOffset and run the barrier off the end of
+# the allocation.
+METADATA_BATCH_SLOTS = 16
+# BATCH_PAD is the padded batch of the STANDALONE test kernels below
+# (qwen_decode_attention_cce / _cache_offset_test). The fused decode path does
+# not use it -- paged_attention_rope_cce takes whatever shapes decode_fwd passes,
+# and the tiler reads the real batch from the seq_lens descriptor at runtime.
+BATCH_PAD = 16
 DEFAULT_BLOCK_DIM = 24
 BLOCK_SIZE = 128
 NUM_HEADS = 40
@@ -68,8 +81,8 @@ KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM
 
 TILING_BYTES = 2488
 CUMULATIVE_Q_OFFSET = TILING_BYTES
-KV_LENGTHS_OFFSET = CUMULATIVE_Q_OFFSET + BATCH * 8
-METADATA_PREFIX_BYTES = KV_LENGTHS_OFFSET + BATCH * 8
+KV_LENGTHS_OFFSET = CUMULATIVE_Q_OFFSET + METADATA_BATCH_SLOTS * 8
+METADATA_PREFIX_BYTES = KV_LENGTHS_OFFSET + METADATA_BATCH_SLOTS * 8
 BARRIER_SLOT_BYTES = 512
 BARRIER_PHYSICAL_LANES = DEFAULT_BLOCK_DIM * 2
 # The CCE wrapper aligns the barrier start at runtime, so reserve one slot of
@@ -168,13 +181,13 @@ def build_paged_attention_metadata(
 
 @pl.jit
 def qwen_decode_attention_cce(
-    query: pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16],
+    query: pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16],
     key_cache: pl.Tensor[[NUM_BLOCKS_DYN, BLOCK_SIZE, KV_HIDDEN], pl.BF16],
     value_cache: pl.Tensor[[NUM_BLOCKS_DYN, BLOCK_SIZE, KV_HIDDEN], pl.BF16],
-    block_table: pl.Tensor[[BATCH, MAX_BLOCKS_DYN], pl.INT32],
-    seq_lens: pl.Tensor[[BATCH], pl.INT32],
-    out: pl.Out[pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16]],
-) -> pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16]:
+    block_table: pl.Tensor[[BATCH_PAD, MAX_BLOCKS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_PAD], pl.INT32],
+    out: pl.Out[pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16]],
+) -> pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16]:
     """Standalone B16 attention with vLLM's active-TND and paged-BSND ABI."""
     key_cache.bind_dynamic(0, NUM_BLOCKS_DYN)
     value_cache.bind_dynamic(0, NUM_BLOCKS_DYN)
@@ -212,13 +225,13 @@ def qwen_decode_attention_cce(
 
 @pl.jit
 def qwen_decode_attention_cache_offset_test(
-    query: pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16],
+    query: pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16],
     key_cache: pl.Tensor[[NUM_BLOCKS_DYN, BLOCK_SIZE, KV_HIDDEN], pl.BF16],
     value_cache: pl.Tensor[[NUM_BLOCKS_DYN, BLOCK_SIZE, KV_HIDDEN], pl.BF16],
-    block_table: pl.Tensor[[BATCH, MAX_BLOCKS_DYN], pl.INT32],
-    seq_lens: pl.Tensor[[BATCH], pl.INT32],
-    out: pl.Out[pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16]],
-) -> pl.Tensor[[BATCH, NUM_HEADS, HEAD_DIM], pl.BF16]:
+    block_table: pl.Tensor[[BATCH_PAD, MAX_BLOCKS_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_PAD], pl.INT32],
+    out: pl.Out[pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16]],
+) -> pl.Tensor[[BATCH_PAD, NUM_HEADS, HEAD_DIM], pl.BF16]:
     """Read the second layer from a two-layer paged KV pool."""
     key_cache.bind_dynamic(0, NUM_BLOCKS_DYN)
     value_cache.bind_dynamic(0, NUM_BLOCKS_DYN)
@@ -256,7 +269,7 @@ def qwen_decode_attention_cache_offset_test(
 
 
 __all__ = [
-    "BATCH",
+    "BATCH_PAD",
     "BLOCK_SIZE",
     "DEFAULT_BLOCK_DIM",
     "HEAD_DIM",

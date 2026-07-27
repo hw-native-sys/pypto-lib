@@ -21,7 +21,10 @@ from constants import QWEN3_14B_TILING as QWEN3_14B_TILING
 class Qwen3DynamicDims:
     """Dynamic dimensions used by the JIT/program signatures."""
 
-    user_batch: Any
+    # batch: the public (runtime) batch. Kernels read it with
+    # pl.tensor.dim(seq_lens, 0); the internal pipeline stays padded to
+    # QWEN3_14B.batch_pad rows.
+    batch: Any
     kv_cache_rows: Any
     block_table_flat: Any
     rope_seq: Any
@@ -30,7 +33,7 @@ class Qwen3DynamicDims:
     layer_inter_rows: Any
 
 QWEN3_14B_DIMS = Qwen3DynamicDims(
-    user_batch=pl.dynamic("USER_BATCH_DYN"),
+    batch=pl.dynamic("BATCH_DYN"),
     kv_cache_rows=pl.dynamic("KV_CACHE_ROWS_DYN"),
     block_table_flat=pl.dynamic("BLOCK_TABLE_FLAT_DYN"),
     rope_seq=pl.dynamic("ROPE_SEQ_DYN"),

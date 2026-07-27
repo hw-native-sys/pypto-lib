@@ -18,9 +18,9 @@ decode_fwd.py full-layer structure.
 Dynamic batch design
 --------------------
 Every batch-dependent kernel signature dim is a `pl.dynamic(...)` variable
-(`USER_BATCH_DYN` / `PREFILL_TOKENS_DYN` / `KV_CACHE_ROWS_DYN` /
+(`BATCH_DYN` / `PREFILL_TOKENS_DYN` / `KV_CACHE_ROWS_DYN` /
 `BLOCK_TABLE_FLAT_DYN`), so a single compiled program serves any
-`user_batch <= host KV-cache capacity`. Host allocates the input/output
+`batch <= host KV-cache capacity`. Host allocates the input/output
 token ids and slot mapping as packed token-major tensors with leading dim
 `T = sum(chunk_lens)` (no `[batch, max_seq]` padding). The embedding table is
 gathered on device before the first transformer layer. `seq_lens`
@@ -29,7 +29,7 @@ and `chunk_offsets` identify each batch row's slice inside the packed chunk.
 
 Unlike the decode path, prefill bounds hidden-state lifetime by processing
 128-token windows. Batch-1 uses a compact `[128, HIDDEN]` window so it does
-not pay for fake batch rows; larger batches use one fixed `[BATCH * 128,
+not pay for fake batch rows; larger batches use one fixed `[BATCH_PAD * 128,
 HIDDEN]` packed group per window to preserve the batch-16 prefill schedule.
 The per-token `valid_tok` + `valid_shape` pattern still handles sequence-length
 variation inside each window.
@@ -43,7 +43,7 @@ from config import (
 )
 from rms_lm_head import rms_lm_head
 
-USER_BATCH_DYN = D.user_batch
+BATCH_DYN = D.batch
 KV_CACHE_ROWS_DYN = D.kv_cache_rows
 BLOCK_TABLE_FLAT_DYN = D.block_table_flat
 LAYER_DYN = D.layer
@@ -51,7 +51,7 @@ LAYER_HIDDEN_ROWS_DYN = D.layer_hidden_rows
 LAYER_INTER_ROWS_DYN = D.layer_inter_rows
 PREFILL_TOKENS_DYN = pl.dynamic("PREFILL_TOKENS_DYN")
 
-BATCH = M.batch
+BATCH_PAD = M.batch_pad
 MODEL_MAX_SEQ = M.max_seq
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads
@@ -671,9 +671,9 @@ def _attention_phase_window_full_single_block(
 @pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     group_p0: pl.Scalar[pl.INDEX],
     active_prefill_tokens: pl.Scalar[pl.INDEX],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
@@ -699,10 +699,10 @@ def prefill_layer(
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     out.bind_dynamic(0, PREFILL_TOKENS_DYN)
 
-    # Runtime user_batch (host-visible batch). Outer batch loop
+    # Runtime batch (host-visible batch). Outer batch loop
     # iterates with step 1 so every matmul tile's M dim is fully
     # determined by TOK_TILE (no batch-axis pad / trim needed).
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
     k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
@@ -711,7 +711,7 @@ def prefill_layer(
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
     layer_cache_base = layer_idx * layer_cache_rows
-    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // batch
 
     # ── Phase-major MLP staging ──
     # The MLP weights (w_gate/w_up/w_down, ~178MB each) don't fit L2 alongside
@@ -722,7 +722,7 @@ def prefill_layer(
     # the batch loop) runs gate/up/down as flat, band-grouped token-tile sweeps
     # so each weight streams from HBM once and is reused across every token tile.
     # ``hidden_states`` may be a static-capacity group buffer
-    # ([BATCH * MLP_M_TILE, HIDDEN]). Drive token-tile work from the active
+    # ([BATCH_PAD * MLP_M_TILE, HIDDEN]). Drive token-tile work from the active
     # packed rows so partial batches do not run fake MLP tiles.
     prefill_tokens = active_prefill_tokens
     num_tok_tiles = (prefill_tokens + TOK_TILE - 1) // TOK_TILE
@@ -733,7 +733,7 @@ def prefill_layer(
     post_norm_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.BF16)
     resid1_all = pl.create_tensor([toks_pad, HIDDEN], dtype=pl.FP32)
 
-    for b in pl.parallel(0, user_batch, 1):
+    for b in pl.parallel(0, batch, 1):
         original_token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX) + group_p0
         token_base = pl.cast(b * MLP_M_TILE, pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
@@ -1270,9 +1270,9 @@ def prefill_layer(
 @pl.jit(auto_scope=False)
 def prefill_fwd(
     input_ids: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.BF16],
@@ -1293,25 +1293,25 @@ def prefill_fwd(
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Out[pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]],
-) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     input_ids.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    seq_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_offsets.bind_dynamic(0, USER_BATCH_DYN)
-    out.bind_dynamic(0, USER_BATCH_DYN)
+    seq_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_offsets.bind_dynamic(0, BATCH_DYN)
+    out.bind_dynamic(0, BATCH_DYN)
     block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
     slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
     k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
 
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
 
-    final_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    final_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
 
     max_chunk_len = pl.tensor.read(chunk_lens, [0])
-    for b in pl.range(1, user_batch):
+    for b in pl.range(1, batch):
         max_chunk_len = pl.max(max_chunk_len, pl.tensor.read(chunk_lens, [b]))
 
     group_blocks = (max_chunk_len + MLP_M_TILE - 1) // MLP_M_TILE
@@ -1320,7 +1320,7 @@ def prefill_fwd(
         # hidden buffers below; removing it keeps old windows live until function exit.
         with pl.scope():
             p0 = p0_idx * MLP_M_TILE
-            if user_batch == 1:
+            if batch == 1:
                 window_hidden = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16)
                 token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
                 chunk_len_b = pl.tensor.read(chunk_lens, [0])
@@ -1392,15 +1392,15 @@ def prefill_fwd(
                                 )
                                 final_hidden = pl.assemble(final_hidden, final_hidden_chunk, [0, k0])
             else:
-                group_hidden = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                group_hidden = pl.create_tensor([BATCH_PAD * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
 
-                with pl.spmd(BATCH * (MLP_M_TILE // TOK_TILE), name_hint="token_embed_group"):
+                with pl.spmd(BATCH_PAD * (MLP_M_TILE // TOK_TILE), name_hint="token_embed_group"):
                     tile_id = pl.tile.get_block_idx()
                     b = tile_id // (MLP_M_TILE // TOK_TILE)
                     tile_rem = tile_id - b * (MLP_M_TILE // TOK_TILE)
                     local_p0 = tile_rem * TOK_TILE
                     group_p0 = b * MLP_M_TILE + local_p0
-                    if b < user_batch:
+                    if b < batch:
                         token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
                         chunk_len_b = pl.tensor.read(chunk_lens, [b])
                         valid_tok = pl.min(TOK_TILE, pl.max(chunk_len_b - p0 - local_p0, 0))
@@ -1424,14 +1424,14 @@ def prefill_fwd(
 
                 for layer_idx in pl.range(num_layers_actual):
                     with pl.scope():
-                        group_next = pl.create_tensor([BATCH * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
+                        group_next = pl.create_tensor([BATCH_PAD * MLP_M_TILE, HIDDEN], dtype=pl.BF16)
                         group_hidden = prefill_layer(
                             group_hidden,
                             seq_lens,
                             chunk_lens,
                             chunk_offsets,
                             pl.cast(p0, pl.INDEX),
-                            pl.cast(user_batch * MLP_M_TILE, pl.INDEX),
+                            pl.cast(batch * MLP_M_TILE, pl.INDEX),
                             input_rms_weight,
                             wq,
                             wk,
@@ -1452,7 +1452,7 @@ def prefill_fwd(
                             group_next,
                             layer_idx,
                         )
-                for b in pl.parallel(0, user_batch, 1):
+                for b in pl.parallel(0, batch, 1):
                     chunk_len_b = pl.tensor.read(chunk_lens, [b])
                     if chunk_len_b > 0:
                         last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
@@ -1474,7 +1474,7 @@ def prefill_fwd(
 
 
 def build_tensor_specs(
-    batch: int = BATCH,
+    batch: int = BATCH_PAD,
     max_seq: int = MAX_SEQ,
     hidden_size: int = HIDDEN,
     num_heads: int = NUM_HEADS,
@@ -1942,7 +1942,7 @@ if __name__ == "__main__":
         "-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"]
     )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("-b", "--batch", type=int, default=BATCH,
+    parser.add_argument("-b", "--batch", type=int, default=BATCH_PAD,
                         help=("User-visible batch size. Host allocates every "
                               "batch-dependent tensor at exactly this size; "
                               "every kernel signature batch-axis dim is a "

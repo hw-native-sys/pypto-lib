@@ -201,13 +201,43 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   // GM writes visible to every core before the attention phase reads them.
   if constexpr (WithRope) {
 #ifdef __DAV_C220_VEC__
-    // Drive the golden-correct pypto-generated rope_qkv (copied verbatim). The
-    // fused ABI packs 17 tensors then the sole scalar; map them to the
-    // generated parameter order (k_cache, q_tnd, v_cache, seq_lens, inv_rms,
-    // slot_mapping, rope_cos, rope_sin, k_proj, k_norm_w, v_proj, q_proj,
-    // q_norm_w, layer_cache_base, KV_CACHE_ROWS, block_idx, block_num).
-    int64_t kv_cache_rows = static_cast<int64_t>(
-        reinterpret_cast<__gm__ Tensor *>(args[2])->shapes[0]);
+    // Guard the hand-written mapping below against ABI drift in the generated
+    // body. Regenerating rope_qkv_regen.py with a different dynamic-dim or
+    // captured-scalar set changes this signature's ARITY, which this catches at
+    // compile time. It cannot catch two same-typed int64 parameters being
+    // swapped, so keep the order comment below in sync with the emitted
+    // launcher's forwarding call.
+    static_assert(
+        __is_same(
+            decltype(&qwen_rope_gen::rope_qkv),
+            void (*)(__gm__ bfloat16_t *, __gm__ bfloat16_t *, __gm__ bfloat16_t *,
+                     __gm__ int32_t *, __gm__ float *, __gm__ int32_t *, __gm__ float *,
+                     __gm__ float *, __gm__ float *, __gm__ float *, __gm__ float *,
+                     __gm__ float *, __gm__ float *, int64_t, int64_t, int64_t,
+                     int32_t, int32_t)),
+        "rope_qkv signature drifted from the arg mapping below -- re-derive it "
+        "from the launcher's forwarding call in rope_qkv_generated.hpp's preamble");
+    // Drive the golden-correct pypto-generated rope_qkv. The fused ABI packs 17
+    // tensors then the sole scalar; map them to the generated parameter order,
+    // which is reproduced verbatim in rope_qkv_generated.hpp's preamble:
+    //   0-12 k_cache, q_tnd, v_cache, seq_lens, inv_rms, slot_mapping,
+    //        rope_cos, rope_sin, k_proj, k_norm_w, v_proj, q_proj, q_norm_w
+    //   13   unused captured loop scalar (dead in the body -- see below)
+    //   14   layer_cache_base
+    //   15   batch          <- the PUBLIC batch, from the seq_lens descriptor
+    //   16-17 block_idx, block_num
+    //
+    // The batch is read from the seq_lens tensor DESCRIPTOR, exactly like the
+    // tiler does (tiling/entry.cpp), so the RoPE phase and the attention phase
+    // can never disagree about how many sequences are live.
+    int64_t rope_batch = static_cast<int64_t>(
+        reinterpret_cast<__gm__ Tensor *>(args[16])->shapes[0]);
+    // Parameter 13 is a loop-induction scalar the pypto scope captured while
+    // making layer_cache_base an opaque runtime value; it is provably dead in
+    // the generated body (its only occurrence is the signature), so any value
+    // works. Kept explicit rather than removed: dropping it would desynchronize
+    // this call from the emitted signature.
+    constexpr int64_t kUnusedCapturedScalar = 0;
     uint32_t rope_lane = block_idx * 2 + sub_block_idx;
     if (rope_lane < kQwenRopeCores) {
       qwen_rope_gen::rope_qkv(
@@ -224,7 +254,7 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 9)),
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 7)),
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 10)),
-          static_cast<int64_t>(args[17]), kv_cache_rows,
+          kUnusedCapturedScalar, static_cast<int64_t>(args[17]), rope_batch,
           static_cast<int32_t>(rope_lane),
           static_cast<int32_t>(kQwenRopeCores));
     }

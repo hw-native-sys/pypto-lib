@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -166,20 +167,27 @@ def test_fused_attention_uses_standalone_rope_worker_count() -> None:
     )
     fai_body = (kernel_dir / "fai_body.hpp").read_text()
     assert f"constexpr uint32_t kQwenRopeCores = {rope_cores};" in fai_body
+    # Match the lane guard and the guarded call, but NOT the call's trailing
+    # arguments: regenerating the RoPE body can change the parameter list (e.g.
+    # adding a dynamic-dim scalar), and that is a legitimate change this test
+    # should not block. The arg mapping itself is covered by the static_assert
+    # on the function-pointer type in fai_body.hpp.
     guarded_call = re.search(
         r"uint32_t rope_lane = block_idx \* 2 \+ sub_block_idx;\s*"
         r"if \(rope_lane < kQwenRopeCores\) \{\s*"
-        r"qwen_rope_gen::rope_qkv\(.*?"
-        r"static_cast<int32_t>\(rope_lane\),\s*"
-        r"static_cast<int32_t>\(kQwenRopeCores\)\);\s*\}",
+        r"qwen_rope_gen::rope_qkv\(",
         fai_body,
         flags=re.DOTALL,
     )
     assert guarded_call is not None
 
+    # Anchor on the hand-written provenance banner, not on a generated
+    # `const int64_t vNN = 32;` line -- SSA constants are renumbered by every
+    # regeneration, so pinning one makes any regen look like a real failure.
     generated_rope = (kernel_dir / "rope_qkv_generated.hpp").read_text()
-    assert f"const int64_t v27 = {rope_cores};" in generated_rope, (
-        "update the fused lane guard when regenerating the specialized RoPE body"
+    assert f"// ROPE_CORES: {rope_cores}" in generated_rope, (
+        "update the ROPE_CORES provenance banner in rope_qkv_generated.hpp's "
+        "hand-written preamble when regenerating the specialized RoPE body"
     )
 
 
@@ -210,24 +218,148 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
     assert len(greedy_args) == len(inspect.signature(loaded.functions["greedy_sample_fwd"]._func).parameters)
 
 
-def test_decode_contract_uses_static_batch_sixteen() -> None:
+def _rope_qkv_function_body() -> str:
+    path = (
+        _REPO_ROOT / "models" / "qwen3" / "14b" / "kernels" / "paged_attention_cce"
+        / "kernel" / "rope_qkv_generated.hpp"
+    )
+    src = path.read_text()
+    start = src.index("static __aicore__ void rope_qkv(")
+    depth, idx = 0, src.index("{", start)
+    while True:
+        if src[idx] == "{":
+            depth += 1
+        elif src[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start:idx + 1]
+        idx += 1
+
+
+_FLAG_RE = re.compile(r"(set_flag|wait_flag)\((\w+),\s*(\w+),\s*(\w+)\)")
+
+
+def _flag_balance(text: str) -> tuple[Counter, Counter]:
+    sets: Counter = Counter()
+    waits: Counter = Counter()
+    for kind, src_pipe, dst_pipe, event in _FLAG_RE.findall(text):
+        (sets if kind == "set_flag" else waits)[(src_pipe, dst_pipe, event)] += 1
+    return sets, waits
+
+
+def test_generated_rope_every_feasible_path_is_sync_safe() -> None:
+    """Every executable path through the guarded RoPE items must not deadlock.
+
+    The generated body runs two guarded item blocks per pipeline iteration:
+    ``if (item < NUM_KV_HEADS * batch) { ... }``. At the padded batch both
+    guards are always true (max item id 127 < 128), so the skip path never runs
+    today -- but a runtime batch < BATCH_PAD makes it live, and a skipped block
+    owning a ``set_flag`` whose ``wait_flag`` still executes would hang the AIV.
+
+    Model the feasible paths rather than asserting per-block balance: the two
+    blocks handle items ``L`` and ``L + ROPE_CORES``, so the guard can only ever
+    drop the *later* one. Executing block 1 without block 0 is unreachable, and
+    a future codegen where block 0 legitimately hands a credit to block 1 must
+    not be rejected. Simulate each reachable path in source order and require
+    that no wait ever runs without an outstanding set, and that the epilogue
+    drains every credit.
+    """
+    body = _rope_qkv_function_body()
+    lines = body.split("\n")
+
+    blocks: list[tuple[int, int]] = []
+    for n, line in enumerate(lines):
+        if not re.match(r"\s*if \(v\d+ < v\d+\) \{", line):
+            continue
+        depth = 0
+        for end in range(n, len(lines)):
+            depth += lines[end].count("{") - lines[end].count("}")
+            if depth == 0 and end > n:
+                blocks.append((n, end))
+                break
+    assert len(blocks) == 2, f"expected 2 guarded item blocks, found {len(blocks)}"
+
+    def line_block(index: int) -> int | None:
+        for b, (start, end) in enumerate(blocks):
+            if start <= index <= end:
+                return b
+        return None
+
+    # Reachable prefixes only: item L+ROPE_CORES cannot pass a guard that item L
+    # failed, so {block 1 alone} is not a reachable state.
+    for taken in ((), (0,), (0, 1)):
+        credits: Counter = Counter()
+        for index, line in enumerate(lines):
+            owner = line_block(index)
+            if owner is not None and owner not in taken:
+                continue
+            for kind, src_pipe, dst_pipe, event in _FLAG_RE.findall(line):
+                key = (src_pipe, dst_pipe, event)
+                if kind == "set_flag":
+                    credits[key] += 1
+                else:
+                    assert credits[key] > 0, (
+                        f"path {taken or '(no guarded block)'}: wait_flag{key} at "
+                        f"generated line {index} has no outstanding set_flag -- "
+                        f"this path would hang the AIV at a runtime batch < BATCH_PAD"
+                    )
+                    credits[key] -= 1
+        outstanding = {k: v for k, v in credits.items() if v}
+        assert not outstanding, (
+            f"path {taken or '(no guarded block)'} leaves undrained sync credits "
+            f"{outstanding}; the epilogue must consume exactly what the prologue set"
+        )
+
+
+def test_decode_contract_uses_dynamic_batch() -> None:
+    """decode serves any public batch in [1, batch_pad] from one compiled program.
+
+    Every host-visible batch axis is the same ``BATCH`` dim (prefill uses it too,
+    so the two stages no longer spell the same concept differently), and
+    ``limits["batch"]`` is the UPPER BOUND -- the padded pipeline width -- not a
+    required exact value.
+    """
     contract = get_contract("qwen3", "14b")
     decode_args = {arg.name: arg.shape for arg in contract.kernels["decode"].args}
 
     assert contract.limits["batch"] == 16
-    assert decode_args["seq_lens"] == ("B",)
-    assert decode_args["slot_mapping"] == ("B",)
-    assert decode_args["out"] == ("B", "VOCAB")
-    assert decode_args["sampled_ids_in"] == ("B", "SAMPLED_IDS_PAD")
-    assert decode_args["sampled_ids"] == ("B", "SAMPLED_IDS_PAD")
-    assert decode_args["next_hidden"] == ("B", "H")
+    assert decode_args["seq_lens"] == ("BATCH",)
+    assert decode_args["slot_mapping"] == ("BATCH",)
+    assert decode_args["out"] == ("BATCH", "VOCAB")
+    assert decode_args["sampled_ids_in"] == ("BATCH", "SAMPLED_IDS_PAD")
+    assert decode_args["sampled_ids"] == ("BATCH", "SAMPLED_IDS_PAD")
+    assert decode_args["next_hidden"] == ("BATCH", "H")
 
+    # prefill already used a dynamic batch axis; decode must now name it the same.
+    prefill_args = {arg.name: arg.shape for arg in contract.kernels["prefill"].args}
+    assert prefill_args["seq_lens"] == ("BATCH",)
+
+    # Compile-time dummies stay sized at the padded width -- they bound buffer
+    # capacity, not the runtime shape.
     compile_args = contract.kernels["decode"].compile_args_builder(
         _tiny_model_config(),
         _runtime_config(),
     )
     assert compile_args[6].shape == (16,)
     assert compile_args[-1].shape == (16, 8)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 8, 15, 16])
+def test_decode_contract_accepts_batch_within_pad(batch: int) -> None:
+    runtime = _runtime_config()
+    runtime.max_batch_size = batch
+    contract = get_contract("qwen3", "14b")
+    # Must not raise: any batch up to the padded width is servable.
+    contract.kernels["decode"].compile_args_builder(_tiny_model_config(), runtime)
+
+
+@pytest.mark.parametrize("batch", [0, 17, 32])
+def test_decode_contract_rejects_batch_outside_pad(batch: int) -> None:
+    runtime = _runtime_config()
+    runtime.max_batch_size = batch
+    contract = get_contract("qwen3", "14b")
+    with pytest.raises(ValueError, match="max_batch_size"):
+        contract.kernels["decode"].compile_args_builder(_tiny_model_config(), runtime)
 
 
 def test_runtime_arg_builders_follow_host_order() -> None:

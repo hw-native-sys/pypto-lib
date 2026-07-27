@@ -16,7 +16,7 @@ from config import QWEN3_14B as M
 from config import QWEN3_14B_TILING as T
 
 
-BATCH = M.batch
+BATCH_PAD = M.batch_pad
 VOCAB = M.vocab
 REAL_VOCAB = M.real_vocab
 VOCAB_CHUNK = T.vocab_chunk
@@ -47,7 +47,7 @@ assert NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 
 @pl.jit.inline
 def _topk_group_pairs(
-    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
+    logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
     batch_idx: pl.Scalar[pl.INDEX],
     group_idx: pl.Scalar[pl.INDEX],
 ):
@@ -67,13 +67,13 @@ def _topk_group_pairs(
 
 @pl.jit
 def topk_select_fwd(
-    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
+    logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
     sampling_control: pl.Tensor[[2], pl.INT32],
-    topk_values: pl.Out[pl.Tensor[[BATCH, TOPK], pl.FP32]],
-    topk_indices: pl.Out[pl.Tensor[[BATCH, TOPK], pl.INT32]],
+    topk_values: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.FP32]],
+    topk_indices: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.INT32]],
 ):
     """Return greedy top-1 or the largest TOPK real-vocab candidates per row."""
-    for b in pl.parallel(BATCH):
+    for b in pl.parallel(BATCH_PAD):
         if b < pl.read(sampling_control, [0]):
             if pl.read(sampling_control, [1]) == 1:
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_select"):
@@ -261,17 +261,17 @@ def build_tensor_specs(selection_k=TOPK):
 
     def init_logits():
         if selection_k == 1:
-            logits = torch.full((BATCH, VOCAB), -1000.0, dtype=torch.float32)
+            logits = torch.full((BATCH_PAD, VOCAB), -1000.0, dtype=torch.float32)
             logits[:, 7] = 5.0
             logits[:, 42] = 5.0
             if REAL_VOCAB < VOCAB:
                 logits[0, REAL_VOCAB] = 6.0
             return logits
 
-        logits = torch.randn(BATCH, VOCAB, dtype=torch.float32)
+        logits = torch.randn(BATCH_PAD, VOCAB, dtype=torch.float32)
         logits[:, REAL_VOCAB:] = -1000.0
         logits[0, 0:TOPK] = torch.arange(TOPK, 0, -1, dtype=torch.float32) + 1000.0
-        if BATCH > 1:
+        if BATCH_PAD > 1:
             spread_ids = torch.arange(TOPK, dtype=torch.long) * (REAL_VOCAB // TOPK) + 7
             logits[1, spread_ids] = torch.arange(TOPK, 0, -1, dtype=torch.float32) + 1000.0
         if REAL_VOCAB < VOCAB:
@@ -279,15 +279,15 @@ def build_tensor_specs(selection_k=TOPK):
         return logits
 
     return [
-        TensorSpec("logits", [BATCH, VOCAB], torch.float32, init_value=init_logits),
+        TensorSpec("logits", [BATCH_PAD, VOCAB], torch.float32, init_value=init_logits),
         TensorSpec(
             "sampling_control",
             [2],
             torch.int32,
             init_value=lambda: torch.tensor([2 if selection_k == TOPK else 1, selection_k], dtype=torch.int32),
         ),
-        TensorSpec("topk_values", [BATCH, TOPK], torch.float32, is_output=True),
-        TensorSpec("topk_indices", [BATCH, TOPK], torch.int32, is_output=True),
+        TensorSpec("topk_values", [BATCH_PAD, TOPK], torch.float32, is_output=True),
+        TensorSpec("topk_indices", [BATCH_PAD, TOPK], torch.int32, is_output=True),
     ]
 
 

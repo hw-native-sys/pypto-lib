@@ -32,7 +32,12 @@ class Qwen3Config:
     variant: str
 
     # Model shape.
-    batch: int
+    # batch_pad: the row count the decode pipeline is PADDED to -- it is the M of
+    # every matmul, not an architectural ceiling. The public batch is dynamic and
+    # satisfies 1 <= batch <= batch_pad. Raising it is possible but not free: it
+    # needs kMaxBatch + the metadata length arrays bumped on the CCE side, and the
+    # M-dimension tiling (TN/TK/MLP_TN/DOWN_TN) re-validated against L0C/Mat/UB.
+    batch_pad: int
     max_seq: int
     num_heads: int
     num_kv_heads: int
@@ -93,7 +98,7 @@ QWEN3_14B = Qwen3Config(
     name="qwen3-14b",
     family="qwen3",
     variant="14b",
-    batch=16,
+    batch_pad=16,
     max_seq=4096,
     num_heads=40,
     num_kv_heads=8,

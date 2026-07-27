@@ -17,9 +17,9 @@ from config import (
     QWEN3_14B as M,
 )
 
-USER_BATCH_DYN = D.user_batch
+BATCH_DYN = D.batch
 
-BATCH = M.batch
+BATCH_PAD = M.batch_pad
 HIDDEN = M.hidden
 VOCAB = M.vocab
 EPS = M.eps
@@ -45,16 +45,16 @@ LM_HEAD_CORES = 24
 
 @pl.jit.inline
 def rms_lm_head(
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
-) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    batch = pl.tensor.dim(seq_lens, 0)
 
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    final_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
+    for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="final_rmsnorm",
@@ -99,20 +99,20 @@ def rms_lm_head(
     # q_proj / fa_fused / out_proj. Each block owns a DISJOINT set of vocab columns,
     # so there is no split-K / atomic-add and the output is bit-identical to the
     # fan-out. M tiles (b0) are walked serially inside each block, mirroring the
-    # final_rmsnorm loop above (BATCH == BATCH_TILE today, so it runs once).
+    # final_rmsnorm loop above (BATCH_PAD == BATCH_TILE today, so it runs once).
     for lm_core in pl.spmd(
         LM_HEAD_CORES,
         name_hint="lm_head",
         allow_early_resolve=True,
     ):
-        for b0 in pl.range(0, BATCH, BATCH_TILE):
-            lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
+        for b0 in pl.range(0, BATCH_PAD, BATCH_TILE):
+            lm_valid_rows = pl.min(BATCH_TILE, batch - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
                 lm_o0 = ob * VOCAB_CHUNK
                 # matmul (cube), then trim the L0C result to the dynamic user-batch rows
                 # via set_validshape and store straight to `out` (no GM scratch + separate
                 # vector store). The valid-row trim bounds the write into the
-                # dynamic-shaped `out` [USER_BATCH_DYN, VOCAB].
+                # dynamic-shaped `out` [BATCH_DYN, VOCAB].
                 lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
                 lm_weight_chunk = pl.slice(lm_head_weight, [VOCAB_CHUNK, LM_HEAD_K_CHUNK], [lm_o0, 0])
                 lm_acc = pl.matmul(lm_hidden_chunk, lm_weight_chunk, out_dtype=pl.FP32, b_trans=True)
@@ -137,16 +137,16 @@ def rms_lm_head(
 
 @pl.jit.inline
 def rms_lm_head_fp32(
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.FP32],
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
-) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
+    batch = pl.tensor.dim(seq_lens, 0)
 
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    final_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
+    for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="final_rmsnorm",
@@ -184,8 +184,8 @@ def rms_lm_head_fp32(
         name_hint="lm_head",
         allow_early_resolve=True,
     ):
-        for b0 in pl.range(0, BATCH, BATCH_TILE):
-            lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
+        for b0 in pl.range(0, BATCH_PAD, BATCH_TILE):
+            lm_valid_rows = pl.min(BATCH_TILE, batch - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
                 lm_o0 = ob * VOCAB_CHUNK
                 lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
@@ -208,12 +208,12 @@ def rms_lm_head_fp32(
 
 @pl.jit.inline
 def rms_only(
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
-) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     """Variant of rms_lm_head that performs the final RMSNorm but skips the
     LM-head matmul entirely. ``out`` is returned untouched (the harness
     zero-inits it), and ``lm_head_weight`` is accepted but unused so the
@@ -227,8 +227,8 @@ def rms_only(
     measured RMSNorm cost collapses to ~0 in perf traces, force ``final_normed``
     live by writing a small slice (e.g. ``out[:, :HIDDEN]`` cast to FP32) and
     mirroring the same dummy slice in ``golden_decode_layer_no_lm_head``."""
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    final_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
+    for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
             sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
@@ -268,19 +268,19 @@ def rms_only(
 
 @pl.jit.inline
 def rms_lm_head_single_chunk(
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    out: pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32],
-) -> pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]:
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
     """Variant of rms_lm_head that runs only the first ``VOCAB_CHUNK`` of the
     LM-head matmul (one outer ``ob`` iteration). Rows past ``VOCAB_CHUNK``
     stay zero-initialised by the harness."""
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    batch = pl.tensor.dim(seq_lens, 0)
 
-    final_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
+    final_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
+    for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="final_rmsnorm"):
             sq_sum = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
             for kb in pl.range(HIDDEN // FINAL_RMS_K_CHUNK):
@@ -315,8 +315,8 @@ def rms_lm_head_single_chunk(
                     [b0, final_norm_k0],
                 )
 
-    for b0 in pl.parallel(0, BATCH, BATCH_TILE):
-        lm_valid_rows = pl.min(BATCH_TILE, user_batch - b0)
+    for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
+        lm_valid_rows = pl.min(BATCH_TILE, batch - b0)
         lm_o0 = 0
         lm_acc_gm = pl.create_tensor([BATCH_TILE, VOCAB_CHUNK], dtype=pl.FP32)
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head"):

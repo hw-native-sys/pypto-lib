@@ -51,9 +51,9 @@ def _arg(
 
 _PREFILL_ARGS = (
     _arg("hidden_states", "bf16", ("PREFILL_TOKENS", "H")),
-    _arg("seq_lens", "int32", ("USER_BATCH",)),
-    _arg("chunk_lens", "int32", ("USER_BATCH",)),
-    _arg("chunk_offsets", "int32", ("USER_BATCH",)),
+    _arg("seq_lens", "int32", ("BATCH",)),
+    _arg("chunk_lens", "int32", ("BATCH",)),
+    _arg("chunk_offsets", "int32", ("BATCH",)),
     _arg("input_rms_weight", "fp32", ("L", "H")),
     _arg("wq", "bf16", ("L*H", "H")),
     _arg("wk", "bf16", ("L*H", "KVH")),
@@ -73,7 +73,7 @@ _PREFILL_ARGS = (
     _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
-    _arg("out", "fp32", ("USER_BATCH", "VOCAB"), "out"),
+    _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
 )
 
 _DECODE_ARGS = (
@@ -83,9 +83,9 @@ _DECODE_ARGS = (
     _arg("wv", "bf16", ("L*H", "KVH")),
     _arg("q_norm_weight", "fp32", ("L", "D")),
     _arg("k_norm_weight", "fp32", ("L", "D")),
-    _arg("seq_lens", "int32", ("B",)),
+    _arg("seq_lens", "int32", ("BATCH",)),
     _arg("block_table", "int32", ("BLOCK_TABLE_FLAT",)),
-    _arg("slot_mapping", "int32", ("B",)),
+    _arg("slot_mapping", "int32", ("BATCH",)),
     _arg("rope_cos", "fp32", ("MAX_SEQ", "D")),
     _arg("rope_sin", "fp32", ("MAX_SEQ", "D")),
     _arg("k_cache", "bf16", ("KV_CACHE_ROWS", "D"), "inout"),
@@ -97,11 +97,11 @@ _DECODE_ARGS = (
     _arg("post_rms_weight", "fp32", ("L", "H")),
     _arg("final_norm_weight", "fp32", (1, "H")),
     _arg("lm_head_weight", "bf16", ("VOCAB", "H")),
-    _arg("out", "fp32", ("B", "VOCAB"), "out"),
+    _arg("out", "fp32", ("BATCH", "VOCAB"), "out"),
     _arg("embed_weight", "bf16", ("VOCAB", "H")),
-    _arg("sampled_ids_in", "int32", ("B", "SAMPLED_IDS_PAD")),
-    _arg("sampled_ids", "int32", ("B", "SAMPLED_IDS_PAD"), "out"),
-    _arg("next_hidden", "bf16", ("B", "H"), "out"),
+    _arg("sampled_ids_in", "int32", ("BATCH", "SAMPLED_IDS_PAD")),
+    _arg("sampled_ids", "int32", ("BATCH", "SAMPLED_IDS_PAD"), "out"),
+    _arg("next_hidden", "bf16", ("BATCH", "H"), "out"),
 )
 
 
@@ -427,7 +427,7 @@ def load_qwen3_kernel_modules() -> LoadedKernelModules:
             "prefill_block_size": int(modules["prefill"].BLOCK_SIZE),
             "decode_seq_tile": int(decode.SEQ_TILE),
             "decode_block_size": int(decode.BLOCK_SIZE),
-            "decode_batch": int(decode.BATCH),
+            "decode_batch_pad": int(decode.BATCH_PAD),
             "decode_max_seq": int(getattr(decode, "MAX_SEQ", QWEN3_14B.max_seq)),
             "decode_vocab": int(decode.VOCAB),
             "decode_real_vocab": int(decode.REAL_VOCAB),
@@ -435,7 +435,7 @@ def load_qwen3_kernel_modules() -> LoadedKernelModules:
             "decode_sampled_ids_pad": int(
                 getattr(decode, "SAMPLED_IDS_PAD", getattr(greedy_sample, "SAMPLED_IDS_PAD", 1))
             ),
-            "greedy_sample_batch": int(greedy_sample.BATCH),
+            "greedy_sample_batch_pad": int(greedy_sample.BATCH_PAD),
             "greedy_sample_vocab": int(greedy_sample.VOCAB),
             "greedy_sample_sampled_ids_pad": int(greedy_sample.SAMPLED_IDS_PAD),
         },
@@ -454,18 +454,18 @@ def validate_qwen3_kernel_modules(
     if config is None or runtime is None:
         raise TypeError("Qwen3-14B validation expects a model object with config and runtime attributes.")
     padded_vocab = _round_up(int(config.vocab_size), QWEN3_14B_TILING.vocab_chunk)
-    kernel_batch = int(contract.limits["batch"])
+    kernel_batch_pad = int(contract.limits["batch"])
 
     _expect(constants, "prefill_seq_tile", QWEN3_14B_TILING.seq_tile, "prefill_fwd SEQ_TILE mismatch")
     _expect(constants, "prefill_block_size", QWEN3_14B_TILING.block_size, "prefill_fwd BLOCK_SIZE mismatch")
     _expect(constants, "decode_seq_tile", QWEN3_14B_TILING.seq_tile, "decode_fwd SEQ_TILE mismatch")
     _expect(constants, "decode_block_size", QWEN3_14B_TILING.block_size, "decode_fwd BLOCK_SIZE mismatch")
-    _expect(constants, "decode_batch", kernel_batch, "decode_fwd fixed BATCH mismatch")
+    _expect(constants, "decode_batch_pad", kernel_batch_pad, "decode_fwd BATCH_PAD mismatch")
     _expect(constants, "decode_num_layers", int(config.num_hidden_layers), "decode_fwd NUM_LAYERS mismatch")
     _expect(constants, "decode_vocab", padded_vocab, "decode_fwd VOCAB mismatch")
     _expect(constants, "decode_real_vocab", int(config.vocab_size), "decode_fwd REAL_VOCAB mismatch")
     _expect(constants, "decode_sampled_ids_pad", int(contract.limits["sampled_ids_pad"]), "decode sampled width")
-    _expect(constants, "greedy_sample_batch", kernel_batch, "greedy_sample_fwd fixed BATCH mismatch")
+    _expect(constants, "greedy_sample_batch_pad", kernel_batch_pad, "greedy_sample_fwd BATCH_PAD mismatch")
     _expect(constants, "greedy_sample_vocab", padded_vocab, "greedy_sample_fwd VOCAB mismatch")
 
     if int(runtime.max_seq_len) > int(constants["decode_max_seq"]):
@@ -487,8 +487,8 @@ def validate_qwen3_kernel_modules(
             f"{QWEN3_14B_TILING.vocab_chunk}, got {runtime_vocab_pad_multiple}."
         )
     total_kv_pages = getattr(runtime, "total_kv_pages", None)
-    if total_kv_pages is not None and int(total_kv_pages) < kernel_batch:
-        raise ValueError(f"total_kv_pages must be at least kernel_batch ({kernel_batch}), got {total_kv_pages}")
+    if total_kv_pages is not None and int(total_kv_pages) < kernel_batch_pad:
+        raise ValueError(f"total_kv_pages must be at least kernel_batch_pad ({kernel_batch_pad}), got {total_kv_pages}")
     _validate_supported_shape(config)
 
 
@@ -499,7 +499,9 @@ def get_qwen3_14b_contract() -> ModelContract:
         model=ModelId(family="qwen3", variant="14b", size="14b", quant="bf16"),
         capabilities=("paged_kv", "chunked_prefill", "device_greedy_sampling", "device_embedding"),
         limits={
-            "batch": QWEN3_14B.batch,
+            # Upper bound on the public batch: the decode pipeline is padded to
+            # this many rows, so 1 <= batch <= limits["batch"].
+            "batch": QWEN3_14B.batch_pad,
             "max_seq": QWEN3_14B.max_seq,
             "page_size": QWEN3_14B_TILING.block_size,
             "vocab": QWEN3_14B.vocab,
@@ -576,8 +578,14 @@ def _dims(model_config: Any, runtime_config: Any) -> dict[str, int]:
     batch = int(runtime_config.max_batch_size)
     max_seq = int(runtime_config.max_seq_len)
     page = int(runtime_config.page_size)
-    if batch != QWEN3_14B.batch:
-        raise ValueError(f"Qwen3-14B kernels require max_batch_size {QWEN3_14B.batch}, got {batch}")
+    # Decode serves any public batch up to the padded pipeline width: the batch
+    # axes are pl.dynamic and the kernel reads the live batch from the seq_lens
+    # descriptor. The compile-time dummies below are still sized at max_batch_size
+    # (they only bound buffer capacity, not the runtime shape).
+    if not 1 <= batch <= QWEN3_14B.batch_pad:
+        raise ValueError(
+            f"Qwen3-14B kernels require 1 <= max_batch_size <= {QWEN3_14B.batch_pad}, got {batch}"
+        )
     if max_seq > QWEN3_14B.max_seq:
         raise ValueError(f"Qwen3-14B kernels require max_seq <= {QWEN3_14B.max_seq}, got {max_seq}")
     if page != QWEN3_14B_TILING.block_size:
@@ -659,12 +667,18 @@ _DECODE_STAGE = KernelSpec(
     runtime_args_builder=build_decode_runtime_args,
 )
 
+# NOTE: this standalone stage is STATIC batch -- greedy_sample.py fixes its
+# shapes at BATCH_PAD, unlike decode, whose batch axes are pl.dynamic. It is not
+# composable with a dynamic-batch decode run, and nothing requires it to be:
+# decode_fwd samples inline (_greedy_sample_inline) and never calls this stage.
+# Converting it is tracked separately; until then treat it as batch == BATCH_PAD
+# only.
 _GREEDY_SAMPLE_STAGE = KernelSpec(
     name="greedy_sample",
     public_name="qwen3_14b.greedy_sample_fwd",
     args=(
-        _arg("logits", "fp32", ("B", "VOCAB")),
-        _arg("sampled_ids", "int32", ("B", "SAMPLED_IDS_PAD"), "out"),
+        _arg("logits", "fp32", ("BATCH", "VOCAB")),
+        _arg("sampled_ids", "int32", ("BATCH", "SAMPLED_IDS_PAD"), "out"),
     ),
     host_jit_fn=qwen3_greedy_sample_host,
     compile_args_builder=build_greedy_sample_compile_args,

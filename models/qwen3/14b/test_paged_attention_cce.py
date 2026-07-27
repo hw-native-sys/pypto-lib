@@ -16,7 +16,7 @@ import torch
 
 from golden import TensorSpec, run_jit
 from paged_attention_cce import (
-    BATCH,
+    BATCH_PAD,
     BLOCK_SIZE,
     HEAD_DIM,
     KV_HIDDEN,
@@ -114,7 +114,7 @@ def main() -> None:
         choices=SUPPORTED_PLATFORMS,
     )
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--batch", type=int, default=1, choices=[1, BATCH])
+    parser.add_argument("--batch", type=int, default=1, choices=[1, BATCH_PAD])
     parser.add_argument("--context-len", type=int, default=3338)
     parser.add_argument("--capacity", type=int, default=4096)
     parser.add_argument(

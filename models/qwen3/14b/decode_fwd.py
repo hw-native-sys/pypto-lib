@@ -47,7 +47,8 @@ from rms_lm_head import rms_lm_head_fp32  # LM head for the fused multi-layer de
 
 KV_CACHE_ROWS_DYN = D.kv_cache_rows
 
-BATCH = M.batch
+BATCH_PAD = M.batch_pad  # padded pipeline width (M of every matmul)
+BATCH_DYN = D.batch      # public batch; 1 <= batch <= BATCH_PAD
 NUM_HEADS = M.num_heads
 NUM_KV_HEADS = M.num_kv_heads
 HEAD_DIM = M.head_dim
@@ -119,7 +120,7 @@ XG_BLOCKS = 5
 # pl.parallel + per-iter pl.at) keeps the split-K atomic-adds inside a SINGLE
 # orchestration task so they accumulate in parallel via hardware atomic; auto-dep
 # orders seed -> spmd -> rope_qkv, so NO explicit deps are needed.
-TM = 16  # M tile = BATCH (OM = 1; M is not split)
+TM = 16  # M tile = BATCH_PAD (OM = 1; M is not split)
 TN = 256  # inner N sub-tile
 TK = 256  # inner K chunk
 QKV_N_TILE = 512  # outer N-tile width (one ON unit) = N_SUB inner TN subtiles
@@ -135,12 +136,12 @@ SEQ_TILE = T.seq_tile
 BLOCK_SIZE = T.block_size
 assert SEQ_TILE == BLOCK_SIZE
 DECODE_MAX_BLOCKS_PER_SEQ = (MAX_SEQ + BLOCK_SIZE - 1) // BLOCK_SIZE
-NUM_PAGES = BATCH * DECODE_MAX_BLOCKS_PER_SEQ
+NUM_PAGES = BATCH_PAD * DECODE_MAX_BLOCKS_PER_SEQ
 CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE
 
 ROPE_CORES = 32
-ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH) // ROPE_CORES
-assert (NUM_KV_HEADS * BATCH) % ROPE_CORES == 0
+ROPE_ITEMS_PER_CORE = (NUM_KV_HEADS * BATCH_PAD) // ROPE_CORES
+assert (NUM_KV_HEADS * BATCH_PAD) % ROPE_CORES == 0
 
 # Q/K/V are SPMD dispatches, so each has one TASK_ID.  Rope depends on
 # those scalar ids directly; per-tile copies would create duplicate edges.
@@ -194,7 +195,7 @@ assert HIDDEN % QKV_N_TILE == 0 and KV_HIDDEN % QKV_N_TILE == 0, "QKV_N_TILE mus
 assert HIDDEN % QKV_OK == 0, "OK must divide HIDDEN (K dim)"
 assert QKV_K_SLICE % TK == 0, "TK must divide the split-K slice"
 assert Q_ON == 10 and KV_ON == 2, "expected ON = 10 (Q) + 2 (K) + 2 (V)"
-assert TM == BATCH and N_SUB == 2 and QKV_K_CHUNKS == 4
+assert TM == BATCH_PAD and N_SUB == 2 and QKV_K_CHUNKS == 4
 assert DOWN_TN % MLP_OUT_CHUNK == 0, "DOWN_TN must be a multiple of MLP_OUT_CHUNK"
 assert DOWN_ON * DOWN_TN == HIDDEN
 assert K_SPLITS * DOWN_TN == INTERMEDIATE
@@ -216,16 +217,16 @@ assert GATE_UP_SPMD_N < MLP_ON
 
 @pl.jit.inline
 def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
-    hidden_states: pl.Tensor[[BATCH, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
+    hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
     wv: pl.Tensor,
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor[[BATCH], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
-    slot_mapping: pl.Tensor[[BATCH], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -238,13 +239,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     w_up: pl.Tensor,
     w_down: pl.Tensor,
     post_rms_weight: pl.Tensor,
-    out: pl.Tensor[[BATCH, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
+    out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],  # FP32: inter-layer carry (was BF16)
     # normed_in: THIS layer's x*gamma (BF16), produced by the previous layer's fused
     # dcr_xgamma (x_gamma_0 for layer 0). Consumed by QKV — replaces the local x_gamma.
-    normed_in: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    normed_in: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     # normed_out: NEXT layer's x*gamma, written by THIS layer's dcr_xgamma. Escapes via
     # the inline alias (verified: inline out-param tensor writes are visible to caller).
-    normed_out: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
+    normed_out: pl.Tensor[[BATCH_PAD, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     next_gamma_idx: pl.Scalar[pl.INT32],  # clamped min(layer_idx+1, N-1) for dcr_xgamma's gamma
     # x_gamma0 / dcr_xgamma are SPMD producers, so each carry has exactly one
@@ -252,7 +253,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # Array mutation is preserved by the inline lowering, unlike a re-bound Scalar.
     prev_out_tid: pl.Array[1, pl.TASK_ID],
     prev_normed_tid: pl.Array[1, pl.TASK_ID],
-) -> pl.Tensor[[BATCH, HIDDEN], pl.FP32]:
+) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
     # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
     # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
     # 0.._CHUNK_NLAYERS-1 (per-chunk weight slices).
@@ -264,7 +265,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     layer_cache_base = layer_idx * layer_cache_rows
-    user_batch = BATCH
+    batch = pl.tensor.dim(seq_lens, 0)
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
@@ -276,10 +277,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # (deps=[down_tids[k] for k in range(DOWN_ON * K_SPLITS)] — list-comprehension
     # per-index fence works for large N; whole-array deps=[down_tids] does not).
     down_tids = pl.array.create(DOWN_ON * K_SPLITS, pl.TASK_ID)
-    inv_rms_states = pl.create_tensor([BATCH, 1], dtype=pl.FP32)  # deferred 1/rms denominator
-    q_proj = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-    k_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
-    v_proj = pl.create_tensor([BATCH, KV_HIDDEN], dtype=pl.FP32)
+    inv_rms_states = pl.create_tensor([BATCH_PAD, 1], dtype=pl.FP32)  # deferred 1/rms denominator
+    q_proj = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
+    k_proj = pl.create_tensor([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32)
+    v_proj = pl.create_tensor([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32)
 
     # ── Scope 1: input RMSNorm, SPLIT into two INDEPENDENT steps. ──
     # RMSNorm(x) = (x * inv_rms) * gamma, where inv_rms[b] = 1/sqrt(mean_k x^2 +
@@ -296,8 +297,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # produced by the previous dcr_xgamma (or x_gamma0 for layer 0).
 
     # ── Scope 2 allocations (hoisted before the manual scope). ──
-    q_tnd_flat = pl.create_tensor([BATCH * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
-    attn_out = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    q_tnd_flat = pl.create_tensor([BATCH_PAD * NUM_HEADS, HEAD_DIM], dtype=pl.BF16)
+    attn_out = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
 
     with pl.manual_scope():
         # Unflagged barrier from c61f710: prevent RMS/KV setup from taking
@@ -312,12 +313,16 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             name_hint="attn_out_seed",
             allow_early_resolve=True,
         ) as attn_out_seed_tid:
-            for b in pl.range(user_batch, BATCH):
-                attn_out = pl.assemble(
-                    attn_out,
-                    pl.full([1, HIDDEN], dtype=pl.BF16, value=0.0),
-                    [b, 0],
-                )
+            # Static trip count + guard, not pl.range(batch, BATCH_PAD): a
+            # dynamic LOWER bound here would also make this a dynamic-offset GM
+            # store inside an allow_early_resolve pl.at. Mirrors prefill_fwd.
+            for b in pl.range(BATCH_PAD):
+                if b >= batch:
+                    attn_out = pl.assemble(
+                        attn_out,
+                        pl.full([1, HIDDEN], dtype=pl.BF16, value=0.0),
+                        [b, 0],
+                    )
 
         with pl.at(
             level=pl.Level.CORE_GROUP,
@@ -325,15 +330,15 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             allow_early_resolve=True,
             deps=[prev_normed_seed_deps[i] for i in range(2)],
         ) as rms_tid:
-            partial_sq = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+            partial_sq = pl.full([1, BATCH_PAD], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK, stage=4):
                 k0 = kb * RMSNORM_K_CHUNK
                 x_chunk = hidden_states[:, k0 : k0 + RMSNORM_K_CHUNK]  # FP32 already (was cast from BF16)
                 partial_sq = pl.add(
                     partial_sq,
-                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH]),
+                    pl.reshape(pl.row_sum(pl.mul(x_chunk, x_chunk)), [1, BATCH_PAD]),
                 )
-            variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH, 1])
+            variance = pl.reshape(pl.add(pl.mul(partial_sq, HIDDEN_INV), EPS), [BATCH_PAD, 1])
             inv_rms = pl.recip(pl.sqrt(variance))
             inv_rms_states = pl.assemble(inv_rms_states, inv_rms, [0, 0])
 
@@ -341,7 +346,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="q_seed", allow_early_resolve=True) as q_seed_tid:  # no explicit dep: runtime q_proj WAR hazard orders it after prev rope_qkv (now the q_proj reader)
             for snb in pl.pipeline(Q_ON, stage=2):
                 q_proj = pl.assemble(
-                    q_proj, pl.full([BATCH, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
+                    q_proj, pl.full([BATCH_PAD, QKV_N_TILE], dtype=pl.FP32, value=0.0), [0, snb * QKV_N_TILE]
                 )
         # Carry task ids are length-one Arrays; build the explicit dependency
         # array before passing it through deps= so inline lowering retains the
@@ -382,16 +387,16 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             name_hint="kv_seed",
             deps=[prev_normed_seed_deps[i] for i in range(2)],
         ) as kv_seed_tid:
-            k_proj = pl.assemble(k_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
-            v_proj = pl.assemble(v_proj, pl.full([BATCH, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+            k_proj = pl.assemble(k_proj, pl.full([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
+            v_proj = pl.assemble(v_proj, pl.full([BATCH_PAD, KV_HIDDEN], dtype=pl.FP32, value=0.0), [0, 0])
 
         # Create the MLP/output accumulators and their single seed immediately
         # after kv_seed, matching c61f710's task-generation order.  The
         # unflagged seed_dummy keeps this setup out of Q's early window.
-        down_acc_all = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        gate_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
-        up_acc_all = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.FP32)
-        attn_proj_fp32 = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+        down_acc_all = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
+        gate_acc_all = pl.create_tensor([BATCH_PAD, INTERMEDIATE], dtype=pl.FP32)
+        up_acc_all = pl.create_tensor([BATCH_PAD, INTERMEDIATE], dtype=pl.FP32)
+        attn_proj_fp32 = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="mlp_out_seed",
@@ -400,19 +405,19 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         ) as mlp_out_seed_tid:
             for nb in pl.pipeline(DOWN_ON, stage=2):
                 n0 = nb * DOWN_TN
-                zero = pl.full([BATCH, DOWN_TN], dtype=pl.FP32, value=0.0)
+                zero = pl.full([BATCH_PAD, DOWN_TN], dtype=pl.FP32, value=0.0)
                 down_acc_all = pl.assemble(down_acc_all, zero, [0, n0])
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
-                zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
+                zero = pl.full([BATCH_PAD, MLP_TN], dtype=pl.FP32, value=0.0)
                 gate_acc_all = pl.assemble(gate_acc_all, zero, [0, n0])
             for nb in pl.pipeline(MLP_ON, stage=2):
                 n0 = nb * MLP_TN
-                zero = pl.full([BATCH, MLP_TN], dtype=pl.FP32, value=0.0)
+                zero = pl.full([BATCH_PAD, MLP_TN], dtype=pl.FP32, value=0.0)
                 up_acc_all = pl.assemble(up_acc_all, zero, [0, n0])
             for nb in pl.pipeline(N_SPLITS_OUT, stage=2):
                 out_seed_n0 = nb * OUT_TN
-                out_zero = pl.full([BATCH, OUT_TN], dtype=pl.FP32, value=0.0)
+                out_zero = pl.full([BATCH_PAD, OUT_TN], dtype=pl.FP32, value=0.0)
                 attn_proj_fp32 = pl.assemble(attn_proj_fp32, out_zero, [0, out_seed_n0])
 
         with pl.spmd(
@@ -474,8 +479,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
         # cube<->vec FFTS barrier gates the attention phase. q_tnd_flat receives the
         # rotated Q written by the kernel; the raw projections and RoPE tables enter as
         # inputs, so this single op subsumes the former rope_qkv scope + its dep edge.
-        q_tnd = pl.reshape(q_tnd_flat, [BATCH, NUM_HEADS, HEAD_DIM])
-        attn_out_tnd = pl.reshape(attn_out, [BATCH, NUM_HEADS, HEAD_DIM])
+        q_tnd = pl.reshape(q_tnd_flat, [BATCH_PAD, NUM_HEADS, HEAD_DIM])
+        attn_out_tnd = pl.reshape(attn_out, [BATCH_PAD, NUM_HEADS, HEAD_DIM])
         attention_core_num = PA_DEFAULT_BLOCK_DIM
         with pl.spmd(
             attention_core_num,
@@ -512,13 +517,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 seq_lens,
                 layer_cache_base,
             )
-        attn_out = pl.reshape(attn_out_tnd, [BATCH, HIDDEN])
+        attn_out = pl.reshape(attn_out_tnd, [BATCH_PAD, HIDDEN])
         # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all / attn_proj_fp32
         # are created earlier, alongside their hoisted seed tasks between rope and attn.)
-        post_norm_partial = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # raw residual h1 (add-back); FP32 (was BF16)
-        mlp_norm_in = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
-        inv_rms_tile = pl.create_tensor([BATCH, 1], dtype=pl.FP32)
-        mlp_tile = pl.create_tensor([BATCH, INTERMEDIATE], dtype=pl.BF16)
+        post_norm_partial = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # raw residual h1 (add-back); FP32 (was BF16)
+        mlp_norm_in = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)  # h1 * post_gamma (gate/up input)
+        inv_rms_tile = pl.create_tensor([BATCH_PAD, 1], dtype=pl.FP32)
+        mlp_tile = pl.create_tensor([BATCH_PAD, INTERMEDIATE], dtype=pl.BF16)
 
         # ── Scope 3b: manual_scope MLP block. ──
         silu_tids = pl.array.create(MLP_ON, pl.TASK_ID)
@@ -632,7 +637,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
         # RMS reduction reads all of attn_proj_fp32.
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="post_rms_reduce", deps=[out_tids]) as reduce_tid:
-            sq_sum = pl.full([1, BATCH], dtype=pl.FP32, value=0.0)
+            sq_sum = pl.full([1, BATCH_PAD], dtype=pl.FP32, value=0.0)
             for kb in pl.pipeline(HIDDEN // K_CHUNK, stage=2):
                 k0 = kb * K_CHUNK
                 attn_chunk = attn_proj_fp32[:, k0 : k0 + K_CHUNK]
@@ -640,10 +645,10 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 resid_chunk = pl.add(attn_chunk, hidden_chunk)
                 sq_sum = pl.add(
                     sq_sum,
-                    pl.reshape(pl.row_sum(pl.mul(resid_chunk, resid_chunk)), [1, BATCH]),
+                    pl.reshape(pl.row_sum(pl.mul(resid_chunk, resid_chunk)), [1, BATCH_PAD]),
                 )
             post_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, HIDDEN_INV), EPS)))
-            post_inv_rms_col = pl.reshape(post_inv_rms, [BATCH, 1])
+            post_inv_rms_col = pl.reshape(post_inv_rms, [BATCH_PAD, 1])
             inv_rms_tile = pl.assemble(inv_rms_tile, post_inv_rms_col, [0, 0])
 
         # Split-K gate + up critical-wave (per cast / k_split), like out_proj:
@@ -891,12 +896,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
 
 @pl.jit.inline
 def _token_embed_inline(
-    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
     embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    next_hidden: pl.Tensor[[BATCH, HIDDEN], pl.BF16],
-) -> pl.Tensor[[BATCH, HIDDEN], pl.BF16]:
-    user_batch = BATCH
-    for b in pl.parallel(user_batch):
+    next_hidden: pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16],
+) -> pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]:
+    batch = pl.tensor.dim(sampled_ids, 0)
+    for b in pl.parallel(batch):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed"):
             token_id = pl.read(sampled_ids, [b, 0])
             token_row = pl.cast(token_id, target_type=pl.INDEX)
@@ -908,11 +913,11 @@ def _token_embed_inline(
 
 @pl.jit.inline
 def _greedy_sample_inline(
-    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
-    sampled_ids: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
-) -> pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]:
-    user_batch = BATCH
-    for b in pl.parallel(user_batch):
+    logits: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+    sampled_ids: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+) -> pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]:
+    batch = pl.tensor.dim(logits, 0)
+    for b in pl.parallel(batch):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_sample"):
             idx_init = pl.arange(0, [1, SAMPLE_VOCAB_CHUNK], dtype=pl.UINT32)
             chunk_vals = pl.create_tensor([1, SAMPLE_CHUNK_PAD], dtype=pl.FP32)
@@ -997,9 +1002,9 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     wv: pl.Tensor,
     q_norm_weight: pl.Tensor,
     k_norm_weight: pl.Tensor,
-    seq_lens: pl.Tensor[[BATCH], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
-    slot_mapping: pl.Tensor[[BATCH], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
     rope_cos: pl.Tensor,
     rope_sin: pl.Tensor,
     k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
@@ -1011,17 +1016,17 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
-    out: pl.Out[pl.Tensor[[BATCH, VOCAB], pl.FP32]],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
     embed_weight: pl.Tensor,
-    sampled_ids_in: pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32],
-    sampled_ids_out: pl.Out[pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]],
-    next_hidden: pl.Out[pl.Tensor[[BATCH, HIDDEN], pl.BF16]],
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids_out: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
 ):
     # Device-side fused decode: embed the previous sampled token id, loop the inline
     # body over all _FWD_NLAYERS layers, run the LM head, then sample the next token
     # id. Weights are STACKED [_FWD_NLAYERS*HIDDEN, ...] /
     # [_FWD_NLAYERS*INTERMEDIATE, ...]; k_cache / v_cache cover
-    # [_FWD_NLAYERS*BATCH*NUM_KV_HEADS*MAX_SEQ, ...]; out is logits [BATCH, VOCAB].
+    # [_FWD_NLAYERS*BATCH_PAD*NUM_KV_HEADS*MAX_SEQ, ...]; out is logits [BATCH_PAD, VOCAB].
     # _FWD_NLAYERS defaults to NUM_LAYERS (40) and is settable for layer-count tests.
     #
     # The loop-carried `cur` is seeded from next_hidden after embedding the previous
@@ -1040,13 +1045,19 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     block_table.bind_dynamic(0, D.block_table_flat)
     k_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
     v_cache.bind_dynamic(0, KV_CACHE_ROWS_DYN)
-    user_batch = BATCH
+    seq_lens.bind_dynamic(0, BATCH_DYN)
+    slot_mapping.bind_dynamic(0, BATCH_DYN)
+    out.bind_dynamic(0, BATCH_DYN)
+    sampled_ids_in.bind_dynamic(0, BATCH_DYN)
+    sampled_ids_out.bind_dynamic(0, BATCH_DYN)
+    next_hidden.bind_dynamic(0, BATCH_DYN)
+    batch = pl.tensor.dim(seq_lens, 0)
 
     pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
     pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
     pa_num_layers = pl.tensor.dim(input_rms_weight, 0)
     pa_num_pages = pl.tensor.dim(k_cache, 0) // (pa_num_layers * BLOCK_SIZE * NUM_KV_HEADS)
-    pa_max_blocks = pl.tensor.dim(block_table, 0) // user_batch
+    pa_max_blocks = pl.tensor.dim(block_table, 0) // batch
     pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
     pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
     pa_tiling_tid = build_paged_attention_metadata(
@@ -1057,10 +1068,10 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     )
     next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
 
-    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
+    cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
     prev_out_tid = pl.array.create(1, pl.TASK_ID)
     prev_out_tid[0] = pl.system.task_dummy(deps=[])
-    for cb0 in pl.parallel(0, BATCH, BATCH):
+    for cb0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden", allow_early_resolve=True) as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ck0 = ckb * RMSNORM_K_CHUNK
@@ -1072,9 +1083,9 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
                         pl.fillpad(
                             pl.slice(
                                 next_hidden,
-                                [BATCH, RMSNORM_K_CHUNK],
+                                [BATCH_PAD, RMSNORM_K_CHUNK],
                                 [cb0, ck0],
-                                valid_shape=[user_batch, RMSNORM_K_CHUNK],
+                                valid_shape=[batch, RMSNORM_K_CHUNK],
                             ),
                             pad_value=pl.PadValue.zero,
                         ),
@@ -1087,7 +1098,7 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     # ── Pre-loop x_gamma_0: layer 0's normed = cur_0 * gamma_0 (BF16). For layers 1+,
     # the per-layer normed is produced by the PREVIOUS layer's fused dcr_xgamma; only
     # layer 0 (whose cur comes from copy_hidden, not a dcr) needs this standalone task.
-    normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
     prev_normed_tid = pl.array.create(1, pl.TASK_ID)
     with pl.manual_scope():
         with pl.spmd(
@@ -1106,8 +1117,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
         prev_normed_tid[0] = xgamma_tid
 
     for layer_idx in pl.range(_FWD_NLAYERS):
-        layer_next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)  # FP32 layer output
-        next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
+        layer_next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 layer output
+        next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
         next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
@@ -1161,12 +1172,12 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     # BF16->FP32 at the chunk head (copy_hidden) and FP32->BF16 at the tail (copy_out),
     # mirroring decode_fwd's embed-in / lm-head-in casts. (Without these the BF16 cur
     # hits _decode_layer's FP32 x_gamma/rms_recip -> ptoas bfloat16 type error.)
-    user_batch = BATCH
+    batch = pl.tensor.dim(seq_lens, 0)
     pa_metadata = pl.create_tensor([PA_METADATA_BYTES], dtype=pl.UINT8)
     pa_workspace = pl.create_tensor([PA_WORKSPACE_BYTES], dtype=pl.UINT8)
     pa_num_layers = pl.tensor.dim(input_rms_weight, 0)
     pa_num_pages = pl.tensor.dim(k_cache, 0) // (pa_num_layers * BLOCK_SIZE * NUM_KV_HEADS)
-    pa_max_blocks = pl.tensor.dim(block_table, 0) // user_batch
+    pa_max_blocks = pl.tensor.dim(block_table, 0) // batch
     pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
     pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
     pa_tiling_tid = build_paged_attention_metadata(
@@ -1176,17 +1187,17 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         pa_metadata,
     )
 
-    cur = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
+    cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
     prev_out_tid = pl.array.create(1, pl.TASK_ID)
     prev_out_tid[0] = pl.system.task_dummy(deps=[])
-    for cb0 in pl.parallel(0, BATCH, BATCH):
+    for cb0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden") as ch_tid:
             for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ck0 = ckb * RMSNORM_K_CHUNK
                 cur = pl.assemble(
                     cur,
                     pl.cast(
-                        pl.slice(hidden_states, [BATCH, RMSNORM_K_CHUNK], [cb0, ck0]),
+                        pl.slice(hidden_states, [BATCH_PAD, RMSNORM_K_CHUNK], [cb0, ck0]),
                         target_type=pl.FP32,
                     ),
                     [cb0, ck0],
@@ -1194,7 +1205,7 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         prev_out_tid[0] = ch_tid
 
     # Pre-loop x_gamma_0: chunk layer 0's normed = cur * gamma_0 (mirrors decode_fwd).
-    normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+    normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
     prev_normed_tid = pl.array.create(1, pl.TASK_ID)
     with pl.manual_scope():
         with pl.spmd(
@@ -1213,8 +1224,8 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
         prev_normed_tid[0] = xgamma_tid
 
     for i in pl.range(_CHUNK_NLAYERS):
-        next_hidden = pl.create_tensor([BATCH, HIDDEN], dtype=pl.FP32)
-        next_normed = pl.create_tensor([BATCH, HIDDEN], dtype=pl.BF16)
+        next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
+        next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
         next_gamma_idx = pl.min(i + 1, _CHUNK_NLAYERS - 1)
         cur = _decode_layer(
             cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
@@ -1224,14 +1235,14 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
             prev_out_tid, prev_normed_tid,
         )
         normed = next_normed
-    for ob0 in pl.parallel(0, BATCH, BATCH):
+    for ob0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_out"):
             for okb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
                 ok0 = okb * RMSNORM_K_CHUNK
                 out = pl.assemble(
                     out,
                     pl.cast(
-                        pl.slice(cur, [BATCH, RMSNORM_K_CHUNK], [ob0, ok0]), target_type=pl.BF16
+                        pl.slice(cur, [BATCH_PAD, RMSNORM_K_CHUNK], [ob0, ok0]), target_type=pl.BF16
                     ),
                     [ob0, ok0],
                 )
@@ -1275,9 +1286,9 @@ def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tenso
     """Identity paging for the standalone harness: batch b's logical blocks map to
     physical pages [b*DECODE_MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
     token's (pos=seq_len-1) physical row. Mirrors the serving runner's layout."""
-    block_table = torch.arange(BATCH * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
-    slot_mapping = torch.empty(BATCH, dtype=torch.int32)
-    for b in range(BATCH):
+    block_table = torch.arange(BATCH_PAD * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    slot_mapping = torch.empty(BATCH_PAD, dtype=torch.int32)
+    for b in range(BATCH_PAD):
         pos = int(seq_lens[b].item()) - 1
         logical_block = pos // BLOCK_SIZE
         phys_page = b * DECODE_MAX_BLOCKS_PER_SEQ + logical_block
@@ -1291,10 +1302,10 @@ def _smoke_inputs() -> list[torch.Tensor]:
     def randn(shape, dtype):
         return torch.empty(shape, dtype=dtype).normal_()
 
-    seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), dtype=torch.int32)
+    seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH_PAD,), dtype=torch.int32)
     block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
     return [
-        randn([BATCH, HIDDEN], torch.bfloat16),
+        randn([BATCH_PAD, HIDDEN], torch.bfloat16),
         randn([1, HIDDEN], torch.float32),
         randn([HIDDEN, HIDDEN], torch.bfloat16),
         randn([HIDDEN, KV_HIDDEN], torch.bfloat16),
@@ -1374,9 +1385,9 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
         return torch.empty(shape).normal_(0.0, std, generator=g) + bias
 
     if full_seq:
-        seq_lens = torch.full([BATCH], MAX_SEQ, dtype=torch.int32)
+        seq_lens = torch.full([BATCH_PAD], MAX_SEQ, dtype=torch.int32)
     else:
-        seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH,), generator=g, dtype=torch.int32)
+        seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH_PAD,), generator=g, dtype=torch.int32)
 
     # Paged block_table / slot_mapping (identity paging) for the PAGED KV pool the
     # kernel reads — k_cache/v_cache below are sized as the paged pool (CACHE_ROWS).
@@ -1391,7 +1402,7 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
 
     # The flat cache buffers represent BSND bytes: [page, token, kv_head, dim].
     return {
-        "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
+        "hidden_states": rn([BATCH_PAD, HIDDEN], 1.0).to(torch.bfloat16),
         "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
         "wq": rn([HIDDEN, HIDDEN], 0.02).to(torch.bfloat16),
         "wk": rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16),
@@ -1439,11 +1450,11 @@ def golden_decode_layer(values: dict) -> None:
 
     qn = values["q_norm_weight"].float()[0]
     kn = values["k_norm_weight"].float()[0]
-    qh = (q_proj * inv_rms).reshape(BATCH, NUM_HEADS, HEAD_DIM)
+    qh = (q_proj * inv_rms).reshape(BATCH_PAD, NUM_HEADS, HEAD_DIM)
     qh = qh * _rmsnorm_inv(qh) * qn                              # per-head QK-norm
-    kh = (k_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+    kh = (k_proj * inv_rms).reshape(BATCH_PAD, NUM_KV_HEADS, HEAD_DIM)
     kh = kh * _rmsnorm_inv(kh) * kn
-    v_heads = (v_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+    v_heads = (v_proj * inv_rms).reshape(BATCH_PAD, NUM_KV_HEADS, HEAD_DIM)
 
     seq_lens = values["seq_lens"]
     block_table = values["block_table"]
@@ -1452,8 +1463,8 @@ def golden_decode_layer(values: dict) -> None:
     k_cache = values["k_cache"].view(NUM_PAGES * BLOCK_SIZE, KV_HIDDEN).float()
     v_cache = values["v_cache"].view(NUM_PAGES * BLOCK_SIZE, KV_HIDDEN).float()
 
-    attn_out = torch.zeros(BATCH, HIDDEN)
-    for b in range(BATCH):
+    attn_out = torch.zeros(BATCH_PAD, HIDDEN)
+    for b in range(BATCH_PAD):
         slen = int(seq_lens[b].item())
         p = slen - 1
         cos_p, sin_p = rope_cos[p], rope_sin[p]
@@ -1506,7 +1517,7 @@ def _build_specs(inputs: dict) -> list:
         TensorSpec(name, list(inputs[name].shape), inputs[name].dtype, init_value=inputs[name])
         for name in INPUT_NAMES
     ]
-    specs.append(TensorSpec("out", [BATCH, HIDDEN], torch.bfloat16, is_output=True))
+    specs.append(TensorSpec("out", [BATCH_PAD, HIDDEN], torch.bfloat16, is_output=True))
     return specs
 
 
@@ -1562,6 +1573,8 @@ if __name__ == "__main__":
                              "-> logits) against a host chain reference, instead of the default "
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
+    parser.add_argument("-b", "--batch", type=int, default=BATCH_PAD,
+                        help="PUBLIC batch for --validate-fwd (1..BATCH_PAD). decode_fwd's batch\naxes are pl.dynamic, so one compiled program serves any value in range; the\npipeline stays internally padded to BATCH_PAD rows. Ignored by the default\nsingle-layer test, which drives the static decode_fwd_layers.")
     parser.add_argument("--decode-steps", type=int, default=1,
                         help="under --validate-fwd, run this many decode steps for a device-cost "
                              "timing sweep at growing context: each step feeds the previous step's "
@@ -1589,7 +1602,7 @@ if __name__ == "__main__":
     # `python decode_fwd.py -p a2a3sim` sweep — codegen regressions are still
     # caught without needing a device or the heavy full-graph simulation).
     if args.smoke or args.platform.endswith("sim"):
-        smoke_out = torch.empty([BATCH, HIDDEN], dtype=torch.bfloat16)
+        smoke_out = torch.empty([BATCH_PAD, HIDDEN], dtype=torch.bfloat16)
         post_pass = decode_fwd_layers.compile_for_test(*_smoke_inputs(), smoke_out)
         print(f"Compiled program has {len(post_pass.functions)} function(s):")
         for fn in post_pass.functions.values():
@@ -1669,6 +1682,22 @@ if __name__ == "__main__":
         def stack0(t, reps):  # replicate along dim 0
             return torch.cat([t] * reps, dim=0).contiguous()
         hs, irw, wq_, wk_, wv_, qn, kn, sl, bt, sm, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
+        UB = args.batch
+        if not 1 <= UB <= BATCH_PAD:
+            parser.error(f"--batch must be in [1, {BATCH_PAD}], got {UB}")
+        if UB != BATCH_PAD:
+            # Public batch axes are dynamic, so the HOST tensors shrink to UB rows.
+            # block_table in particular MUST be UB * DECODE_MAX_BLOCKS_PER_SEQ: the
+            # kernel derives the paged row stride as len(block_table) // batch, so a
+            # left-over BATCH_PAD-row table would hand the FAI tiler a stride that is
+            # BATCH_PAD/UB times too large and misaddress every b > 0.
+            sl = sl[:UB].contiguous()
+            bt = torch.arange(UB * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+            sm = torch.empty(UB, dtype=torch.int32)
+            for _b in range(UB):
+                _pos = int(sl[_b].item()) - 1
+                sm[_b] = ((_b * DECODE_MAX_BLOCKS_PER_SEQ + _pos // BLOCK_SIZE) * BLOCK_SIZE
+                          + (_pos % BLOCK_SIZE))
         torch.manual_seed(1234)
         final_norm_w = torch.empty([1, HIDDEN], dtype=torch.float32).normal_() * 0.1 + 1.0
         lm_head_w = (torch.empty([VOCAB, HIDDEN], dtype=torch.bfloat16).normal_() * 0.02)
@@ -1693,7 +1722,7 @@ if __name__ == "__main__":
         # generation (the KV content per step is the re-uploaded prefill KV).
         if _n_steps > 1:
             _grow_blocks = (MAX_SEQ + _n_steps + BLOCK_SIZE - 1) // BLOCK_SIZE
-            _grow_pages = BATCH * _grow_blocks
+            _grow_pages = UB * _grow_blocks
             _grow_rows = _grow_pages * NUM_KV_HEADS * BLOCK_SIZE
             bt = torch.arange(_grow_pages, dtype=torch.int32)
             _pad_rows = _grow_rows - kc.shape[0]
@@ -1709,13 +1738,13 @@ if __name__ == "__main__":
 
             def _grow_slot_mapping(seq_lens: torch.Tensor) -> torch.Tensor:
                 """slot_mapping over the enlarged pool (_grow_blocks pages per seq)."""
-                sm_ = torch.empty(BATCH, dtype=torch.int32)
-                for _b in range(BATCH):
+                sm_ = torch.empty(UB, dtype=torch.int32)
+                for _b in range(UB):
                     pos = int(seq_lens[_b].item()) - 1
                     sm_[_b] = (_b * _grow_blocks + pos // BLOCK_SIZE) * BLOCK_SIZE + (pos % BLOCK_SIZE)
                 return sm_
 
-            sl = torch.full([BATCH], MAX_SEQ, dtype=torch.int32)
+            sl = torch.full([UB], MAX_SEQ, dtype=torch.int32)
             sm = _grow_slot_mapping(sl)
             print(f"[stacked-fwd {N}L+LMhead] autoregressive decode: seq_lens {MAX_SEQ} -> "
                   f"{MAX_SEQ + _n_steps - 1} over {_n_steps} steps "
@@ -1726,14 +1755,15 @@ if __name__ == "__main__":
             stack0(wo_, N), stack0(wg, N), stack0(wu, N), stack0(wd, N), stack0(prw, N),
             final_norm_w, lm_head_w,
         ]
-        logits = torch.zeros(BATCH, VOCAB, dtype=torch.float32)
+        logits = torch.zeros(UB, VOCAB, dtype=torch.float32)
         embed_weight = torch.zeros(VOCAB, HIDDEN, dtype=torch.bfloat16)
-        sampled_ids_in = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
-        for b in range(BATCH):
-            sampled_ids_in[b, 0] = b
+        sampled_ids_in = torch.zeros(UB, SAMPLED_IDS_PAD, dtype=torch.int32)
+        for b in range(BATCH_PAD):
             embed_weight[b] = hs[b]
-        sampled_ids_out = torch.zeros(BATCH, SAMPLED_IDS_PAD, dtype=torch.int32)
-        next_hidden = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        for b in range(UB):
+            sampled_ids_in[b, 0] = b
+        sampled_ids_out = torch.zeros(UB, SAMPLED_IDS_PAD, dtype=torch.int32)
+        next_hidden = torch.zeros(UB, HIDDEN, dtype=torch.bfloat16)
         for _step in range(_n_steps):
             decode_fwd(
                 *stacked,
@@ -1769,22 +1799,28 @@ if __name__ == "__main__":
         # chain (N single-layer dispatches) would re-enter each layer from BF16, diverging
         # from decode_fwd and making the argmax check pass/fail for the wrong reason.
         _CHUNK_NLAYERS = N
-        ref_out = torch.zeros(BATCH, HIDDEN, dtype=torch.bfloat16)
+        ref_out = torch.zeros(BATCH_PAD, HIDDEN, dtype=torch.bfloat16)
         decode_fwd_layers(hs, *stacked[:len(INPUT_NAMES) - 1], ref_out, config=run_cfg)
         hn = ref_out.float()
         inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
         ref_normed = (hn * inv) * final_norm_w.float()
-        ref_logits = ref_normed @ lm_head_w.float().t()  # [BATCH, VOCAB]
-        a = logits.cpu(); e = ref_logits.cpu()
+        ref_logits = ref_normed @ lm_head_w.float().t()  # [BATCH_PAD, VOCAB]
+        # Only rows [0, UB) carry real sequences. The reference shares the UB-row
+        # seq_lens, so decode_fwd_layers computes the same UB rows; rows past UB
+        # are padding on both sides and are deliberately not compared.
+        a = logits.cpu()[:UB]
+        e = ref_logits.cpu()[:UB]
         # compare argmax (the actual generation signal) + value closeness
-        amax_k = a.argmax(-1); amax_r = e.argmax(-1)
-        sample_k = sampled_ids_out[:, 0].cpu()
+        amax_k = a.argmax(-1)
+        amax_r = e.argmax(-1)
+        sample_k = sampled_ids_out[:UB, 0].cpu()
         argmax_match = int((amax_k == amax_r).sum())
         sample_match = int((sample_k == amax_k).sum())
         close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
-        print(f"[stacked-fwd {N}L+LMhead] argmax match {argmax_match}/{BATCH} | "
-              f"sample match {sample_match}/{BATCH} | "
+        print(f"[stacked-fwd {N}L+LMhead] batch={UB}/{BATCH_PAD} | "
+              f"argmax match {argmax_match}/{UB} | "
+              f"sample match {sample_match}/{UB} | "
               f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "
               f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} "
               f"sampled={sample_k.tolist()} ref_argmax={amax_r.tolist()}")
-        raise SystemExit(0 if argmax_match == BATCH and sample_match == BATCH else 1)
+        raise SystemExit(0 if argmax_match == UB and sample_match == UB else 1)

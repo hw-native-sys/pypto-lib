@@ -15,7 +15,7 @@ import pypto.language as pl
 from config import QWEN3_14B as M
 from config import QWEN3_14B_TILING as T
 
-BATCH = M.batch
+BATCH_PAD = M.batch_pad
 VOCAB = M.vocab
 REAL_VOCAB = M.real_vocab
 SAMPLED_IDS_PAD = M.sampled_ids_pad
@@ -36,11 +36,11 @@ assert REAL_VOCAB <= VOCAB
 
 @pl.jit
 def greedy_sample_fwd(
-    logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
-    sampled_ids: pl.Out[pl.Tensor[[BATCH, SAMPLED_IDS_PAD], pl.INT32]],
+    logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
+    sampled_ids: pl.Out[pl.Tensor[[BATCH_PAD, SAMPLED_IDS_PAD], pl.INT32]],
 ):
     """Select the argmax token id per batch row."""
-    for b in pl.parallel(BATCH):
+    for b in pl.parallel(BATCH_PAD):
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="greedy_sample"):
             idx_init = pl.arange(0, [1, VOCAB_CHUNK], dtype=pl.UINT32)
             chunk_vals = pl.create_tensor([1, CHUNK_PAD], dtype=pl.FP32)
@@ -119,7 +119,7 @@ def build_tensor_specs():
     from golden import TensorSpec
 
     def init_logits():
-        logits = torch.full((BATCH, VOCAB), -1000.0)
+        logits = torch.full((BATCH_PAD, VOCAB), -1000.0)
         logits[0::2, 0] = 0.0
         logits[0::2, 7] = 5.0
         logits[0::2, 42] = 5.0
@@ -131,8 +131,8 @@ def build_tensor_specs():
         return logits
 
     return [
-        TensorSpec("logits", [BATCH, VOCAB], torch.float32, init_value=init_logits),
-        TensorSpec("sampled_ids", [BATCH, SAMPLED_IDS_PAD], torch.int32, is_output=True),
+        TensorSpec("logits", [BATCH_PAD, VOCAB], torch.float32, init_value=init_logits),
+        TensorSpec("sampled_ids", [BATCH_PAD, SAMPLED_IDS_PAD], torch.int32, is_output=True),
     ]
 
 
@@ -140,7 +140,7 @@ def golden_greedy_sample(tensors):
     import torch
 
     logits = tensors["logits"].float()
-    sampled_ids = torch.argmax(logits[:, :REAL_VOCAB], dim=-1).to(torch.int32).view(BATCH, 1)
+    sampled_ids = torch.argmax(logits[:, :REAL_VOCAB], dim=-1).to(torch.int32).view(BATCH_PAD, 1)
     tensors["sampled_ids"][:] = 0
     tensors["sampled_ids"][:, :1] = sampled_ids
 

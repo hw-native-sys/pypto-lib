@@ -16,7 +16,7 @@ from config import (
     QWEN3_14B as M,
 )
 
-USER_BATCH_DYN = D.user_batch
+BATCH_DYN = D.batch
 KV_CACHE_ROWS_DYN = D.kv_cache_rows
 BLOCK_TABLE_FLAT_DYN = D.block_table_flat
 LAYER_DYN = D.layer
@@ -61,9 +61,9 @@ MLP_OUT_BLOCKS = INTERMEDIATE // MLP_OUT_CHUNK
 @pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.INT8],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.INT8],
@@ -93,16 +93,16 @@ def prefill_layer(
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     out.bind_dynamic(0, PREFILL_TOKENS_DYN)
 
-    user_batch = pl.tensor.dim(seq_lens, 0)
+    batch = pl.tensor.dim(seq_lens, 0)
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     layer_hidden_base = layer_idx * HIDDEN
     layer_inter_base = layer_idx * INTERMEDIATE
     layer_cache_base = layer_idx * layer_cache_rows
-    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // user_batch
+    max_blocks_per_seq = pl.tensor.dim(block_table, 0) // batch
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
-    for b in pl.parallel(0, user_batch, 1):
+    for b in pl.parallel(0, batch, 1):
         token_base = pl.cast(pl.tensor.read(chunk_offsets, [b]), pl.INDEX)
         seq_len_b = pl.tensor.read(seq_lens, [b])
         chunk_len_b = pl.tensor.read(chunk_lens, [b])
@@ -739,9 +739,9 @@ def prefill_layer(
 @pl.jit(auto_scope=False)
 def prefill_hidden_a8w8(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_lens: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
-    chunk_offsets: pl.Tensor[[USER_BATCH_DYN], pl.INT32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    chunk_offsets: pl.Tensor[[BATCH_DYN], pl.INT32],
     input_rms_weight: pl.Tensor[[LAYER_DYN, HIDDEN], pl.FP32],
     wq: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.INT8],
     wk: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, KV_HIDDEN], pl.INT8],
@@ -767,14 +767,14 @@ def prefill_hidden_a8w8(
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    out: pl.Out[pl.Tensor[[USER_BATCH_DYN, VOCAB], pl.FP32]],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
     hidden_out: pl.Out[pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
-    seq_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_lens.bind_dynamic(0, USER_BATCH_DYN)
-    chunk_offsets.bind_dynamic(0, USER_BATCH_DYN)
-    out.bind_dynamic(0, USER_BATCH_DYN)
+    seq_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_lens.bind_dynamic(0, BATCH_DYN)
+    chunk_offsets.bind_dynamic(0, BATCH_DYN)
+    out.bind_dynamic(0, BATCH_DYN)
     hidden_out.bind_dynamic(0, PREFILL_TOKENS_DYN)
     block_table.bind_dynamic(0, BLOCK_TABLE_FLAT_DYN)
     slot_mapping.bind_dynamic(0, PREFILL_TOKENS_DYN)
