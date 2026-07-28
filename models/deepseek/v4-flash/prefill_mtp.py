@@ -8,15 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
-"""DeepSeek-V4 MTP packed-prefill forward.
-
-This mirrors the official MTP block:
-``e_proj(enorm(hidden_states)).unsqueeze(2) + h_proj(hnorm(prev_hidden_states))``
-followed by one SWA block, MoE, MTP ``hc_head`` and MTP RMSNorm.  The input
-``prev_hidden_states`` and ``pre_hc_hidden_out`` keep the official pre-hc layout
-``[T, HC_MULT, D]``.  ``hidden_states`` is the shared embedding/current-token
-hidden input in token-major ``[T, D]`` layout.
-"""
+"""DeepSeek-V4 MTP prefill: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
 import argparse
 
@@ -87,13 +79,16 @@ from prefill_fwd import build_single_layer_tensor_specs
 from rmsnorm import golden_rms_norm, rms_norm
 
 
+# model config
 T = PREFILL_TOKENS
 MTP_LAYER_ID = M.num_hidden_layers
+
+# communication
 MTP_MOE_EPOCH = 1
 LM_HEAD_COMM_EPOCH = 1
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def mtp_prefill_fwd(
     hidden_states: pl.Tensor[[T, D], pl.BF16],
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.FP32],
@@ -164,45 +159,51 @@ def mtp_prefill_fwd(
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = num_tokens
     projected = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    with pl.scope():
+        mtp_projection(
+            hidden_states, prev_hidden_states,
+            enorm_w, hnorm_w,
+            e_proj_w, e_proj_w_scale, e_proj_smooth,
+            h_proj_w, h_proj_w_scale, h_proj_smooth,
+            projected,
+        )
+
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    with pl.scope():
+        prefill_attention_swa(
+            projected,
+            hc_attn_fn, hc_attn_scale, hc_attn_base,
+            attn_norm_w,
+            wq_a, wq_b, wq_b_scale,
+            wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            kv_cache, ori_block_table, ori_slot_mapping,
+            position_ids,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn, nt,
+        )
 
-    mtp_projection(
-        hidden_states, prev_hidden_states,
-        enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
-        projected,
-    )
+    with pl.scope():
+        moe(
+            x_attn,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias,
+            tid2eid, input_ids,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            pre_hc_hidden_out,
+            recv_meta, recv_x, recv_aux, recv_route,
+            arrived, data_arrived, routed_y_buf, combine_arrived,
+            pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        )
 
-    prefill_attention_swa(
-        projected,
-        hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        kv_cache, ori_block_table, ori_slot_mapping,
-        position_ids,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn, nt,
-    )
-
-    moe(
-        x_attn,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid, input_ids,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        pre_hc_hidden_out,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        pl.cast(MTP_LAYER_ID, pl.INT32), nt, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
-    )
     clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
-
     x_head = pl.create_tensor([T, D], dtype=pl.BF16)
-    hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
-    rms_norm(x_head, mtp_norm_w, hidden_out)
+    with pl.scope():
+        hc_head(pre_hc_hidden_out, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
+        rms_norm(x_head, mtp_norm_w, hidden_out)
     return hidden_out
 
 
@@ -277,34 +278,32 @@ def l3_mtp_prefill_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    lm_head_hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
-    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
-        recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_aux = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+        recv_route = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         mtp_prefill_fwd(
-            hidden_states[r],
-            prev_hidden_states[r],
+            hidden_states[r], prev_hidden_states[r],
             enorm_w[r], hnorm_w[r],
             e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
             h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
-            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
-            wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r],
+            hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r],
+            attn_norm_w[r],
+            wq_a[r], wq_b[r], wq_b_scale[r],
+            wkv[r], gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
             kv_cache[r], ori_block_table[r], ori_slot_mapping[r],
             position_ids[r],
             attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
-            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r], norm_w[r],
-            gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
+            hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
+            norm_w[r], gate_w[r], gate_bias[r],
+            tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
@@ -317,6 +316,10 @@ def l3_mtp_prefill_fwd(
             device=r,
         )
 
+    lm_head_hidden_window_buf = pld.alloc_window_buffer([GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
+    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
+    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
+    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
     for r in pl.range(pld.world_size()):
         hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
         hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
@@ -333,13 +336,7 @@ def l3_mtp_prefill_fwd(
 def _ranked(spec, torch, is_output=False):
     from golden import TensorSpec
 
-    return TensorSpec(
-        spec.name,
-        list(spec.shape),
-        spec.dtype,
-        init_value=spec.init_value,
-        is_output=is_output,
-    )
+    return TensorSpec(spec.name, list(spec.shape), spec.dtype, init_value=spec.init_value, is_output=is_output)
 
 
 def _projection_specs():
@@ -381,18 +378,26 @@ def _projection_specs():
             h_proj_cache = init_proj_pair()
         return h_proj_cache[1]
 
+    def init_hidden_states():
+        return torch.randn(N_RANKS, T, D).to(torch.bfloat16)
+
+    def init_prev_hidden_states():
+        return torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)
+
+    def init_projection_ones():
+        return torch.ones(N_RANKS, D)
+
     return [
-        TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, init_value=lambda: torch.randn(N_RANKS, T, D).to(torch.bfloat16)),
-        TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.float32,
-                   init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
-        TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
+        TensorSpec("hidden_states", [N_RANKS, T, D], torch.bfloat16, init_value=init_hidden_states),
+        TensorSpec("prev_hidden_states", [N_RANKS, T, HC_MULT, D], torch.float32, init_value=init_prev_hidden_states),
+        TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
+        TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
         TensorSpec("e_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_e_proj_w),
         TensorSpec("e_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_e_proj_w_scale),
-        TensorSpec("e_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
+        TensorSpec("e_proj_smooth", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
         TensorSpec("h_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_h_proj_w),
         TensorSpec("h_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_h_proj_w_scale),
-        TensorSpec("h_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
+        TensorSpec("h_proj_smooth", [N_RANKS, D], torch.float32, init_value=init_projection_ones),
     ]
 
 
@@ -401,15 +406,24 @@ def _mtp_head_specs():
     from golden import TensorSpec
 
     base = [5.9166, -3.6223, -2.9324, -3.3124]
+
+    def init_hc_head_fn():
+        return torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519
+
+    def init_hc_head_scale():
+        return torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32)
+
+    def init_hc_head_base():
+        return torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous()
+
+    def init_norm_w():
+        return (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16)
+
     return [
-        TensorSpec("mtp_hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32,
-                   init_value=lambda: torch.randn(N_RANKS, HC_MULT, HC_DIM) * 0.0519),
-        TensorSpec("mtp_hc_head_scale", [N_RANKS, 1], torch.float32,
-                   init_value=lambda: torch.full((N_RANKS, 1), 0.076099, dtype=torch.float32)),
-        TensorSpec("mtp_hc_head_base", [N_RANKS, HC_MULT], torch.float32,
-                   init_value=lambda: torch.tensor(base, dtype=torch.float32).view(1, HC_MULT).expand(N_RANKS, -1).contiguous()),
-        TensorSpec("mtp_norm_w", [N_RANKS, D], torch.bfloat16,
-                   init_value=lambda: (torch.randn(N_RANKS, D) * 0.1 + 1.0).to(torch.bfloat16)),
+        TensorSpec("mtp_hc_head_fn", [N_RANKS, HC_MULT, HC_DIM], torch.float32, init_value=init_hc_head_fn),
+        TensorSpec("mtp_hc_head_scale", [N_RANKS, 1], torch.float32, init_value=init_hc_head_scale),
+        TensorSpec("mtp_hc_head_base", [N_RANKS, HC_MULT], torch.float32, init_value=init_hc_head_base),
+        TensorSpec("mtp_norm_w", [N_RANKS, D], torch.bfloat16, init_value=init_norm_w),
     ]
 
 
@@ -417,11 +431,10 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
     import torch
     from golden import ScalarSpec, TensorSpec
 
-    base = {
-        spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID)
-        if isinstance(spec, TensorSpec)
-    }
+    base_tensor_specs = build_single_layer_tensor_specs(
+        start_pos=start_pos, num_tokens=num_tokens, layer_id=MTP_LAYER_ID,
+    )
+    base = {spec.name: spec for spec in base_tensor_specs if isinstance(spec, TensorSpec)}
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
@@ -429,30 +442,37 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
 
     def init_logit_row_indices():
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[:, :max(min(num_tokens, MAX_LOGIT_ROWS), 0)] = torch.arange(
-            max(min(num_tokens, MAX_LOGIT_ROWS), 0), dtype=torch.int32
-        )
+        valid_rows = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
+        indices[:, :valid_rows] = torch.arange(valid_rows, dtype=torch.int32)
         return indices
+
     projection = {spec.name: spec for spec in _projection_specs()}
     mtp_head = {spec.name: spec for spec in _mtp_head_specs()}
-    moe_specs = {spec.name: spec for spec in build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens) if isinstance(spec, TensorSpec)}
+    moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
+    moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
 
     ordered_names = [
         "hidden_states", "prev_hidden_states",
-        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+        "enorm_w", "hnorm_w",
+        "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
         "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
-        "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
-        "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
-        "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
+        "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+        "attn_norm_w",
+        "wq_a", "wq_b", "wq_b_scale",
+        "wkv", "gamma_cq", "gamma_ckv",
+        "freqs_cos", "freqs_sin",
+        "kv_cache", "ori_block_table", "ori_slot_mapping",
         "position_ids",
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
-        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+        "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
+        "norm_w",
         "gate_w", "gate_bias", "tid2eid", "input_ids",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
         "routed_w2", "routed_w2_scale",
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
         "shared_w2", "shared_w2_scale",
-        "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+        "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base",
+        "mtp_norm_w",
     ]
 
     specs = []
@@ -465,45 +485,65 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
             specs.append(_ranked(moe_specs[name], torch))
         elif name == "kv_cache":
             cache_dtype = base[name].dtype
-            specs.append(TensorSpec(
-                name,
-                [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM],
-                cache_dtype,
-                init_value=lambda: torch.zeros(
-                    N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM, dtype=cache_dtype
-                ),
+
+            def init_kv_cache():
+                return torch.zeros(N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM, dtype=cache_dtype)
+
+            cache_spec = TensorSpec(
+                name, [N_RANKS, ori_block_num, BLOCK_SIZE, 1, HEAD_DIM], cache_dtype,
+                init_value=init_kv_cache,
                 is_output=True,
-            ))
+            )
+            specs.append(cache_spec)
         elif name == "ori_block_table":
             table_dtype = base[name].dtype
-            specs.append(TensorSpec(
-                name,
-                [N_RANKS, BLOCK_NUM],
-                table_dtype,
-                init_value=lambda: torch.arange(BLOCK_NUM, dtype=table_dtype)
-                .remainder(ori_block_num)
-                .view(1, BLOCK_NUM)
-                .expand(N_RANKS, -1)
-                .contiguous(),
-            ))
+
+            def init_ori_block_table():
+                table = torch.arange(BLOCK_NUM, dtype=table_dtype).remainder(ori_block_num)
+                return table.view(1, BLOCK_NUM).expand(N_RANKS, -1).contiguous()
+
+            block_table_spec = TensorSpec(
+                name, [N_RANKS, BLOCK_NUM], table_dtype,
+                init_value=init_ori_block_table,
+            )
+            specs.append(block_table_spec)
         elif name == "ori_slot_mapping":
             slot_init = base[name].init_value
-            specs.append(TensorSpec(
-                name,
-                [N_RANKS, T],
-                base[name].dtype,
-                init_value=lambda: torch.remainder(
-                    slot_init()[:1].reshape(1, T), ori_block_num * BLOCK_SIZE
-                ).expand(N_RANKS, -1).contiguous(),
-            ))
+
+            def init_ori_slot_mapping():
+                slots = torch.remainder(slot_init()[:1].reshape(1, T), ori_block_num * BLOCK_SIZE)
+                return slots.expand(N_RANKS, -1).contiguous()
+
+            slot_mapping_spec = TensorSpec(
+                name, [N_RANKS, T], base[name].dtype,
+                init_value=init_ori_slot_mapping,
+            )
+            specs.append(slot_mapping_spec)
         else:
             specs.append(_ranked(base[name], torch))
 
-    specs.append(TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
-    specs.append(TensorSpec("logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32, init_value=init_logit_row_indices))
+    lm_head_spec = TensorSpec(
+        "lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16,
+        init_value=init_lm_head_weight,
+    )
+    specs.append(lm_head_spec)
+    hidden_out_spec = TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True)
+    specs.append(hidden_out_spec)
+    pre_hc_hidden_spec = TensorSpec(
+        "pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32,
+        is_output=True,
+    )
+    specs.append(pre_hc_hidden_spec)
+    logits_spec = TensorSpec(
+        "logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32,
+        is_output=True,
+    )
+    specs.append(logits_spec)
+    row_indices_spec = TensorSpec(
+        "logit_row_indices", [N_RANKS, MAX_LOGIT_ROWS], torch.int32,
+        init_value=init_logit_row_indices,
+    )
+    specs.append(row_indices_spec)
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
@@ -518,7 +558,7 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
 
     sq_sum = torch.zeros(token_count, 1, dtype=torch.float32)
     for k0 in range(0, HC_DIM, HC_HEAD_RMS_K_TILE):
-        x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_RMS_K_TILE]
+        x_chunk = x_flat_2d[:, k0 : k0 + HC_HEAD_RMS_K_TILE]
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_HEAD_DIM_INV + HC_HEAD_RMS_EPS)
 
@@ -526,8 +566,8 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
     for h in range(HC_MULT):
         mix_col = torch.zeros(token_count, 1, dtype=torch.float32)
         for k0 in range(0, HC_DIM, HC_HEAD_LINEAR_K_TILE):
-            x_chunk = x_flat_2d[:, k0:k0 + HC_HEAD_LINEAR_K_TILE]
-            w_chunk = hc_head_fn[h:h + 1, k0:k0 + HC_HEAD_LINEAR_K_TILE]
+            x_chunk = x_flat_2d[:, k0 : k0 + HC_HEAD_LINEAR_K_TILE]
+            w_chunk = hc_head_fn[h : h + 1, k0 : k0 + HC_HEAD_LINEAR_K_TILE]
             mix_col += (x_chunk * w_chunk).sum(dim=1, keepdim=True)
         mix_cols.append(mix_col * rsqrt)
     mixes = torch.cat(mix_cols, dim=1).reshape(token_count, HC_MULT)
@@ -535,17 +575,13 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
     pre = torch.sigmoid(mixes * hc_head_scale.float() + hc_head_base.float()) + HC_HEAD_EPS
     x_view = x_hc.float().view(shape)
     if HC_MULT == 4:
-        y = (
-            x_view[:, 0, :] * pre[:, 0:1]
-            + x_view[:, 1, :] * pre[:, 1:2]
-        ) + (
-            x_view[:, 2, :] * pre[:, 2:3]
-            + x_view[:, 3, :] * pre[:, 3:4]
-        )
+        y01 = x_view[:, 0, :] * pre[:, 0:1] + x_view[:, 1, :] * pre[:, 1:2]
+        y23 = x_view[:, 2, :] * pre[:, 2:3] + x_view[:, 3, :] * pre[:, 3:4]
+        y = y01 + y23
     else:
         y = torch.zeros(token_count, D, dtype=torch.float32)
         for h in range(HC_MULT):
-            y += x_view[:, h, :] * pre[:, h:h + 1]
+            y += x_view[:, h, :] * pre[:, h : h + 1]
 
     rounded = (y.contiguous().view(torch.int32) + 0x8000) & -0x10000
     return rounded.view(torch.float32).to(torch.bfloat16)
@@ -558,7 +594,7 @@ def golden_mtp_prefill_fwd(tensors):
 
     projected = torch.zeros_like(tensors["prev_hidden_states"])
     for rank in range(N_RANKS):
-        golden_mtp_projection({
+        projection_tensors = {
             "hidden_states": tensors["hidden_states"][rank],
             "prev_hidden_states": tensors["prev_hidden_states"][rank],
             "enorm_w": tensors["enorm_w"][rank],
@@ -570,11 +606,12 @@ def golden_mtp_prefill_fwd(tensors):
             "h_proj_w_scale": tensors["h_proj_w_scale"][rank],
             "h_proj_smooth": tensors["h_proj_smooth"][rank],
             "hidden_states_out": projected[rank],
-        })
+        }
+        golden_mtp_projection(projection_tensors)
 
     x_attn = torch.zeros_like(projected)
     for rank in range(N_RANKS):
-        golden_prefill_attention_swa({
+        attention_tensors = {
             "x_hc": projected[rank],
             "hc_attn_fn": tensors["hc_attn_fn"][rank],
             "hc_attn_scale": tensors["hc_attn_scale"][rank],
@@ -598,7 +635,8 @@ def golden_mtp_prefill_fwd(tensors):
             "wo_b_scale": tensors["wo_b_scale"][rank],
             "x_out": x_attn[rank],
             "num_tokens": num_tokens,
-        })
+        }
+        golden_prefill_attention_swa(attention_tensors)
 
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
@@ -616,14 +654,13 @@ def golden_mtp_prefill_fwd(tensors):
         )
         tensors["hidden_out"][rank] = golden_rms_norm(x_head, tensors["mtp_norm_w"][rank])
 
-    golden_lm_head(
-        {
-            "hidden_states": tensors["hidden_out"],
-            "lm_head_weight": tensors["lm_head_weight"],
-            "logit_row_indices": tensors["logit_row_indices"],
-            "logits": tensors["logits"],
-        }
-    )
+    lm_head_tensors = {
+        "hidden_states": tensors["hidden_out"],
+        "lm_head_weight": tensors["lm_head_weight"],
+        "logit_row_indices": tensors["logit_row_indices"],
+        "logits": tensors["logits"],
+    }
+    golden_lm_head(lm_head_tensors)
 
 
 def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
@@ -641,10 +678,14 @@ def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
-    parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
-                        help="EP world size / rank count (parsed at import by moe).")
-    parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
-                        help=f"comma-separated device ids; need at least {N_RANKS}")
+    parser.add_argument(
+        "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
+        help="EP world size / rank count (parsed at import by moe).",
+    )
+    parser.add_argument(
+        "-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
+        help=f"comma-separated device ids; need at least {N_RANKS}",
+    )
     parser.add_argument("--start-pos", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=BLOCK_NUM)
