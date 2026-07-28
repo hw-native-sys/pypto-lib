@@ -86,7 +86,6 @@ gh pr create \
   --head "$BRANCH_NAME" \
   --title "Type: concise description" \
   --body "$(cat <<'EOF'
-## Summary
 - Key change 1
 - Key change 2
 EOF
@@ -97,12 +96,21 @@ EOF
 seven types in `/git-commit`. It becomes the squash-merge subject on `main`, so never the
 conventional-commit `feat(scope):` form.
 
-**Body**:
+**Body** — the repo squash-merges, so this text lands verbatim in `git log` on `main`. Write it as
+a commit body, not as a web page:
 
+- One commit body for the **squashed whole**, not a concatenation of the per-commit bodies. A
+  single-commit PR reuses that commit's body verbatim.
+- With several commits, describe the net `git diff "$BASE_REF"...HEAD` — the end state a reader of
+  `main` sees. Merge bullets that touch the same thing, and drop any step the later commits undid:
+  "add X" + "fix X" + "rename X to Y" is one bullet about Y, never three. A bullet that only makes
+  sense as history ("revert the earlier attempt", "address review feedback") does not belong.
 - Derived **only** from `$BASE_REF..HEAD` — never from the conversation that produced it, from
   commits already on `main`, or from tool output.
-- `## Summary` is the ONLY section. No `## Test plan`, `## Testing`, `## Validation`, `## Notes`,
-  `## Related Issues`, or any other heading.
+- Plain `-` bullets wrapped at 72 characters. **No markdown headings at all** — no `## Summary`,
+  no `## Test plan`, `## Testing`, `## Validation`, `## Notes`, or `## Related Issues`.
+- A `Perf:` PR ends with the measured before -> after and the configuration measured on, as a
+  trailing sentence rather than a section.
 - Link an issue with a bare trailing `Fixes #123`, and only when a real issue number exists. Omit
   the line otherwise — never a heading followed by `None` / `N/A` / `(if applicable)`.
 - Every bullet verifiable from the diff. No lint / `pre-commit` runs, syntax checks, commands
