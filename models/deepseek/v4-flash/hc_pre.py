@@ -680,8 +680,39 @@ def hc_pre_test(
     return x_mixed
 
 
+def _golden_a2a3_cube_linear(x_flat_2d, hc_fn):
+    """Emulate the A2/A3 f32 Cube MAD reduction used by the HC projection."""
+    import torch
+
+    cube_acc_k = 4
+    group_block = 64
+    assert LINEAR_K_PER_SPLIT % cube_acc_k == 0
+    groups_per_split = LINEAR_K_PER_SPLIT // cube_acc_k
+
+    t_dim = x_flat_2d.shape[0]
+    x_groups = x_flat_2d.reshape(t_dim, 1, LINEAR_OK, groups_per_split, cube_acc_k)
+    w_groups = hc_fn.reshape(1, MIX_HC, LINEAR_OK, groups_per_split, cube_acc_k)
+    split_mixes = torch.zeros(t_dim, MIX_HC, LINEAR_OK, dtype=torch.float32)
+    for group0 in range(0, groups_per_split, group_block):
+        group_dots = (
+            x_groups[..., group0:group0 + group_block, :].double()
+            * w_groups[..., group0:group0 + group_block, :].double()
+        ).sum(dim=-1)
+        for group in range(group_dots.shape[-1]):
+            split_mixes = (split_mixes.double() + group_dots[..., group]).float()
+
+    # Atomic completion order is not a semantic guarantee.  Canonical split
+    # order is the deterministic golden representative.  Other legal orders
+    # differ by only a few FP32 ULPs; the output tolerances cover the rare case
+    # where that difference crosses a BF16 boundary.
+    mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)
+    for split in range(LINEAR_OK):
+        mixes += split_mixes[..., split]
+    return mixes
+
+
 def golden_hc_pre(tensors):
-    """Torch reference, direct port of model.py Block.hc_pre + hc_split_sinkhorn."""
+    """Torch reference matching the target HC-pre reduction and nonlinearities."""
     import torch
 
     x = tensors["x"].float()  # [T, hc, D]
@@ -698,16 +729,10 @@ def golden_hc_pre(tensors):
         sq_sum += (x_chunk * x_chunk).sum(dim=1, keepdim=True)
     rsqrt = torch.rsqrt(sq_sum * HC_DIM_INV + NORM_EPS)
 
-    # Per-K-chunk partial dots in one reduction, then accumulated in chunk order
-    # to match the cube K-fragment accumulation. Summing over n_chunk with a
-    # single torch.sum instead reorders the adds and is not bit-exact.
-    n_chunk = HC_DIM // LINEAR_K_CHUNK
-    x_k = x_flat_2d.reshape(t_dim, 1, n_chunk, LINEAR_K_CHUNK)
-    w_k = hc_fn.reshape(1, MIX_HC, n_chunk, LINEAR_K_CHUNK)
-    per_chunk = (x_k * w_k).sum(dim=3)                       # [T, mix_hc, n_chunk]
-    mixes = torch.zeros(t_dim, MIX_HC, dtype=torch.float32)  # [T, mix_hc]
-    for c in range(n_chunk):
-        mixes += per_chunk[:, :, c]
+    # A2/A3 f32 Cube MAD accumulates four consecutive products before rounding
+    # the updated accumulator to FP32.  Reproduce that target-defined reduction
+    # instead of using Torch's different reduction tree.
+    mixes = _golden_a2a3_cube_linear(x_flat_2d, hc_fn)
     mixes *= rsqrt
 
     pre = torch.sigmoid(mixes[..., :HC_MULT] * hc_scale[0] + hc_base[:HC_MULT]) + HC_EPS
