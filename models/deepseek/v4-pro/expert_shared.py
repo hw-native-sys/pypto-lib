@@ -309,25 +309,35 @@ def golden_expert_shared(tensors):
     import torch
     import torch.nn.functional as F
 
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
-
+    # Mirror the kernel's numerics exactly. Every matmul in the kernel is an
+    # exact INT8 x INT8 -> INT32 accumulate, dequantized AFTER the reduction by
+    # the per-row input scale x per-channel weight scale. Integer accumulation
+    # is exact and order-independent, so an int32 matmul here is bit-identical
+    # to the kernel's tiled int32 accumulate regardless of K-tiling. A fp32
+    # matmul of pre-dequantized operands (the previous form) instead accumulates
+    # fp32 rounding error that flips bf16 last-bit ties on the final cast; mirror
+    # the kernel's "accumulate-int32, then one fp32 dequant mul" order to match.
     x_local_i8 = tensors["x_local_i8"]                       # [T, D] int8
     x_local_scale_dq = tensors["x_local_scale_dq"].float()   # [T, 1]
-    x_local = x_local_i8.float() * x_local_scale_dq
-    sw1 = dequant_w(tensors["shared_w1"], tensors["shared_w1_scale"].float())
-    sw3 = dequant_w(tensors["shared_w3"], tensors["shared_w3_scale"].float())
-    sw2 = dequant_w(tensors["shared_w2"], tensors["shared_w2_scale"].float())
+    w1_i8 = tensors["shared_w1"]                        # [MOE_INTER, D] int8
+    w1_scale = tensors["shared_w1_scale"].float()       # [MOE_INTER]
+    w3_i8 = tensors["shared_w3"]                        # [MOE_INTER, D] int8
+    w3_scale = tensors["shared_w3_scale"].float()       # [MOE_INTER]
+    w2_i8 = tensors["shared_w2"]                        # [D, MOE_INTER] int8
+    w2_scale = tensors["shared_w2_scale"].float()       # [D]
 
-    sh_gate = x_local @ sw1.T
-    sh_up = x_local @ sw3.T
+    gate_int = x_local_i8.to(torch.int32) @ w1_i8.to(torch.int32).T
+    sh_gate = gate_int.to(torch.float32) * x_local_scale_dq * w1_scale.unsqueeze(0)
+    up_int = x_local_i8.to(torch.int32) @ w3_i8.to(torch.int32).T
+    sh_up = up_int.to(torch.float32) * x_local_scale_dq * w3_scale.unsqueeze(0)
     if SWIGLU_LIMIT > 0:
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
     sh_h_i8, sh_h_sd = _int8_quant_per_row(sh_h)
-    sh_h = sh_h_i8.float() * sh_h_sd
-    sh = sh_h @ sw2.T
+    # W2: exact INT32 accumulate, then per-row (h) x per-channel (w2) dequant.
+    sh_int = sh_h_i8.to(torch.int32) @ w2_i8.to(torch.int32).T
+    sh = sh_int.to(torch.float32) * sh_h_sd * w2_scale.unsqueeze(0)
 
     tensors["sh"][:] = sh.to(torch.bfloat16)
 
