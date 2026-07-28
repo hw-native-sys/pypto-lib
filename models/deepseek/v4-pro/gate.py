@@ -88,7 +88,7 @@ def gate(
 
     # One token per core with two-level full-row reductions.
     norm_w_2d = pl.reshape(norm_w, [1, D])
-    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
+    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm"):
         rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
         rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
         xg = pl.mul(rms_x, rms_w)
@@ -135,7 +135,6 @@ def gate(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="x_norm_quant",
-            allow_early_resolve=True,
         ):
             xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
             for xq_b_k in pl.pipeline(0, D, QUANT_TILE, stage=2):
@@ -167,7 +166,7 @@ def gate(
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate"):
         tg = gb_idx // GATE_N_BLOCKS
         nb = gb_idx % GATE_N_BLOCKS
         t1 = tg * GATE_M_TILE
@@ -200,7 +199,7 @@ def gate(
     active_route_tiles = (active_tokens + GATE_T_TILE - 1) // GATE_T_TILE
     # Hash layers index via tid2eid[input_ids]; score layers sort+gather.
     if layer_id < N_HASH_LAYERS:
-        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash", allow_early_resolve=True):
+        for th_idx in pl.spmd(active_route_tiles, name_hint="route_hash"):
             t1 = th_idx * GATE_T_TILE
             # eids from tid2eid[input_ids]: scalar lookup (dynamic row index) into a
             # Tensor. tid2eid row load hits the 32B tile floor (TOPK*4=24B), so the
@@ -232,7 +231,7 @@ def gate(
                         pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
                         pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
     else:
-        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
+        for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort"):
             t1 = ts_idx * GATE_T_TILE
             # topk_idx_tile stays Tensor (created here, not a pl.full Tile) so
             # the batched pl.gather below accepts it — Tile-against-Tensor src

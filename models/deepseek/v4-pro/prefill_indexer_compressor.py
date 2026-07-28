@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache."""
+"""DeepSeek-V4 prefill indexer compressor for ratio-4 overlapping KV cache.
+
+Hybrid LI A8C8 (Step 5): compressor linears stay BF16; Indexer Cache C8 writes
+dynamic per-position FP8 e4m3 + FP32 dequant scale (max=448; not main KV group64).
+"""
 
 import pypto.language as pl
 
@@ -17,9 +21,9 @@ from config import (
     FP32_NEG_INF,
     PREFILL_IDX_BLOCK_NUM,
     PREFILL_IDX_MAX_BLOCKS,
-    INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
+from mx_quant_common import ATOL_RTOL, FP8_E4M3_MAX
 
 # model config (mirrors decode_indexer_compressor)
 EPS = M.rms_norm_eps
@@ -59,6 +63,15 @@ MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
 PACKED_STATE_UPDATE_TILE = 16
 PACKED_RMS_TILE = 16
+# A5 FP32 tgather / 16-row Mat mul corrupt rows beyond the first few (decode hides
+# this with B<=8 real rows in an RMS_PAD_TILE=16 box). Prefill packs only this many
+# live writes into each 16-row tile.
+TRUSTED_RMS_ROWS = 4
+ROPE_GATHER_T_TILE = 4
+assert PACKED_RMS_TILE % ROPE_GATHER_T_TILE == 0
+assert TRUSTED_RMS_ROWS <= PACKED_RMS_TILE
+assert MAX_CMP_WRITES % TRUSTED_RMS_ROWS == 0
+NUM_RMS_BATCHES = MAX_CMP_WRITES // TRUSTED_RMS_ROWS
 
 
 @pl.jit.inline
@@ -73,9 +86,12 @@ def prefill_indexer_compressor(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    # C8 indexer cache: FP8 e4m3 KV (quant-on-write) + per-position FP32 dequant scale.
+    idx_kv_cache: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.Out[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
+    # Dense compressed-order FP8 rows for the harness (written with cache; no A5-hostile
+    # idx_slot_mapping rescan). Production callers may pass a throwaway buffer.
+    kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.FP8E4M3FN]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -91,8 +107,6 @@ def prefill_indexer_compressor(
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
     idx_kv_scale_flat = pl.reshape(idx_kv_scale, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
-    normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
-    final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
     for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
@@ -271,104 +285,116 @@ def prefill_indexer_compressor(
             pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_CHUNK] = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_rmsnorm_rope"):
-        final_base = final_block * PACKED_RMS_TILE
+    # Pack TRUSTED_RMS_ROWS live writes into each 16-row box (rows 0..TRUSTED-1);
+    # pad the rest with zeros — same A5-safe pattern as decode B<=8 in RMS_PAD_TILE=16.
+    rms_pooled = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32)
+    rms_normed = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.BF16)
+    rms_final = pl.create_tensor([NUM_RMS_BATCHES * PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32)
+
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_rmsnorm_rope"):
+        box = batch * PACKED_RMS_TILE
+        write_base = batch * TRUSTED_RMS_ROWS
+        rms_pooled[box : box + PACKED_RMS_TILE, 0:HEAD_DIM] = pl.full(
+            [PACKED_RMS_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0
+        )
         cos_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        for final_dt in pl.range(PACKED_RMS_TILE):
-            final_i = final_base + final_dt
-            write_slot_raw = pl.read(write_dst_map, [0, final_i])
+        for dt in pl.range(TRUSTED_RMS_ROWS):
+            wi = write_base + dt
+            rms_pooled[box + dt : box + dt + 1, 0:HEAD_DIM] = pooled_kv[wi : wi + 1, 0:HEAD_DIM]
+            write_slot_raw = pl.read(write_dst_map, [0, wi])
             if write_slot_raw >= 0:
-                write_pos = pl.read(write_pos_map, [0, final_i])
+                write_pos = pl.read(write_pos_map, [0, wi])
                 cmp_pos = pl.cast(write_pos + 1 - COMPRESS_RATIO, pl.INDEX)
-                cos_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                cos_b[dt : dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
                     freqs_cos[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
-                sin_b[final_dt : final_dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
+                sin_b[dt : dt + 1, 0 : ROPE_HEAD_DIM // 2] = pl.cast(
                     freqs_sin[cmp_pos : cmp_pos + 1, 0 : ROPE_HEAD_DIM // 2],
                     target_type=pl.FP32,
                 )
         partial_sq = pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_chunk = rms_pooled[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, PACKED_RMS_TILE]))
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [PACKED_RMS_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
         for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
+            kv_norm_chunk = rms_pooled[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[final_base : final_base + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
-                normed_chunk,
-                target_type=pl.BF16,
-                mode="rint",
+            rms_normed[box : box + PACKED_RMS_TILE, k0 : k0 + HEAD_TILE] = pl.cast(
+                normed_chunk, target_type=pl.BF16, mode="rint"
             )
-        kv_rope_norm = pooled_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        kv_rope_norm = rms_pooled[box : box + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
-        # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
-        rope_ones = pl.full([PACKED_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv[final_base : final_base + PACKED_RMS_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
-            rope_rot,
-            target_type=pl.BF16,
-            mode="rint",
+        rope_ones = pl.full([ROPE_GATHER_T_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        rope_col = pl.col_expand_mul(
+            rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32)
         )
+        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)
+        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))
+        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)
+        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)
+        for rope_r0 in pl.range(0, PACKED_RMS_TILE, ROPE_GATHER_T_TILE):
+            rn = rope_normed[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0:ROPE_HEAD_DIM]
+            cos_s = cos_b[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0 : ROPE_HEAD_DIM // 2]
+            sin_s = sin_b[rope_r0 : rope_r0 + ROPE_GATHER_T_TILE, 0 : ROPE_HEAD_DIM // 2]
+            cos_il = pl.gather(cos_s, dim=-1, index=rope_dup_idx)
+            sin_il = pl.gather(sin_s, dim=-1, index=rope_dup_idx)
+            swapped = pl.gather(rn, dim=-1, index=rope_swap_idx)
+            rope_rot = pl.add(pl.mul(rn, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+            rms_normed[box + rope_r0 : box + rope_r0 + ROPE_GATHER_T_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
+                rope_rot, target_type=pl.BF16, mode="rint"
+            )
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_hadamard"):
-        final_base = final_block * PACKED_RMS_TILE
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_kv_hadamard"):
+        box = batch * PACKED_RMS_TILE
         for o0 in pl.range(0, HEAD_DIM, OUT_TILE):
             final_acc = pl.matmul(
-                normed_kv[final_base : final_base + PACKED_RMS_TILE, 0:HEAD_DIM],
+                rms_normed[box : box + PACKED_RMS_TILE, 0:HEAD_DIM],
                 hadamard[0:HEAD_DIM, o0 : o0 + OUT_TILE],
                 out_dtype=pl.FP32,
             )
-            final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
+            rms_final[box : box + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write"):
-        final_base = final_block * PACKED_RMS_TILE
-        # C8 quant-on-write: per-row INT8 quant of the bf16-rounded block + per-position dequant scale
+    for batch in pl.spmd(NUM_RMS_BATCHES, name_hint="prefill_idx_c4_cache_write"):
+        box = batch * PACKED_RMS_TILE
+        write_base = batch * TRUSTED_RMS_ROWS
         kv_blk_f32 = pl.cast(
-            pl.cast(final_kv[final_base : final_base + PACKED_RMS_TILE, 0:HEAD_DIM], target_type=pl.BF16, mode="rint"),
-            target_type=pl.FP32)
-        # amax = max(|x|); abs-based (max(row_max, -row_min) is wrong on signed KV)
+            pl.cast(rms_final[box : box + PACKED_RMS_TILE, 0:HEAD_DIM], target_type=pl.BF16, mode="rint"),
+            target_type=pl.FP32,
+        )
         kv_amax = pl.reshape(pl.row_max(pl.abs(kv_blk_f32)), [1, PACKED_RMS_TILE])
         kv_amax = pl.maximum(kv_amax, pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS))
-        kv_scale_q_row = pl.div(pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), kv_amax)
+        kv_scale_q_row = pl.div(pl.full([1, PACKED_RMS_TILE], dtype=pl.FP32, value=FP8_E4M3_MAX), kv_amax)
         kv_scale_dq_col = pl.reshape(pl.recip(kv_scale_q_row), [PACKED_RMS_TILE, 1])
         kv_scale_q_col = pl.reshape(kv_scale_q_row, [PACKED_RMS_TILE, 1])
         kv_scaled = pl.row_expand_mul(kv_blk_f32, kv_scale_q_col)
-        kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
-        kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
-        kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
-        for final_dt in pl.range(PACKED_RMS_TILE):
-            final_i = final_base + final_dt
-            dst_row_raw = pl.read(write_dst_map, [0, final_i])
+        kv_fp8_blk = pl.cast(kv_scaled, target_type=pl.FP8E4M3FN, mode="rint")
+        for dt in pl.range(TRUSTED_RMS_ROWS):
+            wi = write_base + dt
+            dst_row_raw = pl.read(write_dst_map, [0, wi])
             if dst_row_raw >= 0:
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
-                idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_i8_blk[final_dt : final_dt + 1, :]
-                # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
-                pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [final_dt, 0]))
+                idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_fp8_blk[dt : dt + 1, :]
+                pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [dt, 0]))
+                kv[wi : wi + 1, 0:HEAD_DIM] = kv_fp8_blk[dt : dt + 1, :]
             else:
-                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + final_i
+                keepalive_row = PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE - MAX_CMP_WRITES + wi
                 idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
-                    keepalive_row : keepalive_row + 1,
-                    0:HEAD_DIM,
+                    keepalive_row : keepalive_row + 1, 0:HEAD_DIM
                 ]
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
+                kv[wi : wi + 1, 0:HEAD_DIM] = pl.cast(
+                    pl.full([1, HEAD_DIM], dtype=pl.FP32, value=0.0),
+                    target_type=pl.FP8E4M3FN,
+                    mode="trunc",
+                )
 
     for update_idx in pl.spmd(T * PACKED_PROJ_BLOCKS, name_hint="prefill_idx_c4_state_update"):
         update_ob = update_idx % PACKED_PROJ_BLOCKS
@@ -412,7 +438,7 @@ def prefill_indexer_compressor(
 @pl.jit
 def prefill_indexer_compressor_test(
     x: pl.Tensor[[T, D], pl.BF16],
-    kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.INT8]],
+    kv: pl.Out[pl.Tensor[[MAX_CMP_WRITES, HEAD_DIM], pl.FP8E4M3FN]],
     compress_state: pl.InOut[
         pl.Tensor[[INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]
     ],
@@ -424,7 +450,7 @@ def prefill_indexer_compressor_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.FP8E4M3FN]],
     idx_kv_scale: pl.InOut[pl.Tensor[[PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
@@ -434,33 +460,22 @@ def prefill_indexer_compressor_test(
 ):
     prefill_indexer_compressor(
         x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
+        hadamard, idx_kv_cache, idx_kv_scale, kv, idx_block_table, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
-    for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
-        kv_base = kv_block * PACKED_RMS_TILE
-        for kv_dt in pl.range(PACKED_RMS_TILE):
-            kv_i = kv_base + kv_dt
-            src_row_raw = pl.cast(-1, pl.INT64)
-            write_seen = pl.cast(0, pl.INDEX)
-            for scan_w in pl.range(T):
-                if scan_w < num_tokens:
-                    scan_slot_raw = pl.read(idx_slot_mapping, [scan_w])
-                    if scan_slot_raw >= 0:
-                        if write_seen == kv_i:
-                            src_row_raw = scan_slot_raw
-                        write_seen = write_seen + 1
-            if src_row_raw >= 0:
-                src_row = pl.cast(src_row_raw, pl.INDEX)
-                # C8 readback: raw INT8 cache rows in compressed order (dequant scale checked separately
-                # via idx_kv_scale). A vector INT8->float widen mis-lanes, so expose the int8 as-is.
-                kv[kv_i : kv_i + 1, 0:HEAD_DIM] = idx_kv_cache_flat[src_row : src_row + 1, 0:HEAD_DIM]
-            else:
-                # INT8 zero via the fp16->int8 cast (a direct pl.full INT8 hits an i8 texpands wall)
-                kv[kv_i : kv_i + 1, 0:HEAD_DIM] = pl.cast(
-                    pl.full([1, HEAD_DIM], dtype=pl.FP16, value=0.0), target_type=pl.INT8, mode="trunc")
     return kv, compress_state, idx_kv_cache, idx_kv_scale
+
+
+def _fp8_quant_per_row(x):
+    """Per-row FP8 e4m3 symmetric quant with FP32 dequant scale (max=448)."""
+    import torch
+
+    rows = x.float().reshape(-1, x.shape[-1])
+    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale_quant = FP8_E4M3_MAX / amax
+    out_fp8 = (rows * scale_quant).to(torch.float8_e4m3fn)
+    scale_dequant = 1.0 / scale_quant
+    return out_fp8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
 
 
 def golden_prefill_indexer_compressor(tensors):
@@ -475,7 +490,7 @@ def golden_prefill_indexer_compressor(tensors):
     kv_state_flat = compress_state_flat[:, :OUT_DIM]
     score_state_flat = compress_state_flat[:, OUT_DIM:]
     state_block_table = tensors["inner_compress_state_block_table"]
-    idx_kv_cache = tensors["idx_kv_cache"]        # C8: INT8 KV
+    idx_kv_cache = tensors["idx_kv_cache"]        # C8: FP8 e4m3 KV
     idx_kv_scale = tensors["idx_kv_scale"]        # C8: per-position FP32 dequant scale
     cache_rows = idx_kv_cache.view(idx_kv_cache.shape[0] * BLOCK_SIZE, 1, HEAD_DIM)[:, 0, :]
     scale_rows = idx_kv_scale.view(idx_kv_scale.shape[0] * BLOCK_SIZE, 1, 1)[:, 0, 0]
@@ -483,7 +498,7 @@ def golden_prefill_indexer_compressor(tensors):
     ape = tensors["ape"]
     norm_w = tensors["norm_w"]
     hadamard = tensors["hadamard"].float()
-    kv = torch.zeros(MAX_CMP_WRITES, HEAD_DIM, dtype=torch.int8)
+    kv = torch.zeros(MAX_CMP_WRITES, HEAD_DIM, dtype=torch.float8_e4m3fn)
 
     def state_row(abs_pos):
         if abs_pos < 0 or abs_pos >= MAX_SEQ_LEN:
@@ -565,15 +580,13 @@ def golden_prefill_indexer_compressor(tensors):
         normed[:, NOPE_HEAD_DIM:HEAD_DIM] = torch.stack([rot_even, rot_odd], dim=-1).flatten(-2).to(torch.bfloat16).float()
         final = normed.to(torch.bfloat16).float() @ hadamard
         final_bf16 = final.to(torch.bfloat16)[0]
-        # C8 quant-on-write: int8 + per-position dequant scale of the bf16-rounded compressed row
+        # C8 quant-on-write: FP8 e4m3 + per-position dequant scale of the bf16-rounded row
         row_bf16 = final_bf16.float()
-        amax = row_bf16.abs().amax().clamp_min(INT8_AMAX_EPS)
-        scale_q = INT8_SCALE_MAX / amax
-        row_i8 = torch.round(row_bf16 * scale_q).to(torch.int32).to(torch.float16).to(torch.int8)
-        cache_rows[dst_row] = row_i8
-        scale_rows[dst_row] = 1.0 / scale_q
+        row_fp8, row_sc = _fp8_quant_per_row(row_bf16.view(1, HEAD_DIM))
+        cache_rows[dst_row] = row_fp8.view(HEAD_DIM)
+        scale_rows[dst_row] = row_sc.view(()).item()
         if write_i < MAX_CMP_WRITES:
-            kv[write_i] = row_i8
+            kv[write_i] = row_fp8.view(HEAD_DIM)
         write_i += 1
 
     for t in range(int(tensors["num_tokens"])):
@@ -646,7 +659,7 @@ def build_tensor_specs(start_pos: int = START_POS):
             h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
         return (h * (HEAD_DIM ** -0.5)).to(torch.bfloat16)
     def init_idx_kv_cache():
-        return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.int8)
+        return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM, dtype=torch.float8_e4m3fn)
     def init_idx_kv_scale():
         return torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
     def init_idx_block_table():
@@ -685,7 +698,7 @@ def build_tensor_specs(start_pos: int = START_POS):
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),
-        TensorSpec("kv", [MAX_CMP_WRITES, HEAD_DIM], torch.int8, is_output=True),
+        TensorSpec("kv", [MAX_CMP_WRITES, HEAD_DIM], torch.float8_e4m3fn, is_output=True),
         TensorSpec("compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("wkv", [OUT_DIM, D], torch.bfloat16, init_value=init_wkv),
@@ -695,7 +708,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         TensorSpec("freqs_cos", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_cos),
         TensorSpec("freqs_sin", [MAX_SEQ_LEN, ROPE_HEAD_DIM], torch.bfloat16, init_value=init_freqs_sin),
         TensorSpec("hadamard", [HEAD_DIM, HEAD_DIM], torch.bfloat16, init_value=init_hadamard),
-        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.int8, init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_cache", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.float8_e4m3fn, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_kv_scale", [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32, init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
@@ -725,6 +738,8 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    indexer_tol = ATOL_RTOL["indexer_fp8"]
+
     result = run_jit(
         fn=prefill_indexer_compressor_test,
         specs=build_tensor_specs(args.start_pos),
@@ -733,12 +748,20 @@ if __name__ == "__main__":
         runtime_cfg=dict(platform=args.platform, device_id=args.device, enable_l2_swimlane=args.enable_l2_swimlane),
         compile_only=args.compile_only,
         compare_fn={
-            # C8: raw INT8 compressed rows (+/-1 LSB on the boundary rows the compressor rewrote).
-            "kv": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+            # C8: raw FP8 compressed rows (+/- tolerance on boundary rows the compressor rewrote).
+            "kv": ratio_allclose(
+                atol=indexer_tol["atol"], rtol=indexer_tol["rtol"],
+                max_error_ratio=indexer_tol["pct"],
+            ),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
-            # C8 cache: INT8 rows exact bar the <=B boundary rows the compressor rewrote (+/-1 LSB).
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
+            "idx_kv_cache": ratio_allclose(
+                atol=indexer_tol["atol"], rtol=indexer_tol["rtol"],
+                max_error_ratio=indexer_tol["pct"],
+            ),
+            "idx_kv_scale": ratio_allclose(
+                atol=indexer_tol["atol"], rtol=indexer_tol["rtol"],
+                max_error_ratio=indexer_tol["pct"],
+            ),
         },
     )
     if not result.passed:

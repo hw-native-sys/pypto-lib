@@ -6,238 +6,433 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 MoE routed local expert compute (decode, EP single-card).
+"""DeepSeek-V4 MoE routed local expert — temporary MXFP8 weights + acts.
 
-Only the routed-expert path lives here. The shared expert was split out
-into ``expert_shared.py``; both kernels are composed in ``moe.py``.
+AscendC Hybrid is W4A8 (MXFP4 weight × MXFP8 act). On A5, FP4 Mat→Right TMov
+is blocked by PTOAS EmitC (cannot fix in pypto-lib alone), so this kernel
+temporarily uses MXFP8 weights+acts (same path as ``expert_shared``). Switch
+back to Hybrid MXFP4 when EmitC FP4 Right is fixed.
+
+  BF16 recv_x → dynamic MXFP8 (e4m3 + e8m0) → MX GEMM (FP8 w1/w3) → SwiGLU
+  → dynamic MXFP8 → MX GEMM (FP8 w2) → × routing weight → BF16 recv_y
+
+Weights are Right matrices for ``matmul_mx`` (``pl.FP8E4M3FN``):
+  w1/w3: ``[E, D, MOE_INTER]`` + tiled scale ``[E, _W13_SCALE_ROWS, MM_INTER_TILE]``
+  w2:    ``[E, MOE_INTER, D]`` + tiled scale ``[E, _W2_SCALE_ROWS, D_OUT_TILE]``
 """
-
 
 import pypto.language as pl
 
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP_WORLD_SIZE, RECV_MAX)
+from config import (
+    FLASH as M,
+    DECODE_BATCH,
+    DECODE_SEQ,
+    EP_WORLD_SIZE,
+    RECV_MAX,
+    MX_BLOCK_K,
+)
+from mx_quant_common import (
+    ATOL_RTOL,
+    dynamic_mx_quant_e4m3,
+    gen_mxfp8_weight_kn,
+    mx_matmul_fp8,
+    unpack_scale_b_nn_tiled,
+)
 
 
-# model config
 B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
-
-# EP layout / recv buffers (single-card view: kernel only sees the local shard)
 N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
 
-# tiling
 RECV_TILE = 16
-K_TILE = 512
-INTER_K = 512
-MM_INTER_TILE = 256
-MM_GATE_INNER = 4
-ACT_INTER_TILE = 128
-ACT_GATE_INNER = 4
-D_OUT_TILE = 256
-# h_tile_i8 store innermost = QUANT_TILE bytes (int8); 512 hits the a2a3 L2 cache
-# line (perf_hint PH001 flagged the prior 256B store as sub-line).
-QUANT_TILE = 512
-D_OUT_TILE_ACT = 512
-W2_INNER = 4
-W2_ACT_INNER = 8
-TILES_PER_EXPERT = RECV_MAX // RECV_TILE
+K_TILE = 128
+MM_INTER_TILE = 128
+ACT_INTER_TILE = 256
+D_OUT_TILE = 128
 
-assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+assert RECV_MAX % RECV_TILE == 0
+assert D % MX_BLOCK_K == 0 and MOE_INTER % MX_BLOCK_K == 0
+assert SWIGLU_LIMIT > 0.0
+
+_GATE_SPMD = MOE_INTER // MM_INTER_TILE
+_GATE_K_CHUNKS = D // K_TILE
+_DOWN_SPMD = D // D_OUT_TILE
+_DOWN_K_CHUNKS = MOE_INTER // K_TILE
+_KS = K_TILE // MX_BLOCK_K
+# Tiled MX_B_NN: each (K-chunk, N-tile) independently convert_x2'd; col offset 0.
+_W13_SCALE_ROWS = _GATE_SPMD * _GATE_K_CHUNKS * _KS
+_W2_SCALE_ROWS = _DOWN_SPMD * _DOWN_K_CHUNKS * _KS
+# Concurrent: all local experts × recv tiles × SPMD × K-chunks
+_MX_PHASE_SLOTS = max(_GATE_SPMD * _GATE_K_CHUNKS, _DOWN_SPMD * _DOWN_K_CHUNKS)
+_MX_WS_SLOTS = N_LOCAL_EXPERTS * (RECV_MAX // RECV_TILE) * _MX_PHASE_SLOTS
+assert _GATE_K_CHUNKS == 32 and _DOWN_K_CHUNKS == 16  # pl.unroll literals below
 
 
 @pl.jit.inline
 def expert_routed(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W2_SCALE_ROWS, D_OUT_TILE], pl.FP8E8M0],
     recv_y: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
 ):
-    recv_y_flat = pl.reshape(recv_y, [N_LOCAL_EXPERTS * RECV_MAX, D])
-
-    # gate (w1) / up (w3) INT32 accumulators for every (expert, row-tile), flat
-    # row-addressed so they survive the parallel nest that produces them.
-    gate_i32 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT32)
-    up_i32 = pl.create_tensor([N_LOCAL_EXPERTS * RECV_MAX, MOE_INTER], dtype=pl.INT32)
-
-    # Each local expert owns a disjoint recv_y row slab. The routed stages run in
-    # auto scope: the runtime tracks every dependency from the tensor reads/writes,
-    # including ordering the recv_x read after its producer (the dispatch gather),
-    # which a manual scope would not do automatically. The final w2 epilogue
-    # assembles each static channel block into recv_y.
-    for local_i in pl.parallel(N_LOCAL_EXPERTS):
-        # This expert's row slab of the two accumulators.
-        flat_base = local_i * RECV_MAX
-        gate_e = gate_i32[flat_base : flat_base + RECV_MAX]
-        up_e = up_i32[flat_base : flat_base + RECV_MAX]
-
-        n_rows = pl.read(recv_expert_count, [local_i, 0])
-        n_tiles = (n_rows + RECV_TILE - 1) // RECV_TILE
-
-        for t in pl.parallel(n_tiles):
-            t0 = t * RECV_TILE
-
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_gate_mm"):
-                nb_idx = pl.tile.get_block_idx()
-                n_base = nb_idx * (MM_GATE_INNER * MM_INTER_TILE)
-                for ng in pl.range(MM_GATE_INNER):
-                    n0 = n_base + ng * MM_INTER_TILE
-                    gate_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                    for k0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_k = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, k0 : k0 + K_TILE]
-                        w1_k = routed_w1[local_i : local_i + 1, n0 : n0 + MM_INTER_TILE, k0 : k0 + K_TILE]
-                        if k0 == 0:
-                            gate_acc = pl.matmul(x_k, w1_k, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            gate_acc = pl.matmul_acc(gate_acc, x_k, w1_k, b_trans=True)
-                    gate_e[t0 : t0 + RECV_TILE, n0 : n0 + MM_INTER_TILE] = pl.reshape(
-                        gate_acc, [RECV_TILE, MM_INTER_TILE]
-                    )
-
-            with pl.spmd(MOE_INTER // (MM_GATE_INNER * MM_INTER_TILE), name_hint="exp_up_mm"):
-                ub_idx = pl.tile.get_block_idx()
-                u_base = ub_idx * (MM_GATE_INNER * MM_INTER_TILE)
-                for ug in pl.range(MM_GATE_INNER):
-                    u0 = u_base + ug * MM_INTER_TILE
-                    up_acc = pl.create_tensor([1, RECV_TILE, MM_INTER_TILE], dtype=pl.INT32)
-                    for uk0 in pl.pipeline(0, D, K_TILE, stage=2):
-                        x_u = recv_x[local_i : local_i + 1, t0 : t0 + RECV_TILE, uk0 : uk0 + K_TILE]
-                        w3_k = routed_w3[local_i : local_i + 1, u0 : u0 + MM_INTER_TILE, uk0 : uk0 + K_TILE]
-                        if uk0 == 0:
-                            up_acc = pl.matmul(x_u, w3_k, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            up_acc = pl.matmul_acc(up_acc, x_u, w3_k, b_trans=True)
-                    up_e[t0 : t0 + RECV_TILE, u0 : u0 + MM_INTER_TILE] = pl.reshape(
-                        up_acc, [RECV_TILE, MM_INTER_TILE]
-                    )
-
+    # Left-scale: store flat tquant exp to per-slot GM → mx_a_zz (AND2ZZ)
+    # → LeftScale. Direct Mat ND→LeftScale is numerically wrong.
+    mx_scale_ws = pl.create_tensor(
+        [_MX_WS_SLOTS * RECV_TILE, K_TILE // MX_BLOCK_K], dtype=pl.FP8E8M0
+    )
     for local_e in pl.parallel(N_LOCAL_EXPERTS):
-        # This expert's row slab of the two accumulators.
-        e_flat_base = local_e * RECV_MAX
-        gate_slab = gate_i32[e_flat_base : e_flat_base + RECV_MAX]
-        up_slab = up_i32[e_flat_base : e_flat_base + RECV_MAX]
-
         e_rows = pl.read(recv_expert_count, [local_e, 0])
         e_tiles = (e_rows + RECV_TILE - 1) // RECV_TILE
+        # 2D GM views for MX weight/scale loads (mx_layout needs rank-2).
+        w1_e = pl.reshape(
+            pl.slice(routed_w1, [1, D, MOE_INTER], [local_e, 0, 0]),
+            [D, MOE_INTER],
+        )
+        w1s_e = pl.reshape(
+            pl.slice(routed_w1_scale, [1, _W13_SCALE_ROWS, MM_INTER_TILE], [local_e, 0, 0]),
+            [_W13_SCALE_ROWS, MM_INTER_TILE],
+        )
+        w3_e = pl.reshape(
+            pl.slice(routed_w3, [1, D, MOE_INTER], [local_e, 0, 0]),
+            [D, MOE_INTER],
+        )
+        w3s_e = pl.reshape(
+            pl.slice(routed_w3_scale, [1, _W13_SCALE_ROWS, MM_INTER_TILE], [local_e, 0, 0]),
+            [_W13_SCALE_ROWS, MM_INTER_TILE],
+        )
+        w2_e = pl.reshape(
+            pl.slice(routed_w2, [1, MOE_INTER, D], [local_e, 0, 0]),
+            [MOE_INTER, D],
+        )
+        w2s_e = pl.reshape(
+            pl.slice(routed_w2_scale, [1, _W2_SCALE_ROWS, D_OUT_TILE], [local_e, 0, 0]),
+            [_W2_SCALE_ROWS, D_OUT_TILE],
+        )
 
         for tt in pl.parallel(e_tiles):
             tt0 = tt * RECV_TILE
-            flat_tt0 = e_flat_base + tt0
-            valid_rows = pl.min(RECV_TILE, e_rows - tt0)
+            # Static slot base (worst-case RECV_MAX tiles) for concurrent experts × tiles.
+            tile_base = (local_e * (RECV_MAX // RECV_TILE) + tt) * _MX_PHASE_SLOTS
+
+            gate_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+            up_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+
+            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_gate_mm"):
+                n0 = nb_idx * MM_INTER_TILE
+                # Peel K=0 with matmul_mx; pl.unroll remaining so Acc SSA chains.
+                k0 = 0
+                x_tile = pl.load(
+                    recv_x,
+                    [local_e, tt0, k0],
+                    [1, RECV_TILE, K_TILE],
+                    target_memory=pl.Mem.Vec,
+                )
+                x_2d = pl.reshape(x_tile, [RECV_TILE, K_TILE])
+                x_q, x_s = pl.mx_quant(
+                    pl.cast(x_2d, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3"
+                )
+                w_tile = pl.load(w1_e, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+                ws_tile = pl.load(
+                    w1s_e,
+                    [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, MM_INTER_TILE],
+                    target_memory=pl.Mem.Mat,
+                    mx_layout="mx_b_nn",
+                )
+                srow = (tile_base + nb_idx * _GATE_K_CHUNKS) * RECV_TILE
+                la = pl.move(
+                    pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
+                )
+                la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las = pl.move(
+                    pl.load(
+                        mx_scale_ws,
+                        [srow, 0],
+                        [RECV_TILE, _KS],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
+                )
+                las = pl.tget_scale_addr(las, la)
+                las = pl.set_validshape(las, RECV_TILE, _KS)
+                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+                gate_acc = pl.matmul_mx(la, las, rb, rbs)
+                for db in pl.unroll(31):  # _GATE_K_CHUNKS - 1
+                    k0 = (db + 1) * K_TILE
+                    x_tile = pl.load(
+                        recv_x,
+                        [local_e, tt0, k0],
+                        [1, RECV_TILE, K_TILE],
+                        target_memory=pl.Mem.Vec,
+                    )
+                    x_2d = pl.reshape(x_tile, [RECV_TILE, K_TILE])
+                    x_q, x_s = pl.mx_quant(
+                        pl.cast(x_2d, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3"
+                    )
+                    w_tile = pl.load(w1_e, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+                    ws_tile = pl.load(
+                        w1s_e,
+                        [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                        [_KS, MM_INTER_TILE],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_b_nn",
+                    )
+                    srow = (
+                        tile_base + nb_idx * _GATE_K_CHUNKS + (db + 1)
+                    ) * RECV_TILE
+                    la2 = pl.move(
+                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
+                    )
+                    la2 = pl.set_validshape(la2, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las2 = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, _KS],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las2 = pl.tget_scale_addr(las2, la2)
+                    las2 = pl.set_validshape(las2, RECV_TILE, _KS)
+                    rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                    rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                    gate_acc = pl.matmul_mx_acc(gate_acc, la2, las2, rb2, rbs2)
+                pl.store(gate_acc, [0, n0], gate_fp32)
+
+            for nb_idx in pl.spmd(MOE_INTER // MM_INTER_TILE, name_hint="exp_up_mm"):
+                n0 = nb_idx * MM_INTER_TILE
+                k0 = 0
+                x_tile = pl.load(
+                    recv_x,
+                    [local_e, tt0, k0],
+                    [1, RECV_TILE, K_TILE],
+                    target_memory=pl.Mem.Vec,
+                )
+                x_2d = pl.reshape(x_tile, [RECV_TILE, K_TILE])
+                x_q, x_s = pl.mx_quant(
+                    pl.cast(x_2d, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3"
+                )
+                w_tile = pl.load(w3_e, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+                ws_tile = pl.load(
+                    w3s_e,
+                    [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, MM_INTER_TILE],
+                    target_memory=pl.Mem.Mat,
+                    mx_layout="mx_b_nn",
+                )
+                srow = (tile_base + nb_idx * _GATE_K_CHUNKS) * RECV_TILE
+                la = pl.move(
+                    pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
+                )
+                la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las = pl.move(
+                    pl.load(
+                        mx_scale_ws,
+                        [srow, 0],
+                        [RECV_TILE, _KS],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
+                )
+                las = pl.tget_scale_addr(las, la)
+                las = pl.set_validshape(las, RECV_TILE, _KS)
+                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+                up_acc = pl.matmul_mx(la, las, rb, rbs)
+                for db in pl.unroll(31):
+                    k0 = (db + 1) * K_TILE
+                    x_tile = pl.load(
+                        recv_x,
+                        [local_e, tt0, k0],
+                        [1, RECV_TILE, K_TILE],
+                        target_memory=pl.Mem.Vec,
+                    )
+                    x_2d = pl.reshape(x_tile, [RECV_TILE, K_TILE])
+                    x_q, x_s = pl.mx_quant(
+                        pl.cast(x_2d, target_type=pl.FP32, mode="none"), mode="mxfp8_e4m3"
+                    )
+                    w_tile = pl.load(w3_e, [k0, n0], [K_TILE, MM_INTER_TILE], target_memory=pl.Mem.Mat)
+                    ws_tile = pl.load(
+                        w3s_e,
+                        [nb_idx * _GATE_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                        [_KS, MM_INTER_TILE],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_b_nn",
+                    )
+                    srow = (
+                        tile_base + nb_idx * _GATE_K_CHUNKS + (db + 1)
+                    ) * RECV_TILE
+                    la2 = pl.move(
+                        pl.move(pl.tile.reinterpret_view(x_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
+                    )
+                    la2 = pl.set_validshape(la2, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(x_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las2 = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, _KS],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las2 = pl.tget_scale_addr(las2, la2)
+                    las2 = pl.set_validshape(las2, RECV_TILE, _KS)
+                    rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                    rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                    up_acc = pl.matmul_mx_acc(up_acc, la2, las2, rb2, rbs2)
+                pl.store(up_acc, [0, n0], up_fp32)
 
             h_tile_fp32 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.FP32)
+            for part in pl.spmd(MOE_INTER // ACT_INTER_TILE, name_hint="exp_swiglu"):
+                n0 = part * ACT_INTER_TILE
+                gate_rows = gate_fp32[:, n0 : n0 + ACT_INTER_TILE]
+                up_rows = up_fp32[:, n0 : n0 + ACT_INTER_TILE]
+                gate_clamped = pl.minimum(gate_rows, SWIGLU_LIMIT)
+                up_clamped = pl.maximum(pl.minimum(up_rows, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+                sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_clamped)), 1.0))
+                gated = pl.mul(pl.mul(gate_clamped, sigmoid), up_clamped)
+                h_tile_fp32[:, n0 : n0 + ACT_INTER_TILE] = gated
 
-            with pl.spmd(MOE_INTER // (ACT_GATE_INNER * ACT_INTER_TILE), name_hint="exp_gate_up_act"):
-                ab_idx = pl.tile.get_block_idx()
-                a_base = ab_idx * (ACT_GATE_INNER * ACT_INTER_TILE)
-                for ag in pl.pipeline(ACT_GATE_INNER, stage=2):
-                    a0 = a_base + ag * ACT_INTER_TILE
-                    gate_2d_i32 = gate_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
-                    up_2d_i32 = up_slab[tt0 : tt0 + RECV_TILE, a0 : a0 + ACT_INTER_TILE]
-                    recv_x_scale_dq = pl.reshape(recv_scale_dq[local_e : local_e + 1, tt0 : tt0 + RECV_TILE], [RECV_TILE, 1])
-                    w1_scale_chunk = routed_w1_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
-                    w3_scale_chunk = routed_w3_scale[local_e : local_e + 1, a0 : a0 + ACT_INTER_TILE]
-                    gate_2d = pl.cast(gate_2d_i32, target_type=pl.FP32, mode="none")
-                    up_2d = pl.cast(up_2d_i32, target_type=pl.FP32, mode="none")
-                    gate_2d = pl.col_expand_mul(pl.row_expand_mul(gate_2d, recv_x_scale_dq), w1_scale_chunk)
-                    up_2d = pl.col_expand_mul(pl.row_expand_mul(up_2d, recv_x_scale_dq), w3_scale_chunk)
-                    if SWIGLU_LIMIT > 0.0:
-                        gate_2d = pl.minimum(gate_2d, SWIGLU_LIMIT)
-                        up_2d = pl.maximum(pl.minimum(up_2d, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-                    sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_2d)), 1.0))
-                    silu = pl.mul(gate_2d, sigmoid)
-                    gated = pl.mul(silu, up_2d)
-                    gated_valid = pl.set_validshape(gated, valid_rows, ACT_INTER_TILE)
-                    gated_masked = pl.fillpad(gated_valid, pad_value=pl.PadValue.zero)
-                    h_tile_fp32[:, a0 : a0 + ACT_INTER_TILE] = gated_masked
-
-            h_tile_i8 = pl.create_tensor([RECV_TILE, MOE_INTER], dtype=pl.INT8)
-            h_tile_scale_dq = pl.create_tensor([RECV_TILE, 1], dtype=pl.FP32, manual_dep=True)
-            with pl.at(level=pl.Level.CORE_GROUP, name_hint="exp_h_q"):
-                eh_amax = pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                for k0 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_a_f32 = h_tile_fp32[:, k0 : k0 + QUANT_TILE]
-                    eh_a_abs = pl.maximum(eh_a_f32, pl.neg(eh_a_f32))
-                    eh_a_max = pl.reshape(pl.row_max(eh_a_abs), [1, RECV_TILE])
-                    eh_amax = pl.maximum(eh_amax, eh_a_max)
-                eh_sq_row = pl.div(
-                    pl.full([1, RECV_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), eh_amax
+            for db_idx in pl.spmd(D // D_OUT_TILE, name_hint="exp_w2_mm"):
+                d0 = db_idx * D_OUT_TILE
+                k0 = 0
+                h_tile = pl.load(
+                    h_tile_fp32, [0, k0], [RECV_TILE, K_TILE], target_memory=pl.Mem.Vec
                 )
-                h_tile_scale_dq[:, :] = pl.reshape(pl.recip(eh_sq_row), [RECV_TILE, 1])
-                eh_sq_col = pl.reshape(eh_sq_row, [RECV_TILE, 1])
-                for k1 in pl.pipeline(0, MOE_INTER, QUANT_TILE, stage=2):
-                    eh_q_f32 = h_tile_fp32[:, k1 : k1 + QUANT_TILE]
-                    eh_q_scaled = pl.row_expand_mul(eh_q_f32, eh_sq_col)
-                    eh_q_i32 = pl.cast(eh_q_scaled, target_type=pl.INT32, mode="rint")
-                    eh_q_half = pl.cast(eh_q_i32, target_type=pl.FP16, mode="round")
-                    h_tile_i8[:, k1 : k1 + QUANT_TILE] = pl.cast(eh_q_half, target_type=pl.INT8, mode="trunc")
-
-            y_i32 = pl.create_tensor([RECV_TILE, D], dtype=pl.INT32)
-            with pl.spmd(D // (W2_INNER * D_OUT_TILE), name_hint="exp_w2_mm"):
-                wb_idx = pl.tile.get_block_idx()
-                d_base = wb_idx * (W2_INNER * D_OUT_TILE)
-                for dg in pl.range(W2_INNER):
-                    d0 = d_base + dg * D_OUT_TILE
-                    y_acc = pl.create_tensor([1, RECV_TILE, D_OUT_TILE], dtype=pl.INT32)
-                    for k0 in pl.pipeline(0, MOE_INTER, INTER_K, stage=2):
-                        h_k = h_tile_i8[:, k0 : k0 + INTER_K]
-                        w2_k = routed_w2[local_e : local_e + 1, d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
-                        if k0 == 0:
-                            y_acc = pl.matmul(h_k, w2_k, b_trans=True, out_dtype=pl.INT32)
-                        else:
-                            y_acc = pl.matmul_acc(y_acc, h_k, w2_k, b_trans=True)
-                    y_i32[:, d0 : d0 + D_OUT_TILE] = pl.reshape(y_acc, [RECV_TILE, D_OUT_TILE])
-
-            recv_y_tile = pl.create_tensor([RECV_TILE, D], dtype=pl.BF16)
-            with pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="exp_w2_act"):
-                db_idx = pl.tile.get_block_idx()
-                act_d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
-                w_col_blk = pl.reshape(
-                    recv_weights[local_e : local_e + 1, tt0 : tt0 + RECV_TILE],
-                    [RECV_TILE, 1],
+                h_q, h_s = pl.mx_quant(h_tile, mode="mxfp8_e4m3")
+                w_tile = pl.load(w2_e, [k0, d0], [K_TILE, D_OUT_TILE], target_memory=pl.Mem.Mat)
+                ws_tile = pl.load(
+                    w2s_e,
+                    [db_idx * _DOWN_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                    [_KS, D_OUT_TILE],
+                    target_memory=pl.Mem.Mat,
+                    mx_layout="mx_b_nn",
                 )
-                row_scale_blk = pl.mul(h_tile_scale_dq, w_col_blk)
-                for dg in pl.pipeline(W2_ACT_INNER, stage=2):
-                    act_d0 = act_d_base + dg * D_OUT_TILE_ACT
-                    y_2d_i32 = y_i32[:, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                    w2_scale_chunk = routed_w2_scale[local_e : local_e + 1, act_d0 : act_d0 + D_OUT_TILE_ACT]
-                    y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
-                    y_2d = pl.col_expand_mul(pl.row_expand_mul(y_2d, row_scale_blk), w2_scale_chunk)
-                    recv_y_tile[:, act_d0 : act_d0 + D_OUT_TILE_ACT] = pl.cast(
-                        y_2d, target_type=pl.BF16, mode="rint"
+                srow = (tile_base + db_idx * _DOWN_K_CHUNKS) * RECV_TILE
+                la = pl.move(
+                    pl.move(pl.tile.reinterpret_view(h_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                    target_memory=pl.Mem.Left,
+                )
+                la = pl.set_validshape(la, RECV_TILE, K_TILE)
+                pl.store(pl.tile.reinterpret_view(h_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                las = pl.move(
+                    pl.load(
+                        mx_scale_ws,
+                        [srow, 0],
+                        [RECV_TILE, _KS],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_a_zz",
+                    ),
+                    target_memory=pl.Mem.LeftScale,
+                )
+                las = pl.tget_scale_addr(las, la)
+                las = pl.set_validshape(las, RECV_TILE, _KS)
+                rb = pl.move(w_tile, target_memory=pl.Mem.Right)
+                rbs = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb)
+                y_acc = pl.matmul_mx(la, las, rb, rbs)
+                for kb in pl.unroll(15):  # _DOWN_K_CHUNKS - 1
+                    k0 = (kb + 1) * K_TILE
+                    h_tile = pl.load(
+                        h_tile_fp32, [0, k0], [RECV_TILE, K_TILE], target_memory=pl.Mem.Vec
                     )
-            recv_y_flat = pl.assemble(recv_y_flat, recv_y_tile, [flat_tt0, 0])
+                    h_q, h_s = pl.mx_quant(h_tile, mode="mxfp8_e4m3")
+                    w_tile = pl.load(w2_e, [k0, d0], [K_TILE, D_OUT_TILE], target_memory=pl.Mem.Mat)
+                    ws_tile = pl.load(
+                        w2s_e,
+                        [db_idx * _DOWN_K_CHUNKS * _KS + (k0 // K_TILE) * _KS, 0],
+                        [_KS, D_OUT_TILE],
+                        target_memory=pl.Mem.Mat,
+                        mx_layout="mx_b_nn",
+                    )
+                    srow = (
+                        tile_base + db_idx * _DOWN_K_CHUNKS + (kb + 1)
+                    ) * RECV_TILE
+                    la2 = pl.move(
+                        pl.move(pl.tile.reinterpret_view(h_q, pl.FP8E4M3FN), target_memory=pl.Mem.Mat),
+                        target_memory=pl.Mem.Left,
+                    )
+                    la2 = pl.set_validshape(la2, RECV_TILE, K_TILE)
+                    pl.store(pl.tile.reinterpret_view(h_s, pl.FP8E8M0), [srow, 0], mx_scale_ws)
+                    las2 = pl.move(
+                        pl.load(
+                            mx_scale_ws,
+                            [srow, 0],
+                            [RECV_TILE, _KS],
+                            target_memory=pl.Mem.Mat,
+                            mx_layout="mx_a_zz",
+                        ),
+                        target_memory=pl.Mem.LeftScale,
+                    )
+                    las2 = pl.tget_scale_addr(las2, la2)
+                    las2 = pl.set_validshape(las2, RECV_TILE, _KS)
+                    rb2 = pl.move(w_tile, target_memory=pl.Mem.Right)
+                    rbs2 = pl.tget_scale_addr(pl.move(ws_tile, target_memory=pl.Mem.RightScale), rb2)
+                    y_acc = pl.matmul_mx_acc(y_acc, la2, las2, rb2, rbs2)
+                # Apply routing weights then store BF16.
+                w_col = pl.load(
+                    recv_weights,
+                    [local_e, tt0],
+                    [1, RECV_TILE],
+                    target_memory=pl.Mem.Vec,
+                )
+                w_col = pl.reshape(w_col, [RECV_TILE, 1])
+                # trowexpandmul requires row-major dst/src (Acc is col_major).
+                y_fp32 = pl.move(
+                    y_acc, target_memory=pl.Mem.Vec, blayout=pl.TileLayout.row_major
+                )
+                y_scaled = pl.row_expand_mul(y_fp32, w_col)
+                y_bf16 = pl.cast(y_scaled, target_type=pl.BF16, mode="rint")
+                # tstore needs ND (row_major + none_box); Acc→Vec path leaves boxed slayout.
+                y_bf16 = pl.move(
+                    y_bf16,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.row_major,
+                    slayout=pl.TileLayout.none_box,
+                )
+                pl.store(y_bf16, [local_e, tt0, d0], recv_y)
 
     return recv_y
 
 
 @pl.jit
 def expert_routed_test(
-    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.INT8],
-    recv_scale_dq: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
+    recv_x: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16],
     recv_weights: pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX], pl.FP32],
     recv_expert_count: pl.Tensor[[N_LOCAL_EXPERTS, 1], pl.INT32],
-    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.INT8],
-    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER], pl.FP32],
-    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.INT8],
-    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, D], pl.FP32],
+    routed_w1: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w1_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
+    routed_w3: pl.Tensor[[N_LOCAL_EXPERTS, D, MOE_INTER], pl.FP8E4M3FN],
+    routed_w3_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE], pl.FP8E8M0],
+    routed_w2: pl.Tensor[[N_LOCAL_EXPERTS, MOE_INTER, D], pl.FP8E4M3FN],
+    routed_w2_scale: pl.Tensor[[N_LOCAL_EXPERTS, _W2_SCALE_ROWS, D_OUT_TILE], pl.FP8E8M0],
     recv_y: pl.Out[pl.Tensor[[N_LOCAL_EXPERTS, RECV_MAX, D], pl.BF16]],
 ):
     expert_routed(
-        recv_x, recv_scale_dq, recv_weights, recv_expert_count,
+        recv_x, recv_weights, recv_expert_count,
         routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
         routed_w2, routed_w2_scale,
         recv_y,
@@ -245,182 +440,167 @@ def expert_routed_test(
     return recv_y
 
 
-def _int8_quant_per_row(x):
-    """Per-row (per-token) INT8 symmetric quant matching v3.2 scope2 Stage 2.6."""
-    import torch
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
+def gen_routed_weight(shape, dequant_std, chan_cv, n_tile, k_tile=K_TILE):
+    """Synthesize routed-expert MXFP8 weight + tiled MX_B_NN scale.
 
-
-def golden_expert_routed(tensors):
-    """Torch reference for the routed expert. recv_y is the per-row routing-
-    weight-scaled SwiGLU output, ready for combine reduce to simply sum.
-
-    Per-expert layout: recv_x[e, 0:cnt[e], :] is the valid INT8 receive
-    payload; recv_y[e, cnt[e]:, :] stays at zero."""
-    import torch
-    import torch.nn.functional as F
-
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
-
-    recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
-    recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
-    recv_weights = tensors["recv_weights"].float()  # [E, RECV_MAX]
-    recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
-    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
-    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
-    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
-
-    recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
-    for e in range(N_LOCAL_EXPERTS):
-        n_rows = int(recv_expert_count[e, 0].item())
-        if n_rows == 0:
-            continue
-        x_sub_i8 = recv_x_i8[e, :n_rows, :]
-        x_sub_sd = recv_scale_dq[e, :n_rows].reshape(-1, 1)
-        x_sub_q = x_sub_i8.float() * x_sub_sd
-        w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
-
-        gate = x_sub_q @ w1[e].T
-        up = x_sub_q @ w3[e].T
-        if SWIGLU_LIMIT > 0:
-            gate = gate.clamp(max=SWIGLU_LIMIT)
-            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
-        h = F.silu(gate) * up
-        # A8 requant before w2 matmul.
-        h_i8, h_sd = _int8_quant_per_row(h)
-        h = h_i8.float() * (h_sd * w_per_row)
-        recv_y[e, :n_rows, :] = h @ w2[e].T
-
-    tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
-
-
-def gen_routed_weight(shape, dequant_std):
-    """Synthesize a routed-expert per-channel-symmetric INT8 weight + FP32 scale by
-    simulating the real DeepSeek-V4-Flash MXFP4 routed-expert quant grid (e2m1, per-32-group
-    E8M0 scale), then re-quantizing per-output-channel. A plain ``randn`` INT8 is wrong:
-    routed collapses onto ~37 discrete levels with an ~11.6% zero spike (the FP4 grid) and a
-    per-channel scale CV ~0.09 (the fine group scale flattens it). Per-output-channel INT8 is
-    scale-invariant, so the level structure / zero spike emerge from the grid alone and
-    ``dequant_std`` only sets the absolute scale magnitude. (shared experts use a different
-    grid -- see expert_shared.gen_shared_weight.)
-
-    ``shape`` last dim = reduction (in) dim; leading dims map to the per-output-channel
-    scale shape ([E, out, in] -> scale [E, out]).
+    ``shape`` is historical ``[E, out, in]``. Returns Right-matrix storage
+    ``(w_kn [E, in, out] float8_e4m3fn, scale [E, scale_rows, n_tile] float8_e8m0fnu)``.
     """
     import torch
-
-    FP4_MAG = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    FP4_MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])  # nearest-grid bounds
-    FP4_MAX, TINY = 6.0, 1e-20
-    GROUP = 32
-    CHUNK_ELEMS = 1 << 25    # elements per pass; unchunked this walks GiB-sized temporaries
 
     *lead, out, inn = shape
     n_lead = 1
     for dim in lead:
         n_lead *= dim
+    ws = []
+    ss = []
+    for _ in range(n_lead):
+        w, s = gen_mxfp8_weight_kn(
+            (inn, out),
+            dequant_std=dequant_std,
+            chan_cv=chan_cv,
+            pack_nn=True,
+            n_tile=n_tile,
+            k_tile=k_tile,
+        )
+        ws.append(w)
+        ss.append(s)
+    w_out = torch.stack(ws, dim=0).reshape(*lead, inn, out)
+    s_out = torch.stack(ss, dim=0).reshape(*lead, *ss[0].shape)
+    return w_out, s_out
 
-    W = torch.randn(*shape).reshape(n_lead, out, inn)
-    w_i8 = torch.empty(n_lead, out, inn, dtype=torch.int8)
-    scale = torch.empty(n_lead, out, 1, dtype=torch.float32)
 
-    # e2m1 + per-32-group E8M0 (round-up) scale on the in dim, then per-output-channel
-    # INT8. Chunked over the leading dim: every reduction here is confined to one
-    # (out, in) row, so the chunk boundary cannot change a result.
-    step = max(1, CHUNK_ELEMS // (out * inn))
-    for i0 in range(0, n_lead, step):
-        w = W[i0:i0 + step]
-        wg = w.reshape(-1, out, inn // GROUP, GROUP)
-        absw = wg.abs()
-        grp_scale = torch.exp2(torch.ceil(torch.log2((absw.amax(-1, keepdim=True) / FP4_MAX).clamp_min(TINY))))
-        idx = torch.bucketize(absw.div_(grp_scale), FP4_MID).clamp_max_(7)
-        wq = (torch.sign(wg) * FP4_MAG[idx]).mul_(grp_scale).reshape(w.shape)
-        amax = wq.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        chan_scale = amax / INT8_SCALE_MAX
-        w_i8[i0:i0 + step] = torch.round(wq.div_(chan_scale)).clamp_(
-            -INT8_SCALE_MAX, INT8_SCALE_MAX).to(torch.int8)
-        scale[i0:i0 + step] = chan_scale
-    del W
+def golden_expert_routed(tensors):
+    """Torch reference: per-K-tile dyn MXFP8 + tiled MX_B_NN unpack (matches device)."""
+    import torch
+    import torch.nn.functional as F
 
-    scale = (scale * (dequant_std / (w_i8.float() * scale).std())).squeeze(-1).float()
-    return w_i8.reshape(*shape), scale.reshape(*lead, out)
+    def _b_scale(s, n_tile, logical_k, logical_n):
+        return unpack_scale_b_nn_tiled(
+            s,
+            k_tile_rows=_KS,
+            n_tile=n_tile,
+            logical_k=logical_k // MX_BLOCK_K,
+            logical_n=logical_n,
+        )
+
+    def mx_matmul_act_tiled(x_f, w, w_s, k_tile):
+        acc = None
+        for k0 in range(0, x_f.shape[-1], k_tile):
+            xq, xs = dynamic_mx_quant_e4m3(x_f[..., k0 : k0 + k_tile])
+            part = mx_matmul_fp8(
+                xq, xs, w[k0 : k0 + k_tile], w_s[k0 // MX_BLOCK_K : (k0 + k_tile) // MX_BLOCK_K]
+            )
+            acc = part if acc is None else acc + part
+        return acc
+
+    recv_x = tensors["recv_x"]
+    recv_weights = tensors["recv_weights"]
+    recv_expert_count = tensors["recv_expert_count"]
+    e, recv_max, d = recv_x.shape
+    out = torch.zeros(e, recv_max, d, dtype=torch.float32)
+
+    for ei in range(e):
+        n_rows = int(recv_expert_count[ei, 0].item())
+        if n_rows <= 0:
+            continue
+        x = recv_x[ei, :n_rows, :].float()
+        w1_s = _b_scale(tensors["routed_w1_scale"][ei], MM_INTER_TILE, D, MOE_INTER)
+        w3_s = _b_scale(tensors["routed_w3_scale"][ei], MM_INTER_TILE, D, MOE_INTER)
+        w2_s = _b_scale(tensors["routed_w2_scale"][ei], D_OUT_TILE, MOE_INTER, D)
+        gate = mx_matmul_act_tiled(x, tensors["routed_w1"][ei], w1_s, K_TILE)
+        up = mx_matmul_act_tiled(x, tensors["routed_w3"][ei], w3_s, K_TILE)
+        if SWIGLU_LIMIT and SWIGLU_LIMIT > 0:
+            gate = gate.clamp(max=SWIGLU_LIMIT)
+            up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        h = F.silu(gate) * up
+        y = mx_matmul_act_tiled(h, tensors["routed_w2"][ei], w2_s, K_TILE)
+        y = y * recv_weights[ei, :n_rows].reshape(-1, 1).float()
+        out[ei, :n_rows, :] = y
+
+    tensors["recv_y"][:] = out.to(torch.bfloat16)
 
 
 def build_tensor_specs():
     import torch
     from golden import TensorSpec
 
-    # Across-layer-mean dequant std (typical layer) of the real DeepSeek-V4-Flash MXFP4
-    # routed experts; gen_routed_weight simulates the FP4 grid (see its docstring).
     ROUTED_DEQUANT_STD = {"w1": 2.47e-2, "w2": 2.44e-2, "w3": 2.46e-2}
 
-    # Distribute B*S*TOPK token-expert pairs uniformly across local experts.
     total = B * S * M.num_experts_per_tok
     counts = torch.bincount(
         torch.randint(0, N_LOCAL_EXPERTS, (total,)),
         minlength=N_LOCAL_EXPERTS,
-    ).to(torch.int32)
-    counts_2d = counts.reshape(N_LOCAL_EXPERTS, 1)
+    ).clamp(max=RECV_MAX)
+    recv_expert_count = counts.to(torch.int32).reshape(N_LOCAL_EXPERTS, 1)
 
-    # Build a consistent INT8 recv_x + per-row dequant scale (dispatch is
-    # responsible for per-token quantization). Invalid tail rows go to INT8 0
-    # with scale 0 so dequant produces 0.
-    x_bf16 = torch.randn(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
-    valid_mask_3d = (
-        torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(N_LOCAL_EXPERTS, 1, 1)
+    recv_x = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D, dtype=torch.bfloat16)
+    recv_weights = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
+    for e in range(N_LOCAL_EXPERTS):
+        n = int(counts[e].item())
+        if n == 0:
+            continue
+        recv_x[e, :n] = torch.randn(n, D, dtype=torch.bfloat16)
+        recv_weights[e, :n] = torch.rand(n) * 0.5 + 0.5
+
+    # Real MXFP8 grid (block=32); chan_cv reproduces per-output-channel magnitude spread.
+    w1, w1_s = gen_routed_weight(
+        (N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"], chan_cv=0.50, n_tile=MM_INTER_TILE
     )
-    recv_x_i8_pre, recv_scale_dq_pre = _int8_quant_per_row(x_bf16)
-    recv_x_i8_pre = torch.where(valid_mask_3d, recv_x_i8_pre, torch.zeros_like(recv_x_i8_pre))
-    valid_mask_2d = valid_mask_3d.squeeze(-1)
-    recv_scale_dq_pre = torch.where(
-        valid_mask_2d,
-        recv_scale_dq_pre.squeeze(-1),
-        torch.zeros_like(recv_scale_dq_pre.squeeze(-1)),
+    w3, w3_s = gen_routed_weight(
+        (N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"], chan_cv=0.50, n_tile=MM_INTER_TILE
     )
-
-    def init_recv_x():
-        return recv_x_i8_pre
-
-    def init_recv_scale_dq():
-        return recv_scale_dq_pre.float()
-
-    def init_recv_expert_count():
-        return counts_2d
-
-    # Per-row routing weight in [0, 1); tail rows (slot >= count) stay 0 so
-    # they don't perturb the BF16 round-trip in expert_routed.
-    recv_weights_pre = torch.rand(N_LOCAL_EXPERTS, RECV_MAX, dtype=torch.float32)
-    recv_weights_pre = torch.where(
-        valid_mask_2d, recv_weights_pre, torch.zeros_like(recv_weights_pre)
+    w2, w2_s = gen_routed_weight(
+        (N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"], chan_cv=0.33, n_tile=D_OUT_TILE
     )
-
-    def init_recv_weights():
-        return recv_weights_pre
-
-    # Synthesize (int8, per-channel scale) by simulating the real MXFP4 routed-expert
-    # quant grid (see gen_routed_weight). The kernel + golden both consume int8+scale.
-    w1_i8, w1_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-    w3_i8, w3_s = gen_routed_weight((N_LOCAL_EXPERTS, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
-    w2_i8, w2_s = gen_routed_weight((N_LOCAL_EXPERTS, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
 
     return [
-        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.int8, init_value=init_recv_x),
-        TensorSpec("recv_scale_dq", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_scale_dq),
-        TensorSpec("recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=init_recv_weights),
-        TensorSpec("recv_expert_count", [N_LOCAL_EXPERTS, 1], torch.int32, init_value=init_recv_expert_count),
-        TensorSpec("routed_w1", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w1_i8),
-        TensorSpec("routed_w1_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w1_s),
-        TensorSpec("routed_w3", [N_LOCAL_EXPERTS, MOE_INTER, D], torch.int8, init_value=lambda: w3_i8),
-        TensorSpec("routed_w3_scale", [N_LOCAL_EXPERTS, MOE_INTER], torch.float32, init_value=lambda: w3_s),
-        TensorSpec("routed_w2", [N_LOCAL_EXPERTS, D, MOE_INTER], torch.int8, init_value=lambda: w2_i8),
-        TensorSpec("routed_w2_scale", [N_LOCAL_EXPERTS, D], torch.float32, init_value=lambda: w2_s),
+        TensorSpec("recv_x", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, init_value=lambda: recv_x),
+        TensorSpec(
+            "recv_weights", [N_LOCAL_EXPERTS, RECV_MAX], torch.float32, init_value=lambda: recv_weights
+        ),
+        TensorSpec(
+            "recv_expert_count",
+            [N_LOCAL_EXPERTS, 1],
+            torch.int32,
+            init_value=lambda: recv_expert_count,
+        ),
+        TensorSpec(
+            "routed_w1",
+            [N_LOCAL_EXPERTS, D, MOE_INTER],
+            torch.float8_e4m3fn,
+            init_value=lambda: w1,
+        ),
+        TensorSpec(
+            "routed_w1_scale",
+            [N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE],
+            torch.float8_e8m0fnu,
+            init_value=lambda: w1_s,
+        ),
+        TensorSpec(
+            "routed_w3",
+            [N_LOCAL_EXPERTS, D, MOE_INTER],
+            torch.float8_e4m3fn,
+            init_value=lambda: w3,
+        ),
+        TensorSpec(
+            "routed_w3_scale",
+            [N_LOCAL_EXPERTS, _W13_SCALE_ROWS, MM_INTER_TILE],
+            torch.float8_e8m0fnu,
+            init_value=lambda: w3_s,
+        ),
+        TensorSpec(
+            "routed_w2",
+            [N_LOCAL_EXPERTS, MOE_INTER, D],
+            torch.float8_e4m3fn,
+            init_value=lambda: w2,
+        ),
+        TensorSpec(
+            "routed_w2_scale",
+            [N_LOCAL_EXPERTS, _W2_SCALE_ROWS, D_OUT_TILE],
+            torch.float8_e8m0fnu,
+            init_value=lambda: w2_s,
+        ),
         TensorSpec("recv_y", [N_LOCAL_EXPERTS, RECV_MAX, D], torch.bfloat16, is_output=True),
     ]
 
@@ -430,13 +610,14 @@ if __name__ == "__main__":
     from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
+    parser.add_argument("-p", "--platform", type=str, default="a5",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
+    parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    moe_tol = ATOL_RTOL["moe_mx"]
     result = run_jit(
         fn=expert_routed_test,
         specs=build_tensor_specs(),
@@ -447,10 +628,9 @@ if __name__ == "__main__":
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
         ),
-        rtol=1e-3,
-        atol=1e-3,
+        rtol=moe_tol["rtol"],
+        atol=moe_tol["atol"],
         compare_fn={
-            # BF16 recv_y, ~1 ULP. Gen weights reproduce real(L21): 0.016% vs 0.015% of points > 1e-3.
             "recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
         },
     )
