@@ -32,7 +32,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_START_POS, FLASH as M
+from config import DECODE_START_POS, PRO_KERNEL as M
 from decode_attention_swa import (
     BLOCK_SIZE,
     HEAD_DIM,

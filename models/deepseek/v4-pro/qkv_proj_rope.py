@@ -12,7 +12,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import PRO_KERNEL as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # Dynamic shape variables.
@@ -51,9 +51,12 @@ QR_OK = 2               # qr_proj split-K factor          | D//QR_OK cores share
 QR_K_SLICE = D // QR_OK # qr_proj K per split (=2048)     | QR_K_SLICE//QR_K_TILE inner chunks
 KV_M_TILE = MATMUL_T_TILE  # kv_proj token (M) tile; decode pads from 8 real rows to 16
 KV_N_TILE = 128         # kv_proj HEAD_DIM (N) per matmul
-KV_K_TILE = 256         # kv_proj D (K) reduction tile    | divides KV_K_SLICE
+# 128 (not 256) so the inner pipeline trip count stays EVEN -- see the
+# _even_pipeline_trip assert below. PRO's D = 7168 gives KV_K_SLICE = 1792,
+# which at a 256 tile is 7 chunks; 128 gives 14.
+KV_K_TILE = 128         # kv_proj D (K) reduction tile    | divides KV_K_SLICE
 KV_OK = 4               # kv_proj split-K factor          | D//KV_OK cores share each N-group
-KV_K_SLICE = D // KV_OK # kv_proj K per split (=1024)     | KV_K_SLICE//KV_K_TILE inner chunks
+KV_K_SLICE = D // KV_OK # kv_proj K per split (PRO: 1792) | KV_K_SLICE//KV_K_TILE inner chunks
 QPROJ_M_TILE = MATMUL_T_TILE  # qproj token (M) tile; decode pads from 8 real rows to 16
 KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
@@ -66,6 +69,26 @@ for _m_tile in (QR_M_TILE, KV_M_TILE, QPROJ_M_TILE):
     assert (PREFILL_BATCH * PREFILL_SEQ) % _m_tile == 0
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
+
+
+def _even_pipeline_trip(name: str, trip: int) -> None:
+    """Split-K matmul loops run as ``pl.pipeline(..., stage=2)`` over a loop-carried
+    L0C accumulator. With an ODD trip count the final partial lands in the alternate
+    pipeline buffer, so codegen has to reconcile the two with an acc->acc ``pto.tmov``
+    -- an address-space pair A5 does not implement, and ptoas rejects the kernel with
+    ``'pto.tmov' op expects a supported tmov address-space pair for this target``.
+    An even trip count leaves the result in the canonical buffer and emits no move.
+
+    This bit us switching FLASH (D=4096) -> PRO (D=7168): kv_proj went 4 -> 7 chunks.
+    """
+    assert trip % 2 == 0, (
+        f"{name} pipeline trip count must be even, got {trip}; an odd count makes "
+        "codegen emit an unsupported acc->acc pto.tmov. Retune the K tile or split-K factor."
+    )
+
+
+_even_pipeline_trip("qr_proj", QR_K_SLICE // QR_K_TILE)
+_even_pipeline_trip("kv_proj", KV_K_SLICE // KV_K_TILE)
 assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 4 == 0
 assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
@@ -152,8 +175,8 @@ def qkv_proj_rope(
         q_rope_sin_signed[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_sin_signed
         q_rope_swap_idx[qrp_t0 : qrp_t0 + Q_ROPE_T_TILE, :] = qrp_swap_idx
 
-    # Split-K qr_proj (M=t_dim, K=D=4096, N=Q_LORA=1024). QR_N_TILE=128 gives
-    # eight N-groups; QR_OK=2 expands them to 16 cube blocks and atomic-adds the
+    # Split-K qr_proj (M=t_dim, K=D=7168, N=Q_LORA=1536). QR_N_TILE=128 gives
+    # twelve N-groups; QR_OK=2 expands them to 24 cube blocks and atomic-adds the
     # K partials into a zero-seeded output. Auto-dep on qr_fp32 orders the seed
     # before every atomic RMW.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)

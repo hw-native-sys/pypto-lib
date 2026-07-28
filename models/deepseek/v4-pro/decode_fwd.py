@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 # ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
-"""DeepSeek-V4 Flash decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
+"""DeepSeek-V4 Pro decode forward experiment with looped CSA/HCA layers inside a pl.jit function."""
 # ruff: noqa: F403,F405
 
 import argparse
@@ -43,7 +43,6 @@ from decode_attention_swa import (
     ROPE_HEAD_DIM,
     T,
     WIN as SWA_WIN,
-    attention_swa,
     build_tensor_specs as build_attention_tensor_specs,
 )
 from decode_attention_hca import (
@@ -79,7 +78,7 @@ from decode_attention_csa import (
     attention_csa,
     build_tensor_specs as build_csa_tensor_specs,
 )
-from config import DECODE_START_POS, FLASH as MODEL_CONFIG
+from config import DECODE_START_POS, PRO_KERNEL as MODEL_CONFIG
 from moe import (
     AUX_PAD,
     IDX_PAD,
@@ -98,13 +97,40 @@ from moe import (
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
 assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
 
+# Per-layer KV compress ratios of the main model. ``compress_ratios`` carries
+# num_hidden_layers + num_nextn_predict_layers entries; the trailing entry is the
+# MTP layer (ratio 0 / SWA) and belongs to decode_mtp.py, not to this forward.
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 43
-CSA_NUM_LAYERS = 21
-HCA_NUM_LAYERS = 20
+FWD_COMPRESS_RATIOS = MODEL_CONFIG.compress_ratios[:MODEL_NUM_LAYERS]
+FWD_NUM_LAYERS = MODEL_NUM_LAYERS
+CSA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(CSA_COMPRESS_RATIO)
+HCA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(HCA_COMPRESS_RATIO)
 # FWD index of the last layer (indexes per-FWD-layer stacked weights, not csa order).
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
-assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
+
+# Emission shape this body hand-unrolls: LEAD_NUM_LAYERS unrolled leading layers,
+# then (csa, hca) pairs from the pl.range loop, then one trailing csa layer.
+# Flash: lead = 2 swa, 20 pairs.  Pro: lead = 2 hca, 29 pairs.
+LEAD_NUM_LAYERS = 2
+PAIR_LOOP_COUNT = (FWD_NUM_LAYERS - LEAD_NUM_LAYERS - 1) // 2
+# hca-kind stack slot of the first *looped* hca layer: the leading layers consume
+# a slot each only when they are themselves hca (Pro: 2; Flash: 0, they were swa).
+HCA_LOOP_BASE = FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(HCA_COMPRESS_RATIO)
+
+assert CSA_NUM_LAYERS + HCA_NUM_LAYERS == FWD_NUM_LAYERS, \
+    f"decode_fwd emits csa/hca layers only, got ratios {FWD_COMPRESS_RATIOS}"
+assert all(r == HCA_COMPRESS_RATIO for r in FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS]), \
+    f"decode_fwd unrolls the first {LEAD_NUM_LAYERS} layers as hca (ratio 128)"
+assert all(FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i] == CSA_COMPRESS_RATIO
+           and FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i + 1] == HCA_COMPRESS_RATIO
+           for i in range(PAIR_LOOP_COUNT)), \
+    "decode_fwd loop body expects strict (csa, hca) pairs"
+assert FWD_COMPRESS_RATIOS[FWD_LAST_LAYER] == CSA_COMPRESS_RATIO, \
+    "decode_fwd expects the trailing layer to be csa"
+# csa-kind slice index inside the loop stays a bare loop_i; that only holds when no
+# leading layer is csa.
+assert FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(CSA_COMPRESS_RATIO) == 0, \
+    "leading layers must not be csa; the loop indexes csa stacks with loop_i"
 
 CSA_LAYER_STACKED_NAMES = [
     "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w", "csa_compress_state",
@@ -294,6 +320,11 @@ def decode_fwd(
     shared_w3_scale_l0: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [0 * MOE_INTER])
     shared_w2_l0: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [0 * D, 0])
     shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
+    hca_cmp_wkv_l0: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [0 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_wgate_l0: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [0 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_ape_l0: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [0 * HCA_COMPRESS_RATIO, 0])
+    hca_cmp_norm_w_l0: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [0 * HEAD_DIM])
+    hca_compress_state_l0: pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [0 * HCA_COMPRESS_STATE_BLOCK_NUM, 0, 0])
     hc_attn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
     hc_attn_scale_l1: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [1 * 3])
     hc_attn_base_l1: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [1 * MIX_HC])
@@ -329,17 +360,26 @@ def decode_fwd(
     shared_w3_scale_l1: pl.Tensor[[MOE_INTER], pl.FP32] = pl.slice(shared_w3_scale, [MOE_INTER], [1 * MOE_INTER])
     shared_w2_l1: pl.Tensor[[D, MOE_INTER], pl.INT8] = pl.slice(shared_w2, [D, MOE_INTER], [1 * D, 0])
     shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
+    hca_cmp_wkv_l1: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [1 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_wgate_l1: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [1 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_ape_l1: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [1 * HCA_COMPRESS_RATIO, 0])
+    hca_cmp_norm_w_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [1 * HEAD_DIM])
+    hca_compress_state_l1: pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [1 * HCA_COMPRESS_STATE_BLOCK_NUM, 0, 0])
     x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        attention_swa(
+        attention_hca(
             x_hc,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0,
             attn_norm_w_l0, wq_a_l0, wq_b_l0, wq_b_scale_l0,
             wkv_l0, gamma_cq_l0, gamma_ckv_l0, freqs_cos, freqs_sin,
-            kv_cache_l0,
-            swa_slot_mapping, swa_indices, swa_lens, position_ids,
+            hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
+            hca_compress_state_l0, hca_compress_state_block_table,
+            kv_cache_l0, cmp_kv_l0, cmp_block_table,
+            ori_slot_mapping, window_swa_indices, window_swa_lens,
+            hca_cmp_slot_mapping, hca_state_slot_mapping,
+            position_ids, kv_seq_lens,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             x_attn0,
         )
@@ -358,13 +398,17 @@ def decode_fwd(
             pl.cast(0, pl.INT32), num_tokens, my_rank, pl.cast(1, pl.INT32),
         )
     with pl.scope():
-        attention_swa(
+        attention_hca(
             hidden,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1,
             attn_norm_w_l1, wq_a_l1, wq_b_l1, wq_b_scale_l1,
             wkv_l1, gamma_cq_l1, gamma_ckv_l1, freqs_cos, freqs_sin,
-            kv_cache_l1,
-            swa_slot_mapping, swa_indices, swa_lens, position_ids,
+            hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
+            hca_compress_state_l1, hca_compress_state_block_table,
+            kv_cache_l1, cmp_kv_l1, cmp_block_table,
+            ori_slot_mapping, window_swa_indices, window_swa_lens,
+            hca_cmp_slot_mapping, hca_state_slot_mapping,
+            position_ids, kv_seq_lens,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             x_attn1,
         )
@@ -382,11 +426,14 @@ def decode_fwd(
             routed_y_buf, combine_arrived,
             pl.cast(1, pl.INT32), num_tokens, my_rank, pl.cast(2, pl.INT32),
         )
-    for loop_i in pl.range(HCA_NUM_LAYERS):
+    for loop_i in pl.range(PAIR_LOOP_COUNT):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
+        # csa-kind slot == loop_i; hca-kind slot is offset by the leading hca layers
+        # that already own slots 0..HCA_LOOP_BASE-1.
+        hca_stack_i: pl.Scalar[pl.INT32] = pl.cast(loop_i + HCA_LOOP_BASE, pl.INT32)
         x_attn_csa: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         x_attn_hca: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
         hidden_mid: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
@@ -490,11 +537,11 @@ def decode_fwd(
         wo_a_hca: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [hca_layer * O_GROUPS, 0, 0])
         wo_b_hca: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [hca_layer * D, 0])
         wo_b_scale_hca: pl.Tensor[[D], pl.FP32] = pl.slice(wo_b_scale, [D], [hca_layer * D])
-        hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [loop_i * HCA_MAIN_OUT_DIM, 0])
-        hca_cmp_wgate_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [loop_i * HCA_MAIN_OUT_DIM, 0])
-        hca_cmp_ape_hca: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [loop_i * HCA_COMPRESS_RATIO, 0])
-        hca_cmp_norm_w_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [loop_i * HEAD_DIM])
-        hca_compress_state_hca: pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [loop_i * HCA_COMPRESS_STATE_BLOCK_NUM, 0, 0])
+        hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [hca_stack_i * HCA_MAIN_OUT_DIM, 0])
+        hca_cmp_wgate_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [hca_stack_i * HCA_MAIN_OUT_DIM, 0])
+        hca_cmp_ape_hca: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [hca_stack_i * HCA_COMPRESS_RATIO, 0])
+        hca_cmp_norm_w_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [hca_stack_i * HEAD_DIM])
+        hca_compress_state_hca: pl.Tensor[[HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [hca_stack_i * HCA_COMPRESS_STATE_BLOCK_NUM, 0, 0])
         cmp_kv_hca: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * CSA_CMP_BLOCK_NUM, 0, 0, 0])
         hc_ffn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_ffn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_ffn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_ffn_scale, [3], [hca_layer * 3])
@@ -544,10 +591,12 @@ def decode_fwd(
                 routed_y_buf, combine_arrived,
                 hca_layer, num_tokens, my_rank, hca_moe_epoch,
             )
-    # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
-    # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
+    # FWD index, not the csa-kind index: the *_last slices below index per-FWD-layer
+    # stacked weights; csa-stacked weights use (CSA_NUM_LAYERS - 1).
     csa_layer_last: pl.Scalar[pl.INT32] = pl.cast(FWD_LAST_LAYER, pl.INT32)
-    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(2 * HCA_NUM_LAYERS + 3, pl.INT32)
+    # moe_epoch is the 1-based MoE call id: layer L runs epoch L + 1, so the last
+    # layer runs epoch FWD_NUM_LAYERS.
+    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(FWD_NUM_LAYERS, pl.INT32)
     x_attn_last: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     hc_attn_fn_last: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
     hc_attn_scale_last: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [csa_layer_last * 3])
@@ -1168,7 +1217,7 @@ def _attention_kind_for_layer(layer_id):
 
 def build_single_layer_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     """Per-layer single-rank tensor specs: the base shapes/dtypes/inits that
-    build_tensor_specs restacks across the 43 forward layers."""
+    build_tensor_specs restacks across the FWD_NUM_LAYERS forward layers."""
     import torch
     from decode_metadata import block_table
     from golden import ScalarSpec, TensorSpec
@@ -1384,7 +1433,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed single-token decode forward driver.")
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 Pro packed single-token decode forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8], help="EP world size / rank count (parsed at import by moe)")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)), help=f"comma-separated device ids; need at least {N_RANKS}")

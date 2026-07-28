@@ -24,7 +24,7 @@ from config import (
     DECODE_BATCH,
     DECODE_SEQ,
     DECODE_START_POS,
-    FLASH as M,
+    PRO_KERNEL as M,
 )
 
 

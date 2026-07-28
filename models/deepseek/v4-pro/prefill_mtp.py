@@ -29,7 +29,7 @@ import config
 
 config.MOE_TOKENS = config.PREFILL_TOKENS
 
-from config import FLASH as M, PREFILL_TOKENS
+from config import PRO_KERNEL as M, PREFILL_TOKENS
 from hc_head import (
     EPS as HC_HEAD_RMS_EPS,
     HC_DIM_INV as HC_HEAD_DIM_INV,

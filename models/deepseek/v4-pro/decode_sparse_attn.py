@@ -12,7 +12,7 @@
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -126,7 +126,7 @@ QUANT_TOKEN_TILE = 8
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE   # proj_a cube N-frags per group
 # proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
 # so the per-group split does not multiply the task count by N-frags. A 512-column
-# chunk produces 8 * (4096 / 512) = 64 balanced cube blocks.
+# chunk produces 16 * (7168 / 512) = 224 balanced cube blocks.
 PROJ_B_D_CHUNK = 512
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.

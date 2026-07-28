@@ -72,7 +72,7 @@ import os
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
+from config import PRO_KERNEL as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ
 
 
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
@@ -110,7 +110,12 @@ NUM_CORES = 24
 T_TILE = 8  # vector row-tile (RMS / cast / split / mix_x)
 LINEAR_T_TILE = 16  # cube matmul rows must be a 16-row boxed tile
 COMB_T_TILE = 8  # sinkhorn row-tile
-RMS_K_CHUNK = 512  # cast / rms K-fragment
+# cast / rms K-fragment. 256 (not 512) because PRO's HC_DIM = 4 * 7168 = 28672
+# factors as 4096 * 7: with RMS_OK = 16 the per-split K is 1792, which 512 does
+# not divide. Keeping RMS_OK at 16 preserves the decode fan-out this file is
+# tuned around, so the fragment is the knob that moves. 256 also matches
+# LINEAR_K_CHUNK / D_CHUNK, and still divides CAST_K_SPMD.
+RMS_K_CHUNK = 256
 LINEAR_K_CHUNK = 256  # cube K-fragment per matmul_acc (32x256x4 FP32 weight fits L0B)
 D_CHUNK = 256  # mix_x inner D-fragment (BF16 load = 1KB, 512B-aligned)
 D_SPMD = 1024  # mix_x D per spmd block: decode fans 4096 reduce over D/D_SPMD cores
@@ -124,7 +129,7 @@ LINEAR_K_PER_SPLIT = HC_DIM // LINEAR_OK
 LINEAR_CHUNKS_PER_SPLIT = LINEAR_K_PER_SPLIT // LINEAR_K_CHUNK
 
 # Split the RMS sum-of-squares K reduction over RMS_OK cores, mirroring LINEAR_OK: at decode
-# (1 token-tile) the full 16384-wide reduce is otherwise a single-lane straggler. Each
+# (1 token-tile) the full HC_DIM-wide (28672 for PRO) reduce is otherwise a single-lane straggler. Each
 # (token-tile, K-slice) task atomic-adds its FP32 partial sum-of-squares into sq_sum_acc
 # (zero-seeded in Phase A); Phase C reads the barrier-published total and applies rsqrt inline
 # per group (no separate inv_rms buffer / no within-phase RAW).
@@ -133,8 +138,8 @@ RMS_K_PER_SPLIT = HC_DIM // RMS_OK
 RMS_CHUNKS_PER_SPLIT = RMS_K_PER_SPLIT // RMS_K_CHUNK
 
 # per-phase fan-out factors (compile-time constants; the token-tile factor is dynamic in T)
-CAST_KS = HC_DIM // CAST_K_SPMD  # cast tasks per token-tile (8)
-MIXX_DS = D // D_SPMD  # mix_x tasks per token-tile (4)
+CAST_KS = HC_DIM // CAST_K_SPMD  # cast tasks per token-tile (PRO: 28672/2048 = 14)
+MIXX_DS = D // D_SPMD  # mix_x tasks per token-tile (PRO: 7168/1024 = 7)
 
 assert HC_MULT == 4, (
     f"hc_pre is specialized to HC_MULT == 4, got {HC_MULT}; "

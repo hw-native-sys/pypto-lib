@@ -16,7 +16,7 @@ Tree reduction for softmax+pool. State shift after compression."""
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,

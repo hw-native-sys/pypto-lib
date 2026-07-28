@@ -19,7 +19,7 @@ hidden states with HC lanes: ``[T, HC_MULT, D]``.
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     DECODE_BATCH,
     DECODE_SEQ,
     INT8_AMAX_EPS,

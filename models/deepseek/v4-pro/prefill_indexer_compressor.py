@@ -11,7 +11,7 @@
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     BLOCK_SIZE,
     CSA_INNER_STATE_PHYSICAL_BLOCKS,
     FP32_NEG_INF,

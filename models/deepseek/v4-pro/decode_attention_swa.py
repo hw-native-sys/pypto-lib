@@ -18,7 +18,7 @@ Companion files: attention_csa_draft.py (ratio=4)
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     DECODE_BATCH,
     DECODE_ORI_BLOCK_NUM,
     DECODE_SEQ,

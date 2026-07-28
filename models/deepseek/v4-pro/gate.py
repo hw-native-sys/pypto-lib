@@ -11,7 +11,7 @@
 
 import pypto.language as pl
 
-from config import (FLASH as M, MOE_TOKENS, FP32_NEG_INF,
+from config import (PRO_KERNEL as M, MOE_TOKENS, FP32_NEG_INF,
                     INT8_SCALE_MAX, INT8_AMAX_EPS)
 
 
@@ -20,7 +20,7 @@ T = MOE_TOKENS
 D = M.hidden_size
 NORM_EPS = M.rms_norm_eps
 # Routing space: every rank routes over the full global expert set so dispatch
-# can fan tokens across ranks. moe.py shrinks config.FLASH.n_routed_experts to
+# can fan tokens across ranks. moe.py shrinks config.PRO_KERNEL.n_routed_experts to
 # 32*EP before importing this module, so N_EXPERTS follows the active EP world.
 N_EXPERTS = M.n_routed_experts
 TOPK = M.num_experts_per_tok
@@ -39,10 +39,40 @@ D_TILE = 256
 ROW_PAD = 8
 FFN_REDUCE_TILE = D // ROW_PAD
 assert D % ROW_PAD == 0
-GATE_D_TILE = 2048
+# 512 (not 2048) because PRO's D = 7168 is not a multiple of 2048. 512 -- rather
+# than 1024 -- because the K-loop below is a pl.pipeline(stage=2) over a
+# loop-carried L0C accumulator: 7168/1024 = 7 is ODD, which makes codegen emit an
+# acc->acc pto.tmov that A5 does not implement (ptoas: "'pto.tmov' op expects a
+# supported tmov address-space pair for this target"). 7168/512 = 14 is even.
+GATE_D_TILE = 512
 assert D % GATE_D_TILE == 0, "gate K-loop must cover D"
+assert (D // GATE_D_TILE) % 2 == 0, "gate K-loop trip count must be even (stage=2 acc pipeline)"
 QUANT_TILE = 256
-SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
+# Padded expert row for sort32 + mrgsort: the next power of two >= N_EXPERTS.
+# MUST be >= N_EXPERTS -- the score buffers are [T_PAD, SCORE_PAD] and the topk
+# runs over that width, so a SCORE_PAD below N_EXPERTS silently drops the tail
+# experts from routing. FLASH's 256 experts landed on exactly 256; PRO has 384,
+# which needs 512 (the 128-wide remainder is -inf filled below).
+# Padded expert row for sort32 + mrgsort.
+#
+# MUST be >= N_EXPERTS: the score buffers are [T_PAD, SCORE_PAD] and the topk runs
+# over that width, so a SCORE_PAD below N_EXPERTS silently drops the tail experts
+# from routing. FLASH's 256 experts landed on exactly 256; PRO has 384.
+#
+# Pinned to 512 rather than "next power of two >= N_EXPERTS" so the merge chain in
+# route_sort stays a single fixed shape. The chain is: sort32 emits [1, 2*SCORE_PAD]
+# (value, index) pairs in runs of 64 -> mrgsort format1 merges those 4-at-a-time into
+# runs of 256 -> one format2 merge folds those into a single run. At SCORE_PAD 512
+# that last step is always 4-way. Making it depend on N_EXPERTS would need a Python
+# `if` inside the kernel, and the DSL parser walks *both* branches, so `sr_sorted`
+# would be assigned two different shapes ("Cannot reassign 'sr_sorted' with a
+# different type"). moe.py shrinks N_EXPERTS to 32*EP; those rows just carry more
+# -inf padding (filled below), which costs a little sort work but stays correct.
+SCORE_PAD = 512
+assert SCORE_PAD >= N_EXPERTS, (
+    f"SCORE_PAD ({SCORE_PAD}) must cover every routed expert (N_EXPERTS={N_EXPERTS})"
+)
+assert SCORE_PAD == 512, "route_sort's final mrgsort is hard-wired 4-way over 4 runs of 256"
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
@@ -246,7 +276,14 @@ def gate(
                 sr_idx_init = pl.arange(0, [1, SCORE_PAD], dtype=pl.UINT32)
                 sr_sorted = pl.sort32(sr_row, sr_idx_init)
                 sr_sorted = pl.mrgsort(sr_sorted, block_len=64)
-                sr_sorted = pl.mrgsort(sr_sorted[:, 0:256], sr_sorted[:, 256:512])
+                # format2 4-way: SCORE_PAD=512 -> sort32 gives [1, 1024] = 4 runs of
+                # 256 after format1, folded here into one sorted run of 1024.
+                sr_sorted = pl.mrgsort(
+                    sr_sorted[:, 0:256],
+                    sr_sorted[:, 256:512],
+                    sr_sorted[:, 512:768],
+                    sr_sorted[:, 768:1024],
+                )
                 sr_pairs = sr_sorted[:, 0:SORT_PAD]
                 sr_i = pl.gather(sr_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                 topk_idx_tile[sr_tt : sr_tt + 1, :] = sr_i

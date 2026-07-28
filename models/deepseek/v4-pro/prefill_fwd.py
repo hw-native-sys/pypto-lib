@@ -8,19 +8,18 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 # ci: no-sim    # CI marker: full multi-layer / multi-card forward — device-only, skip on *sim
-"""DeepSeek-V4 Flash packed-prefill forward experiment.
+"""DeepSeek-V4 Pro packed-prefill forward experiment.
 
 Mirrors ``decode_fwd.py``: a single rank-generic ``@pl.jit`` per-rank kernel
 (``prefill_fwd``) is launched once per EP rank from an ``@pl.jit.host`` driver
 (``l3_prefill_fwd``) via ``for r in pl.range(pld.world_size())``, so the same
 program scales to EP 2 / 4 / 8.  The per-rank kernel hand-unrolls the model's
-layer schedule and calls ``prefill_attention_{swa,hca,csa}`` + ``moe`` directly
+layer schedule and calls ``prefill_attention_{hca,csa}`` + ``moe`` directly
 (no ``prefill_layer`` wrapper).  Each attention / moe stage runs in its own
 ``pl.scope`` under ``auto_scope=False`` (matching ``decode_fwd``), and the final
-hidden state passes ``hc_head`` -> final ``rms_norm`` -> TP-sharded ``lm_head``
-to produce full-vocabulary logits.  This is a kernel-only smoke driver: it does
-not run a golden comparison.  With ``lm_head`` composed in, ``--ep 2`` / TP=2
-only (mirrors ``decode_fwd``).
+hidden state passes ``hc_head`` -> final ``rms_norm`` to produce the normalized
+``[T, D]`` hidden state.  There is no ``lm_head`` / logits stage here.  This is a
+kernel-only smoke driver: it does not run a golden comparison.
 """
 
 import argparse
@@ -36,7 +35,7 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 # moe, which freezes recv shapes and derives RECV_MAX = EP * MOE_TOKENS at import.
 import config
 config.MOE_TOKENS = config.PREFILL_TOKENS
-# Import moe first: it applies the EP/FLASH override before the attention modules
+# Import moe first: it applies the EP/PRO override before the attention modules
 # bake config-derived MoE shapes (matches prefill_layer's import order).
 from moe import (
     AUX_PAD,
@@ -57,10 +56,12 @@ from moe import (
     build_tensor_specs as build_moe_tensor_specs,
     moe,
 )
-from config import FLASH as MODEL_CONFIG
+from config import PRO_KERNEL as MODEL_CONFIG
+# The main model has no swa layer under Pro, but the MTP layer still is one:
+# ``compress_ratios[num_hidden_layers] == 0``, and prefill_mtp builds its specs
+# through ``build_single_layer_tensor_specs``. Only the kernel symbol is dead.
 from prefill_attention_swa import (
     build_tensor_specs as build_swa_attention_tensor_specs,
-    prefill_attention_swa,
 )
 from prefill_attention_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -106,27 +107,60 @@ from hc_head import hc_head
 from rmsnorm import rms_norm
 
 # ---------------------------------------------------------------------------
-# Model layer schedule (DeepSeek-V4 Flash, 43 hidden layers):
-#   layer 0, 1                     -> swa
-#   layer 2, 4, ..., 40            -> csa   (20 layers, loop body)
-#   layer 3, 5, ..., 41            -> hca   (20 layers, loop body)
-#   layer 42 (FWD_LAST_LAYER)      -> csa   (final layer)
-# CSA total = 20 (loop) + 1 (last) = 21 ; HCA total = 20.
+# Model layer schedule, derived from MODEL_CONFIG.compress_ratios so the same
+# hand-unrolled body serves any preset shaped as "LEAD_NUM_LAYERS leading layers
+# + alternating (csa, hca) pairs + 1 trailing csa".
+#
+# DeepSeek-V4 Pro (61 hidden layers, no swa in the main model):
+#   layer 0, 1                     -> hca   (ratio 128; Flash used swa here)
+#   layer 2, 4, ..., 58            -> csa   (29 layers, loop body)
+#   layer 3, 5, ..., 59            -> hca   (29 layers, loop body)
+#   layer 60 (FWD_LAST_LAYER)      -> csa   (final layer)
+# CSA total = 29 (loop) + 1 (last) = 30 ; HCA total = 2 (lead) + 29 = 31.
+#
+# ``compress_ratios`` carries num_hidden_layers + num_nextn_predict_layers
+# entries; the trailing entry is the MTP layer (ratio 0 / swa), which belongs to
+# prefill_mtp.py and not to this forward.
 # ---------------------------------------------------------------------------
 MODEL_NUM_LAYERS = MODEL_CONFIG.num_hidden_layers
-FWD_NUM_LAYERS = 43
-CSA_NUM_LAYERS = 21
-HCA_NUM_LAYERS = 20
+FWD_COMPRESS_RATIOS = MODEL_CONFIG.compress_ratios[:MODEL_NUM_LAYERS]
+FWD_NUM_LAYERS = MODEL_NUM_LAYERS
+CSA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(CSA_COMPRESS_RATIO)
+HCA_NUM_LAYERS = FWD_COMPRESS_RATIOS.count(HCA_COMPRESS_RATIO)
 HCA_COMPRESS_STATE_DIM = 2 * HCA_MAIN_OUT_DIM
 CSA_COMPRESS_STATE_DIM = 2 * CSA_MAIN_OUT_DIM
 CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
-LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
-assert MODEL_NUM_LAYERS == 43, "DeepSeek-V4 Flash hidden layer count changed"
+# Emission shape this body hand-unrolls: LEAD_NUM_LAYERS unrolled leading layers,
+# then (csa, hca) pairs from the pl.range loop, then one trailing csa layer.
+# Flash: lead = 2 swa, 20 pairs.  Pro: lead = 2 hca, 29 pairs.
+LEAD_NUM_LAYERS = 2
+PAIR_LOOP_COUNT = (FWD_NUM_LAYERS - LEAD_NUM_LAYERS - 1) // 2
+# hca-kind stack slot of the first *looped* hca layer: the leading layers consume
+# a slot each only when they are themselves hca (Pro: 2; Flash: 0, they were swa).
+HCA_LOOP_BASE = FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(HCA_COMPRESS_RATIO)
+# moe_epoch is the 1-based MoE call id: layer L runs epoch L + 1, so the trailing
+# layer runs epoch FWD_NUM_LAYERS.
+LAST_MOE_EPOCH = FWD_NUM_LAYERS
+
+assert CSA_NUM_LAYERS + HCA_NUM_LAYERS == FWD_NUM_LAYERS, \
+    f"prefill_fwd emits csa/hca layers only, got ratios {FWD_COMPRESS_RATIOS}"
+assert all(r == HCA_COMPRESS_RATIO for r in FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS]), \
+    f"prefill_fwd unrolls the first {LEAD_NUM_LAYERS} layers as hca (ratio 128)"
+assert all(FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i] == CSA_COMPRESS_RATIO
+           and FWD_COMPRESS_RATIOS[LEAD_NUM_LAYERS + 2 * i + 1] == HCA_COMPRESS_RATIO
+           for i in range(PAIR_LOOP_COUNT)), \
+    "prefill_fwd loop body expects strict (csa, hca) pairs"
+assert FWD_COMPRESS_RATIOS[FWD_LAST_LAYER] == CSA_COMPRESS_RATIO, \
+    "prefill_fwd expects the trailing layer to be csa"
+# csa-kind slice index inside the loop stays a bare loop_i; that only holds when no
+# leading layer is csa.
+assert FWD_COMPRESS_RATIOS[:LEAD_NUM_LAYERS].count(CSA_COMPRESS_RATIO) == 0, \
+    "leading layers must not be csa; the loop indexes csa stacks with loop_i"
 
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
-# the 43-layer prefill scope is open. Keep the other rings on their defaults.
+# the 61-layer prefill scope is open. Keep the other rings on their defaults.
 PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
 
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
@@ -134,7 +168,7 @@ PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
 HC_HEAD_NAMES = ["hc_head_fn", "hc_head_scale", "hc_head_base"]
 FINAL_NORM_NAMES = ["final_norm_w"]
 
-# Per-FWD-layer stacked weights (sliced by the FWD layer index 0..42).
+# Per-FWD-layer stacked weights (sliced by the FWD layer index 0..FWD_LAST_LAYER).
 FWD_LAYER_STACKED_NAMES = [
     "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
     "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
@@ -146,7 +180,7 @@ FWD_LAYER_STACKED_NAMES = [
     "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
     "shared_w2", "shared_w2_scale",
 ]
-# CSA-compact stacked weights (sliced by the CSA order index 0..20).
+# CSA-compact stacked weights (sliced by the CSA order index 0..CSA_NUM_LAYERS-1).
 CSA_LAYER_STACKED_NAMES = [
     "csa_cmp_wkv", "csa_cmp_wgate", "csa_cmp_ape", "csa_cmp_norm_w",
     "csa_compress_state",
@@ -154,7 +188,8 @@ CSA_LAYER_STACKED_NAMES = [
     "csa_inner_wkv", "csa_inner_wgate", "csa_inner_ape", "csa_inner_norm_w",
     "csa_inner_compress_state", "idx_kv_cache", "idx_kv_scale",
 ]
-# HCA-compact stacked weights (sliced by the HCA order index 0..19).
+# HCA-compact stacked weights (sliced by the HCA order index 0..HCA_NUM_LAYERS-1;
+# under Pro the two leading hca layers own slots 0 and 1).
 HCA_LAYER_STACKED_NAMES = [
     "hca_cmp_wkv", "hca_cmp_wgate", "hca_cmp_ape", "hca_cmp_norm_w",
     "hca_compress_state",
@@ -307,7 +342,7 @@ def prefill_fwd(
     nt: pl.Scalar[pl.INT32] = num_tokens
     hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
 
-    # ===================== layer 0 : swa =================================
+    # ===================== layer 0 : hca =================================
     hc_attn_fn_l0: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [0 * MIX_HC, 0])
     hc_attn_scale_l0: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [0 * 3])
     hc_attn_base_l0: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [0 * MIX_HC])
@@ -319,6 +354,12 @@ def prefill_fwd(
     gamma_cq_l0: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [0 * Q_LORA])
     gamma_ckv_l0: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [0 * HEAD_DIM])
     kv_cache_l0: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(kv_cache, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [0 * CSA_ORI_BLOCK_NUM, 0, 0, 0])
+    cmp_kv_l0: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [0 * CSA_CMP_BLOCK_NUM, 0, 0, 0])
+    hca_cmp_wkv_l0: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [0 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_wgate_l0: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [0 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_ape_l0: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [0 * HCA_COMPRESS_RATIO, 0])
+    hca_cmp_norm_w_l0: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [0 * HEAD_DIM])
+    hca_compress_state_l0: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [0 * HCA_STATE_BLOCK_NUM, 0, 0])
     attn_sink_l0: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [0 * H])
     wo_a_l0: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [0 * O_GROUPS, 0, 0])
     wo_b_l0: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [0 * D, 0])
@@ -344,13 +385,16 @@ def prefill_fwd(
     shared_w2_scale_l0: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [0 * D])
     x_attn0: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        prefill_attention_swa(
+        prefill_attention_hca(
             x_hc,
             hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0, attn_norm_w_l0,
             wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
             freqs_cos, freqs_sin,
-            kv_cache_l0, ori_block_table, ori_slot_mapping,
-            position_ids,
+            hca_cmp_wkv_l0, hca_cmp_wgate_l0, hca_cmp_ape_l0, hca_cmp_norm_w_l0,
+            hca_compress_state_l0, hca_compress_state_block_table,
+            kv_cache_l0, ori_slot_mapping, ori_block_table,
+            cmp_kv_l0, cmp_block_table,
+            position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
             attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
             x_attn0, nt,
         )
@@ -369,7 +413,7 @@ def prefill_fwd(
             pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
         )
 
-    # ===================== layer 1 : swa =================================
+    # ===================== layer 1 : hca =================================
     hc_attn_fn_l1: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [1 * MIX_HC, 0])
     hc_attn_scale_l1: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [1 * 3])
     hc_attn_base_l1: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [1 * MIX_HC])
@@ -381,6 +425,12 @@ def prefill_fwd(
     gamma_cq_l1: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [1 * Q_LORA])
     gamma_ckv_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [1 * HEAD_DIM])
     kv_cache_l1: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(kv_cache, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [1 * CSA_ORI_BLOCK_NUM, 0, 0, 0])
+    cmp_kv_l1: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [1 * CSA_CMP_BLOCK_NUM, 0, 0, 0])
+    hca_cmp_wkv_l1: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [1 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_wgate_l1: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [1 * HCA_MAIN_OUT_DIM, 0])
+    hca_cmp_ape_l1: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [1 * HCA_COMPRESS_RATIO, 0])
+    hca_cmp_norm_w_l1: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [1 * HEAD_DIM])
+    hca_compress_state_l1: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [1 * HCA_STATE_BLOCK_NUM, 0, 0])
     attn_sink_l1: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [1 * H])
     wo_a_l1: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16] = pl.slice(wo_a, [O_GROUPS, O_LORA, O_GROUP_IN], [1 * O_GROUPS, 0, 0])
     wo_b_l1: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8] = pl.slice(wo_b, [D, O_GROUPS * O_LORA], [1 * D, 0])
@@ -406,13 +456,16 @@ def prefill_fwd(
     shared_w2_scale_l1: pl.Tensor[[D], pl.FP32] = pl.slice(shared_w2_scale, [D], [1 * D])
     x_attn1: pl.Tensor[[T, HC_MULT, D], pl.FP32] = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        prefill_attention_swa(
+        prefill_attention_hca(
             hidden,
             hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1, attn_norm_w_l1,
             wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
             freqs_cos, freqs_sin,
-            kv_cache_l1, ori_block_table, ori_slot_mapping,
-            position_ids,
+            hca_cmp_wkv_l1, hca_cmp_wgate_l1, hca_cmp_ape_l1, hca_cmp_norm_w_l1,
+            hca_compress_state_l1, hca_compress_state_block_table,
+            kv_cache_l1, ori_slot_mapping, ori_block_table,
+            cmp_kv_l1, cmp_block_table,
+            position_ids, hca_cmp_slot_mapping, hca_state_slot_mapping,
             attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
             x_attn1, nt,
         )
@@ -431,12 +484,15 @@ def prefill_fwd(
             pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
         )
 
-    # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
-    for loop_i in pl.range(HCA_NUM_LAYERS):
+    # ============ loop : csa (even) + hca (odd) pairs, layers 2..59 ======
+    for loop_i in pl.range(PAIR_LOOP_COUNT):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
         hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
+        # csa-kind slot == loop_i; hca-kind slot is offset by the leading hca layers
+        # that already own slots 0..HCA_LOOP_BASE-1.
+        hca_stack_i: pl.Scalar[pl.INT32] = pl.cast(loop_i + HCA_LOOP_BASE, pl.INT32)
 
         # ---- csa attention weights (per-FWD by csa_layer, compact by loop_i) ----
         hc_attn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -526,7 +582,7 @@ def prefill_fwd(
                 csa_layer, nt, my_rank, csa_moe_epoch,
             )
 
-        # ---- hca attention weights (per-FWD by hca_layer, compact by loop_i) ----
+        # ---- hca attention weights (per-FWD by hca_layer, compact by hca_stack_i) ----
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
         hc_attn_base_hca: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [hca_layer * MIX_HC])
@@ -537,11 +593,11 @@ def prefill_fwd(
         wkv_hca: pl.Tensor[[D, HEAD_DIM], pl.BF16] = pl.slice(wkv, [D, HEAD_DIM], [hca_layer * D, 0])
         gamma_cq_hca: pl.Tensor[[Q_LORA], pl.BF16] = pl.slice(gamma_cq, [Q_LORA], [hca_layer * Q_LORA])
         gamma_ckv_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(gamma_ckv, [HEAD_DIM], [hca_layer * HEAD_DIM])
-        hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [loop_i * HCA_MAIN_OUT_DIM, 0])
-        hca_cmp_wgate_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [loop_i * HCA_MAIN_OUT_DIM, 0])
-        hca_cmp_ape_hca: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [loop_i * HCA_COMPRESS_RATIO, 0])
-        hca_cmp_norm_w_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [loop_i * HEAD_DIM])
-        hca_compress_state_hca: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [loop_i * HCA_STATE_BLOCK_NUM, 0, 0])
+        hca_cmp_wkv_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wkv, [HCA_MAIN_OUT_DIM, D], [hca_stack_i * HCA_MAIN_OUT_DIM, 0])
+        hca_cmp_wgate_hca: pl.Tensor[[HCA_MAIN_OUT_DIM, D], pl.BF16] = pl.slice(hca_cmp_wgate, [HCA_MAIN_OUT_DIM, D], [hca_stack_i * HCA_MAIN_OUT_DIM, 0])
+        hca_cmp_ape_hca: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32] = pl.slice(hca_cmp_ape, [HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], [hca_stack_i * HCA_COMPRESS_RATIO, 0])
+        hca_cmp_norm_w_hca: pl.Tensor[[HEAD_DIM], pl.BF16] = pl.slice(hca_cmp_norm_w, [HEAD_DIM], [hca_stack_i * HEAD_DIM])
+        hca_compress_state_hca: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], pl.FP32] = pl.slice(hca_compress_state, [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM], [hca_stack_i * HCA_STATE_BLOCK_NUM, 0, 0])
         kv_cache_hca: pl.Tensor[[CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(kv_cache, [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * CSA_ORI_BLOCK_NUM, 0, 0, 0])
         cmp_kv_hca: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16] = pl.slice(cmp_kv, [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], [hca_layer * CSA_CMP_BLOCK_NUM, 0, 0, 0])
         attn_sink_hca: pl.Tensor[[H], pl.FP32] = pl.slice(attn_sink, [H], [hca_layer * H])
@@ -597,7 +653,7 @@ def prefill_fwd(
                 hca_layer, nt, my_rank, hca_moe_epoch,
             )
 
-    # ================ layer 42 (FWD_LAST_LAYER) : csa -> x_out ===========
+    # ================ layer 60 (FWD_LAST_LAYER) : csa -> x_out ===========
     csa_layer_last: pl.Scalar[pl.INT32] = pl.cast(FWD_LAST_LAYER, pl.INT32)
     csa_order_last: pl.Scalar[pl.INT32] = pl.cast(CSA_LAST_ORDER, pl.INT32)
     last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(LAST_MOE_EPOCH, pl.INT32)
@@ -1280,7 +1336,7 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DeepSeek-V4 Flash packed-prefill forward driver.")
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 Pro packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
     parser.add_argument("--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
                         help="EP world size / rank count (parsed at import by moe).")

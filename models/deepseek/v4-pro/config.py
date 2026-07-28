@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """DeepSeek-V4 configuration"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Optional, Tuple
 
 
@@ -230,12 +230,38 @@ PRO = DeepSeekV4Config(
     original_max_position_embeddings=65536,
     dtype="fp8",
     scale_fmt="ue8m0",
-    expert_dtype=None,
+    # Routed-expert weights are 4-bit on both supported deployments: Hybrid
+    # MXFP8-MXFP4 on Ascend 950PR/DT and Hybrid INT8-INT4 on Atlas-A3 Pod both
+    # specify W4A8 for the routed experts (shared experts stay W8A8).
+    expert_dtype="fp4",
     scale_dtype="fp8",
     max_batch_size=4,
 )
 
 PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
+
+# Sequence budget these kernel programs are built for.
+#
+# ``PRO.max_position_embeddings`` is the real 1 M-position capability of
+# DeepSeek-V4-Pro and is left untouched so the preset stays a faithful model
+# description. The programs in this directory are single-kernel test cases, not
+# a serving deployment: each one sizes its paged-KV pool to hold the *whole*
+# context (e.g. ``assert SPARSE_ORI_MAX_BLOCKS <= BLOCK_NUM``), and their golden
+# references are recomputed in torch on the host. Admitting 1 M positions would
+# need a ~64x larger physical pool than the cases allocate and a host-side
+# golden nobody can compute. So the kernels import ``PRO_KERNEL``: architecture
+# identical to PRO, sequence budget matched to what the v4-flash cases already
+# exercise (8k prompt + 512 decode steps).
+#
+# Raise this if a case needs a longer context; nothing else has to change.
+KERNEL_MAX_SEQ_LEN = 16384
+
+PRO_KERNEL = replace(PRO, max_position_embeddings=KERNEL_MAX_SEQ_LEN)
+
+# The preset this directory's kernel programs are built for. Every kernel here
+# imports ``PRO_KERNEL`` explicitly; ACTIVE exists so the derived pool sizes
+# below cannot silently drift to a different preset than the kernels use.
+ACTIVE = PRO_KERNEL
 
 
 # Deployment constants
@@ -257,7 +283,7 @@ LM_HEAD_TP_SIZE = 8
 # Static paged-cache pools shared by decode and prefill kernels. ``*_BLOCK_NUM``
 # is the global physical-pool capacity and is deliberately independent from the
 # compute batch. Per-request ownership is expressed only by block tables.
-KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
+KV_ORI_TABLE_MAX_BLOCKS = (ACTIVE.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
 KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64

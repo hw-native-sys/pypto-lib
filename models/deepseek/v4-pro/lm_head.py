@@ -26,7 +26,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M, LM_HEAD_TP_SIZE, PREFILL_TOKENS
+from config import DECODE_TOKENS, PRO_KERNEL as M, LM_HEAD_TP_SIZE, PREFILL_TOKENS
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -57,7 +57,7 @@ TP_SIZE = _parse_tp_argv()
 
 T = DECODE_TOKENS
 T_MAX = max(DECODE_TOKENS, PREFILL_TOKENS)
-D = M.hidden_size  # 4096 hidden size.
+D = M.hidden_size  # 7168 under the PRO preset.
 VOCAB = M.vocab_size  # 129280 vocabulary size.
 
 LM_HEAD_K_CHUNK = 128  # K tile width; D / 128 = 32 matmul accumulation blocks.

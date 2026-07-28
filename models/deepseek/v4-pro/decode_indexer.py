@@ -14,7 +14,7 @@ The inner Compressor is invoked via golden_compressor (placeholder)."""
 import pypto.language as pl
 
 from config import (
-    FLASH as M,
+    PRO_KERNEL as M,
     DECODE_BATCH,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -86,7 +86,10 @@ D_TILE = 512
 # assemble races here, since T_PAD == MM_ROW_TILE makes the seed a full-extent write.
 # WEIGHTS_K_SLICE // D_TILE == 2, so the inner loop is a pl.range: a degenerate
 # 2-iteration pl.pipeline(stage=2) miscompiles over matmul.
-WEIGHTS_OK = 4
+# 7 (not 4) because PRO's D = 7168 = 512 * 14, so WEIGHTS_OK must divide 14 for
+# WEIGHTS_K_SLICE to stay a whole number of D_TILEs. 7 keeps WEIGHTS_K_SLICE //
+# D_TILE == 2, i.e. the exact inner-loop trip count the comment above depends on.
+WEIGHTS_OK = 7
 WEIGHTS_K_SLICE = D // WEIGHTS_OK
 assert WEIGHTS_K_SLICE % D_TILE == 0
 QH_QUANT_TILE = 64

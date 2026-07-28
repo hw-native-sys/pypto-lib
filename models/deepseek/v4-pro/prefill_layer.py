@@ -37,7 +37,7 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 # moe (which freezes recv shapes and derives RECV_MAX = EP * MOE_TOKENS at import).
 import config
 config.MOE_TOKENS = config.PREFILL_TOKENS
-# Import moe first. It applies the EP2 FLASH override before dependent
+# Import moe first. It applies the EP2 PRO override before dependent
 # modules bake config-derived MoE shapes.
 from moe import (
     AUX_PAD,
@@ -59,7 +59,7 @@ from moe import (
     golden_moe,
     moe,
 )
-from config import FLASH as MODEL_CONFIG
+from config import PRO_KERNEL as MODEL_CONFIG
 from prefill_attention_swa import (
     BLOCK_NUM as SWA_ORI_BLOCK_NUM,
     BLOCK_SIZE as SWA_BLOCK_SIZE,
@@ -131,6 +131,31 @@ IDX_CACHE_BLOCKS = PREFILL_IDX_BLOCK_NUM
 ORI_TABLE_BLOCKS = SPARSE_ORI_MAX_BLOCKS
 CMP_TABLE_BLOCKS = SPARSE_CMP_MAX_BLOCKS
 IDX_TABLE_BLOCKS = IDX_CACHE_MAX_BLOCKS
+
+# ---------------------------------------------------------------------------
+# Layer schedule, derived from the active preset (never hard-coded).
+#
+# ``compress_ratios`` holds ``num_hidden_layers + 1`` entries; the trailing one
+# describes the MTP layer, which ``prefill_mtp.py`` owns. The main-model
+# schedule is a uniform prefix followed by a strict CSA(4)/HCA(128) alternation:
+#   flash: 43 layers = 2 SWA (ratio 0) prefix + 21 CSA + 20 HCA
+#   pro:   61 layers = 0 SWA, HCA (ratio 128) prefix + 30 CSA + 31 HCA
+# ``prefill_layer_core`` dispatches on the runtime ``layer_id`` scalar, so it can
+# only reproduce the schedule with integer arithmetic; these three constants are
+# exactly what that arithmetic needs. ``_kernel_attention_kind`` below
+# cross-checks them against ``compress_ratios`` at import.
+# ---------------------------------------------------------------------------
+_MAIN_RATIOS = tuple(MODEL_CONFIG.compress_ratios[: MODEL_CONFIG.num_hidden_layers])
+NUM_SWA_LAYERS = sum(1 for r in _MAIN_RATIOS if r == 0)   # leading SWA run: flash 2, pro 0
+FIRST_CSA_LAYER = _MAIN_RATIOS.index(4)                   # alternation start: 2 for both
+CSA_PARITY = FIRST_CSA_LAYER % 2                          # CSA layers carry this parity
+assert _MAIN_RATIOS[:NUM_SWA_LAYERS] == (0,) * NUM_SWA_LAYERS, \
+    "SWA layers must form the leading prefix of compress_ratios"
+assert all(r == 128 for r in _MAIN_RATIOS[NUM_SWA_LAYERS:FIRST_CSA_LAYER]), \
+    "layers between the SWA prefix and the first CSA layer must be HCA (ratio 128)"
+assert all(r == (4 if (i - FIRST_CSA_LAYER) % 2 == 0 else 128)
+           for i, r in enumerate(_MAIN_RATIOS) if i >= FIRST_CSA_LAYER), \
+    "compress_ratios must alternate CSA(4)/HCA(128) from FIRST_CSA_LAYER onwards"
 
 # Dynamic (batch-dependent) kernel-signature dims. Kept local to this file so
 # config.py and the fixed-T child kernels stay untouched (issue #591 §1).
@@ -341,7 +366,7 @@ def prefill_layer_core(
             input_ids_tile = pl.slice(input_ids, [TOK_TILE], [tile_base])
 
             x_attn_tile = pl.create_tensor([TOK_TILE, HC_MULT, D], dtype=pl.FP32)
-            if layer_id < 2:
+            if layer_id < NUM_SWA_LAYERS:
                 prefill_attention_swa(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
                     attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -351,7 +376,7 @@ def prefill_layer_core(
                     attn_sink, wo_a, wo_b, wo_b_scale,
                     x_attn_tile, valid_n,
                 )
-            elif layer_id % 2 == 1:
+            elif layer_id < FIRST_CSA_LAYER or layer_id % 2 != CSA_PARITY:
                 prefill_attention_hca(
                     x_hc_tile, hc_attn_fn, hc_attn_scale, hc_attn_base,
                     attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
@@ -725,6 +750,12 @@ def _spec_value(spec, torch):
 
 
 def _attention_kind_for_layer(layer_id):
+    if not 0 <= layer_id < MODEL_CONFIG.num_hidden_layers:
+        raise ValueError(
+            f"layer_id must be in [0, {MODEL_CONFIG.num_hidden_layers - 1}] for the "
+            f"{MODEL_CONFIG.name} main model, got {layer_id}; the trailing MTP layer "
+            f"({MODEL_CONFIG.num_hidden_layers}) is owned by prefill_mtp.py"
+        )
     ratio = MODEL_CONFIG.compress_ratios[layer_id]
     if ratio == 0:
         return "swa"
@@ -733,6 +764,20 @@ def _attention_kind_for_layer(layer_id):
     if ratio == 4:
         return "csa"
     raise ValueError(f"unsupported DeepSeek V4 attention compress ratio {ratio} at layer {layer_id}")
+
+
+def _kernel_attention_kind(layer_id):
+    """Host mirror of the integer dispatch inside ``prefill_layer_core``."""
+    if layer_id < NUM_SWA_LAYERS:
+        return "swa"
+    if layer_id < FIRST_CSA_LAYER or layer_id % 2 != CSA_PARITY:
+        return "hca"
+    return "csa"
+
+
+assert all(_kernel_attention_kind(i) == _attention_kind_for_layer(i)
+           for i in range(MODEL_CONFIG.num_hidden_layers)), \
+    "prefill_layer_core dispatch disagrees with MODEL_CONFIG.compress_ratios"
 
 
 def _tile_token_meta(kind, context_len, valid_tok, torch):
@@ -1289,7 +1334,10 @@ if __name__ == "__main__":
         compare_fn={
             # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
             # --chunk-lens 128,192
-            # swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
+            # TODO: re-measure on Pro real weights. The numbers below are the
+            # Flash measurements (2 SWA layers, 256 experts, routed_scaling 1.5)
+            # and do not describe Pro, whose layer 0 is HCA, not SWA:
+            #   swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
             "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             # Packed CSA runs preserve the standalone child-kernel precision

@@ -15,7 +15,7 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 
 import pypto.language as pl
 
-from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
+from config import (PRO_KERNEL as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
                     EP_WORLD_SIZE, RECV_MAX)
 
 
@@ -44,10 +44,20 @@ D_OUT_TILE = 256
 QUANT_TILE = 512
 D_OUT_TILE_ACT = 512
 W2_INNER = 4
-W2_ACT_INNER = 8
+# 14 (not 8): the w2-dequant task count is `D // (W2_ACT_INNER * D_OUT_TILE_ACT)`.
+# For FLASH that was 4096 // 4096 == 1 task covering all of D. PRO's D = 7168 is
+# NOT a multiple of 8 * 512 = 4096, so the same expression truncates to 1 task
+# covering only 4096 columns and silently leaves 3072 columns un-dequantized.
+# W2_ACT_INNER must divide D // D_OUT_TILE_ACT (= 14 for PRO).
+W2_ACT_INNER = 14
 TILES_PER_EXPERT = RECV_MAX // RECV_TILE
 
 assert RECV_MAX % RECV_TILE == 0, "RECV_MAX must be a whole number of RECV_TILE row-tiles"
+# Every `<dim> // <tile>` used as a loop/task bound must divide exactly, or the
+# bound silently truncates and part of the tensor is never written.
+assert D % (W2_ACT_INNER * D_OUT_TILE_ACT) == 0, \
+    "W2_ACT_INNER * D_OUT_TILE_ACT must divide D (otherwise the w2-dequant task count truncates)"
+assert MOE_INTER % QUANT_TILE == 0 and D % D_OUT_TILE == 0 and D % D_OUT_TILE_ACT == 0
 
 
 @pl.jit.inline
