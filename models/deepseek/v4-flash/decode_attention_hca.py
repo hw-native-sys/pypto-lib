@@ -33,7 +33,8 @@ from config import (
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import rms_norm
+from rmsnorm import rms_gamma, rms_recip
+from rope_interleave import rope_interleave
 from decode_compressor_ratio128 import compressor_ratio128
 from decode_sparse_attn_hca import sparse_attn_hca, CMP_TOPK as HCA_SPARSE_CMP_TOPK
 
@@ -147,6 +148,12 @@ def attention_hca(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     cmp_cos = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, ROPE_HEAD_DIM // 2], dtype=pl.FP32)
+    # Interleave-duplicated / sign-folded compressed-position rope rows. The ratio-128
+    # compressor's rmsnorm_rope_cache_write rebuilt this j>>1 dup-gather itself; pl.gather
+    # lowers to a per-row TGATHER loop, so it is hoisted here (once, B rows) and read as a
+    # plain load downstream.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="hca_rope"):
         for b in pl.range(B):
             first_t = b * S
@@ -165,16 +172,25 @@ def attention_hca(
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(step_sin_row, target_type=pl.BF16, mode="rint")
 
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
+
+    # Deferred RMSNorm: x_gamma = x_mixed * gamma, with the per-token 1/rms split into
+    # its own scope. qkv_proj_rope needs NO correction -- its q/kv LoRA outputs are
+    # re-normalized and its qr int8 quant is symmetric per token, all invariant to a
+    # positive per-token scale -- so qr_proj_matmul, the critical path, no longer waits
+    # on the reduce. compressor_ratio128 folds x_inv_rms in after its own projections.
+    x_gamma = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_inv_rms = pl.create_tensor([T, 1], dtype=pl.FP32)
+    rms_gamma(x_mixed, attn_norm_w, x_gamma)
+    rms_tid = rms_recip(x_mixed, x_inv_rms)
+    # Defers kv_proj_matmul one hop behind the reduce so qr_proj_matmul dispatches first.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)        # unused on HCA path
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed, wq_a, wq_b, wq_b_scale, wkv,
+        x_gamma, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
@@ -190,16 +206,17 @@ def attention_hca(
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_normed_bsd = pl.reshape(x_normed, [B, S, D])
+    x_gamma_bsd = pl.reshape(x_gamma, [B, S, D])
+    x_inv_rms_bsd = pl.reshape(x_inv_rms, [B, S, 1])
     cmp_kv_proj = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     compressor_ratio128(
-        x_normed_bsd, cmp_kv_proj,
+        x_gamma_bsd, x_inv_rms_bsd, cmp_kv_proj,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
+        cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
         late_dep,
     )
@@ -303,7 +320,7 @@ def golden_attention_hca(tensors):
 
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
-    from rmsnorm import golden_rms_norm
+    from rmsnorm import golden_rms_gamma, golden_rms_recip
     from decode_compressor_ratio128 import golden_compressor
     from decode_sparse_attn_hca import golden_sparse_attn
     from hc_post import golden_hc_post
@@ -343,9 +360,12 @@ def golden_attention_hca(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
+    # Mirrors the kernel's dataflow, as the goldens here do for every other quantized
+    # stage: consumers take the bf16 (x * gamma) half plus the deferred denominator.
+    x_gamma = golden_rms_gamma(x_mixed, tensors["attn_norm_w"])
+    x_inv_rms = golden_rms_recip(x_mixed)
     golden_qkv_proj_rope({
-        "x": x_normed,
+        "x": x_gamma,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -382,7 +402,8 @@ def golden_attention_hca(tensors):
     cmp_slot_mapping_bsd = tensors["cmp_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
     state_slot_mapping_bsd = tensors["state_slot_mapping"].reshape(B, S).to(torch.int64).contiguous()
     golden_compressor({
-        "x": x_normed.reshape(B, S, D),
+        "x": x_gamma.reshape(B, S, D),
+        "x_inv_rms": x_inv_rms.reshape(B, S, 1),
         "kv": cmp_kv_proj,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],

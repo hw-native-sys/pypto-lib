@@ -26,6 +26,7 @@ from config import (
     INT8_AMAX_EPS,
 )
 from decode_indexer_compressor import indexer_compressor
+from rope_interleave import rope_interleave
 
 # model config
 B = DECODE_BATCH
@@ -107,14 +108,20 @@ assert IDX_TOPK <= TOPK_HALF_LEN, "per-half candidate list must cover the final 
 
 @pl.jit.inline
 def indexer(
+    # x carries the caller's RMSNorm elementwise half only (x * gamma); the deferred
+    # per-token inv_rms rides in separately, folded into weights_proj here and into
+    # the inner compressor's projections.
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[T, 1], pl.FP32],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor[[B, S, INNER_HEAD_DIM], pl.FP32],
     inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
@@ -163,32 +170,40 @@ def indexer(
     # half rotated then rounded.
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     # spmd over ROPE_ROW_TILE-row blocks; batch_idx = block base // ROPE_ROW_BLOCK
-    # picks the per-batch cos/sin row. Rotation indices/sign and cos_il/sin_il are
-    # built once per block.
-    #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]  (sign folded into sin_il_signed)
+    # picks the per-batch cos/sin row. cos/sin arrive already interleave-duplicated and
+    # sign-folded (built once by the caller), and col_expand_mul folds the [1, ROPE_HEAD_DIM]
+    # row broadcast into the rotation multiply -- so no cos_il/sin_il tile is materialized
+    # and no per-block dup-gather runs.
+    #   out[j] = x[j]*cos_il[j] + x[j^1]*sin_il_signed[j]
+    #
+    # The j^1 lane-swap index permutes data, so no host table can hold it -- but it is
+    # block-invariant, and rebuilding it inside the spmd cost the same arange/trunc-cast/
+    # lane/arithmetic chain on all 16 blocks. Built once here instead (same form as the
+    # rope_swap scope in decode_sparse_attn_hca) and loaded per block. No pypto bitwise
+    # op is reachable at the tensor level, so the fp32 arithmetic chain is the only form.
+    rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_swap_idx", allow_early_resolve=True):
+        sw_col = pl.col_expand_mul(
+            pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane = pl.sub(sw_col, pl.mul(sw_dup_f, 2.0))                                                # j%2
+        rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = pl.cast(
+            pl.sub(pl.add(sw_col, 1.0), pl.mul(sw_lane, 2.0)), target_type=pl.INT32)                   # j^1
+
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
         o0 = idx * ROPE_ROW_TILE
         batch_idx = o0 // ROPE_ROW_BLOCK
-        cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        rope_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), cos_b)
-        sin_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), sin_b)
-        cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
-        # fold sign into sin_il
-        sin_il_signed = pl.mul(pl.gather(sin_b32, dim=-1, index=rope_dup_idx), rope_sign)
+        rope_swap_idx = rope_swap_idx_t[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
+        cos_row = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
+        sin_row = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM]
         qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM] = pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint")
         qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
         qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(qr_swapped, sin_il_signed))
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+        rope_rot = pl.add(
+            pl.col_expand_mul(qr_rope_slice, cos_row), pl.col_expand_mul(qr_swapped, sin_row))
+        qr_vec = pl.concat(pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"), pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
+        qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
 
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.
@@ -243,10 +258,13 @@ def indexer(
         w_sum = weights_partial[0:MM_ROW_TILE, :]
         for kb in pl.unroll(1, WEIGHTS_OK):
             w_sum = pl.add(w_sum, weights_partial[kb * MM_ROW_TILE : kb * MM_ROW_TILE + MM_ROW_TILE, :])
-        weights[0:MM_ROW_TILE, :] = pl.mul(w_sum, WEIGHTS_SCALE)
+        # Deferred RMSNorm denominator: weights_proj is linear in x, so inv_rms rides
+        # the split-K reduce as a row scale instead of a pass over x.
+        x_inv_rms_tile = pl.slice(x_inv_rms, [MM_ROW_TILE, 1], [0, 0], valid_shape=[pl.min(MM_ROW_TILE, T), 1])
+        weights[0:MM_ROW_TILE, :] = pl.mul(pl.row_expand_mul(w_sum, x_inv_rms_tile), WEIGHTS_SCALE)
 
     indexer_compressor(
-        x, inner_kv,
+        x, x_inv_rms, inner_kv,
         inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         cos, sin, hadamard, idx_kv_cache, idx_kv_scale,
@@ -343,6 +361,7 @@ def indexer(
 @pl.jit
 def indexer_test(
     x: pl.Tensor[[B, S, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[T, 1], pl.FP32],
     qr: pl.Tensor[[T, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T, 1], pl.FP32],
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
@@ -371,15 +390,21 @@ def indexer_test(
 ):
     # Standalone: no rms_norm producer, so the barrier fences nothing (ready on submit).
     late_dep = pl.system.task_dummy(deps=[])
+    # The fused path builds these once in csa_rope_step; standalone does the same
+    # prep here so the fixture / golden keep the half-width cos/sin ABI.
+    cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(cos, sin, cos_il, sin_signed)
     indexer(
         x,
+        x_inv_rms,
         qr,
         qr_scale,
         wq_b,
         wq_b_scale,
         weights_proj,
-        cos,
-        sin,
+        cos_il,
+        sin_signed,
         hadamard,
         inner_kv,
         inner_compress_state,
@@ -489,6 +514,7 @@ def golden_indexer(tensors):
 
     inner_tensors = {
         "x": tensors["x"],
+        "x_inv_rms": tensors["x_inv_rms"],
         "kv": tensors["inner_kv"],
         "wkv": tensors["inner_wkv"],
         "wgate": tensors["inner_wgate"],
@@ -507,7 +533,10 @@ def golden_indexer(tensors):
     }
     golden_compressor(inner_tensors)
 
-    weights = (x @ weights_proj) * WEIGHTS_SCALE
+    # x omitted the RMSNorm inv_rms; weights_proj is linear, so it applies here as a
+    # per-token row scale (kernel order: scale on the split-K reduce, before WEIGHTS_SCALE).
+    x_inv_rms = tensors["x_inv_rms"].float().reshape(bsz, seqlen, 1)
+    weights = ((x @ weights_proj) * x_inv_rms) * WEIGHTS_SCALE
 
     # C8 cache: pre-quantized INT8 KV + per-position dequant scale (no score-time re-quant)
     idx_kv_cache_i8 = tensors["idx_kv_cache"]
@@ -569,6 +598,10 @@ def build_tensor_specs(start_pos=None):
 
     def init_x():
         return torch.rand(B, S, D)
+    # x is the caller's (x * gamma) half, already in a normalized regime, so the
+    # deferred denominator sits near 1 -- but off it, so the row scale is exercised.
+    def init_x_inv_rms():
+        return 0.75 + 0.5 * torch.rand(T, 1)
     def init_qr():
         return torch.rand(T, Q_LORA)
     # weights_proj / inner compressor calibrated to the real DeepSeek-V4-Flash CSA indexer
@@ -657,6 +690,7 @@ def build_tensor_specs(start_pos=None):
 
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x_inv_rms", [T, 1], torch.float32, init_value=init_x_inv_rms),
         TensorSpec("qr", [T, Q_LORA], torch.int8, init_value=lambda: qr_i8),
         TensorSpec("qr_scale", [T, 1], torch.float32, init_value=lambda: qr_scale),
         TensorSpec("wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),

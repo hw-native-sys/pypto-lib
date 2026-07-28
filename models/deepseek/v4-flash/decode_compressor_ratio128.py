@@ -13,6 +13,7 @@ Softmax+pool over all slots. No state shift needed."""
 
 import pypto.language as pl
 
+from rope_interleave import rope_interleave
 from config import (
     FLASH as M,
     BLOCK_SIZE,
@@ -87,7 +88,10 @@ POOL_HEAD_TILE = 128
 
 @pl.jit.inline
 def compressor_ratio128(
+    # x carries the caller's RMSNorm elementwise half only (x * gamma); the deferred
+    # per-token inv_rms rides in separately and is folded into the projections below.
     x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[B_DYN, S_DYN, 1], pl.FP32],
     kv: pl.Tensor[[B_DYN, S_DYN, HEAD_DIM], pl.FP32],
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
@@ -95,8 +99,10 @@ def compressor_ratio128(
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
-    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM // 2], pl.FP32],
+    # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
+    #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
+    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[B_DYN, S_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[B_DYN, S_DYN], pl.INT64],
@@ -110,6 +116,7 @@ def compressor_ratio128(
     cmp_block_num = pl.tensor.dim(cmp_kv_cache, 0)
 
     x_flat = pl.reshape(x, [bs, D])
+    x_inv_rms_flat = pl.reshape(x_inv_rms, [bs, 1])
     t_matmul = pl.max(bs, MM_B_TILE)
     kv_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
     score_proj_pad = pl.create_tensor([BS_PAD, OUT_DIM], dtype=pl.FP32)
@@ -156,8 +163,14 @@ def compressor_ratio128(
                 state_row_i64 = pl.read(state_slot_mapping, [global_c_idx, s_sc])
                 if state_row_i64 >= 0:
                     state_row = pl.cast(state_row_i64, target_type=pl.INDEX)
-                    kv_row = kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
-                    score_row = score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM]
+                    # Deferred RMSNorm denominator: both projections are linear in x, so it
+                    # lands as a per-token scalar, ahead of the ape add and the pool (which
+                    # mixes tokens carrying different inv_rms). Applied in this vector-only
+                    # scope rather than the kv_score_proj epilogue: a vector op there turns
+                    # that pure-cube task mixed, adding a cube->UB->GM round-trip.
+                    x_inv_rms_s = pl.read(x_inv_rms_flat, [proj_row, 0])
+                    kv_row = pl.mul(kv_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM], x_inv_rms_s)
+                    score_row = pl.mul(score_proj_pad[proj_row : proj_row + 1, 0 : OUT_DIM], x_inv_rms_s)
                     ape_row = ape[token_ape_row : token_ape_row + 1, 0 : OUT_DIM]
                     compress_state_rows[state_row : state_row + 1, 0 : OUT_DIM] = kv_row
                     compress_state_rows[
@@ -229,14 +242,16 @@ def compressor_ratio128(
     with pl.at(
         level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
     ):
-        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
+        # cos/sin arrive interleave-duplicated and sign-folded, so these land at the full
+        # ROPE_HEAD_DIM width and feed the rotation with no in-scope dup-gather.
+        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
+        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
         for global_c_idx in pl.range(b_dim):
-            cos_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2] = cos[
-                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2
+            cos_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM] = cos[
+                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM
             ]
-            sin_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2] = sin[
-                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM // 2
+            sin_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM] = sin[
+                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM
             ]
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
@@ -260,22 +275,18 @@ def compressor_ratio128(
         # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
         # are folded into rope_normed BEFORE the swap, so the swapped lane n[j^1] correctly
-        # carries gamma[j^1]; inv_rms is per-row so it commutes. swap_idx (j^1), sign
-        # ([-1,+1,...]) and dup_idx (j>>1) are built IN-KERNEL from pl.arange; cos_il/sin_il
-        # are dup-gathered from the per-batch cos/sin rows. normed_kv is FP32 -> write directly.
-        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
+        # carries gamma[j^1]; inv_rms is per-row so it commutes. Only swap_idx (j^1) is built
+        # in-kernel -- it permutes data, so no table can hold it; the interleaved cos and
+        # sign-folded sin come in ready to use. normed_kv is FP32 -> write directly.
+        #   out[j] = n[j]*cos_il[j] + n[j^1]*sin_il_signed[j]
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
         rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
         rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
         rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
         rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
         normed_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
         for global_c_idx in pl.range(b_dim):
@@ -297,6 +308,7 @@ def compressor_ratio128(
 @pl.jit
 def compressor_test(
     x: pl.Tensor[[B_DYN, S_DYN, D], pl.BF16],
+    x_inv_rms: pl.Tensor[[B_DYN, S_DYN, 1], pl.FP32],
     kv: pl.Out[pl.Tensor[[B_DYN, S_DYN, HEAD_DIM], pl.FP32]],
     compress_state: pl.InOut[pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32]],
     compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
@@ -313,6 +325,8 @@ def compressor_test(
 ):
     x.bind_dynamic(0, B_DYN)
     x.bind_dynamic(1, S_DYN)
+    x_inv_rms.bind_dynamic(0, B_DYN)
+    x_inv_rms.bind_dynamic(1, S_DYN)
     kv.bind_dynamic(0, B_DYN)
     kv.bind_dynamic(1, S_DYN)
     compress_state.bind_dynamic(0, COMPRESS_STATE_BLOCK_NUM_DYN)
@@ -329,8 +343,14 @@ def compressor_test(
     state_slot_mapping.bind_dynamic(1, S_DYN)
 
     late_dep = pl.system.task_dummy(deps=[])
+    # The fused path builds these once in hca_rope; standalone does the same prep here
+    # so the fixture / golden keep the half-width cos/sin ABI.
+    cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(cos, sin, cos_il, sin_signed)
     compressor_ratio128(
-        x, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, cos, sin,
+        x, x_inv_rms, kv, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w,
+        cos_il, sin_signed,
         cmp_kv_cache, position_ids, cmp_slot_mapping, state_slot_mapping, late_dep,
     )
     return kv, compress_state, cmp_kv_cache
@@ -385,8 +405,11 @@ def golden_compressor(tensors):
     bsz, _, _ = x.shape
     ratio, rd = COMPRESS_RATIO, ROPE_HEAD_DIM
 
-    kv = x @ wkv.t()                    # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
-    score = x @ wgate.t()               # [B, S, OUT_DIM]
+    # x omitted the RMSNorm inv_rms; both projections are linear, so it applies
+    # here as a per-token row scale (kernel order: scale after the FP32 matmul).
+    x_inv_rms = tensors["x_inv_rms"].float().reshape(x.shape[0], x.shape[1], 1)
+    kv = (x @ wkv.t()) * x_inv_rms        # [B, S, OUT_DIM]  (wkv stored [OUT_DIM, D] for b_trans)
+    score = (x @ wgate.t()) * x_inv_rms   # [B, S, OUT_DIM]
     pooled = torch.zeros(bsz, 1, HEAD_DIM, dtype=torch.float32, device=x.device)
     should_compress_rows = torch.zeros(bsz, dtype=torch.bool, device=x.device)
 
@@ -469,6 +492,10 @@ def build_tensor_specs(start_pos=None):
 
     def init_x():
         return torch.rand(B, S, D)
+    # x is the caller's (x * gamma) half, already in a normalized regime, so the
+    # deferred denominator sits near 1 -- but off it, so the row scale is exercised.
+    def init_x_inv_rms():
+        return 0.75 + 0.5 * torch.rand(B, S, 1)
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
     # Calibrated to the real DeepSeek-V4-Flash 150
@@ -537,6 +564,7 @@ def build_tensor_specs(start_pos=None):
         )
     return [
         TensorSpec("x", [B, S, D], torch.bfloat16, init_value=init_x),
+        TensorSpec("x_inv_rms", [B, S, 1], torch.float32, init_value=init_x_inv_rms),
         TensorSpec("kv", [B, S, HEAD_DIM], torch.float32, is_output=True),
         TensorSpec("compress_state", [COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [B, COMPRESS_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),

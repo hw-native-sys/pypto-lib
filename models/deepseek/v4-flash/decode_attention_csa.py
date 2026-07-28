@@ -50,7 +50,8 @@ from hc_post import hc_post
 from hc_pre import hc_pre
 from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import rms_norm
+from rmsnorm import rms_gamma, rms_recip
+from rope_interleave import rope_interleave
 from decode_sparse_attn import sparse_attn
 
 # model config
@@ -169,6 +170,14 @@ def attention_csa(
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     step_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     step_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Interleave-duplicated / sign-folded step rope rows for the indexer subsystem.
+    # The indexer's qr_rope re-ran the j>>1 dup-gather on each of its 16 spmd blocks
+    # (32 rows each) and its compressor once more; pl.gather lowers to a per-row
+    # TGATHER loop, so that was ~1056 row-gathers per layer to rebuild one small
+    # position-invariant table. Built once here instead (B rows, off the critical
+    # path -- this scope has no producer) and read as a plain load downstream.
+    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_rope_step"):
         for b in pl.range(B):
             first_t = b * S
@@ -184,8 +193,13 @@ def attention_csa(
             step_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             step_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[step_pos_b : step_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
+    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
+
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
+    # Same hoist as step_cos_il above, for the main compressor's rmsnorm_rope.
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_cmp_rope"):
         for b in pl.range(B):
             first_t = b * S
@@ -195,18 +209,28 @@ def attention_csa(
             cmp_cos[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_cos[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
             cmp_sin[b : b + 1, 0 : HALF_ROPE] = pl.cast(freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0 : HALF_ROPE], target_type=pl.FP32)
 
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # rms_norm fans out to qr_proj_matmul (critical path), kv_proj_matmul, kv_score_proj
-    # and weights_proj. The latter three take this barrier instead of racing the first:
-    # the dummy resolves one hop after rms_norm, so qr_proj_matmul is dispatched first.
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
+
+    # Deferred RMSNorm: x_gamma_t = x_mixed * gamma, with the per-token 1/rms split into
+    # its own scope. qkv_proj_rope needs NO correction -- its q/kv LoRA outputs are
+    # re-normalized (q_a / kv_a layernorm) and its qr int8 quant is symmetric per token,
+    # all invariant to a positive per-token scale -- so qr_proj_matmul, the critical path,
+    # no longer waits on the reduce. The compressor and indexer fold x_inv_rms in after
+    # their own projections.
+    x_gamma_t = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_inv_rms = pl.create_tensor([T, 1], dtype=pl.FP32)
+    rms_gamma(x_mixed, attn_norm_w, x_gamma_t)
+    rms_tid = rms_recip(x_mixed, x_inv_rms)
+    # kv_proj_matmul, kv_score_proj and weights_proj take this barrier instead of racing
+    # qr_proj_matmul: the dummy resolves one hop after the reduce, which itself overlaps
+    # the qr projection.
     late_dep = pl.system.task_dummy(deps=[rms_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+        x_gamma_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
@@ -222,7 +246,7 @@ def attention_csa(
                 write_row = pl.cast(write_row_i64, pl.INDEX)
                 kv_cache_flat[write_row : write_row + 1, 0 : HEAD_DIM] = kv[write_t : write_t + 1, 0 : HEAD_DIM]
 
-    x_normed = pl.reshape(x_normed_t, [B, S, D])
+    x_gamma = pl.reshape(x_gamma_t, [B, S, D])
     cmp_out = pl.create_tensor([B, S, HEAD_DIM], dtype=pl.FP32)
     position_ids_bsd = pl.reshape(position_ids, [B, S])
     cmp_slot_mapping_bsd = pl.reshape(cmp_slot_mapping, [B, S])
@@ -230,10 +254,10 @@ def attention_csa(
     state_slot_mapping_bsd = pl.reshape(state_slot_mapping, [B, S])
     inner_state_slot_mapping_bsd = pl.reshape(inner_state_slot_mapping, [B, S])
     compressor_ratio4(
-        x_normed, cmp_out,
+        x_gamma, x_inv_rms, cmp_out,
         compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        cmp_cos, cmp_sin, cmp_kv,
+        cmp_cos_il, cmp_sin_signed, cmp_kv,
         position_ids_bsd, cmp_slot_mapping_bsd, state_slot_mapping_bsd,
         late_dep,
     )
@@ -242,8 +266,8 @@ def attention_csa(
     idx_score_unused = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([B, S, INDEXER_SCORE_LEN], dtype=pl.INT32)
     indexer(
-        x_normed, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
-        weights_proj, step_cos, step_sin, hadamard_idx,
+        x_gamma, x_inv_rms, qr, qr_scale, idx_wq_b, idx_wq_b_scale,
+        weights_proj, step_cos_il, step_sin_signed, hadamard_idx,
         idx_kv_unused, inner_compress_state, inner_compress_state_block_table,
         inner_wkv, inner_wgate, inner_ape, inner_norm_w,
         idx_kv_cache, idx_kv_scale, idx_block_table,
@@ -351,7 +375,7 @@ def golden_attention_csa(tensors):
     from hc_pre import golden_hc_pre
     from decode_indexer import golden_indexer
     from qkv_proj_rope import golden_qkv_proj_rope
-    from rmsnorm import golden_rms_norm
+    from rmsnorm import golden_rms_gamma, golden_rms_recip
     from decode_sparse_attn import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -390,9 +414,15 @@ def golden_attention_csa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr_i8 = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
+    # Mirrors the kernel's dataflow, as the goldens here do for every other quantized
+    # stage: consumers take the bf16 (x * gamma) half plus the deferred denominator.
+    # Feeding the fully normalized x instead would round to bf16 at a DIFFERENT point
+    # than the kernel, and that noise survives the LoRA re-norm even though the scale
+    # itself cancels -- it measures as error without being any less accurate.
+    x_gamma = golden_rms_gamma(x_mixed, tensors["attn_norm_w"])
+    x_inv_rms = golden_rms_recip(x_mixed)
     golden_qkv_proj_rope({
-        "x": x_normed,
+        "x": x_gamma,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
@@ -415,7 +445,8 @@ def golden_attention_csa(tensors):
 
     cmp_out = torch.zeros(B, S, HEAD_DIM, dtype=torch.float32)
     golden_compressor({
-        "x": x_normed.reshape(B, S, D),
+        "x": x_gamma.reshape(B, S, D),
+        "x_inv_rms": x_inv_rms,
         "kv": cmp_out,
         "compress_state": tensors["compress_state"],
         "compress_state_block_table": tensors["compress_state_block_table"],
@@ -435,7 +466,8 @@ def golden_attention_csa(tensors):
     idx_score = torch.zeros(B, S, INDEXER_SCORE_LEN, dtype=torch.float32)
     idx_topk_full = torch.full((B, S, INDEXER_SCORE_LEN), -1, dtype=torch.int32)
     golden_indexer({
-        "x": x_normed.reshape(B, S, D),
+        "x": x_gamma.reshape(B, S, D),
+        "x_inv_rms": x_inv_rms,
         "qr": qr_i8,
         "qr_scale": qr_scale,
         "wq_b": tensors["idx_wq_b"],

@@ -25,7 +25,11 @@ EPS = M.rms_norm_eps
 # tiling
 D_TILE = 128
 T_TILE = 8
+# per-core D slice of the deferred form's elementwise pass (no cross-D dependency,
+# so it fans over D where the fused form could only fan over T)
+GAMMA_D_SLICE = 512
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
+assert D % GAMMA_D_SLICE == 0 and GAMMA_D_SLICE % D_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -63,6 +67,68 @@ def rms_norm(
     return rms_tid
 
 
+@pl.jit.inline
+def rms_gamma(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    x_gamma: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Elementwise half of RMSNorm: x * gamma, without the 1/rms denominator.
+
+    RMSNorm(x) = (x * gamma) * inv_rms, where inv_rms is a per-token positive
+    scalar. Consumers that are linear in x (a projection matmul) or invariant to
+    a positive per-token scale (a second RMSNorm, symmetric per-token quant, a
+    top-k) can take `x_gamma` directly and fold inv_rms in downstream -- or drop
+    it entirely. Pair with `rms_recip` when some consumer still needs it.
+
+    Fans over D, which the fused form cannot: there is no cross-D dependency here.
+    Returns its TaskId, for callers hanging a deferral barrier off it.
+    """
+    t_dim = pl.tensor.dim(x, 0)
+    with pl.spmd(
+        t_dim // T_TILE * (D // GAMMA_D_SLICE), name_hint="rms_gamma", allow_early_resolve=True
+    ) as xg_tid:
+        xg_blk = pl.tile.get_block_idx()
+        xg_t0 = (xg_blk // (D // GAMMA_D_SLICE)) * T_TILE
+        xg_slice0 = (xg_blk % (D // GAMMA_D_SLICE)) * GAMMA_D_SLICE
+        for xg_db in pl.pipeline(GAMMA_D_SLICE // D_TILE, stage=2):
+            xg_d0 = xg_slice0 + xg_db * D_TILE
+            xg_chunk = pl.cast(x[xg_t0 : xg_t0 + T_TILE, xg_d0 : xg_d0 + D_TILE], target_type=pl.FP32)
+            xg_w_chunk = pl.cast(pl.reshape(norm_w[xg_d0 : xg_d0 + D_TILE], [1, D_TILE]), pl.FP32)
+            x_gamma[xg_t0 : xg_t0 + T_TILE, xg_d0 : xg_d0 + D_TILE] = pl.cast(
+                pl.col_expand_mul(xg_chunk, xg_w_chunk),
+                target_type=pl.BF16,
+                mode="rint",
+            )
+
+    return xg_tid
+
+
+@pl.jit.inline
+def rms_recip(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    inv_rms: pl.Tensor[[T_DYN, 1], pl.FP32],
+):
+    """Reduce half of RMSNorm: the per-token 1/rms denominator.
+
+    Split out from `rms_gamma` so it no longer gates the projection that consumes
+    x_gamma -- it overlaps that matmul instead. Returns its TaskId, for callers
+    hanging a deferral barrier off it.
+    """
+    t_dim = pl.tensor.dim(x, 0)
+    with pl.spmd(t_dim // T_TILE, name_hint="rms_recip", allow_early_resolve=True) as rms_tid:
+        tg = pl.tile.get_block_idx() * T_TILE
+        x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
+        for rms_db in pl.pipeline(D // D_TILE, stage=2):
+            rms_d0 = rms_db * D_TILE
+            rms_x_chunk = pl.cast(x[tg : tg + T_TILE, rms_d0 : rms_d0 + D_TILE], target_type=pl.FP32)
+            x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
+        x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
+        inv_rms[tg : tg + T_TILE, 0:1] = pl.reshape(x_inv_rms, [T_TILE, 1])
+
+    return rms_tid
+
+
 @pl.jit
 def rms_norm_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -83,6 +149,18 @@ def golden_rms_norm(x, norm_w):
     norm_w = norm_w.float()
     inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS)
     return (x * inv * norm_w).to(torch.bfloat16)
+
+
+def golden_rms_gamma(x, norm_w):
+    import torch
+
+    return (x.float() * norm_w.float()).to(torch.bfloat16)
+
+
+def golden_rms_recip(x):
+    import torch
+
+    return torch.rsqrt(x.float().square().mean(-1, keepdim=True) + EPS)
 
 
 def golden_rms_norm_test(tensors):

@@ -355,26 +355,25 @@ def qkv_proj_rope(
             kv_view[tg : tg + KV_RMS_T_TILE, n0 : n0 + KV_TILE] = pl.cast(kv_normed, target_type=pl.BF16, mode="rint")
 
         # RoPE writeback on columns [NOPE_DIM:HEAD_DIM), interleaved (CANN A3) swap-gather
-        # (same form as qproj_dequant_rms_nope_rope), built in-kernel. inv_rms (per-row, the same
-        # factor used for NOPE above) and gamma (per-column, full ROPE_DIM) are folded into
+        # (same form as qproj_dequant_rms_nope_rope). inv_rms (per-row, the same factor used
+        # for NOPE above) and gamma (per-column, full ROPE_DIM) are folded into
         # kv_rope_norm_chunk BEFORE the swap so the swapped lane n[j^1] carries gamma[j^1]
         # (gamma does NOT commute with the rotation; inv_rms does).
-        #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
+        #   out[j] = n[j]*cos_il[j] + n[j^1]*sin_il_signed[j]
+        #
+        # q_rope_prepare above already built cos_il / sign-folded sin / swap_idx over the
+        # full [t_dim, ROPE_DIM] token rows from the same rope_cos_view -- slice them here
+        # instead of re-running the arange chain and re-gathering the same two tables.
+        # Values are bit-identical: same source rows, same j>>1 index, and folding the
+        # +/-1 sign into sin only flips a sign bit, so (n[j^1]*sign)*sin == n[j^1]*(sin*sign).
         gamma_rope_cast = pl.cast(gamma_ckv[NOPE_DIM : NOPE_DIM + ROPE_DIM], target_type=pl.FP32)
         gamma_rope = pl.reshape(gamma_rope_cast, [1, ROPE_DIM])
         kv_rope_chunk = kv_fp32[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM]
         kv_rope_norm_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_rope_chunk, kv_inv_rms_t), gamma_rope)
-        kv_ones = pl.full([KV_RMS_T_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0)
-        kv_col = pl.col_expand_mul(kv_ones, pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        kv_dup_f = pl.cast(pl.cast(pl.mul(kv_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        kv_dup_idx = pl.cast(kv_dup_f, target_type=pl.INT32)                                       # j>>1
-        kv_lane = pl.sub(kv_col, pl.mul(kv_dup_f, 2.0))                                            # j%2
-        kv_swap_idx = pl.cast(pl.sub(pl.add(kv_col, 1.0), pl.mul(kv_lane, 2.0)), target_type=pl.INT32)  # j^1
-        kv_sign = pl.sub(pl.mul(kv_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        kv_cos_il = pl.gather(pl.cast(rope_cos_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
-        kv_sin_il = pl.gather(pl.cast(rope_sin_view[tg : tg + KV_RMS_T_TILE, :], target_type=pl.FP32), dim=-1, index=kv_dup_idx)
-        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=kv_swap_idx)
-        kv_rope_rot = pl.add(pl.mul(kv_rope_norm_chunk, kv_cos_il), pl.mul(pl.mul(kv_swapped, kv_sign), kv_sin_il))
+        kv_cos_il = q_rope_cos_il[tg : tg + KV_RMS_T_TILE, :]
+        kv_sin_signed = q_rope_sin_signed[tg : tg + KV_RMS_T_TILE, :]
+        kv_swapped = pl.gather(kv_rope_norm_chunk, dim=-1, index=q_rope_swap_idx[tg : tg + KV_RMS_T_TILE, :])
+        kv_rope_rot = pl.add(pl.mul(kv_rope_norm_chunk, kv_cos_il), pl.mul(kv_swapped, kv_sin_signed))
         kv_rope_i16 = pl.cast(kv_rope_rot, target_type=pl.BF16, mode="rint")
         kv_view[tg : tg + KV_RMS_T_TILE, NOPE_DIM : NOPE_DIM + ROPE_DIM] = kv_rope_i16
 

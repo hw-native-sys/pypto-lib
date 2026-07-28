@@ -32,7 +32,7 @@ from config import (
 from hc_pre import hc_pre
 from hc_post import hc_post
 from qkv_proj_rope import qkv_proj_rope
-from rmsnorm import rms_norm
+from rmsnorm import rms_gamma
 from decode_sparse_attn_swa import sparse_attn_swa
 
 
@@ -122,16 +122,20 @@ def attention_swa(
                 rope_cos_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(cos_row, target_type=pl.BF16, mode="rint")
                 rope_sin_t[t : t + 1, 0 : ROPE_HEAD_DIM] = pl.cast(sin_row, target_type=pl.BF16, mode="rint")
 
-    x_normed_t = pl.create_tensor([T, D], dtype=pl.BF16)
-    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_t)
-    # Defers kv_proj_matmul one hop behind rms_norm so qr_proj_matmul dispatches first.
-    late_dep = pl.system.task_dummy(deps=[rms_tid])
+    # Deferred RMSNorm, reduce half omitted entirely: qkv_proj_rope is the only consumer
+    # of the norm here, and it re-normalizes (q_a / kv_a layernorm) and symmetric-int8
+    # quantizes -- all invariant to a positive per-token scale -- so the 1/rms denominator
+    # is never observable. The SWA layer runs the elementwise half alone.
+    x_gamma_t = pl.create_tensor([T, D], dtype=pl.BF16)
+    xg_tid = rms_gamma(x_mixed, attn_norm_w, x_gamma_t)
+    # Defers kv_proj_matmul one hop behind the norm so qr_proj_matmul dispatches first.
+    late_dep = pl.system.task_dummy(deps=[xg_tid])
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
     qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
     qkv_proj_rope(
-        x_normed_t, wq_a, wq_b, wq_b_scale, wkv,
+        x_gamma_t, wq_a, wq_b, wq_b_scale, wkv,
         rope_cos_t, rope_sin_t, gamma_cq, gamma_ckv,
         q, kv, qr, qr_scale, late_dep,
     )
@@ -220,7 +224,7 @@ def golden_attention_swa(tensors):
 
     from hc_pre import golden_hc_pre
     from qkv_proj_rope import golden_qkv_proj_rope
-    from rmsnorm import golden_rms_norm
+    from rmsnorm import golden_rms_gamma
     from decode_sparse_attn_swa import golden_sparse_attn
     from hc_post import golden_hc_post
 
@@ -258,9 +262,11 @@ def golden_attention_swa(tensors):
     kv = torch.zeros(T, HEAD_DIM, dtype=torch.bfloat16)
     qr = torch.zeros(T, Q_LORA, dtype=torch.int8)
     qr_scale = torch.zeros(T, 1, dtype=torch.float32)
-    x_normed = golden_rms_norm(x_mixed, tensors["attn_norm_w"])
+    # Mirrors the kernel: only the elementwise half is materialized. The 1/rms
+    # denominator cancels inside qkv_proj_rope's LoRA re-norm and symmetric quant.
+    x_gamma = golden_rms_gamma(x_mixed, tensors["attn_norm_w"])
     golden_qkv_proj_rope({
-        "x": x_normed,
+        "x": x_gamma,
         "wq_a": tensors["wq_a"],
         "wq_b": tensors["wq_b"],
         "wq_b_scale": tensors["wq_b_scale"],
