@@ -137,18 +137,29 @@ def prefill_indexer(
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
     for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_idx_qr_proj"):
         o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
-        for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
-            q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
-            wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
-            if q0 == 0:
-                qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
-            else:
-                qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+        # Accumulate one QR_PROJ_ROW_TILE-row block at a time rather than all T rows
+        # in a single [T, Q_OUT_TILE] matmul. The full-T form silently produces
+        # wrong INT32 products on a5: qr_proj came out correlated 0.086 with the
+        # reference, which scrambled `score` at every visible position (2010 of
+        # 2016) while leaving row norms intact, so it reads as noise rather than
+        # as a crash. decode_indexer never hit it because its decode T fits in one
+        # 16-row tile.
+        #
+        # NOT an on-chip capacity problem -- the emitted tiles all fit a5's limits
+        # (L0A 128x128 i8 = 16 KB, L0B 128x256 i8 = 32 KB, L0C 128x256 i32 = 128 KB
+        # against 64/64/256 KB). Root cause is below pypto-lib; keep M tiled here.
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
         for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+            qr_acc = pl.create_tensor([QR_PROJ_ROW_TILE, Q_OUT_TILE], dtype=pl.INT32)
+            for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
+                q0 = kb * Q_TILE
+                qr_tile = qr[r0 : r0 + QR_PROJ_ROW_TILE, q0 : q0 + Q_TILE]
+                wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
+                if q0 == 0:
+                    qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
+                else:
+                    qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
+            acc_fp32 = pl.cast(qr_acc, target_type=pl.FP32, mode="none")
             scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
             qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
