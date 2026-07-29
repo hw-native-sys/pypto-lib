@@ -652,6 +652,8 @@ def _run_benchmark_l3(
                 compiled, ordered,
                 rounds=rounds, warmup=warmup,
                 config=_l3_run_config(runtime_cfg),
+                persistent=True,
+                reset_persistent_windows=False,
             )
         except RuntimeError as e:
             # No [STRACE] markers: runtime not built with SIMPLER_PROFILING.
@@ -840,7 +842,18 @@ def _run_l3_resident(
         The upload / free bracket the dispatch so the resident buffers exist for
         every launch and are always released — even if *dispatch_fn* raises.
         """
-        with compiled.prepare() as rt:
+        # Benchmarks model serving's steady-state dispatch: retain CommDomains
+        # across rounds and let kernels clear their own signal windows. Keep the
+        # ordinary validation path one-shot.
+        if bench:
+            prepared = compiled.prepare(
+                run_config,
+                persistent=True,
+                reset_persistent_windows=False,
+            )
+        else:
+            prepared = compiled.prepare()
+        with prepared as rt:
             # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
             # free below; worker_id is the card a whole-tensor buffer was allocated on.
             resident_handles: list[tuple[str, Any, bool, int]] = []

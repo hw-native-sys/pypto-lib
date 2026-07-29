@@ -33,6 +33,7 @@ from golden.runner import (
     _report_l3_per_rank,
     _report_raw_samples,
     _resident_loop_sizes,
+    _run_benchmark_l3,
     _run_l3_resident,
     _save_tensors,
     _setup_runtime_dir,
@@ -1247,6 +1248,48 @@ class TestShareInPlace:
         assert tensors["a"] is a
 
 
+def test_l3_benchmark_reuses_persistent_windows_without_runtime_reset(monkeypatch):
+    """L3 benchmark rounds retain CommDomains and rely on kernel-side signal clears."""
+    call = {}
+
+    def _benchmark(compiled, args, **kwargs):
+        call["compiled"] = compiled
+        call["args"] = args
+        call["kwargs"] = kwargs
+        return None
+
+    fake_runtime = types.ModuleType("pypto.runtime")
+    fake_runtime.benchmark = _benchmark
+    compiled = object()
+    tensors = {"x": torch.zeros(1)}
+    monkeypatch.setattr("golden.runner._l3_ordered_args", lambda *_a: ["ORDERED"])
+    monkeypatch.setattr("golden.runner._l3_run_config", lambda _cfg: "RUNCFG")
+
+    with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+        result = _run_benchmark_l3(
+            compiled,
+            [],
+            tensors,
+            {},
+            {"platform": "a2a3"},
+            rounds=7,
+            warmup=2,
+        )
+
+    assert result is None
+    assert call == {
+        "compiled": compiled,
+        "args": ["ORDERED"],
+        "kwargs": {
+            "rounds": 7,
+            "warmup": 2,
+            "config": "RUNCFG",
+            "persistent": True,
+            "reset_persistent_windows": False,
+        },
+    }
+
+
 class TestResidentPath:
     """resident specs route through the L3 prepare() worker."""
 
@@ -1276,6 +1319,85 @@ class TestResidentPath:
 
         assert r.passed, f"unexpected failure: {r.error}"
         l3res.assert_called_once()
+
+    def test_resident_benchmark_reuses_persistent_windows_without_runtime_reset(
+        self, monkeypatch
+    ):
+        """The resident L3 benchmark prepares its worker in persistent mode."""
+        import golden.runner as R
+
+        calls = {"prepare": None, "dispatches": 0}
+
+        class _FakeRT:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def __call__(self, *_args, config=None):
+                calls["dispatches"] += 1
+
+        class _FakeDCP:
+            def prepare(self, *args, **kwargs):
+                calls["prepare"] = (args, kwargs)
+                return _FakeRT()
+
+        class _Capture:
+            def __init__(self, path):
+                self.path = path
+
+            def __enter__(self):
+                self.path.touch()
+                return None
+
+            def __exit__(self, *_a):
+                return False
+
+        fake_dcp = types.ModuleType("pypto.ir.distributed_compiled_program")
+        fake_dcp.DistributedCompiledProgram = _FakeDCP
+        fake_bench = types.ModuleType("pypto.runtime.bench")
+        fake_bench._STRACE_LOG_LEVEL = "v9"
+        fake_bench._capture_fd_stderr = _Capture
+        fake_bench._parse_stats_from_strace = lambda *_a, **_k: types.SimpleNamespace(
+            host_wall_us=[]
+        )
+        fake_log = types.ModuleType("pypto.runtime.log_config")
+        fake_log.configure_log = lambda _level: None
+        fake_log.current_level = lambda: "v0"
+
+        monkeypatch.setenv("PYPTO_BENCH", "1")
+        monkeypatch.setenv("PYPTO_BENCH_ROUNDS", "1")
+        monkeypatch.setenv("PYPTO_BENCH_WARMUP", "1")
+        monkeypatch.setattr(R, "_l3_ordered_names", lambda _c: ["x"])
+        monkeypatch.setattr(R, "_l3_run_config", lambda _cfg: "RUNCFG")
+
+        with patch.dict(
+            sys.modules,
+            {
+                "pypto.ir.distributed_compiled_program": fake_dcp,
+                "pypto.runtime.bench": fake_bench,
+                "pypto.runtime.log_config": fake_log,
+            },
+        ):
+            result = R._run_l3_resident(
+                compiled=_FakeDCP(),
+                tensor_specs=[TensorSpec("x", [1], torch.float32)],
+                tensors={"x": torch.zeros(1)},
+                scalar_specs_eff={},
+                runtime_cfg={"platform": "a2a3"},
+                golden_outputs=None,
+                rtol=1e-5,
+                atol=1e-5,
+                compare_fn={},
+            )
+
+        assert result is None
+        assert calls["prepare"] == (
+            ("RUNCFG",),
+            {"persistent": True, "reset_persistent_windows": False},
+        )
+        assert calls["dispatches"] == 2
 
     @staticmethod
     def _fake_dcp_module():
