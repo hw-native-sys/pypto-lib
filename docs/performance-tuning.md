@@ -54,6 +54,26 @@ A distributed program adds a per-rank breakdown and a context line:
   the slowest card finishes. The `eff_us` lines expose the cross-card
   imbalance that max hides; a persistent gap between ranks is a load-balance
   problem, not a kernel problem.
+- A `rank N: eff_us` line **sums** that card's dispatches within a round (a card
+  runs them serially). When a card dispatches more than once per round, each rank
+  line gains a nested `slot` line per dispatch so you can see which dispatch owns
+  the time:
+
+  ```
+  [RUN]     rank 10: eff_us min=500.0 median=510.0 mean=510.0 max=520.0
+  [RUN]       slot 0 (prefill_orch): eff_us min=200.0 median=205.0 mean=205.0 max=210.0
+  [RUN]       slot 1 (decode_orch): eff_us min=300.0 median=305.0 mean=305.0 max=310.0
+  [RUN]     rank 11: eff_us min=520.1 median=561.0 mean=561.0 max=602.0
+  [RUN]       slot 0 (decode_orch): eff_us min=520.1 median=561.0 mean=561.0 max=602.0
+  ```
+
+  `slot` is the dispatch's position within its rank's round (slot 1 is the same
+  dispatch in every round), and the name in parentheses is the orchestration
+  function it runs. Once the slot lines appear, every rank's dispatches are
+  listed — including single-dispatch ranks like 11 above, whose slot line
+  necessarily restates its rank line — so the breakdown stays a complete tree.
+  The slot lines are omitted entirely when every card dispatches exactly once per
+  round.
 - `host_union_mean_us` is the cross-rank host-timeline window
   (`max(end) - min(start)`), so it captures start skew and overlap, but
   includes host dispatch overhead.

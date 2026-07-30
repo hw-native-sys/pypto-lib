@@ -1609,6 +1609,28 @@ class _FakeStats:
     def per_round(self, metric="device"):
         return [400.0, 410.0] if metric == "union" else [99.0, 100.4]
 
+    def per_dispatch(self, _metric="device"):
+        # One dispatch per rank per round, so it agrees with per_rank above and
+        # the per-dispatch report has nothing to un-fuse.
+        return {(10, 0): [50.0, 51.0], (11, 0): [99.0, 100.4]}
+
+    def dispatch_tasks(self):
+        return {(10, 0): "decode_orch", (11, 0): "decode_orch"}
+
+
+class _FakeMultiDispatchStats(_FakeStats):
+    """``_FakeStats`` where rank 10 dispatches twice per round.
+
+    This is the shape ``per_rank`` fuses: rank 10's 20+30 and 21+30 are what its
+    per-rank line reports as 50.0 / 51.0.
+    """
+
+    def per_dispatch(self, _metric="device"):
+        return {(10, 0): [20.0, 21.0], (10, 1): [30.0, 30.0], (11, 0): [99.0, 100.4]}
+
+    def dispatch_tasks(self):
+        return {(10, 0): "prefill_orch", (10, 1): "decode_orch", (11, 0): "decode_orch"}
+
 
 class TestBenchLoopSizes:
     """``PYPTO_BENCH_ROUNDS`` / ``PYPTO_BENCH_WARMUP`` override the defaults.
@@ -1656,6 +1678,44 @@ class TestBenchReports:
         assert "rank 10 raw n=2 eff_us=[50.0, 51.0]" in lines[1]
         assert "rank 11 raw n=2 eff_us=[99.0, 100.4]" in lines[2]
 
+    def test_per_rank_omits_slots_when_one_dispatch_per_rank(self, capsys):
+        """Nothing is fused, so slot lines would only restate the rank lines."""
+        _report_l3_per_rank(_FakeStats())
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in lines[0]
+        assert "rank 11: eff_us min=99.0 median=99.7 mean=99.7 max=100.4" in lines[1]
+        assert len(lines) == 2
+        assert "slot" not in out
+
+    def test_per_rank_nests_a_ranks_fused_dispatches(self, capsys):
+        """Rank 10's summed 50.0/51.0 is broken back into its two dispatches.
+
+        Slot lines follow their own rank line (not a separate block) and are
+        indented one level deeper, so the breakdown reads as a tree.
+        """
+        _report_l3_per_rank(_FakeMultiDispatchStats())
+        lines = capsys.readouterr().out.splitlines()
+        assert lines == [
+            "[RUN]     rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0",
+            "[RUN]       slot 0 (prefill_orch): eff_us min=20.0 median=20.5 mean=20.5 max=21.0",
+            "[RUN]       slot 1 (decode_orch): eff_us min=30.0 median=30.0 mean=30.0 max=30.0",
+            "[RUN]     rank 11: eff_us min=99.0 median=99.7 mean=99.7 max=100.4",
+            "[RUN]       slot 0 (decode_orch): eff_us min=99.0 median=99.7 mean=99.7 max=100.4",
+        ]
+
+    def test_per_rank_tolerates_older_pypto(self, capsys):
+        """An installed pypto without ``per_dispatch`` still gets the rank lines."""
+
+        class _NoPerDispatch:
+            def per_rank(self, _metric="device"):
+                return {10: [50.0]}
+
+        _report_l3_per_rank(_NoPerDispatch())
+        out = capsys.readouterr().out
+        assert "rank 10: eff_us min=50.0" in out
+        assert "slot" not in out
+
     def test_report_lines_stay_ci_safe(self, monkeypatch, capsys):
         """Daily CI greps ``effective_us .*mean=`` and takes the last match, so
         exactly one line may match it; device_wall is no longer reported at all.
@@ -1664,7 +1724,9 @@ class TestBenchReports:
         import re
 
         monkeypatch.setenv("PYPTO_BENCH_RAW", "1")
-        stats = _FakeStats()
+        # The multi-dispatch fake exercises every reporter, including the nested
+        # per-dispatch slot lines, against the single-match contract.
+        stats = _FakeMultiDispatchStats()
         _report_effective(stats)
         _report_l3_per_rank(stats)
         _report_raw_samples(stats)
@@ -1673,6 +1735,7 @@ class TestBenchReports:
         assert re.findall(r"effective_us .*mean=([0-9.]+)", out) == ["99.7"]  # mean of [99.0, 100.4]
         assert "device_wall" not in out
         assert "rank 10: eff_us min=50.0 median=50.5 mean=50.5 max=51.0" in out
+        assert "slot 1 (decode_orch): eff_us" in out
 
 
 if __name__ == "__main__":

@@ -569,31 +569,83 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _print_eff_summary(label: str, samples: Any, *, indent: int) -> None:
+    """Print one ``eff_us`` min/median/mean/max line for *samples*, or ``(no timing)``.
+
+    Zero samples are dropped first (a round with no orch/sched span reads 0).
+    *indent* is the space count after the ``[RUN]`` tag, which is how the
+    per-dispatch lines nest under their rank.
+
+    The line uses an ``eff_us`` token, never ``effective_us``, so the Daily-CI
+    collector's ``effective_us`` match cannot select it.
+    """
+    eff = [e for e in samples if e > 0.0]
+    pad = " " * indent
+    if not eff:
+        print(f"[RUN]{pad}{label}: (no timing)", flush=True)
+        return
+    print(
+        f"[RUN]{pad}{label}: eff_us min={min(eff):.1f} "
+        f"median={statistics.median(eff):.1f} "
+        f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
+        flush=True,
+    )
+
+
+def _per_dispatch_effective(stats: Any) -> dict[tuple[int, int], list[float]]:
+    """``{(pid, slot): [per-round Effective ...]}``, or ``{}`` when not worth printing.
+
+    ``slot`` is the dispatch's position within its rank's round, so slot ``s`` is
+    the same dispatch in every round and nothing is summed — unlike ``per_rank``.
+
+    Returns ``{}`` when the breakdown would add nothing: the installed pypto
+    predates ``per_dispatch``, there is no dispatch grid (L2 / flatten fallback),
+    or no rank issues more than one dispatch per round (every slot line would
+    just restate its rank line).
+    """
+    per_dispatch_fn = getattr(stats, "per_dispatch", None)
+    if per_dispatch_fn is None:
+        return {}  # installed pypto predates the per-dispatch view
+    per_dispatch = per_dispatch_fn("effective")
+    if not per_dispatch:
+        return {}
+    if len(per_dispatch) <= len({pid for pid, _slot in per_dispatch}):
+        return {}  # at most one dispatch per rank: nothing the rank lines fuse
+    return per_dispatch
+
+
 def _report_l3_per_rank(stats: Any) -> None:
-    """Print each rank's Effective summary for an L3 run.
+    """Print each rank's Effective summary for an L3 run, with its dispatches.
 
     Uses ``BenchmarkStats.per_rank("effective")`` — ``{pid: [per-round ...]}``
     where each round entry is that rank's summed dispatch Effective window — to
     surface the cross-card imbalance the headline (per-round max across ranks)
     hides. No-op for L2 and the flatten fallback (``per_rank`` returns ``{}``).
 
-    The per-rank lines deliberately use an ``eff_us`` token, so the Daily-CI
-    collector's ``effective_us`` match never selects them.
+    Because a rank entry **sums** that card's dispatches (a card runs them
+    serially), one nested ``slot`` line per dispatch follows each rank line,
+    read from ``per_dispatch`` and labelled with the orchestration function
+    ``dispatch_tasks()`` names. Those appear only when some rank dispatches more
+    than once per round (see :func:`_per_dispatch_effective`); then every rank's
+    dispatches are listed, so single-dispatch ranks show one slot line restating
+    their rank line and the block stays a complete table.
+
+    All lines use an ``eff_us`` token, so the Daily-CI collector's
+    ``effective_us`` match never selects them.
     """
     rank_eff = stats.per_rank("effective")
     if not rank_eff:
         return
+    tasks = getattr(stats, "dispatch_tasks", dict)() or {}
+    by_rank: dict[int, list[tuple[int, str, list[float]]]] = {}
+    for key, samples in _per_dispatch_effective(stats).items():
+        pid, slot = key
+        by_rank.setdefault(pid, []).append((slot, tasks.get(key, ""), samples))
     for pid in sorted(rank_eff):
-        eff = [e for e in rank_eff[pid] if e > 0.0]
-        if not eff:
-            print(f"[RUN]     rank {pid}: (no timing)", flush=True)
-            continue
-        print(
-            f"[RUN]     rank {pid}: eff_us min={min(eff):.1f} "
-            f"median={statistics.median(eff):.1f} "
-            f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
-            flush=True,
-        )
+        _print_eff_summary(f"rank {pid}", rank_eff[pid], indent=5)
+        for slot, task, samples in sorted(by_rank.get(pid, []), key=lambda entry: entry[0]):
+            label = f"slot {slot}" + (f" ({task})" if task else "")
+            _print_eff_summary(label, samples, indent=7)
 
 
 def _l3_ordered_args(
