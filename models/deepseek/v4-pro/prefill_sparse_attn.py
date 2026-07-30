@@ -135,11 +135,12 @@ def prefill_sparse_attn(
     # from there its two tasks go resident alongside merge_norm, and that pairing trips an
     # on-device "the address for VEC to access UB is out of bounds" fault (AICore errcode 341)
     # which stalls the schedule at completed=3/312 with merge_norm + rope_cs both running.
-    # Neither task is individually out of bounds -- every tile fits a5's 245760 B vector
-    # budget (merge_norm 98816, rope_cs 98304) and the fault flips on pure timing (raising
-    # log_level alone makes it pass), so the defect is below pypto-lib. Measured from the old
-    # position: 16 faults / 18 runs. From here: 0 / 13. Hoisting overlaps the tables with
-    # gather_kv instead, which is also strictly better for latency.
+    # Neither task is individually out of bounds -- a5's vector buffer is 256 KB (262144 B,
+    # pto-isa PTO_UBUF_SIZE_BYTES for PTO_NPU_ARCH_A5) and the two tasks allocate 98816 and
+    # 98304 B -- and the fault flips on pure timing (raising log_level alone makes it pass),
+    # so the defect is below pypto-lib. Measured from the old position: 16 faults / 18 runs.
+    # From here: 0 / 13. Hoisting overlaps the tables with gather_kv instead, which is also
+    # strictly better for latency.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     for cp in pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs"):
