@@ -16,17 +16,10 @@ import argparse
 import pypto.language as pl
 import pypto.language.distributed as pld
 from golden import run_jit
-from hc_head import hc_head
 from lm_head import (
-    GROUP_LOGIT_ROWS,
-    MAX_LOGIT_ROWS,
     TP_SIZE as LM_HEAD_TP_SIZE,
-    VOCAB as LM_HEAD_VOCAB,
-    VOCAB_PER_TP,
-    lm_head,
 )
 from pypto.ir.distributed_compiled_program import DistributedConfig
-from rmsnorm import rms_norm
 
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on decode_layer).
@@ -259,12 +252,7 @@ def decode_fwd(
     cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
-    hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[1], pl.FP32],
-    hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
-    final_norm_w: pl.Tensor[[D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
-    x_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
     recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
     recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
@@ -275,7 +263,7 @@ def decode_fwd(
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, D], pl.BF16]:
+) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     nt = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
@@ -499,7 +487,7 @@ def decode_fwd(
                 hidden_mid,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                csa_layer, nt, my_rank, csa_moe_epoch,
+                pl.cast(0, pl.INT32), nt, my_rank, csa_moe_epoch,
             )
         hc_attn_fn_hca: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [hca_layer * MIX_HC, 0])
         hc_attn_scale_hca: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [hca_layer * 3])
@@ -568,7 +556,7 @@ def decode_fwd(
                 hidden,
                 recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
                 routed_y_buf, combine_arrived,
-                hca_layer, nt, my_rank, hca_moe_epoch,
+                pl.cast(0, pl.INT32), nt, my_rank, hca_moe_epoch,
             )
     # FWD index (14), not CSA_LAST_LAYER (6): the *_last slices below index per-FWD-layer
     # stacked weights; csa-stacked weights use the literal (CSA_NUM_LAYERS-1).
@@ -658,14 +646,10 @@ def decode_fwd(
             pre_hc_hidden_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            csa_layer_last, nt, my_rank, last_moe_epoch,
+            pl.cast(0, pl.INT32), nt, my_rank, last_moe_epoch,
         )
     clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
-    x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
-    with pl.scope():
-        hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
-        rms_norm(x_head, final_norm_w, x_out)
-    return x_out
+    return pre_hc_hidden_out
 
 
 
@@ -751,20 +735,10 @@ def l3_decode_fwd(
     cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
-    hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
-    hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
-    final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
-    lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
-    logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
-    logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    # MoE and LM-head run sequentially, so they can share data storage; keep
-    # LM-head completion counters separate from the MoE epoch protocol below.
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
     recv_aux_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
     recv_route_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
@@ -772,12 +746,6 @@ def l3_decode_fwd(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    # The LM head owns every window and counter it touches: a peer routes into
-    # logits_window while still reading its own hidden_window.
-    lm_head_hidden_window_buf = pld.alloc_window_buffer(GROUP_LOGIT_ROWS * D * 2)
-    lm_head_logits_window_buf = pld.alloc_window_buffer(MAX_LOGIT_ROWS * LM_HEAD_VOCAB * 4)
-    lm_head_hidden_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-    lm_head_logits_done_buf = pld.alloc_window_buffer([LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -807,25 +775,10 @@ def l3_decode_fwd(
             csa_state_slot_mapping[r], csa_inner_state_slot_mapping[r], position_ids[r],
             kv_seq_lens[r], hca_compress_state_block_table[r], csa_compress_state_block_table[r],
             csa_inner_compress_state_block_table[r], cmp_block_table[r], idx_block_table[r],
-            input_ids[r], hc_head_fn[r], hc_head_scale[r], hc_head_base[r], final_norm_w[r],
-            pre_hc_hidden_out[r], hidden_out[r], recv_meta, recv_x, recv_aux, recv_route, arrived,
+            input_ids[r],
+            pre_hc_hidden_out[r], recv_meta, recv_x, recv_aux, recv_route, arrived,
             data_arrived, routed_y_buf, combine_arrived, num_tokens_per_owner, r,
             device=r,
-        )
-
-    # Grouped LM head: the N_RANKS DP world is cut into N_RANKS // LM_HEAD_TP_SIZE
-    # groups. Every card is both an owner and a TP rank, so the single lm_head
-    # dispatch runs on the full world and every peer stays inside its own group.
-    for r in pl.range(pld.world_size()):
-        hidden_window = pld.window(lm_head_hidden_window_buf, [GROUP_LOGIT_ROWS, D], dtype=pl.BF16)
-        hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
-        logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head(
-            hidden_out[r], lm_head_weight[r], logit_row_indices[r], logits[r],
-            hidden_window, hidden_done, logits_window, logits_done,
-            r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
-            LM_HEAD_COMM_EPOCH, device=r,
         )
 
 
@@ -845,11 +798,13 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
         if name == "tid2eid":
             token_ids = torch.arange(VOCAB, dtype=torch.int32).view(VOCAB, 1)
             topk_ids = torch.arange(TOPK, dtype=torch.int32).view(1, TOPK)
-            rows = []
-            for layer in range(layer_count):
-                layer_eids = (token_ids * TOPK + topk_ids + layer * TOPK) % N_EXPERTS_GLOBAL
-                rows.append(layer_eids)
-            packed = torch.cat(rows, dim=0)
+            # Balanced round-robin, identical every layer: token t -> experts
+            # {(t*TOPK + slot) % N_E}. With the per-rank-offset input_ids below
+            # (rank r consumes tid2eid rows [r*num_tokens, r*num_tokens+T)) and
+            # num_tokens=T=8, the active routes tile 0..(N_RANKS*T*TOPK) = 0..96,
+            # i.e. 3 full passes over the 32 experts -> exactly 3 tokens/expert.
+            layer_eids = (token_ids * TOPK + topk_ids) % N_EXPERTS_GLOBAL
+            packed = torch.cat([layer_eids for _ in range(layer_count)], dim=0)
             return packed.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
 
         base_init = spec.init_value
@@ -874,6 +829,22 @@ def _make_layer_stacked_spec(name, base_specs, layer_count=FWD_NUM_LAYERS):
 def _make_shared_spec(name, base_spec, out_name=None):
     from golden import TensorSpec
     return TensorSpec(out_name or name, list(base_spec.shape), base_spec.dtype, init_value=base_spec.init_value if out_name is None else None, is_output=out_name is not None)
+
+
+def _make_balanced_input_ids_spec(base_spec, num_tokens):
+    """Per-rank-offset token ids for balanced hash routing. Rank r consumes
+    tid2eid rows [r*num_tokens, r*num_tokens+T); combined with the balanced
+    round-robin tid2eid, the active routes across ranks form one contiguous run
+    over the expert set, giving every expert an equal token count each layer."""
+    import torch
+    from golden import TensorSpec
+
+    def init_value():
+        rank_starts = torch.arange(N_RANKS, dtype=torch.int64).unsqueeze(1) * num_tokens
+        token_offsets = torch.arange(T, dtype=torch.int64).unsqueeze(0)
+        return rank_starts + token_offsets
+
+    return TensorSpec("input_ids", list(base_spec.shape), base_spec.dtype, init_value=init_value)
 
 
 def _make_hc_head_spec(name):
@@ -1383,16 +1354,6 @@ def build_tensor_specs(
     import torch
     from golden import TensorSpec
 
-    def init_lm_head_weight():
-        shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
-        return torch.stack([shards[r % LM_HEAD_TP_SIZE] for r in range(N_RANKS)], dim=0)
-
-    def init_logit_row_indices():
-        active = max(min(num_tokens, MAX_LOGIT_ROWS), 0)
-        indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[:, :active] = torch.arange(active, dtype=torch.int32)
-        return indices
-
     base_specs = {
         spec.name: spec
         for spec in build_single_layer_tensor_specs(
@@ -1414,7 +1375,7 @@ def build_tensor_specs(
         cmp_block_num=cmp_block_num,
         idx_block_num=idx_block_num,
     )
-    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'window_swa_indices', 'window_swa_lens', 'swa_slot_mapping', 'swa_indices', 'swa_lens', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids', 'hc_head_fn', 'hc_head_scale', 'hc_head_base', 'final_norm_w']
+    ordered_names = ['x_hc', 'hc_attn_fn', 'hc_attn_scale', 'hc_attn_base', 'attn_norm_w', 'wq_a', 'wq_b', 'wq_b_scale', 'wkv', 'gamma_cq', 'gamma_ckv', 'kv_cache', 'attn_sink', 'wo_a', 'wo_b', 'wo_b_scale', 'hca_cmp_wkv', 'hca_cmp_wgate', 'hca_cmp_ape', 'hca_cmp_norm_w', 'hca_compress_state', 'csa_cmp_wkv', 'csa_cmp_wgate', 'csa_cmp_ape', 'csa_cmp_norm_w', 'csa_compress_state', 'csa_idx_wq_b', 'csa_idx_wq_b_scale', 'csa_weights_proj', 'csa_hadamard_idx', 'csa_inner_wkv', 'csa_inner_wgate', 'csa_inner_ape', 'csa_inner_norm_w', 'csa_inner_compress_state', 'cmp_kv', 'idx_kv_cache', 'idx_kv_scale', 'hc_ffn_fn', 'hc_ffn_scale', 'hc_ffn_base', 'norm_w', 'gate_w', 'gate_bias', 'tid2eid', 'routed_w1', 'routed_w1_scale', 'routed_w3', 'routed_w3_scale', 'routed_w2', 'routed_w2_scale', 'shared_w1', 'shared_w1_scale', 'shared_w3', 'shared_w3_scale', 'shared_w2', 'shared_w2_scale', 'freqs_cos', 'freqs_sin', 'block_table', 'ori_slot_mapping', 'window_swa_indices', 'window_swa_lens', 'swa_slot_mapping', 'swa_indices', 'swa_lens', 'hca_cmp_slot_mapping', 'hca_state_slot_mapping', 'csa_cmp_slot_mapping', 'csa_idx_slot_mapping', 'csa_state_slot_mapping', 'csa_inner_state_slot_mapping', 'position_ids', 'kv_seq_lens', 'hca_compress_state_block_table', 'csa_compress_state_block_table', 'csa_inner_compress_state_block_table', 'cmp_block_table', 'idx_block_table', 'input_ids']
     specs = []
     for name in ordered_names:
         if name in metadata_specs:
@@ -1425,6 +1386,8 @@ def build_tensor_specs(
             specs.append(_make_layer_stacked_spec(name, base_specs, HCA_NUM_LAYERS))
         elif name in LAYER_STACKED_NAMES:
             specs.append(_make_layer_stacked_spec(name, base_specs))
+        elif name == "input_ids":
+            specs.append(_make_balanced_input_ids_spec(base_specs["input_ids"], num_tokens))
         elif name in SHARED_NAMES:
             specs.append(_make_shared_spec(name, base_specs[name]))
         elif name in HC_HEAD_NAMES:
@@ -1444,20 +1407,11 @@ def build_tensor_specs(
             spec.resident = "stacked"
 
     specs.append(TensorSpec("pre_hc_hidden_out", [N_RANKS, T, HC_MULT, D], torch.float32, is_output=True))
-    specs.append(TensorSpec("lm_head_weight", [N_RANKS, VOCAB_PER_TP, D], torch.bfloat16, init_value=init_lm_head_weight))
-    specs.append(TensorSpec("hidden_out", [N_RANKS, T, D], torch.bfloat16, is_output=True))
-    specs.append(TensorSpec("logits", [N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], torch.float32, is_output=True))
     specs.append(TensorSpec(
         "num_tokens_per_owner",
         [N_RANKS],
         torch.int32,
         init_value=lambda: torch.full((N_RANKS,), num_tokens, dtype=torch.int32),
-    ))
-    specs.append(TensorSpec(
-        "logit_row_indices",
-        [N_RANKS, MAX_LOGIT_ROWS],
-        torch.int32,
-        init_value=init_logit_row_indices,
     ))
     return specs
 
