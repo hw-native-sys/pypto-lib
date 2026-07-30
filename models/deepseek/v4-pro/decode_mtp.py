@@ -71,9 +71,13 @@ from moe import (
     moe,
 )
 from mtp_projection import (
+    D_CHUNK,
+    OUT_CHUNK,
+    _WQ_SCALE_ROWS,
     golden_mtp_projection,
     mtp_projection,
 )
+from mx_quant_common import gen_mxfp8_weight_kn
 from rmsnorm import golden_rms_norm, rms_norm
 
 
@@ -88,12 +92,10 @@ def mtp_decode_layer(
     position_ids: pl.Tensor[[T], pl.INT32],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[_WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
+    h_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[_WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -159,10 +161,8 @@ def mtp_decode_layer(
         hnorm_w,
         e_proj_w,
         e_proj_w_scale,
-        e_proj_smooth,
         h_proj_w,
         h_proj_w_scale,
-        h_proj_smooth,
         projected_hidden,
     )
     x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.BF16)
@@ -240,12 +240,10 @@ def l3_mtp_decode_layer(
     position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
-    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    e_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
-    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
+    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
+    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -317,8 +315,8 @@ def l3_mtp_decode_layer(
             prev_pre_hc_hidden[r],
             position_ids[r],
             enorm_w[r], hnorm_w[r],
-            e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
-            h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
+            e_proj_w[r], e_proj_w_scale[r],
+            h_proj_w[r], h_proj_w_scale[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
             wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
@@ -367,7 +365,6 @@ def _ranked_spec(name, spec, *, replicated=False, is_output=False):
 def _projection_specs():
     import torch
     from golden import TensorSpec
-    from mtp_projection import _quantize_weight_per_out
 
     e_proj_cache = None
     h_proj_cache = None
@@ -376,10 +373,11 @@ def _projection_specs():
         weights = []
         scales = []
         for _ in range(N_RANKS):
-            w = (torch.rand(D, D) / D ** 0.5).to(torch.bfloat16)
-            w_i8, scale = _quantize_weight_per_out(w)
-            weights.append(w_i8)
-            scales.append(scale.float())
+            w, scale = gen_mxfp8_weight_kn(
+                (D, D), dequant_std=0.1, chan_cv=0.50, n_tile=OUT_CHUNK, k_tile=D_CHUNK
+            )
+            weights.append(w)
+            scales.append(scale)
         return torch.stack(weights, dim=0).contiguous(), torch.stack(scales, dim=0).contiguous()
 
     def init_e_proj_w():
@@ -419,12 +417,14 @@ def _projection_specs():
         ),
         "enorm_w": TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         "hnorm_w": TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        "e_proj_w": TensorSpec("e_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_e_proj_w),
-        "e_proj_w_scale": TensorSpec("e_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_e_proj_w_scale),
-        "e_proj_smooth": TensorSpec("e_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        "h_proj_w": TensorSpec("h_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_h_proj_w),
-        "h_proj_w_scale": TensorSpec("h_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_h_proj_w_scale),
-        "h_proj_smooth": TensorSpec("h_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
+        "e_proj_w": TensorSpec("e_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_e_proj_w),
+        "e_proj_w_scale": TensorSpec(
+            "e_proj_w_scale", [N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_e_proj_w_scale
+        ),
+        "h_proj_w": TensorSpec("h_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_h_proj_w),
+        "h_proj_w_scale": TensorSpec(
+            "h_proj_w_scale", [N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_h_proj_w_scale
+        ),
     }
 
 
@@ -501,8 +501,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
     }
     ordered_names = [
         "hidden_states", "prev_pre_hc_hidden", "position_ids",
-        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-        "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale",
+        "h_proj_w", "h_proj_w_scale",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin", "kv_cache",
@@ -536,8 +536,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T):
             )
 
     resident_names = replicated_attention | {
-        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-        "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale",
+        "h_proj_w", "h_proj_w_scale",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
         "gate_w", "gate_bias", "tid2eid",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
@@ -569,10 +569,8 @@ def golden_mtp_decode_layer(tensors):
             "hnorm_w": tensors["hnorm_w"][rank],
             "e_proj_w": tensors["e_proj_w"][rank],
             "e_proj_w_scale": tensors["e_proj_w_scale"][rank],
-            "e_proj_smooth": tensors["e_proj_smooth"][rank],
             "h_proj_w": tensors["h_proj_w"][rank],
             "h_proj_w_scale": tensors["h_proj_w_scale"][rank],
-            "h_proj_smooth": tensors["h_proj_smooth"][rank],
             "hidden_states_out": projected[rank],
         })
 

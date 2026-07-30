@@ -1195,7 +1195,7 @@ if __name__ == "__main__":
             "attn_out": ratio_allclose(
                 atol=oproj_tol["atol"],
                 rtol=oproj_tol["rtol"],
-                max_error_ratio=0.05,
+                max_error_ratio=oproj_tol["pct"],
             ),
         },
     )

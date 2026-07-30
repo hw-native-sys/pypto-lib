@@ -851,6 +851,72 @@ if __name__ == "__main__":
 
     indexer_tol = ATOL_RTOL["indexer_fp8"]
 
+    def score_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
+        """ratio_allclose at indexer pct, plus per-kernel blame on fail."""
+        import torch
+
+        base = ratio_allclose(
+            atol=indexer_tol["atol"],
+            rtol=indexer_tol["rtol"],
+            max_error_ratio=indexer_tol["pct"],
+        )
+        ok, msg = base(
+            actual, expected,
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
+        if ok:
+            return ok, msg
+
+        a = actual.cpu().float()
+        e = expected.cpu().float()
+        tol = indexer_tol["atol"] + indexer_tol["rtol"] * e.abs()
+        bad = (a - e).abs() > tol
+        # Finite visible scores only (masked cols are -inf).
+        finite = torch.isfinite(e)
+        bad_f = bad & finite
+        n_bad = int(bad_f.sum().item())
+        n_fin = int(finite.sum().item())
+        zero_act = bad_f & (a.abs() < 1e-12)
+        n_zero = int(zero_act.sum().item())
+
+        # Token axis → weights_proj / score loop over t; cache tiles → prefill_idx_score.
+        tok_bad = bad_f.any(dim=1)
+        col_bad = bad_f.any(dim=0)
+        cache_tiles = (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE
+        tile_bad_counts = []
+        for cb in range(cache_tiles):
+            c0, c1 = cb * CACHE_TILE, min((cb + 1) * CACHE_TILE, INDEXER_SCORE_CAP)
+            tile_bad_counts.append(int(bad_f[:, c0:c1].sum().item()))
+
+        # qr_proj SPMD writes Q_OUT_TILE-wide chunks of [T, heads*dim]; score
+        # collapses heads, so column structure won't map 1:1 — use zero-actual
+        # rate as the MX/A-scale race signature for prefill_idx_qr_proj.
+        print("[DIAG] score fail attribution "
+              f"(threshold pct={indexer_tol['pct']}):")
+        print(f"  finite_bad={n_bad}/{n_fin}  zero_actual_among_bad="
+              f"{n_zero}/{max(n_bad, 1)} ({(100.0 * n_zero / max(n_bad, 1)):.1f}%)")
+        print(f"  tokens_with_any_bad={int(tok_bad.sum())}/{a.shape[0]}  "
+              f"cols_with_any_bad={int(col_bad.sum())}/{a.shape[1]}")
+        print(f"  bad_per_CACHE_TILE(32)={tile_bad_counts}  "
+              f"→ kernel prefill_idx_score tiles")
+        if n_zero > n_bad * 0.5:
+            blame = "prefill_idx_qr_proj (MX A-scale GM stage; many actual==0)"
+        elif max(tile_bad_counts) > 2 * (sum(tile_bad_counts) / max(len(tile_bad_counts), 1)):
+            blame = "prefill_idx_score (errors concentrated in few CACHE_TILEs)"
+        else:
+            blame = ("Q-path cascade (qr_proj→rope→hadamard_quant) or "
+                     "prefill_idx_score FP8 accumulate noise")
+        print(f"  likely_unstable_kernel: {blame}")
+        print("  note: idx_kv_cache/scale use same pct; if those PASS, "
+              "compressor kernels are not the score regressor")
+        return ok, msg
+
+    score_compare.__name__ = f"ratio_allclose(pct={indexer_tol['pct']})"
+
     result = run_jit(
         fn=prefill_indexer_test,
         specs=build_tensor_specs(args.start_pos),
@@ -861,7 +927,7 @@ if __name__ == "__main__":
         atol=indexer_tol["atol"],
         compile_only=args.compile_only,
         compare_fn={
-            "score": ratio_allclose(atol=indexer_tol["atol"], rtol=indexer_tol["rtol"], max_error_ratio=0.05),
+            "score": score_compare,
             "topk_idxs": topk_idxs_compare,
             # C8 cache: FP8 rows may differ slightly on boundary rows the compressor rewrote.
             "idx_kv_cache": ratio_allclose(

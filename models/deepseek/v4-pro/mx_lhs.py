@@ -6,11 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Canonical LeftScale (AND2ZZ) wiring for dyn MX quant → matmul_mx.
+"""Canonical LeftScale wiring for dyn MX quant → matmul_mx.
 
 ``pl.mx_quant`` / tquant emits flat scale ``[1, groups]``. Cube LeftScale needs
-``[M, K/32]`` via AND2ZZ. Direct ``Mat ND → LeftScale`` is numerically wrong
-even with target_shape; stage through GM then TLOAD with ``mx_layout="mx_a_zz"``.
+``[M, K/32]``. Direct ``Mat ND → LeftScale`` is numerically wrong even with
+target_shape; stage through GM then TLOAD with ``mx_layout="mx_a_zz"``.
+
+**Production data plane (all ND A-scale stores):** store row-major ND bytes to
+GM; ptoas EmitC only emits ``Layout::MX_A_ZZ``, so
+``_ptoas_preprocess._rewrite_mx_a_zz_e8m0_to_nd`` rewrites to ``MX_A_ND``
+(AND2ZZ). Disabling that rewrite raises ``RuntimeError`` until a full ZZ-on-GM
+rollout exists.
 
 Do not reuse one scale GM slot across K-chunks (AIV can overwrite while AIC
 TLOADs). Prefer ``pl.range`` / ``pl.unroll`` over ``pl.pipeline`` on MX V2C

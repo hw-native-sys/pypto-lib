@@ -631,7 +631,7 @@ if __name__ == "__main__":
         rtol=moe_tol["rtol"],
         atol=moe_tol["atol"],
         compare_fn={
-            "recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+            "recv_y": ratio_reldiff(diff_thd=2e-3, pct_thd=moe_tol["pct"]),
         },
     )
     if not result.passed:

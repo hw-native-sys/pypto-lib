@@ -74,6 +74,7 @@ _MX_WS_SLOTS = N_MTILES * max(
 assert _GATE_K_CHUNKS == 32 and _DOWN_K_CHUNKS == 16  # pl.unroll literals below
 
 
+
 @pl.jit.inline
 def expert_shared(
     x_local: pl.Tensor[[T, D], pl.BF16],
@@ -85,7 +86,7 @@ def expert_shared(
     shared_w2_scale: pl.Tensor[[_W2_SCALE_ROWS, D_OUT_TILE], pl.FP8E8M0],
     sh: pl.Tensor[[T, D], pl.BF16],
 ):
-    # Left-scale: store flat tquant exp to per-slot GM → mx_a_zz (AND2ZZ)
+    # Left-scale: store flat tquant exp to per-slot GM → mx_a_zz (AND2ZZ via rewrite)
     # → LeftScale. Direct Mat ND→LeftScale is numerically wrong.
     mx_scale_ws = pl.create_tensor(
         [_MX_WS_SLOTS * SH_M_TILE, K_TILE // MX_BLOCK_K], dtype=pl.FP8E8M0
@@ -471,7 +472,7 @@ if __name__ == "__main__":
         rtol=moe_tol["rtol"],
         atol=moe_tol["atol"],
         compare_fn={
-            "sh": ratio_reldiff(diff_thd=2e-3, pct_thd=0.01),
+            "sh": ratio_reldiff(diff_thd=2e-3, pct_thd=moe_tol["pct"]),
         },
     )
     if not result.passed:

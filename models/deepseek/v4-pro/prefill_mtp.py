@@ -57,7 +57,8 @@ from moe import (
     golden_moe,
     moe,
 )
-from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
+from mtp_projection import D_CHUNK, OUT_CHUNK, _WQ_SCALE_ROWS, golden_mtp_projection, mtp_projection
+from mx_quant_common import gen_mxfp8_weight_kn
 from prefill_attention_swa import (
     BLOCK_NUM,
     BLOCK_SIZE,
@@ -87,12 +88,10 @@ def mtp_prefill_fwd(
     prev_hidden_states: pl.Tensor[[T, HC_MULT, D], pl.BF16],
     enorm_w: pl.Tensor[[D], pl.FP32],
     hnorm_w: pl.Tensor[[D], pl.FP32],
-    e_proj_w: pl.Tensor[[D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    e_proj_smooth: pl.Tensor[[D], pl.FP32],
-    h_proj_w: pl.Tensor[[D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[_WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
+    h_proj_w: pl.Tensor[[D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[_WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
@@ -157,8 +156,8 @@ def mtp_prefill_fwd(
     mtp_projection(
         hidden_states, prev_hidden_states,
         enorm_w, hnorm_w,
-        e_proj_w, e_proj_w_scale, e_proj_smooth,
-        h_proj_w, h_proj_w_scale, h_proj_smooth,
+        e_proj_w, e_proj_w_scale,
+        h_proj_w, h_proj_w_scale,
         projected,
     )
 
@@ -199,12 +198,10 @@ def l3_mtp_prefill_fwd(
     prev_hidden_states: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.BF16],
     enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
-    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    e_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    e_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
-    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.INT8],
-    h_proj_w_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
-    h_proj_smooth: pl.Tensor[[N_RANKS, D], pl.FP32],
+    e_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    e_proj_w_scale: pl.Tensor[[N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
+    h_proj_w: pl.Tensor[[N_RANKS, D, D], pl.FP8E4M3FN],
+    h_proj_w_scale: pl.Tensor[[N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], pl.FP8E8M0],
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
@@ -275,8 +272,8 @@ def l3_mtp_prefill_fwd(
             hidden_states[r],
             prev_hidden_states[r],
             enorm_w[r], hnorm_w[r],
-            e_proj_w[r], e_proj_w_scale[r], e_proj_smooth[r],
-            h_proj_w[r], h_proj_w_scale[r], h_proj_smooth[r],
+            e_proj_w[r], e_proj_w_scale[r],
+            h_proj_w[r], h_proj_w_scale[r],
             hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r],
             wq_a[r], wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r],
             freqs_cos[r], freqs_sin[r],
@@ -321,10 +318,11 @@ def _projection_specs():
         weights = []
         scales = []
         for _ in range(N_RANKS):
-            w = (torch.rand(D, D) / D ** 0.5).to(torch.bfloat16)
-            w_i8, scale = _quantize_weight_per_out(w)
-            weights.append(w_i8)
-            scales.append(scale.float())
+            w, scale = gen_mxfp8_weight_kn(
+                (D, D), dequant_std=0.1, chan_cv=0.50, n_tile=OUT_CHUNK, k_tile=D_CHUNK
+            )
+            weights.append(w)
+            scales.append(scale)
         return torch.stack(weights, dim=0).contiguous(), torch.stack(scales, dim=0).contiguous()
 
     def init_e_proj_w():
@@ -355,12 +353,10 @@ def _projection_specs():
                    init_value=lambda: torch.randn(N_RANKS, T, HC_MULT, D).to(torch.bfloat16)),
         TensorSpec("enorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
         TensorSpec("hnorm_w", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        TensorSpec("e_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_e_proj_w),
-        TensorSpec("e_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_e_proj_w_scale),
-        TensorSpec("e_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
-        TensorSpec("h_proj_w", [N_RANKS, D, D], torch.int8, init_value=init_h_proj_w),
-        TensorSpec("h_proj_w_scale", [N_RANKS, D], torch.float32, init_value=init_h_proj_w_scale),
-        TensorSpec("h_proj_smooth", [N_RANKS, D], torch.float32, init_value=lambda: torch.ones(N_RANKS, D)),
+        TensorSpec("e_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_e_proj_w),
+        TensorSpec("e_proj_w_scale", [N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_e_proj_w_scale),
+        TensorSpec("h_proj_w", [N_RANKS, D, D], torch.float8_e4m3fn, init_value=init_h_proj_w),
+        TensorSpec("h_proj_w_scale", [N_RANKS, _WQ_SCALE_ROWS, OUT_CHUNK], torch.float8_e8m0fnu, init_value=init_h_proj_w_scale),
     ]
 
 
@@ -396,8 +392,8 @@ def build_tensor_specs(start_pos=0, num_tokens=T):
 
     ordered_names = [
         "hidden_states", "prev_hidden_states",
-        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-        "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+        "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale",
+        "h_proj_w", "h_proj_w_scale",
         "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
         "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
         "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
@@ -486,10 +482,8 @@ def golden_mtp_prefill_fwd(tensors):
             "hnorm_w": tensors["hnorm_w"][rank],
             "e_proj_w": tensors["e_proj_w"][rank],
             "e_proj_w_scale": tensors["e_proj_w_scale"][rank],
-            "e_proj_smooth": tensors["e_proj_smooth"][rank],
             "h_proj_w": tensors["h_proj_w"][rank],
             "h_proj_w_scale": tensors["h_proj_w_scale"][rank],
-            "h_proj_smooth": tensors["h_proj_smooth"][rank],
             "hidden_states_out": projected[rank],
         })
 

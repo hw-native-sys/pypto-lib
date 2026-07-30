@@ -319,6 +319,24 @@ def convert_x1_scale_format(
     return x1.reshape(x1.shape[0] * x1.shape[1], x1.shape[2] * x1.shape[3])
 
 
+def zz_fp16_gather_indices(m: int, kmx: int, block_size: int = 16, c0_size_mx: int = 2):
+    """INT32 gather indices for device-side ND→ZZ pack via FP16 reinterpret.
+
+    ``tile.gather`` rejects UINT8/FP8E8M0; ZZ reorders at ``c0=2`` bytes, so
+    reinterpret the flat scale as FP16 and gather with these indices::
+
+        xs_f16 = pl.tile.reinterpret_view(xs_u8, pl.FP16)
+        packed_f16 = pl.tile.gather(xs_f16, idx_tile, tmp)
+    """
+    import torch
+
+    assert kmx % c0_size_mx == 0 and m % block_size == 0
+    nd = np.arange(m * kmx, dtype=np.float64).reshape(m, kmx)
+    zz_bytes = convert_x1_scale_format(nd, block_size, c0_size_mx).astype(np.int32).reshape(-1)
+    idx = (zz_bytes[::2] // 2).astype(np.int32)
+    assert idx.size == m * kmx // 2
+    return torch.from_numpy(idx.copy()).reshape(1, m * kmx // 2)
+
 def convert_x2_scale_format(
     x2_mx_gm: np.ndarray, block_size: int = 16, c0_size_mx: int = 2
 ) -> np.ndarray:
