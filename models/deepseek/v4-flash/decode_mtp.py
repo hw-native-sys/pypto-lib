@@ -75,8 +75,8 @@ from mtp_projection import golden_mtp_projection, mtp_projection
 from rmsnorm import golden_rms_norm, rms_norm
 
 
-# model config
-MTP_LAYER_ID = M.num_hidden_layers
+# balanced hash routing
+MTP_ROUTE_LAYER_ID = 0
 
 # communication
 MTP_MOE_EPOCH = 1
@@ -225,7 +225,10 @@ def mtp_decode_layer(
             next_pre_hc_hidden,
             recv_meta, recv_x, recv_aux, recv_route,
             arrived, data_arrived, routed_y_buf, combine_arrived,
-            pl.cast(MTP_LAYER_ID, pl.INT32), num_tokens, my_rank, pl.cast(MTP_MOE_EPOCH, pl.INT32),
+            pl.cast(MTP_ROUTE_LAYER_ID, pl.INT32),
+            num_tokens,
+            my_rank,
+            pl.cast(MTP_MOE_EPOCH, pl.INT32),
         )
 
     clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
@@ -538,7 +541,11 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     mtp_head_specs = _mtp_head_specs()
     swa_tensor_specs = build_swa_tensor_specs(start_pos)
     swa_specs = {spec.name: spec for spec in swa_tensor_specs if isinstance(spec, TensorSpec)}
-    moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
+    moe_tensor_specs = build_moe_tensor_specs(
+        layer_id=MTP_ROUTE_LAYER_ID,
+        num_tokens=num_tokens,
+        balanced_routing=True,
+    )
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
 
     def init_lm_head_weight():
@@ -776,7 +783,7 @@ def golden_mtp_decode_layer(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["x_next"] = tensors["next_pre_hc_hidden"]
-    moe_tensors["layer_id"] = MTP_LAYER_ID
+    moe_tensors["layer_id"] = MTP_ROUTE_LAYER_ID
     moe_tensors["num_tokens"] = num_tokens
     golden_moe(moe_tensors)
 

@@ -33,7 +33,7 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -558,7 +558,6 @@ def moe_test(
         routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
-    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
 
 
