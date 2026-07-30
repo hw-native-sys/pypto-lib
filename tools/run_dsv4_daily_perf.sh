@@ -20,7 +20,7 @@ readonly PTOAS_BIN="${PYPTO_DAILY_PTOAS_BIN:-/usr/local/bin/ptoas-bin}"
 readonly PTO_ISA_DIR="${PYPTO_DAILY_PTO_ISA_ROOT:-$(realpath "$REPO_ROOT/../pto-isa")}"
 readonly ATTENTION_DEVICE="${PYPTO_DAILY_ATTENTION_DEVICE:-4}"
 readonly MOE_DEVICE="${PYPTO_DAILY_MOE_DEVICE:-2,0}"
-readonly DECODE_DEVICE="${PYPTO_DAILY_DECODE_DEVICE:-auto}"
+readonly DECODE_DEVICE="${PYPTO_DAILY_DECODE_DEVICE:-0,2}"
 readonly DEFAULT_SCHEDULE_HOUR="${PYPTO_DAILY_PERF_HOUR:-05}"
 
 readonly STATE_ROOT="${PYPTO_DAILY_PERF_STATE_ROOT:-$REPO_ROOT/.cache/dsv4-daily-perf}"
@@ -80,7 +80,7 @@ Commands:
 Environment overrides:
   PYPTO_DAILY_ATTENTION_DEVICE  Single card for CSA/SWA/HCA (default: 4)
   PYPTO_DAILY_MOE_DEVICE        Explicit EP2 card pair (default: 2,0)
-  PYPTO_DAILY_DECODE_DEVICE     Full-decode selector (default: auto)
+  PYPTO_DAILY_DECODE_DEVICE     Full-decode card pair (default: 0,2)
   PYPTO_DAILY_PERF_HOUR         Shanghai schedule hour (default: 05)
   PYPTO_DAILY_PERF_STATE_ROOT   Persistent result and scheduler state directory
 EOF
@@ -255,7 +255,7 @@ run_benchmarks() {
 
     run_case \
         "$checkout" "$result_dir" "$git_sha" \
-        "decode_fwd_43l_ep2_8k" "0.54" "$DECODE_DEVICE" "2" \
+        "decode_fwd_43l_ep2_8k" "0.54" "$DECODE_DEVICE" "" \
         'python models/deepseek/v4-flash/decode_fwd.py -p a2a3 --ep 2 --tp 2 -d "$TASK_DEVICE" --start-pos 8192 --num-tokens 8 --enable-l2-swimlane 0' \
         "decode_fwd_43l_ep2_8k_perf.log" || failures=$((failures + 1))
 
