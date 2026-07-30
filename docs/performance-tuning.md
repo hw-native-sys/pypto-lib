@@ -59,7 +59,7 @@ A distributed program adds a per-rank breakdown and a context line:
   line gains a nested `slot` line per dispatch so you can see which dispatch owns
   the time:
 
-  ```
+  ```text
   [RUN]     rank 10: eff_us min=500.0 median=510.0 mean=510.0 max=520.0
   [RUN]       slot 0 (prefill_orch): eff_us min=200.0 median=205.0 mean=205.0 max=210.0
   [RUN]       slot 1 (decode_orch): eff_us min=300.0 median=305.0 mean=305.0 max=310.0
@@ -73,7 +73,9 @@ A distributed program adds a per-rank breakdown and a context line:
   listed — including single-dispatch ranks like 11 above, whose slot line
   necessarily restates its rank line — so the breakdown stays a complete tree.
   The slot lines are omitted entirely when every card dispatches exactly once per
-  round.
+  round, and also when a card's dispatch *order* varies between rounds — a slot
+  then names no single callable, so pypto reports no per-dispatch view rather
+  than mislabelling it.
 - `host_union_mean_us` is the cross-rank host-timeline window
   (`max(end) - min(start)`), so it captures start skew and overlap, but
   includes host dispatch overhead.
