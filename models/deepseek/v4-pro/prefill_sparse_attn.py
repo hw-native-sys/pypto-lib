@@ -126,6 +126,38 @@ def prefill_sparse_attn(
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
     """Gather cache-first SWA/compressed rows, then run sparse attention and o-proj."""
+    # RoPE tables, built up front. out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j]; precompute
+    # the head-invariant cos_il / sign-folded sin once, then rotate each head's rope segment
+    # in the `rope` stage below (no rope_buf round-trip).
+    #
+    # This only reads freqs_cos/freqs_sin, so it may sit anywhere before `rope` -- but it must
+    # NOT sit next to `rope`, in the merge_norm..rope window where it used to live. Dispatched
+    # from there its two tasks go resident alongside merge_norm, and that pairing trips an
+    # on-device "the address for VEC to access UB is out of bounds" fault (AICore errcode 341)
+    # which stalls the schedule at completed=3/312 with merge_norm + rope_cs both running.
+    # Neither task is individually out of bounds -- every tile fits a5's 245760 B vector
+    # budget (merge_norm 98816, rope_cs 98304) and the fault flips on pure timing (raising
+    # log_level alone makes it pass), so the defect is below pypto-lib. Measured from the old
+    # position: 16 faults / 18 runs. From here: 0 / 13. Hoisting overlaps the tables with
+    # gather_kv instead, which is also strictly better for latency.
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    for cp in pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs"):
+        cp_r0 = cp * ROPE_TILE
+        cp_c0 = 2 * cp_r0
+        cs_col = pl.col_expand_mul(
+            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...]
+        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
+            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+
     # Gather KV per token: each (token, block) of PREFILL_ATTN_TILE slots is staged into one
     # UB tile (scattered 1-row loads on MTE2, invalid slots stay zero) then flushed with a
     # single wide MTE3 store. Invalid slots are carried by -1 padding.
@@ -270,27 +302,8 @@ def prefill_sparse_attn(
                 col = (gh - g * HEADS_PER_GROUP) * HEAD_DIM
                 o_packed[pack_row:pack_row + 1, col:col + NOPE_DIM] = n_bf16[n_hi:n_hi + 1, 0:NOPE_DIM]
 
-    # Inverse RoPE fused with the rope-column pack: out[j] = x[j]*cos_il[j] + x[j^1]*sin_signed[j].
-    # Precompute the head-invariant cos_il / sign-folded sin once, then rotate each head's rope
-    # segment and store it straight into o_packed (no rope_buf round-trip).
-    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    for cp in pl.spmd(ROPE_HALF // ROPE_TILE, name_hint="rope_cs"):
-        cp_r0 = cp * ROPE_TILE
-        cp_c0 = 2 * cp_r0
-        cs_col = pl.col_expand_mul(
-            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
-        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
-        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...]
-        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
-
+    # Inverse RoPE fused with the rope-column pack, against the tables built at the top of the
+    # kernel (see the note there for why they are not built here).
     attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
     # with-form spmd so the dispatch TaskId (rope_tid) is an explicit dep of the
     # manual-scope proj_a tasks below (which read rope's o_packed rope cols).
