@@ -37,7 +37,7 @@ from lm_head import (
     VOCAB as LM_HEAD_VOCAB,
     VOCAB_PER_TP,
     golden_lm_head,
-    lm_head,
+    lm_head_test,
 )
 from moe import (
     AUX_PAD,
@@ -325,7 +325,7 @@ def l3_mtp_prefill_fwd(
         hidden_done = pld.window(lm_head_hidden_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
         logits_window = pld.window(lm_head_logits_window_buf, [MAX_LOGIT_ROWS, LM_HEAD_VOCAB], dtype=pl.FP32)
         logits_done = pld.window(lm_head_logits_done_buf, [LM_HEAD_TP_SIZE, 1], dtype=pl.INT32)
-        lm_head(
+        lm_head_test(
             hidden_out[r], lm_head_weight[r], logit_row_indices[r], logits[r],
             hidden_window, hidden_done, logits_window, logits_done,
             r // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE, r % LM_HEAD_TP_SIZE,
