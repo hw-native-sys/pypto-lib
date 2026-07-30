@@ -341,7 +341,7 @@ def _per_token_int8_quant(x_bf16):
     import torch
     x_f32 = x_bf16.float()
     amax = x_f32.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_q = INT8_SCALE_MAX / amax
+    scale_q = torch.full_like(amax, INT8_SCALE_MAX) / amax
     scaled = x_f32 * scale_q
     x_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
     scale_dq = (1.0 / scale_q).reshape(-1)  # [T]
