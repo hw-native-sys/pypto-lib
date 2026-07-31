@@ -167,9 +167,13 @@ direction) or a `ScalarSpec` (named scalar, dtype, value); see
 top opaque function. For each entry, allocate a torch tensor:
 
 - Pure inputs and inout initial values are filled via `spec.create_tensor()`
-  (random by default, or constant when `init_value` is set).
+  (`init_value=None` creates zeros; random data requires an explicit factory
+  such as `torch.randn`).
 - Pure outputs are zero-initialised.
 - Scalars become 0-D tensors carrying the spec value.
+
+See [Golden Harness](run-and-validate/golden-harness.md) for the complete
+`TensorSpec` initialization contract.
 
 When `save_data=True`, the input snapshot is written to `data/in/<name>.pt`
 so the same inputs can be replayed later; this is off by default, so no
@@ -242,19 +246,11 @@ For L2 swimlane: open the generated `merged_swimlane_*.json` at
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
 gaps, and dependency stalls.
 
-For kernel-internal swimlane / MindStudio Insight traces, use the
-`incore-profiling` skill directly on an existing build:
-
-```bash
-python .claude/skills/incore-profiling/incore_profile.py \
-  --build-dir build_output/<ProgramName>_<ts> --target a2a3
-```
-
-or drive the case run end-to-end with `--case <kernel.py>` instead of
-`--build-dir`. The export root is written under
-`build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`, and the build
-directory also gets `latest_all_funcs_kernel_insight_export_root.txt` pointing
-at the latest export.
+For kernel-internal swimlanes and MindStudio Insight traces, see
+[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
+The repository workflow can reuse an existing build or drive a case
+end-to-end. It writes the export root below
+`build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`.
 
 See pypto's `docs/en/dev/03-runtime-dfx.md` and the simpler reference at
 `runtime/docs/dfx/{l2-swimlane,tensor-dump,pmu-profiling,dep_gen}.md` for
@@ -273,7 +269,7 @@ before validation, and prints
 env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
 `PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop and `PYPTO_BENCH_RAW`
 dumps the per-dispatch samples. See
-[performance-tuning.md](performance-tuning.md#measuring--the-benchmark-loop-pypto_bench)
+[performance-tuning.md](performance-tuning.md#measuring-the-benchmark-loop-pypto_bench)
 for the output format, the multi-card breakdown, and what the number means.
 
 ### 5. Validate

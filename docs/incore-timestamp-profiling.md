@@ -10,8 +10,8 @@ registers, writes an extra GM output, and adds a cache writeback at the end of
 the task. Remove it before reporting production performance or submitting the
 kernel unless permanent telemetry is an explicit requirement.
 
-For single-core instruction and pipe analysis, use the simulator workflow in
-the [`incore-profiling` skill](../.claude/skills/incore-profiling/SKILL.md).
+For single-core instruction and pipe analysis, use
+[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
 For task-level scheduling, start with the L2 swimlane described in
 [`performance-tuning.md`](performance-tuning.md).
 

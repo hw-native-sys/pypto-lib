@@ -3,6 +3,8 @@
 Tensor-level kernels and model implementations built on the **pypto**
 programming framework, targeting Ascend NPUs (910B/C, 950).
 
+**Documentation:** [www.pypto.ai/pypto-lib](https://www.pypto.ai/pypto-lib/)
+
 ```
 examples/        Self-contained kernels for learning the DSL
   beginner/        hello_world, matmul, etc.
@@ -23,18 +25,21 @@ Files ending in `_draft.py` are works-in-progress and excluded from CI.
 
 ## Quick start
 
-Install pypto + simpler + ptoas (see [.claude/skills/setup_env/SKILL.md](.claude/skills/setup_env/SKILL.md)
-or use the `/setup_env` skill), then run any example:
+Follow the
+[installation and environment guide](docs/get-started/installation.md), then
+run a beginner example:
 
 ```bash
 python examples/beginner/hello_world.py -p a2a3sim   # simulator
 python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 ```
 
-Every example accepts `-p {a2a3, a2a3sim, a5, a5sim}` and `-d <device_id>`,
-and exits non-zero on validation mismatch. See
-[docs/compile-runtime-workflow.md](docs/compile-runtime-workflow.md) for the
-full flow (compile → input gen → golden → runtime → validate).
+The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
+on validation mismatch. Model and distributed entry points have
+script-specific platform and device arguments; inspect `--help` and the
+[platform guide](docs/get-started/platforms.md). See the
+[compile and runtime workflow](docs/compile-runtime-workflow.md) for the full
+flow (compile → input generation → golden → runtime → validation).
 
 ## Writing a kernel
 
@@ -77,4 +82,7 @@ torch, kernel/golden parity, dtype alignment, quantization schemes, the
 | [**ptoas**](https://github.com/hw-native-sys/PTOAS) | LLVM/MLIR-based assembler/optimizer for PTO Bytecode — parses `.pto`, runs Da Vinci-specific passes, lowers to C++ |
 | [**pto-isa**](https://github.com/hw-native-sys/pto-isa) | PTO Tile Library — virtual tile-ISA implementations and headers shared across Ascend generations |
 
-Pinned versions live in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+The selected PyPTO revision owns the compatible simpler submodule, PTOAS
+release, and PTO ISA commit. See
+[Installation and Environment](docs/get-started/installation.md) for the
+pinning chain.

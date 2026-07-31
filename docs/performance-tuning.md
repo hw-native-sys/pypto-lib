@@ -104,11 +104,10 @@ PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
   python models/deepseek/v4-flash/prefill_fwd.py -p a2a3 -d 0
 ```
 
-When only the timing changes between iterations — not the numerics — pair
-this with the `test-with-golden` skill
-([`.claude/skills/test-with-golden/`](../.claude/skills/test-with-golden/SKILL.md))
-to generate the golden once and replay it via `golden_data=`, cutting the
-torch recompute out of every later run.
+When only the timing changes between iterations — not the numerics — save the
+golden once and replay it via `golden_data=`, cutting the torch recompute out
+of every later run. See
+[Save and Replay Golden Data](run-and-validate/save-and-replay.md).
 
 ---
 
@@ -146,7 +145,7 @@ Look for these shapes on the swimlane that indicate a problem:
 |---|---|---|
 | Cores idle while AICPU lane is solid | Kernels too small; AICPU scheduling is the bottleneck | Make kernels larger (item 2) |
 | Long tail on a single AIC/AIV | One kernel is too big and serializes | Split it (item 3) |
-| Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the core buffers | Re-tile to fill `mat_left` / `mat_right` / vector buffers (item 4) |
+| Cube / vector unit utilization low even though kernel is busy | Tile size under-fills the user-visible on-chip buffers | Re-tile against `Mat` / `Acc` for cube or `Vec` for vector work (item 4) |
 | Cube lane busy while vector lane idle (or vice versa) | Vec/cube epilogue is split into separate kernels | Merge into a mixed kernel (item 2c) |
 | Sequential AICPU dispatch trail per region | Region issues one kernel per iteration | Use `pl.spmd` to dispatch a block fan-out once (item 5) |
 
@@ -247,11 +246,11 @@ for q0 in pl.parallel(0, hidden, Q_OUT_CHUNK):
 
 #### 4. Tiling — fill the core-internal buffers
 
-Each AIC / AIV core has fixed on-chip buffers: cube `mat` (left/right
-operand staging) on AIC, vector working buffers on AIV. The tile sizes
-declared in your `pl.slice` / `pl.matmul` (typically `BATCH_TILE`,
-`K_STEP`, `Q_OUT_CHUNK`, …) control how full those buffers run each
-iteration.
+Each AIC / AIV core has fixed on-chip buffers. At the DSL level, cube tiles
+directly consume `Mat` (L1 operand storage) and `Acc` (L0C accumulator
+storage), while vector tiles consume `Vec` (UB). The tile sizes declared in
+your `pl.slice` / `pl.matmul` (typically `BATCH_TILE`, `K_STEP`,
+`Q_OUT_CHUNK`, …) control these spaces.
 
 - Too small → buffers are under-utilized, cube/vector throughput drops
   proportionally, MTE2 issues many small loads.
@@ -266,8 +265,9 @@ build_output/<ProgramName>_<ts>/report/memory_after_AllocateMemoryAddr.txt
 ```
 
 listing, for each compute function, how full each on-chip space runs
-against its hardware limit (on 910C: vector `Vec` 192 KB; cube `Mat`
-512 KB, `Left` / `Right` 64 KB each, `Acc` 128 KB):
+against its hardware limit (on the illustrated 910C configuration: vector
+`Vec` 192 KB; cube `Mat` 512 KB, `Left` / `Right` 64 KB each, `Acc`
+128 KB):
 
 ```
 --- gather_kv ---
@@ -284,28 +284,32 @@ against its hardware limit (on 910C: vector `Vec` 192 KB; cube `Mat`
   Acc    |     4.0 KB  |   128.0 KB  |    3.1%  |  1
 ```
 
-Scan the `Usage` column: a kernel sitting far below its limit has
-headroom to enlarge its tiles, while one near 100 % is already
-buffer-bound. Aim to grow each kernel's bottleneck space — `Vec` for
-vector kernels, `Left` / `Right` / `Acc` for cube kernels — close to (but
-under) its limit; ideally every kernel runs each buffer it uses near full.
+Scan the `Usage` column for `Mat`, `Acc`, and `Vec`. These are the
+user-visible constraints affected by the M/N/K or vector fragment. `Left`
+and `Right` report the L0A/L0B staging chosen by the compiler for the L1
+fragment; they can routinely read close to 100% and are not independent DSL
+tile budgets. Do not shrink a tile merely to reduce a `Left` or `Right`
+percentage.
 
-Pick tile sizes so that one tile of the cube left operand (`[BATCH_TILE,
-K_STEP]`) and one tile of the right operand (`[K_STEP, N_CHUNK]`) each
-sit just under the per-core buffer budget — i.e. cube `mat_left` /
-`mat_right` are close to full. For vector-heavy regions, size the
-working tile so the vector buffer is similarly filled.
+Grow the space that limits the task: `Mat` for operand fragments, `Acc` for
+the output fragment, or `Vec` for vector working data. An oversized plain
+matmul output may be compiler-subtiled through L0C, so `Acc` is often a
+performance boundary rather than an immediate compile failure; extra tiles
+still add FIXPIPE drains. The exact build report and compile result are
+authoritative.
 
 Practical procedure:
 
 1. Start from the natural problem dimensions (`BATCH`, `HIDDEN`, …).
-2. Pick `K_STEP` and the output-chunk size so both cube operands fit
-   without spilling.
+2. Pick `K_STEP` and the output-chunk size so `Mat` and `Acc` stay within
+   the intended bounds without forcing inefficient compiler sub-tiling.
 3. Sweep one tile dim up/down by 2× and re-measure with PMU — keep the
    size that pushes the cube (or vector) unit closer to 100 %.
 
 The K loop is then driven by `pl.pipeline(stage=2 or 4)` so the next
 tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
+For the complete M/N/K constraint model and empirical sweep method, see
+[Cube Tile Tuning](debug-and-tune/cube-tile-tuning.md).
 
 #### 5. `pl.spmd` for parallel sub-kernel dispatch
 
@@ -351,26 +355,12 @@ Not every kernel exposes `--enable-pmu`; a kernel that does not can still be
 captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run` / `run_jit`
 call (the harness bundles it into the runtime's DFX options).
 
-Per-kernel intra-core swimlane (MindStudio Insight / msprof simulator
-trace), exported from an existing build directory:
-
-```bash
-python .claude/skills/incore-profiling/incore_profile.py \
-  --build-dir build_output/<ProgramName>_<ts> --target a2a3
-# → build_output/<...>/kernel_insight_all_funcs_<ts>/
-```
-
-Pass `--case <kernel.py>` instead of `--build-dir` to drive the case run
-end-to-end rather than reusing a build.
-
-This is the `incore-profiling` skill
-([`.claude/skills/incore-profiling/`](../.claude/skills/incore-profiling/SKILL.md)):
-it builds a standalone single-core simulator testcase per kernel — driven by the
-kernel `.cpp` and its sibling `.pto`, with no PTOAS checkout — runs it under
-`msprof op simulator`, and emits the Insight trace. De-clutter it into a
-Perfetto-viewable per-pipe swimlane with
-`python -m pypto.tools.clean_sim_trace <OPPROF_*> -o <out>`. See the skill's
-`SKILL.md` for the full flag reference and troubleshooting.
+For a per-kernel intra-core swimlane, use
+[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
+It explains how the repository workflow builds a standalone single-core
+testcase from the generated `.cpp` and sibling `.pto`, runs it under
+`msprof op simulator`, validates that data-dependent work actually executed,
+and cleans the Insight trace for Perfetto.
 
 For phase timing inside a multi-core extern on real hardware, use
 [`incore-timestamp-profiling.md`](incore-timestamp-profiling.md). It covers

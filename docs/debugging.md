@@ -5,9 +5,9 @@ through runtime hangs to precision mismatches. It pairs with
 [compile-runtime-workflow.md](compile-runtime-workflow.md) (what each phase
 does), [performance-tuning.md](performance-tuning.md) (perf), and
 [precision-tuning.md](precision-tuning.md) (numerical fidelity — cast modes,
-dtype alignment, the `error_distribution` sweep). To locate *which pypto
-commit* introduced a precision regression, use the `bisect-precision` skill
-instead.
+dtype alignment, the `error_distribution` sweep). To locate *which PyPTO
+commit* introduced a precision regression, use
+[Precision Regression Bisect](debug-and-tune/precision-regression-bisect.md).
 
 The harness exposes most of these as both a `run` / `run_jit` kwarg and a
 CLI flag; a typical model `__main__` wires them up like:
@@ -231,4 +231,4 @@ read-dep and lets the downstream task race).
 | Run hangs / deadlocks (§4) | device log | `runtime_cfg["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |
 | Precision mismatch, unknown stage (§5) | args dump | `enable_dump_args=` / `--dump-args [LEVEL]` |
 | Non-deterministic / raced result (§6) | dependency graph | `enable_dep_gen=` / `--enable-dep-gen` |
-| Regression vs. a known-good pypto commit | `bisect-precision` skill | — |
+| Regression vs. a known-good PyPTO commit | [Precision Regression Bisect](debug-and-tune/precision-regression-bisect.md) | — |
