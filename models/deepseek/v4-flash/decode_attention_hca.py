@@ -81,9 +81,11 @@ COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COM
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
-COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash/pro 8192 (= 1048576/128); max compressed positions
-SPARSE_IDX_TOPK = M.index_topk             # sparse_attn module's IDX_TOPK (static shape contract)
-HCA_TOPK_LIMIT = min(COMPRESS_TOPK, SPARSE_IDX_TOPK)
+COMPRESS_TOPK = MAX_SEQ_LEN // COMPRESS_RATIO   # demo 32; flash 128 (= 16384/128); max compressed positions
+# HCA has no indexer: the compressed tail is every slot the cache holds, so the
+# only bound is the cache capacity (`index_topk` belongs to the ratio-4 indexer).
+# Longest context served = COMPRESS_TOPK * COMPRESS_RATIO = MAX_SEQ_LEN.
+HCA_TOPK_LIMIT = COMPRESS_TOPK
 
 HCA_CMP_TOPK = HCA_SPARSE_CMP_TOPK
 

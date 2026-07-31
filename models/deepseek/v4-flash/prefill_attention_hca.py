@@ -102,6 +102,11 @@ assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 pr
 assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
 assert SPARSE_ORI_MAX_BLOCKS * BLOCK_SIZE >= S, "prefill HCA ori cache pool is too small"
 assert SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE >= PREFILL_MAX_COMPRESSED, "prefill HCA cmp table is too small"
+# HCA has no indexer: the compressed tail is every slot the cache holds, so the
+# shared prefill pruning width must cover the whole cache, not a top-k budget.
+assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
+    f"prefill HCA compressed tail ({PREFILL_MAX_COMPRESSED} slots) must cover "
+    f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)")
 assert SPARSE_CMP_BLOCK_NUM >= SPARSE_CMP_MAX_BLOCKS, "prefill HCA cmp physical pool is too small"
 assert PREFILL_COMPRESSED_LEN == 1
 

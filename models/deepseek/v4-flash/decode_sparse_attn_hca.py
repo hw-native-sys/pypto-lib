@@ -37,8 +37,6 @@ HALF_ROPE = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
 WIN = M.sliding_window
 MAX_SEQ_LEN = M.max_position_embeddings
-IDX_TOPK = M.index_topk
-TOPK_FULL = WIN + IDX_TOPK           # full sparse-K width (window + indexer topk)
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
@@ -145,13 +143,25 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
     if compress_ratio == 0:
         return 0
     if compress_ratio == 4:
-        return IDX_TOPK
+        return CMP_TOPK
     if compress_ratio == 128:
         return MAX_SEQ_LEN // compress_ratio
     raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
 
 
-CMP_TOPK = min(MAX_SEQ_LEN // 128, IDX_TOPK)
+# Compressed-cache capacity: the ratio-128 layer has no indexer, so its compressed
+# tail is the deterministic full compressed cache, one slot per COMPRESS_RATIO
+# tokens. `index_topk` is the ratio-4 indexer's budget and does NOT bound this.
+CMP_CAPACITY = MAX_SEQ_LEN // DEFAULT_COMPRESS_RATIO
+# Rounded up to a whole sparse block so TOPK needs no padding (PADDED_TOPK == TOPK).
+CMP_TOPK = ((CMP_CAPACITY + ATTN_K_TILE - 1) // ATTN_K_TILE) * ATTN_K_TILE
+# Longest context this build serves: the compressed tail reaches back
+# CMP_TOPK * COMPRESS_RATIO tokens (16384 at MAX_SEQ_LEN=16384; 128 slots x 128).
+# Past it the tail drops its NEWEST slots, leaving a hole between the compressed
+# history and the sliding window -- raise MAX_SEQ_LEN (and the CMP pool sizing the
+# asserts below check) to serve longer, do not cap CMP_TOPK.
+MAX_SUPPORTED_SEQ = CMP_TOPK * DEFAULT_COMPRESS_RATIO
+CMP_BLOCKS_PER_REQ = (CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
 # HCA sparse-K width: cache-first window slots + the deterministic
 # ratio-128 compressed tail.
 TOPK = WIN + CMP_TOPK
@@ -161,7 +171,13 @@ SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 GATHER_WIN_ROWS = WIN // GATHER_SEGS
 GATHER_CMP_ROWS = (PADDED_TOPK - WIN) // GATHER_SEGS
-assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
+assert PADDED_TOPK == TOPK, f"block-aligned CMP_TOPK must leave no dead sparse-K columns (TOPK={TOPK})"
+assert CMP_BLOCKS_PER_REQ <= CMP_MAX_BLOCKS, (
+    f"compressed block table ({CMP_MAX_BLOCKS} blocks) must index the whole "
+    f"{CMP_TOPK}-slot tail; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
+assert B * CMP_BLOCKS_PER_REQ <= CMP_BLOCK_NUM, (
+    f"compressed KV pool ({CMP_BLOCK_NUM} blocks) must hold B={B} requests x "
+    f"{CMP_BLOCKS_PER_REQ} blocks; MAX_SUPPORTED_SEQ={MAX_SUPPORTED_SEQ}")
 assert WIN == ATTN_K_TILE, f"HCA window tile requires WIN ({WIN}) == ATTN_K_TILE ({ATTN_K_TILE})"
 assert WIN % GATHER_SEGS == 0 and (PADDED_TOPK - WIN) % GATHER_SEGS == 0
 assert GATHER_WIN_ROWS % GATHER_RUN == 0, "window bulk-copy runs must tile the window slice"
@@ -814,7 +830,7 @@ def build_tensor_specs(
 
         The compressed tail width follows the active specialization (TOPK - WIN):
         the pruned build narrows it to `cmp_valid` columns, the full-blocks
-        baseline keeps the IDX_TOPK-wide padded tail.
+        baseline keeps the whole CMP_TOPK-wide tail.
         """
         indices = torch.full((T, CMP_TOPK), -1, dtype=torch.int32)
         if cmp_valid:
@@ -823,7 +839,7 @@ def build_tensor_specs(
             indices[:, :] = -1
         if mixed_topk_fixture:
             indices[:, :] = -1
-            mixed_cmp_valid = min(cmp_valid, IDX_TOPK)
+            mixed_cmp_valid = cmp_valid
             if mixed_cmp_valid:
                 indices[:, :mixed_cmp_valid] = torch.arange(mixed_cmp_valid, dtype=torch.int32)
         if cache_window_replacement_fixture:
