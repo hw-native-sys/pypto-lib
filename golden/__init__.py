@@ -12,6 +12,36 @@ Provides tensor and scalar specifications, result validation, and a runner
 that compiles and executes PyPTO programs with golden reference comparison.
 """
 
+import os
+
+import torch
+
+
+_DEFAULT_GOLDEN_NUM_THREADS = 16
+
+
+def _configure_golden_threads() -> int:
+    raw_value = os.environ.get(
+        "PYPTO_GOLDEN_NUM_THREADS",
+        str(_DEFAULT_GOLDEN_NUM_THREADS),
+    )
+    try:
+        num_threads = int(raw_value)
+    except ValueError as error:
+        raise ValueError(
+            f"PYPTO_GOLDEN_NUM_THREADS must be a positive integer, got {raw_value!r}"
+        ) from error
+    if num_threads <= 0:
+        raise ValueError(
+            f"PYPTO_GOLDEN_NUM_THREADS must be a positive integer, got {raw_value!r}"
+        )
+    torch.set_num_threads(num_threads)
+    return num_threads
+
+
+_GOLDEN_NUM_THREADS = _configure_golden_threads()
+
+
 from .runner import RunResult, run, run_jit
 from .spec import ScalarSpec, TensorSpec
 from .validation import (

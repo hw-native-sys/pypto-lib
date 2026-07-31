@@ -195,6 +195,15 @@ of recomputing — `golden_data` always wins over `golden_fn`.
 If neither is provided, validation is skipped and the run reports
 `PASS (validation skipped)`.
 
+Golden PyTorch operations use 16 intra-op CPU threads by default. Set
+`PYPTO_GOLDEN_NUM_THREADS` to a positive integer to override the repository
+default for a run:
+
+```bash
+PYPTO_GOLDEN_NUM_THREADS=8 \
+  python models/deepseek/v4-flash/decode_attention_csa.py -p a2a3 -d 0
+```
+
 ### 4. Runtime (simpler)
 
 Driven by the **simpler** repo (PTO2 runtime).
