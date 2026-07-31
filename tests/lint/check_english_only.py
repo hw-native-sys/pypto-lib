@@ -17,8 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Only check files under these directories
-DEFAULT_INCLUDED_PREFIXES = ["examples/"]
+# Public documentation and teaching examples are English-only.
+DEFAULT_INCLUDED_PREFIXES = ["README.md", "docs/", "examples/"]
 
 # Excluded sub-directories within included paths
 DEFAULT_EXCLUDED_PATTERNS = ["examples/docs"]

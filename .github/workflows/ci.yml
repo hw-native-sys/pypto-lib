@@ -66,47 +66,77 @@ jobs:
         with:
           python-version: "3.10"
       - id: check
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          set -euo pipefail
+
+          echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
+          echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
             echo "files=" >> "$GITHUB_OUTPUT"
-            # Serving is PR-only (see its `if`), so never arm it here.
-            echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
-            echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
+            echo "Manual runs retain the full smoke suite."
             exit 0
           fi
-          CHANGED_FILES=$(git diff --name-only \
-            ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            DIFF_RANGE="${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] ||
+               [ "$BEFORE" = "0000000000000000000000000000000000000000" ] ||
+               ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null ||
+               ! git merge-base --is-ancestor "$BEFORE" "${{ github.sha }}"; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "files=" >> "$GITHUB_OUTPUT"
+              echo "Push base is unavailable; retaining the full smoke suite."
+              exit 0
+            fi
+            DIFF_RANGE="$BEFORE..${{ github.sha }}"
+          fi
+
+          CHANGED_FILES=$(git diff --name-only "$DIFF_RANGE")
           # Map the raw diff to the runnable scripts CI must exercise:
           #  - a changed models/ source file selects every runnable file that
           #    (transitively) imports it, not just the file itself;
-          #  - any change outside models/ (golden/, .github/, docs, examples, …)
-          #    selects all runnable examples as a smoke test.
+          #  - runtime-affecting changes outside models/ select all examples;
+          #  - documentation-only paths select no simulator or device work.
           # See .github/scripts/detect_changes.py for the rules.
           FILES=$(printf '%s\n' "$CHANGED_FILES" | python .github/scripts/detect_changes.py)
-          if [ -n "$FILES" ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ -n "$FILES" ]; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            # Main pushes retain the historical full examples smoke for every
+            # runtime-affecting change, including model paths intentionally
+            # excluded from the PR runner matrix.
+            RUNTIME_IMPACT=$(
+              printf '%s\n' "$CHANGED_FILES" |
+                python .github/scripts/detect_changes.py --runtime-impact
+            )
+            echo "has_changes=$RUNTIME_IMPACT" >> "$GITHUB_OUTPUT"
           fi
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
           # Serving e2e jobs are model-specific and expensive. CI-infra edits
           # (.github/**) must not trigger them.
-          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3/14b/'; then
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3/14b/'; then
             echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_qwen_serving_tests=false" >> "$GITHUB_OUTPUT"
           fi
-          if printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4-(flash|pro)/'; then
+          if [ "${{ github.event_name }}" = "pull_request" ] &&
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4-(flash|pro)/'; then
             echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run_deepseek_serving_tests=false" >> "$GITHUB_OUTPUT"
           fi
           echo "Selected files: $FILES"
 
   sim:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: needs.detect-changes.outputs.has_changes == 'true'
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
@@ -202,7 +232,7 @@ jobs:
 
   a2a3:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: needs.detect-changes.outputs.has_changes == 'true'
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
