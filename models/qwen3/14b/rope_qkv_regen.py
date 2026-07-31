@@ -130,7 +130,7 @@ def rope_qkv_regen(  # noqa: PLR0913 -- mirrors the extern's packed arg list
 
     # layer_cache_base must reach the generated body as an OPAQUE runtime scalar,
     # because the extern supplies its own cache_row_offset in that parameter slot.
-    # An entry `pl.Scalar` does NOT work: compile_for_test specializes it on the
+    # An entry `pl.Scalar` does NOT work: lowering specializes it on the
     # traced value and the parameter goes dead (`0 + x` folds; a non-zero probe is
     # baked as a literal). Deriving it from a pl.range induction variable
     # reproduces how decode_fwd's per-layer inline loop produced the shipped ABI.
@@ -389,7 +389,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     set_backend_type(_backend_type(args.platform))
-    post_pass = rope_qkv_regen.compile_for_test(*_dummy_inputs(args.batch))
+    post_pass = rope_qkv_regen.lower(*_dummy_inputs(args.batch))
     print(f"Compiled program has {len(post_pass.functions)} function(s):")
     for fn in post_pass.functions.values():
         print(f"  {fn.name}: {fn.func_type}")
