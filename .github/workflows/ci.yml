@@ -12,7 +12,170 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TEMP (bench-only run): every job below is pinned off with `if: false` so a
+  # dispatch runs csa-bench alone. Drop the `if: false` lines (restoring the
+  # commented-out originals) to bring normal CI back.
+  csa-bench:
+    # Benchmark-only job: models/deepseek/v4-flash/decode_attention_csa.py timed
+    # with PYPTO_BENCH=1, run twice on fixed cards — one even (8), one odd (9) —
+    # instead of `--device auto`, so the two numbers are attributable to a known
+    # card rather than to whatever the queue happened to lend.
+    runs-on: [self-hosted, linux, arm64, npu]
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: checkout
+    env:
+      PTOAS_ROOT: ${{ github.workspace }}/checkout/ptoas-bin
+      PTO_ISA_ROOT: ${{ github.workspace }}/checkout/pto-isa
+      CMAKE_BUILD_PARALLEL_LEVEL: 16
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CCACHE_MAXSIZE: 30G
+      CCACHE_UMASK: '000'
+
+    steps:
+      - name: Fetch composite action definitions
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/actions
+          clean: false
+          persist-credentials: false
+
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
+        with:
+          checkout-path: checkout
+          needs-device: 'true'
+          build-namespace: a2a3
+          pip-cache-name: pip-a2a3
+
+      - name: Bench decode_attention_csa (even/odd card)
+        shell: bash
+        env:
+          PYPTO_LOG_LEVEL: error
+          PYPTO_WARNING_LEVEL: none
+          # Quiet simpler's runtime logger: a SIMPLER_PROFILING build otherwise
+          # floods every dispatch with [STRACE] INFO_V9 markers. benchmark()
+          # raises it to v9 around its own fd-captured loop, then restores.
+          PYPTO_RUNTIME_LOG: error
+          PYPTO_BENCH: '1'
+          # Dump every measured dispatch's Effective sample, not just the
+          # min/median/mean/max summary — a 100-sample sequence shows warmup
+          # drift and bimodality that four aggregates hide. The raw lines use an
+          # `eff_us` token, so they never collide with the `effective_us` grep.
+          PYPTO_BENCH_RAW: '1'
+          PTO2_RING_DEP_POOL: 16384
+          PTO2_RING_TASK_WINDOW: 16384
+          PTO2_RING_HEAP: 1073741824
+        run: |
+          source activate.sh
+          set +e
+          KERNEL=models/deepseek/v4-flash/decode_attention_csa.py
+          : > bench.tsv
+          : > bench_raw.log
+          failed=()
+          # This kernel is single-card, so benchmark() reports one L2 line:
+          #   [RUN]   effective_us (N rounds) min= median= mean= max=
+          # covering the Effective window (orch∪sched) over 100 rounds / 5 warmup
+          # (the defaults, left unpinned so numbers stay comparable). The per-rank
+          # / per-slot breakdown only exists for L3 — per_rank()/per_dispatch()
+          # return {} here — so the detail below comes from the raw samples and
+          # the L2 swimlane pass instead.
+          run_card() {
+            local card="$1" parity="$2" out rc line rounds min med mean max status
+            echo "::group::card ${card} (${parity}) — bench"
+            # Fixed `--device <card>`, not `auto`: the whole point is binding the
+            # measurement to a named card. task-submit still refuses a --block'ed
+            # card, and errors if the card is already lent out.
+            out=$( task-submit --device "$card" --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $KERNEL -p a2a3 -d $card" 2>&1 )
+            rc=$?
+            printf '%s\n' "$out"
+            echo "::endgroup::"
+            line=$(printf '%s\n' "$out" | grep -oP 'effective_us \(.*' | tail -1)
+            rounds=$(printf '%s\n' "$line" | grep -oP '\(\K[0-9]+(?= rounds\))')
+            min=$(printf '%s\n' "$line" | grep -oP '\bmin=\K[0-9.]+')
+            med=$(printf '%s\n' "$line" | grep -oP '\bmedian=\K[0-9.]+')
+            mean=$(printf '%s\n' "$line" | grep -oP '\bmean=\K[0-9.]+')
+            max=$(printf '%s\n' "$line" | grep -oP '\bmax=\K[0-9.]+')
+            # Keep the raw per-dispatch samples out of the table but in an
+            # artifact — one line of 100 numbers per card.
+            {
+              printf '=== card %s (%s) ===\n' "$card" "$parity"
+              printf '%s\n' "$out" | grep -E 'raw samples:|raw n=' || echo '(no raw samples)'
+            } >> bench_raw.log
+            [ "$rc" -ne 0 ] && { failed+=("card ${card} (${parity})"); echo "::error file=${KERNEL}::FAIL (card ${card}, ${parity})"; }
+            [ "$rc" -eq 0 ] && status=pass || status=fail
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+              "$card" "$parity" "$status" "${rounds:--}" \
+              "${min:--}" "${med:--}" "${mean:--}" "${max:--}" >> bench.tsv
+          }
+          # Second pass per card: one dispatch with the L2 swimlane on, which is
+          # the single-card stand-in for the L3 per-slot lines — it writes a
+          # per-task record set (dfx_outputs/l2_perf_records.json + a merged
+          # Perfetto trace) showing where the time goes inside the schedule.
+          # Kept separate from the timed pass because the instrumentation would
+          # perturb the very number the timed pass measures; PYPTO_BENCH=0
+          # overrides the step env so it stays a single dispatch.
+          trace_card() {
+            local card="$1" parity="$2"
+            echo "::group::card ${card} (${parity}) — L2 swimlane"
+            task-submit --device "$card" --timeout 3600 --max-time 900 \
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout PYPTO_BENCH=0 PYPTO_BENCH_RAW=0 python $KERNEL -p a2a3 -d $card --enable-l2-swimlane"
+            # Diagnostic only: a missing trace must not fail the bench job.
+            [ $? -ne 0 ] && echo "::warning::swimlane capture failed on card ${card} (${parity})"
+            echo "::endgroup::"
+          }
+          run_card 8 even
+          run_card 9 odd
+          trace_card 8 even
+          trace_card 9 odd
+          {
+            echo "## decode_attention_csa bench (a2a3, effective_us)"
+            echo
+            echo "| Card | Parity | Status | Rounds | min | median | mean | max |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
+            while IFS=$'\t' read -r card parity status rounds min med mean max; do
+              echo "| $card | $parity | $status | $rounds | $min | $med | $mean | $max |"
+            done < bench.tsv
+            echo
+            echo "Raw per-dispatch samples: \`bench_raw.log\`; L2 per-task trace:"
+            echo "\`dfx_outputs/\` in the artifact (open \`merged_swimlane_*.json\` in ui.perfetto.dev)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=== bench.tsv (card parity status rounds min median mean max) ==="
+          cat bench.tsv
+          echo "=== bench_raw.log ==="
+          cat bench_raw.log
+          if [ ${#failed[@]} -ne 0 ]; then
+            printf 'FAILED: %s\n' "${failed[@]}"
+            exit 1
+          fi
+
+      - name: Kill orphaned task-submit tasks
+        if: always()
+        uses: ./.github/actions/kill-orphaned-tasks
+        with:
+          checkout-path: checkout
+
+      - name: Upload bench results
+        # Before the build_output cleanup below: the swimlane traces live there.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-decode-attention-csa
+          path: |
+            checkout/bench.tsv
+            checkout/bench_raw.log
+            checkout/build_output/**/dfx_outputs/**
+          if-no-files-found: warn
+
+      - name: Clean up build artifacts
+        if: always()
+        run: rm -rf build_output
+
   pre-commit:
+    if: false  # TEMP: bench-only run
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,6 +188,7 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    if: false  # TEMP: bench-only run
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -52,6 +216,7 @@ jobs:
         run: pytest tests/golden -v
 
   detect-changes:
+    if: false  # TEMP: bench-only run
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
@@ -106,7 +271,8 @@ jobs:
 
   sim:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: false  # TEMP: bench-only run
+    # if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
@@ -202,7 +368,8 @@ jobs:
 
   a2a3:
     needs: detect-changes
-    if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
+    if: false  # TEMP: bench-only run
+    # if: github.event_name != 'pull_request' || needs.detect-changes.outputs.has_changes == 'true'
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -317,9 +484,10 @@ jobs:
     # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
     # its own job (serving-deepseek) so the two models schedule independently and
     # the expensive 8-card borrow does not serialize behind the single-card run.
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
+    if: false  # TEMP: bench-only run
+    # if: >-
+    #   github.event_name == 'pull_request' &&
+    #   needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
@@ -375,9 +543,10 @@ jobs:
     # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
     # of `serving` so the 8-card borrow schedules independently of the single-card
     # qwen3 run. Same setup contract as `serving`; gated by its own model guard.
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
+    if: false  # TEMP: bench-only run
+    # if: >-
+    #   github.event_name == 'pull_request' &&
+    #   needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
