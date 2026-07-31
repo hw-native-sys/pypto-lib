@@ -114,10 +114,19 @@ def hc_head(
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_head_linear", allow_early_resolve=True):
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
         k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, HC_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
             k0 = k_base + kb * LINEAR_K_CHUNK
-            x_linear_chunk = x_flat[t0 : t0 + LINEAR_T_TILE, k0 : k0 + LINEAR_K_CHUNK]  # FP32 input -> pure-AIC matmul
+            # FP32 input -> pure-AIC matmul. t_linear rounds up to LINEAR_T_TILE, so at
+            # decode dims (t_dim=8) this tile spans rows past the end of x_flat; the
+            # valid_shape clamp keeps the GM read in bounds (cf. hc_pre.py:223).
+            x_linear_chunk = pl.slice(
+                x_flat,
+                [LINEAR_T_TILE, LINEAR_K_CHUNK],
+                [t0, k0],
+                valid_shape=[t_rows, LINEAR_K_CHUNK],
+            )
             w_chunk = pl.slice(
                 hc_head_fn,
                 [HC_PAD, LINEAR_K_CHUNK],
