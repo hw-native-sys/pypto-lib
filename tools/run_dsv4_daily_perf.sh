@@ -16,6 +16,7 @@ readonly REMOTE_NAME="${PYPTO_DAILY_REMOTE_NAME:-upstream}"
 readonly DEFAULT_REMOTE_URL="git@github.com:hw-native-sys/pypto-lib.git"
 readonly CONDA_BASE="${PYPTO_DAILY_CONDA_BASE:-$(conda info --base 2>/dev/null || true)}"
 readonly CONDA_ENV="${PYPTO_DAILY_CONDA_ENV:-wq3}"
+readonly CANN_ROOT="${PYPTO_DAILY_CANN_ROOT:-/usr/local/Ascend/cann-9.0.0}"
 readonly PTOAS_BIN="${PYPTO_DAILY_PTOAS_BIN:-/usr/local/bin/ptoas-bin}"
 readonly PTO_ISA_DIR="${PYPTO_DAILY_PTO_ISA_ROOT:-$(realpath "$REPO_ROOT/../pto-isa")}"
 readonly ATTENTION_DEVICE="${PYPTO_DAILY_ATTENTION_DEVICE:-4}"
@@ -81,6 +82,7 @@ Environment overrides:
   PYPTO_DAILY_ATTENTION_DEVICE  Single card for CSA/SWA/HCA (default: 4)
   PYPTO_DAILY_MOE_DEVICE        Explicit EP2 card pair (default: 2,0)
   PYPTO_DAILY_DECODE_DEVICE     Full-decode card pair (default: 0,2)
+  PYPTO_DAILY_CANN_ROOT         CANN installation (default: /usr/local/Ascend/cann-9.0.0)
   PYPTO_DAILY_PERF_HOUR         Shanghai schedule hour (default: 05)
   PYPTO_DAILY_PERF_STATE_ROOT   Persistent result and scheduler state directory
 EOF
@@ -96,8 +98,10 @@ remote_url() {
 
 activate_environment() {
     local conda_sh="$CONDA_BASE/etc/profile.d/conda.sh"
+    local cann_set_env="$CANN_ROOT/set_env.sh"
 
     [[ -f "$conda_sh" ]] || die "Conda activation script not found: $conda_sh"
+    [[ -f "$cann_set_env" ]] || die "CANN environment script not found: $cann_set_env"
     [[ -d "$PTOAS_BIN" ]] || die "PTOAS directory not found: $PTOAS_BIN"
     [[ -d "$PTO_ISA_DIR" ]] || die "PTO ISA directory not found: $PTO_ISA_DIR"
 
@@ -105,6 +109,9 @@ activate_environment() {
     # shellcheck disable=SC1090
     source "$conda_sh"
     conda activate "$CONDA_ENV"
+    # shellcheck disable=SC1090
+    source "$cann_set_env"
+    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     set -u
 
     require_command git
@@ -139,6 +146,7 @@ dry_run() {
     printf 'Performance ref:  %s\n' "$PERF_BRANCH"
     printf 'Main ref:         %s\n' "$MAIN_BRANCH"
     printf 'Conda env:        %s (%s)\n' "$CONDA_ENV" "$CONDA_BASE"
+    printf 'CANN root:        %s\n' "$CANN_ROOT"
     printf 'PTOAS root:       %s\n' "$PTOAS_BIN"
     printf 'PTO ISA root:     %s\n' "$PTO_ISA_DIR"
     printf 'State root:       %s\n' "$STATE_ROOT"
@@ -164,16 +172,17 @@ run_case() {
     local benchmark_log_name="$9"
     local benchmark_log="$result_dir/$benchmark_log_name"
     local submit_log="$result_dir/${label}.task-submit.log"
-    local checkout_q conda_sh_q conda_env_q benchmark_log_q
+    local checkout_q conda_sh_q conda_env_q cann_set_env_q benchmark_log_q
     local child_command rc mean_us status
     local -a submit_command
 
     printf -v checkout_q '%q' "$checkout"
     printf -v conda_sh_q '%q' "$CONDA_BASE/etc/profile.d/conda.sh"
     printf -v conda_env_q '%q' "$CONDA_ENV"
+    printf -v cann_set_env_q '%q' "$CANN_ROOT/set_env.sh"
     printf -v benchmark_log_q '%q' "$benchmark_log"
 
-    child_command="cd $checkout_q && source $conda_sh_q && conda activate $conda_env_q && PYPTO_BENCH=1 $python_command > $benchmark_log_q 2>&1"
+    child_command="cd $checkout_q && source $conda_sh_q && conda activate $conda_env_q && source $cann_set_env_q && export LD_LIBRARY_PATH=\"\$CONDA_PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\" && PYPTO_BENCH=1 $python_command > $benchmark_log_q 2>&1"
     submit_command=(
         task-submit
         --ptoas "$ptoas_version"
@@ -296,6 +305,7 @@ run_daily() {
         printf 'performance_branch=%s\n' "$PERF_BRANCH"
         printf 'main_branch=%s\n' "$MAIN_BRANCH"
         printf 'conda_env=%s\n' "$CONDA_ENV"
+        printf 'cann_root=%s\n' "$CANN_ROOT"
         printf 'ptoas_root=%s\n' "$PTOAS_BIN"
         printf 'pto_isa_root=%s\n' "$PTO_ISA_DIR"
     } >"$result_dir/metadata.txt"
