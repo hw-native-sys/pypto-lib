@@ -99,7 +99,7 @@ test -n "$PTO_ISA_COMMIT"
 **not** choose between a simulator and a real device; the script's `-p`
 argument makes that choice.
 
-## Install PTO ISA, PyPTO, and simpler
+## Install PTO ISA and PyPTO
 
 ```bash
 git clone https://github.com/hw-native-sys/pto-isa.git \
@@ -108,11 +108,33 @@ git -C "$PYPTO_WORKSPACE/pto-isa" checkout "$PTO_ISA_COMMIT"
 export PTO_ISA_ROOT="$PYPTO_WORKSPACE/pto-isa"
 
 python -m pip install --no-build-isolation "$PYPTO_ROOT"
+```
+
+## Prepare a real-device build
+
+Skip this section for a simulator-only environment.
+
+For real-device support, source CANN **before installing simpler**:
+
+```bash
+export CANN_ROOT=/path/to/Ascend/cann
+source "$CANN_ROOT/set_env.sh"
+npu-smi info
+```
+
+The simpler installer detects CANN's `ccec` and cross compiler and builds the
+onboard runtime binaries at installation time. Sourcing CANN only after simpler
+has been installed does not add those binaries.
+
+## Install simpler
+
+```bash
 python -m pip install --no-build-isolation "$PYPTO_ROOT/runtime"
 ```
 
 Installing simpler from `runtime/` keeps the build and runtime at the revision
-selected by PyPTO.
+selected by PyPTO. If simpler was installed before CANN was sourced, source
+CANN and reinstall this same path.
 
 ## Install the pinned PTOAS release
 
@@ -127,15 +149,23 @@ printf '%s  %s\n' "$PTOAS_SHA256" "$PTOAS_ARCHIVE" | sha256sum -c -
 
 mkdir -p "$PTOAS_ROOT"
 tar -xzf "$PTOAS_ARCHIVE" -C "$PTOAS_ROOT"
-chmod +x "$PTOAS_ROOT/ptoas" "$PTOAS_ROOT/bin/ptoas"
+
+if [ -f "$PTOAS_ROOT/ptoas" ]; then
+  chmod +x "$PTOAS_ROOT/ptoas"
+elif [ -f "$PTOAS_ROOT/bin/ptoas" ]; then
+  chmod +x "$PTOAS_ROOT/bin/ptoas"
+else
+  printf 'PTOAS executable not found under %s\n' "$PTOAS_ROOT" >&2
+  exit 1
+fi
 ```
 
 Do not skip the checksum. A missing checksum for the current architecture
 means the selected PyPTO revision does not declare a compatible PTOAS asset.
 
-## Configure a real-device shell
+## Re-enter a real-device shell
 
-Before an NPU run, source the CANN environment selected for the machine:
+Before each NPU run, source the same CANN environment used to build simpler:
 
 ```bash
 export CANN_ROOT=/path/to/Ascend/cann
@@ -155,8 +185,17 @@ export PTO_ISA_ROOT="$PYPTO_WORKSPACE/pto-isa"
 
 ```bash
 python -c "import pypto, torch; from golden import run, run_jit; print(torch.__version__)"
-test -x "$PTOAS_ROOT/ptoas"
-test -x "$PTOAS_ROOT/bin/ptoas"
+
+if [ -f "$PTOAS_ROOT/ptoas" ] && [ -x "$PTOAS_ROOT/ptoas" ]; then
+  ptoas_bin="$PTOAS_ROOT/ptoas"
+elif [ -f "$PTOAS_ROOT/bin/ptoas" ] && [ -x "$PTOAS_ROOT/bin/ptoas" ]; then
+  ptoas_bin="$PTOAS_ROOT/bin/ptoas"
+else
+  printf 'PTOAS executable not found under %s\n' "$PTOAS_ROOT" >&2
+  exit 1
+fi
+"$ptoas_bin" --version
+
 git -C "$PYPTO_ROOT" submodule status runtime
 git -C "$PTO_ISA_ROOT" rev-parse HEAD
 ```
@@ -169,10 +208,10 @@ Then proceed to [Run your first kernel](first-kernel.md).
 |---|---|
 | `ModuleNotFoundError: golden` | Run from the repository root and export that root in `PYTHONPATH`. |
 | `ModuleNotFoundError: pypto` | Activate the intended Python environment and reinstall the selected PyPTO checkout. |
-| PTOAS cannot be found | Verify both PTOAS executables and keep `PTOAS_ROOT` exported. |
+| PTOAS cannot be found | Verify that either `$PTOAS_ROOT/ptoas` or `$PTOAS_ROOT/bin/ptoas` is a regular executable file, and keep `PTOAS_ROOT` exported. |
 | PTO ISA headers cannot be found | Verify `PTO_ISA_ROOT` and that its `HEAD` equals `runtime/pto_isa.pin`. |
 | Simulator compilation cannot find `g++-15` | Install GCC 15 or provide `gcc-15` and `g++-15` wrappers for the active compiler environment. |
-| A device run cannot initialize the runtime | Source the intended CANN `set_env.sh`, then check `npu-smi info`. |
+| A device run cannot find or initialize the onboard runtime | Confirm CANN was sourced when simpler was installed, reinstall simpler if necessary, source the same `set_env.sh`, then check `npu-smi info`. |
 
 The CI-equivalent setup is implemented in
 [`.github/actions/setup-ci-job/action.yml`](../../.github/actions/setup-ci-job/action.yml).

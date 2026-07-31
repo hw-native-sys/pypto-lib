@@ -81,16 +81,17 @@ build_output/<case>/kernel_insight_all_funcs_<timestamp>/
 ├── summary.txt
 └── funcs/
     └── <kernel>/
-        └── collect/out/OPPROF_*/simulator/
-            ├── trace.json
-            ├── visualize_data.bin
-            └── core0.*/
+        ├── collect/out/OPPROF_*/.../simulator/  # newer CANN
+        └── export/.../simulator/                # older CANN export pass
 ```
 
-`manifest_export.csv` and `summary.txt` are the first files to inspect. They
-record which kernels exported successfully and why a failed kernel was
-skipped. Per-core directories contain instruction-execution and
-code-execution CSV files in addition to raw traces.
+Treat `manifest_export.csv` as authoritative. Each row records the status and
+the actual `export_dir`, `trace_json`, and `visualize_data_bin` paths. Newer
+CANN versions can emit final artifacts during collection, in which case the
+recorded export directory is below `collect/out`; older versions use the
+separate `export/` path. `summary.txt` is a convenient human-readable index.
+Per-core directories contain instruction-execution and code-execution CSV
+files in addition to raw traces.
 
 Keep the complete collection under `build_output/`. It is generated evidence
 and must not be committed.
@@ -110,7 +111,7 @@ The cleaned directory contains:
 
 ```text
 trace.clean.json
-instr_metrics.json
+instr_metrics.json       # only when the source contains an API_INSTR block
 raw_simulator/
 ```
 
@@ -118,9 +119,11 @@ Rename `trace.clean.json` to include the kernel name before comparing several
 traces side by side. Record the source case, target, generated function, input
 assumptions, and any patched scalar arguments in a nearby `summary.txt`.
 
-Open the cleaned JSON in [Perfetto](https://ui.perfetto.dev/). Use
-`instr_metrics.json` to summarize cycles by pipeline and to detect an
-obviously empty workload before drawing conclusions.
+Open the cleaned JSON in [Perfetto](https://ui.perfetto.dev/). When present,
+use `instr_metrics.json` to summarize cycles by pipeline and to detect an
+obviously empty workload before drawing conclusions. Its absence only means
+the source trace had no `API_INSTR` block; consult the per-core CSV files and
+the cleaned trace instead.
 
 ## Validate that the standalone workload is real
 
@@ -143,13 +146,21 @@ Before trusting such a trace:
 1. Identify every tensor and scalar that controls execution.
 2. Derive hidden dynamic scalars from generated orchestration
    `add_scalar` calls or the kernel signature.
-3. Replace control input binaries with representative data.
-4. Patch the standalone `main.cpp` scalar values.
-5. Rebuild and recollect from the testcase's working directory.
-6. Record the exact wired workload with the trace.
+3. Choose representative values for the control tensors and scalars.
+4. For a direct dynamic extent or stride, regenerate with
+   `--dynamic-dim N`, where `N` is at least the largest scalar value.
+   For a computed SSA extent or stride, use the full PTOAS generator.
+5. Replace the control input binaries and wire scalar values without
+   exceeding the generated bound.
+6. Rebuild and recollect from the testcase's working directory.
+7. Record the exact wired workload with the trace.
 
-The `.pto` shapes already size the full GM allocations in normal cases.
-Change contents and scalar values before changing buffer sizes.
+Static `.pto` shapes size the full GM allocations. For a direct `%argN`
+dynamic extent or stride, the bundled generator uses `--dynamic-dim`
+(default `256`) as the allocation bound and emits a runtime guard. It rejects
+computed SSA dimensions because it cannot bound them safely. Regenerate with
+the intended bound instead of patching only the scalar or allocation; changing
+only one can make the standalone case access beyond its generated buffer.
 
 ## Interpret pipeline evidence
 

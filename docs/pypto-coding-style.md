@@ -166,19 +166,19 @@ reductions.
 
 ### Elementwise
 
-Tensor-tensor binary: `pl.add`, `pl.sub`, `pl.mul`, `pl.div`,
-`pl.maximum`, `pl.minimum`. Tensor-scalar variants (second operand is a
-Python `int`/`float` or `pl.Scalar`) suffix with `s`: `pl.adds`, `pl.subs`,
-`pl.muls`, `pl.divs`, `pl.maxs`, `pl.mins`. Unary: `pl.neg`, `pl.abs`,
-`pl.exp`, `pl.log`, `pl.sqrt`, `pl.recip`, `pl.rsqrt`. Activations:
-`pl.relu`, `pl.lrelu`, `pl.prelu`. Type conversion: `pl.cast(x, target_type=...)`.
-Binary ops broadcast over compatible shapes; prefer `pl.recip` + `pl.mul`
-over `pl.div` on hot paths.
+Unified binary ops are `pl.add`, `pl.sub`, `pl.mul`, `pl.div`,
+`pl.maximum`, and `pl.minimum`. They accept either a tensor/tile or a Python
+`int`/`float`/`pl.Scalar` as the second operand and dispatch to the appropriate
+tensor or tile operation. Unary ops are `pl.neg`, `pl.abs`, `pl.exp`, `pl.log`,
+`pl.sqrt`, `pl.recip`, and `pl.rsqrt`. Activations are `pl.relu`, `pl.lrelu`,
+and `pl.prelu`. Type conversion uses `pl.cast(x, target_type=...)`. Binary ops
+broadcast over compatible shapes; prefer `pl.recip` + `pl.mul` over `pl.div`
+on hot paths.
 
 ```python
 silu_x = pl.mul(x, pl.recip(pl.add(pl.exp(pl.neg(x)), one)))   # x * sigmoid(x)
 out_bf16 = pl.cast(acc_fp32, target_type=pl.BF16)
-scaled = pl.muls(scores, attn_scale)                           # scalar mul
+scaled = pl.mul(scores, attn_scale)                            # scalar mul
 ```
 
 For comparison / select / bit-twiddling — `pl.cmp`, `pl.cmps`, `pl.sel`,
@@ -216,8 +216,9 @@ normed = pl.col_expand_mul(pl.row_expand_mul(x, inv_rms), gamma)
 tensor/tile (typical use: zero-init a partial accumulator before a
 reduction). `pl.fillpad(x, pad_value=...)` rewrites the padded tail of a
 `valid_shape` slice with a sentinel — most often `pl.PadValue.min` to
-mask out invalid positions before a softmax `row_max`. There is also an
-in-place `pl.fillpad_inplace`.
+mask out invalid positions before a softmax `row_max`. When explicit tile-level
+in-place semantics are required, use `pl.tile.fillpad_inplace`; there is no
+top-level `pl.fillpad_inplace`.
 
 ```python
 partial_sq = pl.full([1, BATCH_TILE], dtype=pl.FP32, value=0.0)
@@ -350,10 +351,14 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="kproj"):
 Matmul fused with a bias add: `lhs @ rhs + bias`. Cheaper than a separate
 `pl.add` epilogue when the bias is broadcast over the M axis.
 
-### `pl.batch_matmul`, `pl.batch_matmul_acc`
+### Batched matmul
 
-Batched variants for stacked matmul (shape `[B, M, K] @ [B, K, N]`); same
-arg shape as the non-batched forms.
+`pl.batch_matmul(lhs, rhs)` is the tile-level batched form for
+`[B, M, K] @ [B, K, N]`. At tensor level, use `pl.matmul`: rank-greater-than-2
+inputs are lowered to batched matmul automatically. Likewise, use
+`pl.matmul_acc` for batched tensor accumulation. The explicit tile-only
+accumulation API is `pl.tile.batch_matmul_acc`; there is no top-level
+`pl.batch_matmul_acc`.
 
 ### `pl.gemv`, `pl.gemv_acc`, `pl.gemv_bias`
 

@@ -7,8 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """
-DeepSeek V3.2-EXP single-layer prefill BACK part (batch=16, max_seq=4096).
-[NOTE] Current test is reduced to batch=4, max_seq=128 for faster iteration and dodge HBM OOM issue.
+DeepSeek V3.2-EXP single-layer prefill BACK part.
+
+The current test uses batch=1 and max_seq=128.
 
 BACK boundary:
 - read combine tensor
@@ -343,4 +344,3 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
-

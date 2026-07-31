@@ -75,7 +75,7 @@ before increasing batch, sequence length, or layer count.
 | --- | --- | --- | --- |
 | [qwen3_32b_decode.py](../../models/qwen3/32b/qwen3_32b_decode.py) | Single-layer decode, conventional tensor layout | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 | [qwen3_32b_decode_4d.py](../../models/qwen3/32b/qwen3_32b_decode_4d.py) | Single-layer decode, 4D-blocked layout | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
-| [qwen3_32b_prefill_draft.py](../../models/qwen3/32b/qwen3_32b_prefill_draft.py) | Draft single-layer prefill | A2/A3, A2/A3 sim, A5, A5 sim | Excluded because it is a draft |
+| [qwen3_32b_prefill_draft.py](../../models/qwen3/32b/qwen3_32b_prefill_draft.py) | Draft single-layer prefill | A2/A3, A5 | Excluded because it is a draft |
 
 The 32B entries are component harnesses, not serving contracts or full
 multi-layer runners. A simulator run is a suitable first check:

@@ -15,7 +15,7 @@ The V3.2-EXP tree contains three runnable components:
 | [deepseek_v3_2_prefill_back.py](../../models/deepseek/v3_2/deepseek_v3_2_prefill_back.py) | Reduced single-layer prefill back fixture | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 
 These are component harnesses rather than a complete prefill/decode model
-contract. The prefill-back fixture is deliberately reduced to batch 4 and
+contract. The prefill-back fixture is deliberately reduced to batch 1 and
 sequence length 128 in source.
 
 ```bash

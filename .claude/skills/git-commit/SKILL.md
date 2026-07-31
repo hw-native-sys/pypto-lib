@@ -30,6 +30,7 @@ pre-commit run --all-files
 | `ruff-check` | Python linting — runs with `--fix`, so re-stage what it rewrites |
 | `check-headers` | Copyright header format |
 | `check-english-only` | Code comments and docstrings are in English |
+| `check-public-docs` | Public-doc boundaries, local links, and skill-to-doc links |
 
 **Never bypass.** No `--no-verify`, no `SKIP=...`. Any file the commit touches must leave it with
 zero violations, including violations that predate the change.

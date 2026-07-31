@@ -115,8 +115,9 @@ of every later run. See
 
 ### Capture
 
-Run the case with `--enable-l2-swimlane`. The runtime writes per-task L2
-records and a merged swimlane JSON under the build directory:
+Run the case with `--enable-l2-swimlane`. The runtime writes raw per-task L2
+records under the build directory and, on a real-device platform, converts
+them to a merged swimlane:
 
 ```bash
 python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
@@ -124,15 +125,21 @@ python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
 
 ```
 build_output/<ProgramName>_<ts>/dfx_outputs/
-├── l2_perf_records.json
-└── merged_swimlane_<ts>.json   ← open this
+├── l2_swimlane_records.json
+├── deps.json                    # real-device graph pass
+└── merged_swimlane_<ts>.json   # real device only; open this
 ```
 
 Two viewers work:
 
 - Open `merged_swimlane_<ts>.json` in <https://ui.perfetto.dev/>.
-- Or open `l2_perf_records.json` directly with the
+- Or open `l2_swimlane_records.json` directly with the
   [pypto-toolkit VSCode extension](https://marketplace.visualstudio.com/items?itemName=CANN-PUB.pypto-toolkit).
+
+Simulator platforms emit `l2_swimlane_records.json` but intentionally skip
+the merged conversion because their records do not yet include the task
+metadata the converter requires. Use a real-device capture when you need the
+merged Perfetto view and dependency arrows.
 
 The trace shows one lane per AICPU / AIC / AIV with task name, duration
 and dependency edges — gaps and stalls are visible directly.
@@ -266,14 +273,14 @@ build_output/<ProgramName>_<ts>/report/memory_after_AllocateMemoryAddr.txt
 
 listing, for each compute function, how full each on-chip space runs
 against its hardware limit (on the illustrated 910C configuration: vector
-`Vec` 192 KB; cube `Mat` 512 KB, `Left` / `Right` 64 KB each, `Acc`
-128 KB):
+`Vec` has a 184 KB compiler-safe limit within the 192 KB physical UB; cube
+`Mat` is 512 KB, `Left` / `Right` are 64 KB each, and `Acc` is 128 KB):
 
 ```
 --- gather_kv ---
   Space  |  Used       |  Limit      |  Usage   |  MemRefs
   -------+-------------+-------------+----------+---------
-  Vec    |   129.0 KB  |   192.0 KB  |   67.2%  |  2
+  Vec    |   129.0 KB  |   184.0 KB  |   70.1%  |  2
 
 --- kv_proj_matmul ---
   Space  |  Used       |  Limit      |  Usage   |  MemRefs

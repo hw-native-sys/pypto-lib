@@ -17,7 +17,7 @@ kernel behavior:
 
 Task mapping:
 
-- Environment setup: `.claude/skills/setup_env/SKILL.md`
+- Environment setup: `.claude/skills/setup-env/SKILL.md`
 - Kernel style pass: `.claude/skills/fmt-coding-style/SKILL.md`
 - Precision debugging: `.claude/skills/bisect-precision/SKILL.md`
 - Performance profiling: `.claude/skills/incore-profiling/SKILL.md`

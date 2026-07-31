@@ -29,9 +29,9 @@ Keep both scripts in this skill directory.
 - Treat `build_output/` as generated local state; never commit traces.
 - Do not modify source kernels merely to make a synthetic trace busy unless
   the user explicitly asks for a source change.
-- Pass `--no-auto-msopprof` on the first real preflight. Auto-provisioning or
-  `--msopprof` copies files into the selected CANN installation. Obtain user
-  approval before any such external write.
+- Worker provisioning is disabled by default. `--auto-msopprof` and
+  `--msopprof` copy files into the selected CANN installation; obtain user
+  approval before using either option.
 - Do not mix a worker and injection library from unrelated CANN versions
   without explicitly reporting the fallback and validating the collection.
 - Never interpret a near-empty or wrong-pipe trace as a fast kernel.
@@ -53,8 +53,7 @@ For an existing build, list functions without touching the toolchain:
 python .claude/skills/incore-profiling/incore_profile.py \
   --build-dir build_output/<case> \
   --target <a2a3-or-a5> \
-  --list-funcs \
-  --no-auto-msopprof
+  --list-funcs
 ```
 
 Confirm that each selected `.cpp` has a sibling `.pto`.
@@ -67,8 +66,7 @@ Run one function:
 python .claude/skills/incore-profiling/incore_profile.py \
   --build-dir build_output/<case> \
   --target <a2a3-or-a5> \
-  --func <function> \
-  --no-auto-msopprof
+  --func <function>
 ```
 
 Profile all discovered functions only when requested by omitting `--func`.
@@ -82,12 +80,18 @@ python .claude/skills/incore-profiling/incore_profile.py \
   --case <case.py> \
   --target <a2a3-or-a5> \
   --build-output-root <repo-root>/build_output \
-  --no-auto-msopprof \
   -- <case-arguments>
 ```
 
 Use `--task-submit` only when the user requested or authorized the repository's
 internal task queue workflow.
+
+The bundled generator allocates runtime-shaped tensor dimensions using
+`--dynamic-dim` (default `256`). Generated `main.cpp` rejects a direct dynamic
+scalar that exceeds this allocation bound. Set `--dynamic-dim` to at least the
+largest scalar value you plan to wire; regenerate the case instead of patching
+only the scalar. An unresolved computed shape or stride is an error—use a full
+PTOAS source checkout via `--ptoas-root` for those cases.
 
 If the preflight reports a missing worker:
 
@@ -95,8 +99,8 @@ If the preflight reports a missing worker:
    `set_env.sh`.
 2. If copying a local worker is necessary, identify the exact source and
    destination and request approval.
-3. After approval, use `--msopprof <path>` or the auto-provision option and
-   verify that the companion injection library came from the same package.
+3. After approval, use `--msopprof <path>` or `--auto-msopprof` and verify that
+   the companion injection library came from the same package.
 
 ## Validate the collection
 

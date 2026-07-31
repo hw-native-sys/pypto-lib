@@ -45,14 +45,18 @@ location. Most compile failures are fixed at the cited site without any
 further tooling; read the message before reaching for the heavier
 mechanisms below.
 
-- **Compile failure** — the IR after every pass is under
-  `build_output/<...>/passes_dump/` (written by default, `dump_passes=True`).
-  Diff the last clean pass against the first failing one to see which pass
-  rejected the IR. `report/` holds scheduling diagnostics.
-- **ptoas failure** — the error quotes the `.pto` op. `skip_ptoas=True`
-  (a `compile_cfg` knob) keeps the raw `.pto` MLIR and stops before the C++
-  wrapper, isolating whether the regression is in pypto's IR→MLIR or in
-  ptoas.
+- **Compile failure** — scripts using `golden.run` call `ir.compile`
+  directly, whose default `dump_passes=True` writes per-pass IR under
+  `build_output/<...>/passes_dump/`. `golden.run_jit` constructs a
+  `RunConfig`, whose default is `dump_passes=False`; pass
+  `compile_cfg=dict(dump_passes=True)` when you need the same files. Diff the
+  last clean pass against the first failing one to see which pass rejected
+  the IR. `report/` holds scheduling diagnostics.
+- **PTOAS failure** — the error quotes the `.pto` op. With `golden.run`,
+  `compile_cfg=dict(skip_ptoas=True)` keeps the raw `.pto` MLIR and stops
+  before the C++ wrapper, isolating whether the regression is in PyPTO's
+  IR-to-MLIR path or in PTOAS. `skip_ptoas` is not a `RunConfig` field and
+  therefore is not accepted by `golden.run_jit`.
 - **Runtime crash** — rerun on the matching simulator (`-p a2a3sim` /
   `a5sim`); it gives more diagnostic output than the device backend and
   reproduces most lowering bugs.
@@ -120,9 +124,10 @@ The log states which path it took:
 
 ## 4. Runtime hang / deadlock — device log via `log_level` + `ASCEND_PROCESS_LOG_PATH`
 
-When a run **hangs** (no progress, then AICPU 2-second sync timeouts) rather
-than raising a clean error, the Python side has nothing to show — the stall
-is on the device. Raise the runtime log verbosity and read the device log:
+When a run **hangs** (no progress, followed by AICPU sync-timeout messages)
+rather than raising a clean error, the Python side has nothing to show — the
+stall is on the device. Raise the runtime log verbosity and read the device
+log:
 
 1. Set `log_level` in `runtime_cfg`:
 
@@ -140,17 +145,20 @@ is on the device. Raise the runtime log verbosity and read the device log:
    running:
 
    ```bash
-   export ASCEND_PROCESS_LOG_PATH=/device_log
-   python models/deepseek/v4-flash/moe.py -p a2a3 -d 0
+   mkdir -p build_output/device_logs
+   export ASCEND_PROCESS_LOG_PATH="$PWD/build_output/device_logs"
+   python models/deepseek/v4-flash/moe.py -p a2a3 --ep 2 -d 0,1
    ```
 
-3. Read the logs under `/device_log` to find the **last task that
-   dispatched** and which core stalled — that pins the kernel or dependency
-   the schedule is waiting on.
+3. Read the logs under `build_output/device_logs/` to find the **last task
+   that dispatched** and which core stalled — that pins the kernel or
+   dependency the schedule is waiting on.
 
 `ASCEND_PROCESS_LOG_PATH` is a runtime environment variable, not a harness
-kwarg, so it is set in the shell. Hangs under high host concurrency are
-often false timeouts — run the suspect test serially before deep-diving.
+kwarg, so it is set in the shell. Create a directory writable by the current
+user before running; `build_output/` is suitable local generated state. Hangs
+under high host concurrency are often false timeouts — run the suspect test
+serially before deep-diving.
 
 ---
 
@@ -210,14 +218,23 @@ blows up, and the §1–§5 precision rules that stage likely violated — see
 ## 6. Find missing dependencies with gen-deps
 
 `enable_dep_gen=True` (CLI `--enable-dep-gen`) writes
-`dfx_outputs/deps.json`, rendered as `deps_graph.html` — the task-graph
-dependency edges the orchestration emitted. Open it when results are
-**non-deterministic** (values shift run to run, or shift with location) or a
-GM write→read looks raced: a dropped edge — a consumer that does not wait on
-its producer — shows up as a missing arrow. That points straight at the
-orchestration dependency that was lost (a classic cause is `add_output`
-instead of `add_inout` on a write-then-read GM round-trip, which drops the
-read-dep and lets the downstream task race).
+`dfx_outputs/deps.json`. Rendering is an offline step; the runtime does not
+create an HTML file automatically:
+
+```bash
+cd build_output/<ProgramName>_<timestamp>/dfx_outputs
+python -m simpler_setup.tools.deps_viewer deps.json \
+  --format text -o deps_viewer.txt
+python -m simpler_setup.tools.deps_viewer deps.json \
+  --format html --engine sfdp -o deps_viewer.html
+```
+
+Open `deps_viewer.html` when results are **non-deterministic** (values shift
+run to run, or shift with location) or a GM write→read looks raced. A dropped
+edge — a consumer that does not wait on its producer — shows up as a missing
+arrow. That points straight at the orchestration dependency that was lost (a
+classic cause is `add_output` instead of `add_inout` on a write-then-read GM
+round-trip, which drops the read-dep and lets the downstream task race).
 
 ---
 
@@ -225,7 +242,7 @@ read-dep and lets the downstream task race).
 
 | Symptom | Tool | Kwarg / flag |
 |---------|------|--------------|
-| Compile / ptoas error | `passes_dump/`, `skip_ptoas` | `compile_cfg=dict(skip_ptoas=True)` |
+| Compile / PTOAS error | `passes_dump/`; `skip_ptoas` for `golden.run` only | `compile_cfg=dict(dump_passes=True)`; with `run`, `compile_cfg=dict(skip_ptoas=True)` |
 | Need to reproduce on the same inputs | golden-data replay (§2) | `golden_data=` / `--golden-data` |
 | Iterating on generated `.cpp` / `.pto` | runtime-dir reuse (§3) | `runtime_dir=` / `--runtime-dir` |
 | Run hangs / deadlocks (§4) | device log | `runtime_cfg["log_level"]="v0"` + `ASCEND_PROCESS_LOG_PATH` |

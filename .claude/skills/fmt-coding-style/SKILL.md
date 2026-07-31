@@ -172,39 +172,18 @@ Structures that stay one-item-per-line:
   single line.
 
 **List literals of short items follow the call-site rule**: several per line,
-grouped by role. `decode_mtp.py`'s `ordered_names` / `replicated_attention` are
-one string per line and should be regrouped; `decode_fwd.py`'s
-`CSA_LAYER_STACKED_NAMES` is the target form.
-
-```python
-# before
-ordered_names = [
-    "hidden_states",
-    "prev_pre_hc_hidden",
-    "position_ids",
-    "enorm_w",
-    "hnorm_w",
-    "e_proj_w",
-    ...
-]
-
-# after
-ordered_names = [
-    "hidden_states", "prev_pre_hc_hidden", "position_ids",
-    "enorm_w", "hnorm_w",
-    "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
-    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
-    ...
-]
-```
+grouped by role. The grouped `ordered_names` and `replicated_attention` in
+`decode_mtp.py`, and `CSA_LAYER_STACKED_NAMES` in `decode_fwd.py`, are current
+reference forms.
 
 Element order is load-bearing here — `ordered_names` drives the spec order —
 so, as with call arguments, regroup the line breaks only and never reorder.
 
 Naming the intermediates is part of the rule — reuse the existing local naming
 idiom (`<thing>_<what>`: `hidden_sq`, `prev_deq`, `q_acc`), and do not reuse a
-name already live in the same `@pl.jit.inline` scope; see the SSA-collision
-traps in memory.
+name already live in the same `@pl.jit.inline` scope. Search the full scope
+before introducing a name; duplicate live names can collide during SSA
+conversion.
 
 ## Rule 2 — Comments state WHAT, not WHY
 

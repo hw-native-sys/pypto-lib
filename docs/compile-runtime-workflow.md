@@ -1,9 +1,11 @@
 # Compile and Runtime Workflow
 
-What happens when you run `python <kernel>.py -p <platform>`. All
-pypto-lib examples and model kernels follow the same flow, driven by
-`golden.run` — or `golden.run_jit` for kernels written as a module-level
-`@pl.jit` function instead of a `@pl.program` class.
+What usually happens when you run `python <kernel>.py -p <platform>`.
+Most examples and model harnesses use `golden.run` for `@pl.program` kernels
+or `golden.run_jit` for module-level `@pl.jit` kernels. A few specialized
+smoke, artifact-regeneration, and external-runtime drivers call PyPTO's
+compile/runtime APIs directly; their `__main__` blocks are the authority for
+what a command actually validates.
 
 ## CLI shape
 
@@ -28,9 +30,10 @@ result = run(
 ```
 
 A kernel written as a module-level `@pl.jit` function calls **`run_jit`**
-instead, passing `fn=<jit_function>` in place of `program=`. Everything
-else — `specs`, `golden_fn`, the tolerances, and the phases below — is
-identical.
+instead, passing `fn=<jit_function>` in place of `program=`. Both entry points
+share tensor specs, golden computation, runtime dispatch, and validation, but
+their `compile_cfg` fields and defaults differ; see
+[Compile configuration](#compile-configuration).
 
 | Flag | Purpose |
 |------|---------|
@@ -56,32 +59,34 @@ that many cards from the host device queue with
 `task-submit --device "$DEVICE_ID" --device-num N`. `$DEVICE_ID` is `auto`
 (borrow any free cards) or a fixed id set by the CI backend, and the lent
 set comes back as `$TASK_DEVICE`, passed straight to `-d`. Files without the
-marker default to one card. Runs use each program's **default** world size
-(ep2 / 2 cards); higher world sizes (ep4/ep8) are exercised as explicit
-`task-submit --device-num 4/8 … python … --ep 4` steps added by hand in
-[daily_ci.yml](../.github/workflows/daily_ci.yml) (the card pool must provide
-that many cards). See the `a2a3` job in
+marker default to one card. Runs use each program's **default** world size,
+commonly EP2 for distributed DeepSeek entries. The current workflow contains
+only a commented EP4 command example; it does not provide active EP4 or EP8
+per-file coverage. See the `a2a3` job in
 [.github/workflows/ci.yml](../.github/workflows/ci.yml).
 
 Multi-card kernels use HCCL, which silent-crashes inside docker. For this
-reason the real-NPU job runs **on the host (no container)** — set up via
-conda + `set_env.sh`, mirroring pypto's `dist-system-tests`. The job keeps
-the large `PTO2_RING_*` sizes for every run and preserves them into each
-task-submit child; the `setup-npu-device-job` action exposes an `unset-ring`
-input to drop them if an HCCL path ever needs it. Running a multi-card
-kernel locally needs a real `set_env.sh`-sourced shell, e.g.
+reason the real-NPU job runs **on the host (no container)**. The shared
+`setup-ci-job` action writes an activation script that enters the Python
+environment and sources CANN's `set_env.sh`; each `task-submit` child sources
+that script. The workflow also preserves its `PTO2_RING_*` settings into the
+child. Running a multi-card kernel locally needs the same kind of real-device
+shell, e.g.
 `python models/deepseek/v4-flash/moe.py -p a2a3 --ep 2 -d 0,1`.
 
-## Phases inside `golden.run`
+## Phases inside the Golden Harness
 
 The harness prints `[RUN] <stage> ...` / `[RUN] <stage> done (Xs)` around
 each phase, so the console log is the authoritative trace of what ran:
 
 ### 1. Compile (pypto)
 
-Driven by the **pypto** repo. `pypto.ir.compile(program, backend_type=..., **compile_cfg)`
-runs in two sub-stages: a **pass pipeline** that transforms the IR, then a
-**codegen pipeline** that emits files. Output goes under
+Driven by the **pypto** repo. `run` calls
+`pypto.ir.compile(program, backend_type=..., **compile_cfg)` directly.
+`run_jit` builds a `pypto.runtime.RunConfig` from `compile_cfg` and calls
+`fn.compile(..., config=...)`, which specializes the JIT function before
+entering the same IR compiler. Both paths run a **pass pipeline** followed by
+a **codegen pipeline** and normally write
 `build_output/<ProgramName>_<timestamp>/`.
 
 #### 1a. Pass pipeline
@@ -89,8 +94,9 @@ runs in two sub-stages: a **pass pipeline** that transforms the IR, then a
 `PassManager.get_strategy(strategy).run_passes(program, ...)` runs an
 ordered sequence of passes that progressively rewrites the IR. The exact
 pass list changes often — consult the pypto repo for the current pipeline,
-and look at `passes_dump/` (written when `dump_passes=True`, the default)
-to see the IR after each pass for any given run.
+and look at `passes_dump/` when `dump_passes` is enabled. Direct `run`
+compilation inherits `ir.compile`'s enabled default; `run_jit` inherits
+`RunConfig`'s disabled default.
 
 The end state, regardless of which passes ran, is the same:
 
@@ -113,8 +119,8 @@ and emits files in three streams:
 - **InCore kernels → `.pto` → C++ wrapper.** Each kernel function (or
   group thereof) goes through `PTOCodegen` to produce an MLIR text file
   (`.pto`) under `ptoas/`. Then `ptoas` (the external assembler/optimizer
-  toolchain — located via `$PTOAS_ROOT/ptoas` or `PATH`) compiles each
-  `.pto` to a C++ kernel wrapper under `kernels/aic/` (cube) or
+  toolchain) compiles each `.pto` to a C++ kernel wrapper under
+  `kernels/aic/` (cube) or
   `kernels/aiv/` (vector). The ptoas invocations run in a thread pool
   since each is an independent subprocess. `skip_ptoas=True` keeps the
   raw `.pto` files and skips the C++ wrapper step (useful for inspecting
@@ -126,11 +132,16 @@ and emits files in three streams:
 - **Config → `kernel_config.py`.** Records each kernel's name, runtime
   ID, and core type (cube / vector) for the runtime to load.
 
+When `PTOAS_ROOT` is set, PyPTO searches only
+`$PTOAS_ROOT/ptoas` and then `$PTOAS_ROOT/bin/ptoas`; it deliberately does
+not fall back to a potentially mismatched binary on `PATH`. When
+`PTOAS_ROOT` is unset, PyPTO searches `PATH`.
+
 #### Output directory layout
 
 ```
 build_output/<ProgramName>_<ts>/
-├── passes_dump/    # IR after each pass (dump_passes=True)
+├── passes_dump/    # IR after each pass, when dump_passes is enabled
 ├── ptoas/          # raw .pto MLIR + ptoas intermediates
 ├── kernels/
 │   ├── aic/        # cube kernel C++ wrappers from ptoas
@@ -142,19 +153,40 @@ build_output/<ProgramName>_<ts>/
 └── dfx_outputs/    # runtime DFX artefacts (any --enable-* flag)
 ```
 
-#### Compile knobs
+#### Compile configuration
 
-Forwarded from `compile_cfg` to `ir.compile`:
+For **`run`**, `compile_cfg` is forwarded to `ir.compile`. Common fields are:
 
-| Kwarg | Purpose |
-|-------|---------|
-| `backend_type` | Auto-set from `runtime.platform` (`a2a3*` → `Ascend910B`, `a5*` → `Ascend950`). |
-| `output_dir` | Override the default `build_output/<name>_<timestamp>/`. |
-| `strategy` | `OptimizationStrategy.Default` (full pipeline) or `DebugTileOptimization` (skips tensor-only passes — for tile-pass debugging). |
-| `dump_passes` | Default `True`; writes IR after every pass to `passes_dump/`. |
-| `skip_ptoas` | Stop after `.pto` generation (no kernel C++ wrappers). |
-| `profiling` | Record per-stage compile timings under `report/`. |
-| `verification_level`, `diagnostic_phase`, `disabled_diagnostics` | Tune the pass-time verifier and diagnostic gates. |
+| `compile_cfg` field | Purpose |
+|---|---|
+| `output_dir` | Override `build_output/<name>_<timestamp>/`. |
+| `strategy` | Select the optimization strategy. |
+| `dump_passes` | Write pass IR under `passes_dump/`; defaults to `True` on this direct compiler path. |
+| `skip_ptoas` | Stop after `.pto` generation without producing kernel C++ wrappers. |
+| `profiling` | Write compile-stage timing reports under `report/`. |
+| `verification_level`, `diagnostic_phase`, `disabled_diagnostics` | Configure compiler verification and diagnostics. |
+| `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Configure distributed lowering, AUTO-scope dependency analysis, and memory planning. |
+
+The harness derives `backend_type` and `platform` from
+`runtime_cfg["platform"]` unless the direct compile configuration already
+supplies them.
+
+For **`run_jit`**, `compile_cfg` must instead contain fields accepted by
+`pypto.runtime.RunConfig`. The JIT layer maps its compile-side fields into
+`ir.compile`:
+
+| `compile_cfg` field | Compiler mapping |
+|---|---|
+| `dump_passes` | Same pass dumps, but the `RunConfig` default is `False`. |
+| `save_kernels_dir` | Maps to `ir.compile(output_dir=...)`. |
+| `compile_profiling` | Maps to `ir.compile(profiling=...)`. |
+| `strategy`, `diagnostic_phase`, `disabled_diagnostics` | Forwarded to the corresponding compiler fields. |
+| `distributed_config`, `analyze_auto_scopes_for_deps`, `memory_planner` | Forwarded when set. |
+
+`output_dir`, `profiling`, `skip_ptoas`, and `verification_level` are not
+`RunConfig` field names and therefore cannot be copied unchanged from a
+`run` call into `run_jit`. Unknown fields raise while constructing
+`RunConfig`; unknown direct-compiler fields raise in `ir.compile`.
 
 To stop after compile without touching the device, see `compile_only` under
 [Skipping phases](#skipping-phases).
@@ -184,8 +216,9 @@ data — useful for deterministic regression checks.
 ### 3. Compute golden
 
 The golden runs **before** device execution: it depends only on the input
-snapshot, not on the runtime, so the reference is ready for validation and
-a later runtime crash still leaves a usable `data/out/`.
+snapshot, not on the runtime, so the reference is ready for validation. With
+`save_data=True`, a later runtime crash still leaves the persisted
+`data/out/` snapshot.
 
 If `golden_fn` is provided, `run` builds a `scratch` dict with cloned
 inputs and zero-init outputs, calls `golden_fn(scratch)` (which fills the
@@ -209,42 +242,61 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
 
 ### 4. Runtime (simpler)
 
-Driven by the **simpler** repo (PTO2 runtime).
-`pypto.runtime.execute_compiled(work_dir, ordered_args, **runtime_cfg)`
-loads the compiled artifacts onto the target platform and runs them.
-Tensors passed by reference are mutated in place: outputs land back into
-the same Python tensors after the call returns.
+Driven by the **simpler** repo (PTO2 runtime). For a single-chip build, the
+harness orders the arguments according to `specs` and calls
+`pypto.runtime.execute_compiled`. For an L3
+`DistributedCompiledProgram`, it instead dispatches the compiled object with a
+`pypto.runtime.RunConfig`; resident-weight L3 programs use the prepared-worker
+path. Tensors are mutated in place, so outputs land in the same Python tensors
+after dispatch.
 
-`runtime_cfg` is forwarded verbatim — `platform`, `device_id`, the
-runtime DFX flags below, and any other runtime knobs. Refer to the
-simpler repo for the full set of runtime options and platform-specific
-behavior.
+`runtime_cfg` is therefore not forwarded verbatim in every case:
+
+- `log_level` is consumed by the harness to configure PyPTO's runtime logger;
+- the five DFX fields below are bundled into the runtime's DFX options on the
+  single-chip path;
+- remaining single-chip fields are passed to `execute_compiled`, which rejects
+  unknown names;
+- L3 dispatch retains fields supported by `RunConfig`.
 
 #### Runtime DFX flags
 
-PyPTO surfaces simpler's four runtime DFX (Design For X) sub-features as
+PyPTO surfaces simpler's five runtime DFX (Design For X) sub-features as
 independent toggles on `runtime_cfg`. They share the same output
-directory but can be enabled in any combination:
+directory and can be enabled in any combination. CLI spellings are
+entry-specific; the table lists the common spelling when a script exposes it.
 
 | Kwarg | CLI flag | Artefact under `dfx_outputs/` |
 |-------|----------|-------------------------------|
-| `enable_l2_swimlane=True` | `--enable-l2-swimlane` | `l2_perf_records.json` → `merged_swimlane_*.json` |
+| `enable_l2_swimlane=True` (or a supported level) | `--enable-l2-swimlane [N]` | `l2_swimlane_records.json`; onboard runs also attempt `merged_swimlane_*.json` |
 | `enable_dump_args=<N>` (int, `0`=off) | `--dump-args [N]` (bare = `1`) | `args_dump/{args_dump.json,args.bin}` |
 | `enable_pmu=<N>` (int, `0`=off) | `--enable-pmu [N]` (bare = `2`) | `pmu.csv` |
-| `enable_dep_gen=True` | `--enable-dep-gen` | `deps.json` → `deps_graph.html` |
-
-Enabling any flag auto-forces `save_kernels=True` so
-`build_output/<ProgramName>_<ts>/dfx_outputs/` survives the run.
+| `enable_dep_gen=True` | `--enable-dep-gen` | `deps.json` |
+| `enable_scope_stats=True` | `--enable-scope-stats` | `scope_stats/scope_stats.jsonl` |
 
 Args-dump level `1` captures only arguments selected with `pl.dump_tag` or a
 `dumps=` list; level `2` captures every task's tensor payloads and scalar
 values. Level `3` captures the same argument metadata without writing tensor
 payloads or `args.bin`.
 
-For L2 swimlane: open the generated `merged_swimlane_*.json` at
+For an onboard L2 swimlane run, PyPTO first attempts a dependency-graph
+capture and then a clean timing capture so the converter can add dependency
+arrows without perturbing the timing pass. Open the generated
+`merged_swimlane_*.json` at
 [ui.perfetto.dev](https://ui.perfetto.dev/) to visualize per-task
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
-gaps, and dependency stalls.
+gaps, and dependency stalls. Simulator runs retain
+`l2_swimlane_records.json` but do not generate the merged trace because the
+required task metadata is unavailable.
+
+The raw dependency and scope-stat files can also be rendered offline:
+
+```bash
+python -m simpler_setup.tools.deps_viewer \
+  build_output/<name>/dfx_outputs/deps.json --format html --engine sfdp
+python -m simpler_setup.tools.scope_stats_plot \
+  build_output/<name>/dfx_outputs/scope_stats/scope_stats.jsonl
+```
 
 For kernel-internal swimlanes and MindStudio Insight traces, see
 [In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
@@ -253,12 +305,10 @@ end-to-end. It writes the export root below
 `build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`.
 
 See pypto's `docs/en/dev/03-runtime-dfx.md` and the simpler reference at
-`runtime/docs/dfx/{l2-swimlane,tensor-dump,pmu-profiling,dep_gen}.md` for
-full per-flag details.
-
-> The old single boolean `runtime_profiling` / `--runtime-profiling` is
-> a deprecated alias for `enable_l2_swimlane` / `--enable-l2-swimlane`.
-> It still works but emits a `DeprecationWarning` and will be removed.
+`runtime/docs/dfx/{l2-swimlane-profiling,args-dump,pmu-profiling,dep_gen,scope-stats}.md`
+for full per-flag details. There is no `runtime_profiling` /
+`--runtime-profiling` compatibility alias in the current Python API; use
+`enable_l2_swimlane` or the entry's `--enable-l2-swimlane` flag.
 
 ### 4b. Benchmark (opt-in, before validation)
 
@@ -285,10 +335,12 @@ per-output with the `compare_fn={"out_name": custom_callable}` argument.
 | `ratio_allclose(atol, rtol, max_error_ratio=0.005)` | Quantized kernels where a small outlier fraction may exceed per-point `atol + rtol·|expected|`. NaN/Inf always fail. |
 | `ratio_reldiff(diff_thd, pct_thd, max_diff_hd=inf)` | cann-recipes-infer-style relative-diff check: per-point `rdiff > diff_thd` bad-point ratio capped by `pct_thd`, with optional single-point `max_diff_hd` cap. |
 
-The harness exits with `RunResult(passed=True)` on success. On any
-failure (compile error, runtime crash, validation mismatch) it returns
-`passed=False` with the error message; the model's `__main__` then
-`raise SystemExit(1)`.
+The harness returns `RunResult(passed=True)` on success. Validation mismatches
+and a small set of harness-level setup errors return
+`RunResult(passed=False, error=...)`. Compiler errors, golden-function errors,
+and ordinary runtime exceptions generally propagate instead of being converted
+to `RunResult`. A CLI should check a returned result and exit nonzero when it is
+false; an uncaught compile/runtime exception is already a nonzero failure.
 
 ## Skipping phases
 
@@ -297,9 +349,9 @@ failure (compile error, runtime crash, validation mismatch) it returns
 | Knob | Effect |
 |------|--------|
 | `compile_only=True` | Stops after the compile phase. Useful in CI smoke tests that just check the program lowers cleanly. |
-| `runtime_dir="<path>"` (kwarg to `run`) | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
-| `golden_data="<path>"` (kwarg to `run`) | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
-| `save_data=True` (kwarg to `run`; default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3/14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |
+| `runtime_dir="<path>"` | Skips compile and reuses an existing `build_output/<...>` directory. Useful when iterating on `golden_fn` or validation logic without recompiling. |
+| `golden_data="<path>"` | Loads inputs from `<path>/in/` and goldens from `<path>/out/` instead of generating them. `golden_data` overrides `golden_fn`. Useful for deterministic regressions: a previous run leaves these files in its `data/` dir, so passing that dir reproduces the exact failing inputs. |
+| `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3/14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |
 
 For diagnosing compile errors, runtime hangs, and precision mismatches, see
 [debugging.md](debugging.md).

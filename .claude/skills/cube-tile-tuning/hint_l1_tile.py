@@ -112,9 +112,10 @@ filters; ranking is by DMA cost, which already prices padding in):
       line). For a weight-dominated decode GEMM (tiny M, huge B) DMA waste stays
       small even when MAC waste is 100%.
 
-Wall-clock proxy: tasks are dispatched in waves of `cores` (default 24).
-A 25-task config takes 2 waves on 24 cores — almost 2× slower than a
-24-task config with similar per-task work. The cost we minimize is therefore
+Wall-clock proxy: tasks are dispatched in waves of `cores` (default 24 on
+A2/A3 and 18 on A5). A 25-task A2/A3 config takes 2 waves on 24 cores—almost
+2× slower than a 24-task config with similar per-task work. The cost we
+minimize is therefore
 
   sequential_dma = per_task_dma * ceil(num_tasks / cores)
                  = (total_dma / num_tasks) * ceil(num_tasks / cores)
@@ -142,14 +143,19 @@ Wave-considered vs non-wave-considered:
     width. Sequential DMA is still reported as a secondary column.
 
 Usage:
-    python hint_l1_tile.py --M 16 --N 5120 --K 17408
-    python hint_l1_tile.py --M 16 --N 512  --K 17408
-    python hint_l1_tile.py --M 16 --N 256  --K 256
+    python hint_l1_tile.py --platform a2a3 --M 16 --N 5120 --K 17408
+    python hint_l1_tile.py --platform a5 --M 16 --N 512 --K 17408
 """
 
 import argparse
 from dataclasses import dataclass
 from itertools import product
+
+
+PLATFORM_DEFAULTS = {
+    "a2a3": {"acc_buffer_bytes": 128 * 1024, "cores": 24},
+    "a5": {"acc_buffer_bytes": 256 * 1024, "cores": 18},
+}
 
 
 @dataclass(frozen=True)
@@ -326,15 +332,16 @@ def hint_l1_tile(
     bytes_b: int = 2,
     bytes_c: int = 4,
     l1_available_bytes: int = 512 * 1024,
-    acc_buffer_bytes: int = 128 * 1024,
+    acc_buffer_bytes: int | None = None,
     min_contig_bytes: int = 256,
     m_min: int = 1,
-    cores: int = 24,
+    cores: int | None = None,
     tile_multiple: int = 16,
     cache_line_bytes: int = 512,
     max_waves: int = 3,
     wave_considered: bool = True,
     b_trans: bool = False,
+    platform: str = "a2a3",
 ) -> list[TileCandidate]:
     """Sweep (TM, TN, TK, OM, ON, OK, pin) and return all feasible candidates.
 
@@ -364,7 +371,18 @@ def hint_l1_tile(
     K/N search floors: False = plain B=[K,N] (N-contiguous); True = B=[N,K],
     K-contiguous (the transposed layout of LLM weight matmuls), where a short K
     tile drops TK*bb below the cache line and doubles the B load.
+
+    ``platform`` supplies the default accumulator budget and core count when
+    those values are not overridden: A2/A3 uses 128 KB and 24 cores; A5 uses
+    256 KB and 18 cores.
     """
+    if platform not in PLATFORM_DEFAULTS:
+        raise ValueError(f"unknown platform {platform!r}; expected one of {sorted(PLATFORM_DEFAULTS)}")
+    profile = PLATFORM_DEFAULTS[platform]
+    if acc_buffer_bytes is None:
+        acc_buffer_bytes = profile["acc_buffer_bytes"]
+    if cores is None:
+        cores = profile["cores"]
     if M <= 0 or N <= 0 or K <= 0:
         raise ValueError(f"M, N, K must be > 0, got M={M}, N={N}, K={K}")
     if l1_available_bytes <= 0:
@@ -496,7 +514,7 @@ def _fmt_bytes(b: int) -> str:
     return f"{b} B"
 
 
-def _print(M: int, N: int, K: int, l1: int, acc: int, cores: int,
+def _print(M: int, N: int, K: int, l1: int, acc: int, cores: int, platform: str,
            cands: list[TileCandidate], top_n: int,
            wave_considered: bool, b_trans: bool) -> None:
     mode = "wave-considered" if wave_considered else "non-wave-considered"
@@ -504,7 +522,7 @@ def _print(M: int, N: int, K: int, l1: int, acc: int, cores: int,
     rank_metric = "sequential DMA" if wave_considered else "total DMA"
     print(f"\nMatmul (M={M}, N={N}, K={K}), L1 budget {_fmt_bytes(l1)} (A+B), "
           f"Acc budget {_fmt_bytes(acc)} (C), per core, {cores} cores "
-          f"[{mode}; {layout}]")
+          f"[{platform}; {mode}; {layout}]")
     print(
         "  Notation: each axis decomposes as dim = O * L * T:\n"
         "    T (Tile)  = L1-resident fragment per load/store\n"
@@ -580,6 +598,12 @@ def _main() -> None:
     p.add_argument("--bytes-c", type=int, default=4,
                    help="C accumulator elem bytes (default 4 = FP32 cube accumulator)")
     p.add_argument(
+        "--platform",
+        choices=sorted(PLATFORM_DEFAULTS),
+        default="a2a3",
+        help="Target family; selects default Acc capacity and AIC core count",
+    )
+    p.add_argument(
         "--l1-bytes",
         type=int,
         default=512 * 1024,
@@ -589,9 +613,9 @@ def _main() -> None:
     p.add_argument(
         "--acc-bytes",
         type=int,
-        default=128 * 1024,
-        help="L0C accumulator buffer per core in bytes (default 128 KB on 910B, "
-             "256 KB on a5/950). C never uses L1. L0C is a *soft* wall — the compiler "
+        default=None,
+        help="Override the platform L0C accumulator budget (128 KB on A2/A3, "
+             "256 KB on A5). C never uses L1. L0C is a *soft* wall — the compiler "
              "output-tiles an oversized fragment at a drain cost; this filter is the "
              "conservative 'fits one L0C tile' boundary.",
     )
@@ -619,8 +643,8 @@ def _main() -> None:
     p.add_argument(
         "--cores",
         type=int,
-        default=24,
-        help="Number of parallel AIC cores; tasks dispatch in waves of this many (default 24)",
+        default=None,
+        help="Override the platform AIC core count (24 on A2/A3, 18 on A5)",
     )
     p.add_argument(
         "--max-waves",
@@ -663,6 +687,9 @@ def _main() -> None:
         help="Max rows to print, sorted by ascending sequential DMA (default 12)",
     )
     args = p.parse_args()
+    profile = PLATFORM_DEFAULTS[args.platform]
+    acc_bytes = args.acc_bytes if args.acc_bytes is not None else profile["acc_buffer_bytes"]
+    cores = args.cores if args.cores is not None else profile["cores"]
 
     cands = hint_l1_tile(
         args.M,
@@ -672,17 +699,18 @@ def _main() -> None:
         bytes_b=args.bytes_b,
         bytes_c=args.bytes_c,
         l1_available_bytes=args.l1_bytes,
-        acc_buffer_bytes=args.acc_bytes,
+        acc_buffer_bytes=acc_bytes,
         min_contig_bytes=args.min_contig,
         m_min=args.m_min,
-        cores=args.cores,
+        cores=cores,
         tile_multiple=args.tile_multiple,
         cache_line_bytes=args.cache_line,
         max_waves=args.max_waves,
         wave_considered=args.wave_considered,
         b_trans=args.b_trans,
+        platform=args.platform,
     )
-    _print(args.M, args.N, args.K, args.l1_bytes, args.acc_bytes, args.cores,
+    _print(args.M, args.N, args.K, args.l1_bytes, acc_bytes, cores, args.platform,
            cands, args.top, args.wave_considered, args.b_trans)
 
 

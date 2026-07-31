@@ -1,5 +1,5 @@
 ---
-name: setup_env
+name: setup-env
 description: Set up the pypto-lib development environment, including pypto, ptoas, torch, CANN/device checks, and runtime variables. Use when preparing to run examples, tests, codegen, or CI-equivalent local validation.
 ---
 
@@ -28,26 +28,34 @@ this skill.
 3. Reuse a user-selected PyPTO checkout when one is provided. Otherwise place
    a new checkout in a scoped sibling directory after obtaining any required
    network approval. Never overwrite or delete an existing checkout.
-4. Follow the installation guide in order:
+4. Follow the installation guide and derive every dependency from the selected
+   PyPTO revision:
    - initialize PyPTO submodules;
    - derive the PTOAS version/checksum and PTO ISA commit from that exact PyPTO
      revision;
    - check out PTO ISA at the pin;
-   - install PyPTO and its pinned `runtime/` submodule;
+   - install PyPTO;
    - verify the PTOAS checksum before extraction.
-5. Keep installs inside the active environment and user-writable directories.
+5. For a device environment, source the selected CANN `set_env.sh` and run
+   `npu-smi info` before installing simpler. Simpler detects `ccec` and the
+   cross-compiler during installation and only prebuilds the platforms whose
+   toolchains are active.
+6. Install PyPTO's pinned `runtime/` submodule after the requested simulator or
+   device toolchain is active. Confirm that the requested platform binaries
+   were built.
+7. Keep installs inside the active environment and user-writable directories.
    Do not use `sudo`, modify CANN, or install into a system directory unless
    the user explicitly requests and authorizes it.
-6. For a device environment, source the selected CANN `set_env.sh`, run
-   `npu-smi info`, and use only a device allocated to the user.
-7. Verify:
+8. For a device environment, use only a device allocated to the user.
+9. Verify:
    - `import pypto`, `import torch`, and imports from `golden`;
-   - both expected PTOAS executables are present and executable;
+   - one supported PTOAS executable (`ptoas` or `bin/ptoas`) is a regular
+     executable file;
    - the simpler submodule revision belongs to the selected PyPTO checkout;
    - PTO ISA `HEAD` matches `runtime/pto_isa.pin`;
    - `PTOAS_ROOT`, `PTO_ISA_ROOT`, and the repository `PYTHONPATH` are usable in
      the shell that will run the case.
-8. When the requested platform is available, run
+10. When the requested platform is available, run
    `examples/beginner/hello_world.py` as the final smoke test. A device smoke
    requires an allocation; do not substitute an arbitrary visible device.
 

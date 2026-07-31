@@ -50,7 +50,7 @@ gitlink pins simpler, `toolchain/versions.env` pins PTOAS, and
 ## Environment Setup
 
 Read [`docs/get-started/installation.md`](../docs/get-started/installation.md)
-for the public procedure. Use the `/setup_env` skill to inspect and execute
+for the public procedure. Use the `/setup-env` skill to inspect and execute
 that procedure on the current machine.
 
 ## Common Commands

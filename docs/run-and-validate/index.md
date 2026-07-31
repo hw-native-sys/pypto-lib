@@ -1,7 +1,10 @@
 # Run and Validate
 
-Runnable PyPTO-Lib scripts use the local Golden Harness to turn a kernel
-definition into a correctness result.
+Most runnable PyPTO-Lib scripts use the local Golden Harness to turn a kernel
+definition into a correctness result. A few specialized smoke, regeneration,
+or external-runtime drivers call PyPTO's compile/runtime APIs directly; inspect
+the selected script's `__main__` block and `--help` before assuming that it
+performs golden validation.
 
 The common flow is:
 

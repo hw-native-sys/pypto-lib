@@ -35,10 +35,10 @@ The default is `mode="round"` (ties-away). **torch's `.to(dtype)` uses RNE
 float-narrowing cast, you must pass `mode="rint"` explicitly — the default
 diverges from torch on exact ties.
 
-For `fp32 → bf16` the two modes differ *only* on exact ties, so the
-whole-tensor impact is tiny (measured ~1e-4 rel-L2 on dsv4 attn output). It is
-still worth getting right, because the golden harness emulates the device and
-you want the golden and the kernel to round the same way.
+For `fp32 → bf16` the two modes differ *only* on exact ties. How often those
+ties occur and their whole-tensor impact are workload-dependent, so measure
+them rather than relying on a fixed error estimate. The golden and kernel
+should still use the same rule.
 
 ### Recommended modes vs. torch-CPU
 
@@ -47,7 +47,7 @@ you want the golden and the kernel to round the same way.
 | `fp32 → bf16` | `rint` | matches torch `.to(torch.bfloat16)` (RNE) |
 | `fp32 → fp16` | `rint` | matches torch `.to(torch.float16)` (RNE) |
 | `fp32 → int8` (quant) | `rint` | round-to-nearest-even on the scaled value, matching a torch `round().to(int8)` quantizer |
-| `int32 → fp16/fp32` (de-quant) | `round` | exact for in-range integers; default is fine |
+| `int32 → fp16/fp32` (de-quant) | `rint` | matches torch when rounding is needed; every integer is exactly representable only through magnitude 2^11 in fp16 and 2^24 in fp32 |
 | `acc → fp32` (cube/Acc move) | `none` | width-preserving move, no rounding involved |
 | float → `int` for **indices** / lane math | `trunc` or `floor` | deterministic floor/truncation, never ties-away (which would jump an index) |
 
@@ -86,9 +86,8 @@ the real weight disagree on dtype. When injecting a real weight, cast it to
 the kernel's declared spec dtype precisely to avoid this:
 
 ```python
-dt = _spec_torch_dtype(spec)            # the dtype the kernel declared
-if dt is not None and v.dtype != dt:
-    v = v.to(dt)                        # force the real weight to match
+if v.dtype != spec.dtype:
+    v = v.to(spec.dtype)                 # force the real weight to match
 ```
 
 Checklist:
@@ -154,9 +153,9 @@ a constant. Things to vary and measure:
   the dsv4 W8A8 checkpoints use (`weight_offset == 0`). Only reach for a
   zero-point if the data is genuinely one-sided.
 - **Scale source** — compute the activation scale from the *actual* dynamic
-  range of the activation, not a static constant. Real-weight activations on
-  dsv4 q-proj have ~5× the dynamic range of random fixtures, which is why the
-  quant error there is ~0.8% rel-L2 with real weights vs ~0.03% with random.
+  range of the activation, not a static constant. Real-weight activations can
+  have a substantially different range from random fixtures, so measure the
+  resulting quantization error on representative data.
 - **Rounding** — RNE (`mode="rint"`) on the scaled value to match a torch
   `round()` quantizer (see §1).
 
@@ -201,8 +200,8 @@ justifies.
 
 `error_distribution` (§6) tells you *how much* and *what shape* the output is
 off, but not *which stage*. Combine it with args dump to pin the exact op —
-to go from "the whole kernel is 0.4% off" to "the q-proj dequant is the
-source" (full dump procedure in [debugging.md](debugging.md) §2 and §5):
+to go from "the whole kernel is off" to "the q-proj dequant is the source"
+(full dump procedure in [debugging.md](debugging.md) §2 and §5):
 
 1. Pin the inputs with `golden_data=<dir>` so every re-run sees identical
    tensors.
@@ -224,11 +223,10 @@ where the error first appears, which is where one of §1–§5 was violated.
 Random fixtures hide precision bugs that only real weights expose, because the
 error is data-dependent:
 
-- **Dynamic range** drives quant error. Real activations on dsv4 q-proj have
-  ~5× the dynamic range of `torch.randn` fixtures, pushing q-proj quant error
-  from ~0.03% (random) to ~0.8% (real) rel-L2 — a ~24× difference that random
-  testing would never surface. A standalone module can look perfect on random
-  data and still be the dominant error term in the full model.
+- **Dynamic range** drives quant error. Real activations can cover a very
+  different range from `torch.randn` fixtures. A standalone module can look
+  accurate on random data and still be the dominant error term in the full
+  model, so report measurements with the exact workload and checkpoint.
 - **Seed your fixtures.** Bare `torch.randn` is unseeded and flaky run-to-run;
   the strict cache tolerances (`max_error_ratio=0.0`) need a *seeded* normal
   so the distribution is reproducible. The prefill fixtures use a seeded

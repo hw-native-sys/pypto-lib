@@ -34,11 +34,12 @@ allocation adds alignment padding, ~10-25%); the device compile's
 truth. This tool flags MARGINAL when the estimate is within 15% of the budget.
 """
 import argparse
+import math
 
-# Per-core on-chip budgets (bytes). 910B (a2a3) defaults; a5/950 overrides Acc.
+# Per-core budgets modeled by this helper (bytes).
 PLATFORM = {
-    "a2a3": {"mat": 512 * 1024, "acc": 128 * 1024, "l0a": 64 * 1024, "l0b": 64 * 1024, "ub": 192 * 1024},
-    "a5":   {"mat": 512 * 1024, "acc": 256 * 1024, "l0a": 64 * 1024, "l0b": 64 * 1024, "ub": 256 * 1024},
+    "a2a3": {"mat": 512 * 1024, "acc": 128 * 1024},
+    "a5": {"mat": 512 * 1024, "acc": 256 * 1024},
 }
 
 
@@ -65,7 +66,7 @@ def main():
     # Guard against zero/negative args -- K and the budgets are divisors below.
     for name, val in (("M", a.M), ("N", a.N), ("K", a.K), ("bytes-in", a.bytes_in),
                       ("bytes-out", a.bytes_out), ("weights", a.weights),
-                      ("double-buffer", a.double_buffer)):
+                      ("double-buffer", a.double_buffer), ("cache-line", a.cache_line)):
         if val <= 0:
             p.error(f"--{name} must be > 0 (got {val})")
     for name, val in (("accum", a.accum), ("mat-bytes", a.mat_bytes), ("acc-bytes", a.acc_bytes)):
@@ -110,13 +111,23 @@ def main():
             print("  Mat is the wall: activation alone exceeds the L1 budget -- reduce M or K.")
         else:
             # Largest N that fits Mat at this K, and largest K at this N.
-            n_max = (bud["mat"] / a.double_buffer / a.bytes_in - a.M * a.K) / (a.weights * a.K)
-            k_max = bud["mat"] / a.double_buffer / a.bytes_in / (a.N * a.weights + a.M)
-            n_fit = max(0, int(n_max // 16 * 16))
-            k_fit = max(0, int(k_max // a.cache_line * a.cache_line))  # keep K on a cache-line multiple
-            print(f"  Mat is the wall: at K={a.K}, N<={n_fit} fits; at N={a.N}, K<={k_fit} fits.")
-            print(f"  -> trade K down to {k_fit} (>= cache-line {a.cache_line}) to keep N={a.N}, "
-                  f"or shrink N to {n_fit}.")
+            elem_capacity = bud["mat"] // (a.double_buffer * a.bytes_in)
+            n_max = max(0, (elem_capacity // a.K - a.M) // a.weights)
+            k_max = elem_capacity // (a.N * a.weights + a.M)
+            n_fit = n_max // 16 * 16
+            # K is in elements while --cache-line is in bytes. Round to an
+            # element multiple whose byte footprint is an exact cache-line
+            # multiple, rather than rounding K by a byte count.
+            k_multiple = a.cache_line // math.gcd(a.cache_line, a.bytes_in)
+            k_fit = k_max // k_multiple * k_multiple
+            print(f"  Mat is the wall: at K={a.K}, N<={n_fit} fits.")
+            if k_fit > 0:
+                print(f"  At N={a.N}, K<={k_fit} fits on a {k_multiple}-element "
+                      f"({a.cache_line}-byte) multiple.")
+                print(f"  -> trade K down to {k_fit} to keep N={a.N}, or shrink N to {n_fit}.")
+            else:
+                print(f"  No positive {k_multiple}-element ({a.cache_line}-byte) K tile fits "
+                      f"at N={a.N}; shrink N or M before reducing K.")
     if acc <= bud["acc"] and mat <= bud["mat"] and contig >= a.cache_line:
         n_room = int((bud["mat"] / a.double_buffer / a.bytes_in - a.M * a.K) / (a.weights * a.K) // 16 * 16)
         acc_n = int(bud["acc"] / (a.M * a.bytes_out * n_accum) // 16 * 16)

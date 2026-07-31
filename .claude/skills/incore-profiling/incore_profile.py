@@ -555,6 +555,8 @@ def export_one(
         ]
         if args.aicore_arch:
             gen_cmd += ["--aicore-arch", args.aicore_arch]
+        if args.generate_testcase == GEN_PROFILING_CASE:
+            gen_cmd += ["--dynamic-dim", str(args.dynamic_dim)]
         run_cmd(gen_cmd, env=env, log_path=logs_dir / "generate.log", timeout=args.step_timeout)
 
         log(f"[{index:02d}/{total:02d}] build {func}")
@@ -752,15 +754,15 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default=None,
         help="Path to a msopprof worker binary to install. msprof hardcodes the worker "
         "location, so this binary is copied into $ASCEND_TOOLKIT_HOME/tools/msopprof/bin "
-        "(not consumed in place). When omitted and the worker is missing, one is "
-        "auto-provisioned from another local CANN install.",
+        "(not consumed in place). Supplying this option explicitly enables that copy.",
     )
     tool_group.add_argument(
         "--auto-msopprof",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Auto-provision the msopprof worker into $ASCEND_TOOLKIT_HOME/tools/msopprof/bin "
-        "when `msprof op` can't find it (copied, since msprof rejects symlinks).",
+        default=False,
+        help="Opt in to auto-provisioning the msopprof worker into "
+        "$ASCEND_TOOLKIT_HOME/tools/msopprof/bin when `msprof op` cannot find it "
+        "(copied, since msprof rejects symlinks). This writes outside the repository.",
     )
 
     out_group = parser.add_argument_group("output")
@@ -788,6 +790,13 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "--step-timeout", type=int, default=300, help="timeout for testcase generation/cmake/golden"
     )
     prof_group.add_argument("--build-timeout", type=int, default=600, help="timeout for cmake build per func")
+    prof_group.add_argument(
+        "--dynamic-dim",
+        type=int,
+        default=256,
+        help="Allocation bound for each runtime-shaped dimension in the bundled testcase "
+        "generator. Generated code rejects direct dynamic scalars above this value.",
+    )
 
     args, case_args = parser.parse_known_args(argv)
     if case_args and case_args[0] == "--":
@@ -795,6 +804,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     args.ptoas_root = repo_path(args.ptoas_root) if args.ptoas_root else None
     args.pto_isa_root = repo_path(args.pto_isa_root)
     args.generate_testcase = resolve_generate_testcase(args.ptoas_root)
+    if args.dynamic_dim <= 0:
+        parser.error("--dynamic-dim must be greater than zero")
     return args, case_args
 
 
@@ -856,8 +867,8 @@ def assert_bisheng_supports_tl(env: dict[str, str], aicore_arch: str) -> None:
 # worker binary `msopprof` at $ASCEND_TOOLKIT_HOME/tools/msopprof/bin/msopprof
 # (CANN >= 9.0 layout). 8.x CANN ships the same worker at tools/msopt/bin. Some
 # 9.0 toolkit drops ship the launcher but omit the worker, so every collect dies
-# with `Cannot find msopprof` deep in the run. We probe up front and provision a
-# worker when one is missing.
+# with `Cannot find msopprof` deep in the run. We probe up front and optionally
+# provision a worker when the caller explicitly opts in.
 _MSOPPROF_REL = Path("tools/msopprof/bin/msopprof")
 _MSOPPROF_WORKER_RELS = (_MSOPPROF_REL, Path("tools/msopt/bin/msopprof"))
 # Specific msprof error phrases that mean "the worker is unreachable" — kept tight
@@ -1001,11 +1012,10 @@ def _find_msopprof_source(toolkit_home: Path, explicit: str | None) -> Path | No
 def ensure_msopprof_worker(env: dict[str, str], args: argparse.Namespace) -> None:
     """Guarantee `msprof op simulator` can find its msopprof backend.
 
-    Probe first; if the worker is reachable, do nothing. Otherwise locate a
-    msopprof binary (explicit --msopprof or another local CANN install) and
-    install it as a real *copy* (msprof rejects symlinks) at the path msprof
-    hardcodes, then re-probe. Fail early with precise remediation when no worker
-    is available or auto-provisioning is disabled.
+    Probe first; if the worker is reachable, do nothing. If the caller supplied
+    ``--msopprof`` or ``--auto-msopprof``, locate a worker and install it as a
+    real *copy* (msprof rejects symlinks) at the path msprof hardcodes, then
+    re-probe. Otherwise fail before writing outside the repository.
     """
     ok, detail = _msopprof_smoke(env)
     if ok:
@@ -1022,8 +1032,9 @@ def ensure_msopprof_worker(env: dict[str, str], args: argparse.Namespace) -> Non
         raise StepError(
             f"`msprof op simulator` cannot find its worker ({detail}).\n"
             f"  Expected at: {expected}\n"
-            f"  Auto-provisioning is off (--no-auto-msopprof). Install the matching CANN "
-            f"msopprof there, or pass --msopprof <path>."
+            f"  Provisioning is disabled by default. Install the matching CANN msopprof "
+            f"there, or obtain approval before passing --auto-msopprof or "
+            f"--msopprof <path>."
         )
     source = _find_msopprof_source(toolkit_home, args.msopprof)
     if source is None:
@@ -1202,6 +1213,7 @@ def main(argv: list[str] | None = None) -> int:
         f"cann_set_env={repo_path(args.cann_set_env)}",
         f"soc_version={args.soc_version}",
         f"generate_testcase={args.generate_testcase}",
+        f"dynamic_dim={args.dynamic_dim}",
         f"pto_isa_root={args.pto_isa_root}",
         "sources:",
         *[str(p) for p in sources],

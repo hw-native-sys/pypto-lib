@@ -27,7 +27,7 @@ Run both from the repository root:
 python .claude/skills/cube-tile-tuning/hint_l1_tile.py \
   --M <full-M> --N <full-N> --K <full-K> \
   --bytes-a <bytes> --bytes-b <bytes> --bytes-c <acc-bytes> \
-  --b-trans
+  --b-trans --platform <a2a3-or-a5>
 
 python .claude/skills/cube-tile-tuning/tile_budget.py \
   --M <row-tile> --N <n-fragment> --K <k-fragment> \
