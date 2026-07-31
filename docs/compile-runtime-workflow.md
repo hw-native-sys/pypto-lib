@@ -37,7 +37,6 @@ identical.
 | `-p` / `--platform` | Target backend. `a2a3` is Ascend 910B/C; `a5` is Ascend 950 — both run on real NPU. `a2a3sim` / `a5sim` are the matching simulators. |
 | `-d` / `--device` | Device ID for multi-card hosts. |
 | `--enable-l2-swimlane` | Forwarded to the runtime; collects per-task L2 perf records into the build_output (see [Runtime DFX flags](#runtime-dfx-flags)). |
-| `--export-kernel-insight` | Qwen3-14B decode helper: after a successful run, invokes `tools/export_all_kernel_insight.py` for the generated kernels and writes Insight exports under the same `build_output/<ProgramName>_<ts>/`. |
 
 `a2a3*` maps to `BackendType.Ascend910B`; `a5*` maps to
 `BackendType.Ascend950`.
@@ -234,11 +233,12 @@ For L2 swimlane: open the generated `merged_swimlane_*.json` at
 execution on each AICPU / AIC / AIV lane and inspect kernel duration,
 gaps, and dependency stalls.
 
-For kernel-internal swimlane / MindStudio Insight traces, use the repo tool
-directly on an existing build:
+For kernel-internal swimlane / MindStudio Insight traces, use the
+`incore-profiling` skill directly on an existing build:
 
 ```bash
-python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
+python .claude/skills/incore-profiling/incore_profile.py \
+  --build-dir build_output/<ProgramName>_<ts> --target a2a3
 ```
 
 or drive the case run end-to-end with `--case <kernel.py>` instead of

@@ -23,7 +23,6 @@ Task mapping:
 - PR workflow: `.claude/skills/github-pr/SKILL.md`
 - PR review fixes: `.claude/skills/fix-pr/SKILL.md`
 - Issue creation: `.claude/skills/create-issue/SKILL.md`
-- AscendC workflows: `.claude/skills/cannbot-skills/*/SKILL.md`
 
 When a Claude skill or agent refers to `Task`, a subagent, or Claude-only
 plugins:

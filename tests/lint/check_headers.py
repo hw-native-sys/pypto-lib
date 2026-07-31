@@ -22,9 +22,7 @@ PY_HEADER = """\
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------"""
 
-EXCLUDED_PREFIXES = [
-    ".claude/skills/cannbot-skills/",
-]
+EXCLUDED_PREFIXES = []
 
 EXCLUDED_SUFFIXES = [
     "_build/",

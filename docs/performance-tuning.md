@@ -355,19 +355,19 @@ Per-kernel intra-core swimlane (MindStudio Insight / msprof simulator
 trace), exported from an existing build directory:
 
 ```bash
-python tools/export_all_kernel_insight.py --build-dir build_output/<ProgramName>_<ts>
+python .claude/skills/incore-profiling/incore_profile.py \
+  --build-dir build_output/<ProgramName>_<ts> --target a2a3
 # → build_output/<...>/kernel_insight_all_funcs_<ts>/
 ```
 
-See [`tools/export_all_kernel_insight.py`](../tools/export_all_kernel_insight.py)
-for driving a case run end-to-end (`--case`) instead of reusing a build.
+Pass `--case <kernel.py>` instead of `--build-dir` to drive the case run
+end-to-end rather than reusing a build.
 
-For ad-hoc, single-kernel profiling without a full model run, the
-`incore-profiling` skill
-([`.claude/skills/incore-profiling/`](../.claude/skills/incore-profiling/SKILL.md))
-builds a standalone single-core simulator testcase per kernel — driven by the
+This is the `incore-profiling` skill
+([`.claude/skills/incore-profiling/`](../.claude/skills/incore-profiling/SKILL.md)):
+it builds a standalone single-core simulator testcase per kernel — driven by the
 kernel `.cpp` and its sibling `.pto`, with no PTOAS checkout — runs it under
-`msprof op simulator`, and emits the same Insight trace. De-clutter it into a
+`msprof op simulator`, and emits the Insight trace. De-clutter it into a
 Perfetto-viewable per-pipe swimlane with
 `python -m pypto.tools.clean_sim_trace <OPPROF_*> -o <out>`. See the skill's
 `SKILL.md` for the full flag reference and troubleshooting.
