@@ -1,0 +1,99 @@
+site_name: PyPTO-Lib
+site_description: Kernels, model implementations, and validation workflows built with PyPTO
+site_url: https://www.pypto.ai/pypto-lib/
+repo_url: https://github.com/hw-native-sys/pypto-lib
+repo_name: hw-native-sys/pypto-lib
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+exclude_docs: |
+  _hooks/
+  requirements.txt
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.action.edit
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+hooks:
+  - docs/_hooks/repo_links.py
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Get Started:
+      - Overview: get-started/index.md
+      - Installation and environment: get-started/installation.md
+      - Run your first kernel: get-started/first-kernel.md
+      - Platforms and devices: get-started/platforms.md
+      - Kernel coding style: pypto-coding-style.md
+  - Run and Validate:
+      - Overview: run-and-validate/index.md
+      - Compile and runtime workflow: compile-runtime-workflow.md
+      - Golden Harness: run-and-validate/golden-harness.md
+      - Save and replay golden data: run-and-validate/save-and-replay.md
+      - CCE extern kernels: cce-extern-kernel-guide.md
+  - Examples:
+      - Overview: examples/index.md
+      - Beginner: examples/beginner.md
+      - Intermediate: examples/intermediate.md
+      - Advanced and distributed: examples/advanced.md
+  - Models:
+      - Support matrix: models/index.md
+      - Qwen3: models/qwen3.md
+      - DeepSeek: models/deepseek.md
+  - Debug and Tune:
+      - Overview: debug-and-tune/index.md
+      - Debugging: debugging.md
+      - Precision tuning: precision-tuning.md
+      - Performance tuning: performance-tuning.md
+      - Cube tile tuning: debug-and-tune/cube-tile-tuning.md
+      - In-core simulator profiling: debug-and-tune/incore-simulator-profiling.md
+      - On-device timestamp profiling: incore-timestamp-profiling.md
+      - Precision regression bisect: debug-and-tune/precision-regression-bisect.md

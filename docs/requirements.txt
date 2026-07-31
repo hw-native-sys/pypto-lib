@@ -1,0 +1,5 @@
+# Documentation-only dependencies. Building the site must not install PyPTO,
+# CANN, or this repository's runtime dependencies.
+mkdocs==1.6.1
+mkdocs-material==9.7.7
+PyYAML>=6,<7
