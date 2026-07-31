@@ -368,7 +368,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             for n_sub in pl.range(N_SUB):
                 n0 = q_n_region + n_sub * TN
                 q_acc = pl.matmul(
-                    normed_in[:, q_k_base : q_k_base + TK],
+                    pl.tensor.set_validshape(normed_in[:, q_k_base : q_k_base + TK], batch, TK),
                     wq[layer_hidden_base + q_k_base : layer_hidden_base + q_k_base + TK, n0 : n0 + TN],
                     out_dtype=pl.FP32,
                 )
@@ -376,7 +376,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     kk = q_k_base + kc * TK
                     q_acc = pl.matmul_acc(
                         q_acc,
-                        normed_in[:, kk : kk + TK],
+                        pl.tensor.set_validshape(normed_in[:, kk : kk + TK], batch, TK),
                         wq[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                     )
                 q_proj = pl.assemble(q_proj, q_acc, [0, n0], atomic=pl.AtomicType.Add)
@@ -434,7 +434,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             for n_sub in pl.range(N_SUB):
                 n0 = k_n_region + n_sub * TN
                 k_acc = pl.matmul(
-                    normed_in[:, k_k_base : k_k_base + TK],
+                    pl.tensor.set_validshape(normed_in[:, k_k_base : k_k_base + TK], batch, TK),
                     wk[layer_hidden_base + k_k_base : layer_hidden_base + k_k_base + TK, n0 : n0 + TN],
                     out_dtype=pl.FP32,
                 )
@@ -442,7 +442,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     kk = k_k_base + kc * TK
                     k_acc = pl.matmul_acc(
                         k_acc,
-                        normed_in[:, kk : kk + TK],
+                        pl.tensor.set_validshape(normed_in[:, kk : kk + TK], batch, TK),
                         wk[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                     )
                 k_proj = pl.assemble(k_proj, k_acc, [0, n0], atomic=pl.AtomicType.Add)
@@ -461,7 +461,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             for n_sub in pl.range(N_SUB):
                 n0 = v_n_region + n_sub * TN
                 v_acc = pl.matmul(
-                    normed_in[:, v_k_base : v_k_base + TK],
+                    pl.tensor.set_validshape(normed_in[:, v_k_base : v_k_base + TK], batch, TK),
                     wv[layer_hidden_base + v_k_base : layer_hidden_base + v_k_base + TK, n0 : n0 + TN],
                     out_dtype=pl.FP32,
                 )
@@ -469,7 +469,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     kk = v_k_base + kc * TK
                     v_acc = pl.matmul_acc(
                         v_acc,
-                        normed_in[:, kk : kk + TK],
+                        pl.tensor.set_validshape(normed_in[:, kk : kk + TK], batch, TK),
                         wv[layer_hidden_base + kk : layer_hidden_base + kk + TK, n0 : n0 + TN],
                     )
                 v_proj = pl.assemble(v_proj, v_acc, [0, n0], atomic=pl.AtomicType.Add)
@@ -557,12 +557,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 name_hint="out_proj",
                 deps=[out_proj_dummy],
             ) as out_tid:
-                out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+                out_a0 = pl.tensor.set_validshape(attn_out[:, k_op : k_op + OUT_INNER_TK], batch, OUT_INNER_TK)
                 out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
                 out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
                 for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
                     out_ks_off = out_lk * OUT_INNER_TK
-                    out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
+                    out_a_k = pl.tensor.set_validshape(
+                        attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK],
+                        batch, OUT_INNER_TK)
                     out_w_k = wo[
                         layer_hidden_base + k_op + out_ks_off : layer_hidden_base + k_op + out_ks_off + OUT_INNER_TK,
                         n_op : n_op + OUT_TN,
@@ -581,12 +583,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             k_split_out = out_idx % K_SPLITS_OUT
             n_op = n_out_proj * OUT_TN
             k_op = k_split_out * OUT_TK
-            out_a0 = attn_out[:, k_op : k_op + OUT_INNER_TK]
+            out_a0 = pl.tensor.set_validshape(attn_out[:, k_op : k_op + OUT_INNER_TK], batch, OUT_INNER_TK)
             out_w0 = wo[layer_hidden_base + k_op : layer_hidden_base + k_op + OUT_INNER_TK, n_op : n_op + OUT_TN]
             out_c_acc = pl.matmul(out_a0, out_w0, out_dtype=pl.FP32)
             for out_lk in pl.pipeline(1, OUT_N_SUB_K, stage=2):
                 out_ks_off = out_lk * OUT_INNER_TK
-                out_a_k = attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK]
+                out_a_k = pl.tensor.set_validshape(
+                        attn_out[:, k_op + out_ks_off : k_op + out_ks_off + OUT_INNER_TK],
+                        batch, OUT_INNER_TK)
                 out_w_k = wo[
                     layer_hidden_base + k_op + out_ks_off : layer_hidden_base + k_op + out_ks_off + OUT_INNER_TK,
                     n_op : n_op + OUT_TN,
@@ -683,7 +687,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             ) as gate_spmd_tid:
                 spmd_gate_n_out = pl.get_block_idx()
                 spmd_gate_n0 = spmd_gate_n_out * MLP_TN
-                spmd_gate_a0 = mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK]
+                spmd_gate_a0 = pl.tensor.set_validshape(
+                    mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK], batch, MLP_INNER_TK)
                 spmd_gate_w0 = w_gate[
                     layer_hidden_base + gu_k0 : layer_hidden_base + gu_k0 + MLP_INNER_TK,
                     spmd_gate_n0 : spmd_gate_n0 + MLP_TN,
@@ -691,9 +696,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 spmd_gate_c_acc = pl.matmul(spmd_gate_a0, spmd_gate_w0, out_dtype=pl.FP32)
                 for spmd_gate_lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                     spmd_gate_ks_off = spmd_gate_lk * MLP_INNER_TK
-                    spmd_gate_a_k = mlp_norm_in[
-                        :, gu_k0 + spmd_gate_ks_off : gu_k0 + spmd_gate_ks_off + MLP_INNER_TK
-                    ]
+                    spmd_gate_a_k = pl.tensor.set_validshape(
+                        mlp_norm_in[
+                            :, gu_k0 + spmd_gate_ks_off : gu_k0 + spmd_gate_ks_off + MLP_INNER_TK
+                        ],
+                        batch,
+                        MLP_INNER_TK,
+                    )
                     spmd_gate_w_k = w_gate[
                         layer_hidden_base + gu_k0 + spmd_gate_ks_off : layer_hidden_base
                         + gu_k0
@@ -715,7 +724,8 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
             ) as up_spmd_tid:
                 spmd_up_n_out = pl.get_block_idx()
                 spmd_up_n0 = spmd_up_n_out * MLP_TN
-                spmd_up_a0 = mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK]
+                spmd_up_a0 = pl.tensor.set_validshape(
+                    mlp_norm_in[:, gu_k0 : gu_k0 + MLP_INNER_TK], batch, MLP_INNER_TK)
                 spmd_up_w0 = w_up[
                     layer_hidden_base + gu_k0 : layer_hidden_base + gu_k0 + MLP_INNER_TK,
                     spmd_up_n0 : spmd_up_n0 + MLP_TN,
@@ -723,9 +733,13 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 spmd_up_c_acc = pl.matmul(spmd_up_a0, spmd_up_w0, out_dtype=pl.FP32)
                 for spmd_up_lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                     spmd_up_ks_off = spmd_up_lk * MLP_INNER_TK
-                    spmd_up_a_k = mlp_norm_in[
-                        :, gu_k0 + spmd_up_ks_off : gu_k0 + spmd_up_ks_off + MLP_INNER_TK
-                    ]
+                    spmd_up_a_k = pl.tensor.set_validshape(
+                        mlp_norm_in[
+                            :, gu_k0 + spmd_up_ks_off : gu_k0 + spmd_up_ks_off + MLP_INNER_TK
+                        ],
+                        batch,
+                        MLP_INNER_TK,
+                    )
                     spmd_up_w_k = w_up[
                         layer_hidden_base + gu_k0 + spmd_up_ks_off : layer_hidden_base
                         + gu_k0
@@ -753,12 +767,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     name_hint="gate_proj",
                     deps=[gate_late_tids[k_split]],
                 ) as gate_tid:
-                    a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
+                    a0 = pl.tensor.set_validshape(mlp_norm_in[:, k0 : k0 + MLP_INNER_TK], batch, MLP_INNER_TK)
                     w0 = w_gate[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
-                        a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
+                        a_k = pl.tensor.set_validshape(
+                            mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK],
+                            batch, MLP_INNER_TK)
                         w_k = w_gate[
                             layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
                             n0 : n0 + MLP_TN,
@@ -772,12 +788,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     name_hint="up_proj",
                     deps=[up_late_tids[k_split]],
                 ) as up_tid:
-                    a0 = mlp_norm_in[:, k0 : k0 + MLP_INNER_TK]
+                    a0 = pl.tensor.set_validshape(mlp_norm_in[:, k0 : k0 + MLP_INNER_TK], batch, MLP_INNER_TK)
                     w0 = w_up[layer_hidden_base + k0 : layer_hidden_base + k0 + MLP_INNER_TK, n0 : n0 + MLP_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, MLP_N_SUB_K, stage=2):
                         ks_off = lk * MLP_INNER_TK
-                        a_k = mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK]
+                        a_k = pl.tensor.set_validshape(
+                            mlp_norm_in[:, k0 + ks_off : k0 + ks_off + MLP_INNER_TK],
+                            batch, MLP_INNER_TK)
                         w_k = w_up[
                             layer_hidden_base + k0 + ks_off : layer_hidden_base + k0 + ks_off + MLP_INNER_TK,
                             n0 : n0 + MLP_TN,
@@ -828,12 +846,14 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                     allow_early_resolve=True,
                     deps=[silu_tids[k_split]],  # down_seed funneled via fa_fused (silu -> ... -> out_proj -> fa_fused)
                 ) as down_tid:
-                    a0 = mlp_tile[:, k0 : k0 + DOWN_TK]
+                    a0 = pl.tensor.set_validshape(mlp_tile[:, k0 : k0 + DOWN_TK], batch, DOWN_TK)
                     w0 = w_down[layer_inter_base + k0 : layer_inter_base + k0 + DOWN_TK, n0 : n0 + DOWN_TN]
                     c_acc = pl.matmul(a0, w0, out_dtype=pl.FP32)
                     for lk in pl.pipeline(1, N_SUB_K, stage=2):
                         ks_off = lk * DOWN_TK
-                        a_k = mlp_tile[:, k0 + ks_off : k0 + ks_off + DOWN_TK]
+                        a_k = pl.tensor.set_validshape(
+                            mlp_tile[:, k0 + ks_off : k0 + ks_off + DOWN_TK],
+                            batch, DOWN_TK)
                         w_k = w_down[layer_inter_base + k0 + ks_off : layer_inter_base + k0 + ks_off + DOWN_TK, n0 : n0 + DOWN_TN]
                         c_acc = pl.matmul_acc(c_acc, a_k, w_k)
                     down_acc_all = pl.assemble(down_acc_all, c_acc, [0, n0], atomic=pl.AtomicType.Add)
@@ -1603,7 +1623,7 @@ if __name__ == "__main__":
     # caught without needing a device or the heavy full-graph simulation).
     if args.smoke or args.platform.endswith("sim"):
         smoke_out = torch.empty([BATCH_PAD, HIDDEN], dtype=torch.bfloat16)
-        post_pass = decode_fwd_layers.compile_for_test(*_smoke_inputs(), smoke_out)
+        post_pass = decode_fwd_layers.lower(*_smoke_inputs(), smoke_out)
         print(f"Compiled program has {len(post_pass.functions)} function(s):")
         for fn in post_pass.functions.values():
             print(f"  {fn.name}: {fn.func_type}")
