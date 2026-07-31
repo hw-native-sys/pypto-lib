@@ -105,14 +105,18 @@ activate_environment() {
     [[ -d "$PTOAS_BIN" ]] || die "PTOAS directory not found: $PTOAS_BIN"
     [[ -d "$PTO_ISA_DIR" ]] || die "PTO ISA directory not found: $PTO_ISA_DIR"
 
-    set +u
-    # shellcheck disable=SC1090
-    source "$conda_sh"
-    conda activate "$CONDA_ENV"
-    # shellcheck disable=SC1090
-    source "$cann_set_env"
-    export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    set -u
+    # Validate the child environment without leaking Conda's libraries into
+    # the parent Git/SSH process.
+    (
+        set +u
+        # shellcheck disable=SC1090
+        source "$conda_sh"
+        conda activate "$CONDA_ENV"
+        # shellcheck disable=SC1090
+        source "$cann_set_env"
+        export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        python -c 'import ctypes; ctypes.CDLL("libhccl.so")'
+    )
 
     require_command git
     require_command task-submit
@@ -187,6 +191,11 @@ run_case() {
         task-submit
         --ptoas "$ptoas_version"
         --device "$device"
+        --env PTO_ISA_ROOT
+        --env TZ
+        --env PTO2_RING_TASK_WINDOW
+        --env PTO2_RING_DEP_POOL
+        --env PTO2_RING_HEAP
     )
     if [[ -n "$device_num" ]]; then
         submit_command+=(--device-num "$device_num")
