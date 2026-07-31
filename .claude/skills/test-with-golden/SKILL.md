@@ -3,120 +3,52 @@ name: test-with-golden
 description: Speed up iterative kernel testing by generating the golden reference ONCE (save_data=True) and replaying it on every later run via golden_data, skipping input generation and the torch golden recompute each iteration. Adds a --save-data flag to the kernel when it lacks one. Use for performance/timing tuning where the kernel's numerical result is unchanged between runs; NOT recommended for precision debugging.
 ---
 
-# Test with a frozen golden (`test-with-golden`)
+# Test with a Frozen Golden
 
-Iterating on a kernel usually means running the same golden test dozens of
-times. Every run regenerates random inputs and recomputes the torch golden —
-work that is pure overhead when you are only changing *how fast* the kernel
-runs, not *what* it computes. This skill freezes the golden once and replays
-it, so each later run is just **compile + device + validate**.
-
-The harness already supports this through two `run` / `run_jit` kwargs:
-
-- `save_data=True` — persist generated inputs to `{work_dir}/data/in/` and the
-  golden outputs to `{work_dir}/data/out/`.
-- `golden_data=<dir>` — load inputs from `<dir>/in/` and expected outputs from
-  `<dir>/out/` instead of generating fresh data and recomputing the golden.
-  `golden_data` takes precedence over `golden_fn`.
-
-Since `save_data` now defaults to **False**, the first run must explicitly opt
-in to produce the snapshot; every run after that reuses it.
-
-## When to use
-
-**Use it for performance / timing work** — tile-size sweeps, scope tuning,
-loop-construct changes, buffer sizing, swimlane / PMU profiling. The kernel's
-numerical output is expected to be identical across iterations, so a single
-frozen golden stays valid and you save the per-run generation + golden cost.
-
-**Do NOT use it for precision debugging.** Precision work changes the numerics
-(quant schemes, dtype/rounding, fixtures) and often varies the RNG seed to
-probe input-dependent error. A frozen golden pins one input sample, hiding
-that variation, and any fixture/quant change silently invalidates the cached
-`data/out/`. Regenerate the golden every run there instead.
+Read [Save and Replay Golden Data](../../../docs/run-and-validate/save-and-replay.md)
+before editing or running the target. That page is the canonical API,
+snapshot-layout, invalidation, and CLI-wiring reference.
 
 ## Workflow
 
-### 1. First run — generate and persist the golden
+1. Confirm that replay is appropriate. Use it for performance or timing work
+   whose specs, inputs, golden logic, and intended numerics remain unchanged.
+   Do not use it for a precision investigation that needs fixture, seed,
+   dtype, rounding, quantization, or reference changes.
+2. Inspect the target's `__main__` and its `run` or `run_jit` call. Check
+   whether both `--save-data` and `--golden-data` are already exposed.
+3. If either flag is missing, add only the minimal argparse option and keyword
+   forwarding shown in the canonical guide. Do not change the default run:
+   saving must remain opt-in and replay must default to `None`.
+4. Run the target once with its normal platform/device arguments plus
+   `--save-data`. Treat a failed or validation-skipped run as unusable; do not
+   promote its data directory as a snapshot.
+5. Resolve the snapshot from `RunResult.work_dir/data` when the caller exposes
+   the result. Otherwise inspect `build_output/` and require an unambiguous
+   passing run with both `in/` and `out/`; never guess among concurrent runs.
+6. Verify that the snapshot contains every file required by the current specs.
+   Record the snapshot path and the source revision or working-tree state that
+   produced it.
+7. Replay with `--golden-data <work_dir>/data`. Require both input and output
+   cache-hit messages and a passing validation result.
+8. Reuse that exact path for later eligible iterations. Regenerate immediately
+   when any invalidation condition in the guide becomes true.
 
-If the kernel's `__main__` exposes a `--save-data` flag, use it:
+## Safety and Scope
 
-```bash
-python models/deepseek/v4-flash/decode_attention_swa.py -p a2a3 -d 0 --save-data
-```
+- Keep snapshots in `build_output/` or another untracked location. Do not stage
+  `.pt` files.
+- Do not delete an existing snapshot unless the user asks; report stale or
+  superseded paths instead.
+- Do not present replay as a correctness check when validation was skipped.
+- Treat `runtime_dir` as a separate optimization with its own source-compatibility
+  constraint; do not enable it merely because `golden_data` is in use.
+- Keep temporary CLI edits scoped to the requested kernel. Retain them only
+  when they are suitable as a supported interface; otherwise revert those
+  edits after the iteration with the user's work preserved.
 
-**If the kernel has no `--save-data` flag, add it as part of this workflow.**
-`save_data` defaults to False, so a kernel without the flag never persists a
-snapshot and there is nothing to replay. Grep the kernel's `__main__` for
-`--save-data`; when it is missing, wire the flag in with two small edits:
+## Report
 
-1. Add the argument next to the existing `--golden-data` (or the other flags):
-
-   ```python
-   parser.add_argument("--save-data", action="store_true", default=False,
-                       help="persist inputs + golden to data/ for later --golden-data replay")
-   ```
-
-2. Forward it into the `run` / `run_jit` call:
-
-   ```python
-   save_data=args.save_data,
-   ```
-
-If the kernel also lacks `--golden-data`, add that too
-(`parser.add_argument("--golden-data", type=str, default=None)` +
-`golden_data=args.golden_data`) so step 3 has a knob to point at. These edits
-are local to the kernel's CLI; keep them only as long as you are iterating,
-and revert them when done unless the kernel should carry the flags upstream.
-
-### 2. Locate the persisted data directory
-
-The snapshot lands under the compiled output dir, `{work_dir}/data`, which is
-`build_output/<program>/data` **relative to the directory you launched the
-kernel from** (not necessarily next to the kernel file):
-
-```bash
-find build_output -type d -name data
-# -> build_output/_jit_<program>_<timestamp>/data   (contains in/ and out/)
-```
-
-You can also read `result.work_dir` from the `RunResult` — the data dir is
-`<work_dir>/data`.
-
-### 3. Subsequent runs — replay the frozen golden
-
-Point every later run at that directory. Input generation and the torch golden
-are both skipped (the run logs a `cache hit` for each); validation still runs
-against the cached `out/`:
-
-```bash
-python models/deepseek/v4-flash/decode_attention_swa.py -p a2a3 -d 0 \
-    --golden-data build_output/_jit_<program>_<timestamp>/data
-```
-
-A successful replay prints, before the runtime stage:
-
-```
-[RUN] generate inputs ...
-[RUN]   cache hit: build_output/_jit_<program>_<timestamp>/data/in
-[RUN] compute golden ...
-[RUN]   cache hit: build_output/_jit_<program>_<timestamp>/data/out
-```
-
-For kernels without a `--golden-data` flag, add one (step 1) or pass
-`golden_data="<dir>"` at the `run` / `run_jit` call site instead.
-
-## Requirements and caveats
-
-- **Specs must be unchanged.** Replay loads `data/in/*.pt` / `data/out/*.pt`
-  by spec name; if you change tensor shapes, dtypes, the spec set, or the RNG
-  seed, the cached data no longer matches. Delete the `data/` dir and redo
-  step 1.
-- **Golden logic changes invalidate the cache.** If you edit `golden_fn` (the
-  reference computation), the cached `out/` is stale — regenerate it.
-- **Compile still runs.** `golden_data` only skips input/golden generation, not
-  codegen. To also skip recompilation between iterations, combine with
-  `runtime_dir=<build_output/...>` (valid only while the kernel source is
-  unchanged; cpp edits are picked up, kernel-logic edits are not).
-- **Validation is unaffected.** The device output is always compared against
-  the (cached or freshly computed) golden; replay does not weaken the check.
+Report why replay was eligible, any CLI edits, the capture command, snapshot
+path, replay command, cache-hit evidence, validation result, and the conditions
+that will require regeneration.
