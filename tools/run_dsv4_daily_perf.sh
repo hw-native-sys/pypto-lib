@@ -159,6 +159,11 @@ dry_run() {
     print_case_plan
 }
 
+extract_median_us() {
+    local log_file="$1"
+    sed -nE 's/.*effective_us .*median=([0-9]+([.][0-9]+)?).*/\1/p' "$log_file" | tail -n 1
+}
+
 extract_mean_us() {
     local log_file="$1"
     sed -nE 's/.*effective_us .*mean=([0-9]+([.][0-9]+)?).*/\1/p' "$log_file" | tail -n 1
@@ -177,7 +182,7 @@ run_case() {
     local benchmark_log="$result_dir/$benchmark_log_name"
     local submit_log="$result_dir/${label}.task-submit.log"
     local checkout_q conda_sh_q conda_env_q cann_set_env_q benchmark_log_q
-    local child_command rc mean_us status
+    local child_command rc median_us mean_us status
     local -a submit_command
 
     printf -v checkout_q '%q' "$checkout"
@@ -214,21 +219,24 @@ run_case() {
         rc=$?
     fi
 
+    median_us="$(extract_median_us "$benchmark_log")"
     mean_us="$(extract_mean_us "$benchmark_log")"
     if [[ "$rc" -ne 0 ]]; then
         status="fail"
-    elif [[ -z "$mean_us" ]]; then
+    elif [[ -z "$median_us" ]]; then
         status="missing_metric"
     else
         status="pass"
     fi
+    [[ -n "$median_us" ]] || median_us="-"
     [[ -n "$mean_us" ]] || mean_us="-"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$label" "$status" "$ptoas_version" "$device" "$mean_us" "$git_sha" "$benchmark_log_name" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$label" "$status" "$ptoas_version" "$device" "$median_us" "$mean_us" "$git_sha" \
+        "$benchmark_log_name" \
         >>"$result_dir/results.tsv"
 
-    log "Finished $label: status=$status, mean_us=$mean_us"
+    log "Finished $label: status=$status, median_us=$median_us, mean_us=$mean_us"
     if [[ -s "$submit_log" ]]; then
         tail -n 20 "$submit_log"
     fi
@@ -245,7 +253,8 @@ run_benchmarks() {
     local git_sha="$3"
     local failures=0
 
-    printf 'case\tstatus\tptoas\tdevice\tmean_us\tgit_sha\tlog\n' >"$result_dir/results.tsv"
+    printf 'case\tstatus\tptoas\tdevice\tmedian_us\tmean_us\tgit_sha\tlog\n' \
+        >"$result_dir/results.tsv"
 
     run_case \
         "$checkout" "$result_dir" "$git_sha" \
@@ -278,7 +287,7 @@ run_benchmarks() {
         "decode_fwd_43l_ep2_8k_perf.log" || failures=$((failures + 1))
 
     if [[ "$failures" -ne 0 ]]; then
-        log "$failures benchmark case(s) failed or emitted no effective_us mean."
+        log "$failures benchmark case(s) failed or emitted no effective_us median."
         return 1
     fi
 
