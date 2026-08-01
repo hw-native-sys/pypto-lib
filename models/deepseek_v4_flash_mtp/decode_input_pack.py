@@ -68,6 +68,10 @@ def pack_mtp_hidden(
     fallback_hidden: pl.Tensor[[DECODE_SEQ, HC_MULT, D], pl.FP32],
     packed_hidden: pl.Tensor[[DECODE_TOKENS, HC_MULT, D], pl.FP32],
 ) -> pl.Tensor[[DECODE_TOKENS, HC_MULT, D], pl.FP32]:
+    # ``pack_x_hc`` is also used by the ordinary S=1 decode path.  The MTP
+    # geometry is encoded in the static tensor signatures above and validated
+    # by the serving-side MTP layout; keep this JIT body free of Python
+    # assertions because the PyPTO parser does not lower ``assert``.
     for block in pl.spmd(SPMD_BLOCKS, name_hint="pack_mtp_hidden"):
         for work_idx in pl.range(
             block,
