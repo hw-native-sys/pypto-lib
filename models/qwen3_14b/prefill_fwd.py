@@ -1597,7 +1597,7 @@ def prefill_layer(
                             if FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK:
                                 if block_ctx_blocks == 1:
                                     if finalize_tok == FINALIZE_TOK_GROUP and p0_idx == 0:
-                                        if user_batch == 1:
+                                        if batch == 1:
                                             attn_tile, out_proj_tile, cur_li_phase, oi_tmp_phase = (
                                                 _rope_qkpv_out_single_block_fused(
                                                     attn_tile,
@@ -1850,7 +1850,7 @@ def prefill_layer(
                     if FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK:
                         if tile_block_ctx_blocks == 1:
                             if valid_tok == FINALIZE_TOK_GROUP and p0_idx == 0:
-                                if user_batch == 1:
+                                if batch == 1:
                                     if FUSE_OUT_PROJ_IN_ROPE_QKPV:
                                         out_proj_tile = out_proj_tile
                                     else:
