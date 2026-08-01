@@ -200,7 +200,7 @@ def dispatch(
     # loc_e on EVERY destination rank, so the blocking cross-rank puts fan out
     # across N_LOCAL cores. One slot counter per destination rank; token-major
     # order matches the meta pass's per-(dst, loc_e) cumulative count.
-    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True):
+    with pl.spmd(N_LOCAL, name_hint="dispatch_push", allow_early_resolve=True) as _push_tid:
         loc_e = pl.tile.get_block_idx()
         active_tokens = pl.cast(num_tokens, pl.INDEX)
         if active_tokens < 0:
@@ -262,7 +262,11 @@ def dispatch(
     # with dispatch_push instead of trailing dispatch_meta's spin. Anchor it to
     # something -- an unanchored wait is dispatched immediately and spins holding a
     # core group, so pipelined layers stack up spinners.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", allow_early_resolve=True) as _wait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="dispatch_wait",
+        deps=[_push_tid],
+    ) as _wait_tid:
         _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
@@ -282,7 +286,6 @@ def dispatch(
         N_LOCAL,
         name_hint="dispatch_gather",
         deps=[_wait_tid, _meta_tid],
-        allow_early_resolve=True,
     ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
@@ -323,9 +326,8 @@ def combine(
     # Rows are src-major, so the per-(e, src) base is a loop-carried prefix sum over
     # src inside the block (same shape as dispatch_gather). Each route maps to a
     # unique (dst, loc_e) and r_route, so the blocks' puts are write-disjoint.
-    # allow_early_resolve: shared_routed pre-stages only when every producer of its
-    # fanin is flagged, and combine_wait already is.
-    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True):
+    # The combine can resolve early so the wait overlaps the local scatter.
+    with pl.spmd(N_LOCAL, name_hint="combine", allow_early_resolve=True) as _combine_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
         b = pl.cast(0, pl.INDEX)
@@ -365,7 +367,11 @@ def combine(
     # starts. Anchor it to something -- a wait with no dep at all is dispatched the
     # moment the scheduler reaches it and spins holding a core group, so pipelined
     # layers stack up spinners that starve the scatters they wait on.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="combine_wait",
+        deps=[_combine_tid],
+    ) as _cwait_tid:
         _recv_y_anchor = pl.read(recv_y_flat, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:

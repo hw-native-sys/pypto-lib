@@ -55,7 +55,6 @@ from moe import (
     TOPK,
     VOCAB,
     build_tensor_specs as build_moe_tensor_specs,
-    clear_moe_signals,
     moe,
 )
 from config import FLASH as MODEL_CONFIG
@@ -151,7 +150,7 @@ FWD_INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
 
 # T // 2 active tokens need more than the runtime's default ring-2 heap while
 # the 43-layer prefill scope is open. Keep the other rings on their defaults.
-PREFILL_RING_HEAP = (0, 0, 2 * 1024 * 1024 * 1024, 0)
+PREFILL_RING_HEAP = (0, 0, 4 * 1024 * 1024 * 1024, 0)
 
 # Replicated head weights (per-rank, not layer-stacked): hc_head projection and
 # the final RMSNorm gamma — mirrors decode_fwd.
@@ -327,6 +326,7 @@ def prefill_fwd(
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    moe_epoch_base: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
@@ -406,7 +406,8 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(0, pl.INT32), nt, my_rank, pl.cast(1, pl.INT32),
+            pl.cast(0, pl.INT32), nt, my_rank,
+            pl.cast(moe_epoch_base + 1, pl.INT32),
         )
 
     # ===================== layer 1 : swa =================================
@@ -468,15 +469,16 @@ def prefill_fwd(
             hidden,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            pl.cast(1, pl.INT32), nt, my_rank, pl.cast(2, pl.INT32),
+            pl.cast(1, pl.INT32), nt, my_rank,
+            pl.cast(moe_epoch_base + 2, pl.INT32),
         )
 
     # ============ loop : csa (even) + hca (odd) pairs, layers 2..41 ======
     for loop_i in pl.range(HCA_NUM_LAYERS):
         csa_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 2, pl.INT32)
         hca_layer: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
-        csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 3, pl.INT32)
-        hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(loop_i * 2 + 4, pl.INT32)
+        csa_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + loop_i * 2 + 3, pl.INT32)
+        hca_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + loop_i * 2 + 4, pl.INT32)
 
         # ---- csa attention weights (per-FWD by csa_layer, compact by loop_i) ----
         hc_attn_fn_csa: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer * MIX_HC, 0])
@@ -640,7 +642,7 @@ def prefill_fwd(
     # ================ layer 42 (FWD_LAST_LAYER) : csa -> x_out ===========
     csa_layer_last: pl.Scalar[pl.INT32] = pl.cast(FWD_LAST_LAYER, pl.INT32)
     csa_order_last: pl.Scalar[pl.INT32] = pl.cast(CSA_LAST_ORDER, pl.INT32)
-    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(LAST_MOE_EPOCH, pl.INT32)
+    last_moe_epoch: pl.Scalar[pl.INT32] = pl.cast(moe_epoch_base + LAST_MOE_EPOCH, pl.INT32)
     hc_attn_fn_last: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32] = pl.slice(hc_attn_fn, [MIX_HC, HC_DIM], [csa_layer_last * MIX_HC, 0])
     hc_attn_scale_last: pl.Tensor[[3], pl.FP32] = pl.slice(hc_attn_scale, [3], [csa_layer_last * 3])
     hc_attn_base_last: pl.Tensor[[MIX_HC], pl.FP32] = pl.slice(hc_attn_base, [MIX_HC], [csa_layer_last * MIX_HC])
@@ -726,7 +728,6 @@ def prefill_fwd(
             routed_y_buf, combine_arrived,
             csa_layer_last, nt, my_rank, last_moe_epoch,
         )
-    clear_moe_signals(pre_hc_hidden_out, arrived, data_arrived, combine_arrived)
     x_head: pl.Tensor[[T, D], pl.BF16] = pl.create_tensor([T, D], dtype=pl.BF16)
     with pl.scope():
         hc_head(pre_hc_hidden_out, hc_head_fn, hc_head_scale, hc_head_base, x_head)
@@ -820,6 +821,7 @@ def l3_prefill_fwd(
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    moe_epoch_base: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
@@ -867,7 +869,7 @@ def l3_prefill_fwd(
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r], routed_w2[r],
             routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
             shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], num_tokens_per_owner, r,
-            device=r,
+            moe_epoch_base, device=r,
         )
 
     # Grouped LM head: the N_RANKS DP world is cut into N_RANKS // LM_HEAD_TP_SIZE
@@ -1288,7 +1290,7 @@ def build_tensor_specs(
     active_ranks=N_RANKS,
 ):
     import torch
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
 
     def init_lm_head_weight():
         shards = (torch.randn(LM_HEAD_TP_SIZE, VOCAB_PER_TP, D) / D ** 0.5).to(torch.bfloat16)
@@ -1405,6 +1407,9 @@ def build_tensor_specs(
         torch.int32,
         init_value=init_logit_row_indices,
     ))
+    # The standalone prefill driver is a single dispatch, so its first MoE
+    # epoch starts at zero. Serving advances this value for each chunk.
+    specs.append(ScalarSpec("moe_epoch_base", torch.int32, 0))
     return specs
 
 

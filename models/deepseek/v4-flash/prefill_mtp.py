@@ -268,6 +268,7 @@ def l3_mtp_prefill_fwd(
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
+    num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -288,6 +289,12 @@ def l3_mtp_prefill_fwd(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        # The distributed host-orchestration backend currently cannot lower a
+        # dynamic tensor element read reliably (it emits ``tensor.read`` in the
+        # generated Python without importing that namespace).  All ranks use
+        # the same scalar upper bound here; the serving side pads ranks with no
+        # live rows using isolated scratch slots.  Keep the per-owner vector in
+        # the ABI for metadata/debugging and future backends.
         mtp_prefill_fwd(
             hidden_states[r], prev_hidden_states[r],
             enorm_w[r], hnorm_w[r],
@@ -546,6 +553,19 @@ def build_tensor_specs(start_pos=0, num_tokens=T, ori_block_num=BLOCK_NUM):
         init_value=init_logit_row_indices,
     )
     specs.append(row_indices_spec)
+    def init_num_tokens_per_owner():
+        return torch.full((N_RANKS,), int(num_tokens), dtype=torch.int32)
+
+    specs.append(
+        TensorSpec(
+            "num_tokens_per_owner",
+            [N_RANKS],
+            torch.int32,
+            init_value=init_num_tokens_per_owner,
+        )
+    )
+    # Keep the scalar in the standalone operator contract for existing golden
+    # callers; the distributed wrapper uses the per-owner vector above.
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
     return specs
 
