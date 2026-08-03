@@ -1,6 +1,6 @@
 site_name: PyPTO-Lib
 site_description: Kernels, model implementations, and validation workflows built with PyPTO
-site_url: https://www.pypto.ai/pypto-lib/
+site_url: https://hw-native-sys.github.io/pypto-lib/
 repo_url: https://github.com/hw-native-sys/pypto-lib
 repo_name: hw-native-sys/pypto-lib
 edit_uri: edit/main/docs/
