@@ -38,6 +38,13 @@ from decode_attention_swa import (
 )
 from decode_metadata_device import build_swa_metadata
 from decode_input_pack import pack_mtp_hidden
+from decode_routing import (
+    ROUTING_MODES,
+    ROUTING_TRACE_HASH,
+    build_trace_hash_tid2eid,
+    resolve_routing_layer_id,
+    routing_mode_value,
+)
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
     GROUP_LOGIT_ROWS,
@@ -48,6 +55,7 @@ from lm_head import (
     VOCAB_PER_TP,
     compare_sampled_ids,
     golden_lm_head,
+    lm_head,
     lm_head_with_sampling,
 )
 from lookup_embedding import VOCAB_DYN as EMBED_VOCAB_DYN, lookup_embedding
@@ -75,12 +83,212 @@ from mtp_projection import golden_mtp_projection, mtp_projection
 from rmsnorm import golden_rms_norm, rms_norm
 
 
-# balanced hash routing
-MTP_ROUTE_LAYER_ID = 0
+# model config
+MTP_LAYER_ID = M.num_hidden_layers
 
 # communication
 MTP_MOE_EPOCH = 1
 LM_HEAD_COMM_EPOCH = 1
+
+
+@pl.jit.inline(auto_scope=False)
+def _mtp_decode_body(
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
+    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    tail_pre_hc_pool: pl.Tensor[[B, HC_MULT, D], pl.FP32],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    enorm_w: pl.Tensor[[D], pl.FP32],
+    hnorm_w: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    e_proj_smooth: pl.Tensor[[D], pl.FP32],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[MOE_VOCAB, MOE_TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routing_input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    mtp_hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    mtp_hc_head_scale: pl.Tensor[[1], pl.FP32],
+    mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    mtp_norm_w: pl.Tensor[[D], pl.BF16],
+    hidden_out: pl.Tensor[[T, D], pl.BF16],
+    next_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    routing_mode: pl.Scalar[pl.INT32],
+):
+    hidden_states = pl.create_tensor([T, D], dtype=pl.BF16)
+    lookup_embedding(input_ids, embed_weight, hidden_states)
+    prev_pre_hc_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    fallback_hidden = main_pre_hc_hidden[0:DECODE_SEQ, 0:HC_MULT, 0:D]
+    pack_mtp_hidden(
+        main_pre_hc_hidden,
+        tail_pre_hc_pool,
+        accepted_counts,
+        tail_slot_ids,
+        fallback_hidden,
+        prev_pre_hc_hidden,
+    )
+
+    swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    swa_lens = pl.create_tensor([T], dtype=pl.INT32)
+    build_swa_metadata(
+        position_ids,
+        ori_block_table,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+    )
+    projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    with pl.scope():
+        mtp_projection(
+            hidden_states,
+            prev_pre_hc_hidden,
+            enorm_w,
+            hnorm_w,
+            e_proj_w,
+            e_proj_w_scale,
+            e_proj_smooth,
+            h_proj_w,
+            h_proj_w_scale,
+            h_proj_smooth,
+            projected_hidden,
+        )
+
+    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
+    with pl.scope():
+        attention_swa(
+            projected_hidden,
+            hc_attn_fn,
+            hc_attn_scale,
+            hc_attn_base,
+            attn_norm_w,
+            wq_a,
+            wq_b,
+            wq_b_scale,
+            wkv,
+            gamma_cq,
+            gamma_ckv,
+            freqs_cos,
+            freqs_sin,
+            kv_cache,
+            swa_slot_mapping,
+            swa_indices,
+            swa_lens,
+            position_ids,
+            attn_sink,
+            wo_a,
+            wo_b,
+            wo_b_scale,
+            x_attn,
+        )
+
+    mtp_routing_layer = pl.cast(MTP_LAYER_ID, pl.INT32)
+    if routing_mode == ROUTING_TRACE_HASH:
+        mtp_routing_layer = pl.cast(0, pl.INT32)
+    with pl.scope():
+        moe(
+            x_attn,
+            hc_ffn_fn,
+            hc_ffn_scale,
+            hc_ffn_base,
+            norm_w,
+            gate_w,
+            gate_bias,
+            tid2eid,
+            routing_input_ids,
+            routed_w1,
+            routed_w1_scale,
+            routed_w3,
+            routed_w3_scale,
+            routed_w2,
+            routed_w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w3,
+            shared_w3_scale,
+            shared_w2,
+            shared_w2_scale,
+            next_pre_hc_hidden,
+            recv_meta,
+            recv_x,
+            recv_aux,
+            recv_route,
+            arrived,
+            data_arrived,
+            routed_y_buf,
+            combine_arrived,
+            mtp_routing_layer,
+            num_tokens,
+            my_rank,
+            pl.cast(MTP_MOE_EPOCH, pl.INT32),
+        )
+
+    clear_moe_signals(
+        next_pre_hc_hidden,
+        arrived,
+        data_arrived,
+        combine_arrived,
+    )
+    x_head = pl.create_tensor([T, D], dtype=pl.BF16)
+    with pl.scope():
+        hc_head(
+            next_pre_hc_hidden,
+            mtp_hc_head_fn,
+            mtp_hc_head_scale,
+            mtp_hc_head_base,
+            x_head,
+        )
+        rms_norm(x_head, mtp_norm_w, hidden_out)
+    return hidden_out, next_pre_hc_hidden
 
 
 @pl.jit(auto_scope=False)
@@ -125,6 +333,7 @@ def mtp_decode_layer(
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[MOE_VOCAB, MOE_TOPK], pl.INT32],
     input_ids: pl.Tensor[[T], pl.INT64],
+    routing_input_ids: pl.Tensor[[T], pl.INT64],
     routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -163,88 +372,265 @@ def mtp_decode_layer(
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-) -> pl.Tensor[[T, HC_MULT, D], pl.BF16]:
-    hidden_states = pl.create_tensor([T, D], dtype=pl.BF16)
-    lookup_embedding(input_ids, embed_weight, hidden_states)
-    prev_pre_hc_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    fallback_hidden = main_pre_hc_hidden[0:DECODE_SEQ, 0:HC_MULT, 0:D]
-    pack_mtp_hidden(
+    routing_mode: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[T, D], pl.BF16]:
+    hidden_out, next_pre_hc_hidden = _mtp_decode_body(
+        embed_weight,
         main_pre_hc_hidden,
         tail_pre_hc_pool,
         accepted_counts,
         tail_slot_ids,
-        fallback_hidden,
-        prev_pre_hc_hidden,
-    )
-
-    swa_slot_mapping = pl.create_tensor([T], dtype=pl.INT64)
-    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    swa_lens = pl.create_tensor([T], dtype=pl.INT32)
-    build_swa_metadata(
         position_ids,
+        enorm_w,
+        hnorm_w,
+        e_proj_w,
+        e_proj_w_scale,
+        e_proj_smooth,
+        h_proj_w,
+        h_proj_w_scale,
+        h_proj_smooth,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        kv_cache,
         ori_block_table,
-        swa_slot_mapping,
-        swa_indices,
-        swa_lens,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        hc_ffn_fn,
+        hc_ffn_scale,
+        hc_ffn_base,
+        norm_w,
+        gate_w,
+        gate_bias,
+        tid2eid,
+        input_ids,
+        routing_input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w3,
+        shared_w3_scale,
+        shared_w2,
+        shared_w2_scale,
+        mtp_hc_head_fn,
+        mtp_hc_head_scale,
+        mtp_hc_head_base,
+        mtp_norm_w,
+        hidden_out,
+        next_pre_hc_hidden,
+        recv_meta,
+        recv_x,
+        recv_aux,
+        recv_route,
+        arrived,
+        data_arrived,
+        routed_y_buf,
+        combine_arrived,
+        my_rank,
+        num_tokens,
+        routing_mode,
     )
-    projected_hidden = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
     with pl.scope():
-        mtp_projection(
-            hidden_states, prev_pre_hc_hidden,
-            enorm_w, hnorm_w,
-            e_proj_w, e_proj_w_scale, e_proj_smooth,
-            h_proj_w, h_proj_w_scale, h_proj_smooth,
-            projected_hidden,
-        )
-
-    x_attn = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32)
-    with pl.scope():
-        attention_swa(
-            projected_hidden,
-            hc_attn_fn, hc_attn_scale, hc_attn_base,
-            attn_norm_w,
-            wq_a, wq_b, wq_b_scale,
-            wkv, gamma_cq, gamma_ckv,
-            freqs_cos, freqs_sin,
-            kv_cache, swa_slot_mapping, swa_indices, swa_lens,
-            position_ids,
-            attn_sink, wo_a, wo_b, wo_b_scale,
-            x_attn,
-        )
-
-    with pl.scope():
-        moe(
-            x_attn,
-            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-            norm_w, gate_w, gate_bias,
-            tid2eid, input_ids,
-            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-            routed_w2, routed_w2_scale,
-            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            next_pre_hc_hidden,
-            recv_meta, recv_x, recv_aux, recv_route,
-            arrived, data_arrived, routed_y_buf, combine_arrived,
-            pl.cast(MTP_ROUTE_LAYER_ID, pl.INT32),
-            num_tokens,
-            my_rank,
-            pl.cast(MTP_MOE_EPOCH, pl.INT32),
-        )
-
-    clear_moe_signals(next_pre_hc_hidden, arrived, data_arrived, combine_arrived)
-    x_head = pl.create_tensor([T, D], dtype=pl.BF16)
-    with pl.scope():
-        hc_head(next_pre_hc_hidden, mtp_hc_head_fn, mtp_hc_head_scale, mtp_hc_head_base, x_head)
-        rms_norm(x_head, mtp_norm_w, hidden_out)
         lm_head_with_sampling(
-            hidden_out, lm_head_weight, logit_row_indices, logits,
+            hidden_out,
+            lm_head_weight,
+            logit_row_indices,
+            logits,
             sampled_ids,
-            lm_head_hidden_window, lm_head_hidden_done,
-            lm_head_logits_window, lm_head_logits_done,
+            lm_head_hidden_window,
+            lm_head_hidden_done,
+            lm_head_logits_window,
+            lm_head_logits_done,
             my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
-            my_rank % LM_HEAD_TP_SIZE, LM_HEAD_COMM_EPOCH,
+            my_rank % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH,
         )
     return hidden_out
+
+
+@pl.jit(auto_scope=False)
+def mtp_decode_layer_logits(
+    embed_weight: pl.Tensor[[EMBED_VOCAB_DYN, D], pl.BF16],
+    main_pre_hc_hidden: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    tail_pre_hc_pool: pl.InOut[pl.Tensor[[B, HC_MULT, D], pl.FP32]],
+    accepted_counts: pl.Tensor[[B], pl.INT32],
+    tail_slot_ids: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    enorm_w: pl.Tensor[[D], pl.FP32],
+    hnorm_w: pl.Tensor[[D], pl.FP32],
+    e_proj_w: pl.Tensor[[D, D], pl.INT8],
+    e_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    e_proj_smooth: pl.Tensor[[D], pl.FP32],
+    h_proj_w: pl.Tensor[[D, D], pl.INT8],
+    h_proj_w_scale: pl.Tensor[[D], pl.FP32],
+    h_proj_smooth: pl.Tensor[[D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_ffn_scale: pl.Tensor[[3], pl.FP32],
+    hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
+    tid2eid: pl.Tensor[[MOE_VOCAB, MOE_TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    routing_input_ids: pl.Tensor[[T], pl.INT64],
+    routed_w1: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w1_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w3: pl.Tensor[[N_LOCAL, MOE_INTER, D], pl.INT8],
+    routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
+    routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
+    routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    mtp_hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
+    mtp_hc_head_scale: pl.Tensor[[1], pl.FP32],
+    mtp_hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
+    mtp_norm_w: pl.Tensor[[D], pl.BF16],
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    hidden_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    next_pre_hc_hidden: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
+    logits: pl.Out[pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
+    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    lm_head_hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    lm_head_hidden_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
+    lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    routing_mode: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]:
+    hidden_out, next_pre_hc_hidden = _mtp_decode_body(
+        embed_weight,
+        main_pre_hc_hidden,
+        tail_pre_hc_pool,
+        accepted_counts,
+        tail_slot_ids,
+        position_ids,
+        enorm_w,
+        hnorm_w,
+        e_proj_w,
+        e_proj_w_scale,
+        e_proj_smooth,
+        h_proj_w,
+        h_proj_w_scale,
+        h_proj_smooth,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        kv_cache,
+        ori_block_table,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        hc_ffn_fn,
+        hc_ffn_scale,
+        hc_ffn_base,
+        norm_w,
+        gate_w,
+        gate_bias,
+        tid2eid,
+        input_ids,
+        routing_input_ids,
+        routed_w1,
+        routed_w1_scale,
+        routed_w3,
+        routed_w3_scale,
+        routed_w2,
+        routed_w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w3,
+        shared_w3_scale,
+        shared_w2,
+        shared_w2_scale,
+        mtp_hc_head_fn,
+        mtp_hc_head_scale,
+        mtp_hc_head_base,
+        mtp_norm_w,
+        hidden_out,
+        next_pre_hc_hidden,
+        recv_meta,
+        recv_x,
+        recv_aux,
+        recv_route,
+        arrived,
+        data_arrived,
+        routed_y_buf,
+        combine_arrived,
+        my_rank,
+        num_tokens,
+        routing_mode,
+    )
+    with pl.scope():
+        lm_head(
+            hidden_out,
+            lm_head_weight,
+            logit_row_indices,
+            logits,
+            lm_head_hidden_window,
+            lm_head_hidden_done,
+            lm_head_logits_window,
+            lm_head_logits_done,
+            my_rank // LM_HEAD_TP_SIZE * LM_HEAD_TP_SIZE,
+            my_rank % LM_HEAD_TP_SIZE,
+            LM_HEAD_COMM_EPOCH,
+        )
+    return logits
 
 
 @pl.jit.host
@@ -289,6 +675,7 @@ def l3_mtp_decode_layer(
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, MOE_VOCAB, MOE_TOPK], pl.INT32],
     input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
+    routing_input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
     routed_w1: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
     routed_w1_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
     routed_w3: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER, D], pl.INT8],
@@ -314,6 +701,7 @@ def l3_mtp_decode_layer(
     ],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
+    routing_mode: pl.Scalar[pl.INT32],
 ):
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
@@ -356,7 +744,7 @@ def l3_mtp_decode_layer(
             attn_sink[r], wo_a[r], wo_b[r], wo_b_scale[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r],
-            tid2eid[r], input_ids[r],
+            tid2eid[r], input_ids[r], routing_input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
             routed_w2[r], routed_w2_scale[r],
             shared_w1[r], shared_w1_scale[r], shared_w3[r], shared_w3_scale[r],
@@ -368,7 +756,7 @@ def l3_mtp_decode_layer(
             arrived, data_arrived, routed_y_buf, combine_arrived,
             lm_head_hidden_window, lm_head_hidden_done,
             lm_head_logits_window, lm_head_logits_done,
-            r, num_tokens,
+            r, num_tokens, routing_mode,
             device=r,
         )
 
@@ -390,6 +778,22 @@ def _ranked_spec(name, spec, *, replicated=False, is_output=False):
     return TensorSpec(
         name, [N_RANKS, *spec.shape], spec.dtype,
         init_value=_ranked_init(spec, replicated=replicated), is_output=is_output,
+    )
+
+
+def _routing_input_ids_spec():
+    import torch
+    from golden import TensorSpec
+
+    def init_routing_input_ids():
+        token_ids = torch.arange(T, dtype=torch.int64)
+        return token_ids.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+
+    return TensorSpec(
+        "routing_input_ids",
+        [N_RANKS, T],
+        torch.int64,
+        init_value=init_routing_input_ids,
     )
 
 
@@ -533,19 +937,22 @@ def _mtp_head_specs():
     }
 
 
-def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=ORI_BLOCK_NUM):
+def build_tensor_specs(
+    start_pos=DECODE_START_POS,
+    num_tokens=T,
+    ori_block_num=ORI_BLOCK_NUM,
+    *,
+    routing_mode="model",
+):
     import torch
     from golden import ScalarSpec, TensorSpec
 
+    routing_mode_id = routing_mode_value(routing_mode)
     projection_specs = _projection_specs()
     mtp_head_specs = _mtp_head_specs()
     swa_tensor_specs = build_swa_tensor_specs(start_pos)
     swa_specs = {spec.name: spec for spec in swa_tensor_specs if isinstance(spec, TensorSpec)}
-    moe_tensor_specs = build_moe_tensor_specs(
-        layer_id=MTP_ROUTE_LAYER_ID,
-        num_tokens=num_tokens,
-        balanced_routing=True,
-    )
+    moe_tensor_specs = build_moe_tensor_specs(layer_id=MTP_LAYER_ID, num_tokens=num_tokens)
     moe_specs = {spec.name: spec for spec in moe_tensor_specs if isinstance(spec, TensorSpec)}
 
     def init_lm_head_weight():
@@ -591,7 +998,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         "attn_sink", "wo_a", "wo_b", "wo_b_scale",
         "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base",
         "norm_w",
-        "gate_w", "gate_bias", "tid2eid", "input_ids",
+        "gate_w", "gate_bias", "tid2eid", "input_ids", "routing_input_ids",
         "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
         "routed_w2", "routed_w2_scale",
         "shared_w1", "shared_w1_scale", "shared_w3", "shared_w3_scale",
@@ -606,6 +1013,23 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
             specs.append(projection_specs[name])
         elif name in mtp_head_specs:
             specs.append(mtp_head_specs[name])
+        elif name == "tid2eid" and routing_mode_id == ROUTING_TRACE_HASH:
+            specs.append(TensorSpec(
+                name,
+                [N_RANKS, MOE_VOCAB, MOE_TOPK],
+                torch.int32,
+                init_value=lambda: build_trace_hash_tid2eid(
+                    num_layers=1,
+                    first_layer_id=MTP_LAYER_ID,
+                    n_ranks=N_RANKS,
+                    tokens_per_rank=T,
+                    vocab_size=MOE_VOCAB,
+                    topk=MOE_TOPK,
+                    n_experts=N_EXPERTS_GLOBAL,
+                ),
+            ))
+        elif name == "routing_input_ids":
+            specs.append(_routing_input_ids_spec())
         elif name in moe_specs:
             specs.append(moe_specs[name])
         elif name == "kv_cache":
@@ -680,6 +1104,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
     )
     specs.append(row_indices_spec)
     specs.append(ScalarSpec("num_tokens", torch.int32, num_tokens))
+    specs.append(ScalarSpec("routing_mode", torch.int32, routing_mode_id))
     return specs
 
 
@@ -783,7 +1208,11 @@ def golden_mtp_decode_layer(tensors):
     moe_tensors = dict(tensors)
     moe_tensors["x_hc"] = x_attn
     moe_tensors["x_next"] = tensors["next_pre_hc_hidden"]
-    moe_tensors["layer_id"] = MTP_ROUTE_LAYER_ID
+    moe_tensors["input_ids"] = tensors["routing_input_ids"]
+    moe_tensors["layer_id"] = resolve_routing_layer_id(
+        MTP_LAYER_ID,
+        int(tensors["routing_mode"]),
+    )
     moe_tensors["num_tokens"] = num_tokens
     golden_moe(moe_tensors)
 
@@ -832,6 +1261,7 @@ def main():
     parser.add_argument("--start-pos", type=int, default=DECODE_START_POS)
     parser.add_argument("--num-tokens", type=int, default=T)
     parser.add_argument("--ori-block-num", type=int, default=ORI_BLOCK_NUM)
+    parser.add_argument("--routing-mode", choices=sorted(ROUTING_MODES), default="model")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -854,6 +1284,7 @@ def main():
             start_pos=args.start_pos,
             num_tokens=args.num_tokens,
             ori_block_num=args.ori_block_num,
+            routing_mode=args.routing_mode,
         ),
         golden_fn=golden_mtp_decode_layer,
         compile_only=args.compile_only,

@@ -11,6 +11,7 @@
 import pypto.language as pl
 
 from config import DECODE_BATCH, DECODE_SEQ, DECODE_TOKENS, FLASH as M
+from lm_head import SAMPLED_IDS_PAD
 
 
 VOCAB_DYN = pl.dynamic("PACK_X_HC_VOCAB_DYN")
@@ -25,6 +26,64 @@ SPMD_BLOCKS = 48
 assert DECODE_SEQ == 2, "pack_mtp_hidden requires decode_seq=2"
 assert D % X_HC_HIDDEN_TILE == 0
 assert D % MTP_HIDDEN_TILE == 0
+
+
+@pl.jit
+def pack_mtp_inputs(
+    main_sampled_ids: pl.Tensor[[DECODE_TOKENS, SAMPLED_IDS_PAD], pl.INT32],
+    main_position_ids: pl.Tensor[[DECODE_TOKENS], pl.INT32],
+    accepted_counts: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    tail_slot_ids: pl.Tensor[[DECODE_BATCH], pl.INT32],
+    tail_token_pool: pl.InOut[pl.Tensor[[DECODE_BATCH], pl.INT64]],
+    tail_position_pool: pl.InOut[pl.Tensor[[DECODE_BATCH], pl.INT32]],
+    mtp_input_ids: pl.Out[pl.Tensor[[DECODE_TOKENS], pl.INT64]],
+    mtp_position_ids: pl.Out[pl.Tensor[[DECODE_TOKENS], pl.INT32]],
+):
+    for batch_core in pl.spmd(
+        1,
+        name_hint="pack_mtp_inputs",
+    ):
+        for batch_idx in pl.range(batch_core, DECODE_BATCH):
+            row0 = batch_idx * DECODE_SEQ
+            row1 = row0 + 1
+            slot = pl.cast(
+                pl.read(tail_slot_ids, [batch_idx]),
+                target_type=pl.INDEX,
+            )
+            accepted_count = pl.read(accepted_counts, [batch_idx])
+            sampled0 = pl.cast(
+                pl.read(main_sampled_ids, [row0, 0]),
+                target_type=pl.INT64,
+            )
+            sampled1 = pl.cast(
+                pl.read(main_sampled_ids, [row1, 0]),
+                target_type=pl.INT64,
+            )
+            position0 = pl.read(main_position_ids, [row0])
+            position1 = pl.read(main_position_ids, [row1])
+            if accepted_count == 1:
+                pl.write(
+                    mtp_input_ids,
+                    [row0],
+                    pl.read(tail_token_pool, [slot]),
+                )
+                pl.write(
+                    mtp_position_ids,
+                    [row0],
+                    pl.read(tail_position_pool, [slot]),
+                )
+                pl.write(mtp_input_ids, [row1], sampled0)
+                pl.write(mtp_position_ids, [row1], position0)
+                pl.write(tail_token_pool, [slot], sampled0)
+                pl.write(tail_position_pool, [slot], position0)
+            else:
+                pl.write(mtp_input_ids, [row0], sampled0)
+                pl.write(mtp_position_ids, [row0], position0)
+                pl.write(mtp_input_ids, [row1], sampled1)
+                pl.write(mtp_position_ids, [row1], position1)
+                pl.write(tail_token_pool, [slot], sampled1)
+                pl.write(tail_position_pool, [slot], position1)
+    return mtp_input_ids, mtp_position_ids
 
 
 @pl.jit.inline
@@ -134,3 +193,142 @@ def pack_mtp_hidden(
                         hidden_offset : hidden_offset + MTP_HIDDEN_TILE,
                     ]
     return packed_hidden
+
+
+def golden_pack_mtp_inputs(tensors):
+    sampled_ids = tensors["main_sampled_ids"][:, 0].to(dtype=tensors["tail_token_pool"].dtype)
+    for batch_idx in range(DECODE_BATCH):
+        row0 = batch_idx * DECODE_SEQ
+        row1 = row0 + 1
+        slot = int(tensors["tail_slot_ids"][batch_idx])
+        accepted_count = int(tensors["accepted_counts"][batch_idx])
+        if accepted_count == 1:
+            tensors["mtp_input_ids"][row0] = tensors["tail_token_pool"][slot]
+            tensors["mtp_position_ids"][row0] = tensors["tail_position_pool"][slot]
+            tensors["mtp_input_ids"][row1] = sampled_ids[row0]
+            tensors["mtp_position_ids"][row1] = tensors["main_position_ids"][row0]
+            tensors["tail_token_pool"][slot] = sampled_ids[row0]
+            tensors["tail_position_pool"][slot] = tensors["main_position_ids"][row0]
+        else:
+            tensors["mtp_input_ids"][row0] = sampled_ids[row0]
+            tensors["mtp_position_ids"][row0] = tensors["main_position_ids"][row0]
+            tensors["mtp_input_ids"][row1] = sampled_ids[row1]
+            tensors["mtp_position_ids"][row1] = tensors["main_position_ids"][row1]
+            tensors["tail_token_pool"][slot] = sampled_ids[row1]
+            tensors["tail_position_pool"][slot] = tensors["main_position_ids"][row1]
+
+
+def validate_handoff_fixture(
+    accepted_counts,
+    tail_slot_ids,
+    main_sampled_ids,
+    tail_token_pool,
+):
+    if not bool(((accepted_counts == 1) | (accepted_counts == 2)).all()):
+        raise ValueError("accepted counts must be 1 or 2")
+    slots = tail_slot_ids.tolist()
+    if len(set(slots)) != DECODE_BATCH:
+        raise ValueError("tail slots must be unique")
+    if not all(0 <= slot < DECODE_BATCH for slot in slots):
+        raise ValueError("tail slots must be in the decode batch")
+    sampled_tokens = main_sampled_ids[:, 0]
+    if not bool(((sampled_tokens >= 0) & (sampled_tokens < M.vocab_size)).all()):
+        raise ValueError("sampled tokens must be in the model vocabulary")
+    if not bool(((tail_token_pool >= 0) & (tail_token_pool < M.vocab_size)).all()):
+        raise ValueError("tail tokens must be in the model vocabulary")
+
+
+def _build_handoff_fixture():
+    import torch
+
+    sampled = torch.full((8, 8), -777, dtype=torch.int32)
+    sampled[:, 0] = torch.tensor(
+        [100, 101, 200, 201, 300, 301, 400, 401],
+        dtype=torch.int32,
+    )
+    return {
+        "main_sampled_ids": sampled,
+        "main_position_ids": torch.tensor(
+            [10, 11, 20, 21, 30, 31, 40, 41],
+            dtype=torch.int32,
+        ),
+        "accepted_counts": torch.tensor([1, 2, 1, 2], dtype=torch.int32),
+        "tail_slot_ids": torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+        "tail_token_pool": torch.tensor([900, 901, 902, 903], dtype=torch.int64),
+        "tail_position_pool": torch.tensor([9, 19, 29, 39], dtype=torch.int32),
+    }
+
+
+def build_handoff_tensor_specs():
+    import torch
+    from golden import TensorSpec
+
+    fixture = _build_handoff_fixture()
+    return [
+        TensorSpec("main_sampled_ids", [8, 8], torch.int32, init_value=fixture["main_sampled_ids"]),
+        TensorSpec("main_position_ids", [8], torch.int32, init_value=fixture["main_position_ids"]),
+        TensorSpec("accepted_counts", [4], torch.int32, init_value=fixture["accepted_counts"]),
+        TensorSpec("tail_slot_ids", [4], torch.int32, init_value=fixture["tail_slot_ids"]),
+        TensorSpec(
+            "tail_token_pool",
+            [4],
+            torch.int64,
+            init_value=fixture["tail_token_pool"],
+            is_output=True,
+        ),
+        TensorSpec(
+            "tail_position_pool",
+            [4],
+            torch.int32,
+            init_value=fixture["tail_position_pool"],
+            is_output=True,
+        ),
+        TensorSpec("mtp_input_ids", [8], torch.int64, is_output=True),
+        TensorSpec("mtp_position_ids", [8], torch.int32, is_output=True),
+    ]
+
+
+if __name__ == "__main__":
+    import argparse
+
+    from golden import run_jit
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-p",
+        "--platform",
+        type=str,
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    )
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--dump-passes", action="store_true", default=False)
+    args = parser.parse_args()
+
+    fixture = _build_handoff_fixture()
+    validate_handoff_fixture(
+        fixture["accepted_counts"],
+        fixture["tail_slot_ids"],
+        fixture["main_sampled_ids"],
+        fixture["tail_token_pool"],
+    )
+    result = run_jit(
+        fn=pack_mtp_inputs,
+        specs=build_handoff_tensor_specs(),
+        golden_fn=golden_pack_mtp_inputs,
+        compile_only=args.compile_only,
+        runtime_dir=args.runtime_dir,
+        compile_cfg=dict(dump_passes=args.dump_passes),
+        runtime_cfg=dict(
+            platform=args.platform,
+            device_id=args.device,
+        ),
+        rtol=0,
+        atol=0,
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)

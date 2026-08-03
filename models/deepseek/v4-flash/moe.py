@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+size: 2/4/8 run N-rank distributed; each rank keeps 16 experts."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
