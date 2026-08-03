@@ -22,7 +22,6 @@ X_HC_HIDDEN_TILE = 512
 MTP_HIDDEN_TILE = 1024
 SPMD_BLOCKS = 48
 
-assert DECODE_SEQ == 2, "pack_mtp_hidden requires decode_seq=2"
 assert D % X_HC_HIDDEN_TILE == 0
 assert D % MTP_HIDDEN_TILE == 0
 

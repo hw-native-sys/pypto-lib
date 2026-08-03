@@ -74,6 +74,7 @@ from moe import (
 from mtp_projection import golden_mtp_projection, mtp_projection
 from rmsnorm import golden_rms_norm, rms_norm
 
+assert DECODE_SEQ == 2, "MTP decode requires decode_seq=2"
 
 # model config
 MTP_LAYER_ID = M.num_hidden_layers
