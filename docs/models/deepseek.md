@@ -10,16 +10,16 @@ The V3.2-EXP tree contains three runnable components:
 
 | Entry | Scope | Declared platforms | Configured CI coverage |
 | --- | --- | --- | --- |
-| [deepseek_v3_2_decode_front.py](../../models/deepseek/v3_2/deepseek_v3_2_decode_front.py) | Fused decode front scopes | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
-| [deepseek_v3_2_decode_back.py](../../models/deepseek/v3_2/deepseek_v3_2_decode_back.py) | Single-layer decode back | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
-| [deepseek_v3_2_prefill_back.py](../../models/deepseek/v3_2/deepseek_v3_2_prefill_back.py) | Reduced single-layer prefill back fixture | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
+| [decode_front.py](../../models/deepseek_v3_2/decode_front.py) | Fused decode front scopes | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
+| [decode_back.py](../../models/deepseek_v3_2/decode_back.py) | Single-layer decode back | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
+| [prefill_back.py](../../models/deepseek_v3_2/prefill_back.py) | Reduced single-layer prefill back fixture | A2/A3, A2/A3 sim, A5, A5 sim | A2/A3, A2/A3 sim, A5 sim |
 
 These are component harnesses rather than a complete prefill/decode model
 contract. The prefill-back fixture is deliberately reduced to batch 1 and
 sequence length 128 in source.
 
 ```bash
-python models/deepseek/v3_2/deepseek_v3_2_decode_front.py -p a2a3sim
+python models/deepseek_v3_2/decode_front.py -p a2a3sim
 ```
 
 ## DeepSeek V4
@@ -28,8 +28,8 @@ python models/deepseek/v3_2/deepseek_v3_2_decode_front.py -p a2a3sim
 
 | Variant | Directory | Runnable CLIs | Primary CI target | Kernel-program sequence budget |
 | --- | --- | ---: | --- | ---: |
-| Flash | [v4-flash](../../models/deepseek/v4-flash/) | 37 | A2/A3; A2/A3 sim and A5 sim for non-device-only cases | 16,384 |
-| Pro | [v4-pro](../../models/deepseek/v4-pro/) | 35 | Dedicated A5 daily job | 16,384 |
+| Flash | [deepseek_v4_flash_mtp](../../models/deepseek_v4_flash_mtp/) | 37 | A2/A3; A2/A3 sim and A5 sim for non-device-only cases | 16,384 |
+| Pro | [deepseek_v4_pro](../../models/deepseek_v4_pro/) | 35 | Dedicated A5 daily job | 16,384 |
 
 The Pro model configuration retains its architectural one-million-position
 value, but the tracked Pro kernel programs deliberately use a 16,384-position
@@ -39,6 +39,23 @@ Both tracked V4 presets describe FP8 model data and FP4 routed-expert weights.
 That configuration metadata is not proof that every standalone harness loads
 or validates real quantized checkpoint data; each harness's tensor specs and
 golden function remain the authority.
+
+A directory suffix names the speculative-decoding method the tree's token
+budget is built for. `config.py` is a per-directory singleton — every kernel
+reads `DECODE_BATCH` / `DECODE_SEQ` from it by bare sibling import — so a
+method with a different speculative-token count needs its own tree. Both
+current trees carry `DECODE_SEQ = 2`, the MTP shape of one speculative token
+verified against the previous one. Flash is `deepseek_v4_flash_mtp` because a
+DSpark sibling with a larger budget is planned; Pro has no suffix because it
+has nothing to disambiguate from.
+
+Quantization is not part of the directory name. Both trees consume INT8
+weights today — the Pro routed-expert kernels included, where
+`gen_routed_weight` in
+[expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py)
+re-quantizes off the MXFP4 grid rather than implementing native
+MXFP8-MXFP4. Add a quantization suffix only when one model, variant, and
+method genuinely ship in two quantizations.
 
 ### Entry-point classes
 
@@ -67,8 +84,9 @@ CLIs accept `--ep 2`, `--ep 4`, or `--ep 8`, but the daily workflow does not
 currently add active EP4 or EP8 per-file runs. A commented command example in
 the workflow is not test coverage.
 
-Changes under either V4 directory also trigger a shared eight-card
-`pypto-serving` accuracy job on pull requests. This verifies the external
+Changes under the Flash directory also trigger a shared eight-card
+`pypto-serving` accuracy job on pull requests. Pro does not: it is the A5
+variant and no serving deployment consumes it. The job verifies the external
 serving integration path; it does not change the two-card status of individual
 kernel harnesses.
 
@@ -92,20 +110,20 @@ the job result before citing a revision as verified.
 Run a single-device Flash attention component on the simulator:
 
 ```bash
-python models/deepseek/v4-flash/prefill_attention_csa.py -p a2a3sim
+python models/deepseek_v4_flash_mtp/prefill_attention_csa.py -p a2a3sim
 ```
 
 Run the Flash decode-layer harness at its default EP2 world size:
 
 ```bash
-python models/deepseek/v4-flash/decode_layer.py \
+python models/deepseek_v4_flash_mtp/decode_layer.py \
   -p a2a3 --ep 2 -d 0,1
 ```
 
 Run the equivalent Pro layer on two A5 devices:
 
 ```bash
-python models/deepseek/v4-pro/decode_layer.py \
+python models/deepseek_v4_pro/decode_layer.py \
   -p a5 --ep 2 -d 0,1
 ```
 

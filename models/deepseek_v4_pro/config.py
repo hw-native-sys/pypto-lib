@@ -250,7 +250,7 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 # references are recomputed in torch on the host. Admitting 1 M positions would
 # need a ~64x larger physical pool than the cases allocate and a host-side
 # golden nobody can compute. So the kernels import ``PRO_KERNEL``: architecture
-# identical to PRO, sequence budget matched to what the v4-flash cases already
+# identical to PRO, sequence budget matched to what the Flash cases already
 # exercise (8k prompt + 512 decode steps).
 #
 # Raise this if a case needs a longer context; nothing else has to change.

@@ -10,12 +10,12 @@ examples/        Self-contained kernels for learning the DSL
   beginner/        hello_world, matmul, etc.
   intermediate/    softmax, rms_norm, rope, etc.
   advanced/        Multi-stage fused + instruction-combo kernels (gemm_eltwise, multi_proj, topk)
-models/          End-to-end LLM kernels organized by family
-  qwen3/14b/       Qwen3-14B prefill + decode
-  qwen3/32b/       Qwen3-32B decode
-  deepseek/v3_2/   DeepSeek V3.2-EXP
-  deepseek/v4-flash/  DeepSeek V4-Flash
-  deepseek/v4-pro/    DeepSeek V4-Pro (A5)
+models/          End-to-end LLM kernels, one flat directory per model build
+  qwen3_14b/                   Qwen3-14B prefill + decode
+  qwen3_32b/                   Qwen3-32B decode
+  deepseek_v3_2/               DeepSeek V3.2-EXP
+  deepseek_v4_flash_mtp/   DeepSeek V4-Flash, INT8 W8A8
+  deepseek_v4_pro/      DeepSeek V4-Pro, Hybrid MXFP8-MXFP4 target (A5)
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
 docs/            Coding-style and workflow reference
@@ -31,7 +31,7 @@ run a beginner example:
 
 ```bash
 python examples/beginner/hello_world.py -p a2a3sim   # simulator
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0   # real NPU, device 0
 ```
 
 The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
@@ -50,7 +50,7 @@ the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
 set.
 
 Existing kernels under `examples/intermediate/` are the best reference for
-single-stage patterns; `models/qwen3/14b/decode_fwd.py` shows a
+single-stage patterns; `models/qwen3_14b/decode_fwd.py` shows a
 full-model fused kernel.
 
 ## Debugging

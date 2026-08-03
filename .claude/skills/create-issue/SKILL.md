@@ -172,7 +172,7 @@ current environment" and ask whether to still file. If no → **stop**.
 
 Many pypto-lib repro cases are **local-only** — a scratch kernel, a `_draft.py`,
 or an edit that has not been committed and pushed. A path like
-`models/qwen3/14b/bench_qk_compare.py` is **meaningless to whoever reads the
+`models/qwen3_14b/bench_qk_compare.py` is **meaningless to whoever reads the
 issue** if that file does not exist on any branch they can fetch. Determine the
 visibility of every file the repro needs (the script plus any local helper
 modules / kernels it imports):
@@ -233,7 +233,7 @@ inlining is the default; attach only when inlining is impossible:
 
    Repeat one `<details>` block per local-only file the case needs, and say in
    the body where each file is expected to sit in the tree (imports depend on
-   it), e.g. "save as `models/qwen3/14b/repro_qk_mmad.py`".
+   it), e.g. "save as `models/qwen3_14b/repro_qk_mmad.py`".
 
 2. **Attach the file** — only when it is genuinely too large to inline
    (roughly >500 lines, a binary, or a build/log artifact). `gh issue create`

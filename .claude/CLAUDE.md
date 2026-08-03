@@ -10,7 +10,8 @@ Ascend NPUs (910B/C, 950). It also ships a golden-validation test harness
 ## Repository Layout
 
 - `examples/{beginner,intermediate,advanced}/` — self-contained kernels for learning the DSL
-- `models/{qwen3,deepseek}/` — end-to-end LLM kernels by family
+- `models/<family>_<version>[_<quant>]/` — end-to-end LLM kernels, one flat
+  directory per model build (`qwen3_14b`, `deepseek_v4_flash_mtp`, …)
 - `golden/` — test harness: compile, run on device, validate against torch
 - `tests/` — lint checks and golden-fn unit tests
 - `docs/` — canonical public setup, validation, examples, models, debugging, and tuning guidance
@@ -60,7 +61,7 @@ that procedure on the current machine.
 python examples/beginner/hello_world.py -p a2a3sim
 
 # Run a model on real NPU device 0
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 ```
 
 Platform and device arguments are entry-specific. Inspect the selected

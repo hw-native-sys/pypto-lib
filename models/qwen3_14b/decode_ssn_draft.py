@@ -9,7 +9,7 @@
 """Qwen3-14B single-layer decode forward, serial tile-DSL style, 4D-blocked.
 
 All tensors -- kernel parameters and internal bridges alike -- use the 4D
-pre-blocked layout of qwen3_32b_decode_4d.py:
+pre-blocked layout of qwen3_32b/decode_4d.py:
   - activations / output:  [COL_BLOCKS, 1, BATCH, CHUNK]
   - weights:               [K_BLOCKS, N_BLOCKS, MM_K, MM_N] (one 4 KB tile per block)
   - rms / norm weights:    [K_BLOCKS, 1, 1, CHUNK]

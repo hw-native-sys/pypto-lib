@@ -54,7 +54,7 @@ plugins:
 python examples/beginner/hello_world.py -p a2a3sim
 
 # Run a model on real NPU device 0
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 
 # Run golden harness unit tests
 python -m pytest tests/golden -v
@@ -71,7 +71,8 @@ Every executable kernel or model script generally accepts
 ## Repository Map
 
 - `examples/`: self-contained kernels for learning and reference patterns
-- `models/`: end-to-end LLM kernels organized by model family
+- `models/`: end-to-end LLM kernels, one flat directory per model build
+  (`<family>_<version>[_<quant>]`, e.g. `deepseek_v4_flash_mtp`)
 - `golden/`: compile/run/validate harness against torch references
 - `tests/`: lint checks and golden harness unit tests
 - `docs/`: coding style, compile/runtime workflow, performance tuning,

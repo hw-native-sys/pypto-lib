@@ -18,7 +18,7 @@ in place — this is an edit pass, not a review; do not stop at a list of
 suggestions.
 
 ```text
-$fmt-coding-style models/deepseek/v4-flash/mtp_projection.py
+$fmt-coding-style models/deepseek_v4_flash_mtp/mtp_projection.py
 $fmt-coding-style mtp_projection.py
 $fmt-coding-style                      # no argument: the file open in the IDE
 ```
@@ -32,7 +32,7 @@ Reference points:
 
 - `docs/pypto-coding/pypto-coding-style.md` — the canonical DSL reference (loop constructs,
   `pl.at`, slice/assemble); this skill is the *formatting* layer on top of it.
-- `models/deepseek/v4-flash/qkv_proj_rope.py` — reference header layout.
+- `models/deepseek_v4_flash_mtp/qkv_proj_rope.py` — reference header layout.
 - `ruff.toml` — `line-length = 110`, `target-version = py310`.
 
 ## Rule 1 — One statement per line

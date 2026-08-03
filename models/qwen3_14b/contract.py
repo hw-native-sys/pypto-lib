@@ -570,7 +570,7 @@ def _load_kernel_module(module_name: str) -> Any:
 def _is_other_pypto_lib_short_module(name: str) -> bool:
     module = sys.modules.get(name)
     module_file = str(getattr(module, "__file__", "") or "")
-    pypto_lib_models_dir = str(_KERNEL_DIR.parent.parent.parent)
+    pypto_lib_models_dir = str(_KERNEL_DIR.parent)
     return module_file.startswith(pypto_lib_models_dir) and not module_file.startswith(str(_KERNEL_DIR))
 
 

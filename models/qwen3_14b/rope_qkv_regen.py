@@ -25,7 +25,7 @@ arithmetic exactly, so the header can be regenerated on demand.
 
 Regenerate with::
 
-    python models/qwen3/14b/rope_qkv_regen.py -p a2a3
+    python models/qwen3_14b/rope_qkv_regen.py -p a2a3
 
 then follow the extraction steps printed at the end of the run.
 

@@ -8,7 +8,7 @@
 // the Q-RMSNorm tile row count; 128 is both HEAD_DIM and the item bound at the
 // padded batch). There is no safe local edit -- regenerate instead:
 //
-//     python models/qwen3/14b/rope_qkv_regen.py -p a2a3
+//     python models/qwen3_14b/rope_qkv_regen.py -p a2a3
 //
 // then re-wrap the emitted build_output/_jit_rope_qkv_regen_*/kernels/aiv/
 // rope_qkv.cpp with tools described in that module's docstring.

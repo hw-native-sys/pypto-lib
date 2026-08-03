@@ -121,7 +121,7 @@ def test_loaded_kernel_signatures_match_contract_arg_counts() -> None:
 
 
 def test_fused_attention_declares_real_output_first() -> None:
-    source = _REPO_ROOT / "models" / "qwen3" / "14b" / "paged_attention_cce.py"
+    source = _REPO_ROOT / "models" / "qwen3_14b" / "paged_attention_cce.py"
     tree = ast.parse(source.read_text())
     func = next(
         node
@@ -143,7 +143,7 @@ def test_fused_attention_declares_real_output_first() -> None:
 
 
 def test_fused_attention_uses_standalone_rope_worker_count() -> None:
-    decode_source = _REPO_ROOT / "models" / "qwen3" / "14b" / "decode_fwd.py"
+    decode_source = _REPO_ROOT / "models" / "qwen3_14b" / "decode_fwd.py"
     decode_tree = ast.parse(decode_source.read_text())
     rope_cores = next(
         node.value.value
@@ -159,8 +159,7 @@ def test_fused_attention_uses_standalone_rope_worker_count() -> None:
     kernel_dir = (
         _REPO_ROOT
         / "models"
-        / "qwen3"
-        / "14b"
+        / "qwen3_14b"
         / "kernels"
         / "paged_attention_cce"
         / "kernel"
@@ -220,7 +219,7 @@ def test_compile_arg_builders_follow_loaded_stage_specs() -> None:
 
 def _rope_qkv_function_body() -> str:
     path = (
-        _REPO_ROOT / "models" / "qwen3" / "14b" / "kernels" / "paged_attention_cce"
+        _REPO_ROOT / "models" / "qwen3_14b" / "kernels" / "paged_attention_cce"
         / "kernel" / "rope_qkv_generated.hpp"
     )
     src = path.read_text()

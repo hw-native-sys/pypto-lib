@@ -19,7 +19,7 @@ Tuning needs a number before and after. Set `PYPTO_BENCH=1` and every
 correctness dispatch — no `--benchmark` flag, no edit to the model file:
 
 ```bash
-PYPTO_BENCH=1 python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
+PYPTO_BENCH=1 python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0
 ```
 
 ```
@@ -101,7 +101,7 @@ compare only against other runs with the same sizes.
 ```bash
 # Quick iteration on a long prefill, with the raw per-dispatch samples.
 PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
-  python models/deepseek/v4-flash/prefill_fwd.py -p a2a3 -d 0
+  python models/deepseek_v4_flash_mtp/prefill_fwd.py -p a2a3 -d 0
 ```
 
 When only the timing changes between iterations — not the numerics — save the
@@ -120,7 +120,7 @@ records under the build directory and, on a real-device platform, converts
 them to a merged swimlane:
 
 ```bash
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
+python models/qwen3_14b/decode_fwd.py -p a2a3 -d 0 --enable-l2-swimlane
 ```
 
 ```
@@ -327,7 +327,7 @@ overhead is visible per iteration on the swimlane, replace the explicit
 `for ... in pl.parallel: with pl.at: ...` pattern with `pl.spmd`:
 
 ```python
-# qwen3_32b_decode.py: one AICPU dispatch fans out Q_OUT_BLOCKS blocks
+# qwen3_32b/decode.py: one AICPU dispatch fans out Q_OUT_BLOCKS blocks
 for qi in pl.spmd(Q_OUT_BLOCKS, name_hint="q_proj"):
     ...
 ```
@@ -354,7 +354,7 @@ artifacts drive intra-kernel tuning:
 PMU counters per kernel:
 
 ```bash
-python models/deepseek/v4-flash/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
+python models/deepseek_v4_flash_mtp/decode_sparse_attn.py -p a2a3 -d 0 --enable-pmu 2
 # → build_output/<...>/dfx_outputs/pmu.csv
 ```
 
@@ -393,7 +393,7 @@ hint carries the exact source location:
 [perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost
 dim = 256B; recommended >= 512B for backend a2a3 (L2 cache line = 512B).
 Consider increasing tile shape on the innermost axis.
-at models/deepseek/v4-flash/qkv_proj_rope.py:68:4
+at models/deepseek_v4_flash_mtp/qkv_proj_rope.py:68:4
 ```
 
 Walk the log and widen the trailing tile dimension at each flagged site

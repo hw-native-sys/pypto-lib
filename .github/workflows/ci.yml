@@ -125,11 +125,11 @@ jobs:
           # Serving e2e jobs are model-specific and expensive. CI-infra edits
           # (.github/**) must not trigger them.
           if [ "${{ github.event_name }}" = "pull_request" ] &&
-             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3/14b/'; then
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/qwen3_14b/'; then
             echo "run_qwen_serving_tests=true" >> "$GITHUB_OUTPUT"
           fi
           if [ "${{ github.event_name }}" = "pull_request" ] &&
-             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek/v4-(flash|pro)/'; then
+             printf '%s\n' "$CHANGED_FILES" | grep -qE '^models/deepseek_v4_flash_mtp/'; then
             echo "run_deepseek_serving_tests=true" >> "$GITHUB_OUTPUT"
           fi
           echo "Selected files: $FILES"
