@@ -65,7 +65,7 @@ PACKED_RMS_TILE = 16
 
 
 @pl.jit.inline
-def prefill_indexer_compressor(
+def _prefill_indexer_compressor_with_completion(
     x: pl.Tensor[[T, D], pl.BF16],
     compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
@@ -84,6 +84,7 @@ def prefill_indexer_compressor(
     num_tokens: pl.Scalar[pl.INT32],
     idx_slot_mapping: pl.Tensor[[T], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+    completion: pl.Array[1, pl.TASK_ID],
 ):
     state_block_num = pl.tensor.dim(compress_state, 0)
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
@@ -343,7 +344,12 @@ def prefill_indexer_compressor(
             )
             final_kv[final_base : final_base + PACKED_RMS_TILE, o0 : o0 + OUT_TILE] = final_acc
 
-    for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_cache_write"):
+    scale_scratch = pl.create_tensor([MAX_CMP_WRITES, 1], dtype=pl.FP32)
+    with pl.spmd(
+        MAX_CMP_WRITES // PACKED_RMS_TILE,
+        name_hint="prefill_idx_c4_cache_write",
+    ) as cache_write_tid:
+        final_block = pl.tile.get_block_idx()
         final_base = final_block * PACKED_RMS_TILE
         # C8 quant-on-write: per-row INT8 quant of the bf16-rounded block + per-position dequant scale
         kv_blk_f32 = pl.cast(
@@ -359,23 +365,35 @@ def prefill_indexer_compressor(
         kv_i32 = pl.cast(kv_scaled, target_type=pl.INT32, mode="rint")
         kv_half = pl.cast(kv_i32, target_type=pl.FP16, mode="round")
         kv_i8_blk = pl.cast(kv_half, target_type=pl.INT8, mode="trunc")
+        scale_scratch[final_base : final_base + PACKED_RMS_TILE, 0:1] = kv_scale_dq_col
         for final_dt in pl.range(PACKED_RMS_TILE):
             final_i = final_base + final_dt
             dst_row_raw = pl.read(write_dst_map, [0, final_i])
             if dst_row_raw >= 0:
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_i8_blk[final_dt : final_dt + 1, :]
-                # scale is one value per position; a [1,1] tile store is sub-32B, so scalar-write it
-                pl.write(idx_kv_scale_flat, [dst_row, 0], pl.read(kv_scale_dq_col, [final_dt, 0]))
             else:
                 keepalive_row = idx_block_num * BLOCK_SIZE - MAX_CMP_WRITES + final_i
                 idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
                     keepalive_row : keepalive_row + 1,
                     0:HEAD_DIM,
                 ]
-                pl.write(idx_kv_scale_flat, [keepalive_row, 0], pl.read(idx_kv_scale_flat, [keepalive_row, 0]))
 
-    for update_t in pl.spmd(T, name_hint="prefill_idx_c4_state_update"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_c4_scale_scatter") as scale_scatter_tid:
+        scale_tile = scale_scratch[0:MAX_CMP_WRITES, 0:1]
+        for scale_i in pl.range(MAX_CMP_WRITES):
+            dst_row_raw = pl.read(write_dst_map, [0, scale_i])
+            if dst_row_raw >= 0:
+                dst_row = pl.cast(dst_row_raw, pl.INDEX)
+                scale_value = pl.read(scale_tile, [scale_i, 0])
+                pl.write(idx_kv_scale_flat, [dst_row, 0], scale_value)
+            else:
+                keepalive_row = idx_block_num * BLOCK_SIZE - MAX_CMP_WRITES + scale_i
+                keepalive_value = pl.read(idx_kv_scale_flat, [keepalive_row, 0])
+                pl.write(idx_kv_scale_flat, [keepalive_row, 0], keepalive_value)
+
+    with pl.spmd(T, name_hint="prefill_idx_c4_state_update") as state_update_tid:
+        update_t = pl.tile.get_block_idx()
         if update_t < num_tokens:
             state_row_raw = pl.read(inner_state_slot_mapping, [update_t])
             if state_row_raw >= 0:
@@ -404,9 +422,42 @@ def prefill_indexer_compressor(
                         pool_dep,
                     )
 
-    # Writes through the flattened views already update the caller-owned buffers.
-    # Avoid a dynamic reshape-back here because this inline kernel is nested.
+    completion[0] = pl.system.task_dummy(deps=[cache_write_tid, scale_scatter_tid, state_update_tid])
+
+    # Return the caller-owned cache and state roots.
     return idx_kv_cache, idx_kv_scale, compress_state
+
+
+@pl.jit.inline
+def prefill_indexer_compressor(
+    x: pl.Tensor[[T, D], pl.BF16],
+    compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
+    inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
+    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
+    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
+    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    idx_slot_mapping: pl.Tensor[[T], pl.INT64],
+    inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
+):
+    completion = pl.array.create(1, pl.TASK_ID)
+    idx_kv_cache_out, idx_kv_scale_out, compress_state_out = _prefill_indexer_compressor_with_completion(
+        x, compress_state, inner_compress_state_block_table,
+        wkv, wgate, ape,
+        norm_w, freqs_cos, freqs_sin,
+        hadamard, idx_kv_cache, idx_kv_scale,
+        idx_block_table, position_ids, num_tokens,
+        idx_slot_mapping, inner_state_slot_mapping, completion,
+    )
+    return idx_kv_cache_out, idx_kv_scale_out, compress_state_out
 
 
 @pl.jit
@@ -434,13 +485,21 @@ def prefill_indexer_compressor_test(
 ):
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     idx_cache_rows = idx_block_num * BLOCK_SIZE
-    prefill_indexer_compressor(
-        x, compress_state, inner_compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        hadamard, idx_kv_cache, idx_kv_scale, idx_block_table, position_ids, num_tokens,
-        idx_slot_mapping, inner_state_slot_mapping,
+    completion = pl.array.create(1, pl.TASK_ID)
+    _prefill_indexer_compressor_with_completion(
+        x, compress_state, inner_compress_state_block_table,
+        wkv, wgate, ape,
+        norm_w, freqs_cos, freqs_sin,
+        hadamard, idx_kv_cache, idx_kv_scale,
+        idx_block_table, position_ids, num_tokens,
+        idx_slot_mapping, inner_state_slot_mapping, completion,
     )
     idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_cache_rows, HEAD_DIM])
-    for kv_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract"):
+    with pl.spmd(
+        MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_idx_c4_kv_test_extract",
+        deps=[completion[0]],
+    ) as _extract_tid:
+        kv_block = pl.tile.get_block_idx()
         kv_base = kv_block * PACKED_RMS_TILE
         for kv_dt in pl.range(PACKED_RMS_TILE):
             kv_i = kv_base + kv_dt

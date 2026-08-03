@@ -118,36 +118,25 @@ SPARSE_BIAS_COLS = min(TOPK, PREFILL_SPARSE_PAD)
 SPARSE_CMP_BIAS_COLS = max(0, SPARSE_BIAS_COLS - WIN)
 
 @pl.jit.inline
-def _prefill_sparse_attn_with_block_mask(
-    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+def _prefill_sparse_attn_stage(
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
     cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
     valid_block_mask: pl.Tensor[[T, VALID_BLOCK_MASK_COLS], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
     num_tokens: pl.Scalar[pl.INT32],
-    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    sparse_kv: pl.Tensor[[T * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[T, PREFILL_SPARSE_PAD], pl.FP32],
 ):
-    """Run sparse attention with an exact per-token block mask.
-
-    Set mask bits denote blocks containing live metadata. Nonnegative compressed
-    indices must fit ``cmp_block_table`` and map to nonnegative physical blocks.
-    Padded mask entries must be zero.
-    """
+    """Stage sparse sources and per-token attention bias."""
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     ori_cache_rows = ori_block_num * BLOCK_SIZE
     cmp_cache_rows = cmp_block_num * BLOCK_SIZE
     ori_kv_flat = pl.reshape(ori_kv, [ori_cache_rows, HEAD_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_cache_rows, HEAD_DIM])
-    sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    # Gather sparse sources in reverse token-tile order.
     with pl.spmd(
         (T + GATHER_TOKEN_TILE - 1) // GATHER_TOKEN_TILE,
         name_hint="gather_ori_kv",
@@ -206,7 +195,6 @@ def _prefill_sparse_attn_with_block_mask(
                                     stage[gather_ki:gather_ki + 1, :] = cmp_kv_flat[src:src + 1, :]
                         sparse_kv[block_base:block_base + PREFILL_ATTN_TILE, :] = stage
 
-    sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
     with pl.spmd(T // BIAS_TOKEN_TILE, name_hint="build_bias") as bias_tid:
         bias_blk = pl.tile.get_block_idx()
         bias_t0 = bias_blk * BIAS_TOKEN_TILE
@@ -225,12 +213,34 @@ def _prefill_sparse_attn_with_block_mask(
             sparse_bias[bias_t0:bias_t0 + BIAS_TOKEN_TILE, SPARSE_BIAS_COLS:PREFILL_SPARSE_PAD] = pl.full(
                 [BIAS_TOKEN_TILE, PREFILL_SPARSE_PAD - SPARSE_BIAS_COLS], dtype=pl.FP32, value=FP32_NEG_INF)
 
+    return sparse_kv, sparse_bias
+
+
+@pl.jit.inline
+def _prefill_sparse_attn_math(
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    sparse_kv: pl.Tensor[[T * PREFILL_SPARSE_PAD, HEAD_DIM], pl.BF16],
+    sparse_bias: pl.Tensor[[T, PREFILL_SPARSE_PAD], pl.FP32],
+    valid_block_mask: pl.Tensor[[T, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    """Run source-independent sparse QK/PV, merge, inverse RoPE, and projection."""
+
     # Block 0 stores all-masked fallback statistics.
     blk_rows = T * (H // HEAD_TILE) * PREFILL_ATTN_BLOCKS * HEAD_TILE
     sparse_blk_mi = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([blk_rows, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([blk_rows, HEAD_DIM], dtype=pl.FP32)
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
+    # Reshape sink bias for head-tile broadcast.
+    attn_sink_col = pl.reshape(attn_sink, [H, 1])
 
     # Build head-invariant inverse-RoPE tables in disjoint column tiles.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
@@ -289,12 +299,8 @@ def _prefill_sparse_attn_with_block_mask(
             cs_sign,
         )
 
-    # qk_pv publishes AIC-produced statistics before merge_rope_pack.
-    with pl.spmd(
-        T,
-        name_hint="qk_pv",
-        deps=[gather_ori_tid, gather_cmp_tid, bias_tid],
-    ) as qk_tid:
+    # Consume staged sparse sources for QK/PV.
+    with pl.spmd(T, name_hint="qk_pv") as qk_tid:
         qk_t = pl.tile.get_block_idx()
         if qk_t < num_tokens:
             qk_kv_base = qk_t * PREFILL_SPARSE_PAD
@@ -420,7 +426,7 @@ def _prefill_sparse_attn_with_block_mask(
                             pl.row_expand_mul(cur_oi, beta),
                         )
                         m_mi = mi_new
-                sink_bias = pl.reshape(attn_sink[m_h0:m_h0 + HEAD_TILE], [HEAD_TILE, 1])
+                sink_bias = attn_sink_col[m_h0:m_h0 + HEAD_TILE, :]
                 sink_tile = pl.add(pl.sub(m_mi, m_mi), sink_bias)
                 denom = pl.add(m_li, pl.exp(pl.sub(sink_tile, m_mi)))
                 n_full = pl.row_expand_div(m_oi, denom)[0:HEAD_TILE, :]
@@ -585,6 +591,43 @@ def _prefill_sparse_attn_with_block_mask(
             ] = pl.cast(out_t, target_type=pl.BF16, mode="rint")
 
     return attn_out
+
+
+@pl.jit.inline
+def _prefill_sparse_attn_with_block_mask(
+    q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[CMP_MAX_BLOCKS], pl.INT32],
+    cmp_indices: pl.Tensor[[T, IDX_TOPK], pl.INT32],
+    valid_block_mask: pl.Tensor[[T, VALID_BLOCK_MASK_COLS], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    """Stage sparse sources, then run sparse-attention math."""
+    sparse_kv = pl.create_tensor([T * PREFILL_SPARSE_PAD, HEAD_DIM], dtype=pl.BF16)
+    sparse_bias = pl.create_tensor([T, PREFILL_SPARSE_PAD], dtype=pl.FP32)
+    sparse_kv, sparse_bias = _prefill_sparse_attn_stage(
+        ori_kv, swa_indices,
+        cmp_kv, cmp_block_table, cmp_indices,
+        valid_block_mask, num_tokens,
+        sparse_kv, sparse_bias,
+    )
+    return _prefill_sparse_attn_math(
+        q,
+        sparse_kv, sparse_bias,
+        valid_block_mask, attn_sink,
+        freqs_cos, freqs_sin,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, num_tokens,
+    )
 
 
 @pl.jit.inline

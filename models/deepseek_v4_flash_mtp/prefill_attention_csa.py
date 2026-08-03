@@ -38,8 +38,8 @@ from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
     CSA_STATE_MAX_BLOCKS,
+    _prefill_compressor_ratio4_with_completion,
     golden_prefill_compressor_ratio4,
-    prefill_compressor_ratio4,
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
 from hc_pre import golden_hc_pre, hc_pre
@@ -228,11 +228,13 @@ def prefill_attention_csa(
                     write_row = pl.cast(write_row_raw, pl.INDEX)
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
-    prefill_compressor_ratio4(
+    compressor_completion = pl.array.create(1, pl.TASK_ID)
+    _prefill_compressor_ratio4_with_completion(
         x_normed, compress_state, compress_state_block_table,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        freqs_cos, freqs_sin, cmp_kv,
-        position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        cmp_wkv, cmp_wgate, cmp_ape,
+        cmp_norm_w, freqs_cos, freqs_sin,
+        cmp_kv, position_ids, num_tokens,
+        cmp_slot_mapping, state_slot_mapping, compressor_completion,
     )
     # Half-width FP32 cos/sin rows for the indexer Q-RoPE: gather freqs at each token's position
     # and take the first HALF_ROPE columns (matches the golden's materialize_half_rope_tables).
@@ -246,15 +248,15 @@ def prefill_attention_csa(
 
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
-    prefill_indexer(
+    idx_kv_cache_out, idx_kv_scale_out, idx_score_unused, cmp_topk_indices = prefill_indexer(
         x_normed, qr, qr_scale,
         idx_wq_b, idx_wq_b_scale, idx_weights_proj,
-        idx_cos, idx_sin, freqs_cos, freqs_sin, hadamard_idx,
-        inner_compress_state, inner_compress_state_block_table,
-        inner_wkv, inner_wgate, inner_ape, inner_norm_w,
-        idx_kv_cache, idx_kv_scale, idx_block_table,
-        idx_score_unused, cmp_topk_indices,
-        position_ids, num_tokens,
+        idx_cos, idx_sin, freqs_cos,
+        freqs_sin, hadamard_idx, inner_compress_state,
+        inner_compress_state_block_table, inner_wkv, inner_wgate,
+        inner_ape, inner_norm_w, idx_kv_cache,
+        idx_kv_scale, idx_block_table, idx_score_unused,
+        cmp_topk_indices, position_ids, num_tokens,
         idx_slot_mapping, inner_state_slot_mapping,
     )
 
@@ -327,7 +329,15 @@ def prefill_attention_csa(
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
-    return kv_cache, cmp_kv, compress_state, idx_kv_cache, idx_kv_scale, inner_compress_state, x_out
+    return (
+        kv_cache,
+        cmp_kv,
+        compress_state,
+        idx_kv_cache,
+        idx_kv_scale,
+        inner_compress_state,
+        x_out,
+    )
 
 
 @pl.jit
@@ -402,7 +412,15 @@ def prefill_attention_csa_test(
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out, num_tokens,
     )
-    return kv_cache, cmp_kv, compress_state, idx_kv_cache, idx_kv_scale, inner_compress_state, x_out
+    return (
+        kv_cache,
+        cmp_kv,
+        compress_state,
+        idx_kv_cache,
+        idx_kv_scale,
+        inner_compress_state,
+        x_out,
+    )
 
 
 def golden_prefill_attention_csa(tensors):
