@@ -63,7 +63,7 @@ marker default to one card. Runs use each program's **default** world size,
 commonly EP2 for distributed DeepSeek entries. The current workflow contains
 only a commented EP4 command example; it does not provide active EP4 or EP8
 per-file coverage. See the `a2a3` job in
-[.github/workflows/ci.yml](../.github/workflows/ci.yml).
+[.github/workflows/ci.yml](../../.github/workflows/ci.yml).
 
 Multi-card kernels use HCCL, which silent-crashes inside docker. For this
 reason the real-NPU job runs **on the host (no container)**. The shared
@@ -124,7 +124,7 @@ and emits files in three streams:
   `kernels/aiv/` (vector). The ptoas invocations run in a thread pool
   since each is an independent subprocess. `skip_ptoas=True` keeps the
   raw `.pto` files and skips the C++ wrapper step (useful for inspecting
-  pure MLIR output or for bisecting whether a regression came from
+  pure MLIR output or for isolating whether a regression came from
   pypto's IR→MLIR or from ptoas).
 - **Orchestration → C++.** `generate_orchestration` emits one
   `orchestration/<orch_name>.cpp` that drives the kernels through the
@@ -204,7 +204,7 @@ top opaque function. For each entry, allocate a torch tensor:
 - Pure outputs are zero-initialised.
 - Scalars become 0-D tensors carrying the spec value.
 
-See [Golden Harness](run-and-validate/golden-harness.md) for the complete
+See [Golden Harness](golden-harness.md) for the complete
 `TensorSpec` initialization contract.
 
 When `save_data=True`, the input snapshot is written to `data/in/<name>.pt`
@@ -299,7 +299,7 @@ python -m simpler_setup.tools.scope_stats_plot \
 ```
 
 For kernel-internal swimlanes and MindStudio Insight traces, see
-[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
+[In-Core Simulator Profiling](../debug-and-tune/incore-simulator-profiling.md).
 The repository workflow can reuse an existing build or drive a case
 end-to-end. It writes the export root below
 `build_output/<ProgramName>_<ts>/kernel_insight_all_funcs_<ts>/`.
@@ -319,7 +319,7 @@ before validation, and prints
 env-gated only — no model file needs a flag. `PYPTO_BENCH_ROUNDS` /
 `PYPTO_BENCH_WARMUP` (default 100 / 5) size the loop and `PYPTO_BENCH_RAW`
 dumps the per-dispatch samples. See
-[performance-tuning.md](performance-tuning.md#measuring-the-benchmark-loop-pypto_bench)
+[performance-tuning.md](../debug-and-tune/performance-tuning.md#measuring-the-benchmark-loop-pypto_bench)
 for the output format, the multi-card breakdown, and what the number means.
 
 ### 5. Validate
@@ -354,4 +354,4 @@ false; an uncaught compile/runtime exception is already a nonzero failure.
 | `save_data=True` (default `False`) | Writes the `data/in/` + `data/out/` snapshot so the exact inputs/goldens can be replayed later via `golden_data`. Off by default: runs skip the snapshot and validate against the in-memory golden only. Opt in when you need replay; full-model kernels like `models/qwen3/14b/{prefill_fwd,decode_fwd}.py` expose it as `--save-data`. |
 
 For diagnosing compile errors, runtime hangs, and precision mismatches, see
-[debugging.md](debugging.md).
+[debugging.md](../debug-and-tune/debugging.md).

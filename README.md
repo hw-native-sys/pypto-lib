@@ -38,12 +38,12 @@ The learning examples accept `-p {a2a3,a2a3sim,a5,a5sim}` and exit non-zero
 on validation mismatch. Model and distributed entry points have
 script-specific platform and device arguments; inspect `--help` and the
 [platform guide](docs/get-started/platforms.md). See the
-[compile and runtime workflow](docs/compile-runtime-workflow.md) for the full
+[compile and runtime workflow](docs/run-and-validate/compile-runtime-workflow.md) for the full
 flow (compile → input generation → golden → runtime → validation).
 
 ## Writing a kernel
 
-Read [docs/pypto-coding-style.md](docs/pypto-coding-style.md) — it covers
+Read [docs/pypto-coding/pypto-coding-style.md](docs/pypto-coding/pypto-coding-style.md) — it covers
 the two kernel forms (`@pl.jit` / `@pl.jit.inline` and `@pl.program` /
 `@pl.function`), `pl.at` scopes, the four loop constructs (`pl.range`,
 `pl.parallel`, `pl.pipeline`, `pl.spmd`), and the vector / cube / mte op
@@ -55,20 +55,20 @@ full-model fused kernel.
 
 ## Debugging
 
-See [docs/debugging.md](docs/debugging.md) for the debugging workflow —
+See [docs/debug-and-tune/debugging.md](docs/debug-and-tune/debugging.md) for the debugging workflow —
 reading pypto/ptoas errors, replaying failing data with `golden_data`,
 reusing a compile with `runtime_dir`, device logs for runtime hangs, and
 the args-dump / dep-gen DFX flags.
 
 ## Performance tuning
 
-See [docs/performance-tuning.md](docs/performance-tuning.md) for the L2
+See [docs/debug-and-tune/performance-tuning.md](docs/debug-and-tune/performance-tuning.md) for the L2
 (inter-kernel) and L1/L0 (intra-kernel) tuning workflow — L2 swimlane in
 Perfetto, PMU counters, and the per-kernel insight swimlane.
 
 ## Precision tuning
 
-See [docs/precision-tuning.md](docs/precision-tuning.md) for keeping a kernel
+See [docs/debug-and-tune/precision-tuning.md](docs/debug-and-tune/precision-tuning.md) for keeping a kernel
 numerically faithful to its torch reference — `pl.cast` rounding modes vs
 torch, kernel/golden parity, dtype alignment, quantization schemes, the
 `error_distribution` threshold sweep, and real-weight testing.

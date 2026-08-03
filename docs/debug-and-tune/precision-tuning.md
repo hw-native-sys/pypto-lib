@@ -55,7 +55,7 @@ should still use the same rule.
 > kernel's benefit (e.g. folding a scale), align the **golden** to the
 > kernel's order rather than de-optimizing the kernel — *except* when the
 > golden is the ground-truth numeric (an RNE cast), in which case fix the
-> kernel. See `docs/debugging.md` §2 for the replay loop.
+> kernel. See `docs/debug-and-tune/debugging.md` §2 for the replay loop.
 
 ---
 

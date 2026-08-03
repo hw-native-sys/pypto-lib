@@ -30,7 +30,7 @@ PYPTO_BENCH=1 python models/qwen3/14b/decode_fwd.py -p a2a3 -d 0
 device (`orch` ∪ `sched` — the old device-log "Total"), recovered from the
 runtime's `[STRACE]` markers. Quote `mean=`: daily CI's per-case perf number
 is exactly this field of exactly this line
-([daily_ci.yml](../.github/workflows/daily_ci.yml)), so a local mean is
+([daily_ci.yml](../../.github/workflows/daily_ci.yml)), so a local mean is
 directly comparable to the dashboard.
 
 Requirements: a real device — a `*sim` platform prints
@@ -107,7 +107,7 @@ PYPTO_BENCH=1 PYPTO_BENCH_ROUNDS=10 PYPTO_BENCH_WARMUP=2 PYPTO_BENCH_RAW=1 \
 When only the timing changes between iterations — not the numerics — save the
 golden once and replay it via `golden_data=`, cutting the torch recompute out
 of every later run. See
-[Save and Replay Golden Data](run-and-validate/save-and-replay.md).
+[Save and Replay Golden Data](../run-and-validate/save-and-replay.md).
 
 ---
 
@@ -316,7 +316,7 @@ Practical procedure:
 The K loop is then driven by `pl.pipeline(stage=2 or 4)` so the next
 tile's MTE2 overlaps the current tile's compute (see Part 2 item 2).
 For the complete M/N/K constraint model and empirical sweep method, see
-[Cube Tile Tuning](debug-and-tune/cube-tile-tuning.md).
+[Cube Tile Tuning](cube-tile-tuning.md).
 
 #### 5. `pl.spmd` for parallel sub-kernel dispatch
 
@@ -363,14 +363,14 @@ captured by passing `runtime_cfg={"enable_pmu": 2}` to its `run` / `run_jit`
 call (the harness bundles it into the runtime's DFX options).
 
 For a per-kernel intra-core swimlane, use
-[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
+[In-Core Simulator Profiling](incore-simulator-profiling.md).
 It explains how the repository workflow builds a standalone single-core
 testcase from the generated `.cpp` and sibling `.pto`, runs it under
 `msprof op simulator`, validates that data-dependent work actually executed,
 and cleans the Insight trace for Perfetto.
 
 For phase timing inside a multi-core extern on real hardware, use
-[`incore-timestamp-profiling.md`](incore-timestamp-profiling.md). It covers
+[`cce-incore-profiling.md`](cce-incore-profiling.md). It covers
 per-core on-device timestamps, collective-barrier interpretation, and exact
 partitions that reconcile internal phases with the L2 task total.
 

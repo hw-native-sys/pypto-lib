@@ -1,4 +1,4 @@
-# On-Device InCore Timestamp Profiling for Multi-Core AscendC Extern Kernels
+# CCE In-Core Profiling
 
 Use on-device timestamps when an L2 swimlane identifies a slow fused task but
 cannot show which phase inside the task is responsible. This technique is most
@@ -11,7 +11,7 @@ the task. Remove it before reporting production performance or submitting the
 kernel unless permanent telemetry is an explicit requirement.
 
 For single-core instruction and pipe analysis, use
-[In-Core Simulator Profiling](debug-and-tune/incore-simulator-profiling.md).
+[In-Core Simulator Profiling](incore-simulator-profiling.md).
 For task-level scheduling, start with the L2 swimlane described in
 [`performance-tuning.md`](performance-tuning.md).
 
@@ -123,7 +123,8 @@ scalar's packed `args[]` position:
 
 Inspect the generated orchestration's `add_input`, `add_output`, and
 `add_scalar` order after adding the probe. Restore and recheck the original ABI
-when removing it. See [`cce-extern-kernel-guide.md`](cce-extern-kernel-guide.md)
+when removing it. See
+[`cce-extern-kernel.md`](../pypto-coding/cce-extern-kernel.md)
 for the complete extern argument and return rules.
 
 ## Capture the actual device output

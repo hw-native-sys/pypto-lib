@@ -14,8 +14,9 @@ Follow these pages in order:
 2. [Run the first kernel](first-kernel.md) on a simulator or an available NPU.
 3. [Choose a platform and device](platforms.md) for later examples and model
    kernels.
-4. Read the [kernel coding style](../pypto-coding-style.md) before modifying a
-   kernel.
+4. Read the
+   [kernel coding style](../pypto-coding/pypto-coding-style.md) before
+   modifying a kernel.
 
 After the first successful run, continue with
 [Run and Validate](../run-and-validate/index.md) to understand the harness and

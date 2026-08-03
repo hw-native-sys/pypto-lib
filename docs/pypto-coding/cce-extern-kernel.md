@@ -1,15 +1,17 @@
-# CCE Extern Kernel Programming Guide
+# CCE Extern Kernel Programming
 
 How to write a hand-written mixed (cube + vector) CCE kernel behind
 `pl.jit.extern` — and, more importantly, the non-obvious traps that make one
 compile fine but **hang on device (507018)** or silently produce wrong data.
 
-This guide was written after folding RoPE into the Qwen3-14B paged-attention
+This reference was written after folding RoPE into the Qwen3-14B paged-attention
 extern (`paged_attention_rope_cce`). Every trap below cost at least one on-device
 debug cycle; they are recorded here so the next person spends minutes, not a night.
 
-The companion references are [`compile-runtime-workflow.md`](compile-runtime-workflow.md)
-(what `python <kernel>.py -p <platform>` does) and [`debugging.md`](debugging.md)
+The companion references are
+[`compile-runtime-workflow.md`](../run-and-validate/compile-runtime-workflow.md)
+(what `python <kernel>.py -p <platform>` does) and
+[`debugging.md`](../debug-and-tune/debugging.md)
 (general `507018` / hang triage). This doc is specifically about the **extern**
 boundary and the AscendC code that runs inside it.
 
@@ -190,7 +192,8 @@ need a **global** cube↔vector barrier, not a per-pair sync.
   direct scalar writes.
 
 For on-device measurement of arrival skew, collective service, and release
-skew, see [`incore-timestamp-profiling.md`](incore-timestamp-profiling.md).
+skew, see
+[`cce-incore-profiling.md`](../debug-and-tune/cce-incore-profiling.md).
 Per-core barrier residence includes time spent waiting for late participants
 and is not the collective's intrinsic service time.
 
@@ -234,7 +237,7 @@ not worth reverse-engineering; work from artifacts.
    To confirm a barrier lowering, generate a known-good native kernel that uses the
    same primitive and diff.
 
-3. **Bisect on device with `return;`.** Insert an early `return;` at successive
+3. **Narrow down on device with `return;`.** Insert an early `return;` at successive
    points and see whether the hang moves:
    `return` before the `TPipe` → after `InitBuffer` → before the first `DataCopy`
    → before the compute loop. The first point that *stops* hanging brackets the
@@ -245,7 +248,7 @@ not worth reverse-engineering; work from artifacts.
    after your phase) to test your phase alone; swap the barrier for a bare
    `PipeBarrier<PIPE_ALL>` to test whether the barrier is the hang; feed valid vs
    garbage inputs deliberately (remember §6 — a skipped attention can *false-pass*
-   a loose single-layer golden, so a "pass" during bisection is not proof).
+   a loose single-layer golden, so a "pass" during narrowing is not proof).
 
 5. **Read the simpler runtime, don't assume.** The execution model (§1) —
    persistent kernel, one-time `set_ffts_base_addr`, unified function-pointer

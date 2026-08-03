@@ -24,7 +24,7 @@ SPEC.loader.exec_module(repo_links)
 repo_links.REF = "test-sha"
 
 
-def rewrite(markdown: str, source_uri: str = "debugging.md") -> str:
+def rewrite(markdown: str, source_uri: str = "debug-and-tune/debugging.md") -> str:
     page = SimpleNamespace(file=SimpleNamespace(src_uri=source_uri))
     return repo_links.on_page_markdown(markdown, page, None, None)
 
@@ -35,7 +35,7 @@ class RepoLinksTest(unittest.TestCase):
         self.assertEqual(rewrite(markdown), markdown)
 
     def test_repository_file_becomes_blob_link(self):
-        rewritten = rewrite("[CI](../.github/workflows/ci.yml#sim)")
+        rewritten = rewrite("[CI](../../.github/workflows/ci.yml#sim)")
         self.assertEqual(
             rewritten,
             "[CI](https://github.com/hw-native-sys/pypto-lib/blob/test-sha/"
@@ -65,11 +65,11 @@ class RepoLinksTest(unittest.TestCase):
         self.assertEqual(rewrite(markdown, "examples/index.md"), markdown)
 
     def test_fenced_code_is_unchanged(self):
-        markdown = "```markdown\n[CI](../.github/workflows/ci.yml)\n```"
+        markdown = "```markdown\n[CI](../../.github/workflows/ci.yml)\n```"
         self.assertEqual(rewrite(markdown), markdown)
 
     def test_reference_definition_is_rewritten(self):
-        rewritten = rewrite("[ci]: ../.github/workflows/ci.yml#sim")
+        rewritten = rewrite("[ci]: ../../.github/workflows/ci.yml#sim")
         self.assertEqual(
             rewritten,
             "[ci]: https://github.com/hw-native-sys/pypto-lib/blob/test-sha/"
@@ -78,7 +78,7 @@ class RepoLinksTest(unittest.TestCase):
 
     def test_missing_target_warns_and_is_still_rewritten(self):
         with self.assertLogs("mkdocs", level="WARNING") as captured:
-            rewritten = rewrite("[Missing](../missing-file.md)")
+            rewritten = rewrite("[Missing](../../missing-file.md)")
         self.assertIn("does not exist", captured.output[0])
         self.assertIn("/blob/test-sha/missing-file.md", rewritten)
 

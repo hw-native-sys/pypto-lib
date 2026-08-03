@@ -274,7 +274,8 @@ topk_idxs = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010,
                       output_dtype=pl.INT32)          # odd lanes = indices
 ```
 
-A full runnable kernel is in [examples/advanced/topk.py](../examples/advanced/topk.py).
+A full runnable kernel is in
+[examples/advanced/topk.py](../../examples/advanced/topk.py).
 
 ### Gather / scatter
 

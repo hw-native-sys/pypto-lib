@@ -1,7 +1,7 @@
 # Cube Tile Tuning
 
 Use this guide to choose the row (`M`), output (`N`), and reduction (`K`) tile
-for a PyPTO matmul. It complements [Performance Tuning](../performance-tuning.md):
+for a PyPTO matmul. It complements [Performance Tuning](performance-tuning.md):
 first confirm that a cube scope is important to end-to-end time, then tune its
 tile against the actual compiler memory report and repeated device
 measurements.

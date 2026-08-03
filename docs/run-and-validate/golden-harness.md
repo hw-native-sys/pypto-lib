@@ -102,7 +102,7 @@ result = run(
 Both entry points perform the same input, golden, runtime, and validation
 stages after their respective compile path. The detailed sequence and
 configuration groups are documented in
-[Compile and Runtime Workflow](../compile-runtime-workflow.md).
+[Compile and Runtime Workflow](compile-runtime-workflow.md).
 
 ## Validation
 
@@ -164,6 +164,7 @@ PYPTO_GOLDEN_NUM_THREADS=8 \
 
 - Use [Save and Replay Golden Data](save-and-replay.md) for repeated timing or
   profiling iterations whose numerical contract is unchanged.
-- Use [Debugging](../debugging.md) when compile, runtime, or validation fails.
-- Use [Precision Tuning](../precision-tuning.md) when the mismatch itself is
+- Use [Debugging](../debug-and-tune/debugging.md) when compile, runtime, or
+  validation fails.
+- Use [Precision Tuning](../debug-and-tune/precision-tuning.md) when the mismatch itself is
   the subject of the work.

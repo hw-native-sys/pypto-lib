@@ -14,7 +14,8 @@ git diff --staged      # review before committing
 
 Check what the hooks cannot: `import pypto.language as pl` (not other aliases), correct
 `pl.FunctionType` (InCore / Orchestration / Opaque), correct parameter directions (`pl.Out`,
-`pl.InOut`), no hardcoded absolute paths or private information. See `docs/pypto-coding-style.md`.
+`pl.InOut`), no hardcoded absolute paths or private information. See
+`docs/pypto-coding/pypto-coding-style.md`.
 
 If the change touches a kernel under `examples/` or `models/`, run it once before committing.
 Docs- or config-only changes need no run.

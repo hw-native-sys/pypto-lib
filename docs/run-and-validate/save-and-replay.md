@@ -153,8 +153,8 @@ files.
 - the `golden_data` cache is read-only during replay.
 
 Use `runtime_dir` only while the compiled kernel logic remains compatible with
-that build. See [Compile and Runtime Workflow](../compile-runtime-workflow.md)
-and [Debugging](../debugging.md) for compile reuse details.
+that build. See [Compile and Runtime Workflow](compile-runtime-workflow.md) and
+[Debugging](../debug-and-tune/debugging.md) for compile reuse details.
 
 The behavior above is implemented in
 [`golden/runner.py`](../../golden/runner.py) and covered by

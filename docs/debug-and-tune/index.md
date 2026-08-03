@@ -13,13 +13,12 @@ then move from the broadest evidence to the narrowest:
 
 | Goal | Start here |
 |------|------------|
-| Diagnose compile errors, runtime failures, hangs, or missing dependencies | [Debugging](../debugging.md) |
-| Diagnose numerical drift and choose comparison thresholds | [Precision Tuning](../precision-tuning.md) |
-| Locate the PyPTO or simpler commit that introduced a precision regression | [Precision Regression Bisect](precision-regression-bisect.md) |
-| Measure end-to-end time and inspect the task schedule | [Performance Tuning](../performance-tuning.md) |
+| Diagnose compile errors, runtime failures, hangs, or missing dependencies | [Debugging](debugging.md) |
+| Diagnose numerical drift and choose comparison thresholds | [Precision Tuning](precision-tuning.md) |
+| Measure end-to-end time and inspect the task schedule | [Performance Tuning](performance-tuning.md) |
 | Choose matmul row, N, and K tiles | [Cube Tile Tuning](cube-tile-tuning.md) |
 | Inspect one generated kernel in the operator simulator | [In-Core Simulator Profiling](incore-simulator-profiling.md) |
-| Partition phases inside a multi-core extern kernel on real hardware | [On-Device InCore Timestamp Profiling](../incore-timestamp-profiling.md) |
+| Partition phases inside a multi-core CCE extern kernel on real hardware | [CCE In-Core Profiling](cce-incore-profiling.md) |
 
 ## Evidence hierarchy
 

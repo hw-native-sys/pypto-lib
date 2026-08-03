@@ -76,8 +76,8 @@ for r in pl.parallel(0, ROWS, ROW_TILE):
 - `pl.at` defines an InCore region.
 - The slice load, `pl.add`, and slice store operate on one tile.
 
-Read the [kernel coding style](../pypto-coding-style.md) before editing this
-or another kernel.
+Read the [kernel coding style](../pypto-coding/pypto-coding-style.md) before
+editing this or another kernel.
 
 ## Understand the validation
 
@@ -97,4 +97,4 @@ CLI exits with status 1.
 Generated files are written to the run's work directory under
 `build_output/`. Continue with the
 [Golden Harness](../run-and-validate/golden-harness.md) or the detailed
-[compile and runtime workflow](../compile-runtime-workflow.md).
+[compile and runtime workflow](../run-and-validate/compile-runtime-workflow.md).

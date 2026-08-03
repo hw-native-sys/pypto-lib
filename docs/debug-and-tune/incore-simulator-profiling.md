@@ -8,9 +8,9 @@ L2 swimlane or PMU report has identified the task worth investigating.
 This workflow is different from:
 
 - `report/perf_hints.log`, which contains compile-time recommendations;
-- the L2 swimlane in [Performance Tuning](../performance-tuning.md), which
+- the L2 swimlane in [Performance Tuning](performance-tuning.md), which
   shows the multi-kernel device schedule; and
-- [On-Device InCore Timestamp Profiling](../incore-timestamp-profiling.md),
+- [CCE In-Core Profiling](cce-incore-profiling.md),
   which instruments phases of a multi-core extern kernel on real inputs.
 
 The repository currently exposes testcase generation and collection through

@@ -14,23 +14,35 @@ kernels and systematic precision or performance tuning.
 Start with [installation and environment setup](get-started/installation.md),
 then [run your first kernel](get-started/first-kernel.md).
 
-### Understand validation
+### Write a kernel
 
-Read the [compile and runtime workflow](compile-runtime-workflow.md) and the
+Use the [PyPTO Coding](pypto-coding/index.md) chapter for the canonical kernel
+style and hand-written CCE extern-kernel conventions.
+
+### Examples
+
+Use the [example catalog](examples/index.md) for focused, self-contained
+kernels organized by learning level.
+
+### Models
+
+Use the [model support matrix](models/index.md) for end-to-end and
+component-level model implementations.
+
+### Run and Validate
+
+Read the
+[compile and runtime workflow](run-and-validate/compile-runtime-workflow.md)
+and the
 [Golden Harness overview](run-and-validate/golden-harness.md) to understand
 how a script compiles, executes, and checks its result.
 
-### Learn from working implementations
-
-Use the [example catalog](examples/index.md) for focused kernels or the
-[model support matrix](models/index.md) for end-to-end and component-level
-model implementations.
-
 ### Diagnose and optimize
 
-Begin with the [debugging playbook](debugging.md), then choose the
-[precision](precision-tuning.md) or
-[performance](performance-tuning.md) workflow for the problem at hand.
+Begin with the [debugging playbook](debug-and-tune/debugging.md), then choose
+the [precision](debug-and-tune/precision-tuning.md) or
+[performance](debug-and-tune/performance-tuning.md) workflow for the problem
+at hand.
 
 ## Ecosystem
 

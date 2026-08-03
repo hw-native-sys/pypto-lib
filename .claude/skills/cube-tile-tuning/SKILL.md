@@ -7,7 +7,7 @@ description: Tune cube/matmul row, N, and K tiles for a PyPTO kernel using analy
 
 Read the canonical
 [Cube Tile Tuning](../../../docs/debug-and-tune/cube-tile-tuning.md) guide and
-[Performance Tuning](../../../docs/performance-tuning.md) before changing a
+[Performance Tuning](../../../docs/debug-and-tune/performance-tuning.md) before changing a
 kernel. Keep the technical method in those documents; use this skill to
 orchestrate one concrete tuning run.
 
@@ -48,7 +48,7 @@ allocation or the currently bound pipe. The budget script is an estimate.
 1. **Resolve the target.**
    - Read the requested kernel, its golden function, and its existing tile
      constants.
-   - Follow `docs/pypto-coding-style.md` for any kernel edit.
+   - Follow `docs/pypto-coding/pypto-coding-style.md` for any kernel edit.
    - Identify all matmuls in the affected scope and give distinct tasks
      distinct knobs before sweeping.
 

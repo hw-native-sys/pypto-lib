@@ -72,13 +72,15 @@ nav:
       - Installation and environment: get-started/installation.md
       - Run your first kernel: get-started/first-kernel.md
       - Platforms and devices: get-started/platforms.md
-      - Kernel coding style: pypto-coding-style.md
+  - PyPTO Coding:
+      - Overview: pypto-coding/index.md
+      - PyPTO coding style: pypto-coding/pypto-coding-style.md
+      - CCE extern kernel: pypto-coding/cce-extern-kernel.md
   - Run and Validate:
       - Overview: run-and-validate/index.md
-      - Compile and runtime workflow: compile-runtime-workflow.md
+      - Compile and runtime workflow: run-and-validate/compile-runtime-workflow.md
       - Golden Harness: run-and-validate/golden-harness.md
       - Save and replay golden data: run-and-validate/save-and-replay.md
-      - CCE extern kernels: cce-extern-kernel-guide.md
   - Examples:
       - Overview: examples/index.md
       - Beginner: examples/beginner.md
@@ -90,10 +92,9 @@ nav:
       - DeepSeek: models/deepseek.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
-      - Debugging: debugging.md
-      - Precision tuning: precision-tuning.md
-      - Performance tuning: performance-tuning.md
+      - Debugging: debug-and-tune/debugging.md
+      - Precision tuning: debug-and-tune/precision-tuning.md
+      - Performance tuning: debug-and-tune/performance-tuning.md
       - Cube tile tuning: debug-and-tune/cube-tile-tuning.md
       - In-core simulator profiling: debug-and-tune/incore-simulator-profiling.md
-      - On-device timestamp profiling: incore-timestamp-profiling.md
-      - Precision regression bisect: debug-and-tune/precision-regression-bisect.md
+      - CCE in-core profiling: debug-and-tune/cce-incore-profiling.md
