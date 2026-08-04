@@ -110,8 +110,6 @@ ATTN_PHASE_MICRO_GROUPS = (FINALIZE_TOK_GROUP + ATTN_TOK_GROUP - 1) // ATTN_TOK_
 ATTN_GI_BLOCKS = (TOTAL_Q_GROUPS + ATTN_GI_GROUP - 1) // ATTN_GI_GROUP
 ATTN_PHASE_WORK_ITEMS = ATTN_PHASE_MICRO_GROUPS * ATTN_GI_BLOCKS
 ATTN_PHASE_SPMD_BLOCKS = 24
-FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK = False
-FUSE_OUT_PROJ_IN_ROPE_QKPV = True
 ATTN_PHASE_SCORE_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_SCORE_ROWS
 ATTN_PHASE_STAT_ROWS = ATTN_PHASE_WORK_ITEMS * ATTN_GI_STAT_ROWS
 ATTN_PHASE_ACC_SCORE_ROWS = ATTN_PHASE_MICRO_GROUPS * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
@@ -1131,325 +1129,6 @@ def _out_proj_aic_phase(
 
 
 @pl.jit.inline(auto_scope=False)
-def _rope_qkpv_out_single_block_fused(
-    attn_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
-    out_proj_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32],
-    all_q_padded_tile: pl.Tensor[[TOK_TILE * TOTAL_Q_GROUPS * Q_HEAD_PAD, HEAD_DIM], pl.BF16],
-    input_inv_rms_tile: pl.Tensor[[TOK_TILE, 1], pl.FP32],
-    q_proj_tile: pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32],
-    k_proj_tile: pl.Tensor[[TOK_TILE, KV_HIDDEN], pl.FP32],
-    v_proj_tile: pl.Tensor[[TOK_TILE, KV_HIDDEN], pl.FP32],
-    q_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
-    k_norm_weight: pl.Tensor[[LAYER_DYN, HEAD_DIM], pl.FP32],
-    rope_cos: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
-    rope_sin: pl.Tensor[[MAX_SEQ, HEAD_DIM], pl.FP32],
-    slot_mapping: pl.Tensor[[PREFILL_TOKENS_DYN], pl.INT32],
-    block_table: pl.Tensor[[BLOCK_TABLE_FLAT_DYN], pl.INT32],
-    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
-    wo: pl.Tensor[[LAYER_HIDDEN_ROWS_DYN, HIDDEN], pl.BF16],
-    cur_li_phase: pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
-    oi_tmp_phase: pl.Tensor[[ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], pl.FP32],
-    fused_ready_deps: pl.Array[3, pl.TASK_ID],
-    b: pl.Scalar[pl.INT32],
-    max_blocks_per_seq: pl.Scalar[pl.INT32],
-    layer_cache_base: pl.Scalar[pl.INT32],
-    layer_hidden_base: pl.Scalar[pl.INT32],
-    chunk_start: pl.Scalar[pl.INT32],
-    p0: pl.Scalar[pl.INT32],
-    final_ti0: pl.Scalar[pl.INT32],
-    slot_token_p0: pl.Scalar[pl.INDEX],
-    layer_idx: pl.Scalar[pl.INT32],
-) -> tuple[
-    pl.Tensor[[TOK_TILE, HIDDEN], pl.BF16],
-    pl.Tensor[[TOK_TILE, HIDDEN], pl.FP32],
-    pl.Tensor[[ATTN_PHASE_ACC_STAT_ROWS, 1], pl.FP32],
-    pl.Tensor[[ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], pl.FP32],
-]:
-    cache_token_rows = pl.tensor.dim(k_cache, 0) // NUM_KV_HEADS
-    k_cache_bsnd = pl.reshape(k_cache, [cache_token_rows, KV_HIDDEN])
-    v_cache_bsnd = pl.reshape(v_cache, [cache_token_rows, KV_HIDDEN])
-    with pl.spmd(
-        ATTN_PHASE_SPMD_BLOCKS,
-        name_hint="rope_qkpv_out_fused_spmd",
-        deps=[fused_ready_deps[0], fused_ready_deps[1], fused_ready_deps[2]],
-        sync_start=True,
-    ) as fused_tid:
-        phase_core = pl.tile.get_block_idx()
-
-        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
-            lane = phase_core * 2 + aiv_id
-            for rel_ti in pl.range(lane, FINALIZE_TOK_GROUP, ATTN_PHASE_SPMD_BLOCKS * 2):
-                ti = final_ti0 + rel_ti
-                chunk_pos = p0 + ti
-                pos = chunk_start + chunk_pos
-                cos_row = pl.slice(rope_cos, [1, HEAD_DIM], [pos, 0])
-                sin_row = pl.slice(rope_sin, [1, HEAD_DIM], [pos, 0])
-                cos_lo = pl.slice(cos_row, [1, HALF_DIM], [0, 0])
-                cos_hi = pl.slice(cos_row, [1, HALF_DIM], [0, HALF_DIM])
-                sin_lo = pl.slice(sin_row, [1, HALF_DIM], [0, 0])
-                sin_hi = pl.slice(sin_row, [1, HALF_DIM], [0, HALF_DIM])
-                cache_slot = pl.cast(pl.tensor.read(slot_mapping, [slot_token_p0 + ti]), pl.INDEX)
-                cache_slot_block = cache_slot // BLOCK_SIZE
-                cache_slot_offset = cache_slot - cache_slot_block * BLOCK_SIZE
-                q_block_row0 = ti * TOTAL_Q_GROUPS * Q_HEAD_PAD
-                input_inv_rms = pl.read(input_inv_rms_tile, [ti, 0])
-                for ki in pl.range(NUM_KV_HEADS):
-                    kv_col = ki * HEAD_DIM
-                    k_head_raw = pl.mul(
-                        pl.slice(k_proj_tile, [1, HEAD_DIM], [ti, kv_col]),
-                        input_inv_rms,
-                    )
-                    k_head = pl.full([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                    k_head = pl.assemble(k_head, k_head_raw, [0, 0])
-                    k_sq = pl.reshape(pl.row_sum(pl.mul(k_head, k_head)), [Q_HEAD_PAD, 1])
-                    k_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(k_sq, HEAD_DIM_INV), EPS)))
-                    k_normed = pl.col_expand_mul(
-                        pl.row_expand_mul(k_head, k_inv_rms),
-                        pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0]),
-                    )
-                    k_lo = pl.reshape(
-                        pl.slice(k_normed, [1, HALF_DIM], [0, 0]),
-                        [1, HALF_DIM],
-                    )
-                    k_hi = pl.reshape(
-                        pl.slice(k_normed, [1, HALF_DIM], [0, HALF_DIM]),
-                        [1, HALF_DIM],
-                    )
-                    rot_lo = pl.sub(
-                        pl.col_expand_mul(k_lo, cos_lo),
-                        pl.col_expand_mul(k_hi, sin_lo),
-                    )
-                    rot_hi = pl.add(
-                        pl.col_expand_mul(k_hi, cos_hi),
-                        pl.col_expand_mul(k_lo, sin_hi),
-                    )
-                    cache_row = layer_cache_base + cache_slot_block * BLOCK_SIZE + cache_slot_offset
-                    cache_col = ki * HEAD_DIM
-                    k_cache_bsnd = pl.assemble(
-                        k_cache_bsnd,
-                        pl.cast(rot_lo, target_type=pl.BF16),
-                        [cache_row, cache_col],
-                    )
-                    k_cache_bsnd = pl.assemble(
-                        k_cache_bsnd,
-                        pl.cast(rot_hi, target_type=pl.BF16),
-                        [cache_row, cache_col + HALF_DIM],
-                    )
-                    v_cache_bsnd = pl.assemble(
-                        v_cache_bsnd,
-                        pl.cast(
-                            pl.mul(
-                                pl.reshape(
-                                    pl.slice(v_proj_tile, [1, HEAD_DIM], [ti, ki * HEAD_DIM]),
-                                    [1, HEAD_DIM],
-                                ),
-                                input_inv_rms,
-                            ),
-                            target_type=pl.BF16,
-                        ),
-                        [cache_row, cache_col],
-                    )
-                    q_base = ki * Q_PER_KV
-                    q_block_raw = pl.reshape(
-                        pl.slice(q_proj_tile, [1, Q_HEAD_BATCH * HEAD_DIM], [ti, q_base * HEAD_DIM]),
-                        [Q_HEAD_BATCH, HEAD_DIM],
-                    )
-                    q_block_pad = pl.full([Q_HEAD_PAD, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                    q_block_pad = pl.assemble(q_block_pad, q_block_raw, [0, 0])
-                    q_block_pad = pl.mul(q_block_pad, input_inv_rms)
-                    q_sq = pl.reshape(
-                        pl.row_sum(pl.mul(q_block_pad, q_block_pad)),
-                        [Q_HEAD_PAD, 1],
-                    )
-                    q_inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(q_sq, HEAD_DIM_INV), EPS)))
-                    q_block = pl.col_expand_mul(
-                        pl.row_expand_mul(q_block_pad, q_inv_rms),
-                        pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0]),
-                    )
-                    q_rot_lo = pl.create_tensor([Q_HEAD_BATCH, HALF_DIM], dtype=pl.FP32)
-                    q_rot_hi = pl.create_tensor([Q_HEAD_BATCH, HALF_DIM], dtype=pl.FP32)
-                    for qi in pl.range(Q_HEAD_BATCH):
-                        q_lo = pl.slice(q_block, [1, HALF_DIM], [qi, 0])
-                        q_hi = pl.slice(q_block, [1, HALF_DIM], [qi, HALF_DIM])
-                        q_rot_lo = pl.assemble(
-                            q_rot_lo,
-                            pl.sub(
-                                pl.col_expand_mul(q_lo, cos_lo),
-                                pl.col_expand_mul(q_hi, sin_lo),
-                            ),
-                            [qi, 0],
-                        )
-                        q_rot_hi = pl.assemble(
-                            q_rot_hi,
-                            pl.add(
-                                pl.col_expand_mul(q_hi, cos_hi),
-                                pl.col_expand_mul(q_lo, sin_hi),
-                            ),
-                            [qi, 0],
-                        )
-                    q_pad_row0 = q_block_row0 + ki * Q_HEAD_PAD
-                    all_q_padded_tile = pl.assemble(
-                        all_q_padded_tile,
-                        pl.cast(q_rot_lo, target_type=pl.BF16),
-                        [q_pad_row0, 0],
-                    )
-                    all_q_padded_tile = pl.assemble(
-                        all_q_padded_tile,
-                        pl.cast(q_rot_hi, target_type=pl.BF16),
-                        [q_pad_row0, HALF_DIM],
-                    )
-                    all_q_padded_tile = pl.assemble(
-                        all_q_padded_tile,
-                        pl.cast(
-                            pl.full(
-                                [Q_HEAD_PAD - Q_HEAD_BATCH, HEAD_DIM],
-                                dtype=pl.FP32,
-                                value=0.0,
-                            ),
-                            target_type=pl.BF16,
-                        ),
-                        [q_pad_row0 + Q_HEAD_BATCH, 0],
-                    )
-        pl.system.syncall(core_type="mix")
-
-        for work_id in pl.range(phase_core, ATTN_PHASE_WORK_ITEMS, ATTN_PHASE_SPMD_BLOCKS):
-            micro_id = work_id // ATTN_GI_BLOCKS
-            gi_block = work_id - micro_id * ATTN_GI_BLOCKS
-            gi = gi_block * ATTN_GI_GROUP
-            attn_ti0 = final_ti0 + micro_id * ATTN_TOK_GROUP
-            kvh = gi // Q_GROUPS
-            block_table_idx = b * max_blocks_per_seq
-            pbid = pl.cast(
-                pl.tensor.read(block_table, [block_table_idx]),
-                pl.INDEX,
-            )
-            cache_row0 = layer_cache_base + pbid * BLOCK_SIZE
-            cache_col = kvh * HEAD_DIM
-            k_tile = pl.slice(k_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
-            v_tile = pl.slice(v_cache_bsnd, [SEQ_TILE, HEAD_DIM], [cache_row0, cache_col])
-            for dd0 in pl.pipeline(0, ATTN_TOK_GROUP, QKPV_PIPELINE_TOK_STEP, stage=3):
-                ti0 = attn_ti0 + dd0
-                q_row0 = ti0 * TOTAL_Q_GROUPS * Q_HEAD_PAD + gi * Q_HEAD_PAD
-                q0 = pl.slice(
-                    all_q_padded_tile,
-                    [Q_HEAD_PAD, HEAD_DIM],
-                    [q_row0, 0],
-                )
-                raw_scores0 = pl.matmul(
-                    q0,
-                    k_tile,
-                    b_trans=True,
-                    out_dtype=pl.FP32,
-                )
-
-                chunk_pos0 = p0 + ti0
-                ctx_len0 = chunk_start + chunk_pos0 + 1
-                scores0 = pl.fillpad(
-                    pl.set_validshape(
-                        pl.mul(raw_scores0, ATTN_SCALE),
-                        Q_HEAD_BATCH,
-                        ctx_len0,
-                    ),
-                    pad_value=pl.PadValue.min,
-                )
-                cur_mi0 = pl.row_max(scores0)
-                exp_scores0 = pl.exp(pl.row_expand_sub(scores0, cur_mi0))
-                exp_scores_bf16_0 = pl.cast(exp_scores0, target_type=pl.BF16)
-                cur_li0 = pl.row_sum(
-                    pl.cast(exp_scores_bf16_0, target_type=pl.FP32),
-                )
-                oi_tmp0 = pl.matmul(
-                    exp_scores_bf16_0,
-                    v_tile,
-                    out_dtype=pl.FP32,
-                )
-                acc_exp_row0 = (
-                    micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
-                    + gi * ATTN_TOK_GROUP * Q_HEAD_PAD
-                    + dd0 * Q_HEAD_PAD
-                )
-                acc_li_row0 = (
-                    micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_BATCH_PAD
-                    + gi * ATTN_TOK_GROUP * Q_HEAD_BATCH_PAD
-                    + dd0 * Q_HEAD_BATCH_PAD
-                )
-                oi_tmp_phase = pl.assemble(
-                    oi_tmp_phase,
-                    pl.slice(oi_tmp0, [Q_HEAD_BATCH_PAD, HEAD_DIM], [0, 0]),
-                    [acc_exp_row0, 0],
-                )
-                cur_li_phase = pl.assemble(
-                    cur_li_phase,
-                    pl.slice(cur_li0, [Q_HEAD_BATCH_PAD, 1], [0, 0]),
-                    [acc_li_row0, 0],
-                )
-        pl.system.syncall(core_type="mix")
-        pl.system.syncall(core_type="mix")
-
-        for final_work_id in pl.range(
-            phase_core,
-            ATTN_PHASE_FINALIZE_WORK_ITEMS,
-            ATTN_PHASE_SPMD_BLOCKS,
-        ):
-            final_micro_id = final_work_id // (ATTN_TOK_GROUP * TOTAL_Q_GROUPS)
-            final_rem = final_work_id - final_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS
-            final_dd = final_rem // TOTAL_Q_GROUPS
-            final_gi = final_rem - final_dd * TOTAL_Q_GROUPS
-            final_dt = final_micro_id * ATTN_TOK_GROUP + final_dd
-            ti = final_ti0 + final_dt
-            kvh = final_gi // Q_GROUPS
-            qg = final_gi - kvh * Q_GROUPS
-            q_base = kvh * Q_PER_KV + qg * Q_HEAD_BATCH
-            acc_exp_row0 = (
-                final_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_PAD
-                + final_gi * ATTN_TOK_GROUP * Q_HEAD_PAD
-                + final_dd * Q_HEAD_PAD
-            )
-            acc_li_row0 = (
-                final_micro_id * ATTN_TOK_GROUP * TOTAL_Q_GROUPS * Q_HEAD_BATCH_PAD
-                + final_gi * ATTN_TOK_GROUP * Q_HEAD_BATCH_PAD
-                + final_dd * Q_HEAD_BATCH_PAD
-            )
-            oi = pl.slice(
-                oi_tmp_phase,
-                [Q_HEAD_BATCH_PAD, HEAD_DIM],
-                [acc_exp_row0, 0],
-            )
-            li = pl.slice(
-                cur_li_phase,
-                [Q_HEAD_BATCH_PAD, 1],
-                [acc_li_row0, 0],
-            )
-            ctx = pl.row_expand_div(oi, li)
-            ctx_bf16 = pl.cast(ctx, target_type=pl.BF16)
-            ctx_row = pl.reshape(
-                pl.slice(ctx_bf16, [Q_HEAD_BATCH, HEAD_DIM], [0, 0]),
-                [1, Q_HEAD_BATCH * HEAD_DIM],
-            )
-            attn_tile = pl.assemble(
-                attn_tile,
-                ctx_row,
-                [ti, q_base * HEAD_DIM],
-            )
-        if FUSE_OUT_PROJ_IN_ROPE_QKPV:
-            pl.system.syncall(core_type="mix")
-
-            for ob in pl.range(phase_core, Q_OUT_BLOCKS, ATTN_PHASE_SPMD_BLOCKS):
-                o0 = ob * Q_OUT_CHUNK
-                tile_a = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, 0])
-                tile_w = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base, o0])
-                o_acc = pl.matmul(tile_a, tile_w, out_dtype=pl.FP32)
-                for kb in pl.pipeline(1, HIDDEN_BLOCKS, stage=2):
-                    k0 = kb * K_CHUNK
-                    tile_a_i = pl.slice(attn_tile, [TOK_TILE, K_CHUNK], [0, k0])
-                    tile_w_i = pl.slice(wo, [K_CHUNK, Q_OUT_CHUNK], [layer_hidden_base + k0, o0])
-                    o_acc = pl.matmul_acc(o_acc, tile_a_i, tile_w_i)
-                out_proj_tile = pl.assemble(out_proj_tile, o_acc, [0, o0])
-    return attn_tile, out_proj_tile, cur_li_phase, oi_tmp_phase
-
-
-@pl.jit.inline(auto_scope=False)
 def prefill_layer(
     hidden_states: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
@@ -1740,173 +1419,50 @@ def prefill_layer(
                             oi_tmp_phase = pl.create_tensor([ATTN_PHASE_ACC_SCORE_ROWS, HEAD_DIM], dtype=pl.FP32)
                             block_ctx_len = chunk_start + group_p0_i32 + p0 + final_ti0 + finalize_tok
                             block_ctx_blocks = (block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                            if FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK:
-                                if block_ctx_blocks == 1:
-                                    if finalize_tok == FINALIZE_TOK_GROUP and p0_idx == 0:
-                                        if batch == 1:
-                                            attn_tile, out_proj_tile, cur_li_phase, oi_tmp_phase = (
-                                                _rope_qkpv_out_single_block_fused(
-                                                    attn_tile,
-                                                    out_proj_tile,
-                                                    all_q_padded_tile,
-                                                    input_inv_rms_tile,
-                                                    q_proj_tile,
-                                                    k_proj_tile,
-                                                    v_proj_tile,
-                                                    q_norm_weight,
-                                                    k_norm_weight,
-                                                    rope_cos,
-                                                    rope_sin,
-                                                    slot_mapping,
-                                                    block_table,
-                                                    k_cache,
-                                                    v_cache,
-                                                    wo,
-                                                    cur_li_phase,
-                                                    oi_tmp_phase,
-                                                    fused_qkpv_deps,
-                                                    b_i32,
-                                                    max_blocks_i32,
-                                                    layer_cache_base_i32,
-                                                    layer_hidden_base_i32,
-                                                    chunk_start,
-                                                    p0_i32,
-                                                    final_ti0_i32,
-                                                    slot_token_p0,
-                                                    layer_idx,
-                                                )
-                                            )
-                                        else:
-                                            rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
-                                            all_q_padded_tile = _manual_rope_kv_cache_phase(
-                                                all_q_padded_tile,
-                                                input_inv_rms_tile,
-                                                q_proj_tile,
-                                                k_proj_tile,
-                                                v_proj_tile,
-                                                q_norm_weight,
-                                                k_norm_weight,
-                                                rope_cos,
-                                                rope_sin,
-                                                slot_mapping,
-                                                k_cache,
-                                                v_cache,
-                                                layer_cache_base_i32,
-                                                chunk_start,
-                                                p0_i32,
-                                                final_ti0_i32,
-                                                finalize_tok_i32,
-                                                slot_token_p0,
-                                                layer_idx,
-                                                p0_idx,
-                                                fused_qkpv_deps,
-                                                rope_ready_deps,
-                                            )
-                                            attn_tile, cur_li_phase, oi_tmp_phase = (
-                                                _attention_phase_window_full_single_block(
-                                                    attn_tile,
-                                                    all_q_padded_tile,
-                                                    block_table,
-                                                    k_cache,
-                                                    v_cache,
-                                                    cur_li_phase,
-                                                    oi_tmp_phase,
-                                                    b_i32,
-                                                    max_blocks_i32,
-                                                    layer_cache_base_i32,
-                                                    chunk_start,
-                                                    p0_i32,
-                                                    final_ti0_i32,
-                                                    rope_ready_deps,
-                                                )
-                                            )
-                                    else:
-                                        rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
-                                        all_q_padded_tile = _manual_rope_kv_cache_phase(
-                                            all_q_padded_tile,
-                                            input_inv_rms_tile,
-                                            q_proj_tile,
-                                            k_proj_tile,
-                                            v_proj_tile,
-                                            q_norm_weight,
-                                            k_norm_weight,
-                                            rope_cos,
-                                            rope_sin,
-                                            slot_mapping,
-                                            k_cache,
-                                            v_cache,
-                                            layer_cache_base_i32,
-                                            chunk_start,
-                                            p0_i32,
-                                            final_ti0_i32,
-                                            finalize_tok_i32,
-                                            slot_token_p0,
-                                            layer_idx,
-                                            p0_idx,
-                                            fused_qkpv_deps,
-                                            rope_ready_deps,
-                                        )
-                                        if finalize_tok == FINALIZE_TOK_GROUP:
-                                            attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
-                                                attn_tile,
-                                                all_q_padded_tile,
-                                                block_table,
-                                                k_cache,
-                                                v_cache,
-                                                cur_li_phase,
-                                                oi_tmp_phase,
-                                                b_i32,
-                                                max_blocks_i32,
-                                                layer_cache_base_i32,
-                                                chunk_start,
-                                                p0_i32,
-                                                final_ti0_i32,
-                                                rope_ready_deps,
-                                            )
-                                        else:
-                                            attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                                attn_tile,
-                                                all_q_padded_tile,
-                                                block_table,
-                                                k_cache,
-                                                v_cache,
-                                                cur_li_phase,
-                                                oi_tmp_phase,
-                                                b_i32,
-                                                max_blocks_i32,
-                                                layer_cache_base_i32,
-                                                chunk_start,
-                                                p0_i32,
-                                                final_ti0_i32,
-                                                finalize_tok_i32,
-                                                rope_ready_deps,
-                                            )
-                                else:
-                                    rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
-                                    all_q_padded_tile = _manual_rope_kv_cache_phase(
+                            rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
+                            all_q_padded_tile = _manual_rope_kv_cache_phase(
+                                all_q_padded_tile,
+                                input_inv_rms_tile,
+                                q_proj_tile,
+                                k_proj_tile,
+                                v_proj_tile,
+                                q_norm_weight,
+                                k_norm_weight,
+                                rope_cos,
+                                rope_sin,
+                                slot_mapping,
+                                k_cache,
+                                v_cache,
+                                layer_cache_base_i32,
+                                chunk_start,
+                                p0_i32,
+                                final_ti0_i32,
+                                finalize_tok_i32,
+                                slot_token_p0,
+                                layer_idx,
+                                p0_idx,
+                                fused_qkpv_deps,
+                                rope_ready_deps,
+                            )
+                            if block_ctx_blocks == 1:
+                                if finalize_tok == FINALIZE_TOK_GROUP:
+                                    attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
+                                        attn_tile,
                                         all_q_padded_tile,
-                                        input_inv_rms_tile,
-                                        q_proj_tile,
-                                        k_proj_tile,
-                                        v_proj_tile,
-                                        q_norm_weight,
-                                        k_norm_weight,
-                                        rope_cos,
-                                        rope_sin,
-                                        slot_mapping,
+                                        block_table,
                                         k_cache,
                                         v_cache,
+                                        cur_li_phase,
+                                        oi_tmp_phase,
+                                        b_i32,
+                                        max_blocks_i32,
                                         layer_cache_base_i32,
                                         chunk_start,
                                         p0_i32,
                                         final_ti0_i32,
-                                        finalize_tok_i32,
-                                        slot_token_p0,
-                                        layer_idx,
-                                        p0_idx,
-                                        fused_qkpv_deps,
                                         rope_ready_deps,
                                     )
+                                else:
                                     attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
                                         attn_tile,
                                         all_q_padded_tile,
@@ -1925,132 +1481,33 @@ def prefill_layer(
                                         rope_ready_deps,
                                     )
                             else:
-                                rope_ready_deps = pl.array.create(ROPE_READY_DEP_COUNT, pl.TASK_ID)
-                                all_q_padded_tile = _manual_rope_kv_cache_phase(
+                                attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
+                                    attn_tile,
                                     all_q_padded_tile,
-                                    input_inv_rms_tile,
-                                    q_proj_tile,
-                                    k_proj_tile,
-                                    v_proj_tile,
-                                    q_norm_weight,
-                                    k_norm_weight,
-                                    rope_cos,
-                                    rope_sin,
-                                    slot_mapping,
+                                    block_table,
                                     k_cache,
                                     v_cache,
+                                    cur_li_phase,
+                                    oi_tmp_phase,
+                                    b_i32,
+                                    max_blocks_i32,
                                     layer_cache_base_i32,
                                     chunk_start,
                                     p0_i32,
                                     final_ti0_i32,
                                     finalize_tok_i32,
-                                    slot_token_p0,
-                                    layer_idx,
-                                    p0_idx,
-                                    fused_qkpv_deps,
                                     rope_ready_deps,
                                 )
-                                if block_ctx_blocks == 1:
-                                    if finalize_tok == FINALIZE_TOK_GROUP:
-                                        attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
-                                            attn_tile,
-                                            all_q_padded_tile,
-                                            block_table,
-                                            k_cache,
-                                            v_cache,
-                                            cur_li_phase,
-                                            oi_tmp_phase,
-                                            b_i32,
-                                            max_blocks_i32,
-                                            layer_cache_base_i32,
-                                            chunk_start,
-                                            p0_i32,
-                                            final_ti0_i32,
-                                            rope_ready_deps,
-                                        )
-                                    else:
-                                        attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                            attn_tile,
-                                            all_q_padded_tile,
-                                            block_table,
-                                            k_cache,
-                                            v_cache,
-                                            cur_li_phase,
-                                            oi_tmp_phase,
-                                            b_i32,
-                                            max_blocks_i32,
-                                            layer_cache_base_i32,
-                                            chunk_start,
-                                            p0_i32,
-                                            final_ti0_i32,
-                                            finalize_tok_i32,
-                                            rope_ready_deps,
-                                        )
-                                else:
-                                    attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window(
-                                        attn_tile,
-                                        all_q_padded_tile,
-                                        block_table,
-                                        k_cache,
-                                        v_cache,
-                                        cur_li_phase,
-                                        oi_tmp_phase,
-                                        b_i32,
-                                        max_blocks_i32,
-                                        layer_cache_base_i32,
-                                        chunk_start,
-                                        p0_i32,
-                                        final_ti0_i32,
-                                        finalize_tok_i32,
-                                        rope_ready_deps,
-                                    )
                     # ── Scope 3: output projection + residual + post RMSNorm + MLP ──
                     # Stage 3.1: Output projection + first residual.
                     # In-place view into this m-tile's first-residual buffer.
                     resid1_tile = pl.slice(resid1_mtile, [TOK_TILE, HIDDEN], [p0, 0])
-                    tile_block_ctx_len = chunk_start + group_p0_i32 + p0 + valid_tok
-                    tile_block_ctx_blocks = (tile_block_ctx_len + SEQ_TILE - 1) // SEQ_TILE
-                    if FUSE_ROPE_QKPV_OUT_SINGLE_BLOCK:
-                        if tile_block_ctx_blocks == 1:
-                            if valid_tok == FINALIZE_TOK_GROUP and p0_idx == 0:
-                                if batch == 1:
-                                    if FUSE_OUT_PROJ_IN_ROPE_QKPV:
-                                        out_proj_tile = out_proj_tile
-                                    else:
-                                        out_proj_tile = _out_proj_aic_phase(
-                                            out_proj_tile,
-                                            attn_tile,
-                                            wo,
-                                            pl.cast(layer_hidden_base, pl.INT32),
-                                        )
-                                else:
-                                    out_proj_tile = _out_proj_aic_phase(
-                                        out_proj_tile,
-                                        attn_tile,
-                                        wo,
-                                        pl.cast(layer_hidden_base, pl.INT32),
-                                    )
-                            else:
-                                out_proj_tile = _out_proj_aic_phase(
-                                    out_proj_tile,
-                                    attn_tile,
-                                    wo,
-                                    pl.cast(layer_hidden_base, pl.INT32),
-                                )
-                        else:
-                            out_proj_tile = _out_proj_aic_phase(
-                                out_proj_tile,
-                                attn_tile,
-                                wo,
-                                pl.cast(layer_hidden_base, pl.INT32),
-                            )
-                    else:
-                        out_proj_tile = _out_proj_aic_phase(
-                            out_proj_tile,
-                            attn_tile,
-                            wo,
-                            pl.cast(layer_hidden_base, pl.INT32),
-                        )
+                    out_proj_tile = _out_proj_aic_phase(
+                        out_proj_tile,
+                        attn_tile,
+                        wo,
+                        pl.cast(layer_hidden_base, pl.INT32),
+                    )
                     for out_core in pl.spmd(OUT_RESID_SPMD_BLOCKS, name_hint="out_proj_aiv_spmd"):
                         for ob in pl.range(out_core, OUT_RESID_BLOCKS, OUT_RESID_SPMD_BLOCKS):
                             o0 = ob * OUT_RESID_CHUNK
