@@ -8,13 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
 """DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8 run N-rank distributed; each rank keeps 32 experts."""
+size: 2/4/8 run N-rank distributed; each rank keeps 16 experts."""
 
 
 # Sub-kernels freeze EP_WORLD_SIZE / n_routed_experts into their shapes at import
 # time, so read --ep from argv and override config before importing them below.
 import dataclasses
+import re
 import sys
+from pathlib import Path
 
 import config
 
@@ -33,7 +35,7 @@ def _parse_ep_argv():
 
 EP = _parse_ep_argv()
 config.EP_WORLD_SIZE = EP
-config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 8 * EP)
+config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
 import pypto.language as pl
@@ -41,9 +43,20 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import FLASH as M, EP_WORLD_SIZE, MOE_TOKENS, RECV_MAX
-from hc_pre import hc_pre
+from hc_pre import (
+    HC_PAD,
+    LINEAR_T_TILE,
+    MIX_PAD,
+    hc_pre_moe_comb,
+    hc_pre_moe_producers,
+)
 from hc_post import hc_post
-from gate import gate
+from gate import T_PAD as GATE_T_PAD, gate_precomputed
+from fused_pre_norm_cce import (
+    FUSED_AIV_CORES,
+    FUSED_SOFT_SYNC_WORDS,
+    fused_pre_norm_cce,
+)
 from expert_shared import expert_shared
 from expert_routed import expert_routed
 
@@ -57,6 +70,7 @@ HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 MOE_INTER = M.moe_intermediate_size
+HC_T_PAD = ((T + LINEAR_T_TILE - 1) // LINEAR_T_TILE) * LINEAR_T_TILE
 
 N_RANKS = EP_WORLD_SIZE
 N_EXPERTS_GLOBAL = M.n_routed_experts
@@ -300,6 +314,8 @@ def dispatch(
                 pl.write(recv_r_route_out, [e, out_col], pl.read(recv_route, [in_row, 0]))
             b = b + n
 
+    return _gather_tid
+
 
 # === Combine =================================================================
 # Push recv_y rows back to their origin rank keyed by r_route, barrier, then a
@@ -447,19 +463,140 @@ def moe(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32, manual_dep=True)
     comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    hc_pre(
-        x_hc, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        x_mixed, post_ffn, comb_ffn,
+    # These two buffers cross only explicitly ordered scheduler boundaries:
+    # their producers feed fused_pre_norm, while delayed comb waits transitively
+    # through dispatch_gather. Suppress OverlapMap's direct producer edges so
+    # comb_sinkhorn's dependency really changes to dispatch_gather rather than
+    # becoming the union of gather + hc_pre_rms/linear.
+    hc_inv_rms = pl.create_tensor(
+        [HC_T_PAD, 1],
+        dtype=pl.FP32,
+        manual_dep=True,
+    )
+    mixes_raw = pl.create_tensor(
+        [HC_T_PAD, MIX_PAD],
+        dtype=pl.FP32,
+        manual_dep=True,
+        init_value=0,
+    )
+    hc_pre_rms_tid, hc_pre_linear_tid = hc_pre_moe_producers(
+        x_hc, hc_ffn_fn, hc_inv_rms, mixes_raw,
     )
 
-    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_norm_scale = pl.create_tensor([T, 1], dtype=pl.FP32, manual_dep=True)
+    pre_val_store = pl.create_tensor([HC_T_PAD, HC_PAD], dtype=pl.FP32)
+    xg_buf = pl.create_tensor([GATE_T_PAD, D], dtype=pl.FP32)
+    gate_inv_rms_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([GATE_T_PAD, 1], dtype=pl.FP32)
+    sync_workspace = pl.create_tensor(
+        [FUSED_SOFT_SYNC_WORDS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
+    x_flat = pl.reshape(x_hc, [T, HC_DIM])
+    scale0 = pl.read(hc_ffn_scale, [0])
+    scale1 = pl.read(hc_ffn_scale, [1])
+    num_tokens_index = pl.cast(num_tokens, pl.INDEX)
+    pl.dump_tag(x_flat)
+    pl.dump_tag(hc_inv_rms)
+    pl.dump_tag(mixes_raw)
+    pl.dump_tag(hc_ffn_base)
+    pl.dump_tag(norm_w)
+    pl.dump_tag(pre_val_store)
+    pl.dump_tag(post_ffn)
+    pl.dump_tag(x_mixed)
+    pl.dump_tag(xg_buf)
+    pl.dump_tag(gate_inv_rms_buf)
+    pl.dump_tag(xn_scale_buf)
+    pl.dump_tag(x_norm_scale)
+    # A pre-submit dump tag is forward-sticky. The runtime snapshots this
+    # InOut argument both before dispatch and after task completion.
+    pl.dump_tag(sync_workspace)
+    # A direct call lets @pl.jit specialize the external callable referenced by
+    # the spmd_submit below. This constant-false branch is removed before codegen.
+    if False:
+        _sync_workspace_specialize = pl.create_tensor(
+            [FUSED_SOFT_SYNC_WORDS],
+            dtype=pl.INT32,
+            init_value=0,
+        )
+        (
+            x_mixed,
+            pre_val_store,
+            post_ffn,
+            xg_buf,
+            gate_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ) = fused_pre_norm_cce(
+            x_mixed,
+            x_flat,
+            hc_inv_rms,
+            mixes_raw,
+            hc_ffn_base,
+            norm_w,
+            pre_val_store,
+            post_ffn,
+            xg_buf,
+            gate_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+            _sync_workspace_specialize,
+            scale0,
+            scale1,
+            num_tokens_index,
+        )
+    (
+        (
+            x_mixed,
+            pre_val_store,
+            post_ffn,
+            xg_buf,
+            gate_inv_rms_buf,
+            xn_scale_buf,
+            x_norm_scale,
+        ),
+        fused_pre_norm_tid,
+    ) = pl.spmd_submit(
+        self.fused_pre_norm_cce,  # noqa: F821 - materialized as a @pl.program method by @pl.jit
+        x_mixed,
+        x_flat,
+        hc_inv_rms,
+        mixes_raw,
+        hc_ffn_base,
+        norm_w,
+        pre_val_store,
+        post_ffn,
+        xg_buf,
+        gate_inv_rms_buf,
+        xn_scale_buf,
+        x_norm_scale,
+        sync_workspace,
+        scale0,
+        scale1,
+        num_tokens_index,
+        core_num=FUSED_AIV_CORES,
+        sync_start=True,
+        deps=[hc_pre_rms_tid, hc_pre_linear_tid],
+        allow_early_resolve=True,
+    )
+    pl.dump_tag(pre_val_store)
+    pl.dump_tag(post_ffn)
+    pl.dump_tag(x_mixed)
+    pl.dump_tag(xg_buf)
+    pl.dump_tag(gate_inv_rms_buf)
+    pl.dump_tag(xn_scale_buf)
+    pl.dump_tag(x_norm_scale)
+
+    x_norm_i8 = pl.create_tensor([T, D], dtype=pl.INT8)
     indices = pl.create_tensor([T, TOPK], dtype=pl.INT32)
     weights = pl.create_tensor([T, TOPK], dtype=pl.FP32)
-    gate(
-        x_mixed, norm_w, gate_w, gate_bias,
+    gate_precomputed(
+        xg_buf, gate_inv_rms_buf, xn_scale_buf,
+        gate_w, gate_bias,
         layer_id, num_tokens, tid2eid, input_ids,
         x_norm_i8, x_norm_scale, indices, weights,
+        fused_pre_norm_tid,
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -476,11 +613,19 @@ def moe(
     recv_r_route_out = pl.create_tensor([N_LOCAL, RECV_MAX], dtype=pl.INT32, manual_dep=True)
     recv_count_out = pl.create_tensor([N_LOCAL, 1], dtype=pl.INT32)
     recv_meta_local = pl.create_tensor([N_RANKS, N_LOCAL], dtype=pl.INT32, manual_dep=True)
-    dispatch(
+    dispatch_gather_tid = dispatch(
         indices, x_norm_i8, x_norm_scale, weights,
         recv_x_out, recv_scale_out, recv_w_out, recv_r_route_out, recv_count_out, recv_meta_local,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         num_tokens, my_rank, moe_epoch,
+    )
+    hc_pre_moe_comb(
+        hc_inv_rms,
+        mixes_raw,
+        hc_ffn_scale,
+        hc_ffn_base,
+        comb_ffn,
+        dispatch_gather_tid,
     )
 
     with pl.scope():
@@ -971,6 +1116,391 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     return specs
 
 
+def audit_fused_pre_norm_codegen(work_dir):
+    """Reject a compiled model whose fused-result aliases shifted in orchestration."""
+    work_dir = Path(work_dir)
+    candidates = sorted(
+        (work_dir / "next_levels").glob("*/orchestration/*.cpp"),
+    )
+    orch_path = next(
+        (
+            path
+            for path in candidates
+            if "// Task " in path.read_text(encoding="utf-8")
+            and ": fused_pre_norm_cce" in path.read_text(encoding="utf-8")
+        ),
+        None,
+    )
+    if orch_path is None:
+        raise RuntimeError(
+            f"fused-pre-norm ABI audit could not find orchestration under {work_dir}",
+        )
+    source = orch_path.read_text(encoding="utf-8")
+    if "specialize_" in source:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit found specialization-only buffers in "
+            f"{orch_path}",
+        )
+
+    def task_header(name):
+        escaped = re.escape(name)
+        header = re.search(
+            rf"(?m)^\s*// (?:Task \d+: {escaped}\s*$|"
+            rf"Spmd [^:]+: {escaped}\s*$|Group {escaped}:.*$)",
+            source,
+        )
+        if header is None:
+            raise RuntimeError(
+                f"fused-pre-norm ABI audit did not find task {name!r} in {orch_path}",
+            )
+        return header
+
+    def task_block(name):
+        header = task_header(name)
+        rest = source[header.end():]
+        next_header = re.search(
+            r"(?m)^\s*// (?:Task \d+:|Spmd [^:]+:|Group [^:]+:)",
+            rest,
+        )
+        return rest[: next_header.start()] if next_header else rest
+
+    def task_params(name):
+        block = task_block(name)
+        params = re.findall(
+            r"\bL0TaskArgs\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+            block,
+        )
+        if len(params) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one L0TaskArgs "
+                f"object for {name}, got {params} in {orch_path}",
+            )
+        return block, params[0]
+
+    def submitted_task_id(name):
+        block, params = task_params(name)
+        submits = re.findall(
+            r"\bTaskOutputTensors\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            r"rt_submit(?:_[A-Za-z0-9_]+)?_task\s*"
+            rf"\([^;]*\b{re.escape(params)}\b\s*\)\s*;",
+            block,
+        )
+        if len(submits) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one submit for "
+                f"{name}, got {submits} in {orch_path}",
+            )
+        task_ids = re.findall(
+            r"\bPTO2TaskId\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+            rf"{re.escape(submits[0])}\.task_id\(\)\s*;",
+            block,
+        )
+        if len(task_ids) != 1:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly one submitted "
+                f"task id for {name}, got {task_ids} in {orch_path}",
+            )
+        return task_ids[0]
+
+    def tensor_args(name):
+        return [
+            re.sub(r"_inline\d+.*$", "", arg.removeprefix("ext_"))
+            for arg in re.findall(
+                r"\.add_(?:input|output|inout|no_dep)\(\s*"
+                r"([A-Za-z_][A-Za-z0-9_]*)",
+                task_block(name),
+            )
+        ]
+
+    expected = {
+        "fused_pre_norm_cce": [
+            "x_mixed",
+            "x_flat",
+            "hc_inv_rms",
+            "mixes_raw",
+            "hc_ffn_base",
+            "norm_w",
+            "pre_val_store",
+            "post_ffn",
+            "xg_buf",
+            "gate_inv_rms_buf",
+            "xn_scale_buf",
+            "x_norm_scale",
+            "sync_workspace",
+        ],
+        "x_norm_quant": ["xn_scale_buf", "x_norm_i8", "xg_buf"],
+        "gate": ["gate_bias", "xg_buf", "gate_w", "gate_inv_rms_buf"],
+        "sh_gate_up_act_q": ["x_norm_scale"],
+        "dispatch_push": [
+            "indices",
+            "recv_x",
+            "x_norm_i8",
+            "x_norm_scale",
+            "weights",
+        ],
+        "comb_sinkhorn": [
+            "hc_inv_rms",
+            "mixes_raw",
+            "hc_base_2d",
+            "comb_ffn",
+        ],
+        "hc_post": ["y_flat", "post_ffn", "ffn_out", "comb_ffn", "residual_flat"],
+    }
+    for task_name, expected_prefix in expected.items():
+        actual = tensor_args(task_name)
+        if actual[: len(expected_prefix)] != expected_prefix:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit failed for "
+                f"{task_name}: expected prefix {expected_prefix}, got {actual}",
+            )
+
+    fused_block, fused_params = task_params("fused_pre_norm_cce")
+
+    def require_task_call(block, params, method, expected_arg, task_name):
+        args = [
+            re.sub(r"\s+", "", arg)
+            for arg in re.findall(
+                rf"\b{re.escape(params)}\.{re.escape(method)}\(([^)]*)\)\s*;",
+                block,
+            )
+        ]
+        if args != [expected_arg]:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected exactly "
+                f"{params}.{method}({expected_arg}) for {task_name}, "
+                f"got {args} in {orch_path}",
+            )
+
+    require_task_call(
+        fused_block,
+        fused_params,
+        "launch_spec.set_block_num",
+        "8",
+        "fused_pre_norm_cce",
+    )
+    require_task_call(
+        fused_block,
+        fused_params,
+        "launch_spec.set_require_sync_start",
+        "true",
+        "fused_pre_norm_cce",
+    )
+    require_task_call(
+        fused_block,
+        fused_params,
+        "set_allow_early_resolve",
+        "true",
+        "fused_pre_norm_cce",
+    )
+    for producer_name in ("hc_pre_rms", "hc_pre_linear"):
+        producer_block, producer_params = task_params(producer_name)
+        require_task_call(
+            producer_block,
+            producer_params,
+            "set_allow_early_resolve",
+            "true",
+            producer_name,
+        )
+
+    workspace_shapes = re.findall(
+        r"\buint32_t\s+"
+        r"(sync_workspace(?:_inline\d+)?)_ci_shapes\[1\]\s*=\s*\{32\}\s*;",
+        source,
+    )
+    if len(workspace_shapes) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected exactly one INT32[32] "
+            f"sync_workspace declaration, got {workspace_shapes} in {orch_path}",
+        )
+    workspace = workspace_shapes[0]
+    workspace_ci = f"{workspace}_ci"
+    workspace_ci_shapes = f"{workspace_ci}_shapes"
+
+    create_info_matches = re.findall(
+        rf"\bTensorCreateInfo\s+{re.escape(workspace_ci)}\s*\(\s*"
+        rf"{re.escape(workspace_ci_shapes)}\s*,\s*1\s*,\s*"
+        r"DataType::INT32\s*\)\s*;",
+        source,
+    )
+    if len(create_info_matches) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace to be a fresh "
+            f"contiguous INT32[32] create-info output in {orch_path}",
+        )
+    init_matches = re.findall(
+        rf"\b{re.escape(workspace_ci)}\.set_initial_value\(\s*0\s*\)\s*;",
+        source,
+    )
+    if len(init_matches) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires exactly one zero initializer "
+            f"for sync_workspace in {orch_path}",
+        )
+
+    workspace_allocations = []
+    for allocation, arguments in re.findall(
+        r"\bTaskOutputTensors\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+        r"alloc_tensors\(([^;]*)\)\s*;",
+        source,
+        flags=re.DOTALL,
+    ):
+        allocation_args = [arg.strip() for arg in arguments.split(",")]
+        if workspace_ci in allocation_args:
+            workspace_allocations.append(
+                (allocation, allocation_args.index(workspace_ci)),
+            )
+    if len(workspace_allocations) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires one fresh alloc_tensors source "
+            f"for sync_workspace, got {workspace_allocations} in {orch_path}",
+        )
+    workspace_allocation, workspace_index = workspace_allocations[0]
+    materializations = re.findall(
+        rf"\bconst\s+Tensor\s*&\s*{re.escape(workspace)}\s*=\s*"
+        rf"{re.escape(workspace_allocation)}\.get_ref\(\s*(\d+)\s*\)\s*;",
+        source,
+    )
+    if materializations != [str(workspace_index)]:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace to be the "
+            "unsliced tensor returned directly by alloc_tensors, got "
+            f"{materializations} in {orch_path}",
+        )
+    if re.search(
+        rf"\b{re.escape(workspace)}\s*\.\s*(?:view|reshape|slice)\s*\(",
+        source,
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit forbids a view/slice/reshape of "
+            f"sync_workspace in {orch_path}",
+        )
+
+    # TensorCreateInfo currently does not print start_offset in orchestration:
+    # its runtime constructor owns the start_offset=0 invariant. If a future
+    # generator starts emitting the field, reject every non-zero value here.
+    visible_start_offsets = re.findall(
+        rf"\b(?:{re.escape(workspace)}|{re.escape(workspace_ci)})"
+        r"\.start_offset\s*=\s*([^;]+)\s*;",
+        source,
+    )
+    visible_start_offsets += re.findall(
+        rf"\b(?:{re.escape(workspace)}|{re.escape(workspace_ci)})"
+        r"\.set_start_offset\(\s*([^)]*)\)\s*;",
+        source,
+    )
+    if any(
+        re.fullmatch(r"0[uUlL]*", value.strip()) is None
+        for value in visible_start_offsets
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires visible sync_workspace "
+            f"start_offset values to be zero, got {visible_start_offsets} "
+            f"in {orch_path}",
+        )
+
+    workspace_add_kinds = re.findall(
+        rf"\b{re.escape(fused_params)}\.add_"
+        rf"(input|output|inout|no_dep)\(\s*{re.escape(workspace)}\s*\)\s*;",
+        fused_block,
+    )
+    if workspace_add_kinds != ["inout"]:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires exactly one full, fresh "
+            "sync_workspace add_inout and no second registration, got "
+            f"{workspace_add_kinds} in {orch_path}",
+        )
+
+    if re.search(
+        rf"\b{re.escape(fused_params)}\.dump\([^;]*"
+        rf"\b{re.escape(workspace)}\b[^;]*\)\s*;",
+        fused_block,
+    ) is None:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit requires sync_workspace in the fused "
+            f"task dump set in {orch_path}",
+        )
+
+    dependency_calls = re.findall(
+        rf"\b{re.escape(fused_params)}\.set_dependencies\(\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*;",
+        fused_block,
+    )
+    if len(dependency_calls) != 1:
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected exactly one dependency list "
+            f"for fused_pre_norm_cce, got {dependency_calls} in {orch_path}",
+        )
+    deps_array, deps_count = dependency_calls[0]
+    deps_capacity = re.findall(
+        rf"\bPTO2TaskId\s+{re.escape(deps_array)}\[(\d+)\]\s*;",
+        fused_block,
+    )
+    deps_count_init = re.findall(
+        rf"\buint32_t\s+{re.escape(deps_count)}\s*=\s*(\d+)\s*;",
+        fused_block,
+    )
+    deps = re.findall(
+        rf"\b{re.escape(deps_array)}\[\s*{re.escape(deps_count)}\+\+\s*\]"
+        r"\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        fused_block,
+    )
+    expected_deps = [
+        submitted_task_id("hc_pre_rms"),
+        submitted_task_id("hc_pre_linear"),
+    ]
+    if (
+        deps_capacity != ["2"]
+        or deps_count_init != ["0"]
+        or deps != expected_deps
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected exactly the hc_pre_rms and "
+            "hc_pre_linear submitted task ids as dependencies, got "
+            f"capacity={deps_capacity}, count_init={deps_count_init}, "
+            f"deps={deps}, expected={expected_deps} in {orch_path}",
+        )
+
+    if not (
+        task_header("dispatch_gather").start()
+        < task_header("comb_sinkhorn").start()
+        < task_header("hc_post").start()
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit found invalid delayed-comb task order in "
+            f"{orch_path}",
+        )
+
+    comb_block = task_block("comb_sinkhorn")
+    comb_deps = re.findall(
+        r"_deps\[[^\]]+\]\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        comb_block,
+    )
+    if (
+        len(comb_deps) != 1
+        or re.fullmatch(r"(?:dispatch_gather_tid|_gather_tid)_inline\d+", comb_deps[0])
+        is None
+        or "hc_pre_rms_tid" in comb_block
+        or "hc_pre_linear_tid" in comb_block
+    ):
+        raise RuntimeError(
+            "fused-pre-norm ABI audit expected comb_sinkhorn to depend only on "
+            f"dispatch_gather, got {comb_deps} in {orch_path}",
+        )
+
+    for tensor_name in ("hc_inv_rms", "mixes_raw"):
+        if re.search(
+            rf"TensorCreateInfo\s+{tensor_name}\S*\([^;\n]*"
+            rf"/\*manual_dep=\*/true\);",
+            source,
+        ) is None:
+            raise RuntimeError(
+                "fused-pre-norm ABI audit expected manual dependency tracking "
+                f"for {tensor_name} in {orch_path}",
+            )
+    print(f"[AUDIT] fused-pre-norm ABI PASS ({orch_path})", flush=True)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -989,6 +1519,15 @@ if __name__ == "__main__":
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
+    parser.add_argument(
+        "--dump-args",
+        nargs="?",
+        const=1,
+        default=0,
+        type=int,
+        choices=(0, 1, 2, 3),
+        help="runtime argument dump level (1 dumps only pl.dump_tag tensors)",
+    )
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--save-data", action="store_true", default=False)
@@ -1027,6 +1566,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dump_args=args.dump_args,
             log_level=args.log_level,
         ),
         rtol=1e-3,
@@ -1042,3 +1582,5 @@ if __name__ == "__main__":
         if result.error:
             print(result.error)
         raise SystemExit(1)
+    if result.work_dir is not None:
+        audit_fused_pre_norm_codegen(result.work_dir)

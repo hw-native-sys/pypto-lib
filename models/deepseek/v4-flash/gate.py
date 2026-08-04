@@ -47,35 +47,18 @@ TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
 assert TOPK <= TOPK_PAD
 
+
 @pl.jit.inline
-def gate(
+def ffn_norm(
     x_mixed: pl.Tensor[[T, D], pl.BF16],
     norm_w: pl.Tensor[[D], pl.BF16],
-    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
-    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
-    layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
-    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
-    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+    inv_rms_buf: pl.Tensor[[T_PAD, 1], pl.FP32],
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
-    indices: pl.Tensor[[T, TOPK], pl.INT32],
-    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    xn_scale_buf: pl.Tensor[[T_PAD, 1], pl.FP32],
 ):
-    # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
-    # the per-token positive scalar inv_rms factors out of everything downstream:
-    #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
-    #   - int8 quant : symmetric per-token quant of xg CANCELS inv_rms exactly;
-    #                  inv_rms rides only x_norm_scale (= inv_rms * amax(xg)/127).
-    # This lets sq_sum (needs raw x) and xg share ONE pass over x_mixed instead of
-    # a sqsum pass followed by a separate normalize pass.
-    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
-    # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
-    # and consumed by x_norm_quant so quant skips its own amax pass.
-    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
-    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
-    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    """Submit the standalone FFN normalization and return its TaskId."""
     active_tokens = pl.cast(num_tokens, pl.INDEX)
     if active_tokens < 0:
         active_tokens = pl.cast(0, pl.INDEX)
@@ -86,9 +69,13 @@ def gate(
     if active_gate_tokens > T:
         active_gate_tokens = pl.cast(T, pl.INDEX)
 
-    # One token per core with two-level full-row reductions.
     norm_w_2d = pl.reshape(norm_w, [1, D])
-    for tok in pl.spmd(active_gate_tokens, name_hint="ffn_norm", allow_early_resolve=True):
+    with pl.spmd(
+        active_gate_tokens,
+        name_hint="ffn_norm",
+        allow_early_resolve=True,
+    ) as ffn_norm_tid:
+        tok = pl.tile.get_block_idx()
         rms_x = pl.cast(pl.tile.load(x_mixed, [tok, 0], [1, D]), pl.FP32)
         rms_w = pl.cast(pl.tile.load(norm_w_2d, [0, 0], [1, D]), pl.FP32)
         xg = pl.mul(rms_x, rms_w)
@@ -118,7 +105,6 @@ def gate(
         amax_eps = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_AMAX_EPS)
         amax_eps = pl.set_validshape(amax_eps, 1, 1)
         xg_amax = pl.maximum(xg_amax, amax_eps)
-        # quant scale = INT8_SCALE_MAX / amax(xg); dequant scale rides inv_rms.
         scale_max = pl.tile.full([1, ROW_PAD], dtype=pl.FP32, value=INT8_SCALE_MAX)
         scale_max = pl.set_validshape(scale_max, 1, 1)
         xg_sq = pl.div(scale_max, xg_amax)
@@ -127,7 +113,44 @@ def gate(
         pl.tile.store(x_norm_dequant_scale, [tok, 0], x_norm_scale, shapes=[1, 1])
         pl.tile.store(xg_sq, [tok, 0], xn_scale_buf, shapes=[1, 1])
 
-    seed_dummy = pl.system.task_dummy(deps=[])
+    return ffn_norm_tid
+
+
+@pl.jit.inline
+def gate_precomputed(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+    inv_rms_buf: pl.Tensor[[T_PAD, 1], pl.FP32],
+    xn_scale_buf: pl.Tensor[[T_PAD, 1], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+    norm_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Consume FFN-normalization buffers produced by a prior task."""
+    # Tag the consumer-side SSA values as well as the extern outputs so partial
+    # args dump can detect a wrong return/alias binding byte-for-byte.
+    pl.dump_tag(xg_buf)
+    pl.dump_tag(inv_rms_buf)
+    pl.dump_tag(xn_scale_buf)
+    pl.dump_tag(x_norm_scale)
+    route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    biased_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    active_gate_tiles = (active_tokens + GATE_M_TILE - 1) // GATE_M_TILE
+    active_gate_tokens = active_gate_tiles * GATE_M_TILE
+    if active_gate_tokens > T:
+        active_gate_tokens = pl.cast(T, pl.INDEX)
 
     # Per-token symmetric INT8 quant of xg: scale precomputed in ffn_norm. inv_rms
     # cancels here (symmetric quant is invariant to a positive per-token scalar),
@@ -137,7 +160,7 @@ def gate(
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="x_norm_quant",
-            deps=[seed_dummy],
+            deps=[norm_tid],
             allow_early_resolve=True,
         ):
             xn_sq_col = xn_scale_buf[t0 : t0 + T_TILE, 0:1]
@@ -154,7 +177,11 @@ def gate(
     # Pre-route setup: zero the inactive-token outputs and NEG_INF the biased pad
     # columns so the sort ranks pad experts last. Route write-backs are guarded to
     # active tokens, so the inactive-zero can run here rather than post-route.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="gate_pre_route"):
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="gate_pre_route",
+        deps=[norm_tid],
+    ):
         for zt in pl.range(T):
             if zt >= active_tokens:
                 pl.write(x_norm_scale, [zt, 0], pl.cast(0.0, pl.FP32))
@@ -170,7 +197,13 @@ def gate(
     # GATE_N_TILE] slice on its own core; token-tile is the dynamic dim, so it
     # stays outermost and // % divide by the compile-time GATE_N_BLOCKS.
     GATE_N_BLOCKS = N_EXPERTS // GATE_N_TILE
-    for gb_idx in pl.spmd(active_gate_tiles * GATE_N_BLOCKS, name_hint="gate", allow_early_resolve=True):
+    with pl.spmd(
+        active_gate_tiles * GATE_N_BLOCKS,
+        name_hint="gate",
+        deps=[norm_tid],
+        allow_early_resolve=True,
+    ) as _gate_tid:
+        gb_idx = pl.tile.get_block_idx()
         tg = gb_idx // GATE_N_BLOCKS
         nb = gb_idx % GATE_N_BLOCKS
         t1 = tg * GATE_M_TILE
@@ -275,6 +308,53 @@ def gate(
     # The @pl.inline parser requires inline call expressions to have a return
     # value. weights is convenient because it's already pl.Out and reads as
     # the same SSA name on the caller side.
+    return weights
+
+
+@pl.jit.inline
+def gate(
+    x_mixed: pl.Tensor[[T, D], pl.BF16],
+    norm_w: pl.Tensor[[D], pl.BF16],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    layer_id: pl.Scalar[pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
+    input_ids: pl.Tensor[[T], pl.INT64],
+    x_norm_i8: pl.Tensor[[T, D], pl.INT8],
+    x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+):
+    """Standalone gate API retained for unit tests and non-MoE callers."""
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    inv_rms_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    xn_scale_buf = pl.create_tensor([T_PAD, 1], dtype=pl.FP32)
+    norm_tid = ffn_norm(
+        x_mixed,
+        norm_w,
+        num_tokens,
+        xg_buf,
+        inv_rms_buf,
+        x_norm_scale,
+        xn_scale_buf,
+    )
+    gate_precomputed(
+        xg_buf,
+        inv_rms_buf,
+        xn_scale_buf,
+        gate_w,
+        gate_bias,
+        layer_id,
+        num_tokens,
+        tid2eid,
+        input_ids,
+        x_norm_i8,
+        x_norm_scale,
+        indices,
+        weights,
+        norm_tid,
+    )
     return weights
 
 
