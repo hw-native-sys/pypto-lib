@@ -48,13 +48,6 @@ ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 ORI_CACHE_ROWS_DYN = pl.dynamic("ORI_CACHE_ROWS_DYN")
 
 # tiling
-GATHER_SPLITS = 4
-GATHER_ROWS_PER_TASK = WIN // GATHER_SPLITS
-# Sub-tile probed for physical contiguity: a decode window is a run of consecutive
-# logical positions, so a sub-tile that stays inside one paged block maps to
-# consecutive cache rows and moves in ONE bulk DMA. Only a block-straddling or -1
-# sub-tile falls back to the per-row copy (~0.44us/row vs ~0.02us/row bulk).
-GATHER_RUN = 16
 H_TILE = 16
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
 # per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
@@ -126,9 +119,7 @@ PB_ACT_TBLKS = T // PROJ_B_ACT_TBLK
 NEG_INF = -1.0e20
 
 assert T % 2 == 0
-assert WIN % GATHER_SPLITS == 0
-assert GATHER_ROWS_PER_TASK % GATHER_RUN == 0, "bulk-copy runs must tile the gather task"
-assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two paged blocks by construction"
+assert WIN == BLOCK_SIZE, "a window spans at most two paged blocks only while WIN == BLOCK_SIZE"
 assert H % 4 == 0
 assert QK_M_TILE % H_TILE == 0
 assert H % QK_M_TILE == 0
@@ -158,6 +149,7 @@ def sparse_attn_swa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T, WIN], pl.INT32],
+    swa_lens: pl.Tensor[[T], pl.INT32],
     sparse_bias: pl.Tensor[[T, PADDED_TOPK], pl.FP32],
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T, ROPE_DIM], pl.BF16],
@@ -177,40 +169,6 @@ def sparse_attn_swa(
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no MTP overlay path here.
 
-    swa_kv_flat = pl.create_tensor([T * WIN, HEAD_DIM], dtype=pl.BF16)
-    gather_tids = pl.array.create(1, pl.TASK_ID)
-    with pl.spmd(T * GATHER_SPLITS, name_hint="swa_gather_kv") as gather_tid:
-        g_task = pl.tile.get_block_idx()
-        g_t = g_task // GATHER_SPLITS
-        g_split = g_task - g_t * GATHER_SPLITS
-        g_r0 = g_split * GATHER_ROWS_PER_TASK
-        g_base = g_t * WIN
-        # Probe each sub-tile's first/last slot: endpoints GATHER_RUN-1 apart mean
-        # the whole run sits in one paged block and moves as one bulk copy.
-        for g_sub in pl.range(GATHER_ROWS_PER_TASK // GATHER_RUN):
-            g_sr0 = g_r0 + g_sub * GATHER_RUN
-            g_sdst = g_base + g_sr0
-            g_first = pl.read(swa_indices, [g_t, g_sr0])
-            g_last = pl.read(swa_indices, [g_t, g_sr0 + GATHER_RUN - 1])
-            # A -1 slot anywhere in the run pins g_run_ok below the match value,
-            # so an invalid or block-straddling run takes the per-row path.
-            g_run_ok = (g_last - g_first) + pl.min(g_first, 0) * GATHER_RUN
-            if g_run_ok == GATHER_RUN - 1:
-                g_run_src = pl.cast(g_first, pl.INDEX)
-                swa_kv_flat[g_sdst : g_sdst + GATHER_RUN, 0 : HEAD_DIM] = ori_kv_flat[
-                    g_run_src : g_run_src + GATHER_RUN, 0 : HEAD_DIM
-                ]
-            else:
-                for g_dr in pl.range(GATHER_RUN):
-                    g_dst = g_sdst + g_dr
-                    g_slot_i32 = pl.read(swa_indices, [g_t, g_sr0 + g_dr])
-                    if g_slot_i32 >= 0:
-                        g_slot = pl.cast(g_slot_i32, pl.INDEX)
-                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = ori_kv_flat[g_slot : g_slot + 1, 0 : HEAD_DIM]
-                    else:
-                        swa_kv_flat[g_dst : g_dst + 1, 0 : HEAD_DIM] = pl.full(
-                            [1, HEAD_DIM], dtype=pl.BF16, value=0.0)
-    gather_tids[0] = gather_tid
 
     # qk_pv writes per-tile (mi, li, oi) to GM; merge_norm reads them back. Not
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
@@ -222,14 +180,42 @@ def sparse_attn_swa(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(T, name_hint="qk_pv", deps=[gather_tids[0]], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(T, name_hint="qk_pv", allow_early_resolve=True) as qk_tid:
         qk_t = pl.tile.get_block_idx()
         qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+        # A window is WIN consecutive positions and WIN == BLOCK_SIZE, so it is the
+        # tail of block P plus the head of block P+1. Assemble both runs into ONE
+        # contiguous L1 operand with two bulk DMAs: valid_shape carries the runtime
+        # split without touching the tile's allocation, so the cube still sees a
+        # single ATTN_K_TILE-column matmul and the KV never round-trips through GM.
+        qk_slot0 = pl.max(pl.read(swa_indices, [qk_t, 0]), 0)
+        qk_r = qk_slot0 % BLOCK_SIZE
+        qk_head = WIN - qk_r
+        qk_blk1 = pl.max(pl.read(swa_indices, [qk_t, qk_head % WIN]), 0)
+        qk_len = pl.min(pl.max(pl.read(swa_lens, [qk_t]), 0), WIN)
+        qk_kv = pl.create_l1([ATTN_K_TILE, HEAD_DIM], pl.BF16)
+        qk_src0 = pl.cast(qk_slot0, pl.INDEX)
+        qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [0, 0], [qk_src0, 0],
+                              [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_head, HEAD_DIM])
+        if qk_r > 0:
+            qk_src1 = pl.cast(qk_blk1, pl.INDEX)
+            qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_head, 0], [qk_src1, 0],
+                                  [ATTN_K_TILE, HEAD_DIM], valid_shape=[qk_r, HEAD_DIM])
+        qk_tail = WIN - qk_len
+        if qk_tail > 0:
+            # Cold start: rows past the visible prefix are allocated but not yet
+            # written. Replicate the window's oldest visible slot over them --
+            # that row is written by definition, whereas a run starting anywhere
+            # else in the pool is no more initialized than the rows it replaces.
+            # sparse_bias masks their scores, but a non-finite value would reach
+            # the QK matmul and propagate through row_max before it applied.
+            for qk_fill in pl.range(qk_tail):
+                qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_len + qk_fill, 0],
+                                      [qk_src0, 0], [1, HEAD_DIM])
+
         for qk_sb in pl.unroll(SPARSE_BLOCKS):
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
-            qk_base = qk_t * WIN + qk_s0
-            qk_kv = swa_kv_flat[qk_base : qk_base + ATTN_K_TILE, 0 : HEAD_DIM]
 
             # Keep both 32-head batches in one token task so they reuse the KV
             # tile already resident in L1 instead of loading it once per block.
@@ -493,6 +479,7 @@ def sparse_attn_test(
         q,
         ori_kv,
         swa_indices,
+        swa_lens,
         sparse_bias,
         attn_sink,
         freqs_cos,
