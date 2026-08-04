@@ -160,13 +160,24 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   using Kernel = std::conditional_t<IsFlashDecode, FdKernel, NonFdKernel>;
 
   GM_ADDR metadata = tensor_data<uint8_t>(args, 6);
-  // pypto packs tensors first, then the sole scalar last: the rope-fused ABI
-  // has 17 tensors so cache_row_offset is at args[17]; the attention-only ABI
-  // has 7 tensors so it is at args[7].
+  __gm__ const FAInferTilingData *tiling =
+      reinterpret_cast<__gm__ const FAInferTilingData *>(
+          metadata + qwen_fai_metadata::kTilingOffset);
+  // pypto packs tensors first, then the scalars last: the rope-fused ABI has 17
+  // tensors so cache_row_offset is at args[17] and batch_offset at args[18]; the
+  // attention-only ABI has 7 tensors so cache_row_offset is at args[7].
   uint64_t cache_row_offset =
       static_cast<uint64_t>(WithRope ? args[17] : args[7]);
   uint64_t cache_byte_offset =
       cache_row_offset * kQwenFaiHeadDim * sizeof(uint16_t);
+  // First public batch row this call serves. decode_fwd runs a batch above
+  // kMaxBatch as consecutive row chunks: the per-row inputs it slices itself
+  // (q/k/v_proj, q_tnd, out) are already chunk-local, but seq_lens, slot_mapping
+  // and the block table are whole-batch, so they are indexed from this row. The
+  // tiling was built for the same window, hence its 0-based batch indices. Zero
+  // for the attention-only ABI, which has no chunking caller. (Reading `tiling`
+  // is safe on both: each entry.cpp invalidates the metadata lines first.)
+  uint64_t batch_offset = WithRope ? static_cast<uint64_t>(args[18]) : 0;
   constexpr int32_t query_arg = WithRope ? 1 : 0;
   constexpr int32_t key_arg = WithRope ? 2 : 1;
   constexpr int32_t value_arg = WithRope ? 3 : 2;
@@ -174,13 +185,21 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
   constexpr int32_t out_arg = WithRope ? 0 : 4;
   GM_ADDR key = tensor_data<uint16_t>(args, key_arg) + cache_byte_offset;
   GM_ADDR value = tensor_data<uint16_t>(args, value_arg) + cache_byte_offset;
+  // BYTES. GM_ADDR is a byte pointer, so every displacement applied to one is a
+  // byte count -- unlike the typed `__gm__ int32_t *` arithmetic in the RoPE
+  // call below, which advances ELEMENTS. The two units are one cast apart, so
+  // name the byte quantities rather than inlining the sizeof().
+  uint64_t block_table_byte_offset =
+      batch_offset * tiling->maxNumBlocksPerBatch * sizeof(int32_t);
+  GM_ADDR block_table =
+      tensor_data<int32_t>(args, block_table_arg) + block_table_byte_offset;
 
   FAIKernelParams params{tensor_data<uint16_t>(args, query_arg),
                          key,
                          value,
                          nullptr,
                          nullptr,
-                         tensor_data<int32_t>(args, block_table_arg),
+                         block_table,
                          metadata + qwen_fai_metadata::kCumulativeQOffset,
                          metadata + qwen_fai_metadata::kKvLengthsOffset,
                          tensor_data<uint16_t>(args, out_arg),
@@ -224,14 +243,14 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
     //        rope_cos, rope_sin, k_proj, k_norm_w, v_proj, q_proj, q_norm_w
     //   13   unused captured loop scalar (dead in the body -- see below)
     //   14   layer_cache_base
-    //   15   batch          <- the PUBLIC batch, from the seq_lens descriptor
+    //   15   batch          <- rows this call serves, from the tiling
     //   16-17 block_idx, block_num
     //
-    // The batch is read from the seq_lens tensor DESCRIPTOR, exactly like the
-    // tiler does (tiling/entry.cpp), so the RoPE phase and the attention phase
-    // can never disagree about how many sequences are live.
-    int64_t rope_batch = static_cast<int64_t>(
-        reinterpret_cast<__gm__ Tensor *>(args[16])->shapes[0]);
+    // The batch is read back from the TILING the tiler just emitted, so the RoPE
+    // phase and the attention phase can never disagree about how many sequences
+    // are live -- including when decode_fwd chunks a public batch above
+    // kMaxBatch and this call serves only a window of it.
+    int64_t rope_batch = static_cast<int64_t>(tiling->batch);
     // Parameter 13 is a loop-induction scalar the pypto scope captured while
     // making layer_cache_base an opaque runtime value; it is provably dead in
     // the generated body (its only occurrence is the signature), so any value
@@ -244,9 +263,17 @@ run_qwen_fai(__gm__ int64_t *args, __gm__ int32_t *barrier_state = nullptr) {
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 2)),
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 1)),
           reinterpret_cast<__gm__ bfloat16_t *>(tensor_data<uint16_t>(args, 3)),
-          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 16)),
+          // seq_lens and slot_mapping are WHOLE-BATCH, so they start at the
+          // window's first row; inv_rms_states and the projections below are
+          // chunk-local buffers the caller already sliced, so they start at 0.
+          // ELEMENTS: these are typed int32 pointers holding one entry per row,
+          // so `+ batch_offset` advances rows directly -- no sizeof(), unlike
+          // the byte arithmetic on the GM_ADDR values above.
+          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 16)) +
+              batch_offset,
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 14)),
-          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 15)),
+          reinterpret_cast<__gm__ int32_t *>(tensor_data<int32_t>(args, 15)) +
+              batch_offset,
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 12)),
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 13)),
           reinterpret_cast<__gm__ float *>(tensor_data<float>(args, 8)),

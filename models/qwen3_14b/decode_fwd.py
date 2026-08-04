@@ -15,10 +15,15 @@ FusedInferAttentionScore through ``pl.jit.extern``. Its public ABI matches vLLM:
 Q/O are active TND and the flat paged K/V buffers contain BSND bytes ordered as
 ``[page, token, kv_head, dim]``.
 
-``decode_fwd`` accepts public batch 1 or 16 while keeping the model pipeline
-internally padded to 16 rows. The inter-layer residual remains FP32; BF16
-conversion occurs only at the external chunk boundaries and model-defined
-compute boundaries.
+``decode_fwd`` accepts ANY public batch >= 1 while keeping the model pipeline
+internally padded to 16 rows: a batch above that width runs as
+ceil(batch / BATCH_PAD) consecutive row windows, each executing the full layer
+stack and the LM head for its rows, with the token embedding and the sampling
+shared across the whole batch. Windows are serialized on the single paged-attention
+metadata/workspace pair, and weights are re-read per window, so throughput is flat
+past 16 rows -- correctness scales, cost does not amortize. The inter-layer
+residual remains FP32; BF16 conversion occurs only at the external chunk
+boundaries and model-defined compute boundaries.
 """
 
 import argparse
@@ -253,6 +258,12 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     # Array mutation is preserved by the inline lowering, unlike a re-bound Scalar.
     prev_out_tid: pl.Array[1, pl.TASK_ID],
     prev_normed_tid: pl.Array[1, pl.TASK_ID],
+    # Public batch WINDOW this call serves. The row-indexed tensors above
+    # (hidden_states, normed_in/out, out) already hold the window's rows;
+    # seq_lens / slot_mapping / block_table are whole-batch, so the attention
+    # extern indexes them from batch_offset.
+    batch_offset: pl.Scalar[pl.INDEX],
+    batch_count: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32]:
     # Per-layer offsets into the STACKED weights / PAGED KV cache. decode_fwd passes
     # the running loop index 0.._FWD_NLAYERS-1; decode_fwd_layers passes
@@ -265,7 +276,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
     layer_cache_rows = pl.tensor.dim(k_cache, 0) // num_layers_actual
     layer_cache_base = layer_idx * layer_cache_rows
-    batch = pl.tensor.dim(seq_lens, 0)
+    batch = batch_count  # live rows in THIS window; pipeline rows above it are masked
     q_norm_w = pl.slice(q_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
     k_norm_w = pl.slice(k_norm_weight, [1, HEAD_DIM], [layer_idx, 0])
 
@@ -516,6 +527,7 @@ def _decode_layer(  # noqa: PLR0913 — model signature is intrinsic
                 slot_mapping,
                 seq_lens,
                 layer_cache_base,
+                batch_offset,
             )
         attn_out = pl.reshape(attn_out_tnd, [BATCH_PAD, HIDDEN])
         # Scope-3 allocations. (down_acc_all / gate_acc_all / up_acc_all / attn_proj_fp32
@@ -1060,75 +1072,104 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
     pa_max_blocks = pl.tensor.dim(block_table, 0) // batch
     pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
     pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
-    pa_tiling_tid = build_paged_attention_metadata(
-        seq_lens,
-        pa_max_blocks_i32,
-        pa_num_pages_i32,
-        pa_metadata,
-    )
     next_hidden = _token_embed_inline(sampled_ids_in, embed_weight, next_hidden)
 
-    cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
-    prev_out_tid = pl.array.create(1, pl.TASK_ID)
-    prev_out_tid[0] = pl.system.task_dummy(deps=[])
-    for cb0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden", allow_early_resolve=True) as ch_tid:
-            for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
-                ck0 = ckb * RMSNORM_K_CHUNK
-                # FIRST-layer boundary: cast the external BF16 embed input -> FP32 once,
-                # so every layer consumes FP32 hidden with no per-boundary round-trip.
-                cur = pl.assemble(
-                    cur,
-                    pl.cast(
-                        pl.fillpad(
-                            pl.slice(
-                                next_hidden,
-                                [BATCH_PAD, RMSNORM_K_CHUNK],
-                                [cb0, ck0],
-                                valid_shape=[batch, RMSNORM_K_CHUNK],
-                            ),
-                            pad_value=pl.PadValue.zero,
-                        ),
-                        target_type=pl.FP32,
-                    ),
-                    [cb0, ck0],
-                )
-        prev_out_tid[0] = ch_tid
-
-    # ── Pre-loop x_gamma_0: layer 0's normed = cur_0 * gamma_0 (BF16). For layers 1+,
-    # the per-layer normed is produced by the PREVIOUS layer's fused dcr_xgamma; only
-    # layer 0 (whose cur comes from copy_hidden, not a dcr) needs this standalone task.
-    normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
-    prev_normed_tid = pl.array.create(1, pl.TASK_ID)
-    with pl.manual_scope():
-        with pl.spmd(
-            XG_BLOCKS,
-            name_hint="x_gamma0",
-            allow_early_resolve=True,
-            deps=[prev_out_tid[0]],
-        ) as xgamma_tid:
-            xg_k0 = pl.tile.get_block_idx() * (HIDDEN // XG_BLOCKS)
-            for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
-                k0 = xg_k0 + kb * RMSNORM_K_CHUNK
-                x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]
-                gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
-                xg = pl.col_expand_mul(x_chunk, gamma)
-                normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
-        prev_normed_tid[0] = xgamma_tid
-
-    for layer_idx in pl.range(_FWD_NLAYERS):
-        layer_next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 layer output
-        next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
-        next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
-        cur = _decode_layer(
-            cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
-            seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache,
-            pa_metadata, pa_workspace, pa_tiling_tid, wo, w_gate, w_up, w_down,
-            post_rms_weight, layer_next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
-            prev_out_tid, prev_normed_tid,
+    # ── Batch CHUNKING: the pipeline is padded to BATCH_PAD rows and the attention
+    # bridge tiles at most METADATA_BATCH_SLOTS sequences per call, so a public
+    # batch above BATCH_PAD is served as ceil(batch / BATCH_PAD) consecutive row
+    # windows, each running the full layer stack + LM head for its rows. Embed and
+    # sampling stay OUTSIDE: both already walk the whole public batch.
+    #
+    # Windows are SERIALIZED, not parallel: pa_metadata / pa_workspace are single
+    # buffers, so the next window's tiling rebuild must wait for the previous
+    # window's last attention reader. prev_out_tid[0] after the layer loop is that
+    # window's final consolidated writer, which transitively follows every one of
+    # its attention tasks.
+    num_chunks = (batch + BATCH_PAD - 1) // BATCH_PAD
+    pa_tiling_seed = pl.array.create(1, pl.TASK_ID)
+    pa_tiling_seed[0] = pl.system.task_dummy(deps=[])
+    for chunk_idx in pl.range(num_chunks):
+        # Bind every window scalar to its own SSA value: an unbound index
+        # EXPRESSION reaching an extern arg is not a variable the orchestration
+        # codegen can pack.
+        chunk_row0 = pl.cast(chunk_idx * BATCH_PAD, pl.INDEX)
+        chunk_rows = pl.min(BATCH_PAD, batch - chunk_row0)  # < BATCH_PAD on the tail window
+        chunk_rows_i32 = pl.cast(chunk_rows, pl.INT32)
+        chunk_row0_i32 = pl.cast(chunk_row0, pl.INT32)
+        pa_tiling_tid = build_paged_attention_metadata(
+            seq_lens,
+            pa_max_blocks_i32,
+            pa_num_pages_i32,
+            pa_metadata,
+            chunk_row0_i32,
+            chunk_rows_i32,
+            pa_tiling_seed,
         )
-        normed = next_normed
-    out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, seq_lens, out)
+
+        cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 inter-layer carry (was BF16)
+        prev_out_tid = pl.array.create(1, pl.TASK_ID)
+        prev_out_tid[0] = pl.system.task_dummy(deps=[])
+        for cb0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
+            with pl.at(level=pl.Level.CORE_GROUP, name_hint="copy_hidden", allow_early_resolve=True) as ch_tid:
+                for ckb in pl.range(HIDDEN // RMSNORM_K_CHUNK):
+                    ck0 = ckb * RMSNORM_K_CHUNK
+                    # FIRST-layer boundary: cast the external BF16 embed input -> FP32 once,
+                    # so every layer consumes FP32 hidden with no per-boundary round-trip.
+                    # The read starts at this window's first public row; the pipeline row
+                    # stays 0-based, and chunk_rows zero-fills the tail window's pad rows.
+                    cur = pl.assemble(
+                        cur,
+                        pl.cast(
+                            pl.fillpad(
+                                pl.slice(
+                                    next_hidden,
+                                    [BATCH_PAD, RMSNORM_K_CHUNK],
+                                    [chunk_row0 + cb0, ck0],
+                                    valid_shape=[chunk_rows, RMSNORM_K_CHUNK],
+                                ),
+                                pad_value=pl.PadValue.zero,
+                            ),
+                            target_type=pl.FP32,
+                        ),
+                        [cb0, ck0],
+                    )
+            prev_out_tid[0] = ch_tid
+
+        # ── Pre-loop x_gamma_0: layer 0's normed = cur_0 * gamma_0 (BF16). For layers 1+,
+        # the per-layer normed is produced by the PREVIOUS layer's fused dcr_xgamma; only
+        # layer 0 (whose cur comes from copy_hidden, not a dcr) needs this standalone task.
+        normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
+        prev_normed_tid = pl.array.create(1, pl.TASK_ID)
+        with pl.manual_scope():
+            with pl.spmd(
+                XG_BLOCKS,
+                name_hint="x_gamma0",
+                allow_early_resolve=True,
+                deps=[prev_out_tid[0]],
+            ) as xgamma_tid:
+                xg_k0 = pl.tile.get_block_idx() * (HIDDEN // XG_BLOCKS)
+                for kb in pl.pipeline(HIDDEN // RMSNORM_K_CHUNK // XG_BLOCKS, stage=2):
+                    k0 = xg_k0 + kb * RMSNORM_K_CHUNK
+                    x_chunk = cur[:, k0 : k0 + RMSNORM_K_CHUNK]
+                    gamma = pl.slice(input_rms_weight, [1, RMSNORM_K_CHUNK], [0, k0])
+                    xg = pl.col_expand_mul(x_chunk, gamma)
+                    normed = pl.assemble(normed, pl.cast(xg, target_type=pl.BF16), [0, k0])
+            prev_normed_tid[0] = xgamma_tid
+
+        for layer_idx in pl.range(_FWD_NLAYERS):
+            layer_next_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)  # FP32 layer output
+            next_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)  # next layer's x*gamma
+            next_gamma_idx = pl.min(layer_idx + 1, _FWD_NLAYERS - 1)  # clamp: last layer's normed unused
+            cur = _decode_layer(
+                cur, input_rms_weight, wq, wk, wv, q_norm_weight, k_norm_weight,
+                seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache,
+                pa_metadata, pa_workspace, pa_tiling_tid, wo, w_gate, w_up, w_down,
+                post_rms_weight, layer_next_hidden, normed, next_normed, layer_idx, next_gamma_idx,
+                prev_out_tid, prev_normed_tid, chunk_row0, chunk_rows_i32,
+            )
+            normed = next_normed
+        out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, out, chunk_row0, chunk_rows)
+        pa_tiling_seed[0] = prev_out_tid[0]
     sampled_ids_out = _greedy_sample_inline(out, sampled_ids_out)
     return out, sampled_ids_out, next_hidden
 
@@ -1180,11 +1221,19 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
     pa_max_blocks = pl.tensor.dim(block_table, 0) // batch
     pa_num_pages_i32 = pl.cast(pa_num_pages, pl.INT32)
     pa_max_blocks_i32 = pl.cast(pa_max_blocks, pl.INT32)
+    # Layer-chunk entry: STATIC BATCH_PAD-row hidden in/out, so it serves one
+    # window (rows 0..batch). Public batches above BATCH_PAD are decode_fwd's job.
+    batch_i32 = pl.cast(batch, pl.INT32)
+    pa_tiling_seed = pl.array.create(1, pl.TASK_ID)
+    pa_tiling_seed[0] = pl.system.task_dummy(deps=[])
     pa_tiling_tid = build_paged_attention_metadata(
         seq_lens,
         pa_max_blocks_i32,
         pa_num_pages_i32,
         pa_metadata,
+        0,
+        batch_i32,
+        pa_tiling_seed,
     )
 
     cur = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.FP32)
@@ -1232,7 +1281,7 @@ def decode_fwd_layers(  # noqa: PLR0913 — fused decode of a CONTIGUOUS layer C
             seq_lens, block_table, slot_mapping, rope_cos, rope_sin, k_cache, v_cache,
             pa_metadata, pa_workspace, pa_tiling_tid, wo, w_gate, w_up, w_down,
             post_rms_weight, next_hidden, normed, next_normed, i, next_gamma_idx,
-            prev_out_tid, prev_normed_tid,
+            prev_out_tid, prev_normed_tid, 0, batch_i32,
         )
         normed = next_normed
     for ob0 in pl.parallel(0, BATCH_PAD, BATCH_PAD):
@@ -1286,9 +1335,10 @@ def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tenso
     """Identity paging for the standalone harness: batch b's logical blocks map to
     physical pages [b*DECODE_MAX_BLOCKS_PER_SEQ .. ]; slot_mapping[b] is the current
     token's (pos=seq_len-1) physical row. Mirrors the serving runner's layout."""
-    block_table = torch.arange(BATCH_PAD * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
-    slot_mapping = torch.empty(BATCH_PAD, dtype=torch.int32)
-    for b in range(BATCH_PAD):
+    rows = seq_lens.shape[0]
+    block_table = torch.arange(rows * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    slot_mapping = torch.empty(rows, dtype=torch.int32)
+    for b in range(rows):
         pos = int(seq_lens[b].item()) - 1
         logical_block = pos // BLOCK_SIZE
         phys_page = b * DECODE_MAX_BLOCKS_PER_SEQ + logical_block
@@ -1373,11 +1423,13 @@ def _rope_half(vec: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     return torch.cat([lo * cos_lo - hi * sin_lo, hi * cos_hi + lo * sin_hi], dim=-1)
 
 
-def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.Tensor]:
+def random_inputs(full_seq: bool = False, seed: int = 1234, batch: int = BATCH_PAD) -> dict[str, torch.Tensor]:
     """Deterministic random fixture (name -> tensor) for decode_fwd_layers (N==1).
 
     full_seq: set every sequence length to MAX_SEQ (full KV cache) for a stable,
     maximum-load performance run; otherwise sample varied lengths in [1, MAX_SEQ].
+    batch: public batch — sizes the per-row tensors and the paged pool. Above
+    BATCH_PAD it is only meaningful for decode_fwd, which chunks internally.
     """
     g = torch.Generator().manual_seed(seed)
 
@@ -1385,9 +1437,10 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
         return torch.empty(shape).normal_(0.0, std, generator=g) + bias
 
     if full_seq:
-        seq_lens = torch.full([BATCH_PAD], MAX_SEQ, dtype=torch.int32)
+        seq_lens = torch.full([batch], MAX_SEQ, dtype=torch.int32)
     else:
-        seq_lens = torch.randint(1, MAX_SEQ + 1, (BATCH_PAD,), generator=g, dtype=torch.int32)
+        seq_lens = torch.randint(1, MAX_SEQ + 1, (batch,), generator=g, dtype=torch.int32)
+    cache_rows = batch * DECODE_MAX_BLOCKS_PER_SEQ * NUM_KV_HEADS * BLOCK_SIZE
 
     # Paged block_table / slot_mapping (identity paging) for the PAGED KV pool the
     # kernel reads — k_cache/v_cache below are sized as the paged pool (CACHE_ROWS).
@@ -1402,7 +1455,7 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
 
     # The flat cache buffers represent BSND bytes: [page, token, kv_head, dim].
     return {
-        "hidden_states": rn([BATCH_PAD, HIDDEN], 1.0).to(torch.bfloat16),
+        "hidden_states": rn([batch, HIDDEN], 1.0).to(torch.bfloat16),
         "input_rms_weight": rn([1, HIDDEN], 0.1, 1.0).float(),
         "wq": rn([HIDDEN, HIDDEN], 0.02).to(torch.bfloat16),
         "wk": rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16),
@@ -1414,8 +1467,8 @@ def random_inputs(full_seq: bool = False, seed: int = 1234) -> dict[str, torch.T
         "slot_mapping": slot_mapping,
         "rope_cos": rope_cos,
         "rope_sin": rope_sin,
-        "k_cache": rn([CACHE_ROWS, HEAD_DIM], 0.01).to(torch.bfloat16),
-        "v_cache": rn([CACHE_ROWS, HEAD_DIM], 0.02, 0.3).to(torch.bfloat16),
+        "k_cache": rn([cache_rows, HEAD_DIM], 0.01).to(torch.bfloat16),
+        "v_cache": rn([cache_rows, HEAD_DIM], 0.02, 0.3).to(torch.bfloat16),
         "wo": rn([HIDDEN, HIDDEN], 0.0006).to(torch.bfloat16),
         "w_gate": rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16),
         "w_up": rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16),
@@ -1574,7 +1627,7 @@ if __name__ == "__main__":
                              "single-layer golden test.")
     parser.add_argument("--fwd-layers", type=int, default=4, help="layer count N for --validate-fwd")
     parser.add_argument("-b", "--batch", type=int, default=BATCH_PAD,
-                        help="PUBLIC batch for --validate-fwd (1..BATCH_PAD). decode_fwd's batch\naxes are pl.dynamic, so one compiled program serves any value in range; the\npipeline stays internally padded to BATCH_PAD rows. Ignored by the default\nsingle-layer test, which drives the static decode_fwd_layers.")
+                        help="PUBLIC batch for --validate-fwd (>= 1, no upper bound). decode_fwd's\nbatch axes are pl.dynamic, so one compiled program serves any value; the\npipeline stays internally padded to BATCH_PAD rows and a larger batch runs as\nceil(batch / BATCH_PAD) row windows. Ignored by the default single-layer test,\nwhich drives the static decode_fwd_layers.")
     parser.add_argument("--decode-steps", type=int, default=1,
                         help="under --validate-fwd, run this many decode steps for a device-cost "
                              "timing sweep at growing context: each step feeds the previous step's "
@@ -1651,7 +1704,10 @@ if __name__ == "__main__":
     if data_input_dir.is_dir():
         inputs = load_inputs(data_input_dir)
     else:
-        random_values = random_inputs(full_seq=args.max_seq, seed=args.seed)
+        # Generate the fixture at the requested public batch: above BATCH_PAD the
+        # per-row tensors and the paged pool must cover every row decode_fwd will
+        # chunk over, not just one pipeline width.
+        random_values = random_inputs(full_seq=args.max_seq, seed=args.seed, batch=args.batch)
         inputs = [random_values[name] for name in INPUT_NAMES]
     # dep_gen (--enable-dep-gen) is an AICPU-side DFX collector for the producer->
     # consumer task graph; it does not reduce the AICore cohort, so it coexists with
@@ -1683,14 +1739,14 @@ if __name__ == "__main__":
             return torch.cat([t] * reps, dim=0).contiguous()
         hs, irw, wq_, wk_, wv_, qn, kn, sl, bt, sm, rc, rs, kc, vc, wo_, wg, wu, wd, prw = inputs
         UB = args.batch
-        if not 1 <= UB <= BATCH_PAD:
-            parser.error(f"--batch must be in [1, {BATCH_PAD}], got {UB}")
-        if UB != BATCH_PAD:
-            # Public batch axes are dynamic, so the HOST tensors shrink to UB rows.
+        if UB < 1:
+            parser.error(f"--batch must be >= 1, got {UB}")
+        if UB != hs.shape[0]:
+            # Public batch axes are dynamic, so the HOST tensors track UB rows.
             # block_table in particular MUST be UB * DECODE_MAX_BLOCKS_PER_SEQ: the
             # kernel derives the paged row stride as len(block_table) // batch, so a
-            # left-over BATCH_PAD-row table would hand the FAI tiler a stride that is
-            # BATCH_PAD/UB times too large and misaddress every b > 0.
+            # table sized for a different row count would hand the FAI tiler a wrong
+            # stride and misaddress every b > 0.
             sl = sl[:UB].contiguous()
             bt = torch.arange(UB * DECODE_MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
             sm = torch.empty(UB, dtype=torch.int32)
@@ -1758,7 +1814,7 @@ if __name__ == "__main__":
         logits = torch.zeros(UB, VOCAB, dtype=torch.float32)
         embed_weight = torch.zeros(VOCAB, HIDDEN, dtype=torch.bfloat16)
         sampled_ids_in = torch.zeros(UB, SAMPLED_IDS_PAD, dtype=torch.int32)
-        for b in range(BATCH_PAD):
+        for b in range(UB):
             embed_weight[b] = hs[b]
         for b in range(UB):
             sampled_ids_in[b, 0] = b
@@ -1798,9 +1854,32 @@ if __name__ == "__main__":
         # its boundaries), matching decode_fwd's FP32-carry-until-LM-head path. A per-layer
         # chain (N single-layer dispatches) would re-enter each layer from BF16, diverging
         # from decode_fwd and making the argmax check pass/fail for the wrong reason.
+        # decode_fwd_layers is the BATCH_PAD-wide layer stack, so a public batch above
+        # it is referenced one window at a time -- the same rows decode_fwd chunks
+        # over, but as independent dispatches. The KV pool and the weights are passed
+        # whole; only the per-row inputs (hidden, seq_lens, block_table, slot_mapping)
+        # are windowed, and the block-table slice keeps its ABSOLUTE page ids so each
+        # window addresses the same pages the fused run did.
         _CHUNK_NLAYERS = N
-        ref_out = torch.zeros(BATCH_PAD, HIDDEN, dtype=torch.bfloat16)
-        decode_fwd_layers(hs, *stacked[:len(INPUT_NAMES) - 1], ref_out, config=run_cfg)
+        _BPS = DECODE_MAX_BLOCKS_PER_SEQ
+        # `stacked` drops hidden_states, so a windowed input sits one slot before
+        # its INPUT_NAMES position. Derive the slots instead of writing them out:
+        # reordering INPUT_NAMES would otherwise silently window the wrong tensor.
+        def _slot(name: str) -> int:
+            return INPUT_NAMES.index(name) - 1
+        ref_rows = []
+        for _w0 in range(0, UB, BATCH_PAD):
+            _n = min(BATCH_PAD, UB - _w0)
+            _hs_w = torch.zeros(BATCH_PAD, HIDDEN, dtype=hs.dtype)
+            _hs_w[:_n] = hs[_w0 : _w0 + _n]
+            _win = list(stacked[: len(INPUT_NAMES) - 1])
+            _win[_slot("seq_lens")] = sl[_w0 : _w0 + _n].contiguous()
+            _win[_slot("block_table")] = bt[_w0 * _BPS : (_w0 + _n) * _BPS].contiguous()
+            _win[_slot("slot_mapping")] = sm[_w0 : _w0 + _n].contiguous()
+            _ref_w = torch.zeros(BATCH_PAD, HIDDEN, dtype=torch.bfloat16)
+            decode_fwd_layers(_hs_w, *_win, _ref_w, config=run_cfg)
+            ref_rows.append(_ref_w[:_n])
+        ref_out = torch.cat(ref_rows, dim=0)
         hn = ref_out.float()
         inv = torch.rsqrt(hn.pow(2).mean(-1, keepdim=True) + EPS)
         ref_normed = (hn * inv) * final_norm_w.float()
@@ -1817,7 +1896,8 @@ if __name__ == "__main__":
         argmax_match = int((amax_k == amax_r).sum())
         sample_match = int((sample_k == amax_k).sum())
         close = torch.isclose(a, e, rtol=5e-2, atol=5e-2)
-        print(f"[stacked-fwd {N}L+LMhead] batch={UB}/{BATCH_PAD} | "
+        _windows = (UB + BATCH_PAD - 1) // BATCH_PAD
+        print(f"[stacked-fwd {N}L+LMhead] batch={UB} ({_windows}x{BATCH_PAD}-row window(s)) | "
               f"argmax match {argmax_match}/{UB} | "
               f"sample match {sample_match}/{UB} | "
               f"logits {int(close.sum())/a.numel():.4%} within 5e-2 | "

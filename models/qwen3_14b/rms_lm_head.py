@@ -140,11 +140,14 @@ def rms_lm_head_fp32(
     hidden_states: pl.Tensor[[BATCH_PAD, HIDDEN], pl.FP32],
     final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
     lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
-    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
     out: pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32],
+    # Public row WINDOW: hidden_states holds the window's rows 0-based, and the
+    # logits land at out[row_offset ...]. A caller that serves the whole batch in
+    # one pass passes (0, batch); decode_fwd chunks a batch above BATCH_PAD and
+    # calls once per window.
+    row_offset: pl.Scalar[pl.INDEX],
+    valid_rows: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]:
-    batch = pl.tensor.dim(seq_lens, 0)
-
     final_normed = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
     for b0 in pl.parallel(0, BATCH_PAD, BATCH_TILE):
         with pl.at(
@@ -185,7 +188,7 @@ def rms_lm_head_fp32(
         allow_early_resolve=True,
     ):
         for b0 in pl.range(0, BATCH_PAD, BATCH_TILE):
-            lm_valid_rows = pl.min(BATCH_TILE, batch - b0)
+            lm_valid_rows = pl.min(BATCH_TILE, valid_rows - b0)
             for ob in pl.range(lm_core, VOCAB // VOCAB_CHUNK, LM_HEAD_CORES):
                 lm_o0 = ob * VOCAB_CHUNK
                 lm_hidden_chunk = pl.slice(final_normed, [BATCH_TILE, LM_HEAD_K_CHUNK], [b0, 0])
@@ -201,7 +204,7 @@ def rms_lm_head_fp32(
                     )
                     lm_acc = pl.matmul_acc(lm_acc, lm_hidden_chunk, lm_weight_chunk, b_trans=True)
                 lm_acc_trimmed = pl.set_validshape(lm_acc, lm_valid_rows, VOCAB_CHUNK)
-                out = pl.assemble(out, lm_acc_trimmed, [b0, lm_o0])
+                out = pl.assemble(out, lm_acc_trimmed, [row_offset + b0, lm_o0])
 
     return out
 

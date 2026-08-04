@@ -311,12 +311,12 @@ def test_generated_rope_every_feasible_path_is_sync_safe() -> None:
 
 
 def test_decode_contract_uses_dynamic_batch() -> None:
-    """decode serves any public batch in [1, batch_pad] from one compiled program.
+    """decode serves any public batch >= 1 from one compiled program.
 
     Every host-visible batch axis is the same ``BATCH`` dim (prefill uses it too,
     so the two stages no longer spell the same concept differently), and
-    ``limits["batch"]`` is the UPPER BOUND -- the padded pipeline width -- not a
-    required exact value.
+    ``limits["batch"]`` is the padded pipeline WIDTH -- one decode row window --
+    not a required exact value and no longer decode's ceiling.
     """
     contract = get_contract("qwen3", "14b")
     decode_args = {arg.name: arg.shape for arg in contract.kernels["decode"].args}
@@ -343,22 +343,35 @@ def test_decode_contract_uses_dynamic_batch() -> None:
     assert compile_args[-1].shape == (16, 8)
 
 
-@pytest.mark.parametrize("batch", [1, 2, 8, 15, 16])
-def test_decode_contract_accepts_batch_within_pad(batch: int) -> None:
+@pytest.mark.parametrize("batch", [1, 2, 8, 15, 16, 17, 32, 33, 100])
+def test_decode_contract_accepts_any_batch(batch: int) -> None:
     runtime = _runtime_config()
     runtime.max_batch_size = batch
     contract = get_contract("qwen3", "14b")
-    # Must not raise: any batch up to the padded width is servable.
+    # Must not raise at ANY batch: decode_fwd runs a batch above the padded width
+    # as ceil(batch / batch_pad) row windows, so limits["batch"] bounds one window,
+    # not the public batch.
     contract.kernels["decode"].compile_args_builder(_tiny_model_config(), runtime)
 
 
-@pytest.mark.parametrize("batch", [0, 17, 32])
-def test_decode_contract_rejects_batch_outside_pad(batch: int) -> None:
+@pytest.mark.parametrize("batch", [0, -1])
+def test_decode_contract_rejects_empty_batch(batch: int) -> None:
     runtime = _runtime_config()
     runtime.max_batch_size = batch
     contract = get_contract("qwen3", "14b")
     with pytest.raises(ValueError, match="max_batch_size"):
         contract.kernels["decode"].compile_args_builder(_tiny_model_config(), runtime)
+
+
+@pytest.mark.parametrize("batch", [17, 32])
+def test_prefill_and_greedy_sample_stay_capped_at_pad(batch: int) -> None:
+    """Only decode chunks. The other two stages still bound the batch by the pad."""
+    runtime = _runtime_config()
+    runtime.max_batch_size = batch
+    contract = get_contract("qwen3", "14b")
+    for stage in ("prefill", "greedy_sample"):
+        with pytest.raises(ValueError, match="max_batch_size"):
+            contract.kernels[stage].compile_args_builder(_tiny_model_config(), runtime)
 
 
 def test_runtime_arg_builders_follow_host_order() -> None:

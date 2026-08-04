@@ -70,7 +70,9 @@ METADATA_BATCH_SLOTS = 16
 # BATCH_PAD is the padded batch of the STANDALONE test kernels below
 # (qwen_decode_attention_cce / _cache_offset_test). The fused decode path does
 # not use it -- paged_attention_rope_cce takes whatever shapes decode_fwd passes,
-# and the tiler reads the real batch from the seq_lens descriptor at runtime.
+# and the row window each call serves is passed explicitly (batch_offset /
+# batch_count), so a public batch above METADATA_BATCH_SLOTS is served as
+# consecutive windows rather than rejected.
 BATCH_PAD = 16
 DEFAULT_BLOCK_DIM = 24
 BLOCK_SIZE = 128
@@ -145,6 +147,11 @@ def paged_attention_rope_cce(
     slot_mapping: pl.Tensor,
     seq_lens: pl.Tensor,
     cache_row_offset: pl.Scalar[pl.INDEX],
+    # First public batch row served by this call. The whole-batch inputs
+    # (seq_lens, slot_mapping, block_table) are indexed from here; the per-row
+    # buffers the caller slices itself stay 0-based. Scalars pack after every
+    # tensor, so this lands at args[18] -- see kernel/fai_body.hpp.
+    batch_offset: pl.Scalar[pl.INDEX],
 ) -> pl.Tensor: ...
 
 
@@ -158,6 +165,8 @@ def paged_attention_tiling_cce(
     metadata: pl.Out[pl.Tensor],
     max_blocks_per_seq: pl.Scalar[pl.INT32],
     num_blocks: pl.Scalar[pl.INT32],
+    batch_offset: pl.Scalar[pl.INT32],
+    batch_count: pl.Scalar[pl.INT32],
 ) -> pl.Tensor: ...
 
 
@@ -167,14 +176,29 @@ def build_paged_attention_metadata(
     max_blocks_per_seq: pl.Scalar[pl.INT32],
     num_blocks: pl.Scalar[pl.INT32],
     metadata: pl.Tensor[[METADATA_BYTES], pl.UINT8],
+    batch_offset: pl.Scalar[pl.INT32],
+    batch_count: pl.Scalar[pl.INT32],
+    prev_reader_tid: pl.Array[1, pl.TASK_ID],
 ):
-    """Build runtime FAI metadata and return its scheduler dependency."""
-    with pl.spmd(1, name_hint="pa_tiling", allow_early_resolve=True) as tiling_tid:
+    """Build runtime FAI metadata for one row window and return its dependency.
+
+    ``batch_count`` rows starting at ``batch_offset`` are tiled into a 0-based
+    tiling, so a caller serving more than METADATA_BATCH_SLOTS rows repeats the
+    call per window. ``prev_reader_tid`` orders this rebuild after the readers of
+    the PREVIOUS window's metadata -- the buffer is reused, and the attention
+    tasks that read it live in a manual scope with no auto-tracked WAR edge.
+    A length-one Array (not a plain TASK_ID Scalar) because an explicit dep may
+    only name a tid the enclosing scope captured; callers that build the metadata
+    once seed it with a fresh ``pl.system.task_dummy``.
+    """
+    with pl.spmd(1, name_hint="pa_tiling", allow_early_resolve=True, deps=[prev_reader_tid[0]]) as tiling_tid:
         metadata = paged_attention_tiling_cce(
             seq_lens,
             metadata,
             max_blocks_per_seq,
             num_blocks,
+            batch_offset,
+            batch_count,
         )
     return tiling_tid
 
@@ -197,11 +221,19 @@ def qwen_decode_attention_cce(
     workspace = pl.create_tensor([WORKSPACE_BYTES], dtype=pl.UINT8)
     max_blocks_per_seq = pl.cast(pl.tensor.dim(block_table, 1), pl.INT32)
     num_blocks = pl.cast(pl.tensor.dim(key_cache, 0), pl.INT32)
+    pa_tiling_seed = pl.array.create(1, pl.TASK_ID)
+    pa_tiling_seed[0] = pl.system.task_dummy(deps=[])
+    # Bound to its own SSA value: an unbound expression reaching an extern arg is
+    # not a variable the orchestration codegen can pack.
+    batch_count = pl.cast(pl.tensor.dim(seq_lens, 0), pl.INT32)
     tiling_tid = build_paged_attention_metadata(
         seq_lens,
         max_blocks_per_seq,
         num_blocks,
         metadata,
+        0,
+        batch_count,
+        pa_tiling_seed,
     )
     attention_core_num = DEFAULT_BLOCK_DIM
     with pl.spmd(
@@ -241,11 +273,19 @@ def qwen_decode_attention_cache_offset_test(
     workspace = pl.create_tensor([WORKSPACE_BYTES], dtype=pl.UINT8)
     max_blocks_per_seq = pl.tensor.dim(block_table, 1)
     layer_num_blocks = pl.tensor.dim(block_table, 0) * max_blocks_per_seq
+    pa_tiling_seed = pl.array.create(1, pl.TASK_ID)
+    pa_tiling_seed[0] = pl.system.task_dummy(deps=[])
+    # Bound to its own SSA value: an unbound expression reaching an extern arg is
+    # not a variable the orchestration codegen can pack.
+    batch_count = pl.cast(pl.tensor.dim(seq_lens, 0), pl.INT32)
     tiling_tid = build_paged_attention_metadata(
         seq_lens,
         pl.cast(max_blocks_per_seq, pl.INT32),
         pl.cast(layer_num_blocks, pl.INT32),
         metadata,
+        0,
+        batch_count,
+        pa_tiling_seed,
     )
     cache_row_offset = layer_num_blocks * BLOCK_SIZE * NUM_KV_HEADS
     attention_core_num = DEFAULT_BLOCK_DIM

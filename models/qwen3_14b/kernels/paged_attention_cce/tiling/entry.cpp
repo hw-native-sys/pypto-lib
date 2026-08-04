@@ -38,10 +38,6 @@ static __aicore__ __attribute__((always_inline)) __gm__ T *tensor_data(__gm__ in
     return reinterpret_cast<__gm__ T *>(tensor->buffer.addr) + tensor->start_offset;
 }
 
-static __aicore__ __attribute__((always_inline)) __gm__ Tensor *tensor_desc(__gm__ int64_t *args, int32_t index) {
-    return reinterpret_cast<__gm__ Tensor *>(args[index]);
-}
-
 static __aicore__ __attribute__((always_inline)) __gm__ int32_t *barrier_data(__gm__ uint8_t *metadata) {
     uint64_t raw_barrier = reinterpret_cast<uint64_t>(metadata + qwen_fai_metadata::kBarrierAlignmentOffset);
     uint64_t aligned_barrier = (raw_barrier + qwen_fai_metadata::kBarrierAlignmentBytes - 1) &
@@ -71,16 +67,21 @@ static __aicore__ void flush_metadata_prefix(__gm__ uint8_t *metadata) {
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *seq_lens_desc = tensor_desc(args, 0);
     __gm__ const int32_t *seq_lens = tensor_data<const int32_t>(args, 0);
     __gm__ uint8_t *metadata = tensor_data<uint8_t>(args, 1);
     __gm__ uint32_t *tiling_out = reinterpret_cast<__gm__ uint32_t *>(metadata + qwen_fai_metadata::kTilingOffset);
     __gm__ int64_t *cumulative_q_out =
         reinterpret_cast<__gm__ int64_t *>(metadata + qwen_fai_metadata::kCumulativeQOffset);
     __gm__ int64_t *kv_lengths_out = reinterpret_cast<__gm__ int64_t *>(metadata + qwen_fai_metadata::kKvLengthsOffset);
-    uint32_t batch = static_cast<uint32_t>(seq_lens_desc->shapes[0]);
     uint32_t max_blocks_per_batch = static_cast<uint32_t>(args[2]);
     uint32_t num_blocks = static_cast<uint32_t>(args[3]);
+    // Row WINDOW, passed explicitly instead of read from the seq_lens descriptor:
+    // decode_fwd serves a public batch above kMaxBatch as consecutive row chunks,
+    // and every chunk hands the same full-batch seq_lens tensor to a call that must
+    // tile only [batch_offset, batch_offset + batch). The emitted tiling is 0-based
+    // over the window -- fai_body.hpp offsets the block table to match.
+    uint32_t batch_offset = static_cast<uint32_t>(args[4]);
+    uint32_t batch = static_cast<uint32_t>(args[5]);
 
     clear_barrier(barrier_data(metadata));
     if (batch == 0 || batch > qwen_fai_tiler::kMaxBatch) {
@@ -91,7 +92,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int64_t local_cumulative_q[qwen_fai_tiler::kMaxBatch] = {};
     int64_t local_kv_lengths[qwen_fai_tiler::kMaxBatch] = {};
     for (uint32_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
-        local_seq_lens[batch_idx] = static_cast<uint32_t>(seq_lens[batch_idx]);
+        local_seq_lens[batch_idx] = static_cast<uint32_t>(seq_lens[batch_offset + batch_idx]);
     }
 
     FAInferTilingData tiling;

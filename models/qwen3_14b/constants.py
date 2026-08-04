@@ -33,10 +33,13 @@ class Qwen3Config:
 
     # Model shape.
     # batch_pad: the row count the decode pipeline is PADDED to -- it is the M of
-    # every matmul, not an architectural ceiling. The public batch is dynamic and
-    # satisfies 1 <= batch <= batch_pad. Raising it is possible but not free: it
-    # needs kMaxBatch + the metadata length arrays bumped on the CCE side, and the
-    # M-dimension tiling (TN/TK/MLP_TN/DOWN_TN) re-validated against L0C/Mat/UB.
+    # every matmul, not a ceiling on the public batch. decode_fwd serves any batch
+    # >= 1 by running ceil(batch / batch_pad) row windows, so raising this is a
+    # THROUGHPUT change (one window does more rows per weight read), not a
+    # capability one. Raising it is not free: it needs kMaxBatch + the metadata
+    # length arrays bumped on the CCE side, the generated RoPE body regenerated
+    # (its per-core item count is baked in), and the M-dimension tiling
+    # (TN/TK/MLP_TN/DOWN_TN) re-validated against L0C/Mat/UB.
     batch_pad: int
     max_seq: int
     num_heads: int

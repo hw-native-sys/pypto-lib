@@ -50,13 +50,14 @@ first — several traps below follow directly from it.
 is **not** positional to the Python signature.
 
 For the fused Qwen extern, the declaration starts with the returned attention
-buffer and ends with the scalar:
+buffer and ends with the scalars:
 
 ```python
 def paged_attention_rope_cce(
     out, query, key_cache, value_cache, block_table, workspace, metadata,
     q_proj, k_proj, ..., seq_lens,
     cache_row_offset: pl.Scalar[pl.INDEX],
+    batch_offset: pl.Scalar[pl.INDEX],
 ) -> ...
 ```
 
@@ -72,10 +73,12 @@ the `args[]` indices are:
 | 5 | workspace    | | 14 | inv_rms_states |
 | 6 | metadata     | | 15 | slot_mapping |
 | 7 | q_proj       | | 16 | seq_lens |
-| 8 | k_proj       | | **17** | **cache_row_offset (the scalar — LAST)** |
+| 8 | k_proj       | | **17** | **cache_row_offset (first scalar)** |
+|   |              | | **18** | **batch_offset (second scalar — LAST)** |
 
 The scalar `cache_row_offset` is the eighteenth parameter and lands at
-`args[17]`. Read it at `args[7]` and you get `q_proj`'s tensor descriptor pointer
+`args[17]`, and `batch_offset` follows it at `args[18]`. Read `cache_row_offset`
+at `args[7]` and you get `q_proj`'s tensor descriptor pointer
 reinterpreted as an integer offset; read `seq_lens` at `args[17]` and you
 `reinterpret_cast<Tensor*>(scalar_value)` → for layer 0 that value is `0` → null
 deref → the next `DataCopy` from it **hangs the vector core** (surfaces as
@@ -83,7 +86,7 @@ deref → the next `DataCopy` from it **hangs the vector core** (surfaces as
 
 An earlier fused draft placed the scalar between `metadata` and `q_proj`; it
 still landed at `args[17]` because the ten following tensors were packed ahead
-of it. The current fused signature keeps the scalar last. The attention-only
+of it. The current fused signature keeps the scalars last. The attention-only
 `paged_attention_cce` does the same, at `args[7]`. Add tensors after a scalar
 and every packed scalar index shifts even when its signature position does not.
 

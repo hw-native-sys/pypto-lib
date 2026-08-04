@@ -277,7 +277,9 @@ def build_decode_compile_args(model_config: Any, runtime_config: Any) -> tuple[t
     """Build dummy compile arguments for the Qwen3 decode HOST wrapper."""
     import torch
 
-    dims = _dims(model_config, runtime_config)
+    # No batch ceiling: decode_fwd runs a public batch above the padded pipeline
+    # width as consecutive batch_pad-row windows.
+    dims = _dims(model_config, runtime_config, batch_limit=None)
     cache_rows = dims["layers"] * dims["batch"] * dims["runtime_cache_blocks"] * dims["kv_heads"] * dims["page"]
     return (
         torch.empty((dims["layers"], dims["hidden"]), dtype=torch.float32),
@@ -499,8 +501,12 @@ def get_qwen3_14b_contract() -> ModelContract:
         model=ModelId(family="qwen3", variant="14b", size="14b", quant="bf16"),
         capabilities=("paged_kv", "chunked_prefill", "device_greedy_sampling", "device_embedding"),
         limits={
-            # Upper bound on the public batch: the decode pipeline is padded to
-            # this many rows, so 1 <= batch <= limits["batch"].
+            # The padded pipeline width. It is the public-batch ceiling for
+            # prefill and the standalone greedy_sample stage. DECODE is no longer
+            # bounded by it: decode_fwd serves any batch >= 1 by running
+            # ceil(batch / limits["batch"]) row windows, so a consumer that wants
+            # a larger decode batch should size against this value as a window,
+            # not as a maximum.
             "batch": QWEN3_14B.batch_pad,
             "max_seq": QWEN3_14B.max_seq,
             "page_size": QWEN3_14B_TILING.block_size,
@@ -574,17 +580,20 @@ def _is_other_pypto_lib_short_module(name: str) -> bool:
     return module_file.startswith(pypto_lib_models_dir) and not module_file.startswith(str(_KERNEL_DIR))
 
 
-def _dims(model_config: Any, runtime_config: Any) -> dict[str, int]:
+def _dims(model_config: Any, runtime_config: Any, batch_limit: int | None = QWEN3_14B.batch_pad) -> dict[str, int]:
     batch = int(runtime_config.max_batch_size)
     max_seq = int(runtime_config.max_seq_len)
     page = int(runtime_config.page_size)
-    # Decode serves any public batch up to the padded pipeline width: the batch
-    # axes are pl.dynamic and the kernel reads the live batch from the seq_lens
-    # descriptor. The compile-time dummies below are still sized at max_batch_size
-    # (they only bound buffer capacity, not the runtime shape).
-    if not 1 <= batch <= QWEN3_14B.batch_pad:
+    # The batch axes are pl.dynamic and the kernel reads the live batch from the
+    # seq_lens descriptor, so the compile-time dummies below only bound buffer
+    # capacity, not the runtime shape. batch_limit is the per-stage ceiling:
+    # decode passes None (it chunks any batch into batch_pad-row windows), while
+    # prefill and the standalone greedy_sample stage stay at the padded width.
+    if batch < 1:
+        raise ValueError(f"Qwen3-14B kernels require max_batch_size >= 1, got {batch}")
+    if batch_limit is not None and batch > batch_limit:
         raise ValueError(
-            f"Qwen3-14B kernels require 1 <= max_batch_size <= {QWEN3_14B.batch_pad}, got {batch}"
+            f"Qwen3-14B kernels require 1 <= max_batch_size <= {batch_limit}, got {batch}"
         )
     if max_seq > QWEN3_14B.max_seq:
         raise ValueError(f"Qwen3-14B kernels require max_seq <= {QWEN3_14B.max_seq}, got {max_seq}")
