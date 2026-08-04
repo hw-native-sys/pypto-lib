@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
 # ci: no-sim
+# CI control: exercise the unchanged prefill MTP path in pull-request CI.
 """DeepSeek-V4 MTP prefill: projection, SWA attention, MoE, HC head, RMSNorm, and LM head."""
 
 import argparse
