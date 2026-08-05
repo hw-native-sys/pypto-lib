@@ -59,11 +59,11 @@ from moe import (
     moe,
 )
 from config import FLASH as MODEL_CONFIG
-from prefill_attention_swa import (
+from prefill_swa import (
     build_tensor_specs as build_swa_attention_tensor_specs,
     prefill_attention_swa,
 )
-from prefill_attention_hca import (
+from prefill_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
@@ -72,7 +72,7 @@ from prefill_attention_hca import (
     build_tensor_specs as build_hca_attention_tensor_specs,
     prefill_attention_hca,
 )
-from prefill_attention_csa import (
+from prefill_csa import (
     BLOCK_SIZE,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,
     CSA_CMP_BLOCK_NUM,

@@ -422,7 +422,7 @@ def indexer_test(
 def gen_shared_weight(shape, dequant_std, chan_cv):
     """Synthesize a per-output-channel-symmetric INT8 weight + FP32 scale by simulating the
     real DeepSeek-V4-Flash MXFP8 quant grid (e4m3, 128x128-block E8M0 scale), then re-quantizing
-    per-output-channel. Used for the indexer ``idx wq_b`` (and shared by decode_attention_csa),
+    per-output-channel. Used for the indexer ``idx wq_b`` (and shared by decode_csa),
     which follows the same FP8 grid as the shared experts: ~200 discrete levels, ~1.1% zero
     spike, per-channel scale CV ~0.61. A plain randn INT8 misses that level/scale structure.
     ``chan_cv`` (log-space source-gain std) injects the per-output-channel magnitude spread the

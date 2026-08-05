@@ -237,7 +237,7 @@ default for a run:
 
 ```bash
 PYPTO_GOLDEN_NUM_THREADS=8 \
-  python models/deepseek_v4_flash_mtp/decode_attention_csa.py -p a2a3 -d 0
+  python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0
 ```
 
 ### 4. Runtime (simpler)

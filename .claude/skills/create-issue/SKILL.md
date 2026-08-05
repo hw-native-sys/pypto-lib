@@ -145,7 +145,7 @@ Confirm the problem before filing. **Bug reports only.**
 ### 3a: Identify the reproduction script
 
 - If the user gave a specific script/command, use it.
-- If the issue names a file (e.g. "`decode_attention_csa.py` FAILs x_out"), use
+- If the issue names a file (e.g. "`decode_csa.py` FAILs x_out"), use
   that file with the platform/device it fails on (`-p a2a3`, `-d <id>`).
 - If unclear, **ask the user** which script reproduces the problem.
 

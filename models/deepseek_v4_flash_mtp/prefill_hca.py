@@ -494,7 +494,7 @@ def build_tensor_specs(
     # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
     # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
     # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
-    # Mirrors decode_attention_hca.
+    # Mirrors decode_hca.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():
@@ -526,7 +526,7 @@ def build_tensor_specs(
         return shared_freqs_sin.clone()
     # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_hca / decode_compressor_ratio128.
+    # Mirrors decode_hca / decode_compressor_ratio128.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0246
     def init_cmp_wgate():
@@ -684,7 +684,7 @@ def valid_ratio_reldiff(
 ):
     """Relative-diff comparator restricted to the valid (active) token rows.
 
-    Mirrors decode_attention_hca's ``ratio_reldiff`` bar and prefill_layer's
+    Mirrors decode_hca's ``ratio_reldiff`` bar and prefill_layer's
     ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
     ``T`` rows but only the leading ``num_tokens`` participate in attention
     accuracy. The deterministic zero padding is sliced off so it cannot dilute

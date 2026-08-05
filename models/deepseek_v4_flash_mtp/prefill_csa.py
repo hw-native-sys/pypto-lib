@@ -639,7 +639,7 @@ def build_tensor_specs(
     # Real layer-8 (CSA, ratio-4) hc_attn scale/base (fn synthetic at real magnitude). A
     # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
     # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
-    # Mirrors decode_attention_csa.
+    # Mirrors decode_csa.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0519
     def init_hc_attn_scale():
@@ -671,7 +671,7 @@ def build_tensor_specs(
         return shared_freqs_sin.clone()
     # Quant-faithful CSA (ratio-4) main compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_csa / decode_compressor_ratio4.
+    # Mirrors decode_csa / decode_compressor_ratio4.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0245
     def init_cmp_wgate():
@@ -704,7 +704,7 @@ def build_tensor_specs(
         return h * (IDX_HEAD_DIM ** -0.5)
     # Quant-faithful indexer inner compressor fixtures (mean l8/l32 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_attention_csa / decode_indexer.
+    # Mirrors decode_csa / decode_indexer.
     def init_inner_wkv():
         return torch.randn(INNER_OUT_DIM, D) * 0.0293
     def init_inner_wgate():
@@ -940,7 +940,7 @@ def valid_ratio_reldiff(
 ):
     """Relative-diff comparator restricted to the valid (active) token rows.
 
-    Mirrors decode_attention_csa's ``ratio_reldiff`` bar and prefill_layer's
+    Mirrors decode_csa's ``ratio_reldiff`` bar and prefill_layer's
     ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
     ``T`` rows but only the leading ``num_tokens`` participate in attention
     accuracy. The deterministic zero padding is sliced off so it cannot dilute

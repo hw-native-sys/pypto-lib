@@ -60,7 +60,7 @@ from moe import (
     moe,
 )
 from mtp_projection import _quantize_weight_per_out, golden_mtp_projection, mtp_projection
-from prefill_attention_swa import (
+from prefill_swa import (
     BLOCK_NUM,
     BLOCK_NUM_DYN,
     BLOCK_SIZE,

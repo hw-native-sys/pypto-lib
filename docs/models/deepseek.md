@@ -110,7 +110,7 @@ the job result before citing a revision as verified.
 Run a single-device Flash attention component on the simulator:
 
 ```bash
-python models/deepseek_v4_flash_mtp/prefill_attention_csa.py -p a2a3sim
+python models/deepseek_v4_flash_mtp/prefill_csa.py -p a2a3sim
 ```
 
 Run the Flash decode-layer harness at its default EP2 world size:

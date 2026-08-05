@@ -72,7 +72,7 @@ nothing to replay. When the snapshot exists, reproduce a failure on the
 re-run at that directory:
 
 ```bash
-python models/deepseek_v4_flash_mtp/decode_attention_csa.py -p a2a3 -d 0 \
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0 \
     --golden-data build_output/_jit_attention_csa_test_20260602_020256/data
 ```
 
@@ -98,7 +98,7 @@ a generated kernel or the orchestration — and re-testing in seconds:
    build directory itself, **not** its `data/` subdir):
 
    ```bash
-   python models/deepseek_v4_flash_mtp/decode_attention_csa.py -p a2a3 -d 0 \
+   python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d 0 \
        --runtime-dir build_output/_jit_attention_csa_test_20260602_020256
    ```
 

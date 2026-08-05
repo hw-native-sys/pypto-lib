@@ -32,7 +32,7 @@ from rmsnorm import rms_norm
 # decode_fwd is self-contained: it imports kernels, constants, and per-kind
 # spec builders directly from the leaf modules (no dependency on decode_layer).
 # Import order matches decode_layer: attention kinds, then config, then moe.
-from decode_attention_swa import (
+from decode_swa import (
     B,
     BLOCK_SIZE,
     D,
@@ -55,7 +55,7 @@ from decode_attention_swa import (
     attention_swa,
     build_tensor_specs as build_attention_tensor_specs,
 )
-from decode_attention_hca import (
+from decode_hca import (
     CMP_BLOCK_NUM as HCA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as HCA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
@@ -67,7 +67,7 @@ from decode_attention_hca import (
     attention_hca,
     build_tensor_specs as build_hca_tensor_specs,
 )
-from decode_attention_csa import (
+from decode_csa import (
     CMP_BLOCK_NUM as CSA_CMP_BLOCK_NUM,
     CMP_MAX_BLOCKS as CSA_CMP_MAX_BLOCKS,
     COMPRESS_RATIO as CSA_COMPRESS_RATIO,

@@ -16,7 +16,7 @@ import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 from config import DECODE_SEQ, DECODE_START_POS, FLASH as M
-from decode_attention_swa import (
+from decode_swa import (
     B,
     BLOCK_SIZE,
     HEAD_DIM,
