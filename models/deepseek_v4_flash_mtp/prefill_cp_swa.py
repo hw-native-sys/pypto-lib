@@ -82,9 +82,6 @@ def _parse_static_int(name: str, default: int) -> int:
     return default
 
 
-# dynamic shape variables
-CP_SWA_ORI_BLOCK_NUM_DYN = pl.dynamic("CP_SWA_ORI_BLOCK_NUM_DYN")
-
 # CP layout
 CP_SIZE = _parse_static_int("cp", CP_DEFAULT)
 NUM_SEGMENTS = 2 * CP_SIZE
