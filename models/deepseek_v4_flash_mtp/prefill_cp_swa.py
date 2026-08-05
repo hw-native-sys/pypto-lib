@@ -55,7 +55,7 @@ from prefill_sparse_attn import (
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
-from rope_tables import build_deepseek_v4_rope_tables
+from utils import build_rope_tables
 
 # model config
 D = M.hidden_size
@@ -750,7 +750,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     base["hc_attn_scale"] = torch.randn(3)
     base["hc_attn_base"] = torch.randn(MIX_HC)
     base["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
-    base["freqs_cos"], base["freqs_sin"] = build_deepseek_v4_rope_tables(
+    base["freqs_cos"], base["freqs_sin"] = build_rope_tables(
         M, 0, dtype=torch.bfloat16
     )
     max_pos = max(ctx["starts"][s] + ctx["lengths"][s] for s in range(2 * cp_size))

@@ -78,7 +78,7 @@ from qkv_proj_rope import (
     qkv_proj_rope,
 )
 from rmsnorm import golden_rms_norm, rms_norm
-from rope_tables import build_deepseek_v4_rope_tables
+from utils import build_rope_tables
 
 # model config
 D = M.hidden_size
@@ -1524,7 +1524,7 @@ def build_tensor_specs(cp_size: int = CP_SIZE):
     hca_values["hc_attn_base"] = torch.randn(MIX_HC)
     hca_values["attn_norm_w"] = torch.ones(D, dtype=torch.bfloat16)
     hca_values["freqs_cos"], hca_values["freqs_sin"] = (
-        build_deepseek_v4_rope_tables(
+        build_rope_tables(
             M, COMPRESS_RATIO, dtype=torch.bfloat16
         )
     )
