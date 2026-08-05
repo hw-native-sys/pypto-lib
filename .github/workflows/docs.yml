@@ -13,8 +13,13 @@ concurrency:
 permissions:
   contents: read
 
+# TEMPORARY (draft experiment, revert before merge): every job below is
+# gated off on branch exp/ptoas-op-fusion-ab. That branch exists only to
+# collect a ptoas op-fusion A/B from the A5 daily sweep, and nothing it
+# changes is exercised by these jobs.
 jobs:
   build:
+    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,6 +52,7 @@ jobs:
           path: site
 
   deploy:
+    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
