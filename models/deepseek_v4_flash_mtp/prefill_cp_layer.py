@@ -173,7 +173,7 @@ def _attention_stage_barrier(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_stage_barrier") as stage_tid:
         # Anchor the boundary to every local attention tile producer.
         for k in pl.range(NUM_MOE_WAVES):
-            pl.read(x_attn_flat, [k * T, 0, 0])
+            _anchor = pl.read(x_attn_flat, [k * T, 0, 0])
         one = pl.cast(1, pl.INT32)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
@@ -207,7 +207,7 @@ def _wave_stage_barrier(
     next wave reuses the shared MoE window bank. The output token creates the
     tensor dependency consumed by the next wave."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="wave_stage_barrier") as wave_tid:
-        pl.read(wave_out, [0, 0, 0])
+        _anchor = pl.read(wave_out, [0, 0, 0])
         one = pl.cast(1, pl.INT32)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
@@ -381,7 +381,7 @@ def _prefill_layer_cp_moe_tail(
             hc_lane = copy_idx % HC_MULT
             token0 = token_block * COPY_TOKEN_TILE
             # Establish the natural barrier-to-copy tensor dependency.
-            pl.read(stage_token, [0, 0, 0])
+            _tok = pl.read(stage_token, [0, 0, 0])
             x_moe_ready[
                 token0 : token0 + COPY_TOKEN_TILE,
                 hc_lane : hc_lane + 1,
@@ -421,8 +421,9 @@ def _prefill_layer_cp_moe_tail(
         1,
         name_hint="final_completion_anchor",
     ):
+        _anchor_idx = pl.tile.get_block_idx()
         # Order cleanup after the final all-rank wave boundary.
-        pl.read(stage_token, [0, 0, 0])
+        _final_tok = pl.read(stage_token, [0, 0, 0])
         final_element = pl.slice(
             x_next_work, [1, 1, 8], [final_row, 0, 0]
         )
