@@ -6,11 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 packed prefill indexer.
-
-This module builds the compressed index KV cache and per-token compressed top-k
-indices consumed by packed CSA prefill sparse attention.
-"""
+"""DeepSeek-V4 packed prefill indexer: compressed index KV cache + per-token compressed top-k."""
 
 import pypto.language as pl
 
@@ -33,7 +29,11 @@ from prefill_indexer_compressor import (
     prefill_indexer_compressor,
 )
 
-# model config (mirrors decode_indexer)
+# Dynamic shape variables.
+IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
+INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
+# model config
 D = M.hidden_size
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 IDX_N_HEADS = M.index_n_heads
@@ -44,7 +44,6 @@ WEIGHTS_SCALE = M.index_weights_scale
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 
-# kernel-local
 COMPRESS_RATIO = 4   # the indexer only runs on ratio-4 layers
 IDX_TOPK = M.index_topk
 INNER_OVERLAP = COMPRESS_RATIO == 4
@@ -52,45 +51,36 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
-CACHE_TILE = 32
+B = 1
+S = 128
+T = B * S
+START_POS = 0
+# prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP] in one Vec scope, so the
+# score output cap stays at 256 rows; the physical pool is sized by PREFILL_IDX_BLOCK_NUM.
+INDEXER_SCORE_MAX_BLOCKS = 2
+INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
+INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 # CP selector widths.
 CP_INDEXER_SCORE_CAP = 1024
 CP_INDEXER_SORT_LEN = 2048
 CP_INDEXER_SELECTED_WIDTH = 256
 
-# Index cache table width mirrors decode. The physical idx_kv_cache pool is
-# sized separately by PREFILL_IDX_BLOCK_NUM; keep the current score output cap
-# at 256 rows because prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP]
-# in one Vec scope.
-SPARSE_CMP_MAX_BLOCKS = 8
-INDEXER_SCORE_MAX_BLOCKS = 2
-
-B = 1
-S = 128
-T = B * S
-START_POS = 0
+# tiling
+CACHE_TILE = 32
+# Named, not inlined: a python max() call is not traceable inside a loop bound.
+INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 SCORE_TOKEN_TILE = 8
 TOPK_TILE = 4
-assert T % TOPK_TILE == 0
-assert T % SCORE_TOKEN_TILE == 0
-INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
-IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
-INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
-assert INDEXER_SCORE_CAP == 256, "INDEXER_SCORE_CAP must stay at 256 rows"
-INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
-INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
-MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-
-# Q-projection / score tiling (mirrors decode_indexer)
 Q_TILE = 128
 Q_OUT_TILE = 256
 QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 32
 WEIGHTS_ROW_TILE = 32
-QH_QUANT_BLOCK = 256
+QH_QUANT_TILE = 256
 QH_QUANT_ROW_TILE = 64
-ROPE_ROW_BLOCK = IDX_N_HEADS          # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
+ROPE_ROW_TILE = IDX_N_HEADS           # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
 ROPE_PREP_TOKEN_TILE = 16
 QH_MM_TILE = 64
 # Per-token sort-tile width. The sort32/mrgsort/gather path requires a wide tile: a narrow (256)
@@ -103,14 +93,10 @@ SORT_LEN = 2048
 # merge stages are sufficient: the only finite values are sorted within the first 512-value run.
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
-assert PREFILL_TOPK_CAP < SORT_LEN and SORT_LEN >= INDEXER_SCORE_CAP
-assert TOPK_PAIR_WIDTH <= SORT_LEN
+SCORE_INIT_TILE = 16                   # rows per -inf init write; keeps [tile, SORT_LEN] under the Vec limit
+
+# A misaligned topk prefix faults on device like a narrow sort.
 assert TOPK_PAIR_WIDTH > 0 and (TOPK_PAIR_WIDTH & (TOPK_PAIR_WIDTH - 1)) == 0
-SCORE_INIT_TILE = 16                   # rows per -inf init write (keep [tile, SORT_LEN] under the Vec-buffer limit)
-assert T % SCORE_INIT_TILE == 0
-assert (IDX_N_HEADS * IDX_HEAD_DIM) % Q_OUT_TILE == 0
-assert (T * IDX_N_HEADS) % QH_QUANT_BLOCK == 0
-assert QH_QUANT_ROW_TILE == ROPE_ROW_BLOCK
 
 
 @pl.jit.inline
@@ -191,9 +177,9 @@ def prefill_indexer(
         rope_cos_il[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = cos_il
         rope_sin_signed[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = pl.mul(sin_il, rope_sign)
 
-    rope_swap_idx = pl.create_tensor([ROPE_ROW_BLOCK, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_rope_swap_idx", allow_early_resolve=True):
-        swap_ones = pl.full([ROPE_ROW_BLOCK, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
         swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
         swap_col = pl.col_expand_mul(swap_ones, swap_col_fp32)
@@ -201,15 +187,15 @@ def prefill_indexer(
         swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
         swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
         swap_index = pl.cast(pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0)), target_type=pl.INT32)
-        rope_swap_idx[0:ROPE_ROW_BLOCK, 0:ROPE_HEAD_DIM] = swap_index
+        rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = swap_index
 
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     for token_idx in pl.spmd(T, name_hint="prefill_idx_qr_rope", allow_early_resolve=True):
-        r0 = token_idx * ROPE_ROW_BLOCK
-        qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_BLOCK, 0 : IDX_NOPE_HEAD_DIM]
+        r0 = token_idx * ROPE_ROW_TILE
+        qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
         qr_nope = pl.cast(qr_nope_fp32, target_type=pl.BF16, mode="rint")
-        qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_BLOCK, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        rope_swap_tile = rope_swap_idx[0:ROPE_ROW_BLOCK, 0:ROPE_HEAD_DIM]
+        qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+        rope_swap_tile = rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
         qr_swapped = pl.gather(qr_rope, dim=-1, index=rope_swap_tile)
         rope_cos_tile = rope_cos_il[token_idx : token_idx + 1, :]
         rope_sin_tile = rope_sin_signed[token_idx : token_idx + 1, :]
@@ -217,7 +203,7 @@ def prefill_indexer(
         rope_swapped = pl.col_expand_mul(qr_swapped, rope_sin_tile)
         rope_rot = pl.add(rope_main, rope_swapped)
         rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-        qr_bf16[r0 : r0 + ROPE_ROW_BLOCK, :] = pl.concat(qr_nope, rope_bf16)
+        qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
 
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
     for mm_idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="prefill_idx_qr_hadamard", allow_early_resolve=True):
@@ -419,9 +405,9 @@ def _prefill_indexer_cp_score_topk(
         rope_cos_il[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = cos_il
         rope_sin_signed[t0 : t0 + ROPE_PREP_TOKEN_TILE, :] = pl.mul(sin_il, rope_sign)
 
-    rope_swap_idx = pl.create_tensor([ROPE_ROW_BLOCK, ROPE_HEAD_DIM], dtype=pl.INT32)
+    rope_swap_idx = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_cp_idx_rope_swap_idx", allow_early_resolve=True):
-        swap_ones = pl.full([ROPE_ROW_BLOCK, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
+        swap_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         swap_col_i32 = pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32)
         swap_col_fp32 = pl.cast(swap_col_i32, target_type=pl.FP32)
         swap_col = pl.col_expand_mul(swap_ones, swap_col_fp32)
@@ -429,16 +415,16 @@ def _prefill_indexer_cp_score_topk(
         swap_dup_f = pl.cast(swap_dup_i32, target_type=pl.FP32)
         swap_lane = pl.sub(swap_col, pl.mul(swap_dup_f, 2.0))
         swap_index = pl.cast(pl.sub(pl.add(swap_col, 1.0), pl.mul(swap_lane, 2.0)), target_type=pl.INT32)
-        rope_swap_idx[0:ROPE_ROW_BLOCK, 0:ROPE_HEAD_DIM] = swap_index
+        rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM] = swap_index
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
     for token_idx in pl.spmd(T, name_hint="prefill_cp_idx_qr_rope", allow_early_resolve=True):
-        r0 = token_idx * ROPE_ROW_BLOCK
-        qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_BLOCK, 0 : IDX_NOPE_HEAD_DIM]
+        r0 = token_idx * ROPE_ROW_TILE
+        qr_nope_fp32 = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
         qr_nope = pl.cast(qr_nope_fp32, target_type=pl.BF16, mode="rint")
-        qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_BLOCK, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        rope_swap_tile = rope_swap_idx[0:ROPE_ROW_BLOCK, 0:ROPE_HEAD_DIM]
+        qr_rope = qr_proj_flat[r0 : r0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+        rope_swap_tile = rope_swap_idx[0:ROPE_ROW_TILE, 0:ROPE_HEAD_DIM]
         qr_swapped = pl.gather(qr_rope, dim=-1, index=rope_swap_tile)
         rope_cos_tile = rope_cos_il[token_idx : token_idx + 1, :]
         rope_sin_tile = rope_sin_signed[token_idx : token_idx + 1, :]
@@ -446,7 +432,7 @@ def _prefill_indexer_cp_score_topk(
         rope_swapped = pl.col_expand_mul(qr_swapped, rope_sin_tile)
         rope_rot = pl.add(rope_main, rope_swapped)
         rope_bf16 = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
-        qr_bf16[r0 : r0 + ROPE_ROW_BLOCK, :] = pl.concat(qr_nope, rope_bf16)
+        qr_bf16[r0 : r0 + ROPE_ROW_TILE, :] = pl.concat(qr_nope, rope_bf16)
 
     qh_acc_gm = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.FP32)
     for mm_idx in pl.spmd(T * IDX_N_HEADS // QH_MM_TILE, name_hint="prefill_cp_idx_qr_hadamard", allow_early_resolve=True):

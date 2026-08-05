@@ -18,7 +18,11 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
 )
 
-# model config (mirrors decode_compressor_ratio4)
+# Dynamic shape variables.
+STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+
+# model config
 EPS = M.rms_norm_eps
 D = M.hidden_size
 HEAD_DIM = M.head_dim
@@ -26,42 +30,31 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-
-# kernel-local (ratio-4 overlapping compressor)
+B = 1
+S = 128
+T = B * S
+START_POS = 0
 COMPRESS_RATIO = 4
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-
-B = 1
-S = 128
-START_POS = 0
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
-PREFILL_ROWS = B * PREFILL_COMPRESSED_LEN
-HEAD_CHUNK = 512
-assert HEAD_DIM % HEAD_CHUNK == 0
-HEAD_BLOCKS = HEAD_DIM // HEAD_CHUNK
-K_TILE = 512
-OUT_TILE = 64
-HEAD_TILE = 64
-RMS_TILE = 16
+COMPRESS_STATE_DIM = 2 * OUT_DIM
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
-T = B * S
+# paged compressed state / KV cache
 CSA_STATE_BLOCK_SIZE = 4
 CSA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + CSA_STATE_BLOCK_SIZE - 1) // CSA_STATE_BLOCK_SIZE
 CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
-STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
-COMPRESS_STATE_DIM = 2 * OUT_DIM
-MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
-PACKED_PROJ_BLOCKS = OUT_DIM // OUT_TILE
-PACKED_STATE_UPDATE_TILE = 16
+
+# tiling
+K_TILE = 512                  # projection D (K) reduction tile
+OUT_TILE = 64                 # projection OUT_DIM (N) tile
+HEAD_D_TILE = 512             # head-dim tile for the softmax pool
+HEAD_TILE = 64
 STATE_UPDATE_TOKEN_TILE = 2
 STATE_UPDATE_OUT_TILE = 256
-assert T % STATE_UPDATE_TOKEN_TILE == 0
-assert OUT_DIM % STATE_UPDATE_OUT_TILE == 0
-assert STATE_UPDATE_OUT_TILE <= HEAD_DIM
 PACKED_RMS_TILE = 16
 
 
@@ -87,15 +80,12 @@ def compressor_ratio4(
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
-    compress_state_flat = pl.reshape(
-        compress_state,
-        [state_block_num * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
-    )
+    compress_state_flat = pl.reshape(compress_state, [state_block_num * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(PACKED_PROJ_BLOCKS, name_hint="prefill_c4_kv_score_proj"):
+    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_c4_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
         kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
         score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
@@ -136,13 +126,13 @@ def compressor_ratio4(
 
     # A contiguous active prefix can close at most ceil(num_tokens / ratio)
     # compressed rows, regardless of the absolute start-position alignment.
-    active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * HEAD_BLOCKS
+    active_pool_blocks = ((num_tokens + COMPRESS_RATIO - 1) // COMPRESS_RATIO) * (HEAD_DIM // HEAD_D_TILE)
     for pool_idx in pl.spmd(active_pool_blocks, name_hint="prefill_c4_softmax_pool"):
-        write_i = pool_idx // HEAD_BLOCKS
-        hb = pool_idx - write_i * HEAD_BLOCKS
-        h0 = hb * HEAD_CHUNK
-        pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
-        pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_CHUNK], dtype=pl.FP32)
+        write_i = pool_idx // (HEAD_DIM // HEAD_D_TILE)
+        hb = pool_idx - write_i * (HEAD_DIM // HEAD_D_TILE)
+        h0 = hb * HEAD_D_TILE
+        pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
+        pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_D_TILE], dtype=pl.FP32)
         write_slot_raw = pl.read(write_dst_map, [0, write_i])
         if write_slot_raw >= 0:
             write_pos = pl.read(write_pos_map, [0, write_i])
@@ -151,64 +141,38 @@ def compressor_ratio4(
             for pool_s in pl.range(COMPRESS_RATIO):
                 prev_abs = prev_start + pool_s
                 front_slot = pool_s
-                pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                    [1, HEAD_CHUNK],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                    [1, HEAD_CHUNK],
-                    dtype=pl.FP32,
-                    value=FP32_NEG_INF,
-                )
+                pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
+                pool_score_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
                 if write_pos >= 2 * COMPRESS_RATIO - 1:
                     prev_state_block = pl.cast(prev_abs // CSA_STATE_BLOCK_SIZE, pl.INDEX)
                     prev_state_intra = pl.cast(prev_abs - prev_state_block * CSA_STATE_BLOCK_SIZE, pl.INDEX)
                     prev_phys_block_raw = pl.read(compress_state_block_table, [prev_state_block])
                     if prev_phys_block_raw >= 0:
                         prev_phys_block = pl.cast(prev_phys_block_raw, pl.INDEX)
-                        prev_state_row = (
-                            prev_phys_block * CSA_STATE_BLOCK_SIZE
-                            + prev_state_intra
-                        )
-                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
-                            prev_state_row : prev_state_row + 1,
-                            h0 : h0 + HEAD_CHUNK,
-                        ]
-                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
-                            prev_state_row : prev_state_row + 1,
-                            OUT_DIM + h0 : OUT_DIM + h0 + HEAD_CHUNK,
-                        ]
+                        prev_state_row = prev_phys_block * CSA_STATE_BLOCK_SIZE + prev_state_intra
+                        prev_kv_col0 = h0
+                        prev_score_col0 = OUT_DIM + h0
+                        pool_kv_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
+                            prev_state_row : prev_state_row + 1, prev_kv_col0 : prev_kv_col0 + HEAD_D_TILE]
+                        pool_score_tile[front_slot : front_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
+                            prev_state_row : prev_state_row + 1, prev_score_col0 : prev_score_col0 + HEAD_D_TILE]
 
                 cur_abs = cur_start + pool_s
                 back_slot = COMPRESS_RATIO + pool_s
-                pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                    [1, HEAD_CHUNK],
-                    dtype=pl.FP32,
-                    value=0.0,
-                )
-                pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = pl.full(
-                    [1, HEAD_CHUNK],
-                    dtype=pl.FP32,
-                    value=FP32_NEG_INF,
-                )
+                pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
+                pool_score_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=FP32_NEG_INF)
                 cur_state_block = pl.cast(cur_abs // CSA_STATE_BLOCK_SIZE, pl.INDEX)
                 cur_state_intra = pl.cast(cur_abs - cur_state_block * CSA_STATE_BLOCK_SIZE, pl.INDEX)
                 cur_phys_block_raw = pl.read(compress_state_block_table, [cur_state_block])
                 if cur_phys_block_raw >= 0:
                     cur_phys_block = pl.cast(cur_phys_block_raw, pl.INDEX)
-                    cur_state_row = (
-                        cur_phys_block * CSA_STATE_BLOCK_SIZE
-                        + cur_state_intra
-                    )
-                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
-                        cur_state_row : cur_state_row + 1,
-                        HEAD_DIM + h0 : HEAD_DIM + h0 + HEAD_CHUNK,
-                    ]
-                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_CHUNK] = compress_state_flat[
-                        cur_state_row : cur_state_row + 1,
-                        OUT_DIM + HEAD_DIM + h0 : OUT_DIM + HEAD_DIM + h0 + HEAD_CHUNK,
-                    ]
+                    cur_state_row = cur_phys_block * CSA_STATE_BLOCK_SIZE + cur_state_intra
+                    cur_kv_col0 = HEAD_DIM + h0
+                    cur_score_col0 = OUT_DIM + HEAD_DIM + h0
+                    pool_kv_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
+                        cur_state_row : cur_state_row + 1, cur_kv_col0 : cur_kv_col0 + HEAD_D_TILE]
+                    pool_score_tile[back_slot : back_slot + 1, 0:HEAD_D_TILE] = compress_state_flat[
+                        cur_state_row : cur_state_row + 1, cur_score_col0 : cur_score_col0 + HEAD_D_TILE]
 
             for pool_t in pl.range(T):
                 if pool_t < num_tokens:
@@ -222,45 +186,41 @@ def compressor_ratio4(
                                 pool_slot = pl.cast(COMPRESS_RATIO + pool_pos - cur_start, pl.INDEX)
                                 pool_col0 = HEAD_DIM + h0
                             pool_ape_slot = pl.cast(pool_pos % COMPRESS_RATIO, pl.INDEX)
-                            pool_ape = ape[pool_ape_slot : pool_ape_slot + 1, pool_col0 : pool_col0 + HEAD_CHUNK]
-                            pool_score = pl.add(
-                                cmp4_score_proj_scratch[pool_t : pool_t + 1, pool_col0 : pool_col0 + HEAD_CHUNK],
-                                pool_ape,
-                            )
-                            pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = cmp4_kv_proj_scratch[
-                                pool_t : pool_t + 1,
-                                pool_col0 : pool_col0 + HEAD_CHUNK,
-                            ]
-                            pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_CHUNK] = pool_score
+                            pool_ape = ape[pool_ape_slot : pool_ape_slot + 1, pool_col0 : pool_col0 + HEAD_D_TILE]
+                            pool_score_row = cmp4_score_proj_scratch[pool_t : pool_t + 1, pool_col0 : pool_col0 + HEAD_D_TILE]
+                            pool_score = pl.add(pool_score_row, pool_ape)
+                            pool_kv_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = cmp4_kv_proj_scratch[
+                                pool_t : pool_t + 1, pool_col0 : pool_col0 + HEAD_D_TILE]
+                            pool_score_tile[pool_slot : pool_slot + 1, 0:HEAD_D_TILE] = pool_score
 
             init_slot = STATE_LEN - 1
-            mi_buf = pl.create_tensor([1, HEAD_CHUNK], dtype=pl.FP32)
-            li_buf = pl.create_tensor([1, HEAD_CHUNK], dtype=pl.FP32)
-            oi_buf = pl.create_tensor([1, HEAD_CHUNK], dtype=pl.FP32)
-            mi_buf[0:1, 0:HEAD_CHUNK] = pool_score_tile[init_slot : init_slot + 1, 0:HEAD_CHUNK]
-            li_buf[0:1, 0:HEAD_CHUNK] = pl.exp(pl.sub(mi_buf[0:1, 0:HEAD_CHUNK], mi_buf[0:1, 0:HEAD_CHUNK]))
-            oi_buf[0:1, 0:HEAD_CHUNK] = pool_kv_tile[init_slot : init_slot + 1, 0:HEAD_CHUNK]
+            mi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
+            li_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
+            oi_buf = pl.create_tensor([1, HEAD_D_TILE], dtype=pl.FP32)
+            mi_buf[0:1, 0:HEAD_D_TILE] = pool_score_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
+            li_buf[0:1, 0:HEAD_D_TILE] = pl.exp(pl.sub(mi_buf[0:1, 0:HEAD_D_TILE], mi_buf[0:1, 0:HEAD_D_TILE]))
+            oi_buf[0:1, 0:HEAD_D_TILE] = pool_kv_tile[init_slot : init_slot + 1, 0:HEAD_D_TILE]
             for pool_slot_i in pl.range(STATE_LEN - 1):
                 if pool_slot_i >= COMPRESS_RATIO or write_pos >= 2 * COMPRESS_RATIO - 1:
-                    mi = mi_buf[0:1, 0:HEAD_CHUNK]
-                    li = li_buf[0:1, 0:HEAD_CHUNK]
-                    oi = oi_buf[0:1, 0:HEAD_CHUNK]
-                    slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_CHUNK]
-                    slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_CHUNK]
+                    mi = mi_buf[0:1, 0:HEAD_D_TILE]
+                    li = li_buf[0:1, 0:HEAD_D_TILE]
+                    oi = oi_buf[0:1, 0:HEAD_D_TILE]
+                    slot_score = pool_score_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
+                    slot_kv = pool_kv_tile[pool_slot_i : pool_slot_i + 1, 0:HEAD_D_TILE]
                     mi_next = pl.maximum(mi, slot_score)
                     alpha = pl.exp(pl.sub(mi, mi_next))
                     beta = pl.exp(pl.sub(slot_score, mi_next))
                     li_next = pl.add(pl.mul(alpha, li), beta)
                     oi_next = pl.add(pl.mul(oi, alpha), pl.mul(slot_kv, beta))
-                    mi_buf[0:1, 0:HEAD_CHUNK] = mi_next
-                    li_buf[0:1, 0:HEAD_CHUNK] = li_next
-                    oi_buf[0:1, 0:HEAD_CHUNK] = oi_next
-            pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_CHUNK] = pl.div(
-                oi_buf[0:1, 0:HEAD_CHUNK],
-                li_buf[0:1, 0:HEAD_CHUNK],
+                    mi_buf[0:1, 0:HEAD_D_TILE] = mi_next
+                    li_buf[0:1, 0:HEAD_D_TILE] = li_next
+                    oi_buf[0:1, 0:HEAD_D_TILE] = oi_next
+            pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.div(
+                oi_buf[0:1, 0:HEAD_D_TILE],
+                li_buf[0:1, 0:HEAD_D_TILE],
             )
         else:
-            pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_CHUNK] = pl.full([1, HEAD_CHUNK], dtype=pl.FP32, value=0.0)
+            pooled_kv[write_i : write_i + 1, h0 : h0 + HEAD_D_TILE] = pl.full([1, HEAD_D_TILE], dtype=pl.FP32, value=0.0)
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
     for final_block in pl.spmd(MAX_CMP_WRITES // PACKED_RMS_TILE, name_hint="prefill_c4_rmsnorm_rope"):
@@ -322,11 +282,8 @@ def compressor_ratio4(
             dst_row_raw = pl.read(write_dst_map, [0, final_i])
             if dst_row_raw >= 0:
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
-                cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(
-                    normed_kv[final_i : final_i + 1, 0:HEAD_DIM],
-                    target_type=pl.BF16,
-                    mode="rint",
-                )
+                final_row = normed_kv[final_i : final_i + 1, 0:HEAD_DIM]
+                cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(final_row, target_type=pl.BF16, mode="rint")
             else:
                 keepalive_row = cmp_block_num * BLOCK_SIZE - MAX_CMP_WRITES + final_i
                 cmp_kv_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = cmp_kv_flat[
@@ -353,6 +310,7 @@ def compressor_ratio4(
                             ape_slot : ape_slot + 1,
                             update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
                         ]
+                        # Slices stay inline: naming one materializes an extra tile.
                         compress_state_flat[
                             state_row : state_row + 1,
                             update_o0 : update_o0 + STATE_UPDATE_OUT_TILE,
@@ -377,9 +335,7 @@ def compressor_ratio4(
                             pool_dep,
                         )
 
-    completion[0] = pl.system.task_dummy(
-        deps=[cache_write_tid, state_update_tid]
-    )
+    completion[0] = pl.system.task_dummy(deps=[cache_write_tid, state_update_tid])
 
     # The flattened views write through to these caller-owned roots. Returning
     # the roots keeps dynamic cache metadata intact when this helper is nested
@@ -614,17 +570,12 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill compressor ratio4 validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on *sim platforms used by CI.")
     parser.add_argument("--start-pos", type=int, default=START_POS,
-                        help="Fixture-only absolute position for token 0; lowered into position_ids and dense cmp_slot_mapping.")
+                        help="Fixture-only absolute position for token 0, lowered into position_ids and cmp_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

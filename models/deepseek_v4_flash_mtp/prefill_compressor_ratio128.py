@@ -6,12 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 single-request token-major prefill compressor, ratio=128.
-
-The public contract is single-request token-major prefill: the
-layer owns the per-request loop and feeds this op one contiguous run of <=T
-tokens.
-"""
+"""DeepSeek-V4 token-major prefill compressor, ratio=128, single request of <=T tokens."""
 
 import pypto.language as pl
 
@@ -26,6 +21,11 @@ from config import (
 )
 
 
+# Dynamic shape variables.
+STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+
+# model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
@@ -37,37 +37,29 @@ ROPE_HEAD_DIM = M.qk_rope_head_dim
 ROPE_HALF = ROPE_HEAD_DIM // 2
 NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 MAX_SEQ_LEN = M.max_position_embeddings
-
+START_POS = 0
 COMPRESS_RATIO = 128
 OUT_DIM = HEAD_DIM
 STATE_LEN = COMPRESS_RATIO
-START_POS = 0
+COMPRESS_STATE_DIM = 2 * OUT_DIM
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
-K_TILE = 512
-OUT_TILE = 32
-HEAD_TILE = 64
-K_BLOCKS = D // K_TILE
-OUT_BLOCKS = OUT_DIM // OUT_TILE
-HEAD_BLOCKS = HEAD_DIM // HEAD_TILE
-
-assert S == COMPRESS_RATIO, "ratio128 prefill compressor bring-up expects one full compression chunk"
-
-
+# paged compressed state / KV cache
 HCA_STATE_BLOCK_SIZE = 8
 HCA_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + HCA_STATE_BLOCK_SIZE - 1) // HCA_STATE_BLOCK_SIZE
 HCA_STATE_BLOCK_NUM = HCA_STATE_PHYSICAL_BLOCKS
-STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
-COMPRESS_STATE_DIM = 2 * OUT_DIM
-MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 HCA_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 HCA_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
+
+# tiling
+K_TILE = 512                 # projection D (K) reduction tile
+OUT_TILE = 32                # projection OUT_DIM (N) tile
+HEAD_TILE = 64               # head-dim tile for the pool and rmsnorm
 HCA_KV_STORE_TILE = 16
 HCA_C128_RMS_TILE = 8
 HCA_C128_RMS_PAD_ROWS = HCA_C128_RMS_TILE
 
-PACKED_C128_PROJ_BLOCKS = OUT_BLOCKS
-PACKED_C128_POOL_BLOCKS = MAX_CMP_WRITES * HEAD_BLOCKS
+assert S == COMPRESS_RATIO, "ratio128 prefill compressor bring-up expects one full compression chunk"
 
 
 @pl.jit.inline
@@ -102,11 +94,11 @@ def prefill_compressor_ratio128(
     )
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(PACKED_C128_PROJ_BLOCKS, name_hint="prefill_hca_c128_kv_score_proj"):
+    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_hca_c128_kv_score_proj"):
         o0 = proj_idx * OUT_TILE
         kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
         score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        for kb in pl.pipeline(0, K_BLOCKS, stage=2):
+        for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
             x_tile = x_flat[0:T, k0 : k0 + K_TILE]
             # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
@@ -155,9 +147,9 @@ def prefill_compressor_ratio128(
                     ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
                 )
 
-    for pool_idx in pl.spmd(PACKED_C128_POOL_BLOCKS, name_hint="prefill_hca_c128_softmax_pool"):
-        write_i = pool_idx // HEAD_BLOCKS
-        hb = pool_idx - write_i * HEAD_BLOCKS
+    for pool_idx in pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool"):
+        write_i = pool_idx // (HEAD_DIM // HEAD_TILE)
+        hb = pool_idx - write_i * (HEAD_DIM // HEAD_TILE)
         h0 = hb * HEAD_TILE
         pool_kv_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
         pool_score_tile = pl.create_tensor([STATE_LEN, HEAD_TILE], dtype=pl.FP32)
@@ -220,7 +212,7 @@ def prefill_compressor_ratio128(
                 cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
                 sin_b[norm_i : norm_i + 1, 0:ROPE_HALF] = sin_row
         partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
-        for rms_kb in pl.pipeline(HEAD_BLOCKS, stage=2):
+        for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
             rms_h0 = rms_kb * HEAD_TILE
             kv_rms_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, rms_h0 : rms_h0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
@@ -259,7 +251,7 @@ def prefill_compressor_ratio128(
             final_cmp_row_raw = pl.read(write_dst_map, [0, final_i])
             if final_cmp_row_raw >= 0:
                 final_cmp_row = pl.cast(final_cmp_row_raw, pl.INDEX)
-                for final_hb in pl.range(HEAD_BLOCKS):
+                for final_hb in pl.range(HEAD_DIM // HEAD_TILE):
                     final_h0 = final_hb * HEAD_TILE
                     final_chunk = normed_kv_pad[final_i : final_i + 1, final_h0 : final_h0 + HEAD_TILE]
                     cmp_kv_flat[final_cmp_row : final_cmp_row + 1, final_h0 : final_h0 + HEAD_TILE] = pl.cast(
