@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=4
+# ci: devices=2
 """DeepSeek V4 context-parallel zigzag ownership and projected-KV tail exchange."""
 
 import sys
@@ -23,7 +23,7 @@ HEAD_DIM = M.head_dim
 
 # CP layout
 CP_CHOICES = (2, 4, 8)
-CP_DEFAULT = 4
+CP_DEFAULT = 2
 EPOCHS = 1
 
 # tiling
