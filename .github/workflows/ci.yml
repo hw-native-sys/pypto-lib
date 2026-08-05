@@ -11,13 +11,15 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# TEMPORARY (draft experiment, revert before merge): every job below is
-# gated off on branch exp/ptoas-op-fusion-ab. That branch exists only to
-# collect a ptoas op-fusion A/B from the A5 daily sweep, and nothing it
-# changes is exercised by these jobs.
+# TEMPORARY (draft experiment, revert before merge): every job below is gated
+# off on branch exp/ptoas-op-fusion-ab. That branch exists only to collect a
+# ptoas op-fusion A/B from the A5 daily sweep; nothing it changes is exercised
+# here. The guard is folded into each job's existing condition rather than
+# added as a second `if:` -- a duplicate key is silently accepted by PyYAML but
+# rejected by Actions, which reports it as a failed run with zero jobs.
 jobs:
   pre-commit:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,7 +32,7 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -58,7 +60,7 @@ jobs:
         run: pytest tests/golden -v
 
   detect-changes:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
@@ -142,9 +144,10 @@ jobs:
           echo "Selected files: $FILES"
 
   sim:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
+    if: >-
+      github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
+      && needs.detect-changes.outputs.has_changes == 'true'
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
@@ -239,9 +242,10 @@ jobs:
         run: rm -rf build_output
 
   a2a3:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     needs: detect-changes
-    if: needs.detect-changes.outputs.has_changes == 'true'
+    if: >-
+      github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
+      && needs.detect-changes.outputs.has_changes == 'true'
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -352,14 +356,14 @@ jobs:
         run: rm -rf build_output
 
   serving-qwen:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     needs: detect-changes
     # PR-only, qwen3-14b (single card). The 8-card DeepSeek V4 run is split into
     # its own job (serving-deepseek) so the two models schedule independently and
     # the expensive 8-card borrow does not serialize behind the single-card run.
     if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
+      github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
+      && github.event_name == 'pull_request'
+      && needs.detect-changes.outputs.run_qwen_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
@@ -411,14 +415,14 @@ jobs:
         run: rm -rf serving-checkout/build_output
 
   serving-deepseek:
-    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab' && github.head_ref != 'exp/ptoas-op-fusion-ab'
     needs: detect-changes
     # PR-only, DeepSeek V4 — the 8-card (--device-num 8) serving run, split out
     # of `serving` so the 8-card borrow schedules independently of the single-card
     # qwen3 run. Same setup contract as `serving`; gated by its own model guard.
     if: >-
-      github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
+      github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
+      && github.event_name == 'pull_request'
+      && needs.detect-changes.outputs.run_deepseek_serving_tests == 'true'
     runs-on: [self-hosted, linux, arm64, npu]
     # One task-submit worst case: --timeout 3600 queue + --max-time 1800 run,
     # plus setup/build headroom.
