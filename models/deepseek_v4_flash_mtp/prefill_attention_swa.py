@@ -36,7 +36,6 @@ from prefill_sparse_attn import (
     PREFILL_ATTN_TILE,
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
-    _quant_w_per_channel,
     golden_prefill_sparse_attn,
     _prefill_sparse_attn_with_block_mask,
 )
@@ -390,7 +389,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables, cache_row_from_table
+    from utils import build_rope_tables, cache_row_from_table, quant_w_per_channel
 
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, 0, dtype=torch.bfloat16)
 
@@ -488,7 +487,7 @@ def build_tensor_specs(
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     return [
         TensorSpec("x_hc", [T, HC_MULT, D], torch.float32, init_value=init_x_hc),

@@ -48,7 +48,6 @@ from prefill_indexer import (
     IDX_CACHE_MAX_BLOCKS,
     INDEXER_SCORE_CAP,
     INDEXER_TOPK_CAP,
-    _int8_quant_per_row as _idx_int8_quant_per_row,
     gen_shared_weight,
     golden_prefill_indexer_core,
     prefill_indexer,
@@ -67,7 +66,6 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD as SPARSE_PREFILL_SPARSE_PAD,
     SPARSE_CMP_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
-    _quant_w_per_channel,
     golden_prefill_sparse_attn,
     _prefill_sparse_attn_with_block_mask,
 )
@@ -592,7 +590,12 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables, cache_row_from_table
+    from utils import (
+        build_rope_tables,
+        cache_row_from_table,
+        int8_quant_per_row,
+        quant_w_per_channel,
+    )
 
     shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
@@ -757,7 +760,7 @@ def build_tensor_specs(
             row = cache_row_from_table(table, cmp_slot)
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM,) - 0.5) * 0.05).to(torch.bfloat16)
-                hi8, hsc = _idx_int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
+                hi8, hsc = int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
                 c_flat[row] = hi8.view(IDX_HEAD_DIM)
                 s_flat[row] = hsc.view(1)
         _idx_hist["cache"] = cache_i8
@@ -852,7 +855,7 @@ def build_tensor_specs(
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel_local(wq_b_bf16)
     wo_b_bf16 = init_wo_b().to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
     # Indexer Q up-proj + weights projection (mirrors the standalone prefill_indexer fixtures).
     idx_wq_b_i8_T, idx_wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
     idx_wq_b_i8 = idx_wq_b_i8_T.t().contiguous()

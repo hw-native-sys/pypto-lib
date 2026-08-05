@@ -733,28 +733,6 @@ def prefill_sparse_attn_test(
         attn_out,
     )
 
-def _quant_w_per_channel(w):
-    """Per-output-channel INT8 quant on the last axis."""
-    import torch
-
-    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-def _int8_quant_per_row(x):
-    """Per-row INT8 symmetric quant matching the W8A8C16 activation path."""
-    import torch
-
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
 def golden_prefill_sparse_attn(tensors):
     """Self-contained torch reference for the cache-first sparse-attn entry."""
     import torch
@@ -866,7 +844,7 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from utils import build_rope_tables, materialize_token_rope_tables
+    from utils import build_rope_tables, materialize_token_rope_tables, quant_w_per_channel
 
     if not 0 < num_tokens <= T:
         raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
@@ -917,7 +895,7 @@ def build_tensor_specs(
     def init_wo_b():
         return ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5).to(torch.bfloat16)
 
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(init_wo_b())
+    wo_b_i8, wo_b_scale = quant_w_per_channel(init_wo_b())
 
     return [
         TensorSpec("q", [T, H, HEAD_DIM], torch.bfloat16, init_value=init_q),

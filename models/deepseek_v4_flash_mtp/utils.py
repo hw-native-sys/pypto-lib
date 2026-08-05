@@ -26,6 +26,8 @@ from config import (
     DECODE_SEQ,
     DECODE_START_POS,
     FLASH as M,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
 )
 
 
@@ -506,3 +508,28 @@ def materialize_half_rope_tables(
     cos, sin = materialize_token_rope_tables(freqs_cos, freqs_sin, positions)
     half_dim = freqs_cos.shape[-1] // 2
     return cos[:, :half_dim].float().contiguous(), sin[:, :half_dim].float().contiguous()
+
+
+# --- INT8 quantization. ---
+def int8_quant_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path.
+
+    Rounds to int8 through fp16 to match the device rounding; returns the
+    per-row dequant scale (``1 / scale_quant``).
+    """
+    rows = x.float().reshape(-1, x.shape[-1])
+    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = rows * scale_quant
+    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    scale_dequant = 1.0 / scale_quant
+    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
+
+
+def quant_w_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-output-channel INT8 quant on the last axis."""
+    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
+    scale_quant = INT8_SCALE_MAX / amax
+    scaled = w.float() * scale_quant.unsqueeze(-1)
+    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
+    return w_i8, (1.0 / scale_quant).float()

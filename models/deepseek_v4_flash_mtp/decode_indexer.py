@@ -419,19 +419,6 @@ def indexer_test(
     return score, idx_kv_cache, idx_kv_scale, topk_idxs
 
 
-def _int8_quant_per_row(x):
-    """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path."""
-    import torch
-
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
 def gen_shared_weight(shape, dequant_std, chan_cv):
     """Synthesize a per-output-channel-symmetric INT8 weight + FP32 scale by simulating the
     real DeepSeek-V4-Flash MXFP8 quant grid (e4m3, 128x128-block E8M0 scale), then re-quantizing
@@ -469,6 +456,7 @@ def golden_indexer(tensors):
     """Torch reference for Indexer.forward decode branch; prefill `start_pos == 0` path is omitted."""
     import torch
     from decode_indexer_compressor import golden_compressor
+    from utils import int8_quant_per_row
 
     x = tensors["x"].float()
     qr = tensors["qr"]
@@ -531,7 +519,7 @@ def golden_indexer(tensors):
     idx_block_table = tensors["idx_block_table"]
     score_full = torch.full((bsz, seqlen, SCORE_LEN), FP32_NEG_INF, dtype=torch.float32)
     topk_idxs = torch.full((bsz, seqlen, SCORE_LEN), -1, dtype=torch.int32)
-    q_i8, q_scale = _int8_quant_per_row(q.reshape(B * S * IDX_N_HEADS, IDX_HEAD_DIM))
+    q_i8, q_scale = int8_quant_per_row(q.reshape(B * S * IDX_N_HEADS, IDX_HEAD_DIM))
     q_i8 = q_i8.view(B, S, IDX_N_HEADS, IDX_HEAD_DIM)
     q_scale = q_scale.view(B, S, IDX_N_HEADS, 1)
 
@@ -573,6 +561,7 @@ def build_tensor_specs(start_pos=None):
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
+        int8_quant_per_row,
         kv_seq_lens_from_starts,
         position_ids_from_starts,
         resolve_start_positions,
@@ -662,11 +651,11 @@ def build_tensor_specs(start_pos=None):
     wq_b_i8_T, wq_b_scale = gen_shared_weight(
         (IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
     wq_b_i8 = wq_b_i8_T.t().contiguous()
-    qr_i8, qr_scale = _int8_quant_per_row(init_qr())
+    qr_i8, qr_scale = int8_quant_per_row(init_qr())
 
     # C8 indexer cache fixture: INT8 + scale from one bf16-rounded random draw
     idx_kv_cache_bf16 = torch.rand(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM).to(torch.bfloat16)
-    idx_kv_i8, idx_kv_sc = _int8_quant_per_row(
+    idx_kv_i8, idx_kv_sc = int8_quant_per_row(
         idx_kv_cache_bf16.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
     idx_kv_i8 = idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     idx_kv_sc = idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)

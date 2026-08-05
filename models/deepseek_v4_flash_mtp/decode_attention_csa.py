@@ -826,8 +826,8 @@ def build_tensor_specs(start_pos=None):
     shared_hadamard_idx = init_hadamard_idx().to(torch.bfloat16)
     shared_idx_kv_cache = init_idx_kv_cache().to(torch.bfloat16)
     # C8 indexer cache: INT8 + per-position scale from the bf16-rounded draw
-    from decode_indexer import _int8_quant_per_row
-    _idx_kv_i8, _idx_kv_sc = _int8_quant_per_row(
+    from utils import int8_quant_per_row
+    _idx_kv_i8, _idx_kv_sc = int8_quant_per_row(
         shared_idx_kv_cache.float().reshape(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM))
     shared_idx_kv_cache_i8 = _idx_kv_i8.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM)
     shared_idx_kv_scale = _idx_kv_sc.view(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)

@@ -632,30 +632,6 @@ def sparse_attn_test(
     return attn_out
 
 
-def _int8_quant_per_row(x):
-    """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path."""
-    import torch
-
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
-def _quant_w_per_channel(w):
-    """Per-output-channel INT8 quant on the last axis."""
-    import torch
-
-    amax = w.float().abs().amax(dim=-1).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = w.float() * scale_quant.unsqueeze(-1)
-    w_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    return w_i8, (1.0 / scale_quant).float()
-
-
 def golden_sparse_attn(tensors):
     """Torch reference: sparse_attn decode path followed by grouped o_proj."""
     import torch
@@ -792,8 +768,8 @@ def build_tensor_specs(
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
-    from utils import block_table
     from golden import TensorSpec
+    from utils import block_table, quant_w_per_channel
     from utils import build_rope_tables, materialize_token_rope_tables
 
     cmp_valid = get_standalone_cmp_valid(compress_ratio)
@@ -901,7 +877,7 @@ def build_tensor_specs(
         return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
 
     wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
-    wo_b_i8, wo_b_scale = _quant_w_per_channel(wo_b_bf16)
+    wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     def init_wo_b():
         """Initialize the second-stage output-projection weights in per-channel INT8 form."""

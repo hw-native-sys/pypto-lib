@@ -290,24 +290,13 @@ def expert_shared_test(
     return sh
 
 
-def _int8_quant_per_row(x):
-    """Per-row (per-token) INT8 symmetric quant matching v3.2 scope2 Stage 2.6."""
-    import torch
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
 def golden_expert_shared(tensors):
     """Torch reference for the shared expert.
 
     Input is the per-token INT8 quant produced by gate (shared with
     dispatch / routed expert); we dequant inside to match the kernel's
     dequant-then-matmul pattern."""
+    from utils import int8_quant_per_row
     import torch
     import torch.nn.functional as F
 
@@ -327,7 +316,7 @@ def golden_expert_shared(tensors):
         sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
         sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
     sh_h = F.silu(sh_gate) * sh_up
-    sh_h_i8, sh_h_sd = _int8_quant_per_row(sh_h)
+    sh_h_i8, sh_h_sd = int8_quant_per_row(sh_h)
     sh_h = sh_h_i8.float() * sh_h_sd
     sh = sh_h @ sw2.T
 
@@ -369,13 +358,14 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs():
+    from utils import int8_quant_per_row
     import torch
     from golden import TensorSpec
 
     # Pre-quantize x_local once so the i8 / scale specs see consistent values
     # (mirrors what gate produces in the full pipeline).
     x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
-    x_local_i8_pre, x_local_sd_pre = _int8_quant_per_row(x_local_bf16)
+    x_local_i8_pre, x_local_sd_pre = int8_quant_per_row(x_local_bf16)
 
     # Synthesize (int8, per-channel scale) by simulating the real MXFP8 shared-expert
     # quant grid (gen_shared_weight). chan_cv reproduces the real per-output-channel scale

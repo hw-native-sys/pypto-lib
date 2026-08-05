@@ -427,6 +427,7 @@ def qkv_proj_rope_test(
 def golden_qkv_proj_rope(tensors):
     """Torch reference: Q/KV LoRA + RoPE for an already attention-normalized input."""
     import torch
+    from utils import int8_quant_per_row
 
     x = tensors["x"].float()
     wq_a = tensors["wq_a"].float()
@@ -437,16 +438,6 @@ def golden_qkv_proj_rope(tensors):
     rope_sin = tensors["rope_sin"].float()
     gamma_cq = tensors["gamma_cq"].float()
     gamma_ckv = tensors["gamma_ckv"].float()
-
-    def int8_quant_per_row(x):
-        rows = x.reshape(-1, x.shape[-1]).float()
-        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-        scale_quant = INT8_SCALE_MAX / amax
-        scaled = rows * scale_quant
-        out_i32 = torch.round(scaled).to(torch.int32)
-        out_half = out_i32.to(torch.float16)
-        out_i8 = out_half.to(torch.int8)
-        return out_i8.reshape_as(x), (1.0 / scale_quant).reshape(*x.shape[:-1], 1)
 
     def rms_norm(x, gamma, eps=EPS):
         inv = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)

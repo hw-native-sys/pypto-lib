@@ -580,22 +580,6 @@ def _prefill_indexer_cp_score_topk(
     return score, cmp_topk_indices
 
 
-def _int8_quant_per_row(x):
-    """Per-row INT8 symmetric quant matching the runtime W8A8C16 activation path.
-
-    Mirrors decode_indexer._int8_quant_per_row: round-to-int8 via fp16 to match the device
-    rounding, return the dequant scale (1/scale_quant) per row.
-    """
-    import torch
-
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    out_i8 = torch.round(rows * scale_quant).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
 def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
     """Return an error string if the top-k prefix contract is broken."""
     import torch
@@ -637,6 +621,7 @@ def topk_prefix_contract_error(topk_indices, position_ids, num_tokens):
 
 
 def golden_prefill_indexer_core(tensors):
+    from utils import int8_quant_per_row
     import torch
 
     compressor_tensors = {
@@ -712,7 +697,7 @@ def golden_prefill_indexer_core(tensors):
 
     # W8A8C16 int8 score, matching decode_indexer: per-row quantize q, INT32 matmul against the
     # pre-quantized KV, then dequantize by both scales before the FP32 head-weighted reduce.
-    q_i8, q_sc = _int8_quant_per_row(q.reshape(T * IDX_N_HEADS, IDX_HEAD_DIM))
+    q_i8, q_sc = int8_quant_per_row(q.reshape(T * IDX_N_HEADS, IDX_HEAD_DIM))
     q_i8 = q_i8.view(T, IDX_N_HEADS, IDX_HEAD_DIM).to(torch.int32)
     q_sc = q_sc.view(T, IDX_N_HEADS, 1)
     score_i32 = torch.einsum("thd,cd->thc", q_i8, kv_i8)
@@ -820,6 +805,7 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 
 
 def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
+    from utils import int8_quant_per_row
     import torch
     from golden import ScalarSpec, TensorSpec
     from utils import build_rope_tables, materialize_half_rope_tables
@@ -899,7 +885,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
                 raise ValueError("fixture historical compressed slot exceeds standalone idx_kv_cache capacity")
             if row >= 0:
                 hist_bf16 = ((torch.rand(IDX_HEAD_DIM) - 0.5) * 0.05).to(torch.bfloat16)
-                hi8, hsc = _int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
+                hi8, hsc = int8_quant_per_row(hist_bf16.float().view(1, IDX_HEAD_DIM))
                 c_flat[row] = hi8.view(IDX_HEAD_DIM)
                 s_flat[row] = hsc.view(1)
         _idx_hist["cache"] = cache_i8
@@ -952,7 +938,7 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     # runtime W8A8C16 activation path.
     wq_b_i8_T, wq_b_scale = gen_shared_weight((IDX_N_HEADS * IDX_HEAD_DIM, Q_LORA), dequant_std=0.108, chan_cv=0.56)
     wq_b_i8 = wq_b_i8_T.t().contiguous()
-    qr_i8, qr_scale = _int8_quant_per_row(torch.rand(T, Q_LORA))
+    qr_i8, qr_scale = int8_quant_per_row(torch.rand(T, Q_LORA))
 
     return [
         TensorSpec("x", [T, D], torch.bfloat16, init_value=init_x),

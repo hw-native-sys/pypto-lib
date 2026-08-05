@@ -282,24 +282,13 @@ def expert_routed_test(
     return recv_y
 
 
-def _int8_quant_per_row(x):
-    """Per-row (per-token) INT8 symmetric quant matching v3.2 scope2 Stage 2.6."""
-    import torch
-    rows = x.float().reshape(-1, x.shape[-1])
-    amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(INT8_AMAX_EPS)
-    scale_quant = INT8_SCALE_MAX / amax
-    scaled = rows * scale_quant
-    out_i8 = torch.round(scaled).to(torch.int32).to(torch.float16).to(torch.int8)
-    scale_dequant = 1.0 / scale_quant
-    return out_i8.reshape_as(x), scale_dequant.reshape(*x.shape[:-1], 1)
-
-
 def golden_expert_routed(tensors):
     """Torch reference for the routed expert. recv_y is the per-row routing-
     weight-scaled SwiGLU output, ready for combine reduce to simply sum.
 
     Per-expert layout: recv_x[e, 0:cnt[e], :] is the valid INT8 receive
     payload; recv_y[e, cnt[e]:, :] stays at zero."""
+    from utils import int8_quant_per_row
     import torch
     import torch.nn.functional as F
 
@@ -331,7 +320,7 @@ def golden_expert_routed(tensors):
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
         h = F.silu(gate) * up
         # A8 requant before w2 matmul.
-        h_i8, h_sd = _int8_quant_per_row(h)
+        h_i8, h_sd = int8_quant_per_row(h)
         h = h_i8.float() * (h_sd * w_per_row)
         recv_y[e, :n_rows, :] = h @ w2[e].T
 
@@ -391,6 +380,7 @@ def gen_routed_weight(shape, dequant_std):
 
 
 def build_tensor_specs():
+    from utils import int8_quant_per_row
     import torch
     from golden import TensorSpec
 
@@ -413,7 +403,7 @@ def build_tensor_specs():
     valid_mask_3d = (
         torch.arange(RECV_MAX).reshape(1, RECV_MAX, 1) < counts.reshape(N_LOCAL_EXPERTS, 1, 1)
     )
-    recv_x_i8_pre, recv_scale_dq_pre = _int8_quant_per_row(x_bf16)
+    recv_x_i8_pre, recv_scale_dq_pre = int8_quant_per_row(x_bf16)
     recv_x_i8_pre = torch.where(valid_mask_3d, recv_x_i8_pre, torch.zeros_like(recv_x_i8_pre))
     valid_mask_2d = valid_mask_3d.squeeze(-1)
     recv_scale_dq_pre = torch.where(
