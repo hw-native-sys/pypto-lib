@@ -822,9 +822,9 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
 def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+    from utils import build_rope_tables, materialize_half_rope_tables
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     if num_tokens <= 0 or num_tokens > T:
         raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")

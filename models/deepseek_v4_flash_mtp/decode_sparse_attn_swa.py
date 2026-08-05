@@ -644,7 +644,7 @@ def build_tensor_specs(
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
-    from decode_metadata import block_table
+    from utils import block_table
     from golden import TensorSpec
 
     def init_q():

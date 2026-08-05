@@ -653,9 +653,9 @@ def golden_prefill_indexer_compressor(tensors):
 def build_tensor_specs(start_pos: int = START_POS):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables
+    from utils import build_rope_tables
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     if start_pos < 0 or start_pos + T > MAX_SEQ_LEN:
         raise ValueError(f"start_pos must satisfy 0 <= start_pos <= {MAX_SEQ_LEN - T}, got {start_pos}")

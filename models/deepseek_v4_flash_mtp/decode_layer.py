@@ -646,7 +646,7 @@ def _attention_kind_for_layer(layer_id):
 
 def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
     import torch
-    from decode_metadata import block_table
+    from utils import block_table
     from golden import ScalarSpec, TensorSpec
 
     _validate_layer_id(layer_id)

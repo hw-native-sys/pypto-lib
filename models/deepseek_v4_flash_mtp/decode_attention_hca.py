@@ -456,7 +456,7 @@ def golden_attention_hca(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
-    from decode_metadata import (
+    from utils import (
         block_table,
         compressed_slot_mapping,
         hca_decode_start_set,
@@ -468,9 +468,9 @@ def build_tensor_specs(start_pos=None):
         swa_indices_and_lens,
     )
     from golden import TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables
+    from utils import build_rope_tables
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def quant_w_per_output_channel(w):
         amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)

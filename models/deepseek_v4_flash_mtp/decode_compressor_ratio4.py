@@ -441,7 +441,7 @@ def golden_compressor(tensors):
 
 def build_tensor_specs(start_pos=None):
     import torch  # type: ignore[import]
-    from decode_metadata import (
+    from utils import (
         block_table,
         compressed_slot_mapping,
         csa_decode_start_set,
@@ -450,9 +450,9 @@ def build_tensor_specs(start_pos=None):
         state_slot_mapping,
     )
     from golden import TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_half_rope_tables
+    from utils import build_rope_tables, materialize_half_rope_tables
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     def init_x():
         return torch.rand(B, S, D)

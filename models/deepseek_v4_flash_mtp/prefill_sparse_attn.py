@@ -866,14 +866,14 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
+    from utils import build_rope_tables, materialize_token_rope_tables
 
     if not 0 < num_tokens <= T:
         raise ValueError(f"num_tokens must be in [1, {T}], got {num_tokens}")
     if ori_block_num <= 0 or cmp_block_num <= 0:
         raise ValueError("dynamic cache block counts must be positive")
     cmp_valid = get_prefill_cmp_valid(compress_ratio)
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
     shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
         shared_freqs_cos,
         shared_freqs_sin,

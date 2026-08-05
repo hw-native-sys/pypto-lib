@@ -792,12 +792,12 @@ def build_tensor_specs(
 ):
     """Build deterministic demo tensors for the merged standalone harness."""
     import torch
-    from decode_metadata import block_table
+    from utils import block_table
     from golden import TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables, materialize_token_rope_tables
+    from utils import build_rope_tables, materialize_token_rope_tables
 
     cmp_valid = get_standalone_cmp_valid(compress_ratio)
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
     shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
         shared_freqs_cos,
         shared_freqs_sin,

@@ -36,7 +36,7 @@ from decode_attention_swa import (
     build_tensor_specs as build_swa_tensor_specs,
     golden_attention_swa,
 )
-from decode_metadata_device import build_swa_metadata
+from decode_metadata import build_swa_metadata
 from decode_input_pack import pack_mtp_hidden
 from hc_head import golden_hc_head, hc_head
 from lm_head import (
@@ -712,7 +712,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
         return indices
 
     def init_ori_block_table():
-        from decode_metadata import block_table
+        from utils import block_table
 
         table = block_table(
             batch=B,
@@ -838,7 +838,7 @@ def build_tensor_specs(start_pos=DECODE_START_POS, num_tokens=T, ori_block_num=O
 
 def golden_mtp_decode_layer(tensors):
     import torch
-    from decode_metadata import paged_slot_mapping, swa_indices_and_lens
+    from utils import paged_slot_mapping, swa_indices_and_lens
 
     num_tokens = int(tensors["num_tokens"])
     hidden_states = torch.empty(

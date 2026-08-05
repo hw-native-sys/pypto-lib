@@ -427,6 +427,8 @@ def golden_prefill_attention_csa(tensors):
     """Torch reference for token-major packed CSA with overlay compressor/indexer."""
     import torch
 
+    from utils import cache_row_from_table
+
     num_tokens = int(tensors["num_tokens"])
     x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
     x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
@@ -521,14 +523,6 @@ def golden_prefill_attention_csa(tensors):
         if dst_row >= 0:
             kv_cache_flat[dst_row, :] = kv[t]
 
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
-
     def assemble_swa_indices():
         swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
         pos = tensors["position_ids"]
@@ -598,9 +592,9 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables
+    from utils import build_rope_tables, cache_row_from_table
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     # Single-request geometry: q_len = num_tokens (active prefix), context_len =
     # start_pos (absolute position base, a multiple of S=WIN under chunked prefill).
@@ -820,13 +814,6 @@ def build_tensor_specs(
         for block in range(IDX_CACHE_MAX_BLOCKS):
             table[block] = block
         return table
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
     def init_position_ids():
         return token_pos()
     def init_cmp_slot_mapping():

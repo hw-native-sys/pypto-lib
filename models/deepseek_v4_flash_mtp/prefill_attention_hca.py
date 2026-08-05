@@ -332,6 +332,8 @@ def _quant_w_per_output_channel(w):
 def golden_prefill_attention_hca(tensors):
     import torch
 
+    from utils import cache_row_from_table
+
     num_tokens = int(tensors["num_tokens"])
     x_hc_rect = tensors["x_hc"].view(B, S, HC_MULT, D)
     x_hc_flat = x_hc_rect.view(T, HC_MULT, D)
@@ -399,14 +401,6 @@ def golden_prefill_attention_hca(tensors):
         "state_slot_mapping": tensors["state_slot_mapping"],
     })
 
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
-
     def build_sparse_metadata():
         swa_idx = torch.full((T, WIN), -1, dtype=torch.int32)
         cmp_idx = torch.full((T, IDX_TOPK), -1, dtype=torch.int32)
@@ -471,9 +465,9 @@ def build_tensor_specs(
 ):
     import torch
     from golden import ScalarSpec, TensorSpec
-    from rope_tables import build_deepseek_v4_rope_tables
+    from utils import build_rope_tables, cache_row_from_table
 
-    shared_freqs_cos, shared_freqs_sin = build_deepseek_v4_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
 
     # Single-request geometry: q_len = num_tokens (active prefix), context_len =
     # start_pos (absolute position base, a multiple of S=WIN under chunked prefill).
@@ -573,13 +567,6 @@ def build_tensor_specs(
             if row >= 0:
                 flat[row] = (torch.rand(MAIN_COMPRESS_STATE_DIM,) - 0.5) * 0.05
         return state
-    def cache_row_from_table(table, slot):
-        block = slot // BLOCK_SIZE
-        intra = slot % BLOCK_SIZE
-        phys_block = int(table[block].item())
-        if phys_block < 0:
-            return -1
-        return phys_block * BLOCK_SIZE + intra
     def init_kv_cache():
         cache = torch.zeros(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)

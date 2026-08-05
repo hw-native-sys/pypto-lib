@@ -6,16 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Decode fixture metadata lowering helpers.
+"""Device-side metadata lowering for DeepSeek-V4 decode.
 
-The runtime kernels consume lowered metadata: block tables map logical cache
-blocks to physical blocks, and slot mappings are flattened physical rows where
-``-1`` means no-write.
+``utils`` holds the host-side torch counterpart used by the per-kernel test
+fixtures.
 """
 
-from typing import Callable
-
-import torch
+import pypto.language as pl
 
 from config import (
     BLOCK_SIZE,
@@ -23,333 +20,477 @@ from config import (
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
     DECODE_SEQ,
-    DECODE_START_POS,
     FLASH as M,
+    IDX_CACHE_MAX_BLOCKS,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_TABLE_MAX_BLOCKS,
 )
 
 
-def resolve_start_positions(
-    start_pos: int | None,
-    *,
-    batch: int = DECODE_BATCH,
-    seq: int = DECODE_SEQ,
-    max_seq_len: int = M.max_position_embeddings,
-    default_fn: Callable[[], torch.Tensor] | None = None,
-) -> torch.Tensor:
-    if start_pos is not None:
-        starts = torch.full((batch,), int(start_pos), dtype=torch.int32)
-    elif default_fn is not None:
-        starts = default_fn().to(torch.int32)
-    else:
-        starts = torch.zeros(batch, dtype=torch.int32)
-    _validate_starts(starts, seq=seq, max_seq_len=max_seq_len)
-    return starts
+B = DECODE_BATCH
+S = DECODE_SEQ
+T = B * S
+WIN = M.sliding_window
+ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
+CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
+HCA_STATE_MAX_BLOCKS = 2048
+CSA_STATE_MAX_BLOCKS = 4096
+CSA_INNER_STATE_MAX_BLOCKS = 4096
+
+GROUP_ORI = 0
+GROUP_CMP = 1
+GROUP_IDX = 2
+GROUP_HCA_STATE = 3
+GROUP_CSA_STATE = 4
+GROUP_CSA_INNER_STATE = 5
+N_CACHE_GROUPS = 6
 
 
-# --- Canonical decode fixture start-position sets, one per attention family. ---
-# Each set packs the family's distinct position regimes into the batch dimension
-# (one start_pos per request); `long_pos` (the 8k target) adds the long-context
-# rolling-state / INT64-slot / long-topk path. Sets are order-preserving-deduped
-# (S=1 collapses the `-seq`/`-1` boundary pairs; some regimes also coincide at the
-# current constants, e.g. window-1 == state_block*32-1 at ratio 4). Coverage is
-# capped at `batch` slots, so sets are kept <= batch to avoid silent truncation.
+@pl.jit.inline
+def build_swa_metadata(
+    # Inputs: bare Tensor parameters have PyPTO's default In direction.
+    position_ids: pl.Tensor[[T], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    # Outputs.
+    swa_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    swa_indices: pl.Out[pl.Tensor[[T, WIN], pl.INT32]],
+    swa_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
+):
+    """Lower paged write slots and visible SWA rows for each decode token."""
+    for token in pl.spmd(T, name_hint="decode_build_swa_metadata"):
+        request = token // S
+        position = pl.read(position_ids, [token])
+        valid_len = pl.min(position + 1, WIN)
+        start = position - valid_len + 1
+        index_row = pl.create_tensor([1, WIN], dtype=pl.INT32)
+        index_row[:, :] = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+        for offset in pl.range(WIN):
+            if offset < valid_len:
+                visible_position = start + offset
+                visible_block = visible_position // BLOCK_SIZE
+                visible_offset = visible_position % BLOCK_SIZE
+                visible_physical_block = pl.read(
+                    ori_block_table,
+                    [request, pl.cast(visible_block, pl.INDEX)],
+                )
+                pl.write(
+                    index_row,
+                    [0, offset],
+                    pl.cast(
+                        visible_physical_block * BLOCK_SIZE + visible_offset,
+                        pl.INT32,
+                    ),
+                )
+        swa_indices[token : token + 1, :] = index_row
 
-def _tile_starts(pattern: list[int], batch: int) -> torch.Tensor:
-    uniq: list[int] = []
-    for p in pattern:
-        if p not in uniq:
-            uniq.append(int(p))
-    vals = torch.empty((batch,), dtype=torch.int32)
-    for b in range(batch):
-        vals[b] = uniq[b % len(uniq)]
-    return vals
+    for metadata_core in pl.spmd(1, name_hint="decode_build_swa_scalar_metadata"):
+        for token in pl.range(metadata_core, T):
+            request = token // S
+            position = pl.read(position_ids, [token])
+            logical_block = position // BLOCK_SIZE
+            block_offset = position % BLOCK_SIZE
+            physical_block = pl.read(
+                ori_block_table,
+                [request, pl.cast(logical_block, pl.INDEX)],
+            )
+            pl.write(
+                swa_slot_mapping,
+                [token],
+                pl.cast(physical_block * BLOCK_SIZE + block_offset, pl.INT64),
+            )
+            pl.write(
+                swa_lens,
+                [token],
+                pl.cast(pl.min(position + 1, WIN), pl.INT32),
+            )
 
 
-# `long_pos` (8k) is listed first in each set so it survives truncation even when
-# batch < set size (until coverage is decoupled from batch), then the remaining
-# regimes in descending importance.
+@pl.jit.inline
+def build_decode_metadata(
+    # Inputs: bare Tensor parameters have PyPTO's default In direction.
+    position_ids: pl.Tensor[[T], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
+    hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_state_block_table: pl.Tensor[[B, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_state_block_table: pl.Tensor[
+        [B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32
+    ],
+    block_counts: pl.Tensor[[B, N_CACHE_GROUPS], pl.INT32],
+    # Outputs.
+    ori_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    swa_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    swa_indices: pl.Out[pl.Tensor[[T, WIN], pl.INT32]],
+    swa_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
+    hca_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    hca_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_idx_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_inner_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+):
+    """Build every position-dependent metadata tensor consumed by decode_fwd."""
+    build_swa_metadata(
+        position_ids,
+        ori_block_table,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+    )
+    for metadata_core in pl.spmd(1, name_hint="decode_build_cache_metadata"):
+        for token in pl.range(metadata_core, T):
+            request = token // S
+            position = pl.read(position_ids, [token])
+            logical_block = position // BLOCK_SIZE
+            block_offset = position % BLOCK_SIZE
+            ori_physical_block = pl.read(
+                ori_block_table,
+                [request, pl.cast(logical_block, pl.INDEX)],
+            )
+            pl.write(
+                ori_slot_mapping,
+                [token],
+                pl.cast(ori_physical_block * BLOCK_SIZE + block_offset, pl.INT64),
+            )
 
-def swa_decode_start_set(
-    *,
-    batch: int = DECODE_BATCH,
-    window: int = M.sliding_window,
-    long_pos: int = DECODE_START_POS,
-) -> torch.Tensor:
-    # long-context wraparound + in-window boundary + one in-window interior slot.
-    pattern = [long_pos, window - 1, 31]
-    return _tile_starts(pattern, batch)
+            hca_cmp_slot = pl.cast(-1, pl.INT64)
+            if (position + 1) % 128 == 0:
+                logical = position // 128
+                count = pl.read(block_counts, [request, GROUP_CMP])
+                physical_block = pl.read(
+                    cmp_block_table,
+                    [
+                        request,
+                        pl.cast(logical // BLOCK_SIZE % count, pl.INDEX),
+                    ],
+                )
+                hca_cmp_slot = pl.cast(
+                    physical_block * BLOCK_SIZE + logical % BLOCK_SIZE,
+                    pl.INT64,
+                )
+            pl.write(hca_cmp_slot_mapping, [token], hca_cmp_slot)
+
+            csa_cmp_slot = pl.cast(-1, pl.INT64)
+            csa_idx_slot = pl.cast(-1, pl.INT64)
+            if (position + 1) % 4 == 0:
+                logical = position // 4
+                cmp_count = pl.read(block_counts, [request, GROUP_CMP])
+                cmp_physical_block = pl.read(
+                    cmp_block_table,
+                    [request, pl.cast(logical // BLOCK_SIZE % cmp_count, pl.INDEX)],
+                )
+                csa_cmp_slot = pl.cast(
+                    cmp_physical_block * BLOCK_SIZE + logical % BLOCK_SIZE,
+                    pl.INT64,
+                )
+                idx_count = pl.read(block_counts, [request, GROUP_IDX])
+                idx_physical_block = pl.read(
+                    idx_block_table,
+                    [request, pl.cast(logical // BLOCK_SIZE % idx_count, pl.INDEX)],
+                )
+                csa_idx_slot = pl.cast(
+                    idx_physical_block * BLOCK_SIZE + logical % BLOCK_SIZE,
+                    pl.INT64,
+                )
+            pl.write(csa_cmp_slot_mapping, [token], csa_cmp_slot)
+            pl.write(csa_idx_slot_mapping, [token], csa_idx_slot)
+
+            hca_state_logical = position // C128_COMPRESSOR_BLOCK_SIZE
+            hca_state_count = pl.read(block_counts, [request, GROUP_HCA_STATE])
+            hca_state_physical_block = pl.read(
+                hca_state_block_table,
+                [
+                    request,
+                    pl.cast(hca_state_logical % hca_state_count, pl.INDEX),
+                ],
+            )
+            pl.write(
+                hca_state_slot_mapping,
+                [token],
+                pl.cast(
+                    hca_state_physical_block * C128_COMPRESSOR_BLOCK_SIZE
+                    + position % C128_COMPRESSOR_BLOCK_SIZE,
+                    pl.INT64,
+                ),
+            )
+
+            csa_state_logical = position // C4A_COMPRESSOR_BLOCK_SIZE
+            csa_state_count = pl.read(block_counts, [request, GROUP_CSA_STATE])
+            csa_state_physical_block = pl.read(
+                csa_state_block_table,
+                [
+                    request,
+                    pl.cast(csa_state_logical % csa_state_count, pl.INDEX),
+                ],
+            )
+            pl.write(
+                csa_state_slot_mapping,
+                [token],
+                pl.cast(
+                    csa_state_physical_block * C4A_COMPRESSOR_BLOCK_SIZE
+                    + position % C4A_COMPRESSOR_BLOCK_SIZE,
+                    pl.INT64,
+                ),
+            )
+
+            inner_state_count = pl.read(
+                block_counts,
+                [request, GROUP_CSA_INNER_STATE],
+            )
+            inner_state_physical_block = pl.read(
+                csa_inner_state_block_table,
+                [
+                    request,
+                    pl.cast(csa_state_logical % inner_state_count, pl.INDEX),
+                ],
+            )
+            pl.write(
+                csa_inner_state_slot_mapping,
+                [token],
+                pl.cast(
+                    inner_state_physical_block * C4A_COMPRESSOR_BLOCK_SIZE
+                    + position % C4A_COMPRESSOR_BLOCK_SIZE,
+                    pl.INT64,
+                ),
+            )
+    return (
+        ori_slot_mapping,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+        hca_cmp_slot_mapping,
+        hca_state_slot_mapping,
+        csa_cmp_slot_mapping,
+        csa_idx_slot_mapping,
+        csa_state_slot_mapping,
+        csa_inner_state_slot_mapping,
+    )
 
 
-def hca_decode_start_set(
-    *,
-    batch: int = DECODE_BATCH,
-    compress_ratio: int = 128,
-    state_block_size: int = C128_COMPRESSOR_BLOCK_SIZE,
-    long_pos: int = DECODE_START_POS,
-) -> torch.Tensor:
-    R = compress_ratio
-    pattern = [
-        long_pos,              # 8k long-context
-        R - 1,                 # compress boundary, one cache entry
-        R,                     # no new boundary on 1st token; 2nd advances window
-        2 * R - 1,             # compressed block crossing
-        state_block_size - 1,  # last slot of state page 0
-        10,                    # pre-compression, state page 1
+@pl.jit
+def decode_metadata(
+    position_ids: pl.Tensor[[T], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
+    hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_state_block_table: pl.Tensor[[B, CSA_STATE_MAX_BLOCKS], pl.INT32],
+    csa_inner_state_block_table: pl.Tensor[
+        [B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32
+    ],
+    block_counts: pl.Tensor[[B, N_CACHE_GROUPS], pl.INT32],
+    ori_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    swa_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    swa_indices: pl.Out[pl.Tensor[[T, WIN], pl.INT32]],
+    swa_lens: pl.Out[pl.Tensor[[T], pl.INT32]],
+    hca_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    hca_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_cmp_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_idx_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+    csa_inner_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
+):
+    """Standalone validation entry for device metadata lowering."""
+    return build_decode_metadata(
+        position_ids,
+        ori_block_table,
+        cmp_block_table,
+        idx_block_table,
+        hca_state_block_table,
+        csa_state_block_table,
+        csa_inner_state_block_table,
+        block_counts,
+        ori_slot_mapping,
+        swa_slot_mapping,
+        swa_indices,
+        swa_lens,
+        hca_cmp_slot_mapping,
+        hca_state_slot_mapping,
+        csa_cmp_slot_mapping,
+        csa_idx_slot_mapping,
+        csa_state_slot_mapping,
+        csa_inner_state_slot_mapping,
+    )
+
+
+def _test_inputs():
+    import torch
+
+    positions = torch.tensor(
+        [126, 127, 3, 4, 8191, 8192, 16382, 16383],
+        dtype=torch.int32,
+    )
+    counts = torch.tensor(
+        [
+            [2, 3, 4, 5, 6, 7],
+            [3, 4, 5, 6, 7, 8],
+            [4, 5, 6, 7, 8, 9],
+            [5, 6, 7, 8, 9, 10],
+        ],
+        dtype=torch.int32,
+    )
+
+    def table(width, group, *, repeat):
+        out = torch.zeros((B, width), dtype=torch.int32)
+        for request in range(B):
+            count = int(counts[request, group])
+            ids = torch.arange(count, dtype=torch.int32) + 1000 * (group + 1) + 100 * request
+            if repeat:
+                out[request] = ids.repeat((width + count - 1) // count)[:width]
+            else:
+                out[request, :count] = ids
+        return out
+
+    return {
+        "position_ids": positions,
+        "ori_block_table": table(ORI_TABLE_MAX_BLOCKS, GROUP_ORI, repeat=True),
+        "cmp_block_table": table(CMP_MAX_BLOCKS, GROUP_CMP, repeat=False),
+        "idx_block_table": table(IDX_MAX_BLOCKS, GROUP_IDX, repeat=False),
+        "hca_state_block_table": table(
+            HCA_STATE_MAX_BLOCKS,
+            GROUP_HCA_STATE,
+            repeat=True,
+        ),
+        "csa_state_block_table": table(
+            CSA_STATE_MAX_BLOCKS,
+            GROUP_CSA_STATE,
+            repeat=True,
+        ),
+        "csa_inner_state_block_table": table(
+            CSA_INNER_STATE_MAX_BLOCKS,
+            GROUP_CSA_INNER_STATE,
+            repeat=True,
+        ),
+        "block_counts": counts,
+    }
+
+
+def golden_decode_metadata(tensors):
+    positions = tensors["position_ids"]
+    ori_table = tensors["ori_block_table"]
+    cmp_table = tensors["cmp_block_table"]
+    idx_table = tensors["idx_block_table"]
+    hca_state_table = tensors["hca_state_block_table"]
+    csa_state_table = tensors["csa_state_block_table"]
+    inner_state_table = tensors["csa_inner_state_block_table"]
+    counts = tensors["block_counts"]
+
+    tensors["swa_indices"].fill_(-1)
+    for token in range(T):
+        request = token // S
+        position = int(positions[token])
+        logical_block, block_offset = divmod(position, BLOCK_SIZE)
+        tensors["swa_slot_mapping"][token] = (
+            int(ori_table[request, logical_block]) * BLOCK_SIZE + block_offset
+        )
+        valid_len = min(position + 1, WIN)
+        start = position - valid_len + 1
+        tensors["swa_lens"][token] = valid_len
+        for offset, visible_position in enumerate(range(start, position + 1)):
+            visible_block, visible_offset = divmod(visible_position, BLOCK_SIZE)
+            tensors["swa_indices"][token, offset] = (
+                int(ori_table[request, visible_block]) * BLOCK_SIZE + visible_offset
+            )
+
+        tensors["ori_slot_mapping"][token] = (
+            int(ori_table[request, logical_block]) * BLOCK_SIZE + block_offset
+        )
+        tensors["hca_cmp_slot_mapping"][token] = -1
+        if (position + 1) % 128 == 0:
+            logical = position // 128
+            count = int(counts[request, GROUP_CMP])
+            block_index, offset = divmod(logical, BLOCK_SIZE)
+            tensors["hca_cmp_slot_mapping"][token] = (
+                int(cmp_table[request, block_index % count]) * BLOCK_SIZE + offset
+            )
+
+        tensors["csa_cmp_slot_mapping"][token] = -1
+        tensors["csa_idx_slot_mapping"][token] = -1
+        if (position + 1) % 4 == 0:
+            logical = position // 4
+            block_index, offset = divmod(logical, BLOCK_SIZE)
+            cmp_count = int(counts[request, GROUP_CMP])
+            idx_count = int(counts[request, GROUP_IDX])
+            tensors["csa_cmp_slot_mapping"][token] = (
+                int(cmp_table[request, block_index % cmp_count]) * BLOCK_SIZE + offset
+            )
+            tensors["csa_idx_slot_mapping"][token] = (
+                int(idx_table[request, block_index % idx_count]) * BLOCK_SIZE + offset
+            )
+
+        hca_block, hca_offset = divmod(position, C128_COMPRESSOR_BLOCK_SIZE)
+        hca_count = int(counts[request, GROUP_HCA_STATE])
+        tensors["hca_state_slot_mapping"][token] = (
+            int(hca_state_table[request, hca_block % hca_count])
+            * C128_COMPRESSOR_BLOCK_SIZE
+            + hca_offset
+        )
+        csa_block, csa_offset = divmod(position, C4A_COMPRESSOR_BLOCK_SIZE)
+        csa_count = int(counts[request, GROUP_CSA_STATE])
+        inner_count = int(counts[request, GROUP_CSA_INNER_STATE])
+        tensors["csa_state_slot_mapping"][token] = (
+            int(csa_state_table[request, csa_block % csa_count])
+            * C4A_COMPRESSOR_BLOCK_SIZE
+            + csa_offset
+        )
+        tensors["csa_inner_state_slot_mapping"][token] = (
+            int(inner_state_table[request, csa_block % inner_count])
+            * C4A_COMPRESSOR_BLOCK_SIZE
+            + csa_offset
+        )
+
+
+def build_tensor_specs():
+    import torch
+    from golden import TensorSpec
+
+    inputs = _test_inputs()
+    specs = [
+        TensorSpec(name, list(value.shape), value.dtype, init_value=value)
+        for name, value in inputs.items()
     ]
-    return _tile_starts(pattern, batch)
+    for name, shape, dtype in (
+        ("ori_slot_mapping", [T], torch.int64),
+        ("swa_slot_mapping", [T], torch.int64),
+        ("swa_indices", [T, WIN], torch.int32),
+        ("swa_lens", [T], torch.int32),
+        ("hca_cmp_slot_mapping", [T], torch.int64),
+        ("hca_state_slot_mapping", [T], torch.int64),
+        ("csa_cmp_slot_mapping", [T], torch.int64),
+        ("csa_idx_slot_mapping", [T], torch.int64),
+        ("csa_state_slot_mapping", [T], torch.int64),
+        ("csa_inner_state_slot_mapping", [T], torch.int64),
+    ):
+        specs.append(TensorSpec(name, shape, dtype, is_output=True))
+    return specs
 
 
-def csa_decode_start_set(
-    *,
-    batch: int = DECODE_BATCH,
-    seq: int = DECODE_SEQ,
-    compress_ratio: int = 4,
-    state_block_size: int = C4A_COMPRESSOR_BLOCK_SIZE,
-    cache_tile: int = 64,
-    window: int = M.sliding_window,
-    long_pos: int = DECODE_START_POS,
-) -> torch.Tensor:
-    R = compress_ratio
-    pattern = [
-        long_pos,                   # 8k long-context (rolling state, INT64 slot, topk 4096)
-        0,                          # cold start, no valid compressed cache
-        R - seq,                    # compress boundary on 2nd token (== R-1 at seq=1)
-        R - 1,                      # compress boundary on 1st token
-        2 * R - 1,                  # 2nd window with previous-window overlap
-        window - 1,                 # sliding-window boundary (== state block 31->32 at ratio 4)
-        window,                     # post-window ring-cache path
-        state_block_size * 32 - 1,  # inner state logical block 31->32 crossing
-        R * cache_tile - 1,         # indexer score over exactly one cache tile
-        R * 2 * cache_tile - 1,     # indexer score over two cache tiles
-    ]
-    return _tile_starts(pattern, batch)
+if __name__ == "__main__":
+    import argparse
 
+    from golden import run_jit
 
-def position_ids_from_starts(starts: torch.Tensor, *, seq: int = DECODE_SEQ) -> torch.Tensor:
-    offsets = torch.arange(seq, dtype=torch.int32, device=starts.device)
-    return starts.to(torch.int32).unsqueeze(1) + offsets.unsqueeze(0)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "-p",
+        "--platform",
+        default="a2a3",
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+    )
+    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--compile-only", action="store_true")
+    args = parser.parse_args()
 
-
-def kv_seq_lens_from_starts(
-    starts: torch.Tensor,
-    *,
-    seq: int = DECODE_SEQ,
-    commit_tokens: int | None = None,
-) -> torch.Tensor:
-    visible_tokens = seq if commit_tokens is None else commit_tokens
-    if visible_tokens < 0 or visible_tokens > seq:
-        raise ValueError(f"commit_tokens must be in [0, {seq}], got {visible_tokens}")
-    return (starts.to(torch.int64) + visible_tokens).to(torch.int32)
-
-
-def block_table(
-    *,
-    batch: int,
-    table_blocks: int,
-    physical_blocks: int | None = None,
-    permuted: bool = False,
-) -> torch.Tensor:
-    physical_blocks = table_blocks if physical_blocks is None else physical_blocks
-    table_cols = torch.arange(table_blocks, dtype=torch.int32)
-    physical_cols = table_cols % physical_blocks
-    if permuted and physical_blocks > 1:
-        physical_cols = (physical_cols * 7 + 3) % physical_blocks
-    # The physical pool is global and does not grow with batch. Interleave the
-    # fixture's request-local logical pages inside that fixed pool; production
-    # serving supplies allocator-owned block tables under the same contract.
-    request_offsets = torch.arange(batch, dtype=torch.int32).unsqueeze(1)
-    return (physical_cols.unsqueeze(0) * batch + request_offsets) % physical_blocks
-
-
-def ori_slot_mapping(
-    positions: torch.Tensor,
-    table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-) -> torch.Tensor:
-    """Map absolute positions into the full paged ori-KV pool.
-
-    Sliding-window visibility is lowered separately by
-    :func:`swa_indices_and_lens`; it must not alias physical KV write rows.
-    """
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = table.to(device=positions.device, dtype=torch.int64)
-    logical_blk = positions_i64 // block_size
-    intra = positions_i64 % block_size
-    in_bounds = logical_blk < table_i64.shape[1]
-    clamped_blk = torch.clamp(logical_blk, max=table_i64.shape[1] - 1)
-    blk = torch.gather(table_i64, 1, clamped_blk)
-    valid = in_bounds & (blk >= 0)
-    return torch.where(valid, blk * block_size + intra, -1)
-
-
-def paged_slot_mapping(
-    positions: torch.Tensor,
-    table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-) -> torch.Tensor:
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = table.to(device=positions.device, dtype=torch.int64)
-    logical_blk = positions_i64 // block_size
-    intra = positions_i64 % block_size
-    in_bounds = logical_blk < table_i64.shape[1]
-    clamped_blk = torch.clamp(logical_blk, max=table_i64.shape[1] - 1)
-    blk = torch.gather(table_i64, 1, clamped_blk)
-    valid = in_bounds & (blk >= 0)
-    return torch.where(valid, blk * block_size + intra, -1)
-
-
-def swa_indices_and_lens(
-    positions: torch.Tensor,
-    table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-    window: int = M.sliding_window,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Lower decode SWA windows to physical KV-cache row indices.
-
-    Each visible absolute logical position is translated with the same paged-KV
-    block table contract as vLLM:
-    ``physical_slot = block_table[req, pos // block_size] * block_size + pos % block_size``.
-    Each row is ordered from the oldest visible token to the current token;
-    invalid tail columns are padded with -1 and ``lens`` records the valid
-    prefix length.
-    """
-    if positions.ndim != 2:
-        raise ValueError("SWA indices expect positions with shape [B, S]")
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = table.to(device=positions.device, dtype=torch.int64)
-    batch, seq = positions_i64.shape
-    indices = torch.full((batch * seq, window), -1, dtype=torch.int32, device=positions.device)
-    lens = torch.zeros((batch * seq,), dtype=torch.int32, device=positions.device)
-
-    for b in range(batch):
-        for s in range(seq):
-            t = b * seq + s
-            abs_pos = int(positions_i64[b, s].item())
-            start = max(0, abs_pos - window + 1)
-            valid_len = abs_pos - start + 1
-            lens[t] = valid_len
-            for k, pos in enumerate(range(start, abs_pos + 1)):
-                logical_blk = pos // block_size
-                intra = pos % block_size
-                if logical_blk >= table_i64.shape[1]:
-                    continue
-                blk = int(table_i64[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, k] = blk * block_size + intra
-    return indices, lens
-
-
-def history_window_swa_indices_and_lens(
-    positions: torch.Tensor,
-    window_block_table: torch.Tensor,
-    *,
-    block_size: int = BLOCK_SIZE,
-    window: int = M.sliding_window,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Lower historical HCA/CSA window rows to physical KV-cache slots.
-
-    Current decode-chunk positions are excluded from this list because HCA/CSA
-    still attend current MTP tokens through their overlay raw-index range. The
-    returned rows are packed oldest-to-newest; invalid tail columns are -1. The
-    block table follows the same vLLM-style absolute logical block contract as
-    SWA, while physical blocks may still be a small sliding-window ring.
-    """
-    if positions.ndim != 2:
-        raise ValueError("history window indices expect positions with shape [B, S]")
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = window_block_table.to(device=positions.device, dtype=torch.int64)
-    batch, seq = positions_i64.shape
-    indices = torch.full((batch * seq, window), -1, dtype=torch.int32, device=positions.device)
-    lens = torch.zeros((batch * seq,), dtype=torch.int32, device=positions.device)
-
-    for b in range(batch):
-        for s in range(seq):
-            t = b * seq + s
-            abs_pos = int(positions_i64[b, s].item())
-            overlay_positions = {int(positions_i64[b, os].item()) for os in range(s + 1)}
-            start = max(0, abs_pos - window + 1)
-            out_k = 0
-            for pos in range(start, abs_pos + 1):
-                if pos in overlay_positions:
-                    continue
-                logical_blk = pos // block_size
-                intra = pos % block_size
-                if logical_blk >= table_i64.shape[1]:
-                    continue
-                blk = int(table_i64[b, logical_blk].item())
-                if blk >= 0:
-                    indices[t, out_k] = blk * block_size + intra
-                    out_k += 1
-            lens[t] = out_k
-    return indices, lens
-
-
-def compressed_slot_mapping(
-    positions: torch.Tensor,
-    cmp_block_table: torch.Tensor,
-    *,
-    compress_ratio: int,
-    block_size: int = BLOCK_SIZE,
-) -> torch.Tensor:
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = cmp_block_table.to(device=positions.device, dtype=torch.int64)
-    boundary = (positions_i64 + 1) % compress_ratio == 0
-    cache_col = positions_i64 // compress_ratio
-    logical_blk = cache_col // block_size
-    intra = cache_col % block_size
-    in_bounds = logical_blk < table_i64.shape[1]
-    clamped_blk = torch.clamp(logical_blk, max=table_i64.shape[1] - 1)
-    blk = torch.gather(table_i64, 1, clamped_blk)
-    valid = boundary & in_bounds & (blk >= 0)
-    return torch.where(valid, blk * block_size + intra, -1)
-
-
-def mask_uncommitted_compressed_boundaries(
-    mapping: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    compress_ratio: int,
-    commit_tokens: int | None,
-) -> torch.Tensor:
-    if commit_tokens is None:
-        return mapping
-    if mapping.shape != positions.shape:
-        raise ValueError("compressed boundary mask expects mapping and positions to have the same shape")
-    if mapping.ndim != 2:
-        raise ValueError("compressed boundary mask expects [B, S] tensors")
-    if commit_tokens < 0 or commit_tokens > mapping.shape[1]:
-        raise ValueError(f"commit_tokens must be in [0, {mapping.shape[1]}], got {commit_tokens}")
-    masked = mapping.clone()
-    positions_i64 = positions.to(torch.int64)
-    token_cols = torch.arange(positions.shape[1], device=positions.device).unsqueeze(0)
-    uncommitted = token_cols >= commit_tokens
-    boundary = (positions_i64 + 1) % compress_ratio == 0
-    masked[uncommitted & boundary] = -1
-    return masked
-
-
-def state_slot_mapping(
-    positions: torch.Tensor,
-    state_block_table: torch.Tensor,
-    *,
-    state_block_size: int,
-) -> torch.Tensor:
-    positions_i64 = positions.to(torch.int64)
-    table_i64 = state_block_table.to(device=positions.device, dtype=torch.int64)
-    logical_blk = positions_i64 // state_block_size
-    intra = positions_i64 % state_block_size
-    in_bounds = logical_blk < table_i64.shape[1]
-    clamped_blk = torch.clamp(logical_blk, max=table_i64.shape[1] - 1)
-    blk = torch.gather(table_i64, 1, clamped_blk)
-    valid = in_bounds & (blk >= 0)
-    return torch.where(valid, blk * state_block_size + intra, -1)
-
-
-def _validate_starts(starts: torch.Tensor, *, seq: int, max_seq_len: int) -> None:
-    if bool((starts < 0).any()):
-        raise ValueError("decode start positions must be non-negative")
-    if bool((starts.to(torch.int64) + seq > max_seq_len).any()):
-        raise ValueError(f"decode start positions plus seq length must fit MAX_SEQ_LEN={max_seq_len}")
+    result = run_jit(
+        fn=decode_metadata,
+        specs=build_tensor_specs(),
+        golden_fn=golden_decode_metadata,
+        compile_only=args.compile_only,
+        runtime_cfg={"platform": args.platform, "device_id": args.device},
+    )
+    if not result.passed:
+        if result.error:
+            print(result.error)
+        raise SystemExit(1)
