@@ -999,7 +999,7 @@ def prefill_layer(
     w_down: pl.Tensor[[LAYER_INTER_ROWS_DYN, HIDDEN], pl.BF16],
     out: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
-    hidden_ready: pl.Tensor[[3], pl.INT32],
+    hidden_ready: pl.Tensor[[2 * BATCH_PAD], pl.INT32],
     kv_cache_ready: pl.Tensor[[NUM_LAYERS * BATCH_PAD], pl.INT32],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1016,8 +1016,8 @@ def prefill_layer(
     layer_inter_base = layer_idx * INTERMEDIATE
     layer_cache_base = layer_idx * layer_cache_rows
     max_blocks_per_seq = pl.tensor.dim(block_table, 0) // batch
-    hidden_ready_read_slot = pl.cast(layer_idx % 2, pl.INDEX)
-    hidden_ready_write_slot = pl.cast((layer_idx + 1) % 2, pl.INDEX)
+    hidden_ready_read_base = pl.cast((layer_idx % 2) * BATCH_PAD, pl.INDEX)
+    hidden_ready_write_base = pl.cast(((layer_idx + 1) % 2) * BATCH_PAD, pl.INDEX)
 
     # Consume each 128-token m-tile immediately after its attention/post-norm
     # tile finishes. Keep the temporary post-norm/residual storage local to
@@ -1028,7 +1028,7 @@ def prefill_layer(
     band_k_chunks = MLP_BAND_WIDTH // MLP_OUT_CHUNK
     silu_band_blocks = MLP_BAND_WIDTH // SILU_OUT_CHUNK
 
-    for b in pl.range(0, batch, 1):
+    for b in pl.parallel(0, batch, 1):
         post_norm_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.BF16, manual_dep=True)
         resid1_mtile = pl.create_tensor([MLP_M_TILE, HIDDEN], dtype=pl.FP32)
         post_norm_tids = pl.array.create(MLP_M_TILE // TOK_TILE, pl.TASK_ID)
@@ -1042,6 +1042,10 @@ def prefill_layer(
         chunk_len_b = pl.min(MLP_M_TILE, pl.max(remaining_tok, 0))
         tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
         kv_ready_idx = pl.cast(layer_idx, pl.INDEX) * BATCH_PAD + b
+        hidden_ready_read_slot = hidden_ready_read_base + b
+        hidden_ready_write_slot = hidden_ready_write_base + b
+        hidden_ready_read_view = pl.slice(hidden_ready, [1], [hidden_ready_read_slot])
+        hidden_ready_write_view = pl.slice(hidden_ready, [1], [hidden_ready_write_slot])
         for p0_idx in pl.unroll(MLP_M_TILE // TOK_TILE):
             post_norm_tid_for_ready = pl.system.task_invalid()
             if p0_idx < tok_blocks:
@@ -1060,9 +1064,8 @@ def prefill_layer(
                         allow_early_resolve=True,
                     ) as x_gamma_tid:
                         xg_core = pl.tile.get_block_idx()
-                        hidden_ready_value = pl.tensor.read(hidden_ready, [hidden_ready_read_slot])
-                        tile_ready_value = pl.tensor.read(hidden_ready, [2])
-                        if hidden_ready_value + tile_ready_value >= 0:
+                        hidden_ready_value = pl.tensor.read(hidden_ready_read_view, [0])
+                        if hidden_ready_value >= 0:
                             for work_id in pl.range(xg_core, X_GAMMA_HIDDEN_BLOCKS, RMSNORM_SPMD_BLOCKS):
                                 k0 = work_id * X_GAMMA_HIDDEN_CHUNK
                                 xg_chunk = pl.cast(
@@ -1482,8 +1485,7 @@ def prefill_layer(
                     out_valid = pl.slice(out_bf, [MLP_M_TILE, K_CHUNK], [0, 0], valid_shape=[valid_tt, K_CHUNK])
                     out = pl.assemble(out, out_valid, [m0, h0])
             with pl.at(level=pl.Level.CORE_GROUP, name_hint="layer_ready_publish", deps=[cast_tid]):
-                pl.tensor.write(hidden_ready, [hidden_ready_write_slot], pl.cast(layer_idx + 1, target_type=pl.INT32))
-                pl.tensor.write(hidden_ready, [2], pl.cast(layer_idx + b + 1, target_type=pl.INT32))
+                pl.tensor.write(hidden_ready_write_view, [0], pl.cast(layer_idx + 1, target_type=pl.INT32))
 
     return out
 
@@ -1547,7 +1549,7 @@ def prefill_fwd(
             p0 = p0_idx * MLP_M_TILE
             if batch == 1:
                 window_hidden_pair = pl.create_tensor([2 * MLP_M_TILE, HIDDEN], dtype=pl.BF16, manual_dep=True)
-                window_hidden_ready = pl.create_tensor([3], dtype=pl.INT32)
+                window_hidden_ready = pl.create_tensor([2 * BATCH_PAD], dtype=pl.INT32)
                 token_base = pl.cast(pl.tensor.read(chunk_offsets, [0]), pl.INDEX)
                 chunk_len_b = pl.tensor.read(chunk_lens, [0])
                 valid_tok = pl.min(MLP_M_TILE, pl.max(chunk_len_b - p0, 0))
@@ -1580,8 +1582,8 @@ def prefill_fwd(
                                 [ti, k0],
                             )
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed_single_ready", deps=[embed_tid]):
-                    pl.tensor.write(window_hidden_ready, [0], pl.cast(1, target_type=pl.INT32))
-                    pl.tensor.write(window_hidden_ready, [2], pl.cast(1, target_type=pl.INT32))
+                    for ready_b in pl.range(BATCH_PAD):
+                        pl.tensor.write(window_hidden_ready, [ready_b], pl.cast(1, target_type=pl.INT32))
 
                 for layer_idx in pl.range(num_layers_actual):
                     read_base = (layer_idx % 2) * MLP_M_TILE
@@ -1623,7 +1625,7 @@ def prefill_fwd(
                     if p0_idx == last_group:
                         local_last = valid_tok - 1
                         with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_single"):
-                            final_ready_slot = pl.cast(num_layers_actual % 2, pl.INDEX)
+                            final_ready_slot = pl.cast((num_layers_actual % 2) * BATCH_PAD, pl.INDEX)
                             final_ready_value = pl.tensor.read(window_hidden_ready, [final_ready_slot])
                             for kb in pl.range(HIDDEN_BLOCKS):
                                 if final_ready_value >= 0:
@@ -1641,7 +1643,7 @@ def prefill_fwd(
                     dtype=pl.BF16,
                     manual_dep=True,
                 )
-                group_hidden_ready = pl.create_tensor([3], dtype=pl.INT32)
+                group_hidden_ready = pl.create_tensor([2 * BATCH_PAD], dtype=pl.INT32)
 
                 with pl.spmd(
                     TOKEN_EMBED_SPMD_BLOCKS,
@@ -1678,8 +1680,8 @@ def prefill_fwd(
                                     [group_idx, k0],
                                 )
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="token_embed_group_ready", deps=[embed_tid]):
-                    pl.tensor.write(group_hidden_ready, [0], pl.cast(1, target_type=pl.INT32))
-                    pl.tensor.write(group_hidden_ready, [2], pl.cast(1, target_type=pl.INT32))
+                    for ready_b in pl.range(BATCH_PAD):
+                        pl.tensor.write(group_hidden_ready, [ready_b], pl.cast(1, target_type=pl.INT32))
 
                 group_rows = BATCH_PAD * MLP_M_TILE
                 for layer_idx in pl.range(num_layers_actual):
@@ -1725,7 +1727,7 @@ def prefill_fwd(
                             valid_tok = pl.min(MLP_M_TILE, chunk_len_b - p0)
                             local_last = b * MLP_M_TILE + valid_tok - 1
                             with pl.at(level=pl.Level.CORE_GROUP, name_hint="save_prefill_last_token_group"):
-                                final_ready_slot = pl.cast(num_layers_actual % 2, pl.INDEX)
+                                final_ready_slot = pl.cast((num_layers_actual % 2) * BATCH_PAD, pl.INDEX) + b
                                 final_ready_value = pl.tensor.read(group_hidden_ready, [final_ready_slot])
                                 for kb in pl.range(HIDDEN_BLOCKS):
                                     if final_ready_value >= 0:
