@@ -66,7 +66,7 @@ PACKED_RMS_TILE = 16
 
 
 @pl.jit.inline
-def _prefill_compressor_ratio4_with_completion(
+def compressor_ratio4(
     x: pl.Tensor[[T, D], pl.BF16],
     compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
@@ -387,34 +387,6 @@ def _prefill_compressor_ratio4_with_completion(
     return cmp_kv, compress_state
 
 
-@pl.jit.inline
-def prefill_compressor_ratio4(
-    x: pl.Tensor[[T, D], pl.BF16],
-    compress_state: pl.Tensor[[STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
-    wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
-    ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
-    norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    num_tokens: pl.Scalar[pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T], pl.INT64],
-):
-    completion = pl.array.create(1, pl.TASK_ID)
-    cmp_kv_out, compress_state_out = _prefill_compressor_ratio4_with_completion(
-        x, compress_state, compress_state_block_table,
-        wkv, wgate, ape,
-        norm_w, freqs_cos, freqs_sin,
-        cmp_kv, position_ids, num_tokens,
-        cmp_slot_mapping, state_slot_mapping, completion,
-    )
-    return cmp_kv_out, compress_state_out
-
-
 def golden_prefill_compressor_ratio4(tensors):
     """Packed token-major torch reference for ratio-4 prefill compressor."""
     import torch
@@ -545,9 +517,10 @@ def prefill_compressor_ratio4_test(
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
     state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
-    return prefill_compressor_ratio4(
+    completion = pl.array.create(1, pl.TASK_ID)
+    return compressor_ratio4(
         x, compress_state, compress_state_block_table, wkv, wgate, ape, norm_w, freqs_cos, freqs_sin,
-        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping,
+        cmp_kv, position_ids, num_tokens, cmp_slot_mapping, state_slot_mapping, completion,
     )
 
 

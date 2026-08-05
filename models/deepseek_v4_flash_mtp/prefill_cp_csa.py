@@ -34,7 +34,7 @@ from prefill_compressor_ratio4 import (
     OUT_DIM as MAIN_OUT_DIM,
     build_tensor_specs as build_compressor_tensor_specs,
     golden_prefill_compressor_ratio4,
-    _prefill_compressor_ratio4_with_completion,
+    compressor_ratio4,
 )
 from prefill_cp_exchange import (
     INNER_STATE_DIM,
@@ -1082,7 +1082,7 @@ def _cp_csa_compress_pack_part(
         active_eff = pl.max(active, 1)
 
         main_completion = pl.array.create(1, pl.TASK_ID)
-        main_cache_written, main_state_written = _prefill_compressor_ratio4_with_completion(
+        main_cache_written, main_state_written = compressor_ratio4(
             x_leaf, main_state, main_state_block_table,
             cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
             freqs_cos, freqs_sin,

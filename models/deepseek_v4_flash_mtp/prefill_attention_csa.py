@@ -38,7 +38,7 @@ from prefill_compressor_ratio4 import (
     CSA_STATE_BLOCK_NUM,
     CSA_STATE_BLOCK_SIZE,
     CSA_STATE_MAX_BLOCKS,
-    _prefill_compressor_ratio4_with_completion,
+    compressor_ratio4,
     golden_prefill_compressor_ratio4,
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
@@ -227,7 +227,7 @@ def prefill_attention_csa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     compressor_completion = pl.array.create(1, pl.TASK_ID)
-    _prefill_compressor_ratio4_with_completion(
+    compressor_ratio4(
         x_normed, compress_state, compress_state_block_table,
         cmp_wkv, cmp_wgate, cmp_ape,
         cmp_norm_w, freqs_cos, freqs_sin,
