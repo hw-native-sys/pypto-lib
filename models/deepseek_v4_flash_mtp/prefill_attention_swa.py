@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 packed prefill SWA attention.
-
-The public contract is single-request token-major prefill: the
-layer owns the per-request loop and feeds this op one contiguous run of <=T
-tokens. SWA consumes lowered metadata such as position_ids, slot mappings, and
-window-ring sparse indices.
-"""
+"""DeepSeek-V4 packed prefill SWA attention over one contiguous run of <=T tokens."""
 
 import pypto.language as pl
 
@@ -37,9 +31,12 @@ from prefill_sparse_attn import (
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    _prefill_sparse_attn_with_block_mask,
+    sparse_attn,
 )
 
+
+# Dynamic shape variables.
+BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
 
 # model config
 B = PREFILL_BATCH
@@ -52,59 +49,31 @@ HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HEAD_DIM = ROPE_DIM
 NOPE_DIM = M.nope_head_dim
-NOPE_HEAD_DIM = NOPE_DIM
 Q_LORA = M.q_lora_rank
 ROPE_HALF = ROPE_DIM // 2
-HALF_ROPE = ROPE_HALF
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 IDX_TOPK = M.index_topk
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
-HC_DIM_INV = 1.0 / HC_DIM
-HC_SINKHORN_ITER = M.hc_sinkhorn_iters
-HC_EPS = M.hc_eps
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
-# SWA cache/topk contract. The ratio-0 path has only the sliding-window cache:
-# single request, one window page, so the cache block count, the block_table
-# length, and the per-request ori-window block count all collapse to 1.
+# paged KV cache. The ratio-0 path has only the sliding-window cache: one
+# request, one window page, so block count / table length / per-request window
+# block count all collapse to 1.
 BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
-START_POS = 0
-
-# prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
-SPARSE_TOPK = WIN + IDX_TOPK
 SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
 SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
-WRITEBACK_GUARD_TILE = 16
-
-# HC tiling, mirrored from hc_pre/hc_post but using prefill B/S/T.
-MIX_PAD = 32
-NEG_INF = -1e20
-T_TILE = 16
-RMS_T_TILE = 16
-LINEAR_T_TILE = 16
-COMB_T_TILE = 16
-RMS_K_CHUNK = 128
-LINEAR_K_CHUNK = 512
-D_CHUNK = 512
-RMS_K_BLOCKS = HC_DIM // RMS_K_CHUNK
-LINEAR_K_BLOCKS = HC_DIM // LINEAR_K_CHUNK
-D_BLOCKS = D // D_CHUNK
-RMS_PIPE_STAGE = 1 if T >= 64 else 4
+START_POS = 0
 
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN+t"
-assert SPARSE_ORI_BLOCK_NUM == BLOCK_NUM
-assert SPARSE_ORI_MAX_BLOCKS <= BLOCK_NUM
 
 
 @pl.jit.inline
@@ -217,7 +186,7 @@ def prefill_attention_swa(
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    _prefill_sparse_attn_with_block_mask(
+    sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv_dummy, cmp_block_table_dummy,
         cmp_indices_dummy,

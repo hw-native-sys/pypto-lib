@@ -51,7 +51,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
-    _prefill_sparse_attn_math,
+    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
@@ -558,7 +558,7 @@ def prefill_cp_swa_core(
         active = pl.read(overlay_active_lengths, [part, part_tile, 1])
         attn_out_tile = pl.create_tensor([TAIL_ROWS, D], dtype=pl.BF16)
         y_tile = pl.create_tensor([TAIL_ROWS, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        _prefill_sparse_attn_math(
+        sparse_attn_math(
             q=q_tile, sparse_kv=sparse_kv_tile, sparse_bias=bias_tile, valid_block_mask=mask_tile,
             attn_sink=attn_sink, freqs_cos=cos_tile, freqs_sin=sin_tile,
             wo_a=wo_a, wo_b=wo_b, wo_b_scale=wo_b_scale,

@@ -6,13 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 packed prefill CSA attention.
-
-This module wires HC pre/post, ratio-4 compressor, indexer, sparse attention,
-and cache writeback for the compressed sparse attention path. Single-request
-the layer owns the per-request loop and feeds this op one
-contiguous run of <=T tokens.
-"""
+"""DeepSeek-V4 packed prefill CSA attention: HC pre/post, ratio-4 compressor, indexer, sparse attention, cache writeback."""
 
 import functools
 
@@ -67,9 +61,17 @@ from prefill_sparse_attn import (
     SPARSE_CMP_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    _prefill_sparse_attn_with_block_mask,
+    sparse_attn,
 )
 
+# Dynamic shape variables.
+ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
+MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
+INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
+# model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
@@ -83,11 +85,9 @@ MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 COMPRESS_RATIO = 4
 START_POS = 0
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 IDX_HEAD_DIM = M.index_head_dim
 IDX_N_HEADS = M.index_n_heads
 IDX_TOPK = M.index_topk
-IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
 HC_MULT = M.hc_mult
 MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
@@ -101,29 +101,20 @@ MAIN_STATE_LEN = COFF * COMPRESS_RATIO
 INNER_OUT_DIM = COFF * IDX_HEAD_DIM
 INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 INNER_STATE_LEN = COFF * COMPRESS_RATIO
-ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
+
+# paged KV cache
 ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-SPARSE_ROPE_CHUNK = 16
-SPARSE_ROPE_INTERLEAVE_CHUNK = 2 * SPARSE_ROPE_CHUNK
-Q_PROJ_OUT_CHUNK = 128
-Q_PROJ_HEAD_BLOCKS = (H * HEAD_DIM) // Q_PROJ_OUT_CHUNK
-CSA_TOPK_TOKEN_TILE = 2
-WRITEBACK_GUARD_TILE = 16
-
-
 SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
 SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
-
-MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 CSA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
-IDX_BLOCK_NUM_DYN = pl.dynamic("PREFILL_IDX_BLOCK_NUM_DYN")
-MAIN_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CSA_STATE_BLOCK_NUM_DYN")
-INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_INNER_STATE_BLOCK_NUM_DYN")
+
+# tiling
+CSA_TOPK_TOKEN_TILE = 2
+
 assert S == WIN, "packed CSA prefill currently assumes one static window page"
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
@@ -316,7 +307,7 @@ def prefill_attention_csa(
             )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    _prefill_sparse_attn_with_block_mask(
+    sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
         cmp_topk_indices,

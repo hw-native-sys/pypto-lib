@@ -84,7 +84,7 @@ from prefill_sparse_attn import (
     PREFILL_SPARSE_PAD,
     ROPE_DIM,
     VALID_BLOCK_MASK_COLS,
-    _prefill_sparse_attn_math,
+    sparse_attn_math,
     build_tensor_specs as build_sparse_attn_tensor_specs,
     golden_prefill_sparse_attn,
 )
@@ -2043,7 +2043,7 @@ def prefill_cp_csa_core(
         active = pl.read(overlay_active_flat, [tile, 1])
         attn_out_tile = pl.create_tensor([T, D], dtype=pl.BF16)
         y_tile = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        _prefill_sparse_attn_math(
+        sparse_attn_math(
             q_tile, sparse_tile, bias_tile, mask_tile,
             attn_sink, cos_tile, sin_tile,
             wo_a, wo_b, wo_b_scale,

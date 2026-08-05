@@ -6,14 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 packed prefill HCA attention bring-up.
-
-Correctness-first standalone for the ratio-128 HCA prefill path. The public
-contract is single-request token-major prefill: the layer owns the
-per-request loop and feeds this op one contiguous run of <=T tokens. HCA
-consumes lowered metadata such as position_ids, dense slot mappings, and sparse
-indices.
-"""
+"""DeepSeek-V4 packed prefill HCA (ratio-128) attention over one contiguous run of <=T tokens."""
 
 import functools
 
@@ -48,22 +41,25 @@ from prefill_sparse_attn import (
     SPARSE_BIAS_COLS,
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
-    _prefill_sparse_attn_with_block_mask,
+    sparse_attn,
 )
 
 
+# Dynamic shape variables.
+ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
+STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
+
+# model config
 B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
-EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 ROPE_DIM = ROPE_HEAD_DIM
-ROPE_HALF = ROPE_DIM // 2
 NOPE_HEAD_DIM = M.nope_head_dim
-NOPE_DIM = NOPE_HEAD_DIM
 Q_LORA = M.q_lora_rank
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
@@ -76,38 +72,28 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
-# prefill_sparse_attn cache/topk contract (mirrors prefill_sparse_attn).
-SPARSE_TOPK = WIN + IDX_TOPK
-SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
-SPARSE_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-
 COMPRESS_RATIO = 128
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
-MAIN_STATE_LEN = COMPRESS_RATIO
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 START_POS = 0
+
+# paged KV cache
+PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
+SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+SPARSE_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
 HCA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
-ORI_BLOCK_NUM_DYN = pl.dynamic("PREFILL_ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("PREFILL_CMP_BLOCK_NUM_DYN")
-STATE_BLOCK_NUM_DYN = pl.dynamic("PREFILL_HCA_STATE_BLOCK_NUM_DYN")
-WRITEBACK_GUARD_TILE = 16
 
 assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
 assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
-assert SPARSE_ORI_MAX_BLOCKS * BLOCK_SIZE >= S, "prefill HCA ori cache pool is too small"
-assert SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE >= PREFILL_MAX_COMPRESSED, "prefill HCA cmp table is too small"
 # HCA has no indexer: the compressed tail is every slot the cache holds, so the
 # shared prefill pruning width must cover the whole cache, not a top-k budget.
 assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
     f"prefill HCA compressed tail ({PREFILL_MAX_COMPRESSED} slots) must cover "
     f"MAX_SEQ_LEN={MAX_SEQ_LEN} ({MAX_SEQ_LEN // COMPRESS_RATIO} slots)")
-assert SPARSE_CMP_BLOCK_NUM >= SPARSE_CMP_MAX_BLOCKS, "prefill HCA cmp physical pool is too small"
-assert PREFILL_COMPRESSED_LEN == 1
 
 
 @pl.jit.inline
@@ -248,7 +234,7 @@ def prefill_attention_hca(
             )
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    _prefill_sparse_attn_with_block_mask(
+    sparse_attn(
         q, kv_cache, swa_indices,
         cmp_kv, cmp_block_table,
         cmp_indices,
