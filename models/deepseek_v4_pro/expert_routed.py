@@ -276,16 +276,24 @@ def golden_expert_routed(tensors):
     import torch
     import torch.nn.functional as F
 
-    def dequant_w(w_i8, w_scale):
-        return w_i8.to(torch.float32) * w_scale.unsqueeze(-1)
-
+    # Mirror the kernel's numerics exactly, as golden_expert_shared already does.
+    # Every matmul in the kernel is an exact INT8 x INT8 -> INT32 accumulate,
+    # dequantized AFTER the reduction by the per-row input scale x per-channel
+    # weight scale. Integer accumulation is exact and order-independent, so an
+    # int32 matmul here is bit-identical to the kernel's tiled accumulate
+    # regardless of K-tiling. A fp32 matmul of pre-dequantized operands (the
+    # previous form) instead accumulates fp32 rounding error that flips bf16
+    # last-bit ties on the final cast.
+    #
+    # Dropping the eager fp32 dequant also drops its cost: it materialized w1,
+    # w3 and w2 as full fp32 tensors held live across the whole expert loop.
     recv_x_i8 = tensors["recv_x"]  # INT8, pre-quantized in dispatch
     recv_scale_dq = tensors["recv_scale_dq"].float()  # [E, RECV_MAX]
     recv_weights = tensors["recv_weights"].float()  # [E, RECV_MAX]
     recv_expert_count = tensors["recv_expert_count"]  # [E, 1] int32
-    w1 = dequant_w(tensors["routed_w1"], tensors["routed_w1_scale"].float())
-    w3 = dequant_w(tensors["routed_w3"], tensors["routed_w3_scale"].float())
-    w2 = dequant_w(tensors["routed_w2"], tensors["routed_w2_scale"].float())
+    w1_i8, w1_scale = tensors["routed_w1"], tensors["routed_w1_scale"].float()
+    w3_i8, w3_scale = tensors["routed_w3"], tensors["routed_w3_scale"].float()
+    w2_i8, w2_scale = tensors["routed_w2"], tensors["routed_w2_scale"].float()
 
     recv_y = torch.zeros(N_LOCAL_EXPERTS, RECV_MAX, D)
     for e in range(N_LOCAL_EXPERTS):
@@ -294,19 +302,23 @@ def golden_expert_routed(tensors):
             continue
         x_sub_i8 = recv_x_i8[e, :n_rows, :]
         x_sub_sd = recv_scale_dq[e, :n_rows].reshape(-1, 1)
-        x_sub_q = x_sub_i8.float() * x_sub_sd
         w_per_row = recv_weights[e, :n_rows].reshape(-1, 1)
 
-        gate = x_sub_q @ w1[e].T
-        up = x_sub_q @ w3[e].T
+        gate_int = x_sub_i8.to(torch.int32) @ w1_i8[e].to(torch.int32).T
+        up_int = x_sub_i8.to(torch.int32) @ w3_i8[e].to(torch.int32).T
+        gate = gate_int.to(torch.float32) * x_sub_sd * w1_scale[e].unsqueeze(0)
+        up = up_int.to(torch.float32) * x_sub_sd * w3_scale[e].unsqueeze(0)
         if SWIGLU_LIMIT > 0:
             gate = gate.clamp(max=SWIGLU_LIMIT)
             up = up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
         h = F.silu(gate) * up
         # A8 requant before w2 matmul.
         h_i8, h_sd = _int8_quant_per_row(h)
-        h = h_i8.float() * (h_sd * w_per_row)
-        recv_y[e, :n_rows, :] = h @ w2[e].T
+        # (h_sd * w_per_row) stays parenthesized: the kernel forms
+        # row_scale_blk = mul(h_tile_scale_dq, w_col_blk) as one fp32 product
+        # before applying it, so the association is load-bearing.
+        y_int = h_i8.to(torch.int32) @ w2_i8[e].to(torch.int32).T
+        recv_y[e, :n_rows, :] = y_int.to(torch.float32) * (h_sd * w_per_row) * w2_scale[e].unsqueeze(0)
 
     tensors["recv_y"][:] = recv_y.to(torch.bfloat16)
 
