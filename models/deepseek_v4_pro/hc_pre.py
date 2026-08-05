@@ -731,11 +731,8 @@ def golden_hc_pre(tensors):
     y3 = x[:, 3, :] * pre[:, 3:4]
     y = (y0 + y1) + (y2 + y3)
 
-    def _to_device_bf16(value):
-        rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
-        return rounded.view(torch.float32).to(torch.bfloat16)
-
-    tensors["x_mixed"][:] = _to_device_bf16(y).reshape(t_dim, D)
+    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
+    tensors["x_mixed"][:] = y.to(torch.bfloat16).reshape(t_dim, D)
     tensors["post"][:] = post_t.reshape(t_dim, HC_MULT)
     tensors["comb"][:] = comb_t.reshape(t_dim, HC_MULT * HC_MULT)
 

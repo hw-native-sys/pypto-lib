@@ -468,8 +468,8 @@ def _golden_hc_head_prefill(x_hc, hc_head_fn, hc_head_scale, hc_head_base):
         for h in range(HC_MULT):
             y += x_view[:, h, :] * pre[:, h:h + 1]
 
-    rounded = (y.contiguous().view(torch.int32) + 0x8000) & -0x10000
-    return rounded.view(torch.float32).to(torch.bfloat16)
+    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
+    return y.to(torch.bfloat16)
 
 
 def golden_mtp_prefill_fwd(tensors):

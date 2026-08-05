@@ -233,11 +233,8 @@ def golden_hc_head(tensors):
         for h in range(HC_MULT):
             y += x_view[:, h, :] * pre[:, h:h + 1]
 
-    def _to_device_bf16(value):
-        rounded = (value.contiguous().view(torch.int32) + 0x8000) & -0x10000
-        return rounded.view(torch.float32).to(torch.bfloat16)
-
-    tensors["y"][:] = _to_device_bf16(y)
+    # Match the kernel's mode="rint" cast (round to nearest, ties to even).
+    tensors["y"][:] = y.to(torch.bfloat16)
 
 
 def build_tensor_specs():
