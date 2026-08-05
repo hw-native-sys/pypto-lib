@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: no-sim    # CI marker: external CCEC attention is A2/A3 onboard only
+# CI PROBE -- comment-only touch so detect-changes runs serving-qwen. Do not merge.
 """Qwen3-14B decode with FP32 inter-layer carry and direct CANN attention.
 
 The projection, QK-norm, RoPE, output projection, MLP, and dependency topology
