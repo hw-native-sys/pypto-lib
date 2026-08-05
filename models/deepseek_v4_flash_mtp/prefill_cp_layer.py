@@ -2,7 +2,8 @@
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
@@ -12,8 +13,6 @@ The rank-local graph composes accepted CP attention with four fixed-size
 baseline MoE waves. Attention, layer-stage, and MoE communication windows
 remain separate so each protocol has one clear owner.
 """
-
-import sys
 
 import torch
 import pypto.language as pl
@@ -48,7 +47,6 @@ from moe import (
     golden_moe,
     moe,
 )
-from config import FLASH as MODEL_CONFIG
 from prefill_cp_swa import (
     CP_CHOICES,
     CP_SIZE,
@@ -56,11 +54,8 @@ from prefill_cp_swa import (
     H,
     HEAD_DIM,
     LOCAL_PARTS,
-    LOCAL_ROWS,
     MAX_SEQ_LEN,
     MAX_SEGMENT_TILES,
-    MIX_HC,
-    NUM_LOCAL_TILES,
     NUM_SEGMENTS,
     O_GROUPS,
     O_GROUP_IN,
@@ -68,7 +63,6 @@ from prefill_cp_swa import (
     ORI_MAX_BLOCKS,
     OVERLAY_ROWS,
     OVERLAY_SOURCES,
-    PRED_OVERLAY_ROWS,
     Q_LORA,
     ROPE_HEAD_DIM,
     TAIL_ROWS,
@@ -161,9 +155,6 @@ def _assert_layer_id(layer_id: int) -> None:
 # wave 0..3 complete. The counter is never reset.
 _ATTN_STAGE = 1          # attention-complete boundary
 _WAVE0_STAGE = 2         # MoE wave 0 complete
-_WAVE1_STAGE = 3         # MoE wave 1 complete
-_WAVE2_STAGE = 4         # MoE wave 2 complete
-_WAVE3_STAGE = 5          # MoE wave 3 complete (final)
 COPY_TOKEN_TILE = 4      # FP32 copy tile: 4 tokens x 1 HC lane x D = 64 KiB
 assert T % COPY_TOKEN_TILE == 0
 
@@ -182,7 +173,7 @@ def _attention_stage_barrier(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_stage_barrier") as stage_tid:
         # Anchor the boundary to every local attention tile producer.
         for k in pl.range(NUM_MOE_WAVES):
-            _anchor = pl.read(x_attn_flat, [k * T, 0, 0])
+            pl.read(x_attn_flat, [k * T, 0, 0])
         one = pl.cast(1, pl.INT32)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
@@ -216,7 +207,7 @@ def _wave_stage_barrier(
     next wave reuses the shared MoE window bank. The output token creates the
     tensor dependency consumed by the next wave."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="wave_stage_barrier") as wave_tid:
-        _anchor = pl.read(wave_out, [0, 0, 0])
+        pl.read(wave_out, [0, 0, 0])
         one = pl.cast(1, pl.INT32)
         for peer in pl.range(CP_SIZE):
             if peer != my_rank:
@@ -260,7 +251,7 @@ def _publish_x_next_after_stage(
     with pl.spmd(
         NUM_MOE_WAVES * wave_blocks,
         name_hint="publish_x_next",
-    ) as _publish_tid:
+    ):
         block = pl.tile.get_block_idx()
         wave = block // wave_blocks
         wave_block = block % wave_blocks
@@ -384,13 +375,13 @@ def _prefill_layer_cp_moe_tail(
         with pl.spmd(
             (T // COPY_TOKEN_TILE) * HC_MULT,
             name_hint="moe_input_copy",
-        ) as _copy_tid:
+        ):
             copy_idx = pl.tile.get_block_idx()
             token_block = copy_idx // HC_MULT
             hc_lane = copy_idx % HC_MULT
             token0 = token_block * COPY_TOKEN_TILE
             # Establish the natural barrier-to-copy tensor dependency.
-            _tok = pl.read(stage_token, [0, 0, 0])
+            pl.read(stage_token, [0, 0, 0])
             x_moe_ready[
                 token0 : token0 + COPY_TOKEN_TILE,
                 hc_lane : hc_lane + 1,
@@ -429,10 +420,9 @@ def _prefill_layer_cp_moe_tail(
     with pl.spmd(
         1,
         name_hint="final_completion_anchor",
-    ) as _anchor_tid:
-        _anchor_idx = pl.tile.get_block_idx()
+    ):
         # Order cleanup after the final all-rank wave boundary.
-        _final_tok = pl.read(stage_token, [0, 0, 0])
+        pl.read(stage_token, [0, 0, 0])
         final_element = pl.slice(
             x_next_work, [1, 1, 8], [final_row, 0, 0]
         )
