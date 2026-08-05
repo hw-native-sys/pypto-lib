@@ -16,11 +16,11 @@ workflow checkpoint. It composes:
 - main compressor (ratio=4, rotate=False)
 - inner compressor (ratio=4, rotate=True)
 - indexer
-- sparse_attn (with fused grouped o_proj)
+- sparse_attn_csa (with fused grouped o_proj)
 - hc_post
 
 The helper stack in this repo has already moved to the refreshed v4 contracts:
-q_proj runs through the W8A8 path, sparse_attn owns grouped o_proj, and the
+q_proj runs through the W8A8 path, sparse_attn_csa owns grouped o_proj, and the
 indexer consumes a prepared `idx_kv_cache` instead of owning the inner
 compressor itself. This file aligns to that stack instead of the older draft
 surface.
@@ -52,7 +52,7 @@ from decode_indexer import indexer
 from qkv_proj_rope import qkv_proj_rope
 from rmsnorm import rms_norm
 from rope_interleave import rope_interleave
-from decode_sparse_attn import sparse_attn
+from decode_sparse_attn_csa import sparse_attn_csa
 
 # model config
 B = DECODE_BATCH
@@ -268,13 +268,13 @@ def attention_csa(
         kv_seq_lens, 0, late_dep,
     )
 
-    # sparse_attn now folds the compressed-slot masking + valid-block flags in from
+    # sparse_attn_csa now folds the compressed-slot masking + valid-block flags in from
     # the raw indexer topk + position, so pass those directly.
     idx_topk_flat = pl.reshape(idx_topk_full, [T, INDEXER_SCORE_LEN])
     position_ids_t1 = pl.reshape(position_ids, [T, 1])
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    sparse_attn(
+    sparse_attn_csa(
         q, kv_cache, window_swa_indices,
         cmp_kv, cmp_block_table, idx_topk_flat, position_ids_t1,
         attn_sink, rope_cos_t, rope_sin_t,
@@ -368,7 +368,7 @@ def golden_attention_csa(tensors):
     from decode_indexer import golden_indexer
     from qkv_proj_rope import golden_qkv_proj_rope
     from rmsnorm import golden_rms_norm
-    from decode_sparse_attn import golden_sparse_attn
+    from decode_sparse_attn_csa import golden_sparse_attn
     from hc_post import golden_hc_post
 
     x_mixed = torch.zeros(T, D, dtype=torch.bfloat16)
@@ -490,7 +490,7 @@ def golden_attention_csa(tensors):
     idx_topk_flat = idx_topk_full.view(T, INDEXER_SCORE_LEN)
 
     attn_out = torch.zeros(T, D, dtype=torch.bfloat16)
-    # sparse_attn folds the compressed-slot masking in (0 <= raw < floor((pos+1)/
+    # sparse_attn_csa folds the compressed-slot masking in (0 <= raw < floor((pos+1)/
     # COMPRESS_RATIO)); pass raw idx_topk + position so the golden masks the same way.
     golden_sparse_attn({
         "q": q,

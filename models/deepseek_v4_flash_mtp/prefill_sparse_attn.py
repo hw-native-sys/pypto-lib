@@ -79,7 +79,7 @@ B_N_TILE = 128
 B_T_TILE = 32
 QUANT_TILE = 512
 QUANT_K_TILE = O_GROUPS * O_LORA // 2
-# o_proj per-group decoupling (mirrors decode_sparse_attn): proj_a_mm (pure cube) ->
+# o_proj per-group decoupling (mirrors decode_sparse_attn_csa): proj_a_mm (pure cube) ->
 # quant (PER-GROUP amax, no global barrier) -> proj_b_mm (pure cube INT32 partials) ->
 # proj_b_act (pure vector dequant+sum). Constants are T/D/O_LORA-derived (T=128 == decode).
 PROJ_A_MM_N_TILE = 128                    # proj_a cube N frag (L0A/L0B wall); PA_NFRAGS per group

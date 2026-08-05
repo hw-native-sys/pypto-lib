@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 sparse attention with grouped output projection (decode)."""
+"""DeepSeek-V4 HCA sparse attention with grouped output projection (decode).
+
+Ratio-128 deterministic compressed tail plus the sliding window; no indexer.
+The SWA and CSA variants live in sibling modules.
+"""
 
 
 import pypto.language as pl
@@ -44,8 +48,7 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
-SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 128
+COMPRESS_RATIO = 128
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
@@ -138,21 +141,10 @@ assert D % PROJ_B_ACT_N_TILE == 0, "proj_b_act vector N-loop must cover D"
 assert O_LORA % B_K_TILE == 0, "proj_b group K-loop covers O_LORA in B_K_TILE iters"
 
 
-def get_standalone_cmp_valid(compress_ratio: int) -> int:
-    """Map demo compress-ratio modes to the valid compressed-cache tail length."""
-    if compress_ratio == 0:
-        return 0
-    if compress_ratio == 4:
-        return CMP_TOPK
-    if compress_ratio == 128:
-        return MAX_SEQ_LEN // compress_ratio
-    raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
-
-
 # Compressed-cache capacity: the ratio-128 layer has no indexer, so its compressed
 # tail is the deterministic full compressed cache, one slot per COMPRESS_RATIO
 # tokens. `index_topk` is the ratio-4 indexer's budget and does NOT bound this.
-CMP_CAPACITY = MAX_SEQ_LEN // DEFAULT_COMPRESS_RATIO
+CMP_CAPACITY = MAX_SEQ_LEN // COMPRESS_RATIO
 # Rounded up to a whole sparse block so TOPK needs no padding (PADDED_TOPK == TOPK).
 CMP_TOPK = ((CMP_CAPACITY + ATTN_K_TILE - 1) // ATTN_K_TILE) * ATTN_K_TILE
 # Longest context this build serves: the compressed tail reaches back
@@ -160,7 +152,7 @@ CMP_TOPK = ((CMP_CAPACITY + ATTN_K_TILE - 1) // ATTN_K_TILE) * ATTN_K_TILE
 # Past it the tail drops its NEWEST slots, leaving a hole between the compressed
 # history and the sliding window -- raise MAX_SEQ_LEN (and the CMP pool sizing the
 # asserts below check) to serve longer, do not cap CMP_TOPK.
-MAX_SUPPORTED_SEQ = CMP_TOPK * DEFAULT_COMPRESS_RATIO
+MAX_SUPPORTED_SEQ = CMP_TOPK * COMPRESS_RATIO
 CMP_BLOCKS_PER_REQ = (CMP_TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
 # HCA sparse-K width: cache-first window slots + the deterministic
 # ratio-128 compressed tail.
@@ -735,18 +727,17 @@ def golden_sparse_attn(tensors):
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
 def build_tensor_specs(
-    compress_ratio: int = DEFAULT_COMPRESS_RATIO,
     causal_regression_fixture: bool = False,
     short_window_fixture: bool = False,
     mixed_topk_fixture: bool = False,
     cache_window_replacement_fixture: bool = False,
 ):
-    """Build deterministic demo tensors for the merged standalone harness."""
+    """Build deterministic demo tensors for the HCA standalone harness."""
     import torch
     from golden import TensorSpec
     from utils import block_table, quant_w_per_channel
 
-    cmp_valid = min(get_standalone_cmp_valid(compress_ratio), TOPK - WIN)
+    cmp_valid = min(CMP_CAPACITY, TOPK - WIN)
 
     def init_q():
         """Initialize the query tensor used by the decode attention stage."""
@@ -876,12 +867,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    # --compress-ratio only selects which compressed-tail data pattern to validate;
-    # the pruned widths are covered by the swa/hca variant tests.
-    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
-                        choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression; use with --compress-ratio 0.")
+                        help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
                         help="Use a short-window topk row with valid prefix + -1 padding.")
     parser.add_argument("--mixed-topk-fixture", action="store_true", default=False,
@@ -897,14 +884,12 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    compress_ratio = args.compress_ratio
-    print(f"compress_ratio={compress_ratio} "
+    print(f"compress_ratio={COMPRESS_RATIO} "
           f"-> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
         fn=sparse_attn_test,
         specs=build_tensor_specs(
-            compress_ratio,
             args.causal_regression_fixture,
             args.short_window_fixture,
             args.mixed_topk_fixture,

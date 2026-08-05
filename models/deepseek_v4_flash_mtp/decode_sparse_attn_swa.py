@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 sparse attention with grouped output projection (decode)."""
+"""DeepSeek-V4 SWA sparse attention with grouped output projection (decode).
+
+Sliding window only -- no compressed cache and no indexer. The CSA and HCA
+variants live in sibling modules.
+"""
 
 
 import pypto.language as pl

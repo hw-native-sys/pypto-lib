@@ -6,7 +6,11 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 sparse attention with grouped output projection (decode)."""
+"""DeepSeek-V4 CSA sparse attention with grouped output projection (decode).
+
+Ratio-4 compressed cache plus the sliding window, with the indexer top-k
+masking folded in. The SWA and HCA variants live in sibling modules.
+"""
 
 
 import pypto.language as pl
@@ -47,13 +51,12 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 # kernel-local
-SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
-DEFAULT_COMPRESS_RATIO = 4
+COMPRESS_RATIO = 4
 # CSA compressed-slot masking (folded in from the CSA orchestrator): raw indexer
 # topk -> per-token bound floor((pos + 1) / COMPRESS_RATIO).
 MAX_SEQ_LEN = M.max_position_embeddings
 INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
-COMPRESS_RATIO_INV = 1.0 / DEFAULT_COMPRESS_RATIO
+COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
 ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 ORI_BLOCK_NUM = DECODE_ORI_BLOCK_NUM
@@ -154,17 +157,6 @@ assert D % PROJ_B_ACT_N_TILE == 0, "proj_b_act vector N-loop must cover D"
 assert O_LORA % B_K_TILE == 0, "proj_b group K-loop covers O_LORA in B_K_TILE iters"
 
 
-def get_standalone_cmp_valid(compress_ratio: int) -> int:
-    """Map demo compress-ratio modes to the valid compressed-cache tail length."""
-    if compress_ratio == 0:
-        return 0
-    if compress_ratio == 4:
-        return IDX_TOPK
-    if compress_ratio == 128:
-        return MAX_SEQ_LEN // compress_ratio
-    raise ValueError(f"Unsupported compress_ratio={compress_ratio}; expected one of {SUPPORTED_COMPRESS_RATIOS}")
-
-
 # CSA/full sparse-K width. SWA and HCA use explicit sibling modules so a
 # combined decode layer can import all three variants in one Python process
 # without relying on import-time config mutation and module-cache order.
@@ -180,7 +172,7 @@ QK_ITEMS = T * SPARSE_BLOCKS
 
 
 @pl.jit.inline
-def sparse_attn(
+def sparse_attn_csa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -613,7 +605,7 @@ def sparse_attn_test(
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T, D], pl.BF16]],
 ):
-    sparse_attn(
+    sparse_attn_csa(
         q,
         ori_kv,
         window_swa_indices,
@@ -644,7 +636,7 @@ def golden_sparse_attn(tensors):
     # Compressed slots: keep raw indexer topk iff 0 <= raw < floor((pos + 1) /
     # COMPRESS_RATIO), else -1 -- the masking sparse_attn now folds in internally.
     raw = tensors["idx_topk"][:, :CMP_TOPK].to(torch.int64)
-    bound = ((tensors["position_ids"][:, 0].to(torch.int64) + 1) // DEFAULT_COMPRESS_RATIO).unsqueeze(1)
+    bound = ((tensors["position_ids"][:, 0].to(torch.int64) + 1) // COMPRESS_RATIO).unsqueeze(1)
     keep = (raw >= 0) & (raw < bound)
     cmp_sparse_indices = torch.where(keep, raw, torch.full_like(raw, -1)).to(torch.int32)
     attn_sink = tensors["attn_sink"].float()
@@ -760,20 +752,19 @@ def golden_sparse_attn(tensors):
     tensors["attn_out"][:] = out.to(torch.bfloat16)
 
 def build_tensor_specs(
-    compress_ratio: int = DEFAULT_COMPRESS_RATIO,
     causal_regression_fixture: bool = False,
     short_window_fixture: bool = False,
     mixed_topk_fixture: bool = False,
     cache_window_replacement_fixture: bool = False,
 ):
-    """Build deterministic demo tensors for the merged standalone harness."""
+    """Build deterministic demo tensors for the CSA standalone harness."""
     import torch
     from golden import TensorSpec
     from utils import block_table, quant_w_per_channel
     from utils import build_rope_tables, materialize_token_rope_tables
 
-    cmp_valid = get_standalone_cmp_valid(compress_ratio)
-    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, compress_ratio, dtype=torch.bfloat16)
+    cmp_valid = IDX_TOPK
+    shared_freqs_cos, shared_freqs_sin = build_rope_tables(M, COMPRESS_RATIO, dtype=torch.bfloat16)
     shared_rope_cos, shared_rope_sin = materialize_token_rope_tables(
         shared_freqs_cos,
         shared_freqs_sin,
@@ -862,7 +853,7 @@ def build_tensor_specs(
     def init_position_ids():
         """Large enough that floor((pos + 1) / COMPRESS_RATIO) >= CMP_TOPK, so the
         per-token bound never clips the fixture slots (mask reduces to raw >= 0)."""
-        return torch.full((T, 1), DEFAULT_COMPRESS_RATIO * CMP_TOPK, dtype=torch.int32)
+        return torch.full((T, 1), COMPRESS_RATIO * CMP_TOPK, dtype=torch.int32)
 
     def init_cos():
         """Build the split-half cosine table used by the inverse-RoPE reference."""
@@ -913,12 +904,8 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    # --compress-ratio only selects which compressed-tail data pattern to validate;
-    # the pruned widths are covered by the swa/hca variant tests.
-    parser.add_argument("--compress-ratio", type=int, default=DEFAULT_COMPRESS_RATIO,
-                        choices=list(SUPPORTED_COMPRESS_RATIOS))
     parser.add_argument("--causal-regression-fixture", action="store_true", default=False,
-                        help="Amplify the S=2 future-window-slot regression; use with --compress-ratio 0.")
+                        help="Amplify the S=2 future-window-slot regression.")
     parser.add_argument("--short-window-fixture", action="store_true", default=False,
                         help="Use a short-window topk row with valid prefix + -1 padding.")
     parser.add_argument("--mixed-topk-fixture", action="store_true", default=False,
@@ -934,14 +921,12 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    compress_ratio = args.compress_ratio
-    print(f"compress_ratio={compress_ratio} "
+    print(f"compress_ratio={COMPRESS_RATIO} "
           f"-> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
     result = run_jit(
         fn=sparse_attn_test,
         specs=build_tensor_specs(
-            compress_ratio,
             args.causal_regression_fixture,
             args.short_window_fixture,
             args.mixed_topk_fixture,
