@@ -13,8 +13,15 @@ concurrency:
 permissions:
   contents: read
 
+# TEMPORARY (draft experiment, revert before merge): every job below is gated
+# off on branch exp/ptoas-op-fusion-ab. That branch exists only to collect a
+# ptoas op-fusion A/B from the A5 daily sweep; nothing it changes is exercised
+# here. The guard is folded into each job's existing condition rather than
+# added as a second `if:` -- a duplicate key is silently accepted by PyYAML but
+# rejected by Actions, which reports it as a failed run with zero jobs.
 jobs:
   build:
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -47,7 +54,10 @@ jobs:
           path: site
 
   deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: >-
+      github.head_ref != 'exp/ptoas-op-fusion-ab' && github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
+      && github.event_name != 'pull_request'
+      && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:

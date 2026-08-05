@@ -4,9 +4,18 @@ on:
   schedule:
     - cron: '0 21 * * *'  # UTC 21:00 = Shanghai 05:00
   workflow_dispatch:
+  # TEMPORARY (draft experiment, revert before merge): run the A5 sweep on every
+  # push to the experiment branch so the op-fusion A/B can be collected without
+  # waiting for the nightly schedule.
+  push:
+    branches: [exp/ptoas-op-fusion-ab]
 
 jobs:
   model-tests-sim:
+    # TEMPORARY (draft experiment): the op-fusion A/B only needs the A5 V4-Pro
+    # sweep. Skip on the experiment branch so a push does not burn the arm64
+    # CPU and 910B runners for an hour each.
+    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
     # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
@@ -129,6 +138,10 @@ jobs:
           path: checkout/results.tsv
 
   model-tests-a2a3:
+    # TEMPORARY (draft experiment): the op-fusion A/B only needs the A5 V4-Pro
+    # sweep. Skip on the experiment branch so a push does not burn the arm64
+    # CPU and 910B runners for an hour each.
+    if: github.ref != 'refs/heads/exp/ptoas-op-fusion-ab'
     # Runs directly on the host like pypto's dist-system-tests — multi-card
     # kernels use HCCL, which needs a host-only env (set_env.sh, HCCL plugin
     # paths); under docker the chip child silent-crashes in comm_init. It holds
@@ -303,6 +316,18 @@ jobs:
     # it, so the existing daily report keeps producing and the A5 table
     # fills in once it runs.
     runs-on: [self-hosted, linux, arm64, npu-a5]
+    # TEMPORARY (draft experiment): two arms of the same V4-Pro sweep, differing
+    # ONLY in the ptoas invocation. `on` is the stock toolchain; `off` appends
+    # --enable-op-fusion=false --enable-shape-inference=false through a wrapper,
+    # so both arms run byte-identical pypto and pypto-lib sources.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fusion: 'on'
+            suffix: ''
+          - fusion: 'off'
+            suffix: '-nofusion'
     # Pro is roughly half the a2a3 sweep (no qwen3 / v3_2 / Flash), so
     # 120 min is generous; keep parity with the other device job's ceiling.
     timeout-minutes: 120
@@ -337,10 +362,47 @@ jobs:
         with:
           checkout-path: checkout
           needs-device: 'true'
-          build-namespace: a5-daily
+          # TEMPORARY (draft experiment): one build tree per arm. setup-ci-job
+          # keys the pypto source tree as pypto-src-<namespace>-<runner>, and its
+          # own docs warn that two jobs sharing one tree will `reset --hard` /
+          # `clean -ffdx` under each other's in-flight configure. The two arms can
+          # land on the same npu-a5 runner, so they must not share it.
+          build-namespace: a5-daily${{ matrix.suffix }}
           pip-cache-name: pip-a5
 
-      - name: Run V4-Pro tests (a5, via task-submit)
+      # TEMPORARY (draft experiment): build the fusion-off ptoas shim.
+      # A wrapper rather than a source change, deliberately -- it keeps the two
+      # arms on completely unmodified pypto/pypto-lib, so the only difference in
+      # the A/B is the assembler command line. pypto resolves the assembler as
+      # $PTOAS_ROOT/ptoas and falls back to $PTOAS_ROOT/bin/ptoas
+      # (python/pypto/backend/_ptoas_locate.py), so a directory holding just an
+      # executable named `ptoas` is enough; overriding PTOAS_ROOT via $GITHUB_ENV
+      # applies to every later step in this job only.
+      - name: Build op-fusion-off ptoas wrapper
+        if: matrix.fusion == 'off'
+        shell: bash
+        run: |
+          set -euo pipefail
+          real="$GITHUB_WORKSPACE/checkout/ptoas-bin"
+          wrap="$GITHUB_WORKSPACE/checkout/ptoas-nofusion"
+          rm -rf "$wrap" && mkdir -p "$wrap"
+          cat > "$wrap/ptoas" <<EOS
+          #!/usr/bin/env bash
+          # Appends the fusion-off flags to every ptoas invocation.
+          # Up to v0.50 <root>/ptoas is the launcher that sets LD_LIBRARY_PATH;
+          # from v0.51 it is a package directory and <root>/bin/ptoas is
+          # self-sufficient. Probe in the same order pypto does.
+          if [ -f "$real/ptoas" ] && [ -x "$real/ptoas" ]; then
+            exec "$real/ptoas" "\$@" --enable-op-fusion=false --enable-shape-inference=false
+          fi
+          exec "$real/bin/ptoas" "\$@" --enable-op-fusion=false --enable-shape-inference=false
+          EOS
+          chmod +x "$wrap/ptoas"
+          echo "PTOAS_ROOT=$wrap" >> "$GITHUB_ENV"
+          echo "Fusion-off wrapper:"; cat "$wrap/ptoas"
+          "$wrap/ptoas" --version || true
+
+      - name: Run V4-Pro tests (a5, op-fusion=${{ matrix.fusion }}, via task-submit)
         shell: bash
         env:
           PYPTO_LOG_LEVEL: error
@@ -422,7 +484,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: results-a5
+          name: results-a5${{ matrix.suffix }}
           path: checkout/results.tsv
 
   summary:
@@ -513,5 +575,7 @@ jobs:
           print("## Daily CI Model Test Results")
           print()
           table("a2a3 and simulators", ["a2a3", "a2a3sim", "a5sim"], "a2a3")
-          table("a5 (DeepSeek V4-Pro)", ["a5"], "a5")
+          # TEMPORARY (draft experiment): second column is the same sweep with
+          # ptoas op fusion disabled. Both arms run identical sources.
+          table("a5 (DeepSeek V4-Pro)", ["a5", "a5-nofusion"], "a5")
           EOF
