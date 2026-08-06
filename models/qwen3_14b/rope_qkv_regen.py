@@ -54,6 +54,7 @@ from pathlib import Path
 import pypto.language as pl
 import torch
 from pypto.backend import BackendType, set_backend_type
+from pypto.runtime import RunConfig
 
 from config import QWEN3_14B_DIMS as D, QWEN3_14B_TILING as T, QWEN3_14B as M
 
@@ -389,8 +390,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     set_backend_type(_backend_type(args.platform))
-    post_pass = rope_qkv_regen.lower(*_dummy_inputs(args.batch))
-    print(f"Lowered program has {len(post_pass.functions)} function(s):")
+    # compile(), NOT lower(): this module exists to produce the codegen artifact
+    # that --emit-header re-wraps (_newest_artifact reads
+    # build_output/_jit_rope_qkv_regen_*/kernels/aiv/rope_qkv.cpp). lower() is
+    # codegen-free and artifact-free by contract, so it would leave the header
+    # regeneration with nothing to read -- and silently, since the run itself
+    # succeeds and CI never passes --emit-header.
+    #
+    # The platform goes in explicitly so compile() cannot fall back to the
+    # DEFAULT backend and collide with the set_backend_type above.
+    compiled = rope_qkv_regen.compile(
+        *_dummy_inputs(args.batch),
+        config=RunConfig(platform=args.platform, backend_type=_backend_type(args.platform)),
+    )
+    post_pass = compiled.program
+    print(f"Compiled program has {len(post_pass.functions)} function(s):")
     for fn in post_pass.functions.values():
         print(f"  {fn.name}: {fn.func_type}")
 
