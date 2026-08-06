@@ -1000,7 +1000,6 @@ def prefill_layer(
     out: pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16],
     layer_idx: pl.Scalar[pl.INT32],
     hidden_ready: pl.Tensor[[2 * BATCH_PAD], pl.INT32],
-    kv_cache_ready: pl.Tensor[[NUM_LAYERS * BATCH_PAD], pl.INT32],
 ) -> pl.Tensor[[PREFILL_TOKENS_DYN, HIDDEN], pl.BF16]:
     hidden_states.bind_dynamic(0, PREFILL_TOKENS_DYN)
     out.bind_dynamic(0, PREFILL_TOKENS_DYN)
@@ -1041,7 +1040,6 @@ def prefill_layer(
         remaining_tok = full_chunk_len_b - group_p0_i32
         chunk_len_b = pl.min(MLP_M_TILE, pl.max(remaining_tok, 0))
         tok_blocks = (chunk_len_b + TOK_TILE - 1) // TOK_TILE
-        kv_ready_idx = pl.cast(layer_idx, pl.INDEX) * BATCH_PAD + b
         hidden_ready_read_slot = hidden_ready_read_base + b
         hidden_ready_write_slot = hidden_ready_write_base + b
         hidden_ready_read_view = pl.slice(hidden_ready, [1], [hidden_ready_read_slot])
@@ -1226,19 +1224,7 @@ def prefill_layer(
                                 fused_qkpv_deps,
                                 rope_ready_deps,
                             )
-                            with pl.at(
-                                level=pl.Level.CORE_GROUP,
-                                name_hint="kv_cache_ready_publish",
-                                deps=[rope_ready_deps[0]],
-                            ) as kv_cache_ready_tid:
-                                prev_kv_ready_value = pl.tensor.read(kv_cache_ready, [kv_ready_idx])
-                                if prev_kv_ready_value >= 0:
-                                    pl.tensor.write(
-                                        kv_cache_ready,
-                                        [kv_ready_idx],
-                                        pl.cast(p0_i32 + final_ti0_i32 + finalize_tok_i32, target_type=pl.INT32),
-                                    )
-                            rope_ready_deps[0] = kv_cache_ready_tid
+                            rope_ready_deps[0] = pl.system.task_dummy(deps=[rope_ready_deps[0]])
                             if block_ctx_blocks == 1:
                                 if finalize_tok == FINALIZE_TOK_GROUP:
                                     attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
@@ -1532,11 +1518,6 @@ def prefill_fwd(
     num_layers_actual = pl.tensor.dim(input_rms_weight, 0)
 
     final_hidden = pl.create_tensor([BATCH_PAD, HIDDEN], dtype=pl.BF16)
-    kv_cache_ready = pl.create_tensor([NUM_LAYERS * BATCH_PAD], dtype=pl.INT32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="kv_cache_ready_seed"):
-        for kv_ready_idx in pl.range(NUM_LAYERS * BATCH_PAD):
-            pl.tensor.write(kv_cache_ready, [kv_ready_idx], pl.cast(0, target_type=pl.INT32))
-
     max_chunk_len = pl.tensor.read(chunk_lens, [0])
     for b in pl.range(1, batch):
         max_chunk_len = pl.max(max_chunk_len, pl.tensor.read(chunk_lens, [b]))
@@ -1618,7 +1599,6 @@ def prefill_fwd(
                             window_next,
                             layer_idx,
                             window_hidden_ready,
-                            kv_cache_ready,
                         )
                 if chunk_len_b > 0:
                     last_group = (chunk_len_b + MLP_M_TILE - 1) // MLP_M_TILE - 1
@@ -1717,7 +1697,6 @@ def prefill_fwd(
                             group_next,
                             layer_idx,
                             group_hidden_ready,
-                            kv_cache_ready,
                         )
                 for b in pl.parallel(0, batch, 1):
                     chunk_len_b = pl.tensor.read(chunk_lens, [b])
