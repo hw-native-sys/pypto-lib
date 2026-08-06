@@ -684,8 +684,7 @@ def valid_ratio_reldiff(
 ):
     """Relative-diff comparator restricted to the valid (active) token rows.
 
-    Mirrors decode_hca's ``ratio_reldiff`` bar and prefill_layer's
-    ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
+    Mirrors decode_hca's ``ratio_reldiff`` bar: the packed buffer carries up to
     ``T`` rows but only the leading ``num_tokens`` participate in attention
     accuracy. The deterministic zero padding is sliced off so it cannot dilute
     the active-token error ratio.

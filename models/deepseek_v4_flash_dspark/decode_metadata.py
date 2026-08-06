@@ -131,7 +131,7 @@ def build_decode_metadata(
     csa_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
     csa_inner_state_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
 ):
-    """Build every position-dependent metadata tensor consumed by decode_fwd."""
+    """Build every position-dependent metadata tensor the decode path consumes."""
     build_swa_metadata(
         position_ids,
         ori_block_table,
