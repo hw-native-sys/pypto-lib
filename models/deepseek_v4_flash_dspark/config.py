@@ -246,7 +246,6 @@ DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
 PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
-MOE_TOKENS = DECODE_TOKENS
 
 # Implementation constants
 BLOCK_SIZE = 128                          # paged-KV page size / weight-quant block size
@@ -281,11 +280,21 @@ INT8_SCALE_MAX = 127.0                    # per-row INT8 quant: clamp scale so |
 INT8_AMAX_EPS = 1e-4                      # amax floor: avoids 127/0 on all-zero rows
 FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax masking)
 
-# EP communication constants
-EP_WORLD_SIZE = 8  # deployment EP world size (demo overrides to 1)
+# Parallelism constants
+TP = 4         # tensor-parallel ranks per DP group
+DP = 4         # DP groups per node
+EP = 16        # expert-parallel world size (moe overrides it from --ep)
 
-# Recv-buffer depth = N_RANKS lanes of MAX_PER_SRC = T rows (distinct top-k, so a
-# source sends at most T rows to a local expert). Recomputed per --ep at import.
-DECODE_RECV_MAX = EP_WORLD_SIZE * DECODE_TOKENS
-PREFILL_RECV_MAX = EP_WORLD_SIZE * PREFILL_TOKENS
+# Per-component TP degree, over the components that shard.
+TP_Q_B = TP            # wq_b: ColumnParallel over heads
+TP_O_A = TP            # wo_a: ColumnParallel over o_groups
+TP_O_B = TP            # wo_b: RowParallel, then allreduce
+TP_ATTN_SINK = TP      # attn_sink: one entry per local head
+TP_SHARED_EXPERT = TP  # shared expert: gate_up ColumnParallel, down RowParallel then allreduce
+TP_VOCAB = TP          # embed_tokens / lm_head: vocab-parallel
+
+# MoE constants
+MOE_TOKENS = DECODE_TOKENS * DP // EP
+DECODE_RECV_MAX = DP * DECODE_TOKENS
+PREFILL_RECV_MAX = DP * PREFILL_TOKENS
 RECV_MAX = DECODE_RECV_MAX

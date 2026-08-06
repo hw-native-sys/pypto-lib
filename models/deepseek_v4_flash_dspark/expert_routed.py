@@ -16,7 +16,7 @@ into ``expert_shared.py``; both kernels are composed in ``moe.py``.
 import pypto.language as pl
 
 from config import (FLASH as M, DECODE_BATCH, DECODE_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS,
-                    EP_WORLD_SIZE, RECV_MAX)
+                    EP, RECV_MAX)
 
 
 # model config
@@ -28,7 +28,7 @@ MOE_INTER = M.moe_intermediate_size
 SWIGLU_LIMIT = M.swiglu_limit
 
 # EP layout / recv buffers (single-card view: kernel only sees the local shard)
-N_LOCAL_EXPERTS = M.n_routed_experts // EP_WORLD_SIZE
+N_LOCAL_EXPERTS = M.n_routed_experts // EP
 
 # tiling
 RECV_TILE = 16
