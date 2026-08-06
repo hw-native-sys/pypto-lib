@@ -13,6 +13,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
@@ -280,7 +281,7 @@ def _quantize_weight_per_out(w):
     return w_i32.to(torch.float16).to(torch.int8), 1.0 / scale_quant
 
 
-def build_tensor_specs(batch=DECODE_BATCH, seq=DECODE_SEQ):
+def build_tensor_specs(batch=DECODE_BATCH // TP, seq=DECODE_SEQ):
     import torch
     from golden import TensorSpec
     t = batch * seq
@@ -352,7 +353,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     modes = {
-        "decode": (DECODE_BATCH, DECODE_SEQ),
+        "decode": (DECODE_BATCH // TP, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
     for mode in (modes if args.mode == "all" else [args.mode]):

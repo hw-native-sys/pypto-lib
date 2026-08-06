@@ -12,7 +12,7 @@ attention-normalized inputs for both decode and prefill attention paths."""
 
 import pypto.language as pl
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
 
 
 # Dynamic shape variables.
@@ -58,18 +58,18 @@ KV_RMS_T_TILE = 8       # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 Q_ROPE_H_TILE = 4       # heads per fused qproj dequant/rms/rope task; cos/sin build amortizes over them
 assert H % Q_ROPE_H_TILE == 0
-assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
+assert (DECODE_BATCH // TP * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 for _m_tile in (QR_M_TILE, KV_M_TILE, QPROJ_M_TILE):
     assert (PREFILL_BATCH * PREFILL_SEQ) % _m_tile == 0
-    assert (DECODE_BATCH * DECODE_SEQ) % _m_tile == 0 or DECODE_BATCH * DECODE_SEQ <= _m_tile
+    assert (DECODE_BATCH // TP * DECODE_SEQ) % _m_tile == 0 or DECODE_BATCH // TP * DECODE_SEQ <= _m_tile
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
 assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 4 == 0
 assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
-assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
+assert (DECODE_BATCH // TP * DECODE_SEQ) % KV_RMS_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % KV_RMS_T_TILE == 0
-assert (DECODE_BATCH * DECODE_SEQ) % Q_ROPE_T_TILE == 0
+assert (DECODE_BATCH // TP * DECODE_SEQ) % Q_ROPE_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % Q_ROPE_T_TILE == 0
 
 
@@ -549,7 +549,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     MODES = {
-        "decode":  (DECODE_BATCH, DECODE_SEQ),
+        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 
