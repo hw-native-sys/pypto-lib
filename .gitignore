@@ -21,6 +21,7 @@ develop-eggs/
 # Project build artifacts
 build_output/
 pa_build/
+site/
 
 # Virtual environments
 .env/

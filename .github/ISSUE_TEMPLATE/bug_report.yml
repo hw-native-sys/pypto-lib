@@ -24,8 +24,8 @@ body:
       label: Description
       description: Clear description of the bug and how to reproduce it
       placeholder: |
-        1. Set up the environment using `/setup_env`
-        2. Run `python3 examples/softmax_example.py`
+        1. Set up the environment using `docs/get-started/installation.md`
+        2. Run `python examples/intermediate/softmax.py -p a2a3sim`
         3. Observe the error...
     validations:
       required: true

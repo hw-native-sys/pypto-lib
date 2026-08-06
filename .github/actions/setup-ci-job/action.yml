@@ -298,7 +298,48 @@ runs:
     - name: Check NPU
       if: ${{ inputs.needs-device == 'true' }}
       shell: bash
-      run: npu-smi info
+      # Since the A5 host's driver upgrade its device nodes are
+      # `crw-rw---- HwHiAiUser:HwHiAiUser`, and the CI user is not in that
+      # group. dcmi_init then cannot open the character device, and npu-smi
+      # exits 187 with "dcmi module initialize failed. ret is -8005" — which
+      # reads like a missing DCMI component but is plain permission denial
+      # (npu-smi lists "Failed to open the character device" among its own
+      # candidate causes). task-submit drops privileges into the HwHiAiUser
+      # group, which is how every model run reaches a card in the first place.
+      #
+      # Direct first: on hosts whose nodes are still world-readable it works,
+      # and the check then costs no device lease and no queue wait.
+      run: |
+        rc=0
+        npu-smi info || rc=$?
+        if [ "$rc" -eq 0 ]; then
+          exit 0
+        fi
+        echo "npu-smi failed directly (exit $rc); the device nodes are likely"
+        echo "group-restricted. Retrying through task-submit ..."
+        # The payload ends on `rc=$?; exit $rc` rather than on `npu-smi info`:
+        # with the probe as the bare last command task-submit reports 215 even
+        # though npu-smi returned 0 (reproduced 3/3 on an A5 host). Setting the
+        # status explicitly makes the outer code npu-smi's own — verified to
+        # pass 0, 9 and 127 through unchanged.
+        #
+        # NPUSMI_RC is a sentinel that separates the two ways this can fail.
+        # task-submit leases a real card, so a busy queue makes it give up on
+        # the wait and exit 1 having never run anything — that says nothing
+        # about the NPU and must not fail a diagnostic step. If the sentinel is
+        # present the probe really ran, and its status is authoritative.
+        rc=0
+        out=$(task-submit --device "${DEVICE_ID:-auto}" --timeout 240 --max-time 60 \
+          --run 'npu-smi info; rc=$?; echo "NPUSMI_RC=$rc"; exit $rc' 2>&1) || rc=$?
+        printf '%s\n' "$out"
+        if ! printf '%s' "$out" | grep -q 'NPUSMI_RC='; then
+          echo "::warning::Could not obtain a card from the device queue within"
+          echo "the wait, so the NPU was never probed. Continuing — every model"
+          echo "run goes through task-submit and will fail loudly if no device"
+          echo "is actually available."
+          exit 0
+        fi
+        exit "$rc"
 
     # Namespace the cache by pto-isa commit so a pto-isa bump can never serve
     # stale objects compiled against the old ISA headers (see issue #1139):

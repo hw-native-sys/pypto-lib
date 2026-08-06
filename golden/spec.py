@@ -48,15 +48,16 @@ class TensorSpec:
         is_output: If ``True``, the tensor is an output to be validated against the
             golden reference.
         resident: Keep this tensor device-resident (``child_memory``): the harness
-            uploads it once and reuses it across the validation dispatch and every
+            uploads inputs once and reuses them across the validation dispatch and every
             benchmark round, skipping the per-dispatch host→device upload and
             device→host readback. Only supported for L3 distributed programs.
-            Combine with ``is_output=True`` for a read-write **resident state
-            buffer** (e.g. a KV cache the kernel updates in place every dispatch):
-            it is uploaded once as its initial state (from ``init_value``), updated
-            on-device across dispatches, and read back **once** at the end (via
-            ``copy_stacked_from`` / ``copy_from``) for golden validation — trading
-            the per-dispatch H2D+D2H of a plain output for a single end-of-run D2H.
+            A pure ``Out`` resident is allocated uninitialized; its zero-filled
+            host placeholder is not uploaded. Combine with ``is_output=True``
+            for either a pure output or a read-write **resident state buffer**
+            (e.g. a KV cache): an ``InOut`` state is uploaded once from
+            ``init_value``, both kinds are updated on-device, and they are read
+            back **once** at the end (via ``copy_stacked_from`` / ``copy_from``)
+            when golden validation is enabled.
             Values:
 
             - ``None`` / ``False`` — not resident (default).

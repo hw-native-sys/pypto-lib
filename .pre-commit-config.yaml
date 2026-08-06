@@ -15,6 +15,13 @@ repos:
         language_version: python3
         pass_filenames: false
 
+      - id: check-public-docs
+        name: check-public-docs
+        entry: python tests/lint/check_public_docs.py
+        language: python
+        language_version: python3
+        pass_filenames: false
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.8
     hooks:

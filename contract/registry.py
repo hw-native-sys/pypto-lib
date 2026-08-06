@@ -30,7 +30,7 @@ def _normalize(value: str) -> str:
 @lru_cache(maxsize=1)
 def _qwen3_14b_registration() -> ContractRegistration:
     root = Path(__file__).resolve().parents[1]
-    variant_dir = root / "models" / "qwen3" / "14b"
+    variant_dir = root / "models" / "qwen3_14b"
     module = _load_registration_module(
         "_pypto_lib_qwen3_14b_contract",
         variant_dir,

@@ -569,31 +569,83 @@ def _report_l3_detail(stats: Any, compiled: Any, *, resident: bool) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _print_eff_summary(label: str, samples: Any, *, indent: int) -> None:
+    """Print one ``eff_us`` min/median/mean/max line for *samples*, or ``(no timing)``.
+
+    Zero samples are dropped first (a round with no orch/sched span reads 0).
+    *indent* is the space count after the ``[RUN]`` tag, which is how the
+    per-dispatch lines nest under their rank.
+
+    The line uses an ``eff_us`` token, never ``effective_us``, so the Daily-CI
+    collector's ``effective_us`` match cannot select it.
+    """
+    eff = [e for e in samples if e > 0.0]
+    pad = " " * indent
+    if not eff:
+        print(f"[RUN]{pad}{label}: (no timing)", flush=True)
+        return
+    print(
+        f"[RUN]{pad}{label}: eff_us min={min(eff):.1f} "
+        f"median={statistics.median(eff):.1f} "
+        f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
+        flush=True,
+    )
+
+
+def _per_dispatch_effective(stats: Any) -> dict[tuple[int, int], list[float]]:
+    """``{(pid, slot): [per-round Effective ...]}``, or ``{}`` when not worth printing.
+
+    ``slot`` is the dispatch's position within its rank's round, so slot ``s`` is
+    the same dispatch in every round and nothing is summed — unlike ``per_rank``.
+
+    Returns ``{}`` when the breakdown would add nothing: the installed pypto
+    predates ``per_dispatch``, there is no dispatch grid (L2 / flatten fallback),
+    or no rank issues more than one dispatch per round (every slot line would
+    just restate its rank line).
+    """
+    per_dispatch_fn = getattr(stats, "per_dispatch", None)
+    if per_dispatch_fn is None:
+        return {}  # installed pypto predates the per-dispatch view
+    per_dispatch = per_dispatch_fn("effective")
+    if not per_dispatch:
+        return {}
+    if len(per_dispatch) <= len({pid for pid, _slot in per_dispatch}):
+        return {}  # at most one dispatch per rank: nothing the rank lines fuse
+    return per_dispatch
+
+
 def _report_l3_per_rank(stats: Any) -> None:
-    """Print each rank's Effective summary for an L3 run.
+    """Print each rank's Effective summary for an L3 run, with its dispatches.
 
     Uses ``BenchmarkStats.per_rank("effective")`` — ``{pid: [per-round ...]}``
     where each round entry is that rank's summed dispatch Effective window — to
     surface the cross-card imbalance the headline (per-round max across ranks)
     hides. No-op for L2 and the flatten fallback (``per_rank`` returns ``{}``).
 
-    The per-rank lines deliberately use an ``eff_us`` token, so the Daily-CI
-    collector's ``effective_us`` match never selects them.
+    Because a rank entry **sums** that card's dispatches (a card runs them
+    serially), one nested ``slot`` line per dispatch follows each rank line,
+    read from ``per_dispatch`` and labelled with the orchestration function
+    ``dispatch_tasks()`` names. Those appear only when some rank dispatches more
+    than once per round (see :func:`_per_dispatch_effective`); then every rank's
+    dispatches are listed, so single-dispatch ranks show one slot line restating
+    their rank line and the block stays a complete table.
+
+    All lines use an ``eff_us`` token, so the Daily-CI collector's
+    ``effective_us`` match never selects them.
     """
     rank_eff = stats.per_rank("effective")
     if not rank_eff:
         return
+    tasks = getattr(stats, "dispatch_tasks", dict)() or {}
+    by_rank: dict[int, list[tuple[int, str, list[float]]]] = {}
+    for key, samples in _per_dispatch_effective(stats).items():
+        pid, slot = key
+        by_rank.setdefault(pid, []).append((slot, tasks.get(key, ""), samples))
     for pid in sorted(rank_eff):
-        eff = [e for e in rank_eff[pid] if e > 0.0]
-        if not eff:
-            print(f"[RUN]     rank {pid}: (no timing)", flush=True)
-            continue
-        print(
-            f"[RUN]     rank {pid}: eff_us min={min(eff):.1f} "
-            f"median={statistics.median(eff):.1f} "
-            f"mean={statistics.fmean(eff):.1f} max={max(eff):.1f}",
-            flush=True,
-        )
+        _print_eff_summary(f"rank {pid}", rank_eff[pid], indent=5)
+        for slot, task, samples in sorted(by_rank.get(pid, []), key=lambda entry: entry[0]):
+            label = f"slot {slot}" + (f" ({task})" if task else "")
+            _print_eff_summary(label, samples, indent=7)
 
 
 def _l3_ordered_args(
@@ -711,10 +763,57 @@ def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
         tensors[name] = t.cpu().contiguous().share_memory_()
 
 
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip only a terminal ``__ssa_vN`` suffix from a compiled parameter name."""
+    base, marker, version = name.rpartition("__ssa_v")
+    return base if marker and version.isdigit() else name
+
+
 def _l3_ordered_names(compiled: Any) -> list[str]:
     """Parameter names in orchestration order (SSA suffix ``orig__ssa_vN`` -> ``orig``)."""
     param_infos, _, _ = compiled._get_metadata()
-    return [p.name.split("__ssa_")[0] for p in param_infos]
+    return [_strip_ssa_suffix(p.name) for p in param_infos]
+
+
+def _l3_pure_out_names(compiled: Any) -> set[str]:
+    """Names of write-only L3 parameters that need no resident initialization."""
+    from pypto.ir import ParamDirection
+
+    param_infos, _, _ = compiled._get_metadata()
+    normalized_names = [_strip_ssa_suffix(p.name) for p in param_infos]
+    if len(set(normalized_names)) != len(normalized_names):
+        raise ValueError("compiled L3 parameters collide after stripping SSA suffixes")
+    return {
+        name
+        for name, p in zip(normalized_names, param_infos, strict=True)
+        if p.direction == ParamDirection.Out
+    }
+
+
+def _alloc_empty_stacked_tensor(rt: Any, spec: TensorSpec) -> Any:
+    """Allocate one uninitialized shard per rank for a pure ``Out`` resident."""
+    from pypto.runtime import StackedDeviceTensor
+
+    shape = tuple(spec.shape)
+    if len(shape) < 2 or shape[0] < 1:
+        raise ValueError(
+            f"TensorSpec {spec.name!r}: resident=\"stacked\" needs shape [B, *tail], got {shape}"
+        )
+    worker_ids = tuple(range(int(shape[0])))
+    shards = []
+    try:
+        for wid in worker_ids:
+            shards.append(
+                rt.alloc_tensor(shape[1:], spec.dtype, init=None, worker_id=wid)
+            )
+        return StackedDeviceTensor(shards, shape, worker_ids)
+    except Exception:
+        for shard, wid in zip(shards, worker_ids, strict=False):
+            try:
+                rt.free_tensor(shard, worker_id=wid)
+            except Exception:  # noqa: BLE001 - preserve the allocation/construction error
+                pass
+        raise
 
 
 def _l3_run_config(runtime_cfg: dict[str, Any]) -> Any:
@@ -785,13 +884,12 @@ def _run_l3_resident(
 
     Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
     that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
-    Each resident spec is uploaded once via ``rt.alloc_tensor(init=...)`` and
-    reused across the validation dispatch and every benchmark round, so its
-    weight is never re-uploaded (H2D) or read back (D2H); per-call IO stays
-    shared-memory host tensors reused in place. A resident spec that is also an
-    output is a read-write state buffer (e.g. a KV cache): uploaded once as its
-    initial state, updated in place on-device, and read back once before
-    validation via :func:`_readback_resident_outputs`.
+    Each resident input / ``InOut`` spec is uploaded once via
+    ``rt.alloc_tensor(init=...)`` and reused across the validation dispatch and
+    every benchmark round. A pure ``Out`` resident is allocated uninitialized,
+    because its host tensor is only an output destination and uploading its
+    zero-filled placeholder would be wasted work. Resident outputs are read back
+    once before golden validation via :func:`_readback_resident_outputs`.
 
     When :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused
     for :func:`_bench_loop_sizes` timed rounds. This cannot go through
@@ -825,6 +923,7 @@ def _run_l3_resident(
     _share_in_place(tensors)
 
     ordered_names = _l3_ordered_names(compiled)
+    pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
     bench = _bench_enabled()
@@ -861,21 +960,25 @@ def _run_l3_resident(
                 for s in resident_specs:
                     if s.resident == "stacked":
                         # Leading-dim sharded: shard i of a [world_size, *tail] weight
-                        # uploaded to card i (identity worker_ids), matching a
+                        # placed on card i (identity worker_ids), matching a
                         # ``for r: child(x[r], device=r)`` orchestrator.
-                        if not hasattr(rt, "alloc_stacked_tensor"):
+                        if s.name in pure_out_names:
+                            handle = _alloc_empty_stacked_tensor(rt, s)
+                        elif not hasattr(rt, "alloc_stacked_tensor"):
                             raise ValueError(
                                 f"TensorSpec {s.name!r}: resident=\"stacked\" needs a pypto runtime "
                                 f"exposing DistributedWorker.alloc_stacked_tensor; this runtime lacks it."
                             )
-                        handle = rt.alloc_stacked_tensor(tensors[s.name])
+                        else:
+                            handle = rt.alloc_stacked_tensor(tensors[s.name])
                         resident_handles.append((s.name, handle, True, 0))
                     else:
                         # Whole-tensor resident on a single card: resident is the int
                         # worker id (0, 1, ...) the consuming kernel is dispatched to.
                         wid = int(s.resident)
+                        init = None if s.name in pure_out_names else tensors[s.name]
                         handle = rt.alloc_tensor(
-                            tuple(s.shape), s.dtype, init=tensors[s.name], worker_id=wid
+                            tuple(s.shape), s.dtype, init=init, worker_id=wid
                         )
                         resident_handles.append((s.name, handle, False, wid))
                 resident_args = {name: handle for name, handle, _, _ in resident_handles}

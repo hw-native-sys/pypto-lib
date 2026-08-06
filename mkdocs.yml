@@ -1,0 +1,101 @@
+site_name: PyPTO-Lib
+site_description: Kernels, model implementations, and validation workflows built with PyPTO
+site_url: https://hw-native-sys.github.io/pypto-lib/
+repo_url: https://github.com/hw-native-sys/pypto-lib
+repo_name: hw-native-sys/pypto-lib
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+exclude_docs: |
+  _hooks/
+  requirements.txt
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.action.edit
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+hooks:
+  - docs/_hooks/repo_links.py
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Get Started:
+      - Overview: get-started/index.md
+      - Installation and environment: get-started/installation.md
+      - Run your first kernel: get-started/first-kernel.md
+      - Platforms and devices: get-started/platforms.md
+  - PyPTO Coding:
+      - Overview: pypto-coding/index.md
+      - PyPTO coding style: pypto-coding/pypto-coding-style.md
+      - CCE extern kernel: pypto-coding/cce-extern-kernel.md
+  - Run and Validate:
+      - Overview: run-and-validate/index.md
+      - Compile and runtime workflow: run-and-validate/compile-runtime-workflow.md
+      - Golden Harness: run-and-validate/golden-harness.md
+      - Save and replay golden data: run-and-validate/save-and-replay.md
+  - Examples:
+      - Overview: examples/index.md
+      - Beginner: examples/beginner.md
+      - Intermediate: examples/intermediate.md
+      - Advanced and distributed: examples/advanced.md
+  - Models:
+      - Overview: models/index.md
+      - Qwen3-14B: models/qwen3_14b.md
+      - DeepSeek V4-Flash (MTP): models/deepseek_v4_flash_mtp.md
+      - DeepSeek V4-Pro: models/deepseek_v4_pro.md
+  - Debug and Tune:
+      - Overview: debug-and-tune/index.md
+      - Debugging: debug-and-tune/debugging.md
+      - Precision tuning: debug-and-tune/precision-tuning.md
+      - Performance tuning: debug-and-tune/performance-tuning.md
+      - Cube tile tuning: debug-and-tune/cube-tile-tuning.md
+      - In-core simulator profiling: debug-and-tune/incore-simulator-profiling.md
+      - CCE in-core profiling: debug-and-tune/cce-incore-profiling.md

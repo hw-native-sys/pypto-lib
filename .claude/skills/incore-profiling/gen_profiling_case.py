@@ -9,16 +9,17 @@
 """Generate a standalone camodel (msprof op-simulator) testcase for ONE PTOAS kernel.
 
 This is the **profiling-focused** testcase generator for the incore-profiling skill.
-It is a drop-in replacement for the legacy PTOAS validation-harness generator:
-same CLI, same output files, but ~10x smaller because it does ONE job — produce a
+It is a focused replacement for the legacy PTOAS validation-harness generator:
+compatible core CLI, same output files, but ~10x smaller because it does ONE job — produce a
 buildable+runnable sim testcase so the camodel can time the kernel — and drops the
 entire correctness-validation machinery (golden compare, ULP tolerances, scatter/
 gather/mrgsort special-casing, runtime int-expression buffer-size inference).
 
 Why it can be small: buffer sizes come straight from the sibling ``<kernel>.pto``'s
-``make_tensor_view`` shape constants (static), instead of being inferred from the
-compiled C++ kernel's runtime pointer arithmetic. The kernel ABI (name, arg types,
-order) comes from the one ``__global__``/``_aic`` declaration line in the ``.cpp``.
+``make_tensor_view`` shapes. Runtime dimensions use an explicit allocation bound,
+and generated code rejects direct scalar dimensions above that bound. The kernel
+ABI (name, arg types, order) comes from the one ``__global__``/``_aic`` declaration
+line in the ``.cpp``.
 
 It emits, at ``<output-root>/ptoas/<testcase>/``:
   - ``<testcase>_kernel.cpp`` : the input .cpp + a compat preamble (+ a merged
@@ -58,8 +59,8 @@ _CPP_TO_NP = {
     "int64_t": "np.int64",
     "uint64_t": "np.uint64",
 }
-# Fallback sizes (elements) when a shape can't be read statically from the .pto.
-_DEFAULT_DYNAMIC = 256  # for make_tensor_view shape = [%argN] (runtime-sized, e.g. seq_lens)
+# Default allocation bound (elements) for make_tensor_view runtime dimensions.
+_DEFAULT_DYNAMIC = 256
 _DEFAULT_SCRATCH = 1 << 20  # GM pointers with no make_tensor_view (e.g. the cube<->vector pipe slot)
 
 
@@ -125,37 +126,60 @@ def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
 
 
 # ── Parse the sibling .pto for static buffer sizes ───────────────────────────
-def _parse_dim_list(blob: str) -> list[int]:
-    """Parse a .pto ``[%cN_index, %argM, ...]`` dim/stride list to ints.
+def _parse_dim_list(blob: str, dynamic_dim: int) -> tuple[list[int], set[int]]:
+    """Parse a .pto ``[%cN_index, %argM, ...]`` dim/stride list.
 
     A constant ``%cN_index`` yields its value; a dynamic ``%argN`` (runtime) or
-    any other non-constant token yields ``_DEFAULT_DYNAMIC``.
+    stride yields ``dynamic_dim`` and records the scalar argument. Computed SSA
+    dimensions are rejected because this focused generator cannot bound them
+    safely.
     """
     out: list[int] = []
+    dynamic_args: set[int] = set()
     for tok in blob.split(","):
-        cm = re.match(r"%c(\d+)_index", tok.strip())
-        out.append(int(cm.group(1)) if cm else _DEFAULT_DYNAMIC)
-    return out
+        token = tok.strip()
+        cm = re.fullmatch(r"%c(\d+)_index", token)
+        if cm:
+            out.append(int(cm.group(1)))
+            continue
+        am = re.fullmatch(r"%arg(\d+)", token)
+        if am:
+            out.append(dynamic_dim)
+            dynamic_args.add(int(am.group(1)))
+            continue
+        raise ValueError(
+            f"cannot safely bound computed PTO dimension {token!r}; "
+            "use incore_profile.py --ptoas-root with the full PTOAS generator"
+        )
+    return out, dynamic_args
 
 
-def parse_pto_sizes(pto_text: str) -> dict[int, int]:
-    """Map GM arg index -> element count, from ``make_tensor_view`` shape + strides.
+def parse_pto_sizes(pto_text: str, dynamic_dim: int = _DEFAULT_DYNAMIC) -> tuple[dict[int, int], set[int]]:
+    """Return GM element counts and scalar args used as runtime dimensions.
 
     Allocates the true linear footprint ``1 + Σ_d (shape[d]-1)*stride[d]`` rather
     than ``prod(shape)``, so a padded/strided view (physical stride larger than
     the shape) is not under-allocated. Constant dims use their value; a dynamic
-    dim (``%argN``) uses ``_DEFAULT_DYNAMIC``. Keeps the largest footprint across
+    dim (``%argN``) uses ``dynamic_dim``. Keeps the largest footprint across
     an arg's views (a safe upper bound on what the kernel touches).
     """
+    if dynamic_dim <= 0:
+        raise ValueError(f"dynamic_dim must be greater than zero, got {dynamic_dim}")
     sizes: dict[int, int] = {}
+    dynamic_args: set[int] = set()
     pat = re.compile(
         r"make_tensor_view\s+%arg(\d+),\s*shape\s*=\s*\[([^\]]*)\]"
         r"(?:,\s*strides\s*=\s*\[([^\]]*)\])?"
     )
     for m in pat.finditer(pto_text):
         argn = int(m.group(1))
-        shape = _parse_dim_list(m.group(2))
-        strides = _parse_dim_list(m.group(3)) if m.group(3) else None
+        shape, shape_args = _parse_dim_list(m.group(2), dynamic_dim)
+        dynamic_args.update(shape_args)
+        if m.group(3):
+            strides, stride_args = _parse_dim_list(m.group(3), dynamic_dim)
+            dynamic_args.update(stride_args)
+        else:
+            strides = None
         if strides and len(strides) == len(shape):
             footprint = 1 + sum((s - 1) * st for s, st in zip(shape, strides))
         else:  # no/mismatched strides -> contiguous product
@@ -163,7 +187,7 @@ def parse_pto_sizes(pto_text: str) -> dict[int, int]:
             for s in shape:
                 footprint *= s
         sizes[argn] = max(sizes.get(argn, 0), footprint)
-    return sizes
+    return sizes, dynamic_args
 
 
 def elem_count_for(param_idx: int, pto_sizes: dict[int, int]) -> int:
@@ -262,6 +286,7 @@ int main() {
 @ALLOC@
 @READ_INPUTS@
 @COPY_TO_DEVICE@
+@DYNAMIC_GUARDS@
     @LAUNCH_CALL@
 
     ACL_CHECK(aclrtSynchronizeStream(stream));
@@ -437,7 +462,13 @@ def emit_launch_cpp(name: str, params: list[Param]) -> str:
     )
 
 
-def emit_main_cpp(name: str, params: list[Param], counts: dict[str, int]) -> str:
+def emit_main_cpp(
+    name: str,
+    params: list[Param],
+    counts: dict[str, int],
+    dynamic_args: set[int],
+    dynamic_dim: int,
+) -> str:
     launch_name = "Launch" + name[:1].upper() + name[1:]
     ptrs = [p for p in params if p.is_ptr]
     scalars = [p for p in params if not p.is_ptr]
@@ -463,6 +494,27 @@ def emit_main_cpp(name: str, params: list[Param], counts: dict[str, int]) -> str
     for p in scalars:
         decls.append(f"    {p.cpp_type} {p.name} = 1;")  # safe default (matches legacy)
 
+    guards = []
+    for argn in sorted(dynamic_args):
+        if argn >= len(params) or params[argn].is_ptr:
+            raise ValueError(
+                f"PTO runtime dimension %arg{argn} is not a scalar kernel parameter; "
+                "use the full PTOAS testcase generator"
+            )
+        scalar = params[argn]
+        guards.extend(
+            [
+                f"    if (static_cast<long double>({scalar.name}) < 0.0L ||",
+                f"        static_cast<long double>({scalar.name}) > {dynamic_dim}.0L) {{",
+                f'        std::fprintf(stderr, "[ERROR] dynamic scalar {scalar.name} exceeds '
+                f"the generated allocation bound [0, {dynamic_dim}]. "
+                'Regenerate with a larger --dynamic-dim instead of patching only main.cpp.\\n");',
+                "        rc = 2;",
+                "        goto cleanup;",
+                "    }",
+            ]
+        )
+
     launch_args = ", ".join((f"{p.name}Device" if p.is_ptr else p.name) for p in params)
     launch_decl_params = ", ".join(
         (f"{host_type(p.cpp_type)} *{p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
@@ -473,6 +525,7 @@ def emit_main_cpp(name: str, params: list[Param], counts: dict[str, int]) -> str
     text = text.replace("@ALLOC@", "\n".join(alloc))
     text = text.replace("@READ_INPUTS@", "\n".join(reads))
     text = text.replace("@COPY_TO_DEVICE@", "\n".join(copy))
+    text = text.replace("@DYNAMIC_GUARDS@", "\n".join(guards))
     text = text.replace("@LAUNCH_CALL@", f"{launch_name}({launch_args}, stream);")
     text = text.replace("@FREE@", "\n".join(free))
     return text
@@ -493,7 +546,13 @@ def emit_golden(params: list[Param], counts: dict[str, int]) -> str:
     return _GOLDEN_TEMPLATE.replace("@INPUT_GENERATE@", "\n".join(lines))
 
 
-def generate(input_cpp: Path, testcase: str, output_root: Path, aicore_arch: str) -> Path:
+def generate(
+    input_cpp: Path,
+    testcase: str,
+    output_root: Path,
+    aicore_arch: str,
+    dynamic_dim: int = _DEFAULT_DYNAMIC,
+) -> Path:
     cpp_text = input_cpp.read_text(encoding="utf-8")
     pto_path = input_cpp.with_suffix(".pto")
     if not pto_path.is_file():
@@ -502,7 +561,7 @@ def generate(input_cpp: Path, testcase: str, output_root: Path, aicore_arch: str
             "The .pto carries the static tensor shapes used for buffer sizing."
         )
     name, is_mixed, params = parse_cpp(cpp_text)
-    pto_sizes = parse_pto_sizes(pto_path.read_text(encoding="utf-8"))
+    pto_sizes, dynamic_args = parse_pto_sizes(pto_path.read_text(encoding="utf-8"), dynamic_dim)
 
     counts: dict[str, int] = {}
     for i, p in enumerate(params):
@@ -515,12 +574,20 @@ def generate(input_cpp: Path, testcase: str, output_root: Path, aicore_arch: str
         emit_kernel_cpp(cpp_text, name, is_mixed, params), encoding="utf-8"
     )
     (out_dir / "launch.cpp").write_text(emit_launch_cpp(name, params), encoding="utf-8")
-    (out_dir / "main.cpp").write_text(emit_main_cpp(name, params, counts), encoding="utf-8")
+    (out_dir / "main.cpp").write_text(
+        emit_main_cpp(name, params, counts, dynamic_args, dynamic_dim), encoding="utf-8"
+    )
     (out_dir / "CMakeLists.txt").write_text(
         _CMAKE_TEMPLATE.replace("@TESTCASE@", testcase).replace("@AICORE_ARCH@", aicore_arch),
         encoding="utf-8",
     )
     (out_dir / "golden.py").write_text(emit_golden(params, counts), encoding="utf-8")
+    if dynamic_args:
+        refs = ", ".join(f"%arg{argn}" for argn in sorted(dynamic_args))
+        print(
+            f"[gen_profiling_case] {refs} use --dynamic-dim={dynamic_dim}; "
+            "generated main.cpp rejects larger direct scalar values"
+        )
     return out_dir
 
 
@@ -532,10 +599,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-mode", default="sim", choices=["sim", "npu"], help="CLI compat (sim only)")
     ap.add_argument("--soc-version", default="Ascend910B1", help="CLI compat (cmake -DSOC_VERSION)")
     ap.add_argument("--aicore-arch", default="dav-c220", help="--cce-aicore-arch (a2a3 / a5)")
+    ap.add_argument(
+        "--dynamic-dim",
+        type=int,
+        default=_DEFAULT_DYNAMIC,
+        help="Allocation bound for each runtime-shaped dimension; generated main.cpp "
+        "rejects direct scalar dimensions above this value",
+    )
     args = ap.parse_args(argv)
+    if args.dynamic_dim <= 0:
+        ap.error("--dynamic-dim must be greater than zero")
 
     arch = args.aicore_arch or "dav-c220"
-    out_dir = generate(Path(args.input), args.testcase, Path(args.output_root), arch)
+    try:
+        out_dir = generate(Path(args.input), args.testcase, Path(args.output_root), arch, args.dynamic_dim)
+    except (FileNotFoundError, ValueError) as exc:
+        ap.error(str(exc))
     print(f"[gen_profiling_case] wrote testcase -> {out_dir}")
     return 0
 

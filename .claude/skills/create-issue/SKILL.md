@@ -78,7 +78,7 @@ If not authenticated, tell the user to run `gh auth login` and **stop**.
 
 **Bug reports only.** (Feature/documentation → skip to Step 7.)
 
-Use the `/setup_env` skill only to **install anything missing** (pypto not
+Use the `/setup-env` skill only to **install anything missing** (pypto not
 importable, ptoas absent, pto-isa not checked out). **Do not** `git checkout main`
 / `git pull` / `git submodule update` on pypto — that would overwrite the very
 environment we are trying to reproduce. Whatever pypto commit/branch the user is
@@ -105,10 +105,29 @@ git -C "$PTO_ISA_ROOT" rev-parse --short HEAD
 git -C "$PTO_ISA_ROOT" branch --show-current         # often empty (detached)
 
 # ptoas version
-"$PTOAS_ROOT/ptoas" --version 2>/dev/null || echo "not found"
+ptoas_bin="$PTOAS_ROOT/ptoas"
+if [ ! -f "$ptoas_bin" ] || [ ! -x "$ptoas_bin" ]; then
+  ptoas_bin="$PTOAS_ROOT/bin/ptoas"
+fi
+if [ -f "$ptoas_bin" ] && [ -x "$ptoas_bin" ]; then
+  "$ptoas_bin" --version
+else
+  echo "not found"
+fi
 
-# CANN version
-cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null || echo "not detected"
+# CANN version from the environment used by the reproduction
+cann_root="${ASCEND_HOME_PATH:-${ASCEND_TOOLKIT_HOME:-}}"
+cann_version=""
+if [ -n "$cann_root" ]; then
+  for info in "$cann_root/version.info" "$cann_root/compiler/version.info" \
+              "$cann_root/opp/version.info" "$cann_root/version.cfg"; do
+    if [ -f "$info" ]; then
+      cann_version="$(sed -n 's/^[Vv]ersion=//p' "$info" | sed -n '1p')"
+      [ -n "$cann_version" ] && break
+    fi
+  done
+fi
+printf '%s\n' "${cann_version:-not detected}"
 ```
 
 Submodule / pinned checkouts (simpler, pto-isa) are typically in **detached
@@ -116,7 +135,7 @@ HEAD**, so `branch --show-current` prints nothing — in that case record the
 branch as `detached` rather than leaving it blank.
 
 Record every value. If a version cannot be detected, use "unknown" and continue.
-If `/setup_env` cannot even make pypto importable, note the failure, **skip
+If `/setup-env` cannot even make pypto importable, note the failure, **skip
 Steps 3–4**, and treat the boundary as **unclear** (file in pypto-lib).
 
 ## Step 3: Reproduce (on the current environment)
@@ -126,7 +145,7 @@ Confirm the problem before filing. **Bug reports only.**
 ### 3a: Identify the reproduction script
 
 - If the user gave a specific script/command, use it.
-- If the issue names a file (e.g. "`decode_attention_csa.py` FAILs x_out"), use
+- If the issue names a file (e.g. "`decode_csa.py` FAILs x_out"), use
   that file with the platform/device it fails on (`-p a2a3`, `-d <id>`).
 - If unclear, **ask the user** which script reproduces the problem.
 
@@ -153,7 +172,7 @@ current environment" and ask whether to still file. If no → **stop**.
 
 Many pypto-lib repro cases are **local-only** — a scratch kernel, a `_draft.py`,
 or an edit that has not been committed and pushed. A path like
-`models/qwen3/14b/bench_qk_compare.py` is **meaningless to whoever reads the
+`models/qwen3_14b/bench_qk_compare.py` is **meaningless to whoever reads the
 issue** if that file does not exist on any branch they can fetch. Determine the
 visibility of every file the repro needs (the script plus any local helper
 modules / kernels it imports):
@@ -171,12 +190,12 @@ git ls-files --error-unmatch <file> 2>/dev/null || echo "UNTRACKED"
 # tracked but with uncommitted edits?
 git diff --stat HEAD -- <file>
 
-# committed — but does that commit actually exist on the remote?
-# `git branch -r --contains` only reads LOCAL remote-tracking refs, which can be
-# stale; ask the remote itself, and confirm the branch still contains the commit.
-git ls-remote origin refs/heads/<branch>            # empty => branch not on remote
-git merge-base --is-ancestor HEAD origin/<branch> \
-  && echo "HEAD is on origin/<branch>" || echo "HEAD NOT PUSHED"
+# committed — is the file's commit on the current remote branch?
+file_commit="$(git log -1 --format=%H -- <file>)"
+git fetch --quiet origin "refs/heads/<branch>"       # fails if the branch is absent/inaccessible
+remote_tip="$(git rev-parse FETCH_HEAD)"             # freshly fetched, not a stale tracking ref
+git merge-base --is-ancestor "$file_commit" "$remote_tip" \
+  && echo "file commit is visible" || echo "file commit is not on the remote branch"
 ```
 
 Also confirm the remote is one the **reader** can reach: a commit pushed only to
@@ -214,7 +233,7 @@ inlining is the default; attach only when inlining is impossible:
 
    Repeat one `<details>` block per local-only file the case needs, and say in
    the body where each file is expected to sit in the tree (imports depend on
-   it), e.g. "save as `models/qwen3/14b/repro_qk_mmad.py`".
+   it), e.g. "save as `models/qwen3_14b/repro_qk_mmad.py`".
 
 2. **Attach the file** — only when it is genuinely too large to inline
    (roughly >500 lines, a binary, or a build/log artifact). `gh issue create`
@@ -291,8 +310,8 @@ anchor:
 
 Compute each **expected** value from the current pypto checkout and compare it to
 what is actually installed. Compare **like-for-like**: full hashes vs full
-hashes, and normalize the ptoas string (`--version` prints `ptoas 0.48`, the pin
-is `v0.48`).
+hashes, and normalize the ptoas string (`--version` prefixes the version with
+`ptoas `, while the pin prefixes it with `v`).
 
 ```bash
 # simpler: expected = pypto's recorded submodule commit (full), actual = runtime HEAD (full)
@@ -304,8 +323,12 @@ tr -d '[:space:]' < "$PYPTO_ROOT/runtime/pto_isa.pin"
 git -C "$PTO_ISA_ROOT" rev-parse HEAD
 
 # ptoas: normalize both sides to a bare version, then compare
-( . "$PYPTO_ROOT/toolchain/versions.env" && echo "${PTOAS_VERSION#v}" )   # e.g. 0.48
-"$PTOAS_ROOT/ptoas" --version 2>/dev/null | sed 's/^ptoas //'             # e.g. 0.48
+( . "$PYPTO_ROOT/toolchain/versions.env" && echo "${PTOAS_VERSION#v}" )
+ptoas_bin="$PTOAS_ROOT/ptoas"
+if [ ! -f "$ptoas_bin" ] || [ ! -x "$ptoas_bin" ]; then
+  ptoas_bin="$PTOAS_ROOT/bin/ptoas"
+fi
+"$ptoas_bin" --version 2>/dev/null | sed 's/^ptoas //'
 ```
 
 If every component matches its pin, proceed to Step 5.
@@ -313,10 +336,10 @@ If every component matches its pin, proceed to Step 5.
 **If any component is off its pinned version** (a stale ptoas binary, a pto-isa
 checkout at a different commit, or a locally-bumped simpler), the reproduction
 environment is **mismatched** — the bug may be an artifact of the mismatch rather
-than a real defect. **Ask the user** (via `AskUserQuestion`) whether to:
+than a real defect. **Ask the user explicitly** whether to:
 
 1. **Align to the pins and re-run** (recommended) — check out the expected
-   simpler / pto-isa commits, reinstall the pinned ptoas via `/setup_env`, then
+   simpler / pto-isa commits, reinstall the pinned ptoas via `/setup-env`, then
    repeat Step 3 on the consistent environment. Use the **aligned** versions in
    the Background; **or**
 2. **File as-is** — keep the mismatched versions, and note the mismatch
@@ -401,9 +424,9 @@ Step 9, after the Step 8 preview.
 
 ### 6a: Dedup (run first, before assembling the final body)
 
-**Launch a `general-purpose` agent** (via `Task`, **model: haiku**) to check for
-duplicates. Keep the main context clean. Give the agent the issue
-summary/keywords, the diagnosed component, and the target repo, plus these exact
+Delegate a bounded, read-only duplicate search to a subagent when one is
+available; otherwise run the same commands directly. Give it only the issue
+summary/keywords, diagnosed component, target repo, and these exact
 instructions:
 
 > **IMPORTANT: ONLY use `gh` CLI with an explicit `--repo OWNER/REPO` flag. Do
@@ -439,7 +462,7 @@ When the target repo ships its own `create-issue` skill:
 1. **Read** the target `SKILL.md` (path in the routing table) and follow **its**
    flow — its templates, required fields, and any project-board steps are
    authoritative for that repo. (Dedup is already done in 6a — don't repeat it.)
-2. **Do not re-run `/setup_env` or re-collect versions.** Reuse the Background
+2. **Do not re-run `/setup-env` or re-collect versions.** Reuse the Background
    from Step 5 verbatim.
 3. The **Background section must be the first thing in the issue body**, above
    whatever the target template's first field is (fold the target's
@@ -486,12 +509,12 @@ Read `.github/ISSUE_TEMPLATE/` and match the request:
 | `feature_request.yml` | new tensor function, new example/model, API improvement | `enhancement` |
 | `documentation.yml` | missing / incorrect / unclear docs | `documentation` |
 
-If ambiguous, clarify with `AskUserQuestion`.
+If ambiguous, ask the user to clarify.
 
 ### 7c: Fill required fields
 
 Fill every field marked `required: true`. Ask the user for anything you cannot
-infer (use `AskUserQuestion` for dropdowns). Auto-fill where possible:
+infer, including dropdown choices. Auto-fill where possible:
 
 - **Title prefix**: `[Bug]` / `[Feature]` / `[Docs]`.
 - **Host Platform**: `uname -s -m` → `Linux (aarch64)` / `Linux (x86_64)` /

@@ -91,7 +91,7 @@ Present everything in one numbered list:
 
 ```text
 Review Comments:
-  1. [A] models/deepseek/v4-flash/moe.py:42 — Missing bounds check (alice)
+  1. [A] models/deepseek_v4_flash_mtp/moe.py:42 — Missing bounds check (alice)
   2. [B] golden/runner.py:15 — Style suggestion (coderabbitai)
 CI Failures:
   3. [CI] lint — golden/runner.py:10: F401 unused import
