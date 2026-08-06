@@ -240,26 +240,28 @@ def lm_head(
             # without a comm ctx.
             for ob in pl.range(blk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                 o0 = ob * LOGITS_COMM_TILE
-                pld.tensor.put(
-                    dst=logits_window,
-                    peer=group_base + owner_tp,
-                    src=logits_shards,
-                    dst_offsets=[0, vocab_base + o0],
-                    src_offsets=[source_row_base, o0],
-                    shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TILE],
-                )
-
-            if LOGITS_COMM_TAIL != 0:
-                if blk == LOGITS_TAIL_BLOCK:
-                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
+                for pr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
                     pld.tensor.put(
                         dst=logits_window,
                         peer=group_base + owner_tp,
                         src=logits_shards,
-                        dst_offsets=[0, vocab_base + tail_o0],
-                        src_offsets=[source_row_base, tail_o0],
-                        shape=[MAX_LOGIT_ROWS, LOGITS_COMM_TAIL],
+                        dst_offsets=[pr, vocab_base + o0],
+                        src_offsets=[source_row_base + pr, o0],
+                        shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TILE],
                     )
+
+            if LOGITS_COMM_TAIL != 0:
+                if blk == LOGITS_TAIL_BLOCK:
+                    tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
+                    for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                        pld.tensor.put(
+                            dst=logits_window,
+                            peer=group_base + owner_tp,
+                            src=logits_shards,
+                            dst_offsets=[tr, vocab_base + tail_o0],
+                            src_offsets=[source_row_base + tr, tail_o0],
+                            shape=[LOGITS_GATHER_ROW_TILE, LOGITS_COMM_TAIL],
+                        )
 
         # Notify folded into the push: each block signals every peer after its own
         # stores, so a peer sees LOGITS_COMM_BLOCKS notifies per source per epoch.

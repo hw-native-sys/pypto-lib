@@ -109,29 +109,29 @@ def mtp_verify_and_pack(
 def _test_inputs():
     import torch
 
-    main_input_ids = torch.tensor(
-        [10, 20, 11, 21, 12, 22, 13, 23],
-        dtype=torch.int64,
-    )
-    main_position_ids = torch.tensor(
-        [100, 101, 200, 201, 300, 301, 400, 401],
-        dtype=torch.int32,
-    )
-    main_sampled_ids = torch.zeros(
-        (MAX_LOGIT_ROWS, SAMPLED_IDS_PAD),
-        dtype=torch.int32,
-    )
-    main_sampled_ids[:, 0] = torch.tensor(
-        [20, 30, 99, 31, 22, 32, 23, 33],
-        dtype=torch.int32,
-    )
+    # Four acceptance regimes, tiled up to B: draft accepted, draft rejected,
+    # draft accepted, and no tail slot at all.
+    regime_input = torch.tensor([10, 20, 11, 21, 12, 22, 13, 23], dtype=torch.int64)
+    regime_sampled = torch.tensor([20, 30, 99, 31, 22, 32, 23, 33], dtype=torch.int32)
+    regime_tail_tokens = torch.tensor([9, 8, 7, 6], dtype=torch.int64)
+    reps = (B + 3) // 4
+
+    main_input_ids = regime_input.repeat(reps)[:T]
+    main_sampled_ids = torch.zeros((MAX_LOGIT_ROWS, SAMPLED_IDS_PAD), dtype=torch.int32)
+    main_sampled_ids[:T, 0] = regime_sampled.repeat(reps)[:T]
+    # One distinct position base per request; the tail sits one step before it.
+    position_bases = (torch.arange(B, dtype=torch.int32) + 1) * 100
+    main_position_ids = torch.stack([position_bases, position_bases + 1], dim=1).reshape(T)
+    # Every request owns its own tail slot; the 4th regime has none.
+    tail_slot_ids = torch.arange(B, dtype=torch.int32)
+    tail_slot_ids[3::4] = -1
     return {
         "main_input_ids": main_input_ids,
         "main_position_ids": main_position_ids,
         "main_sampled_ids": main_sampled_ids,
-        "tail_token_ids": torch.tensor([9, 8, 7, 6], dtype=torch.int64),
-        "tail_positions": torch.tensor([99, 199, 299, 399], dtype=torch.int32),
-        "tail_slot_ids": torch.tensor([0, 1, 2, -1], dtype=torch.int32),
+        "tail_token_ids": regime_tail_tokens.repeat(reps)[:B],
+        "tail_positions": position_bases - 1,
+        "tail_slot_ids": tail_slot_ids,
     }
 
 
