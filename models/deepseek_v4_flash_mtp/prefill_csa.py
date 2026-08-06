@@ -602,7 +602,7 @@ def build_tensor_specs(
     if max_position >= MAX_SEQ_LEN:
         raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
     max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
-    max_sparse_rows = WIN + max_visible_cmp
+    max_sparse_rows = WIN + min(max_visible_cmp, IDX_TOPK)
     if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
         raise ValueError(
             f"needs {max_sparse_rows} sparse rows; current packed sparse CSA cap is {SPARSE_PREFILL_SPARSE_PAD}"

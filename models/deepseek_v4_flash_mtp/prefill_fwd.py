@@ -135,6 +135,8 @@ CSA_INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
 FWD_LAST_LAYER = FWD_NUM_LAYERS - 1
 CSA_LAST_ORDER = CSA_NUM_LAYERS - 1
 LAST_MOE_EPOCH = 2 * HCA_NUM_LAYERS + 3
+
+FWD_TOKENS_DYN = pl.dynamic("PREFILL_FWD_TOKENS_DYN")
 # The LM head owns its barrier counters, so its epoch restarts at 1 rather
 # than continuing the MoE numbering.
 LM_HEAD_COMM_EPOCH = 1
@@ -327,10 +329,14 @@ def prefill_fwd(
     shared_w2_scale: pl.Tensor[[FWD_NUM_LAYERS * D], pl.FP32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
+    tile_base: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, D], pl.BF16]:
     nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         nt = pl.max(nt, pl.read(num_tokens_per_owner, [owner_rank]))
+    nt = nt - tile_base
+    nt = pl.max(pl.cast(1, pl.INT32), nt)
+    nt = pl.min(nt, pl.cast(T, pl.INT32))
     ori_block_num = pl.tensor.dim(kv_cache, 0) // FWD_NUM_LAYERS
     cmp_block_num = pl.tensor.dim(cmp_kv, 0) // FWD_NUM_LAYERS
     hca_state_block_num = pl.tensor.dim(hca_compress_state, 0) // HCA_NUM_LAYERS
@@ -736,7 +742,7 @@ def prefill_fwd(
 
 @pl.jit.host
 def l3_prefill_fwd(
-    x_hc: pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32],
+    x_hc: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, HC_MULT, D], pl.FP32],
     hc_attn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -782,15 +788,15 @@ def l3_prefill_fwd(
     ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    ori_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    hca_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
-    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, T], pl.INT64],
+    ori_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    position_ids: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT32],
+    input_ids: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    hca_cmp_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    hca_state_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    csa_cmp_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    csa_idx_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    csa_state_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
+    csa_inner_state_slot_mapping: pl.Tensor[[N_RANKS, FWD_TOKENS_DYN], pl.INT64],
     hc_ffn_fn: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, FWD_NUM_LAYERS * MIX_HC], pl.FP32],
@@ -816,11 +822,23 @@ def l3_prefill_fwd(
     final_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     pre_hc_hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     lm_head_weight: pl.Tensor[[N_RANKS, VOCAB_PER_TP, D], pl.BF16],
-    hidden_out: pl.Out[pl.Tensor[[N_RANKS, T, D], pl.BF16]],
+    hidden_out: pl.Out[pl.Tensor[[N_RANKS, FWD_TOKENS_DYN, D], pl.BF16]],
     logits: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
 ):
+    x_hc.bind_dynamic(1, FWD_TOKENS_DYN)
+    hidden_out.bind_dynamic(1, FWD_TOKENS_DYN)
+    ori_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    position_ids.bind_dynamic(1, FWD_TOKENS_DYN)
+    input_ids.bind_dynamic(1, FWD_TOKENS_DYN)
+    hca_cmp_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    hca_state_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    csa_cmp_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    csa_idx_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    csa_state_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+    csa_inner_state_slot_mapping.bind_dynamic(1, FWD_TOKENS_DYN)
+
     recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
     recv_x_buf = pld.alloc_window_buffer(N_LOCAL * RECV_MAX * D)
     # The LM head owns every window and counter it touches: a peer routes into
@@ -837,38 +855,65 @@ def l3_prefill_fwd(
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
 
-    for r in pl.range(pld.world_size()):
-        recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
-        recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
-        recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
-        arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
-        combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
-        prefill_fwd(
-            x_hc[r], hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
-            wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], kv_cache[r], attn_sink[r],
-            wo_a[r], wo_b[r], wo_b_scale[r], cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r],
-            hca_cmp_ape[r], hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
-            csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
-            csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r],
-            csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
-            csa_inner_compress_state[r], idx_kv_cache[r], idx_kv_scale[r],
-            hca_compress_state_block_table[r], csa_compress_state_block_table[r],
-            csa_inner_compress_state_block_table[r], freqs_cos[r], freqs_sin[r],
-            ori_block_table[r], cmp_block_table[r], idx_block_table[r], ori_slot_mapping[r],
-            position_ids[r], input_ids[r], hca_cmp_slot_mapping[r], hca_state_slot_mapping[r],
-            csa_cmp_slot_mapping[r], csa_idx_slot_mapping[r], csa_state_slot_mapping[r],
-            csa_inner_state_slot_mapping[r], hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
-            final_norm_w[r], pre_hc_hidden_out[r], hidden_out[r], recv_meta, recv_x, recv_aux,
-            recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
-            hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
-            routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r], routed_w2[r],
-            routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
-            shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], num_tokens_per_owner, r,
-            device=r,
-        )
+    token_dim = pl.tensor.dim(x_hc, 1)
+    tile_count = token_dim // T
+    for tile_id in pl.range(tile_count):
+        tile_base = tile_id * T
+        for r in pl.range(pld.world_size()):
+            recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32] = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
+            recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8] = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+            recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32] = pld.window(recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32)
+            recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32] = pld.window(recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32)
+            arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+            data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+            routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16] = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+            combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32] = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+            x_hc_rank = x_hc[r]
+            hidden_rank = hidden_out[r]
+            ori_slot_rank = ori_slot_mapping[r]
+            position_ids_rank = position_ids[r]
+            input_ids_rank = input_ids[r]
+            hca_cmp_slot_rank = hca_cmp_slot_mapping[r]
+            hca_state_slot_rank = hca_state_slot_mapping[r]
+            csa_cmp_slot_rank = csa_cmp_slot_mapping[r]
+            csa_idx_slot_rank = csa_idx_slot_mapping[r]
+            csa_state_slot_rank = csa_state_slot_mapping[r]
+            csa_inner_state_slot_rank = csa_inner_state_slot_mapping[r]
+            x_hc_tile = pl.slice(x_hc_rank, [T, HC_MULT, D], [tile_base, 0, 0])
+            hidden_tile = pl.slice(hidden_rank, [T, D], [tile_base, 0])
+            ori_slot_tile = pl.slice(ori_slot_rank, [T], [tile_base])
+            position_ids_tile = pl.slice(position_ids_rank, [T], [tile_base])
+            input_ids_tile = pl.slice(input_ids_rank, [T], [tile_base])
+            hca_cmp_slot_tile = pl.slice(hca_cmp_slot_rank, [T], [tile_base])
+            hca_state_slot_tile = pl.slice(hca_state_slot_rank, [T], [tile_base])
+            csa_cmp_slot_tile = pl.slice(csa_cmp_slot_rank, [T], [tile_base])
+            csa_idx_slot_tile = pl.slice(csa_idx_slot_rank, [T], [tile_base])
+            csa_state_slot_tile = pl.slice(csa_state_slot_rank, [T], [tile_base])
+            csa_inner_state_slot_tile = pl.slice(csa_inner_state_slot_rank, [T], [tile_base])
+            prefill_fwd(
+                x_hc_tile, hc_attn_fn[r], hc_attn_scale[r], hc_attn_base[r], attn_norm_w[r], wq_a[r],
+                wq_b[r], wq_b_scale[r], wkv[r], gamma_cq[r], gamma_ckv[r], kv_cache[r], attn_sink[r],
+                wo_a[r], wo_b[r], wo_b_scale[r], cmp_kv[r], hca_cmp_wkv[r], hca_cmp_wgate[r],
+                hca_cmp_ape[r], hca_cmp_norm_w[r], hca_compress_state[r], csa_cmp_wkv[r],
+                csa_cmp_wgate[r], csa_cmp_ape[r], csa_cmp_norm_w[r], csa_compress_state[r],
+                csa_hadamard_idx[r], csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r],
+                csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
+                csa_inner_compress_state[r], idx_kv_cache[r], idx_kv_scale[r],
+                hca_compress_state_block_table[r], csa_compress_state_block_table[r],
+                csa_inner_compress_state_block_table[r], freqs_cos[r], freqs_sin[r],
+                ori_block_table[r], cmp_block_table[r], idx_block_table[r], ori_slot_tile,
+                position_ids_tile, input_ids_tile, hca_cmp_slot_tile, hca_state_slot_tile,
+                csa_cmp_slot_tile, csa_idx_slot_tile, csa_state_slot_tile,
+                csa_inner_state_slot_tile, hc_head_fn[r], hc_head_scale[r], hc_head_base[r],
+                final_norm_w[r], pre_hc_hidden_out[r], hidden_tile, recv_meta, recv_x, recv_aux,
+                recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, hc_ffn_fn[r],
+                hc_ffn_scale[r], hc_ffn_base[r], norm_w[r], gate_w[r], gate_bias[r], tid2eid[r],
+                routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r], routed_w2[r],
+                routed_w2_scale[r], shared_w1[r], shared_w1_scale[r], shared_w3[r],
+                shared_w3_scale[r], shared_w2[r], shared_w2_scale[r], num_tokens_per_owner, r,
+                tile_base,
+                device=r,
+            )
 
     # Grouped LM head: the N_RANKS DP world is cut into N_RANKS // LM_HEAD_TP_SIZE
     # groups. Every card is both an owner and a TP rank, so the single lm_head
@@ -1279,6 +1324,7 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
 def build_tensor_specs(
     start_pos=0,
     num_tokens=T,
+    num_tiles=1,
     ori_block_num=CSA_ORI_BLOCK_NUM,
     cmp_block_num=CSA_CMP_BLOCK_NUM,
     idx_block_num=PREFILL_IDX_BLOCK_NUM,
@@ -1298,7 +1344,7 @@ def build_tensor_specs(
     # an all -1 index row. active_ranks reproduces that skew.
     def init_logit_row_indices():
         indices = torch.full((N_RANKS, MAX_LOGIT_ROWS), -1, dtype=torch.int32)
-        indices[:active_ranks, 0] = max(min(num_tokens, T), 1) - 1
+        indices[:active_ranks, 0] = max(min(num_tokens, num_tiles * T), 1) - 1
         return indices
 
     def init_num_tokens_per_owner():
@@ -1306,9 +1352,10 @@ def build_tensor_specs(
         counts[:active_ranks] = num_tokens
         return counts
 
+    first_tile_tokens = max(1, min(num_tokens, T))
     base_specs = {
         spec.name: spec
-        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=num_tokens, layer_id=0)
+        for spec in build_single_layer_tensor_specs(start_pos=start_pos, num_tokens=first_tile_tokens, layer_id=0)
         if isinstance(spec, TensorSpec)
     }
 
@@ -1351,15 +1398,45 @@ def build_tensor_specs(
         "csa_compress_state": csa_state_block_num,
         "csa_inner_compress_state": inner_state_block_num,
     }
+    TILED_NAMES = {
+        "ori_slot_mapping", "position_ids", "input_ids",
+        "hca_cmp_slot_mapping", "hca_state_slot_mapping",
+        "csa_cmp_slot_mapping", "csa_idx_slot_mapping",
+        "csa_state_slot_mapping", "csa_inner_state_slot_mapping",
+    }
+
+    def make_tiled_shared_spec(name):
+        per_tile = [
+            _make_shared_spec(name, base_specs, start_pos + tile * T, cache_block_nums)
+            for tile in range(num_tiles)
+        ]
+        head = per_tile[0]
+        if num_tiles == 1:
+            return head
+        shape = list(head.shape)
+        shape[1] = num_tiles * T
+
+        def init_joined(parts=per_tile):
+            return torch.cat(
+                [p.init_value() if callable(p.init_value) else p.init_value for p in parts],
+                dim=1,
+            )
+
+        return TensorSpec(name, shape, head.dtype, init_value=init_joined)
+
     specs = []
     for name in ordered_names:
         if name == "x_hc":
             base = base_specs[name]
+            x_hc_shape = list(base.shape)
+            x_hc_shape[1] = num_tiles * T
 
-            def init_x_hc(b=base):
-                return (torch.randn(list(b.shape)) * 0.05).to(b.dtype)
+            def init_x_hc(shape=x_hc_shape, dtype=base.dtype):
+                return (torch.randn(shape) * 0.05).to(dtype)
 
-            specs.append(TensorSpec(name, list(base.shape), base.dtype, init_value=init_x_hc, is_output=False))
+            specs.append(TensorSpec(name, x_hc_shape, base.dtype, init_value=init_x_hc, is_output=False))
+        elif name in TILED_NAMES:
+            specs.append(make_tiled_shared_spec(name))
         elif name in SHARED_NAMES:
             specs.append(_make_shared_spec(name, base_specs, start_pos, cache_block_nums))
         elif name in HC_HEAD_NAMES:
@@ -1430,6 +1507,9 @@ def main():
     parser.add_argument("--inner-state-block-num", type=int, default=INNER_STATE_BLOCK_NUM)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-scope-stats", action="store_true", default=False)
+
+    parser.add_argument("--num-tiles", type=int, default=1,
+                        help="fixed-T tiles in one submitted request; 1 reproduces the packed graph.")
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1456,6 +1536,7 @@ def main():
         csa_state_block_num=args.csa_state_block_num,
         inner_state_block_num=args.inner_state_block_num,
         active_ranks=args.active_ranks,
+        num_tiles=args.num_tiles,
     )
 
     result = run_jit(
