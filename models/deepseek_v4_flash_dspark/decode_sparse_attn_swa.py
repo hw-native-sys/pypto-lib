@@ -28,12 +28,10 @@ from config import (
 
 
 # Dynamic shape variables.
+T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 
 # model config
-# Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
-
 B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
 S = DECODE_SEQ
 T = B * S
@@ -327,7 +325,7 @@ def sparse_attn_swa(
             with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[merge_tid],
                          allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
-                pa_rb = pa_unit // PA_N_FRAGS  # row block outermost: divides by a compile-time constant
+                pa_rb = pa_unit // PA_N_FRAGS  # row block outermost
                 nf = pa_unit - pa_rb * PA_N_FRAGS
                 pa_r0 = pa_rb * PROJ_A_ROW_TILE
                 pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
@@ -364,8 +362,7 @@ def sparse_attn_swa(
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
-                # proj_b_mm reads the full T_PAD-row extent, so rows past the runtime
-                # token count must read as zero.
+                # Zero the rows past the runtime token count; proj_b_mm reads the full T_PAD extent.
                 for zt in pl.range(t_dim, T_PAD, QUANT_TOKEN_TILE):
                     zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
                     o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
@@ -396,7 +393,7 @@ def sparse_attn_swa(
     with pl.spmd(act_t_blks * PROJ_B_ACT_N_REGS, name_hint="proj_b_act",
                  deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
         act_idx = pl.tile.get_block_idx()
-        tblk = act_idx // PROJ_B_ACT_N_REGS  # token block outermost: divides by a compile-time constant
+        tblk = act_idx // PROJ_B_ACT_N_REGS  # token block outermost
         nreg = act_idx - tblk * PROJ_B_ACT_N_REGS
         ob_n0 = nreg * PROJ_B_ACT_N_TILE
         t0 = tblk * PROJ_B_ACT_TASK_T_TILE
@@ -440,7 +437,6 @@ def sparse_attn_test(
     attn_out.bind_dynamic(0, T_DYN)
     t_dim = pl.tensor.dim(q, 0)
     bias_blocks = t_dim // BIAS_T_TILE
-    ori_block_num = pl.tensor.dim(ori_kv, 0)
     sparse_bias = pl.create_tensor([t_dim, PADDED_TOPK], dtype=pl.FP32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="swa_valid_bias"):
         v_col = pl.cast(pl.arange(0, [1, ATTN_K_TILE], dtype=pl.INT32), target_type=pl.FP32)

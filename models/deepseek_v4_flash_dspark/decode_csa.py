@@ -444,7 +444,6 @@ def golden_attention_csa(tensors):
 
     kv_cache = tensors["kv_cache"]
     window_swa_indices = tensors["window_swa_indices"]
-    window_swa_lens = tensors["window_swa_lens"]
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
 

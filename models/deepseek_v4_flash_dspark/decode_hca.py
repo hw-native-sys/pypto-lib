@@ -355,7 +355,6 @@ def golden_attention_hca(tensors):
     # ===== Attention.forward, ratio==128 branch =====
     position_ids = tensors["position_ids"].to(torch.int64)
     kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
-    win = WIN
     ratio = COMPRESS_RATIO
     rd = ROPE_HEAD_DIM
 
@@ -392,7 +391,6 @@ def golden_attention_hca(tensors):
 
     kv_cache = tensors["kv_cache"]
     window_swa_indices = tensors["window_swa_indices"]
-    window_swa_lens = tensors["window_swa_lens"]
     cmp_kv = tensors["cmp_kv"]
     cmp_block_table = tensors["cmp_block_table"]
     attn_out = torch.zeros(tokens, D, dtype=torch.bfloat16)

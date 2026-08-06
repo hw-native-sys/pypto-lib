@@ -28,11 +28,11 @@ from config import (
 from decode_indexer_compressor import indexer_compressor
 from rope_interleave import rope_interleave
 
-# model config
 # Dynamic shape variables. S stays static: the score/topk scopes divide by it.
 B_DYN = pl.dynamic("B_DYN")
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
+# model config
 B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
 S = DECODE_SEQ
 T = B * S
@@ -79,8 +79,7 @@ Q_TILE = 256
 # task so task count halves without growing the [Q_TILE, MM_N_TILE] L1 wq load.
 Q_OUT_TILE = 1024
 T_PAD = ((T + 16 - 1) // 16) * 16  # static upper bound on the token axis
-# Token axis is row-blocked: a tile taller than the (dynamic) source tensor is not
-# expressible, so the matmul M stays at the 16-row cube floor and fans over ceil(bs/16).
+# Matmul M at the 16-row cube floor: a tile taller than the dynamic source is not expressible.
 MM_ROW_TILE = 16
 # INT32 Acc is MM_ROW_TILE * MM_N_TILE * 4B and must stay under the 128KiB L0C wall.
 MM_N_TILE = min(512, (128 * 1024) // (MM_ROW_TILE * 4))
@@ -156,7 +155,7 @@ def indexer(
     score_units = bs * REDUCE_NSPLIT
     qr_acc_pad = pl.create_tensor([T_PAD, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.INT32)
     for qr_unit in pl.spmd(QR_OT_COUNT * row_blocks, name_hint="idx_qr_proj_matmul", allow_early_resolve=True):
-        qr_rb = qr_unit // QR_OT_COUNT  # row block outermost: divides by a compile-time constant
+        qr_rb = qr_unit // QR_OT_COUNT  # row block outermost
         ot = qr_unit - qr_rb * QR_OT_COUNT
         qr_r0 = qr_rb * MM_ROW_TILE
         qr_rows = pl.min(MM_ROW_TILE, bs - qr_r0)
@@ -261,7 +260,7 @@ def indexer(
     # critical path and must win the cores when rms_norm retires.
     with pl.spmd(WEIGHTS_OK * row_blocks, name_hint="weights_proj", deps=[late_dep]) as _weights_tid:
         w_unit = pl.tile.get_block_idx()
-        w_rb = w_unit // WEIGHTS_OK  # row block outermost: divides by a compile-time constant
+        w_rb = w_unit // WEIGHTS_OK  # row block outermost
         kb = w_unit - w_rb * WEIGHTS_OK
         w_r0 = w_rb * MM_ROW_TILE
         w_rows = pl.min(MM_ROW_TILE, bs - w_r0)

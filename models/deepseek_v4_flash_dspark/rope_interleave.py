@@ -34,10 +34,12 @@ from config import FLASH as M, DECODE_BATCH
 # Dynamic shape variables.
 B_DYN = pl.dynamic("B_DYN")  # runtime request count
 
+# model config
 B_MAX = DECODE_BATCH  # compile-time upper bound; sizes the interleaved scratch
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_HEAD_DIM // 2
 
+# tiling
 B_TILE = 4  # rows per gather block; runtime B is a multiple of 4
 
 

@@ -240,7 +240,6 @@ def golden_attention_swa(tensors):
     from decode_sparse_attn_swa import golden_sparse_attn
 
     tokens = tensors["x_hc"].shape[0]
-    batch = tokens // S
     from hc_post import golden_hc_post
 
     # ---- Block.hc_pre (model.py:691) ----
@@ -259,8 +258,6 @@ def golden_attention_swa(tensors):
 
     # ===== Attention.forward (model.py:484-543), ratio==0 branch =====
     position_ids = tensors["position_ids"].to(torch.int64)
-    bsz, seqlen = batch, S
-    win = WIN
     rd = ROPE_HEAD_DIM
 
     freqs_cos = tensors["freqs_cos"]

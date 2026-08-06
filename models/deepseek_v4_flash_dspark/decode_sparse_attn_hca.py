@@ -238,7 +238,7 @@ def sparse_attn_hca(
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
 
-    with pl.spmd(t_qk, name_hint="qk_pv", deps=[gather_tid], allow_early_resolve=True) as qk_tid:
+    with pl.spmd(t_qk, name_hint="qk_pv", deps=[gather_tid], allow_early_resolve=True) as _qk_tid:
         qk_item = pl.tile.get_block_idx()
         qk_t = qk_item // SPARSE_BLOCKS
         qk_sb = qk_item - qk_t * SPARSE_BLOCKS
@@ -319,9 +319,11 @@ def sparse_attn_hca(
             cs_t0 = cs_rb * ROPE_CS_T_TILE
             cs_cos = pl.cast(freqs_cos[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
             cs_sin = pl.cast(freqs_sin[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
-            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
-            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
-                pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
+            cs_cos_dup = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+            cs_sin_dup = pl.gather(cs_sin, dim=-1, index=cs_dup_idx)
+            cs_sin_signed = pl.mul(cs_sin_dup, cs_sign)
+            rope_cos_il[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_cos_dup
+            rope_sin_signed[cs_t0 : cs_t0 + ROPE_CS_T_TILE, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = cs_sin_signed
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE.
     # One spmd block per (token, head-tile) -- T*(H//H_TILE) blocks -- so the merge
@@ -405,7 +407,7 @@ def sparse_attn_hca(
             with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[merge_tid],
                          allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
-                pa_rb = pa_unit // PA_N_FRAGS  # row block outermost: divides by a compile-time constant
+                pa_rb = pa_unit // PA_N_FRAGS  # row block outermost
                 nf = pa_unit - pa_rb * PA_N_FRAGS
                 pa_r0 = pa_rb * PROJ_A_ROW_TILE
                 pa_rows = pl.min(PROJ_A_ROW_TILE, t_dim - pa_r0)
@@ -442,8 +444,7 @@ def sparse_attn_hca(
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = oq_i8
-                # proj_b_mm reads the full T_PAD-row extent, so rows past the runtime
-                # token count must read as zero.
+                # Zero the rows past the runtime token count; proj_b_mm reads the full T_PAD extent.
                 for zt in pl.range(t_dim, T_PAD, QUANT_TOKEN_TILE):
                     zero_half = pl.full([QUANT_TOKEN_TILE, O_LORA], dtype=pl.FP16, value=0.0)
                     o_r_i8_pad[zt : zt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA] = pl.cast(
@@ -478,7 +479,7 @@ def sparse_attn_hca(
     with pl.spmd(act_t_blks * PROJ_B_ACT_N_REGS, name_hint="proj_b_act",
                  deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
         act_idx = pl.tile.get_block_idx()
-        tblk = act_idx // PROJ_B_ACT_N_REGS  # token block outermost: divides by a compile-time constant
+        tblk = act_idx // PROJ_B_ACT_N_REGS  # token block outermost
         nreg = act_idx - tblk * PROJ_B_ACT_N_REGS
         ob_n0 = nreg * PROJ_B_ACT_N_TILE
         t0 = tblk * PROJ_B_ACT_TASK_T_TILE
