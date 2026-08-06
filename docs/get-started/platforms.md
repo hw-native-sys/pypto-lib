@@ -64,9 +64,9 @@ For selected runnable changes, pull-request CI exercises:
 Additional scheduled jobs are configured for broader model and A5-device
 cases. A CLI choice means an entry point accepts the target; it does not by
 itself prove that every path in that program is validated on the target.
-Consult the [Examples](../examples/index.md) and
-[Models](../models/index.md) pages for the stated coverage of a particular
-entry point.
+Consult the [Examples](../examples/index.md) page for the stated coverage of a
+particular example, and the [Models](../models/index.md) pages for what each
+model tree implements.
 
 ## Shared device hosts
 

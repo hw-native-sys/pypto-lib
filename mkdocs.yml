@@ -87,9 +87,10 @@ nav:
       - Intermediate: examples/intermediate.md
       - Advanced and distributed: examples/advanced.md
   - Models:
-      - Support matrix: models/index.md
-      - Qwen3: models/qwen3.md
-      - DeepSeek: models/deepseek.md
+      - Overview: models/index.md
+      - Qwen3-14B: models/qwen3_14b.md
+      - DeepSeek V4-Flash (MTP): models/deepseek_v4_flash_mtp.md
+      - DeepSeek V4-Pro: models/deepseek_v4_pro.md
   - Debug and Tune:
       - Overview: debug-and-tune/index.md
       - Debugging: debug-and-tune/debugging.md

@@ -11,17 +11,19 @@ examples/        Self-contained kernels for learning the DSL
   intermediate/    softmax, rms_norm, rope, etc.
   advanced/        Multi-stage fused + instruction-combo kernels (gemm_eltwise, multi_proj, topk)
 models/          End-to-end LLM kernels, one flat directory per model build
-  qwen3_14b/                   Qwen3-14B prefill + decode
-  qwen3_32b/                   Qwen3-32B decode
-  deepseek_v3_2/               DeepSeek V3.2-EXP
-  deepseek_v4_flash_mtp/   DeepSeek V4-Flash, INT8 W8A8
-  deepseek_v4_pro/      DeepSeek V4-Pro, Hybrid MXFP8-MXFP4 target (A5)
+  qwen3_14b/                   Qwen3-14B prefill + decode, BF16, serving contract
+  deepseek_v4_flash_mtp/       DeepSeek V4-Flash, INT8 W8A8, MTP=1, serving contract
+  deepseek_v4_pro/             DeepSeek V4-Pro, Hybrid MXFP8-MXFP4, A5 variant
+  (other directories are kernel harnesses — see the model pages)
 golden/          Test harness — compile, run on device, validate against torch
 tests/           Lint checks and golden-fn unit tests
 docs/            Coding-style and workflow reference
 ```
 
-Files ending in `_draft.py` are works-in-progress and excluded from CI.
+Files ending in `_draft.py` are works-in-progress and excluded from CI. The
+[model pages](docs/models/index.md) list every model directory, whether it is
+wired to `pypto-serving`, and — for the full model trees — its deployment
+configuration and how its files compose.
 
 ## Quick start
 

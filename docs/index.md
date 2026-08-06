@@ -26,8 +26,8 @@ kernels organized by learning level.
 
 ### Models
 
-Use the [model support matrix](models/index.md) for end-to-end and
-component-level model implementations.
+Use the [model pages](models/index.md) for end-to-end and component-level model
+implementations.
 
 ### Run and Validate
 
