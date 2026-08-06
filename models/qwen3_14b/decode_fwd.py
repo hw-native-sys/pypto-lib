@@ -1598,13 +1598,13 @@ if __name__ == "__main__":
     # reads _CHUNK_NLAYERS at trace time, so the rebind must precede any call.
     _CHUNK_NLAYERS = 1
 
-    # Compile-only smoke: explicit --smoke, or any *sim platform (the CI
-    # `python decode_fwd.py -p a2a3sim` sweep — codegen regressions are still
-    # caught without needing a device or the heavy full-graph simulation).
+    # Lowering-only smoke: explicit --smoke, or any *sim platform (the CI
+    # `python decode_fwd.py -p a2a3sim` sweep catches lowering regressions
+    # without needing a device or the heavy full-graph simulation).
     if args.smoke or args.platform.endswith("sim"):
         smoke_out = torch.empty([BATCH_PAD, HIDDEN], dtype=torch.bfloat16)
-        post_pass = decode_fwd_layers.compile_for_test(*_smoke_inputs(), smoke_out)
-        print(f"Compiled program has {len(post_pass.functions)} function(s):")
+        post_pass = decode_fwd_layers.lower(*_smoke_inputs(), smoke_out)
+        print(f"Lowered program has {len(post_pass.functions)} function(s):")
         for fn in post_pass.functions.values():
             print(f"  {fn.name}: {fn.func_type}")
         raise SystemExit(0)
