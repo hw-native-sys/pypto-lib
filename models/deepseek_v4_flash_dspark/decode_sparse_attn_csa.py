@@ -71,8 +71,8 @@ ATTN_K_TILE = 128
 NUM_QK_CORES = 24        # qk_pv dispatch lanes = a2a3 AIC count; re-sweep for other AIC counts
 A_K_TILE = 256           # proj_a cube K frag
 PROJ_A_MM_N_TILE = 128   # proj_a cube N frag
-MM_T_TILE = 16
-T_PAD = ((T + MM_T_TILE - 1) // MM_T_TILE) * MM_T_TILE
+T_PAD = ((T + 16 - 1) // 16) * 16  # T padded up to the 16-row cube M floor
+MM_T_TILE = T_PAD  # one cube M tile spans every token row
 B_K_TILE = 256           # proj_b_mm cube K frag
 # proj_b_mm cube N frag; Acc = MM_T_TILE*N*4 = 128KB sits exactly on the a2a3 L0C wall.
 PROJ_B_MM_N_TILE = 256
@@ -89,6 +89,10 @@ TOPK = WIN + CMP_TOPK
 SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 QK_ITEMS = T * SPARSE_BLOCKS   # qk_pv work items: one per (token, sparse block)
+# Token tile for the slot / bias vector work; the whole-T form would put
+# [T, IDX_TOPK] FP32 tiles well past the Vec limit.
+BIAS_T_TILE = min(T, 8)
+assert T % BIAS_T_TILE == 0
 
 
 @pl.jit.inline
@@ -132,42 +136,44 @@ def sparse_attn_csa(
     qk_order = pl.create_tensor([QK_ITEMS], dtype=pl.INT32)
     qk_wcur = pl.create_tensor([1], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="csa_slots_build_valid_qk_plan", allow_early_resolve=True) as qk_plan_tid:
-        # Compressed slots [0, IDX_TOPK): vectorized masked copy over all T rows, keeping
+        # Compressed slots [0, IDX_TOPK): vectorized masked copy over a token tile, keeping
         # raw iff 0 <= raw < floor((pos + 1) / COMPRESS_RATIO), as out = mask*(raw + 1) - 1.
-        c_raw = pl.cast(idx_topk[0:T, 0:IDX_TOPK], target_type=pl.FP32)
-        c_pos = pl.cast(position_ids[0:T, 0:1], target_type=pl.FP32)
-        c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
-        c_pos_i32 = pl.cast(c_pos_scaled, target_type=pl.INT32, mode="trunc")
-        c_pos_q = pl.cast(c_pos_i32, target_type=pl.FP32)
-        # Broadcast the per-token bound over IDX_TOPK cols.
-        c_upper_b = pl.row_expand_mul(pl.full([T, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
-        c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
-        c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
-        c_mask = pl.mul(c_ge, c_lt)
-        c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
-        cmp_sparse_indices[0:T, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
-        # Block 0 (sliding-window) is always live; blocks 1.. from the compressed mask.
-        for c_t0 in pl.range(T):
-            pl.write(valid_block_mask, [c_t0, 0], pl.cast(1, pl.INT32))
-        for c_sb in pl.range(1, SPARSE_BLOCKS):
-            c_s0 = (c_sb - 1) * ATTN_K_TILE
-            c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
-            for c_dt in pl.range(T):
-                c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
-                pl.write(valid_block_mask, [c_dt, c_sb], c_valid)
+        for bias_t0 in pl.range(0, T, BIAS_T_TILE):
+            c_raw = pl.cast(idx_topk[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK], target_type=pl.FP32)
+            c_pos = pl.cast(position_ids[bias_t0 : bias_t0 + BIAS_T_TILE, 0:1], target_type=pl.FP32)
+            c_pos_scaled = pl.mul(pl.add(c_pos, 1.0), COMPRESS_RATIO_INV)
+            c_pos_i32 = pl.cast(c_pos_scaled, target_type=pl.INT32, mode="trunc")
+            c_pos_q = pl.cast(c_pos_i32, target_type=pl.FP32)
+            # Broadcast the per-token bound over IDX_TOPK cols.
+            c_upper_b = pl.row_expand_mul(pl.full([BIAS_T_TILE, IDX_TOPK], dtype=pl.FP32, value=1.0), c_pos_q)
+            c_ge = pl.minimum(pl.maximum(pl.add(c_raw, CSA_CMP_GE_BIAS), 0.0), 1.0)
+            c_lt = pl.minimum(pl.maximum(pl.sub(c_upper_b, c_raw), 0.0), 1.0)
+            c_mask = pl.mul(c_ge, c_lt)
+            c_out = pl.sub(pl.mul(c_mask, pl.add(c_raw, 1.0)), 1.0)
+            cmp_sparse_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:IDX_TOPK] = pl.cast(c_out, target_type=pl.INT32)
+            # Block 0 (sliding-window) is always live; blocks 1.. from the compressed mask.
+            for c_t0 in pl.range(BIAS_T_TILE):
+                pl.write(valid_block_mask, [bias_t0 + c_t0, 0], pl.cast(1, pl.INT32))
+            for c_sb in pl.range(1, SPARSE_BLOCKS):
+                c_s0 = (c_sb - 1) * ATTN_K_TILE
+                c_blk_valid = pl.row_max(c_mask[:, c_s0 : c_s0 + ATTN_K_TILE])
+                for c_dt in pl.range(BIAS_T_TILE):
+                    c_valid = pl.cast(pl.read(c_blk_valid, [c_dt, 0]), target_type=pl.INT32)
+                    pl.write(valid_block_mask, [bias_t0 + c_dt, c_sb], c_valid)
 
-        # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
-        # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
-        v_win_f = pl.cast(window_swa_indices[0:T, 0:WIN], target_type=pl.FP32)
-        # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
-        # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
-        # 2 vector ops instead of the add/max/min/sub clamp chain. c_out is the just-
-        # computed post-mask compressed slots (integer-valued), reused directly.
-        v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
-        sparse_bias[0:T, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
-        sparse_bias[0:T, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
-        if PADDED_TOPK > TOPK:
-            sparse_bias[0:T, TOPK:PADDED_TOPK] = pl.full([T, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
+            # Additive softmax bias (0 valid / NEG_INF invalid) that qk_pv adds onto the
+            # scaled scores, so invalid lanes exp to ~0 with no per-block mask multiply.
+            v_win_f = pl.cast(window_swa_indices[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN], target_type=pl.FP32)
+            # Index contract (line 138): raw == -1 invalid, raw >= 0 valid. min(idx, 0)
+            # is -1 for invalid / 0 for valid; * -NEG_INF gives NEG_INF / 0. Bit-exact,
+            # 2 vector ops instead of the add/max/min/sub clamp chain. c_out is the just-
+            # computed post-mask compressed slots (integer-valued), reused directly.
+            v_win_valid = pl.minimum(pl.maximum(pl.add(v_win_f, 1.0), 0.0), 1.0)
+            sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, 0:WIN] = pl.mul(pl.sub(v_win_valid, 1.0), -NEG_INF)
+            sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, WIN:TOPK] = pl.mul(pl.minimum(c_out, 0.0), -NEG_INF)
+            if PADDED_TOPK > TOPK:
+                sparse_bias[bias_t0 : bias_t0 + BIAS_T_TILE, TOPK:PADDED_TOPK] = pl.full(
+                    [BIAS_T_TILE, PADDED_TOPK - TOPK], dtype=pl.FP32, value=NEG_INF)
 
         pl.write(qk_wcur, [0], pl.cast(0, pl.INT32))
         # Pass 1: non-empty tiles to the front of qk_order.

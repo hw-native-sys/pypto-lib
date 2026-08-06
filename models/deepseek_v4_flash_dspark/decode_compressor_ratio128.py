@@ -77,9 +77,11 @@ HEAD_TILE = 64
 B_TILE = 8
 MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
-RMS_PAD_TILE = 16
-RMS_PAD_ROWS = RMS_PAD_TILE
-assert B <= RMS_PAD_TILE
+RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
+RMS_PAD_BLOCKS = (B + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
+RMS_BLK_ROWS = min(B, RMS_PAD_TILE)  # real rows per block; pad rows only when B < RMS_PAD_TILE
+assert B <= RMS_PAD_TILE or B % RMS_PAD_TILE == 0
 # softmax_pool reduces over the state axis with column reductions (no transpose), so it can
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
@@ -229,24 +231,25 @@ def compressor_ratio128(
     cmp_flat_rows = cmp_block_num * BLOCK_SIZE
     cmp_kv_cache_flat = pl.reshape(cmp_kv_cache, [cmp_flat_rows, HEAD_DIM])
 
-    with pl.at(
-        level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]
-    ):
+    with pl.spmd(RMS_PAD_BLOCKS, name_hint="rmsnorm_rope_cache_write", deps=[pool_tid]) as _rms_tid:
+        # one 16-row block of B; rows RMS_BLK_ROWS..15 are pad when B < RMS_PAD_TILE
+        b0 = pl.tile.get_block_idx() * RMS_PAD_TILE
         # cos/sin arrive interleave-duplicated and sign-folded, so these land at the full
         # ROPE_HEAD_DIM width and feed the rotation with no in-scope dup-gather.
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        for global_c_idx in pl.range(b_dim):
-            cos_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM] = cos[
-                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM
+        for local_c_idx in pl.range(RMS_BLK_ROWS):
+            row_c_idx = b0 + local_c_idx
+            cos_b[local_c_idx : local_c_idx + 1, 0 : ROPE_HEAD_DIM] = cos[
+                row_c_idx : row_c_idx + 1, 0 : ROPE_HEAD_DIM
             ]
-            sin_b[global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM] = sin[
-                global_c_idx : global_c_idx + 1, 0 : ROPE_HEAD_DIM
+            sin_b[local_c_idx : local_c_idx + 1, 0 : ROPE_HEAD_DIM] = sin[
+                row_c_idx : row_c_idx + 1, 0 : ROPE_HEAD_DIM
             ]
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
             rms_h0 = rms_kb * HEAD_TILE
-            kv_rms_chunk = pooled_kv[0:RMS_PAD_TILE, rms_h0 : rms_h0 + HEAD_TILE]
+            kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, rms_h0 : rms_h0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
             partial_sq = pl.add(partial_sq, kv_rms_rowsum)
@@ -255,12 +258,12 @@ def compressor_ratio128(
         inv_rms = pl.recip(pl.sqrt(variance))
         for rms_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
             norm_h0 = rms_kb * HEAD_TILE
-            kv_norm_chunk = pooled_kv[0:RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE]
+            kv_norm_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[0:RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
+            normed_kv[b0 : b0 + RMS_PAD_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
 
-        kv_rope_norm = pooled_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        kv_rope_norm = pooled_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
@@ -277,9 +280,10 @@ def compressor_ratio128(
         rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
         rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
-        normed_kv[0:RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
+        normed_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
-        for global_c_idx in pl.range(b_dim):
+        for local_c_idx in pl.range(RMS_BLK_ROWS):
+            global_c_idx = b0 + local_c_idx
             first_pos_b = pl.read(position_ids, [global_c_idx, 0])
             pos_b = first_pos_b % COMPRESS_RATIO
             if pos_b + s_dim >= COMPRESS_RATIO:

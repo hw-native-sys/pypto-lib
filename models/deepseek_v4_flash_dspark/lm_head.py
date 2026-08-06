@@ -32,7 +32,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import FLASH as M
+from config import DECODE_TOKENS, FLASH as M
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -62,9 +62,10 @@ TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
-# Rows. logit_row_indices picks the sources; unused rows stay zero.
-MAX_LOGIT_ROWS = 8
-TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
+# Rows. logit_row_indices picks the sources; unused rows stay zero. A decode step
+# samples every one of its DECODE_TOKENS rows (B main + B draft at MTP = 1).
+MAX_LOGIT_ROWS = DECODE_TOKENS
+TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
 # Tiling

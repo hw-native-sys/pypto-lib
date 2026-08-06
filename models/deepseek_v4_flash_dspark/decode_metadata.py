@@ -318,11 +318,13 @@ def decode_metadata(
 def _test_inputs():
     import torch
 
-    positions = torch.tensor(
+    # Four request regimes of S=2 consecutive positions, tiled up to B requests.
+    position_regimes = torch.tensor(
         [126, 127, 3, 4, 8191, 8192, 16382, 16383],
         dtype=torch.int32,
     )
-    counts = torch.tensor(
+    positions = position_regimes.repeat((T + position_regimes.numel() - 1) // position_regimes.numel())[:T]
+    count_regimes = torch.tensor(
         [
             [2, 3, 4, 5, 6, 7],
             [3, 4, 5, 6, 7, 8],
@@ -331,6 +333,7 @@ def _test_inputs():
         ],
         dtype=torch.int32,
     )
+    counts = count_regimes.repeat((B + count_regimes.shape[0] - 1) // count_regimes.shape[0], 1)[:B]
 
     def table(width, group, *, repeat):
         out = torch.zeros((B, width), dtype=torch.int32)

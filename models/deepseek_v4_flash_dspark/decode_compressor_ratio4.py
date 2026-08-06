@@ -65,9 +65,11 @@ MM_B_TILE = 16
 BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 HEAD_DIM_TILE = 128
-RMS_PAD_TILE = 16  # pad B rows up to one 16-row block (min M for FP32 vec ops)
-RMS_PAD_ROWS = RMS_PAD_TILE  # single block; requires B <= RMS_PAD_TILE
-assert B <= RMS_PAD_TILE
+RMS_PAD_TILE = 16  # 16-row block of B (min M for FP32 vec ops)
+RMS_PAD_BLOCKS = (B + RMS_PAD_TILE - 1) // RMS_PAD_TILE
+RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
+RMS_BLK_ROWS = min(B, RMS_PAD_TILE)  # real rows per block; pad rows only when B < RMS_PAD_TILE
+assert B <= RMS_PAD_TILE or B % RMS_PAD_TILE == 0
 
 
 @pl.jit.inline
@@ -205,15 +207,14 @@ def compressor_ratio4(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope_cache_write"):
-        # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
-        cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=0.0)
-        cos_b[0:B, 0 : ROPE_HEAD_DIM] = cos[0:B, 0 : ROPE_HEAD_DIM]
-        sin_b[0:B, 0 : ROPE_HEAD_DIM] = sin[0:B, 0 : ROPE_HEAD_DIM]
+    for rms_blk in pl.spmd(RMS_PAD_BLOCKS, name_hint="rmsnorm_rope_cache_write"):
+        # one 16-row block of B; rows RMS_BLK_ROWS..15 are pad when B < RMS_PAD_TILE
+        b0 = rms_blk * RMS_PAD_TILE
+        cos_b = pl.slice(cos, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[RMS_BLK_ROWS, ROPE_HEAD_DIM])
+        sin_b = pl.slice(sin, [RMS_PAD_TILE, ROPE_HEAD_DIM], [b0, 0], valid_shape=[RMS_BLK_ROWS, ROPE_HEAD_DIM])
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
-            kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+            kv_rms_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             kv_rms_rowsum = pl.reshape(pl.row_sum(kv_rms_sq), [1, RMS_PAD_TILE])
             partial_sq = pl.add(partial_sq, kv_rms_rowsum)
@@ -221,12 +222,12 @@ def compressor_ratio4(
         variance = pl.reshape(pl.add(pl.mul(partial_sq, HEAD_DIM_INV), EPS), [RMS_PAD_TILE, 1])
         inv_rms = pl.recip(pl.sqrt(variance))
         for k0 in pl.range(0, NOPE_HEAD_DIM, HEAD_TILE):
-            kv_norm_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
+            kv_norm_chunk = pooled_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, k0 : k0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
+            normed_kv[b0 : b0 + RMS_PAD_TILE, k0 : k0 + HEAD_TILE] = normed_chunk
 
-        kv_rope_norm = pooled_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
+        kv_rope_norm = pooled_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM : HEAD_DIM], pl.FP32)
         # A3 interleaved swap-gather (same form as kv_rope_fused in qkv_proj_rope),
         # replacing the de-interleave gather + rotate + re-interleave scatter. gamma+inv_rms
@@ -243,17 +244,17 @@ def compressor_ratio4(
         rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
         rope_rot = pl.add(pl.mul(rope_normed, cos_b), pl.mul(swapped, sin_b))
-        normed_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
+        normed_kv[b0 : b0 + RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = rope_rot
 
         # cache write: reads back only this block's own normed_kv rows, so the normed_kv
         # RAW is intra-block -- no separate scope / cross-task barrier needed.
-        for inner in pl.range(B):
-            c_idx = inner
+        for inner in pl.range(RMS_BLK_ROWS):
+            c_idx = b0 + inner
             first_pos_b = pl.read(position_ids, [c_idx, 0])
             pos_b = first_pos_b % COMPRESS_RATIO
             if pos_b + S >= COMPRESS_RATIO:
                 boundary_s = COMPRESS_RATIO - 1 - pos_b
-                kv_row_fp32 = normed_kv[inner : inner + 1, 0 : HEAD_DIM]
+                kv_row_fp32 = normed_kv[c_idx : c_idx + 1, 0 : HEAD_DIM]
                 cache_row_i64 = pl.read(cmp_slot_mapping, [c_idx, boundary_s])
                 if cache_row_i64 >= 0:
                     cache_row = pl.cast(cache_row_i64, pl.INDEX)

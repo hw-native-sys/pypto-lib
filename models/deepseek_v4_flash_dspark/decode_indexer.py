@@ -74,12 +74,11 @@ Q_TILE = 256
 # is the Mat-safe cube N-tile. Q_OUT_TILE fans Q_OUT_TILE // MM_N_TILE cube ops per
 # task so task count halves without growing the [Q_TILE, MM_N_TILE] L1 wq load.
 Q_OUT_TILE = 1024
-MM_N_TILE = 512
-MM_ROW_TILE = 16
-T_PAD = ((T + MM_ROW_TILE - 1) // MM_ROW_TILE) * MM_ROW_TILE
-# weights_proj is one 16-row boxed matmul per task; decode T fits in one row tile.
-# Fail loudly if a config makes T exceed it (would drop rows).
-assert T_PAD == MM_ROW_TILE, "weights_proj single-row-tile scope assumes decode T <= MM_ROW_TILE"
+T_PAD = ((T + 16 - 1) // 16) * 16  # T padded up to the 16-row cube M floor
+MM_ROW_TILE = T_PAD  # one boxed matmul per task spans every token row
+# INT32 Acc is MM_ROW_TILE * MM_N_TILE * 4B and must stay under the 128KiB L0C wall.
+MM_N_TILE = min(512, (128 * 1024) // (MM_ROW_TILE * 4))
+assert Q_OUT_TILE % MM_N_TILE == 0
 HEAD_DIM_TILE = 32
 D_TILE = 512
 # weights_proj splits K, not N: a [D_TILE, IDX_N_HEADS] row block reads contiguous GM,
