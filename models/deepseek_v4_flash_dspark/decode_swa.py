@@ -20,6 +20,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
+    TP,
     DECODE_ORI_BLOCK_NUM,
     DECODE_SEQ,
     BLOCK_SIZE,
@@ -40,7 +41,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 
 # model config
-B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 BIAS_T_TILE = 8  # sparse_bias row block; T is a multiple of 8 by the batch contract

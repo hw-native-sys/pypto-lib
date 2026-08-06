@@ -19,6 +19,7 @@ from rope_interleave import rope_interleave
 from config import (
     FLASH as M,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
@@ -34,7 +35,7 @@ S_DYN = pl.dynamic("S_DYN")
 T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 # model config
-B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size

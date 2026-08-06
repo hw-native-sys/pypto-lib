@@ -19,6 +19,7 @@ from config import (
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
@@ -34,7 +35,7 @@ COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 
 # model config
-B = DECODE_BATCH
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size

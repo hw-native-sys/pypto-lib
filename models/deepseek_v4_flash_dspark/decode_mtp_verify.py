@@ -10,16 +10,15 @@
 
 import pypto.language as pl
 
-from config import DECODE_BATCH, DECODE_SEQ, DECODE_TOKENS
+from config import DECODE_BATCH, DECODE_SEQ, TP
 from lm_head import MAX_LOGIT_ROWS, SAMPLED_IDS_PAD
 
 
-B = DECODE_BATCH
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
-T = DECODE_TOKENS
+T = B * S
 
 assert S == 2, "MTP verification requires decode_seq=2"
-assert T == B * S
 assert MAX_LOGIT_ROWS >= T
 
 

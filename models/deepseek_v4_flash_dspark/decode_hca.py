@@ -19,6 +19,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
@@ -44,7 +45,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 
 # model config
-B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 EPS = M.rms_norm_eps

@@ -19,6 +19,7 @@ from config import (
     C4A_COMPRESSOR_BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     FLASH as M,
     IDX_CACHE_MAX_BLOCKS,
@@ -27,7 +28,7 @@ from config import (
 )
 
 
-B = DECODE_BATCH
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 WIN = M.sliding_window

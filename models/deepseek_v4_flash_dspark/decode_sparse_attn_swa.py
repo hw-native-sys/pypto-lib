@@ -18,6 +18,7 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
+    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     DECODE_ORI_BLOCK_NUM,
@@ -32,7 +33,7 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
 
 # model config
-B = DECODE_BATCH  # compile-time upper bound; runtime batch is dynamic
+B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
