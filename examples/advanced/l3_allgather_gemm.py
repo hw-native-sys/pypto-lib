@@ -6,7 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""N-rank chunked L3 allgather + GEMM example.
+# ci: devices=2  # CI: fixed 2-card run; borrows 2 cards via task-submit --device-num
+"""N-rank tiled L3 allgather + GEMM example.
 
 This keeps the example intentionally small and explicit:
 
@@ -40,7 +41,7 @@ MAT_N = 4096
 MAT_M_LOCAL = 2048
 
 M_TILE = 128
-K_TILE = 128
+K_TILE = 256
 N_TILE = 256
 M_TILES = MAT_M_LOCAL // M_TILE
 K_TILES = MAT_K // K_TILE
@@ -138,24 +139,16 @@ def make_program(world_size: int, comm_cores: int, gemm_cores: int):
                         [M_TILE, K_TILE],
                         target_memory=pl.MemorySpace.Mat,
                     )
-                    ak_left: pl.Tile[[M_TILE, K_TILE], pl.FP16, pl.Mem.Left] = pl.move(
-                        ak_mat,
-                        target_memory=pl.Mem.Left,
-                    )
                     wk_mat: pl.Tile[[K_TILE, N_TILE], pl.FP16, pl.Mem.Mat] = pl.load(
                         weight,
                         [k0, n0],
                         [K_TILE, N_TILE],
                         target_memory=pl.MemorySpace.Mat,
                     )
-                    wk_right: pl.Tile[[K_TILE, N_TILE], pl.FP16, pl.Mem.Right] = pl.move(
-                        wk_mat,
-                        target_memory=pl.Mem.Right,
-                    )
                     if kb == 0:
-                        local_acc = pl.matmul(ak_left, wk_right)
+                        local_acc = pl.matmul(ak_mat, wk_mat)
                     else:
-                        local_acc = pl.matmul_acc(local_acc, ak_left, wk_right)
+                        local_acc = pl.matmul_acc(local_acc, ak_mat, wk_mat)
 
                 out = pl.store(local_acc, [global_row_offset, n0], out)
 
@@ -187,24 +180,16 @@ def make_program(world_size: int, comm_cores: int, gemm_cores: int):
                                 [M_TILE, K_TILE],
                                 target_memory=pl.MemorySpace.Mat,
                             )
-                            ak_left: pl.Tile[[M_TILE, K_TILE], pl.FP16, pl.Mem.Left] = pl.move(
-                                ak_mat,
-                                target_memory=pl.Mem.Left,
-                            )
                             wk_mat: pl.Tile[[K_TILE, N_TILE], pl.FP16, pl.Mem.Mat] = pl.load(
                                 weight,
                                 [k0, n0],
                                 [K_TILE, N_TILE],
                                 target_memory=pl.MemorySpace.Mat,
                             )
-                            wk_right: pl.Tile[[K_TILE, N_TILE], pl.FP16, pl.Mem.Right] = pl.move(
-                                wk_mat,
-                                target_memory=pl.Mem.Right,
-                            )
                             if kb == 0:
-                                remote_acc = pl.matmul(ak_left, wk_right)
+                                remote_acc = pl.matmul(ak_mat, wk_mat)
                             else:
-                                remote_acc = pl.matmul_acc(remote_acc, ak_left, wk_right)
+                                remote_acc = pl.matmul_acc(remote_acc, ak_mat, wk_mat)
 
                         out = pl.store(remote_acc, [remote_global_row_offset, n0], out)
 
@@ -289,7 +274,7 @@ def summarize_us(samples: list[float]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run an N-rank chunked TPUT allgather + GEMM example.")
+    parser = argparse.ArgumentParser(description="Run an N-rank tiled TPUT allgather + GEMM example.")
     parser.add_argument(
         "-p",
         "--platform",
@@ -391,10 +376,10 @@ def main() -> int:
     print(f"max diff vs torch reference: {max_diff:.6f}")
 
     if not passed:
-        print("chunked TPUT allgather GEMM mismatch")
+        print("tiled TPUT allgather GEMM mismatch")
         return 1
 
-    print("chunked TPUT allgather GEMM passed")
+    print("tiled TPUT allgather GEMM passed")
 
     if args.benchmark:
         outputs.zero_()
