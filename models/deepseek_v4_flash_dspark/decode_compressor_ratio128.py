@@ -106,8 +106,8 @@ def compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B_DYN, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T_DYN], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
