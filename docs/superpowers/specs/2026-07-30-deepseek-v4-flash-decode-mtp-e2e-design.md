@@ -201,10 +201,13 @@ Trace-hash mode must not:
 - replace actual layer IDs used for weight or cache slicing;
 - change the attention layer schedule.
 
-Although the branch is based on `dsv4-ascendc-decode-compare2`, compare4
-restores the first embedding boundary and the main decode tail. The complete
-decode-to-MTP graph therefore remains the comparison boundary while the
-compare2 history supplies the shared baseline and expert topology.
+The implementation is retained on
+`perf/dsv4-eplb-decode-logits-and-mtp-core`. It incorporates the original
+`perf/dsv4-ascendc-decode-mtp-compare4` delta, based on
+`dsv4-ascendc-decode-compare2`, alongside a separate host-prepared
+decode-to-logits benchmark. The complete decode-to-MTP graph restores the
+first embedding boundary and main decode tail, while the compare2 history
+supplies the shared baseline and expert topology.
 
 ## Tensor Ownership and Residency
 

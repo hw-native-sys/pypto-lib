@@ -23,6 +23,12 @@ hidden packing, and SWA metadata construction are fixture preparation and are
 not part of the measured dispatch. Greedy sampling and persistent-signal
 cleanup are also outside the measured dispatch.
 
+This runner and the host-prepared decode-to-logits runner described in
+[DeepSeek V4 Flash Decode-to-Logits Performance Design](2026-07-30-deepseek-v4-flash-decode-logits-design.md)
+are independent benchmark intervals with different prepared inputs. Run them
+as separate processes; do not add their timings or interpret them as an
+end-to-end Decode-to-MTP measurement.
+
 ## AscendC Reference
 
 The strict reference interval in `trace_view_a3_decode.json` starts at Model47

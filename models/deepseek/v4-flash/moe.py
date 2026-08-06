@@ -558,6 +558,7 @@ def moe_test(
         routed_y_buf, combine_arrived,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
+    clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
     return x_next
 
 
