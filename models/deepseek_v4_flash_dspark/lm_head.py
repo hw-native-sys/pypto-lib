@@ -72,6 +72,11 @@ GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 128
 HIDDEN_GATHER_TILE = 512
+# Row tiles for the two window->local copies. Both copy tiles stage through UB,
+# so the row extent has to be tiled rather than taken whole once the row count
+# grows with the decode batch.
+HIDDEN_GATHER_ROW_TILE = min(GROUP_LOGIT_ROWS, 16)
+LOGITS_GATHER_ROW_TILE = min(MAX_LOGIT_ROWS, 8)
 LOGITS_COMM_TILE = 2048
 VOCAB_TAIL = VOCAB_PER_TP % FUSED_VOCAB_TILE
 LOGITS_COMM_TAIL = VOCAB_PER_TP % LOGITS_COMM_TILE
@@ -180,11 +185,16 @@ def lm_head(
     # Window -> matmul operand: a local copy split over k-tiles. Keeps the matmul's
     # auto-dep on owner_hiddens.
     with pl.spmd(
-        D // HIDDEN_GATHER_TILE, name_hint="lm_head_dispatch_gather", deps=[_dwait_tid]
+        (GROUP_LOGIT_ROWS // HIDDEN_GATHER_ROW_TILE) * (D // HIDDEN_GATHER_TILE),
+        name_hint="lm_head_dispatch_gather",
+        deps=[_dwait_tid],
     ) as _dgather_tid:
-        gkb = pl.tile.get_block_idx()
-        gk0 = gkb * HIDDEN_GATHER_TILE
-        owner_hiddens[:, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[:, gk0 : gk0 + HIDDEN_GATHER_TILE]
+        gblock = pl.tile.get_block_idx()
+        gk0 = (gblock % (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_TILE
+        gr0 = (gblock // (D // HIDDEN_GATHER_TILE)) * HIDDEN_GATHER_ROW_TILE
+        owner_hiddens[gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE] = hidden_window[
+            gr0 : gr0 + HIDDEN_GATHER_ROW_TILE, gk0 : gk0 + HIDDEN_GATHER_TILE
+        ]
 
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
     # Project all group-owner rows in one matmul M tile.
@@ -289,13 +299,19 @@ def lm_head(
             for ob in pl.range(gblk, N_LOGITS_COMM_TILES, LOGITS_COMM_BLOCKS):
                 o0 = ob * LOGITS_COMM_TILE
                 lo = src_vocab_base + o0
-                logits[:, lo : lo + LOGITS_COMM_TILE] = logits_window[:, lo : lo + LOGITS_COMM_TILE]
+                for gr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                    logits[gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE] = logits_window[
+                        gr : gr + LOGITS_GATHER_ROW_TILE, lo : lo + LOGITS_COMM_TILE
+                    ]
 
             if LOGITS_COMM_TAIL != 0:
                 if gblk == LOGITS_TAIL_BLOCK:
                     tail_o0 = N_LOGITS_COMM_TILES * LOGITS_COMM_TILE
                     tl = src_vocab_base + tail_o0
-                    logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
+                    for tr in pl.range(0, MAX_LOGIT_ROWS, LOGITS_GATHER_ROW_TILE):
+                        logits[tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL] = logits_window[
+                            tr : tr + LOGITS_GATHER_ROW_TILE, tl : tl + LOGITS_COMM_TAIL
+                        ]
 
     # Every local wait has observed all current-round peer notifies before the
     # logits gather can complete. Clear only this rank's counters so a retained

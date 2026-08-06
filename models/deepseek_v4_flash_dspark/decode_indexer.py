@@ -79,6 +79,9 @@ MM_ROW_TILE = T_PAD  # one boxed matmul per task spans every token row
 # INT32 Acc is MM_ROW_TILE * MM_N_TILE * 4B and must stay under the 128KiB L0C wall.
 MM_N_TILE = min(512, (128 * 1024) // (MM_ROW_TILE * 4))
 assert Q_OUT_TILE % MM_N_TILE == 0
+# Dequant token tile: a whole-T [T, Q_OUT_TILE] FP32 tile does not fit UB.
+DEQUANT_T_TILE = min(T, 8)
+assert T % DEQUANT_T_TILE == 0
 HEAD_DIM_TILE = 32
 D_TILE = 512
 # weights_proj splits K, not N: a [D_TILE, IDX_N_HEADS] row block reads contiguous GM,
@@ -156,9 +159,13 @@ def indexer(
     for ot in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="idx_qr_proj_dequant", allow_early_resolve=True):
         o_base = ot * Q_OUT_TILE
         wq_scale = pl.reshape(wq_b_scale[o_base : o_base + Q_OUT_TILE], [1, Q_OUT_TILE])
-        acc_fp32 = pl.cast(qr_acc_pad[0:T, o_base : o_base + Q_OUT_TILE], target_type=pl.FP32, mode="none")
-        qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale[0:T, :]), wq_scale)
-        qr_proj[0:T, o_base : o_base + Q_OUT_TILE] = qr_dequant
+        for dq_t0 in pl.range(0, T, DEQUANT_T_TILE):
+            acc_fp32 = pl.cast(
+                qr_acc_pad[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE],
+                target_type=pl.FP32, mode="none")
+            qr_scale_tile = qr_scale[dq_t0 : dq_t0 + DEQUANT_T_TILE, :]
+            qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, qr_scale_tile), wq_scale)
+            qr_proj[dq_t0 : dq_t0 + DEQUANT_T_TILE, o_base : o_base + Q_OUT_TILE] = qr_dequant
 
     qr_proj_flat = pl.reshape(qr_proj, [T * IDX_N_HEADS, IDX_HEAD_DIM])
     # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
