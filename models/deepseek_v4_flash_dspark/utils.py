@@ -120,7 +120,7 @@ def csa_decode_start_set(
         R - seq,                    # compress boundary on 2nd token (== R-1 at seq=1)
         R - 1,                      # compress boundary on 1st token
         2 * R - 1,                  # 2nd window with previous-window overlap
-        window - 1,                 # sliding-window boundary (== state block 31->32 at ratio 4)
+        window - 1,                 # sliding-window boundary
         window,                     # post-window ring-cache path
         state_block_size * 32 - 1,  # inner state logical block 31->32 crossing
         R * cache_tile - 1,         # indexer score over exactly one cache tile

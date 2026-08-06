@@ -86,6 +86,12 @@ assert B <= RMS_PAD_TILE or B % RMS_PAD_TILE == 0
 # afford a wider head tile than HEAD_TILE: each wider tile loads each state block fewer times
 # (HEAD_DIM/POOL_HEAD_TILE tiles/batch instead of HEAD_DIM/HEAD_TILE), cutting load redundancy.
 POOL_HEAD_TILE = 128
+# Gather rows per softmax_pool iteration. Held independent of the state page size: the
+# two [STATE_LEN, POOL_HEAD_TILE] FP32 pools already take 128 KB of the 184 KB Vec space,
+# leaving room for one double-buffered [POOL_STATE_TILE, POOL_HEAD_TILE] pair.
+POOL_STATE_TILE = min(COMPRESS_STATE_BLOCK_SIZE, 8)
+POOL_PAGE_STEPS = COMPRESS_STATE_BLOCK_SIZE // POOL_STATE_TILE
+POOL_STATE_STEPS = STATE_LEN // POOL_STATE_TILE
 
 
 @pl.jit.inline
@@ -182,15 +188,17 @@ def compressor_ratio128(
                     softmax_kv_state = pl.create_tensor(
                         [STATE_LEN, POOL_HEAD_TILE], dtype=pl.FP32
                     )
-                    for blk_i in pl.pipeline(STATE_LEN // COMPRESS_STATE_BLOCK_SIZE, stage=2):
-                        s0 = blk_i * COMPRESS_STATE_BLOCK_SIZE
+                    for gather_i in pl.pipeline(POOL_STATE_STEPS, stage=2):
+                        blk_i = gather_i // POOL_PAGE_STEPS
+                        intra0 = (gather_i % POOL_PAGE_STEPS) * POOL_STATE_TILE
+                        s0 = gather_i * POOL_STATE_TILE
                         slot_score = pl.full(
-                            [COMPRESS_STATE_BLOCK_SIZE, POOL_HEAD_TILE],
+                            [POOL_STATE_TILE, POOL_HEAD_TILE],
                             dtype=pl.FP32,
                             value=FP32_NEG_INF,
                         )
                         slot_kv = pl.full(
-                            [COMPRESS_STATE_BLOCK_SIZE, POOL_HEAD_TILE],
+                            [POOL_STATE_TILE, POOL_HEAD_TILE],
                             dtype=pl.FP32,
                             value=0.0,
                         )
@@ -200,21 +208,17 @@ def compressor_ratio128(
                         )
                         if state_blk_raw >= 0:
                             state_blk_id = pl.cast(state_blk_raw, target_type=pl.INDEX)
-                            row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE
+                            row0 = state_blk_id * COMPRESS_STATE_BLOCK_SIZE + intra0
                             slot_score = compress_state_rows[
-                                row0 : row0 + COMPRESS_STATE_BLOCK_SIZE,
+                                row0 : row0 + POOL_STATE_TILE,
                                 OUT_DIM + h0 : OUT_DIM + h0 + POOL_HEAD_TILE,
                             ]
                             slot_kv = compress_state_rows[
-                                row0 : row0 + COMPRESS_STATE_BLOCK_SIZE,
+                                row0 : row0 + POOL_STATE_TILE,
                                 h0 : h0 + POOL_HEAD_TILE,
                             ]
-                        softmax_score_state[
-                            s0 : s0 + COMPRESS_STATE_BLOCK_SIZE, :
-                        ] = slot_score
-                        softmax_kv_state[
-                            s0 : s0 + COMPRESS_STATE_BLOCK_SIZE, :
-                        ] = slot_kv
+                        softmax_score_state[s0 : s0 + POOL_STATE_TILE, :] = slot_score
+                        softmax_kv_state[s0 : s0 + POOL_STATE_TILE, :] = slot_kv
 
                     score_max = pl.col_max(softmax_score_state)
                     score_exp = pl.col_expand_expdif(softmax_score_state, score_max)
