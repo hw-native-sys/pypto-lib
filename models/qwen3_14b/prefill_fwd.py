@@ -1224,7 +1224,6 @@ def prefill_layer(
                                 fused_qkpv_deps,
                                 rope_ready_deps,
                             )
-                            rope_ready_deps[0] = pl.system.task_dummy(deps=[rope_ready_deps[0]])
                             if block_ctx_blocks == 1:
                                 if finalize_tok == FINALIZE_TOK_GROUP:
                                     attn_tile, cur_li_phase, oi_tmp_phase = _attention_phase_window_full_single_block(
