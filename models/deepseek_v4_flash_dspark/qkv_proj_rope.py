@@ -60,9 +60,9 @@ Q_ROPE_H_TILE = 4       # heads per fused qproj dequant/rms/rope task; cos/sin b
 assert H % Q_ROPE_H_TILE == 0
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
-assert DECODE_BATCH * DECODE_SEQ <= MATMUL_T_TILE
 for _m_tile in (QR_M_TILE, KV_M_TILE, QPROJ_M_TILE):
     assert (PREFILL_BATCH * PREFILL_SEQ) % _m_tile == 0
+    assert (DECODE_BATCH * DECODE_SEQ) % _m_tile == 0 or DECODE_BATCH * DECODE_SEQ <= _m_tile
 assert Q_LORA % QR_N_TILE == 0 and D % QR_OK == 0 and QR_K_SLICE % QR_K_TILE == 0
 assert HEAD_DIM % KV_N_TILE == 0 and D % KV_OK == 0 and KV_K_SLICE % KV_K_TILE == 0
 assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 4 == 0

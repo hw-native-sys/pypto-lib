@@ -243,7 +243,7 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 
 # Deployment constants
-DECODE_BATCH = 4                  # B: requests per decode step
+DECODE_BATCH = 64                 # B: requests per decode step
 DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
