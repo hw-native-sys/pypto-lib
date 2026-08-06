@@ -1,0 +1,7 @@
+interface:
+  display_name: "Repo Weekly Progress"
+  short_description: "Create module-first GitHub weekly reports"
+  default_prompt: "Use $repo-weekly-progress to generate this week's module-first progress report for hw-native-sys/pypto-lib."
+
+policy:
+  allow_implicit_invocation: true
