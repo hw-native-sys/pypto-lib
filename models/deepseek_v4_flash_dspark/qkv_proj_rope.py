@@ -116,7 +116,7 @@ def qkv_proj_rope(
     kv_view = pl.reshape(kv, [t_dim, HEAD_DIM])
     qr_view = pl.reshape(qr, [t_dim, Q_LORA])
     qr_scale_view = pl.reshape(qr_scale, [t_dim, 1])
-    t_matmul = pl.max(t_dim, MATMUL_T_TILE)
+    t_matmul = ((t_dim + MATMUL_T_TILE - 1) // MATMUL_T_TILE) * MATMUL_T_TILE  # ceil to whole 16-row cube tiles
 
     # RoPE indices and interleaved cos/signed-sin rows are head-invariant.
     # Prepare them once per token tile so the 16 Q head-group tasks do not each
