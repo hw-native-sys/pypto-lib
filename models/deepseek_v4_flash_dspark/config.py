@@ -6,11 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""DeepSeek-V4 configuration.
-
-Seeded from ``models/deepseek_v4_flash_mtp/`` at ``f0d352ea``, re-sized for the
-vllm-ascend A3 single-node mixed PD point: DP4 TP4 (EP16), B=64, S=2.
-"""
+"""DeepSeek-V4 configuration"""
 
 from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
@@ -264,14 +260,12 @@ KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BL
 KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 KV_CMP_MAX_BLOCKS = 32
 IDX_CACHE_MAX_BLOCKS = 64
-# Every pool must still hold at least one page per in-flight request, so each
-# floor tracks DECODE_BATCH; capacity above that floor is fixture headroom.
-ORI_KV_BLOCK_NUM = max(128, DECODE_BATCH)
-CMP_KV_BLOCK_NUM = max(32, DECODE_BATCH)
-IDX_KV_BLOCK_NUM = max(64, DECODE_BATCH)
-HCA_STATE_PHYSICAL_BLOCKS = max(64, DECODE_BATCH)
-CSA_STATE_PHYSICAL_BLOCKS = max(65, DECODE_BATCH + 1)
-CSA_INNER_STATE_PHYSICAL_BLOCKS = max(65, DECODE_BATCH + 1)
+ORI_KV_BLOCK_NUM = 128
+CMP_KV_BLOCK_NUM = 64
+IDX_KV_BLOCK_NUM = 64
+HCA_STATE_PHYSICAL_BLOCKS = 64
+CSA_STATE_PHYSICAL_BLOCKS = 65
+CSA_INNER_STATE_PHYSICAL_BLOCKS = 65
 DECODE_ORI_BLOCK_NUM = ORI_KV_BLOCK_NUM
 DECODE_CMP_BLOCK_NUM = CMP_KV_BLOCK_NUM
 DECODE_IDX_BLOCK_NUM = IDX_KV_BLOCK_NUM
