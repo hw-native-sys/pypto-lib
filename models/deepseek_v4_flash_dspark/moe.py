@@ -33,11 +33,12 @@ def _parse_ep_argv():
 
 
 def _parse_tp_argv():
-    for i, tok in enumerate(sys.argv):
-        if tok == "--tp" and i + 1 < len(sys.argv):
-            return int(sys.argv[i + 1])
-        if tok.startswith("--tp="):
-            return int(tok.split("=", 1)[1])
+    for name in ("--tp-shared-expert", "--tp"):
+        for i, tok in enumerate(sys.argv):
+            if tok == name and i + 1 < len(sys.argv):
+                return int(sys.argv[i + 1])
+            if tok.startswith(f"{name}="):
+                return int(tok.split("=", 1)[1])
     return _TP_DEFAULT
 
 
@@ -46,11 +47,14 @@ TP_SIZE = _parse_tp_argv()
 if EP not in _EP_CHOICES:
     raise ValueError(f"--ep must be one of {_EP_CHOICES}, got {EP}")
 if TP_SIZE not in _TP_CHOICES:
-    raise ValueError(f"--tp must be one of {_TP_CHOICES}, got {TP_SIZE}")
+    raise ValueError(f"--tp-shared-expert must be one of {_TP_CHOICES}, got {TP_SIZE}")
 if EP % TP_SIZE != 0:
-    raise ValueError(f"--ep must be divisible by --tp, got ep={EP}, tp={TP_SIZE}")
+    raise ValueError(f"--ep must be divisible by --tp-shared-expert, got ep={EP}, tp={TP_SIZE}")
 if config.DECODE_TOKENS % TP_SIZE != 0:
-    raise ValueError(f"decode tokens must be divisible by --tp, got {config.DECODE_TOKENS} and {TP_SIZE}")
+    raise ValueError(
+        f"decode tokens must be divisible by --tp-shared-expert, "
+        f"got {config.DECODE_TOKENS} and {TP_SIZE}"
+    )
 config.EP = EP
 config.TP_SHARED_EXPERT = TP_SIZE
 config.MOE_TOKENS = config.DECODE_TOKENS // TP_SIZE
@@ -1052,8 +1056,11 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
-    parser.add_argument("--tp", type=int, default=_TP_DEFAULT, choices=list(_TP_CHOICES),
-                        help="shared-expert TP size within each contiguous EP rank group")
+    parser.add_argument(
+        "--tp-shared-expert", "--tp", dest="tp", type=int,
+        default=_TP_DEFAULT, choices=list(_TP_CHOICES),
+        help="shared-expert TP size within each contiguous EP rank group",
+    )
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)

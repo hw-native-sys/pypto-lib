@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2
+# ci: devices=4
 """DeepSeek-V4 shared-expert TP with all-reduce and SP gather/reduce-scatter paths."""
 
 import sys
@@ -15,22 +15,23 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
+from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, TP_SHARED_EXPERT
 
 
 # command-line config
 _TP_CHOICES = (2, 4, 8)
-_TP_DEFAULT = 2
+_TP_DEFAULT = TP_SHARED_EXPERT
 _ALLREDUCE_MODES = ("parallel-mesh", "parallel-doubling", "mesh", "ring")
 _RUN_MODES = ("sp", "allreduce")
 
 
 def _parse_tp_argv():
-    for index, token in enumerate(sys.argv):
-        if token == "--tp" and index + 1 < len(sys.argv):
-            return int(sys.argv[index + 1])
-        if token.startswith("--tp="):
-            return int(token.split("=", 1)[1])
+    for name in ("--tp-shared-expert", "--tp"):
+        for index, token in enumerate(sys.argv):
+            if token == name and index + 1 < len(sys.argv):
+                return int(sys.argv[index + 1])
+            if token.startswith(f"{name}="):
+                return int(token.split("=", 1)[1])
     return _TP_DEFAULT
 
 
@@ -46,7 +47,7 @@ def _parse_allreduce_mode_argv(tp_size):
 # distributed config
 TP_SIZE = _parse_tp_argv()
 if TP_SIZE not in _TP_CHOICES:
-    raise ValueError(f"--tp must be one of {_TP_CHOICES}, got {TP_SIZE}")
+    raise ValueError(f"--tp-shared-expert must be one of {_TP_CHOICES}, got {TP_SIZE}")
 ALLREDUCE_MODE = _parse_allreduce_mode_argv(TP_SIZE)
 if ALLREDUCE_MODE not in _ALLREDUCE_MODES:
     raise ValueError(f"--allreduce-mode must be one of {_ALLREDUCE_MODES}, got {ALLREDUCE_MODE}")
@@ -1223,7 +1224,8 @@ if __name__ == "__main__":
         choices=["a2a3", "a2a3sim", "a5", "a5sim"],
     )
     parser.add_argument(
-        "--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
+        "--tp-shared-expert", "--tp", dest="tp", type=int,
+        default=TP_SIZE, choices=list(_TP_CHOICES),
         help="shared-expert tensor-parallel world size",
     )
     parser.add_argument(
