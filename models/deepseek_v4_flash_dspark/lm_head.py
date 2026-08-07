@@ -6,12 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
+# ci: devices=4  # CI: standard TP4 vocabulary group
 """DeepSeek-V4 LM head projection with DP-owned hidden and TP vocab shards.
 
 Hidden states must already have passed the final RMSNorm.
 
-The DP world is cut into ``--dp // --tp`` groups. Every card is both an owner and
+The DP world is cut into ``--dp // --tp-vocab`` groups. Every card is both an owner and
 a TP rank: it holds vocab shard ``rank % TP_SIZE`` and serves only its own group,
 so every ``peer`` is ``group_base + tp_rank``.
 
@@ -32,7 +32,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M
+from config import DECODE_TOKENS, FLASH as M, TP_VOCAB
 
 
 T_DYN = pl.dynamic("LM_HEAD_T_DYN")
@@ -44,7 +44,7 @@ VOCAB = M.vocab_size
 # Parallelism. Static in the frontend, so both worlds are parsed off argv here.
 _TP_CHOICES = (2, 4, 8, 16)
 _DP_CHOICES = (2, 4, 8, 16)
-_TP_DEFAULT = 2
+_TP_DEFAULT = TP_VOCAB
 
 
 def _parse_int_argv(name, default=None):
@@ -56,7 +56,7 @@ def _parse_int_argv(name, default=None):
     return default
 
 
-TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
+TP_SIZE: int = _parse_int_argv("--tp-vocab") or _parse_int_argv("--tp") or _TP_DEFAULT
 # --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
 # The kernel itself carries no DP extent, so composed callers never pass it.
 DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
@@ -69,8 +69,9 @@ TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > 
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
 # Tiling
-FUSED_K_TILE = 256
+FUSED_M_TILE = 256
 FUSED_VOCAB_TILE = 128
+FUSED_K_TILE = 256
 HIDDEN_GATHER_TILE = 512
 # Row tiles for the two window->local copies. Both copy tiles stage through UB,
 # so the row extent has to be tiled rather than taken whole once the row count
@@ -106,9 +107,9 @@ assert VOCAB % TP_SIZE == 0
 assert VOCAB % GREEDY_VOCAB_CHUNK == 0
 assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
-assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
+assert TP_SIZE in _TP_CHOICES, f"--tp-vocab must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
-assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZE}, tp={TP_SIZE}"
+assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp-vocab, got dp={DP_SIZE}, tp={TP_SIZE}"
 
 
 @pl.jit.inline(auto_scope=False)
@@ -197,34 +198,34 @@ def lm_head(
         ]
 
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
-    # Project all group-owner rows in one matmul M tile.
+    # Cap each accumulator at the A2/A3 128 KiB L0C limit.
     for lm_core in pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul"):
-        for mm_ob in pl.range(lm_core, VOCAB_PER_TP // FUSED_VOCAB_TILE, FUSED_LM_HEAD_CORES):
+        for mm_block in pl.range(lm_core, GROUP_LOGIT_ROWS // FUSED_M_TILE * (VOCAB_PER_TP // FUSED_VOCAB_TILE), FUSED_LM_HEAD_CORES):
+            mm_mb = mm_block // (VOCAB_PER_TP // FUSED_VOCAB_TILE)
+            mm_ob = mm_block % (VOCAB_PER_TP // FUSED_VOCAB_TILE)
+            mm_m0 = mm_mb * FUSED_M_TILE
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
-            mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
+            mm_hidden0 = owner_hiddens[mm_m0 : mm_m0 + FUSED_M_TILE, 0:FUSED_K_TILE]
             mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
             mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
-            for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                mm_k0 = mm_kb * FUSED_K_TILE
-                mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
+            for mm_k0 in pl.pipeline(FUSED_K_TILE, D, FUSED_K_TILE, stage=2):
+                mm_hidden_tile = owner_hiddens[mm_m0 : mm_m0 + FUSED_M_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                 mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
                 mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
-            logits_shards[:, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
+            logits_shards[mm_m0 : mm_m0 + FUSED_M_TILE, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
 
         if VOCAB_TAIL != 0:
-            if lm_core == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
+            for mm_tail_mb in pl.range(lm_core, GROUP_LOGIT_ROWS // FUSED_M_TILE, FUSED_LM_HEAD_CORES):
+                mm_tail_m0 = mm_tail_mb * FUSED_M_TILE
                 mm_tail_o0 = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                mm_hidden_t0 = owner_hiddens[:, 0:FUSED_K_TILE]
+                mm_hidden_t0 = owner_hiddens[mm_tail_m0 : mm_tail_m0 + FUSED_M_TILE, 0:FUSED_K_TILE]
                 mm_weight_t0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
                 mm_acc_tail = pl.matmul(mm_hidden_t0, mm_weight_t0, b_trans=True, out_dtype=pl.FP32)
-                for mm_tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                    mm_tail_k0 = mm_tail_kb * FUSED_K_TILE
-                    mm_hidden_tk = owner_hiddens[:, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
-                    mm_weight_tk = lm_head_weight[
-                        mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
-                    ]
+                for mm_tail_k0 in pl.pipeline(FUSED_K_TILE, D, FUSED_K_TILE, stage=2):
+                    mm_hidden_tk = owner_hiddens[mm_tail_m0 : mm_tail_m0 + FUSED_M_TILE, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
+                    mm_weight_tk = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
                     mm_acc_tail = pl.matmul_acc(mm_acc_tail, mm_hidden_tk, mm_weight_tk, b_trans=True)
-                logits_shards[:, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = mm_acc_tail
+                logits_shards[mm_tail_m0 : mm_tail_m0 + FUSED_M_TILE, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = mm_acc_tail
 
     # Send each owner its slice of this card's vocab shard, split over vocab comm
     # tiles: block blk pushes its tiles to every owner.
@@ -643,8 +644,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
-                        help="LM-head tensor-parallel world size")
+    parser.add_argument(
+        "--tp-vocab", "--tp", dest="tp", type=int,
+        default=TP_SIZE, choices=list(_TP_CHOICES),
+        help="LM-head vocabulary tensor-parallel world size",
+    )
     parser.add_argument("--dp", type=int, default=DP_SIZE, choices=list(_DP_CHOICES),
                         help="Attention-DP world size (hidden-row owners)")
     parser.add_argument("--num-tokens", type=int, default=TEST_TOKENS,
