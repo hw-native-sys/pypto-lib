@@ -22,6 +22,7 @@ from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 _TP_CHOICES = (2, 4, 8)
 _TP_DEFAULT = 2
 _ALLREDUCE_MODES = ("parallel-mesh", "parallel-doubling", "mesh", "ring")
+_RUN_MODES = ("sp", "allreduce")
 
 
 def _parse_tp_argv():
@@ -919,6 +920,106 @@ def l3_expert_shared_tp(
         )
 
 
+@pl.jit
+def expert_shared_sp_tp_test(
+    x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[SP_T, D], pl.BF16]],
+    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run one shared-expert TP rank between SP all-gather and reduce-scatter."""
+    sh = expert_shared_sp_tp(
+        x_local_i8, x_local_scale_dq,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        sh,
+        gather_x, gather_scale, scatter,
+        gather_signal, scatter_signal, my_rank,
+    )
+    return sh
+
+
+@pl.jit.host
+def l3_expert_shared_sp_tp(
+    x_local_i8: pl.Tensor[[TP_SIZE, SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[TP_SIZE, SP_T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[TP_SIZE, LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[TP_SIZE, LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[TP_SIZE, LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[TP_SIZE, LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[TP_SIZE, D, LOCAL_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[TP_SIZE, SP_T, D], pl.BF16]],
+):
+    """Launch one SP-local shared-expert rank per TP shard."""
+    gather_x_buf = pld.alloc_window_buffer([T, D], dtype=pl.INT8)
+    gather_scale_buf = pld.alloc_window_buffer([T, 1], dtype=pl.FP32)
+    scatter_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    scatter_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(TP_SIZE):
+        gather_x = pld.window(gather_x_buf, [T, D], dtype=pl.INT8)
+        gather_scale = pld.window(gather_scale_buf, [T, 1], dtype=pl.FP32)
+        scatter = pld.window(scatter_buf, [T, D], dtype=pl.FP32)
+        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        scatter_signal = pld.window(scatter_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        expert_shared_sp_tp_test(
+            x_local_i8[rank], x_local_scale_dq[rank],
+            shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
+            shared_w2[rank], shared_w2_scale[rank],
+            sh[rank],
+            gather_x, gather_scale, scatter,
+            gather_signal, scatter_signal, rank,
+            device=rank,
+        )
+
+
+def golden_expert_shared_sp_tp(tensors):
+    """Torch reference for SP gather, sharded shared expert, and reduce-scatter."""
+    import torch
+    import torch.nn.functional as F
+
+    from utils import int8_quant_per_row
+
+    x_group_i8 = tensors["x_local_i8"].reshape(T, D)
+    x_group_scale = tensors["x_local_scale_dq"].reshape(T, 1)
+    x_group = x_group_i8.float() * x_group_scale.float()
+
+    partials = []
+    for rank in range(TP_SIZE):
+        sw1_scale = tensors["shared_w1_scale"][rank].float().unsqueeze(-1)
+        sw3_scale = tensors["shared_w3_scale"][rank].float().unsqueeze(-1)
+        sw2_scale = tensors["shared_w2_scale"][rank].float().unsqueeze(-1)
+        sw1 = tensors["shared_w1"][rank].float() * sw1_scale
+        sw3 = tensors["shared_w3"][rank].float() * sw3_scale
+        sw2 = tensors["shared_w2"][rank].float() * sw2_scale
+
+        sh_gate = x_group @ sw1.T
+        sh_up = x_group @ sw3.T
+        if SWIGLU_LIMIT > 0:
+            sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
+            sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        sh_h = F.silu(sh_gate) * sh_up
+        sh_h_i8, sh_h_scale_dq = int8_quant_per_row(sh_h)
+        sh_h = sh_h_i8.float() * sh_h_scale_dq
+        partials.append(sh_h @ sw2.T)
+
+    sh_group = torch.stack(partials, dim=0).sum(dim=0)
+    tensors["sh"][:] = sh_group.to(torch.bfloat16).reshape(TP_SIZE, SP_T, D)
+
+
 def golden_expert_shared_tp(tensors):
     """Torch reference with rank-local activation quantization and down sum."""
     import torch
@@ -995,6 +1096,30 @@ def compare_shared_output(actual, expected, **context):
     return True, ""
 
 
+def compare_sp_shared_output(actual, expected, **context):
+    """Validate every rank-local SP shard and communication block."""
+    from golden import ratio_reldiff
+
+    rank_compare = ratio_reldiff(diff_thd=2e-3, pct_thd=0.015, max_diff_hd=0.5)
+    block_compare = ratio_reldiff(diff_thd=2e-2, pct_thd=0.25, max_diff_hd=0.5)
+    for rank in range(TP_SIZE):
+        passed, detail = rank_compare(actual[rank], expected[rank], **context)
+        if not passed:
+            return False, f"TP rank {rank} failed:\n{detail}"
+        for row in range(SP_T):
+            for col_block in range(D // COMM_STAGE_TILE):
+                col = col_block * COMM_STAGE_TILE
+                passed, detail = block_compare(
+                    actual[rank, row, col : col + COMM_STAGE_TILE], expected[rank, row, col : col + COMM_STAGE_TILE],
+                    **context,
+                )
+                if passed:
+                    continue
+                block = row * (D // COMM_STAGE_TILE) + col_block
+                return False, f"TP rank {rank}, SP communication block {block} failed:\n{detail}"
+    return True, ""
+
+
 def build_tensor_specs():
     """Create replicated inputs and intermediate-sharded shared weights."""
     import torch
@@ -1041,6 +1166,52 @@ def build_tensor_specs():
     ]
 
 
+def build_sp_tensor_specs():
+    """Create distinct SP input shards and intermediate-sharded shared weights."""
+    import torch
+
+    from expert_shared import gen_shared_weight
+    from golden import TensorSpec
+    from utils import int8_quant_per_row
+
+    x_group_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
+    x_group_i8, x_group_scale_dq = int8_quant_per_row(x_group_bf16)
+    x_local_i8 = x_group_i8.reshape(TP_SIZE, SP_T, D).contiguous()
+    x_local_scale_dq = x_group_scale_dq.float().reshape(TP_SIZE, SP_T, 1).contiguous()
+
+    shared_dequant_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
+    sw1_i8, sw1_scale = gen_shared_weight((MOE_INTER, D), shared_dequant_std["w1"], chan_cv=0.50)
+    sw3_i8, sw3_scale = gen_shared_weight((MOE_INTER, D), shared_dequant_std["w3"], chan_cv=0.50)
+    sw2_i8, sw2_scale = gen_shared_weight((D, MOE_INTER), shared_dequant_std["w2"], chan_cv=0.33)
+
+    sw1_i8 = sw1_i8.reshape(TP_SIZE, LOCAL_INTER, D).contiguous()
+    sw1_scale = sw1_scale.reshape(TP_SIZE, LOCAL_INTER).contiguous()
+    sw3_i8 = sw3_i8.reshape(TP_SIZE, LOCAL_INTER, D).contiguous()
+    sw3_scale = sw3_scale.reshape(TP_SIZE, LOCAL_INTER).contiguous()
+    sw2_chunks = torch.chunk(sw2_i8, TP_SIZE, dim=1)
+    sw2_chunks = [chunk.contiguous() for chunk in sw2_chunks]
+    sw2_i8 = torch.stack(sw2_chunks, dim=0)
+    sw2_scale = sw2_scale.unsqueeze(0).repeat(TP_SIZE, 1).contiguous()
+
+    return [
+        TensorSpec("x_local_i8", [TP_SIZE, SP_T, D], torch.int8, init_value=lambda: x_local_i8),
+        TensorSpec("x_local_scale_dq", [TP_SIZE, SP_T, 1], torch.float32, init_value=lambda: x_local_scale_dq),
+        TensorSpec("shared_w1", [TP_SIZE, LOCAL_INTER, D], torch.int8, init_value=lambda: sw1_i8, resident="stacked"),
+        TensorSpec(
+            "shared_w1_scale", [TP_SIZE, LOCAL_INTER], torch.float32,
+            init_value=lambda: sw1_scale, resident="stacked",
+        ),
+        TensorSpec("shared_w3", [TP_SIZE, LOCAL_INTER, D], torch.int8, init_value=lambda: sw3_i8, resident="stacked"),
+        TensorSpec(
+            "shared_w3_scale", [TP_SIZE, LOCAL_INTER], torch.float32,
+            init_value=lambda: sw3_scale, resident="stacked",
+        ),
+        TensorSpec("shared_w2", [TP_SIZE, D, LOCAL_INTER], torch.int8, init_value=lambda: sw2_i8, resident="stacked"),
+        TensorSpec("shared_w2_scale", [TP_SIZE, D], torch.float32, init_value=lambda: sw2_scale, resident="stacked"),
+        TensorSpec("sh", [TP_SIZE, SP_T, D], torch.bfloat16, is_output=True),
+    ]
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1054,6 +1225,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tp", type=int, default=TP_SIZE, choices=list(_TP_CHOICES),
         help="shared-expert tensor-parallel world size",
+    )
+    parser.add_argument(
+        "--mode", type=str, default="sp", choices=list(_RUN_MODES),
+        help="SP gather/reduce-scatter path or replicated-input all-reduce path",
     )
     parser.add_argument(
         "--allreduce-mode", type=str, default=ALLREDUCE_MODE, choices=list(_ALLREDUCE_MODES),
@@ -1090,10 +1265,21 @@ if __name__ == "__main__":
     if len(device_ids) < TP_SIZE:
         raise ValueError(f"need at least {TP_SIZE} devices for TP, got {device_ids}")
 
+    if args.mode == "sp":
+        run_fn = l3_expert_shared_sp_tp
+        specs = build_sp_tensor_specs()
+        golden_fn = golden_expert_shared_sp_tp
+        output_compare = compare_sp_shared_output
+    else:
+        run_fn = l3_expert_shared_tp
+        specs = build_tensor_specs()
+        golden_fn = golden_expert_shared_tp
+        output_compare = compare_shared_output
+
     result = run_jit(
-        fn=l3_expert_shared_tp,
-        specs=build_tensor_specs(),
-        golden_fn=golden_expert_shared_tp,
+        fn=run_fn,
+        specs=specs,
+        golden_fn=golden_fn,
         golden_data=args.golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
@@ -1112,7 +1298,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "sh": compare_shared_output,
+            "sh": output_compare,
         },
     )
     if not result.passed:
