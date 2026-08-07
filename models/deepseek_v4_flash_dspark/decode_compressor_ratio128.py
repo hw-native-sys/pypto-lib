@@ -19,7 +19,6 @@ from config import (
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
     DECODE_BATCH,
-    TP,
     DECODE_SEQ,
     DECODE_CMP_BLOCK_NUM,
     FP32_NEG_INF,
@@ -35,7 +34,7 @@ COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
 CMP_BLOCK_NUM_DYN = pl.dynamic("COMPRESSOR_R128_CMP_BLOCK_NUM_DYN")
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size
@@ -106,8 +105,8 @@ def compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
     cmp_kv_cache: pl.Tensor,
     position_ids: pl.Tensor,
     cmp_slot_mapping: pl.Tensor,

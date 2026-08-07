@@ -54,8 +54,6 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 # model config
 LEGACY_B = DECODE_BATCH // TP
-LEGACY_T = LEGACY_B * DECODE_SEQ
-COMPRESSOR_CHUNKS = DECODE_BATCH // LEGACY_B
 B = DECODE_BATCH if TP_SIZE > 1 else LEGACY_B
 S = DECODE_SEQ
 T = B * S
@@ -117,7 +115,6 @@ HCA_WB_TOKEN_TILE = 8  # tokens per cache-writeback SPMD block
 
 assert GLOBAL_H % TP_SIZE == 0
 assert GLOBAL_O_GROUPS % TP_SIZE == 0
-assert DECODE_BATCH % LEGACY_B == 0
 if TP_SIZE > 1:
     assert T == GROUP_T_MAX
 
@@ -409,73 +406,28 @@ def attention_hca_tp(
                     0 : HEAD_DIM,
                 ]
 
-    # The ratio-128 decode compressor is compiled for the legacy B=16/T=32
-    # contract. Split the full TP group into independent request-contiguous
-    # chunks while retaining the shared, replicated state and cache pools.
-    for compressor_chunk in pl.unroll(COMPRESSOR_CHUNKS):
-        compressor_b0 = compressor_chunk * LEGACY_B
-        compressor_t0 = compressor_chunk * LEGACY_T
-        cmp_cos_il = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        cmp_sin_signed = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        cmp_cos_chunk = pl.slice(
-            cmp_cos,
-            [LEGACY_B, ROPE_HEAD_DIM // 2],
-            [compressor_b0, 0],
-        )
-        cmp_sin_chunk = pl.slice(
-            cmp_sin,
-            [LEGACY_B, ROPE_HEAD_DIM // 2],
-            [compressor_b0, 0],
-        )
-        rope_interleave(
-            cmp_cos_chunk,
-            cmp_sin_chunk,
-            cmp_cos_il,
-            cmp_sin_signed,
-        )
-        cmp_kv_proj = pl.create_tensor([LEGACY_T, HEAD_DIM], dtype=pl.FP32)
-        x_normed_chunk = pl.slice(
-            x_normed_group,
-            [LEGACY_T, D],
-            [compressor_t0, 0],
-        )
-        state_block_table_chunk = pl.slice(
-            compress_state_block_table,
-            [LEGACY_B, COMPRESS_STATE_MAX_BLOCKS],
-            [compressor_b0, 0],
-        )
-        position_ids_chunk = pl.slice(
-            position_ids,
-            [LEGACY_T],
-            [compressor_t0],
-        )
-        cmp_slot_mapping_chunk = pl.slice(
-            cmp_slot_mapping,
-            [LEGACY_T],
-            [compressor_t0],
-        )
-        state_slot_mapping_chunk = pl.slice(
-            state_slot_mapping,
-            [LEGACY_T],
-            [compressor_t0],
-        )
-        compressor_ratio128(
-            x_normed_chunk,
-            cmp_kv_proj,
-            compress_state,
-            state_block_table_chunk,
-            cmp_wkv,
-            cmp_wgate,
-            cmp_ape,
-            cmp_norm_w,
-            cmp_cos_il,
-            cmp_sin_signed,
-            cmp_kv,
-            position_ids_chunk,
-            cmp_slot_mapping_chunk,
-            state_slot_mapping_chunk,
-            late_dep,
-        )
+    cmp_cos_il_group = pl.create_tensor([DECODE_BATCH, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed_group = pl.create_tensor([DECODE_BATCH, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il_group, cmp_sin_signed_group)
+
+    cmp_kv_proj = pl.create_tensor([GROUP_T_MAX, HEAD_DIM], dtype=pl.FP32)
+    compressor_ratio128(
+        x_normed_group,
+        cmp_kv_proj,
+        compress_state,
+        compress_state_block_table,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        cmp_cos_il_group,
+        cmp_sin_signed_group,
+        cmp_kv,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
+        late_dep,
+    )
 
     topk_all = pl.create_tensor([GROUP_T_MAX, HCA_CMP_TOPK], dtype=pl.INT32)
     for topk_block in pl.spmd(GROUP_T_MAX // HCA_TOPK_TOKEN_TILE, name_hint="hca_cache_topk"):
@@ -985,47 +937,31 @@ def golden_attention_hca_tp(tensors):
     half_rope = ROPE_HEAD_DIM // 2
     for rank in range(TP_SIZE):
         rank_positions = tensors["position_ids"][rank].to(torch.int64)
-        for compressor_chunk in range(COMPRESSOR_CHUNKS):
-            compressor_b0 = compressor_chunk * LEGACY_B
-            compressor_t0 = compressor_chunk * LEGACY_T
-            cmp_cos = torch.empty(LEGACY_B, half_rope, dtype=torch.float32)
-            cmp_sin = torch.empty(LEGACY_B, half_rope, dtype=torch.float32)
-            for local_batch in range(LEGACY_B):
-                batch = compressor_b0 + local_batch
-                first_pos = int(rank_positions[batch * S].item())
-                cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
-                cmp_pos = first_pos + cmp_offset - COMPRESS_RATIO
-                cmp_cos[local_batch] = tensors[
-                    "freqs_cos"
-                ][rank, cmp_pos, :half_rope].float()
-                cmp_sin[local_batch] = tensors[
-                    "freqs_sin"
-                ][rank, cmp_pos, :half_rope].float()
+        cmp_cos = torch.empty(DECODE_BATCH, half_rope, dtype=torch.float32)
+        cmp_sin = torch.empty(DECODE_BATCH, half_rope, dtype=torch.float32)
+        for batch in range(DECODE_BATCH):
+            first_pos = int(rank_positions[batch * S].item())
+            cmp_offset = COMPRESS_RATIO - (first_pos % COMPRESS_RATIO)
+            cmp_pos = first_pos + cmp_offset - COMPRESS_RATIO
+            cmp_cos[batch] = tensors["freqs_cos"][rank, cmp_pos, :half_rope].float()
+            cmp_sin[batch] = tensors["freqs_sin"][rank, cmp_pos, :half_rope].float()
 
-            golden_compressor({
-                "x": x_normed_group[compressor_t0 : compressor_t0 + LEGACY_T],
-                "kv": torch.zeros(LEGACY_T, HEAD_DIM, dtype=torch.float32),
-                "compress_state": tensors["compress_state"][rank],
-                "compress_state_block_table": tensors[
-                    "compress_state_block_table"
-                ][rank, compressor_b0 : compressor_b0 + LEGACY_B],
-                "wkv": tensors["cmp_wkv"][rank],
-                "wgate": tensors["cmp_wgate"][rank],
-                "ape": tensors["cmp_ape"][rank],
-                "norm_w": tensors["cmp_norm_w"][rank],
-                "cos": cmp_cos,
-                "sin": cmp_sin,
-                "cmp_kv_cache": tensors["cmp_kv"][rank],
-                "position_ids": tensors[
-                    "position_ids"
-                ][rank, compressor_t0 : compressor_t0 + LEGACY_T],
-                "cmp_slot_mapping": tensors[
-                    "cmp_slot_mapping"
-                ][rank, compressor_t0 : compressor_t0 + LEGACY_T],
-                "state_slot_mapping": tensors[
-                    "state_slot_mapping"
-                ][rank, compressor_t0 : compressor_t0 + LEGACY_T],
-            })
+        golden_compressor({
+            "x": x_normed_group,
+            "kv": torch.zeros(GROUP_T_MAX, HEAD_DIM, dtype=torch.float32),
+            "compress_state": tensors["compress_state"][rank],
+            "compress_state_block_table": tensors["compress_state_block_table"][rank],
+            "wkv": tensors["cmp_wkv"][rank],
+            "wgate": tensors["cmp_wgate"][rank],
+            "ape": tensors["cmp_ape"][rank],
+            "norm_w": tensors["cmp_norm_w"][rank],
+            "cos": cmp_cos,
+            "sin": cmp_sin,
+            "cmp_kv_cache": tensors["cmp_kv"][rank],
+            "position_ids": tensors["position_ids"][rank],
+            "cmp_slot_mapping": tensors["cmp_slot_mapping"][rank],
+            "state_slot_mapping": tensors["state_slot_mapping"][rank],
+        })
 
         cache_flat = tensors["kv_cache"][rank].view(-1, HEAD_DIM)
         for token in range(GROUP_T_MAX):
