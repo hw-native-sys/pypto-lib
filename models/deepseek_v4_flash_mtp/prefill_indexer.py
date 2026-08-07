@@ -55,19 +55,31 @@ B = 1
 S = 128
 T = B * S
 START_POS = 0
-# prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP] in one Vec scope, so the
-# score output cap stays at 256 rows; the physical pool is sized by PREFILL_IDX_BLOCK_NUM.
-INDEXER_SCORE_MAX_BLOCKS = 2
-INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
-INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 # CP selector widths.
 CP_INDEXER_SCORE_CAP = 1024
 CP_INDEXER_SORT_LEN = 2048
+
+
 CP_INDEXER_SELECTED_WIDTH = 256
 
 # tiling
 CACHE_TILE = 32
+# Per-token sort-tile width. The sort32/mrgsort/gather path requires a wide tile: a narrow (256)
+# sort faults on device (507018) even with a proper prefix. 2048 matches the indexer KV length and
+# is the confirmed fault-free width. The real score occupies only the first INDEXER_SCORE_CAP
+# columns; the rest stays -inf.
+SORT_LEN = 2048
+
+# History one tile reaches: SORT_LEN candidates, each covering COMPRESS_RATIO
+# raw tokens. Shorter prompts skip the extra K blocks via valid_block_mask.
+RAW_TOKEN_CAP = SORT_LEN * COMPRESS_RATIO
+INDEXER_SCORE_CAP = SORT_LEN
+INDEXER_SCORE_MAX_BLOCKS = INDEXER_SCORE_CAP // BLOCK_SIZE
+INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
+assert RAW_TOKEN_CAP <= MAX_SEQ_LEN
+assert INDEXER_SCORE_CAP == INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
+
 # Named, not inlined: a python max() call is not traceable inside a loop bound.
 INDEXER_SCORE_BLOCKS = max(1, (INDEXER_SCORE_CAP + CACHE_TILE - 1) // CACHE_TILE)
 SCORE_TOKEN_TILE = 8
@@ -83,17 +95,14 @@ QH_QUANT_ROW_TILE = 64
 ROPE_ROW_TILE = IDX_N_HEADS           # one token owns IDX_N_HEADS contiguous q rows + one cos/sin
 ROPE_PREP_TOKEN_TILE = 16
 QH_MM_TILE = 64
-# Per-token sort-tile width. The sort32/mrgsort/gather path requires a wide tile: a narrow (256)
-# sort faults on device (507018) even with a proper prefix. 2048 matches the indexer KV length and
-# is the confirmed fault-free width. The real score occupies only the first INDEXER_SCORE_CAP
-# columns; the rest stays -inf.
-SORT_LEN = 2048
 # topk_pairs (= 2*PREFILL_TOPK_CAP) must be a power of two aligned to the final mrgsort run: a
 # misaligned prefix (e.g. 2*192) faults like a narrow sort. The real score cap is 256, so two
 # merge stages are sufficient: the only finite values are sorted within the first 512-value run.
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
 SCORE_INIT_TILE = 16                   # rows per -inf init write; keeps [tile, SORT_LEN] under the Vec limit
+SCORE_OUT_TOKEN_TILE = min(16, 16384 // INDEXER_SCORE_CAP)
+assert T % SCORE_OUT_TOKEN_TILE == 0
 
 # A misaligned topk prefix faults on device like a narrow sort.
 assert TOPK_PAIR_WIDTH > 0 and (TOPK_PAIR_WIDTH & (TOPK_PAIR_WIDTH - 1)) == 0
@@ -313,8 +322,22 @@ def prefill_indexer(
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
     score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
-        score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
+    if INDEXER_SCORE_CAP == 256:
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
+            score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
+    else:
+        for score_out_idx in pl.spmd(
+            T // SCORE_OUT_TOKEN_TILE,
+            name_hint="prefill_idx_score_out",
+        ):
+            score_out_t0 = score_out_idx * SCORE_OUT_TOKEN_TILE
+            score_out_flat[
+                score_out_t0 : score_out_t0 + SCORE_OUT_TOKEN_TILE,
+                :,
+            ] = score_wide[
+                score_out_t0 : score_out_t0 + SCORE_OUT_TOKEN_TILE,
+                0:INDEXER_SCORE_CAP,
+            ]
 
     # === top-k per token over the visible (causally reachable) compressed positions ===
     for topk_idx in pl.spmd(T // TOPK_TILE, name_hint="prefill_idx_topk"):
@@ -333,6 +356,8 @@ def prefill_indexer(
                     sorted_tile = pl.sort32(score_row, idx_init)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=64)
                     sorted_tile = pl.mrgsort(sorted_tile, block_len=256)
+                    if INDEXER_SCORE_CAP > 256:
+                        sorted_tile = pl.mrgsort(sorted_tile, block_len=1024)
                     topk_pairs = sorted_tile[:, 0:TOPK_PAIR_WIDTH]
                     topk_idxs_tile = pl.gather(topk_pairs, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.INT32)
                     valid_topk = pl.min(PREFILL_TOPK_CAP, visible_t)
