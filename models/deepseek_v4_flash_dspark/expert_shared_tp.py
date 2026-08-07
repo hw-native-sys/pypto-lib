@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2
-"""DeepSeek-V4 shared expert with column-parallel gate/up, local SwiGLU, and row-parallel down all-reduce."""
+"""DeepSeek-V4 shared-expert TP with all-reduce and SP gather/reduce-scatter paths."""
 
 import sys
 
@@ -58,6 +58,7 @@ T = DECODE_TOKENS
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 LOCAL_INTER = MOE_INTER // TP_SIZE
+SP_T = T // TP_SIZE
 SWIGLU_LIMIT = M.swiglu_limit
 
 # tiling
@@ -79,11 +80,14 @@ COMM_STAGE_TILE = 4096
 
 # communication
 COMM_WORKERS = min(24, T * (D // COMM_STAGE_TILE))
+SP_COMM_WORKERS = min(24, SP_T * (D // COMM_STAGE_TILE))
 SIGNAL_ROWS = 2 * (TP_SIZE - 1) if USE_RING_ALLREDUCE else TP_SIZE
 SIGNAL_COLS = TP_SIZE if USE_RING_ALLREDUCE else 1
 
 if MOE_INTER % TP_SIZE != 0:
     raise ValueError(f"intermediate size {MOE_INTER} is not divisible by TP {TP_SIZE}")
+if T % TP_SIZE != 0:
+    raise ValueError(f"token rows {T} must be divisible by TP {TP_SIZE}")
 if T > SH_M_TILE and T % SH_M_TILE != 0:
     raise ValueError("token rows must fit one M tile or be an exact M-tile multiple")
 if SH_VALID_M % SH_ACT_M_TILE != 0:
@@ -259,11 +263,230 @@ def shared_down_local(
 
 
 @pl.jit.inline(auto_scope=False)
+def gather_sp_input(
+    x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
+    gathered_x: pl.Tensor[[T, D], pl.INT8],
+    gathered_scale: pl.Tensor[[T, 1], pl.FP32],
+    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """All-gather one SP input shard inside its contiguous TP group."""
+    group_base = my_rank // TP_SIZE * TP_SIZE
+    tp_rank = my_rank % TP_SIZE
+
+    with pl.spmd(SP_COMM_WORKERS, name_hint="sh_sp_tp_gather_publish") as publish_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, SP_T * (D // COMM_STAGE_TILE), SP_COMM_WORKERS):
+            local_row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            dst_row = tp_rank * SP_T + local_row
+            for peer_tp in pl.range(TP_SIZE):
+                peer = group_base + peer_tp
+                pld.tensor.put(
+                    dst=gather_x, peer=peer, src=x_local_i8,
+                    dst_offsets=[dst_row, col], src_offsets=[local_row, col], shape=[1, COMM_STAGE_TILE],
+                )
+
+        for scale_block in pl.range(comm_core, SP_T // SH_AMAX_TILE, SP_COMM_WORKERS):
+            local_row = scale_block * SH_AMAX_TILE
+            dst_row = tp_rank * SP_T + local_row
+            for peer_tp in pl.range(TP_SIZE):
+                peer = group_base + peer_tp
+                pld.tensor.put(
+                    dst=gather_scale, peer=peer, src=x_local_scale_dq,
+                    dst_offsets=[dst_row, 0], src_offsets=[local_row, 0], shape=[SH_AMAX_TILE, 1],
+                )
+
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=gather_signal, peer=group_base + peer_tp, offsets=[tp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_sp_tp_gather_wait", deps=[publish_tid]) as wait_tid:
+        publish_expected = pl.cast(SP_COMM_WORKERS, pl.INT32)
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.wait(
+                    signal=gather_signal, offsets=[src_tp, 0],
+                    expected=publish_expected, cmp=pld.WaitCmp.Ge,
+                )
+
+    with pl.spmd(SP_COMM_WORKERS, name_hint="sh_sp_tp_gather_copy", deps=[wait_tid]) as copy_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), SP_COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            gathered_x_tile = gather_x[row : row + 1, col : col + COMM_STAGE_TILE]
+            gathered_x[row : row + 1, col : col + COMM_STAGE_TILE] = gathered_x_tile
+        for scale_block in pl.range(comm_core, T // SH_AMAX_TILE, SP_COMM_WORKERS):
+            row = scale_block * SH_AMAX_TILE
+            gathered_scale[row : row + SH_AMAX_TILE, :] = gather_scale[row : row + SH_AMAX_TILE, :]
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_sp_tp_gather_complete", deps=[copy_tid]):
+        _gather_completion_anchor = pl.read(gathered_x, [0, 0])
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=gather_signal, peer=group_base + peer_tp, offsets=[tp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+        completion_expected = pl.cast(SP_COMM_WORKERS + 1, pl.INT32)
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.wait(
+                    signal=gather_signal, offsets=[src_tp, 0],
+                    expected=completion_expected, cmp=pld.WaitCmp.Ge,
+                )
+
+        gather_credits = pl.cast(SP_COMM_WORKERS + 1, pl.INT32)
+        gather_reset: pl.Scalar[pl.INT32] = -gather_credits
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.notify(
+                    target=gather_signal, peer=my_rank, offsets=[src_tp, 0],
+                    value=gather_reset, op=pld.NotifyOp.AtomicAdd,
+                )
+    return gathered_x, gathered_scale
+
+
+@pl.jit.inline(auto_scope=False)
+def reduce_scatter_sp_partial(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    sh_local: pl.Tensor[[SP_T, D], pl.BF16],
+    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Reduce-scatter full-token FP32 partials inside a contiguous TP group."""
+    group_base = my_rank // TP_SIZE * TP_SIZE
+    tp_rank = my_rank % TP_SIZE
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_sp_tp_scatter_publish") as publish_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            source_row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            owner_tp = source_row // SP_T
+            owner_row = source_row % SP_T
+            dst_row = tp_rank * SP_T + owner_row
+            peer = group_base + owner_tp
+            pld.tensor.put(
+                dst=scatter, peer=peer, src=partial,
+                dst_offsets=[dst_row, col], src_offsets=[source_row, col], shape=[1, COMM_STAGE_TILE],
+            )
+
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=scatter_signal, peer=group_base + peer_tp, offsets=[tp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_sp_tp_scatter_wait", deps=[publish_tid]) as wait_tid:
+        publish_expected = pl.cast(COMM_WORKERS, pl.INT32)
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.wait(
+                    signal=scatter_signal, offsets=[src_tp, 0],
+                    expected=publish_expected, cmp=pld.WaitCmp.Ge,
+                )
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_sp_tp_scatter_reduce", deps=[wait_tid]) as reduce_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, SP_T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            local_row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            own_row = tp_rank * SP_T + local_row
+            acc = pl.load(scatter, [own_row, col], [1, COMM_STAGE_TILE])
+            for src_tp in pl.range(TP_SIZE):
+                if src_tp != tp_rank:
+                    src_row = src_tp * SP_T + local_row
+                    source_partial = pl.load(scatter, [src_row, col], [1, COMM_STAGE_TILE])
+                    acc = pl.add(acc, source_partial)
+            reduced_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
+            pl.store(reduced_bf16, [local_row, col], sh_local)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_sp_tp_scatter_complete", deps=[reduce_tid]):
+        _scatter_completion_anchor = pl.read(sh_local, [0, 0])
+        for peer_tp in pl.range(TP_SIZE):
+            if peer_tp != tp_rank:
+                pld.system.notify(
+                    target=scatter_signal, peer=group_base + peer_tp, offsets=[tp_rank, 0],
+                    value=1, op=pld.NotifyOp.AtomicAdd,
+                )
+
+        completion_expected = pl.cast(COMM_WORKERS + 1, pl.INT32)
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.wait(
+                    signal=scatter_signal, offsets=[src_tp, 0],
+                    expected=completion_expected, cmp=pld.WaitCmp.Ge,
+                )
+
+        scatter_credits = pl.cast(COMM_WORKERS + 1, pl.INT32)
+        scatter_reset: pl.Scalar[pl.INT32] = -scatter_credits
+        for src_tp in pl.range(TP_SIZE):
+            if src_tp != tp_rank:
+                pld.system.notify(
+                    target=scatter_signal, peer=my_rank, offsets=[src_tp, 0],
+                    value=scatter_reset, op=pld.NotifyOp.AtomicAdd,
+                )
+    return sh_local
+
+
+@pl.jit.inline(auto_scope=False)
+def expert_shared_sp_tp(
+    x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh_local: pl.Tensor[[SP_T, D], pl.BF16],
+    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the shared expert across contiguous SP and TP rank groups."""
+    gathered_x = pl.create_tensor([T, D], dtype=pl.INT8)
+    gathered_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    gather_sp_input(
+        x_local_i8, x_local_scale_dq,
+        gathered_x, gathered_scale,
+        gather_x, gather_scale, gather_signal,
+        my_rank,
+    )
+
+    h_local = pl.create_tensor([T, LOCAL_INTER], dtype=pl.FP32)
+    local_amax = pl.create_tensor([T, SH_AMAX_TILE], dtype=pl.FP32)
+    shared_gate_up_local(
+        gathered_x, gathered_scale,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        h_local, local_amax,
+    )
+
+    partial = pl.create_tensor([T, D], dtype=pl.FP32)
+    shared_down_local(h_local, local_amax, shared_w2, shared_w2_scale, partial)
+    return reduce_scatter_sp_partial(partial, sh_local, scatter, scatter_signal, my_rank)
+
+
+@pl.jit.inline(auto_scope=False)
 def reduce_down_partial_parallel(
     partial: pl.Tensor[[T, D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    partial_window: pl.InOut[pld.DistributedTensor[[T, D], pl.FP32]],
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    partial_window: pld.DistributedTensor[[T, D], pl.FP32],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Sum down partials through a parallel out-of-place mesh."""
@@ -339,7 +562,7 @@ def reduce_down_partial_parallel(
 
 @pl.jit.inline(auto_scope=False)
 def doubling_pair_barrier(
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     partner: pl.Scalar[pl.INT32],
     dep_tid: pl.Scalar[pl.TASK_ID],
@@ -363,7 +586,7 @@ def doubling_pair_barrier(
 
 @pl.jit.inline(auto_scope=False)
 def doubling_two_partner_barrier(
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     current_partner: pl.Scalar[pl.INT32],
     next_partner: pl.Scalar[pl.INT32],
@@ -400,8 +623,8 @@ def doubling_two_partner_barrier(
 
 @pl.jit.inline(auto_scope=False)
 def finish_doubling_pair(
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
     partner: pl.Scalar[pl.INT32],
     dep_tid: pl.Scalar[pl.TASK_ID],
@@ -427,9 +650,9 @@ def finish_doubling_pair(
 @pl.jit.inline(auto_scope=False)
 def reduce_down_partial_doubling_tp2(
     partial: pl.Tensor[[T, D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    doubling_window: pld.DistributedTensor[[2 * T, D], pl.FP32],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run the TP2 24-worker recursive-doubling AllReduce."""
@@ -467,9 +690,9 @@ def reduce_down_partial_doubling_tp2(
 @pl.jit.inline(auto_scope=False)
 def reduce_down_partial_doubling_tp4(
     partial: pl.Tensor[[T, D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    doubling_window: pld.DistributedTensor[[2 * T, D], pl.FP32],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run the TP4 24-worker recursive-doubling AllReduce."""
@@ -524,9 +747,9 @@ def reduce_down_partial_doubling_tp4(
 @pl.jit.inline(auto_scope=False)
 def reduce_down_partial_doubling_tp8(
     partial: pl.Tensor[[T, D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
-    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
-    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    sh: pl.Tensor[[T, D], pl.BF16],
+    doubling_window: pld.DistributedTensor[[2 * T, D], pl.FP32],
+    signal: pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run the TP8 24-worker recursive-doubling AllReduce."""
