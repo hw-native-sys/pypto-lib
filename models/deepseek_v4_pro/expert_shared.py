@@ -57,16 +57,10 @@ D_OUT_TILE_ACT = 512
 # outer task FLASH had and moves the whole range into the inner pipeline.
 W2_ACT_INNER = 14
 
-# TQuant emits one flat [1, M*K/32] scale tile. K=64 makes that [1, 32],
-# whose byte order is exactly one [16, 2] MX_A_ZZ block. Four consecutive
-# blocks occupy one row of the packed ND backing tensor.
 MX_BLOCK_K = 32
 MX_K_TILE = 64
 MX_K_SCALE_TILE = MX_K_TILE // MX_BLOCK_K
 MX_K_TILES = MOE_INTER // MX_K_TILE
-MX_SCALE_STORE_COLS = 128
-MX_SCALE_TILES_PER_ROW = MX_SCALE_STORE_COLS // (SH_M_TILE * MX_K_SCALE_TILE)
-MX_SCALE_STORE_ROWS = MX_K_TILES // MX_SCALE_TILES_PER_ROW
 W2_SCALE_ROWS = (D // D_OUT_TILE) * MX_K_TILES * MX_K_SCALE_TILE
 
 # Every tile that is used as `<dim> // <tile>` in a loop bound must divide its dim
@@ -78,8 +72,6 @@ assert D % (W2_ACT_INNER * D_OUT_TILE_ACT) == 0, \
     "W2_ACT_INNER * D_OUT_TILE_ACT must divide D (otherwise the w2-dequant task count truncates)"
 assert MOE_INTER % MX_K_TILE == 0
 assert MX_K_TILE == 2 * MX_BLOCK_K
-assert MX_SCALE_STORE_COLS % (SH_M_TILE * MX_K_SCALE_TILE) == 0
-assert MX_K_TILES % MX_SCALE_TILES_PER_ROW == 0
 
 
 @pl.jit.inline
@@ -198,41 +190,34 @@ def expert_shared(
                     n0 : n0 + ACT_INTER_TILE,
                 ] = gated[0:SH_ROWS_PER_BLOCK, :]
 
-        # Store quantized h tile-major so every down-projection K tile is a
-        # standalone [16, 64] tensor window.
         h_tile_mx = pl.create_tensor(
-            [MX_K_TILES * SH_M_TILE, MX_K_TILE], dtype=pl.FP8E4M3FN
+            [SH_M_TILE, MOE_INTER], dtype=pl.FP8E4M3FN
         )
         h_scale_store = pl.create_tensor(
-            [MX_SCALE_STORE_ROWS, MX_SCALE_STORE_COLS], dtype=pl.FP8E8M0
+            [1, SH_M_TILE * MOE_INTER // MX_BLOCK_K], dtype=pl.FP8E8M0
         )
-        for kb_idx in pl.spmd(
-            MX_K_TILES,
+        with pl.at(
+            level=pl.Level.CORE_GROUP,
             name_hint="sh_h_mx_quant",
-            allow_early_resolve=True,
         ):
-            k0 = kb_idx * MX_K_TILE
             h_src = pl.load(
                 h_tile_fp32,
-                [0, k0],
-                [SH_M_TILE, MX_K_TILE],
+                [0, 0],
+                [SH_M_TILE, MOE_INTER],
                 target_memory=pl.Mem.Vec,
             )
-            h_q, h_scale = pl.quant_mx(h_src)
-            pl.store(h_q, [kb_idx * SH_M_TILE, 0], h_tile_mx)
-            scale_row = kb_idx // MX_SCALE_TILES_PER_ROW
-            scale_col = (
-                kb_idx % MX_SCALE_TILES_PER_ROW
-            ) * SH_M_TILE * MX_K_SCALE_TILE
-            pl.store(h_scale, [scale_row, scale_col], h_scale_store)
+            h_q, h_scale = pl.quant_mx(h_src, layout=pl.MX_A_ZZ)
+            pl.store(h_q, [0, 0], h_tile_mx)
+            pl.store(h_scale, [0, 0], h_scale_store)
 
+        # quant_mx writes continuous ZZ boxes. Expose their physical [16, 2]
+        # sequence so each K=64 Cube step starts at the next packed box.
         h_scale_mx = pl.tensor.view(
             h_scale_store,
             [MX_K_TILES * SH_M_TILE, MX_K_SCALE_TILE],
             layout=pl.MX_A_ZZ,
         )
 
-        # Accumulate all 48 tile-major K windows in the down projection.
         y_fp32 = pl.create_tensor([SH_M_TILE, D], dtype=pl.FP32)
         for db_idx in pl.spmd(
             D // D_OUT_TILE,
@@ -283,11 +268,10 @@ def expert_shared(
             for kb in pl.unroll(MX_K_TILES - 1):
                 kb_idx = kb + 1
                 k0 = kb_idx * MX_K_TILE
-                h_row = kb_idx * SH_M_TILE
                 hs_k = pl.move(
                     pl.load(
                         h_tile_mx,
-                        [h_row, 0],
+                        [0, k0],
                         [SH_M_TILE, MX_K_TILE],
                         target_memory=pl.Mem.Mat,
                     ),
@@ -296,7 +280,7 @@ def expert_shared(
                 hs_scale_k = pl.move(
                     pl.load(
                         h_scale_mx,
-                        [h_row, 0],
+                        [kb_idx * SH_M_TILE, 0],
                         [SH_M_TILE, MX_K_SCALE_TILE],
                         target_memory=pl.Mem.Mat,
                     ),
