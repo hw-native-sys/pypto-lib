@@ -27,12 +27,12 @@ from config import (
 )
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+B_DYN = pl.dynamic("COMPRESSOR_R128_B_DYN")
+T_DYN = pl.dynamic("COMPRESSOR_R128_T_DYN")  # T = B * S
 S_DYN = pl.dynamic("S_DYN")
 COMPRESS_STATE_MAX_BLOCKS_DYN = pl.dynamic("COMPRESS_STATE_MAX_BLOCKS_DYN")
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("HCA_STATE_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("COMPRESSOR_R128_CMP_BLOCK_NUM_DYN")
 
 # model config
 B = DECODE_BATCH // TP
@@ -96,10 +96,10 @@ POOL_STATE_STEPS = STATE_LEN // POOL_STATE_TILE
 
 @pl.jit.inline
 def compressor_ratio128(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS_DYN], pl.INT32],
+    x: pl.Tensor,
+    kv: pl.Tensor,
+    compress_state: pl.Tensor,
+    compress_state_block_table: pl.Tensor,
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -108,10 +108,10 @@ def compressor_ratio128(
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    cmp_kv_cache: pl.Tensor,
+    position_ids: pl.Tensor,
+    cmp_slot_mapping: pl.Tensor,
+    state_slot_mapping: pl.Tensor,
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     b_dim = pl.tensor.dim(compress_state_block_table, 0)

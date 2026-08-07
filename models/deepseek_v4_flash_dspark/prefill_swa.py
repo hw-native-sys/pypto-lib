@@ -9,7 +9,10 @@
 """DeepSeek-V4 packed prefill SWA attention over one contiguous run of <=T tokens."""
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from attention_tp import GROUP_T_MAX, TP_CHOICES, TP_SIZE, gather_sp_bf16
 from config import (
     BLOCK_SIZE,
     FLASH as M,
@@ -32,6 +35,7 @@ from prefill_sparse_attn import (
     VALID_BLOCK_MASK_COLS,
     golden_prefill_sparse_attn,
     sparse_attn,
+    sparse_attn_tp,
 )
 
 
@@ -45,7 +49,9 @@ T = B * S
 EPS = M.rms_norm_eps
 D = M.hidden_size
 H = M.num_attention_heads
+LOCAL_H = H // TP_SIZE
 HEAD_DIM = M.head_dim
+LOCAL_Q = LOCAL_H * HEAD_DIM
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HEAD_DIM = ROPE_DIM
 NOPE_DIM = M.nope_head_dim
@@ -59,8 +65,10 @@ MIX_HC = M.mix_hc
 HC_DIM = M.hc_dim
 O_LORA = M.o_lora_rank
 O_GROUPS = M.o_groups
+LOCAL_O_GROUPS = O_GROUPS // TP_SIZE
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
+SP_T = T // TP_SIZE
 
 # paged KV cache. The ratio-0 path has only the sliding-window cache: one
 # request, one window page, so block count / table length / per-request window
@@ -74,6 +82,10 @@ START_POS = 0
 
 assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN+t"
+assert T == GROUP_T_MAX
+assert H % TP_SIZE == 0
+assert O_GROUPS % TP_SIZE == 0
+assert T % TP_SIZE == 0
 
 
 @pl.jit.inline
@@ -197,6 +209,300 @@ def prefill_attention_swa(
     )
 
     hc_post_prefill(attn_out, x_hc, post, comb, x_out, num_tokens)
+    return kv_cache, x_out
+
+
+@pl.jit.inline(auto_scope=False)
+def prefill_attention_swa_tp(
+    x_hc: pl.Tensor[[SP_T, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, LOCAL_O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Tensor[[SP_T, HC_MULT, D], pl.FP32],
+    gather_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    x_mixed = pl.create_tensor([SP_T, D], dtype=pl.BF16)
+    post = pl.create_tensor([SP_T, HC_MULT], dtype=pl.FP32)
+    comb = pl.create_tensor([SP_T, HC_MULT * HC_MULT], dtype=pl.FP32)
+    hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
+
+    x_normed_local = pl.create_tensor([SP_T, D], dtype=pl.BF16)
+    rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_local)
+    late_dep = pl.system.task_dummy(deps=[rms_tid])
+    x_normed_group = pl.create_tensor([T, D], dtype=pl.BF16)
+    x_normed_group = gather_sp_bf16(
+        x_normed_local,
+        x_normed_group,
+        gather_window,
+        gather_signal,
+        my_rank,
+        late_dep,
+    )
+
+    rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
+    materialize_rope_rows(
+        freqs_cos,
+        freqs_sin,
+        position_ids,
+        num_tokens,
+        rope_cos_t,
+        rope_sin_t,
+    )
+
+    q = pl.create_tensor([T, LOCAL_H, HEAD_DIM], dtype=pl.BF16)
+    kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
+    qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
+    qr_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    qkv_proj_rope(
+        x_normed_group,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        rope_cos_t,
+        rope_sin_t,
+        gamma_cq,
+        gamma_ckv,
+        q,
+        kv,
+        qr,
+        qr_scale,
+        late_dep,
+    )
+
+    kv_cache_flat = pl.reshape(kv_cache, [BLOCK_NUM * BLOCK_SIZE, HEAD_DIM])
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_cache_write"):
+        for write_t in pl.range(T):
+            if write_t < num_tokens:
+                write_row_raw = pl.read(ori_slot_mapping, [write_t])
+                if write_row_raw >= 0:
+                    write_row = pl.cast(write_row_raw, pl.INDEX)
+                    kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
+
+    swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
+    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
+        for idx_t in pl.range(T):
+            idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
+            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
+            if idx_t < num_tokens:
+                abs_pos = pl.read(position_ids, [idx_t])
+                window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
+                key_start_abs = abs_pos + 1 - window_valid
+                for win_col in pl.range(WIN):
+                    win_col_i32 = pl.cast(win_col, pl.INT32)
+                    if win_col_i32 < window_valid:
+                        key_abs = key_start_abs + win_col_i32
+                        blk_slot = key_abs // BLOCK_SIZE
+                        blk = pl.read(block_table, [pl.cast(blk_slot, pl.INDEX)])
+                        if blk >= 0:
+                            row = pl.cast(
+                                blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE),
+                                pl.INT32,
+                            )
+                            pl.write(idx_row, [0, win_col], row)
+                            if win_col < SPARSE_BIAS_COLS:
+                                pl.write(
+                                    mask_row,
+                                    [0, win_col // PREFILL_ATTN_TILE],
+                                    pl.cast(1, pl.INT32),
+                                )
+            swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
+            valid_block_mask = pl.assemble(valid_block_mask, mask_row, [idx_t, 0])
+
+    cmp_block_table_dummy = pl.create_tensor(
+        [SPARSE_CMP_MAX_BLOCKS],
+        dtype=pl.INT32,
+        init_value=0,
+    )
+    cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
+    cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
+    attn_out = pl.create_tensor([SP_T, D], dtype=pl.BF16)
+    attn_out = sparse_attn_tp(
+        q,
+        kv_cache,
+        swa_indices,
+        cmp_kv_dummy,
+        cmp_block_table_dummy,
+        cmp_indices_dummy,
+        valid_block_mask,
+        attn_sink,
+        rope_cos_t,
+        rope_sin_t,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out,
+        scatter_window,
+        scatter_signal,
+        num_tokens,
+        my_rank,
+    )
+
+    tp_rank = my_rank % TP_SIZE
+    local_num_tokens = pl.cast(num_tokens - tp_rank * SP_T, pl.INT32)
+    if local_num_tokens < 0:
+        local_num_tokens = pl.cast(0, pl.INT32)
+    if local_num_tokens > SP_T:
+        local_num_tokens = pl.cast(SP_T, pl.INT32)
+    return hc_post_prefill(attn_out, x_hc, post, comb, x_out, local_num_tokens)
+
+
+@pl.jit
+def prefill_attention_swa_tp_test(
+    x_hc: pl.Tensor[[SP_T, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[pl.Tensor[[BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    block_table: pl.Tensor[[BLOCK_NUM], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[T], pl.INT64],
+    position_ids: pl.Tensor[[T], pl.INT32],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, LOCAL_O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[SP_T, HC_MULT, D], pl.FP32]],
+    gather_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    num_tokens: pl.Scalar[pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    return prefill_attention_swa_tp(
+        x_hc,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        kv_cache,
+        block_table,
+        ori_slot_mapping,
+        position_ids,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        x_out,
+        gather_window,
+        gather_signal,
+        scatter_window,
+        scatter_signal,
+        num_tokens,
+        my_rank,
+    )
+
+
+@pl.jit.host
+def l3_prefill_attention_swa_tp(
+    x_hc: pl.Tensor[[TP_SIZE, SP_T, HC_MULT, D], pl.FP32],
+    hc_attn_fn: pl.Tensor[[TP_SIZE, MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[TP_SIZE, 3], pl.FP32],
+    hc_attn_base: pl.Tensor[[TP_SIZE, MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[TP_SIZE, D], pl.BF16],
+    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[TP_SIZE, LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    kv_cache: pl.InOut[
+        pl.Tensor[[TP_SIZE, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]
+    ],
+    block_table: pl.Tensor[[TP_SIZE, BLOCK_NUM], pl.INT32],
+    ori_slot_mapping: pl.Tensor[[TP_SIZE, T], pl.INT64],
+    position_ids: pl.Tensor[[TP_SIZE, T], pl.INT32],
+    attn_sink: pl.Tensor[[TP_SIZE, LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[TP_SIZE, D, LOCAL_O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[TP_SIZE, SP_T, HC_MULT, D], pl.FP32]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    gather_window_buffer = pld.alloc_window_buffer([GROUP_T_MAX, D], dtype=pl.BF16)
+    gather_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    scatter_window_buffer = pld.alloc_window_buffer([GROUP_T_MAX, D], dtype=pl.FP32)
+    scatter_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        gather_window = pld.window(gather_window_buffer, [GROUP_T_MAX, D], dtype=pl.BF16)
+        gather_signal = pld.window(gather_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        scatter_window = pld.window(scatter_window_buffer, [GROUP_T_MAX, D], dtype=pl.FP32)
+        scatter_signal = pld.window(scatter_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        prefill_attention_swa_tp_test(
+            x_hc[rank],
+            hc_attn_fn[rank],
+            hc_attn_scale[rank],
+            hc_attn_base[rank],
+            attn_norm_w[rank],
+            wq_a[rank],
+            wq_b[rank],
+            wq_b_scale[rank],
+            wkv[rank],
+            gamma_cq[rank],
+            gamma_ckv[rank],
+            freqs_cos[rank],
+            freqs_sin[rank],
+            kv_cache[rank],
+            block_table[rank],
+            ori_slot_mapping[rank],
+            position_ids[rank],
+            attn_sink[rank],
+            wo_a[rank],
+            wo_b[rank],
+            wo_b_scale[rank],
+            x_out[rank],
+            gather_window,
+            gather_signal,
+            scatter_window,
+            scatter_signal,
+            num_tokens,
+            rank,
+            device=rank,
+        )
     return kv_cache, x_out
 
 
@@ -352,6 +658,121 @@ def golden_prefill_attention_swa(tensors):
     tensors["x_out"][:] = y
 
 
+def golden_prefill_attention_swa_tp(tensors):
+    """Torch reference for SP prefill rows and local attention-head shards."""
+    import torch
+
+    from prefill_sparse_attn import golden_prefill_sparse_attn_tp
+    from utils import cache_row_from_table
+
+    num_tokens = int(tensors["num_tokens"])
+    x_normed_shards = []
+    post_shards = []
+    comb_shards = []
+    for rank in range(TP_SIZE):
+        x_mixed = torch.zeros(SP_T, D, dtype=torch.bfloat16)
+        post = torch.zeros(SP_T, HC_MULT, dtype=torch.float32)
+        comb = torch.zeros(SP_T, HC_MULT * HC_MULT, dtype=torch.float32)
+        golden_hc_pre({
+            "x": tensors["x_hc"][rank],
+            "hc_fn": tensors["hc_attn_fn"][rank],
+            "hc_scale": tensors["hc_attn_scale"][rank],
+            "hc_base": tensors["hc_attn_base"][rank],
+            "x_mixed": x_mixed,
+            "post": post,
+            "comb": comb,
+        })
+        x_normed_shards.append(golden_rms_norm(x_mixed, tensors["attn_norm_w"][rank]))
+        post_shards.append(post)
+        comb_shards.append(comb)
+
+    x_normed_group = torch.cat(x_normed_shards, dim=0)
+    rope_cos = torch.empty(TP_SIZE, T, ROPE_DIM, dtype=torch.bfloat16)
+    rope_sin = torch.empty_like(rope_cos)
+    q = torch.zeros(TP_SIZE, T, LOCAL_H, HEAD_DIM, dtype=torch.bfloat16)
+    kv = torch.zeros(TP_SIZE, T, HEAD_DIM, dtype=torch.bfloat16)
+    qr = torch.zeros(TP_SIZE, T, Q_LORA, dtype=torch.int8)
+    qr_scale = torch.zeros(TP_SIZE, T, 1, dtype=torch.float32)
+
+    for rank in range(TP_SIZE):
+        positions = tensors["position_ids"][rank].to(torch.long)
+        rope_cos[rank] = tensors["freqs_cos"][rank].index_select(0, positions)
+        rope_sin[rank] = tensors["freqs_sin"][rank].index_select(0, positions)
+        golden_qkv_proj_rope({
+            "x": x_normed_group,
+            "wq_a": tensors["wq_a"][rank],
+            "wq_b": tensors["wq_b"][rank],
+            "wq_b_scale": tensors["wq_b_scale"][rank],
+            "wkv": tensors["wkv"][rank],
+            "rope_cos": rope_cos[rank],
+            "rope_sin": rope_sin[rank],
+            "gamma_cq": tensors["gamma_cq"][rank],
+            "gamma_ckv": tensors["gamma_ckv"][rank],
+            "q": q[rank],
+            "kv": kv[rank],
+            "qr": qr[rank],
+            "qr_scale": qr_scale[rank],
+        })
+
+        kv_cache_flat = tensors["kv_cache"][rank].view(-1, HEAD_DIM)
+        for token in range(num_tokens):
+            write_row = int(tensors["ori_slot_mapping"][rank, token].item())
+            if write_row >= 0:
+                kv_cache_flat[write_row] = kv[rank, token]
+
+    swa_indices = torch.full((TP_SIZE, T, WIN), -1, dtype=torch.int32)
+    for rank in range(TP_SIZE):
+        for token in range(num_tokens):
+            abs_pos = int(tensors["position_ids"][rank, token].item())
+            window_valid = min(WIN, abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            for window_index, key_abs in enumerate(range(key_start_abs, abs_pos + 1)):
+                row = cache_row_from_table(tensors["block_table"][rank], key_abs)
+                if row >= 0:
+                    swa_indices[rank, token, window_index] = row
+
+    cmp_kv = torch.zeros(
+        TP_SIZE,
+        CMP_BLOCK_NUM,
+        BLOCK_SIZE,
+        1,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+    )
+    cmp_block_table = torch.zeros(TP_SIZE, SPARSE_CMP_MAX_BLOCKS, dtype=torch.int32)
+    cmp_indices = torch.full((TP_SIZE, T, IDX_TOPK), -1, dtype=torch.int32)
+    attn_out = torch.zeros(TP_SIZE, SP_T, D, dtype=torch.bfloat16)
+    golden_prefill_sparse_attn_tp({
+        "q": q,
+        "ori_kv": tensors["kv_cache"],
+        "swa_indices": swa_indices,
+        "cmp_kv": cmp_kv,
+        "cmp_block_table": cmp_block_table,
+        "cmp_indices": cmp_indices,
+        "attn_sink": tensors["attn_sink"],
+        "num_tokens": tensors["num_tokens"],
+        "freqs_cos": rope_cos,
+        "freqs_sin": rope_sin,
+        "wo_a": tensors["wo_a"],
+        "wo_b": tensors["wo_b"],
+        "wo_b_scale": tensors["wo_b_scale"],
+        "attn_out": attn_out,
+    })
+
+    for rank in range(TP_SIZE):
+        local_num_tokens = max(0, min(SP_T, num_tokens - rank * SP_T))
+        y = torch.zeros(SP_T, HC_MULT, D, dtype=torch.float32)
+        golden_hc_post_prefill({
+            "x": attn_out[rank],
+            "residual": tensors["x_hc"][rank],
+            "post": post_shards[rank],
+            "comb": comb_shards[rank],
+            "y": y,
+            "num_tokens": local_num_tokens,
+        })
+        tensors["x_out"][rank] = y
+
+
 def build_tensor_specs(
     start_pos: int = START_POS,
     num_tokens: int = T,
@@ -486,6 +907,250 @@ def build_tensor_specs(
     ]
 
 
+def build_tp_tensor_specs(
+    start_pos: int = START_POS,
+    num_tokens: int = T,
+):
+    """Shard the packed prefill fixture after full-weight quantization."""
+    import torch
+    from golden import ScalarSpec, TensorSpec
+
+    base_specs = build_tensor_specs(start_pos, num_tokens)
+    base = {
+        spec.name: spec.create_tensor()
+        for spec in base_specs
+        if isinstance(spec, TensorSpec)
+    }
+
+    def replicate(value):
+        repeats = (TP_SIZE,) + (1,) * value.ndim
+        return value.unsqueeze(0).repeat(repeats).contiguous()
+
+    x_hc = base["x_hc"].reshape(TP_SIZE, SP_T, HC_MULT, D).contiguous()
+    hc_attn_fn = replicate(base["hc_attn_fn"])
+    hc_attn_scale = replicate(base["hc_attn_scale"])
+    hc_attn_base = replicate(base["hc_attn_base"])
+    attn_norm_w = replicate(base["attn_norm_w"])
+    wq_a = replicate(base["wq_a"])
+    wq_b = torch.stack([
+        chunk.contiguous()
+        for chunk in torch.chunk(base["wq_b"], TP_SIZE, dim=1)
+    ])
+    wq_b_scale = base["wq_b_scale"].reshape(TP_SIZE, LOCAL_Q).contiguous()
+    wkv = replicate(base["wkv"])
+    gamma_cq = replicate(base["gamma_cq"])
+    gamma_ckv = replicate(base["gamma_ckv"])
+    freqs_cos = replicate(base["freqs_cos"])
+    freqs_sin = replicate(base["freqs_sin"])
+    kv_cache = replicate(base["kv_cache"])
+    block_table = replicate(base["block_table"])
+    ori_slot_mapping = replicate(base["ori_slot_mapping"])
+    position_ids = replicate(base["position_ids"])
+    attn_sink = torch.stack([
+        chunk.contiguous()
+        for chunk in torch.chunk(base["attn_sink"], TP_SIZE, dim=0)
+    ])
+    wo_a = torch.stack([
+        chunk.contiguous()
+        for chunk in torch.chunk(base["wo_a"], TP_SIZE, dim=0)
+    ])
+    wo_b = torch.stack([
+        chunk.contiguous()
+        for chunk in torch.chunk(base["wo_b"], TP_SIZE, dim=1)
+    ])
+    wo_b_scale = replicate(base["wo_b_scale"])
+
+    return [
+        TensorSpec("x_hc", [TP_SIZE, SP_T, HC_MULT, D], torch.float32, init_value=lambda: x_hc),
+        TensorSpec(
+            "hc_attn_fn",
+            [TP_SIZE, MIX_HC, HC_DIM],
+            torch.float32,
+            init_value=lambda: hc_attn_fn,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "hc_attn_scale",
+            [TP_SIZE, 3],
+            torch.float32,
+            init_value=lambda: hc_attn_scale,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "hc_attn_base",
+            [TP_SIZE, MIX_HC],
+            torch.float32,
+            init_value=lambda: hc_attn_base,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "attn_norm_w",
+            [TP_SIZE, D],
+            torch.bfloat16,
+            init_value=lambda: attn_norm_w,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wq_a",
+            [TP_SIZE, D, Q_LORA],
+            torch.bfloat16,
+            init_value=lambda: wq_a,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wq_b",
+            [TP_SIZE, Q_LORA, LOCAL_Q],
+            torch.int8,
+            init_value=lambda: wq_b,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wq_b_scale",
+            [TP_SIZE, LOCAL_Q],
+            torch.float32,
+            init_value=lambda: wq_b_scale,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wkv",
+            [TP_SIZE, D, HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: wkv,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "gamma_cq",
+            [TP_SIZE, Q_LORA],
+            torch.bfloat16,
+            init_value=lambda: gamma_cq,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "gamma_ckv",
+            [TP_SIZE, HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: gamma_ckv,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "freqs_cos",
+            [TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: freqs_cos,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "freqs_sin",
+            [TP_SIZE, MAX_SEQ_LEN, ROPE_HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: freqs_sin,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "kv_cache",
+            [TP_SIZE, BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: kv_cache,
+            is_output=True,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "block_table",
+            [TP_SIZE, BLOCK_NUM],
+            torch.int32,
+            init_value=lambda: block_table,
+        ),
+        TensorSpec(
+            "ori_slot_mapping",
+            [TP_SIZE, T],
+            torch.int64,
+            init_value=lambda: ori_slot_mapping,
+        ),
+        TensorSpec(
+            "position_ids",
+            [TP_SIZE, T],
+            torch.int32,
+            init_value=lambda: position_ids,
+        ),
+        TensorSpec(
+            "attn_sink",
+            [TP_SIZE, LOCAL_H],
+            torch.float32,
+            init_value=lambda: attn_sink,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_a",
+            [TP_SIZE, LOCAL_O_GROUPS, O_LORA, O_GROUP_IN],
+            torch.bfloat16,
+            init_value=lambda: wo_a,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_b",
+            [TP_SIZE, D, LOCAL_O_GROUPS * O_LORA],
+            torch.int8,
+            init_value=lambda: wo_b,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_b_scale",
+            [TP_SIZE, D],
+            torch.float32,
+            init_value=lambda: wo_b_scale,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "x_out",
+            [TP_SIZE, SP_T, HC_MULT, D],
+            torch.float32,
+            is_output=True,
+        ),
+        ScalarSpec("num_tokens", torch.int32, num_tokens),
+    ]
+
+
+def tp_valid_ratio_reldiff(
+    num_tokens: int,
+    diff_thd: float,
+    pct_thd: float,
+    max_diff_hd: float,
+):
+    """Apply the active-prefix comparator after restoring global token order."""
+    from golden import ratio_reldiff
+
+    base_cmp = ratio_reldiff(
+        diff_thd=diff_thd,
+        pct_thd=pct_thd,
+        max_diff_hd=max_diff_hd,
+        valid_rows=num_tokens,
+        zero_tail=True,
+    )
+
+    def cmp(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        return base_cmp(
+            actual.reshape(T, HC_MULT, D),
+            expected.reshape(T, HC_MULT, D),
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    cmp.__name__ = f"tp_valid_ratio_reldiff(num_tokens={num_tokens})"
+    return cmp
+
+
 if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, ratio_reldiff, run_jit
@@ -493,7 +1158,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill SWA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="context_len (multiple of S=WIN); fixture-only, lowered into token metadata.")
@@ -501,30 +1167,67 @@ if __name__ == "__main__":
                         help="Active token count (q_len), capped by T; passed to the kernel as num_tokens.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--enable-dep-gen", action="store_true", default=False)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.tp != TP_SIZE:
+        raise ValueError(f"import-time TP size {TP_SIZE} does not match --tp {args.tp}")
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) < TP_SIZE:
+        raise ValueError(f"need at least {TP_SIZE} devices, got {device_ids}")
+
     compare_tokens = args.num_tokens
+    distributed = TP_SIZE > 1
+    x_out_compare = (
+        tp_valid_ratio_reldiff(
+            compare_tokens,
+            diff_thd=3e-3,
+            pct_thd=0.005,
+            max_diff_hd=1,
+        )
+        if distributed
+        else ratio_reldiff(
+            diff_thd=3e-3,
+            pct_thd=0.005,
+            max_diff_hd=1,
+            valid_rows=compare_tokens,
+            zero_tail=True,
+        )
+    )
+    compile_cfg = dict(dump_passes=args.dump_passes)
+    runtime_cfg = dict(
+        platform=args.platform,
+        enable_l2_swimlane=args.enable_l2_swimlane,
+        enable_dep_gen=args.enable_dep_gen,
+    )
+    if distributed:
+        compile_cfg["distributed_config"] = DistributedConfig(
+            device_ids=device_ids[:TP_SIZE],
+            num_sub_workers=0,
+        )
+    else:
+        runtime_cfg["device_id"] = device_ids[0]
 
     result = run_jit(
-        fn=prefill_attention_swa_test,
-        specs=build_tensor_specs(
-            args.start_pos,
-            args.num_tokens,
+        fn=l3_prefill_attention_swa_tp if distributed else prefill_attention_swa_test,
+        specs=(
+            build_tp_tensor_specs(args.start_pos, args.num_tokens)
+            if distributed
+            else build_tensor_specs(args.start_pos, args.num_tokens)
         ),
-        golden_fn=golden_prefill_attention_swa,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
-            platform=args.platform,
-            device_id=args.device,
-            enable_l2_swimlane=args.enable_l2_swimlane,
-            enable_dep_gen=args.enable_dep_gen,
-        ),
+        golden_fn=golden_prefill_attention_swa_tp if distributed else golden_prefill_attention_swa,
+        runtime_dir=args.runtime_dir,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        compile_cfg=compile_cfg,
+        runtime_cfg=runtime_cfg,
         compile_only=args.compile_only,
         rtol=1e-2,
         atol=1e-2,
         compare_fn={
-            "x_out": ratio_reldiff(diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1,
-                                   valid_rows=compare_tokens, zero_tail=True),
+            "x_out": x_out_compare,
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2),
         },
     )

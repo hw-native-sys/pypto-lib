@@ -75,7 +75,7 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
 
 
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic("HC_PRE_T_DYN")  # T = B * S
 
 # Implementation selector (both versions are UNIFIED -- one code path for decode AND
 # prefill; no separate decode/prefill dispatch):

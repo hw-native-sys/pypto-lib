@@ -19,7 +19,7 @@ import pypto.language as pl
 from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ
 
 # Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic("HC_POST_T_DYN")  # T = B * S
 
 # model config
 D = M.hidden_size

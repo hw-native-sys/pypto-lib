@@ -30,8 +30,8 @@ from decode_indexer_compressor import indexer_compressor
 from rope_interleave import rope_interleave
 
 # Dynamic shape variables. S stays static: the score/topk scopes divide by it.
-B_DYN = pl.dynamic("B_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+B_DYN = pl.dynamic("INDEXER_B_DYN")
+T_DYN = pl.dynamic("INDEXER_T_DYN")  # T = B * S
 
 # model config
 B = DECODE_BATCH // TP
@@ -117,9 +117,9 @@ assert IDX_TOPK <= TOPK_HALF_LEN, "per-half candidate list must cover the final 
 
 @pl.jit.inline
 def indexer(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
-    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    x: pl.Tensor,
+    qr: pl.Tensor,
+    qr_scale: pl.Tensor,
     wq_b: pl.Tensor[[Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[IDX_N_HEADS * IDX_HEAD_DIM], pl.FP32],
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
@@ -128,23 +128,23 @@ def indexer(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
-    inner_kv: pl.Tensor[[T_DYN, INNER_HEAD_DIM], pl.FP32],
-    inner_compress_state: pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM], pl.FP32],
-    inner_compress_state_block_table: pl.Tensor[[B_DYN, INNER_STATE_MAX_BLOCKS], pl.INT32],
+    inner_kv: pl.Tensor,
+    inner_compress_state: pl.Tensor,
+    inner_compress_state_block_table: pl.Tensor,
     inner_wkv: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
-    idx_block_table: pl.Tensor[[B_DYN, IDX_CACHE_MAX_BLOCKS], pl.INT32],
-    score: pl.Tensor[[T_DYN, SCORE_LEN], pl.FP32],
-    topk_idxs: pl.Tensor[[T_DYN, SCORE_LEN], pl.INT32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    kv_seq_lens: pl.Tensor[[B_DYN], pl.INT32],
+    idx_kv_cache: pl.InOut[pl.Tensor],
+    idx_kv_scale: pl.InOut[pl.Tensor],
+    idx_block_table: pl.Tensor,
+    score: pl.Tensor,
+    topk_idxs: pl.Tensor,
+    position_ids: pl.Tensor,
+    idx_slot_mapping: pl.Tensor,
+    inner_state_slot_mapping: pl.Tensor,
+    kv_seq_lens: pl.Tensor,
     offset: pl.Scalar[pl.INT32],
     late_dep: pl.Scalar[pl.TASK_ID],
 ):

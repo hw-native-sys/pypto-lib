@@ -28,9 +28,9 @@ from rope_interleave import rope_interleave
 
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
-S_DYN = pl.dynamic("S_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+B_DYN = pl.dynamic("INDEXER_COMPRESSOR_B_DYN")
+S_DYN = pl.dynamic("INDEXER_COMPRESSOR_S_DYN")
+T_DYN = pl.dynamic("INDEXER_COMPRESSOR_T_DYN")  # T = B * S
 
 # model config
 B = DECODE_BATCH // TP
@@ -77,10 +77,10 @@ RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 
 @pl.jit.inline
 def indexer_compressor(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    x: pl.Tensor,
+    kv: pl.Tensor,
+    compress_state: pl.Tensor,
+    compress_state_block_table: pl.Tensor,
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
@@ -90,11 +90,11 @@ def indexer_compressor(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
-    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    idx_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    inner_state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    idx_kv_cache: pl.Tensor,
+    idx_kv_scale: pl.Tensor,
+    position_ids: pl.Tensor,
+    idx_slot_mapping: pl.Tensor,
+    inner_state_slot_mapping: pl.Tensor,
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     b_dim = pl.tensor.dim(compress_state_block_table, 0)

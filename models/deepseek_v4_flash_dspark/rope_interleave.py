@@ -32,7 +32,7 @@ from config import FLASH as M, DECODE_BATCH, TP
 
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")  # runtime request count
+B_DYN = pl.dynamic("ROPE_INTERLEAVE_B_DYN")  # runtime request count
 
 # model config
 B_MAX = DECODE_BATCH // TP
@@ -45,8 +45,8 @@ B_TILE = 4  # rows per gather block; runtime B is a multiple of 4
 
 @pl.jit.inline
 def rope_interleave(
-    cos_half: pl.Tensor[[B_DYN, HALF_ROPE], pl.FP32],
-    sin_half: pl.Tensor[[B_DYN, HALF_ROPE], pl.FP32],
+    cos_half: pl.Tensor,
+    sin_half: pl.Tensor,
     cos_il: pl.Tensor[[B_MAX, ROPE_HEAD_DIM], pl.FP32],
     sin_signed: pl.Tensor[[B_MAX, ROPE_HEAD_DIM], pl.FP32],
 ):
