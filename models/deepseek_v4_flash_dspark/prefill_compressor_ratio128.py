@@ -55,12 +55,14 @@ HCA_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 # tiling
 K_TILE = 512                 # projection D (K) reduction tile
 OUT_TILE = 32                # projection OUT_DIM (N) tile
+PROJ_ROW_TILE = min(128, T)  # projection token-row tile; Acc = ROW*OUT_TILE*4 sits under the a2a3 L0C wall
 HEAD_TILE = 64               # head-dim tile for the pool and rmsnorm
 HCA_KV_STORE_TILE = 16
-HCA_C128_RMS_TILE = 8
-HCA_C128_RMS_PAD_ROWS = HCA_C128_RMS_TILE
+HCA_C128_RMS_TILE = 8        # rmsnorm/rope write-row tile
+HCA_C128_RMS_PAD_ROWS = ((MAX_CMP_WRITES + HCA_C128_RMS_TILE - 1) // HCA_C128_RMS_TILE) * HCA_C128_RMS_TILE
 
-assert S == COMPRESS_RATIO, "ratio128 prefill compressor bring-up expects one full compression chunk"
+# A row tile that does not divide T drops the tail rows with no diagnostic.
+assert T % PROJ_ROW_TILE == 0, "ratio128 prefill compressor projection needs whole token-row tiles"
 
 
 @pl.jit.inline
@@ -95,15 +97,17 @@ def prefill_compressor_ratio128(
     )
     normed_kv_pad = pl.create_tensor([HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_hca_c128_kv_score_proj"):
-        o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
+    proj_row_blocks = T // PROJ_ROW_TILE
+    for proj_idx in pl.spmd((OUT_DIM // OUT_TILE) * proj_row_blocks, name_hint="prefill_hca_c128_kv_score_proj"):
+        proj_n = proj_idx // proj_row_blocks
+        o0 = proj_n * OUT_TILE
+        t0 = (proj_idx - proj_n * proj_row_blocks) * PROJ_ROW_TILE
+        kv_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+        score_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x_flat[0:T, k0 : k0 + K_TILE]
-            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
-            # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/decode-HCA.
+            x_tile = x_flat[t0 : t0 + PROJ_ROW_TILE, k0 : k0 + K_TILE]
+            # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN (K-contiguous) load.
             wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             wgate_tile = wgate[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
             if k0 == 0:
@@ -112,17 +116,16 @@ def prefill_compressor_ratio128(
             else:
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+        kv_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = kv_acc
+        score_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = score_acc
 
-    # Precompute write_i -> (position, dst cache row) once (input-only deps -> overlaps the matmul),
-    # replacing the O(T) write-discovery scan in pool / rmsnorm_rope / kv_finalize. Sized to
-    # HCA_C128_RMS_TILE because rmsnorm_rope indexes padded rows beyond MAX_CMP_WRITES (rest stay -1).
-    write_pos_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
-    write_dst_map = pl.create_tensor([1, HCA_C128_RMS_TILE], dtype=pl.INT32)
+    # write_i -> (position, dst cache row) map, consumed by pool / rmsnorm_rope / kv_finalize.
+    # Sized to HCA_C128_RMS_PAD_ROWS: rmsnorm_rope indexes padded rows past MAX_CMP_WRITES, which stay -1.
+    write_pos_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
+    write_dst_map = pl.create_tensor([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_write_map"):
-        write_pos_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=0)
-        write_dst_map[0:1, 0:HCA_C128_RMS_TILE] = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.INT32, value=-1)
+        write_pos_map[0:1, 0:HCA_C128_RMS_PAD_ROWS] = pl.full([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32, value=0)
+        write_dst_map[0:1, 0:HCA_C128_RMS_PAD_ROWS] = pl.full([1, HCA_C128_RMS_PAD_ROWS], dtype=pl.INT32, value=-1)
         map_seen = pl.cast(0, pl.INDEX)
         for map_w in pl.range(T):
             if map_w < num_tokens:
@@ -132,9 +135,9 @@ def prefill_compressor_ratio128(
                     pl.write(write_dst_map, [0, map_seen], pl.cast(map_slot_raw, pl.INT32))
                     map_seen = map_seen + 1
 
-    # State scatter (decode order): write every token's raw projection (+APE on score) into
-    # paged kv_state/score_state BEFORE pooling, so softmax_pool reads its window straight from
-    # state (no seed+overlay, no pool_dep ordering hack). pool depends on this via kv_state RAW.
+    # State scatter: every token's raw projection (+APE on score) into paged kv_state/score_state.
+    # Must land before softmax_pool, which reads its window straight from state; the RAW edge on
+    # compress_state is what carries that order.
     for scatter_t in pl.spmd(T, name_hint="prefill_hca_c128_state_scatter_pre"):
         if scatter_t < num_tokens:
             scatter_row_raw = pl.read(state_slot_mapping, [scatter_t])
@@ -143,10 +146,9 @@ def prefill_compressor_ratio128(
                 scatter_pos = pl.read(position_ids, [scatter_t])
                 scatter_ape_slot = pl.cast(scatter_pos % COMPRESS_RATIO, pl.INDEX)
                 compress_state_flat[scatter_row : scatter_row + 1, 0:OUT_DIM] = kv_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
-                compress_state_flat[scatter_row : scatter_row + 1, OUT_DIM:COMPRESS_STATE_DIM] = pl.add(
-                    score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM],
-                    ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM],
-                )
+                scatter_score = score_proj_scratch[scatter_t : scatter_t + 1, 0:OUT_DIM]
+                scatter_ape = ape[scatter_ape_slot : scatter_ape_slot + 1, 0:OUT_DIM]
+                compress_state_flat[scatter_row : scatter_row + 1, OUT_DIM:COMPRESS_STATE_DIM] = pl.add(scatter_score, scatter_ape)
 
     for pool_idx in pl.spmd(MAX_CMP_WRITES * (HEAD_DIM // HEAD_TILE), name_hint="prefill_hca_c128_softmax_pool"):
         write_i = pool_idx // (HEAD_DIM // HEAD_TILE)
@@ -183,9 +185,8 @@ def prefill_compressor_ratio128(
                         pool_state_row : pool_state_row + 1,
                         OUT_DIM + h0 : OUT_DIM + h0 + HEAD_TILE,
                     ]
-            # Vectorized softmax over all STATE_LEN slots (matches decode128): transpose the
-            # assembled [STATE_LEN, HEAD_TILE] tile and do row_max/exp/sum/div + weighted sum,
-            # replacing the STATE_LEN-1 serial online-flash fold. Same result, no long chain.
+            # Vectorized softmax over all STATE_LEN slots: transpose the assembled
+            # [STATE_LEN, HEAD_TILE] tile, then row_max/exp/sum/div and the weighted sum.
             pool_score_t = pl.transpose(pool_score_tile, axis1=0, axis2=1)
             pool_kv_t = pl.transpose(pool_kv_tile, axis1=0, axis2=1)
             score_max = pl.row_max(pool_score_t)
@@ -201,13 +202,14 @@ def prefill_compressor_ratio128(
             ]
 
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_rmsnorm_rope"):
+    for rms_blk in pl.spmd(HCA_C128_RMS_PAD_ROWS // HCA_C128_RMS_TILE, name_hint="prefill_hca_c128_rmsnorm_rope"):
+        r0 = rms_blk * HCA_C128_RMS_TILE
         cos_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([HCA_C128_RMS_TILE, ROPE_HALF], dtype=pl.FP32, value=0.0)
         for norm_i in pl.range(HCA_C128_RMS_TILE):
-            norm_slot_raw = pl.read(write_dst_map, [0, norm_i])
+            norm_slot_raw = pl.read(write_dst_map, [0, r0 + norm_i])
             if norm_slot_raw >= 0:
-                norm_cmp_pos = pl.cast(pl.read(write_pos_map, [0, norm_i]) + 1 - COMPRESS_RATIO, pl.INDEX)
+                norm_cmp_pos = pl.cast(pl.read(write_pos_map, [0, r0 + norm_i]) + 1 - COMPRESS_RATIO, pl.INDEX)
                 cos_row = pl.cast(freqs_cos[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
                 sin_row = pl.cast(freqs_sin[norm_cmp_pos : norm_cmp_pos + 1, 0:ROPE_HALF], target_type=pl.FP32)
                 cos_b[norm_i : norm_i + 1, 0:ROPE_HALF] = cos_row
@@ -215,7 +217,7 @@ def prefill_compressor_ratio128(
         partial_sq = pl.full([1, HCA_C128_RMS_TILE], dtype=pl.FP32, value=0.0)
         for rms_kb in pl.pipeline(HEAD_DIM // HEAD_TILE, stage=2):
             rms_h0 = rms_kb * HEAD_TILE
-            kv_rms_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, rms_h0 : rms_h0 + HEAD_TILE]
+            kv_rms_chunk = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, rms_h0 : rms_h0 + HEAD_TILE]
             kv_rms_sq = pl.mul(kv_rms_chunk, kv_rms_chunk)
             partial_sq = pl.add(partial_sq, pl.reshape(pl.row_sum(kv_rms_sq), [1, HCA_C128_RMS_TILE]))
 
@@ -223,16 +225,15 @@ def prefill_compressor_ratio128(
         inv_rms = pl.recip(pl.sqrt(variance))
         for norm_kb in pl.pipeline(NOPE_HEAD_DIM // HEAD_TILE, stage=2):
             norm_h0 = norm_kb * HEAD_TILE
-            kv_norm_chunk = pooled_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE]
+            kv_norm_chunk = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE]
             gamma = pl.cast(norm_w_2d[:, norm_h0 : norm_h0 + HEAD_TILE], pl.FP32)
             normed_chunk = pl.col_expand_mul(pl.row_expand_mul(kv_norm_chunk, inv_rms), gamma)
-            normed_kv_pad[0:HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
+            normed_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, norm_h0 : norm_h0 + HEAD_TILE] = normed_chunk
 
-        kv_rope = pooled_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
+        kv_rope = pooled_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM]
         gamma_rope = pl.cast(norm_w_2d[:, NOPE_HEAD_DIM:HEAD_DIM], pl.FP32)
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope, inv_rms), gamma_rope)
-        # A3 interleaved swap-gather (matches decode): single data gather + sign trick instead of
-        # the P0101/P1010 de-interleave gather + rotate + re-interleave scatter.
+        # A3 interleaved swap-gather: one data gather + sign trick.
         # out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]; idx built in-kernel from pl.arange.
         rope_ones = pl.full([HCA_C128_RMS_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
         rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -245,7 +246,7 @@ def prefill_compressor_ratio128(
         sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
         swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
         rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
-        normed_kv_pad[0:HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
+        normed_kv_pad[r0 : r0 + HCA_C128_RMS_TILE, NOPE_HEAD_DIM:HEAD_DIM] = rope_rot
 
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_c128_kv_finalize"):
         for final_i in pl.range(MAX_CMP_WRITES):
@@ -261,8 +262,8 @@ def prefill_compressor_ratio128(
                         mode="rint",
                     )
 
-    # Writes through the flattened views already update the caller-owned buffers.
-    # Avoid a dynamic reshape-back here because this inline kernel is nested.
+    # Writes through the flattened views already update the caller-owned buffers; a dynamic
+    # reshape-back is not valid in this nested inline kernel.
     return cmp_kv, compress_state
 
 
@@ -395,7 +396,7 @@ def build_tensor_specs(start_pos: int = START_POS):
         return state
     # Calibrated to the real DeepSeek-V4-Flash HCA (ratio-128) main compressor (mean l7/l9 of
     # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_compressor_ratio128.
+    # gamma centers near the measured mean.
     def init_wkv():
         return torch.randn(OUT_DIM, D) * 0.0246
     def init_wgate():
@@ -448,24 +449,12 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill compressor ratio128 validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
-    parser.add_argument(
-        "--start-pos",
-        type=int,
-        default=START_POS,
-        help=(
-            "Fixture-only absolute position for token 0. It is lowered into position_ids and compressed write "
-            "slot mapping; it is not a JIT kernel parameter."
-        ),
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on the *sim platforms CI uses.")
+    parser.add_argument("--start-pos", type=int, default=START_POS,
+                        help="Fixture-only absolute position for token 0; not a JIT kernel parameter.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()

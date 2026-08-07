@@ -75,7 +75,6 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 128
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 START_POS = 0
 
 # paged KV cache
@@ -87,7 +86,6 @@ SPARSE_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 HCA_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 
-assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
 # HCA has no indexer: the compressed tail is every slot the cache holds, so the
 # shared prefill pruning width must cover the whole cache, not a top-k budget.
 assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (
@@ -145,14 +143,7 @@ def prefill_attention_hca(
 
     rope_cos_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-    )
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
 
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
@@ -184,16 +175,12 @@ def prefill_attention_hca(
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
     cmp_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor(
-        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
-    )
+    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_hca_sparse_indices"):
         for idx_t in pl.range(T):
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
             cmp_row = pl.full([1, IDX_TOPK], dtype=pl.INT32, value=-1)
-            mask_row = pl.full(
-                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
-            )
+            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -208,11 +195,7 @@ def prefill_attention_hca(
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(swa_row, [0, win_col], row)
                             if win_col < SPARSE_BIAS_COLS:
-                                pl.write(
-                                    mask_row,
-                                    [0, win_col // PREFILL_ATTN_TILE],
-                                    pl.cast(1, pl.INT32),
-                                )
+                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
                 visible_cmp = (abs_pos + 1) // COMPRESS_RATIO
                 for cmp_col in pl.range(IDX_TOPK):
                     cmp_col_i32 = pl.cast(cmp_col, pl.INT32)
@@ -221,16 +204,10 @@ def prefill_attention_hca(
                             pl.write(cmp_row, [0, cmp_col], cmp_col_i32)
                             sparse_col = WIN + cmp_col
                             if sparse_col < SPARSE_BIAS_COLS:
-                                pl.write(
-                                    mask_row,
-                                    [0, sparse_col // PREFILL_ATTN_TILE],
-                                    pl.cast(1, pl.INT32),
-                                )
-            swa_indices = pl.assemble(swa_indices, swa_row, [idx_t, 0])
-            cmp_indices = pl.assemble(cmp_indices, cmp_row, [idx_t, 0])
-            valid_block_mask = pl.assemble(
-                valid_block_mask, mask_row, [idx_t, 0]
-            )
+                                pl.write(mask_row, [0, sparse_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+            swa_indices[idx_t : idx_t + 1, 0:WIN] = swa_row
+            cmp_indices[idx_t : idx_t + 1, 0:IDX_TOPK] = cmp_row
+            valid_block_mask[idx_t : idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
@@ -266,14 +243,14 @@ def prefill_attention_hca_test(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    compress_state: pl.Tensor[
-        [STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32
+    compress_state: pl.InOut[
+        pl.Tensor[[STATE_BLOCK_NUM_DYN, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32]
     ],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -443,10 +420,7 @@ def _state_block_table(max_blocks, physical_blocks):
     return (blocks * 17 + 3) % physical_blocks
 
 
-def build_tensor_specs(
-    start_pos: int = START_POS,
-    num_tokens: int = T,
-):
+def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     import torch
     from golden import ScalarSpec, TensorSpec
     from utils import build_rope_tables, cache_row_from_table, quant_w_per_channel
@@ -490,10 +464,9 @@ def build_tensor_specs(
         x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
         return x
-    # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
-    # synthetic scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out
-    # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
-    # Mirrors decode_hca.
+    # Real layer-9 (HCA, ratio-128) hc_attn scale/base, fn synthetic at real magnitude. A synthetic
+    # scale=0.5/base=0 cancels attn_out and the hc residual to near-zero in x_out, where W8A8 noise
+    # blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():
@@ -525,7 +498,6 @@ def build_tensor_specs(
         return shared_freqs_sin.clone()
     # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
-    # Mirrors decode_hca / decode_compressor_ratio128.
     def init_cmp_wkv():
         return torch.randn(MAIN_OUT_DIM, D) * 0.0246
     def init_cmp_wgate():
@@ -638,30 +610,12 @@ def build_tensor_specs(
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
-        # Compressor caches are written in-place but not validated here (decode
-        # parity); the dedicated prefill_compressor_ratio128 test covers them.
-        TensorSpec(
-            "compress_state",
-            [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
+        TensorSpec("compress_state", [HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [HCA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
-        TensorSpec(
-            "kv_cache",
-            [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_kv_cache,
-            is_output=True,
-        ),
+        TensorSpec("kv_cache", [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
         TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
-        TensorSpec(
-            "cmp_kv",
-            [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv,
-        ),
+        TensorSpec("cmp_kv", [HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
@@ -680,8 +634,7 @@ if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill HCA correctness test.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--start-pos", type=int, default=START_POS,
@@ -696,10 +649,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=prefill_attention_hca_test,
-        specs=build_tensor_specs(
-            args.start_pos,
-            args.num_tokens,
-        ),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_attention_hca,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
@@ -715,6 +665,8 @@ if __name__ == "__main__":
             "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1,
                                    valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
         },
     )
     if not result.passed:
