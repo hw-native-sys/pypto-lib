@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=4
 """DeepSeek-V4 HCA sparse attention with grouped output projection (decode).
 
 Ratio-128 deterministic compressed tail plus the sliding window; no indexer.
@@ -17,7 +18,16 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from attention_tp import GROUP_T_MAX, TP_CHOICES, TP_SIZE, reduce_scatter_fp32
+from attention_tp import (
+    GROUP_T_MAX,
+    TP_ATTN_SINK_SIZE,
+    TP_CHOICES,
+    TP_O_A_SIZE,
+    TP_O_B_SIZE,
+    TP_Q_B_SIZE,
+    reduce_scatter_fp32,
+    require_fused_attention_tp,
+)
 
 from config import (
     FLASH as M,
@@ -42,12 +52,13 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("HCA_ATTN_CMP_BLOCK_NUM_DYN")
 
 # model config
 LEGACY_B = DECODE_BATCH // TP
-B = DECODE_BATCH if TP_SIZE > 1 else LEGACY_B
+B = DECODE_BATCH if TP_Q_B_SIZE > 1 else LEGACY_B
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
 GLOBAL_H = M.num_attention_heads
-H = GLOBAL_H // TP_SIZE
+H = GLOBAL_H // TP_Q_B_SIZE
+ATTN_SINK_H = GLOBAL_H // TP_ATTN_SINK_SIZE
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
@@ -57,10 +68,12 @@ MAX_SEQ_LEN = M.max_position_embeddings
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
 GLOBAL_O_GROUPS = M.o_groups
-O_GROUPS = GLOBAL_O_GROUPS // TP_SIZE
+O_GROUPS = GLOBAL_O_GROUPS // TP_O_A_SIZE
+O_B_LOCAL = GLOBAL_O_GROUPS * O_LORA // TP_O_B_SIZE
 HEADS_PER_GROUP = GLOBAL_H // GLOBAL_O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
-SP_T = GROUP_T_MAX // TP_SIZE
+SP_T = GROUP_T_MAX // TP_O_B_SIZE
+TP_SIZE = require_fused_attention_tp()
 
 COMPRESS_RATIO = 128
 NEG_INF = -1.0e20
@@ -141,11 +154,11 @@ def sparse_attn_hca_partial(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_partial: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
@@ -383,7 +396,7 @@ def sparse_attn_hca_partial(
             m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
             m_mi = m_mi_new
 
-        n_sink_source = pl.reshape(attn_sink, [1, H])
+        n_sink_source = pl.reshape(attn_sink, [1, ATTN_SINK_H])
         n_sink_slice = n_sink_source[0:1, m_h0 : m_h0 + H_VALID]
         n_sink_zeros = pl.full([1, H_VALID], dtype=pl.FP32, value=0.0)
         n_sink_materialized = pl.add(n_sink_slice, n_sink_zeros)
@@ -539,11 +552,11 @@ def sparse_attn_hca(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
 ):
@@ -596,15 +609,15 @@ def sparse_attn_hca_tp(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[DECODE_BATCH, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[GROUP_T_MAX, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Tensor[[SP_T, D], pl.BF16],
     scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
-    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_O_B_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Compute one TP head shard and reduce-scatter its FP32 projection."""
@@ -642,11 +655,11 @@ def sparse_attn_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
@@ -684,15 +697,15 @@ def sparse_attn_tp_test(
     cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[DECODE_BATCH, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[GROUP_T_MAX, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[SP_T, D], pl.BF16]],
     scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
-    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_O_B_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     return sparse_attn_hca_tp(
@@ -717,26 +730,26 @@ def sparse_attn_tp_test(
 
 @pl.jit.host
 def l3_sparse_attn_hca_tp(
-    q: pl.Tensor[[TP_SIZE, GROUP_T_MAX, H, HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[TP_Q_B_SIZE, GROUP_T_MAX, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[TP_SIZE, GROUP_T_MAX, WIN], pl.INT32],
     cmp_kv: pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[TP_SIZE, DECODE_BATCH, CMP_MAX_BLOCKS], pl.INT32],
     cmp_sparse_indices: pl.Tensor[[TP_SIZE, GROUP_T_MAX, CMP_TOPK], pl.INT32],
-    attn_sink: pl.Tensor[[TP_SIZE, H], pl.FP32],
+    attn_sink: pl.Tensor[[TP_ATTN_SINK_SIZE, ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[TP_SIZE, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[TP_SIZE, D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[TP_SIZE, D], pl.FP32],
-    attn_out: pl.Out[pl.Tensor[[TP_SIZE, SP_T, D], pl.BF16]],
+    wo_a: pl.Tensor[[TP_O_A_SIZE, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[TP_O_B_SIZE, D, O_B_LOCAL], pl.INT8],
+    wo_b_scale: pl.Tensor[[TP_O_B_SIZE, D], pl.FP32],
+    attn_out: pl.Out[pl.Tensor[[TP_O_B_SIZE, SP_T, D], pl.BF16]],
 ):
     scatter_window_buffer = pld.alloc_window_buffer([GROUP_T_MAX, D], dtype=pl.FP32)
-    scatter_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    scatter_signal_buffer = pld.alloc_window_buffer([TP_O_B_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         scatter_window = pld.window(scatter_window_buffer, [GROUP_T_MAX, D], dtype=pl.FP32)
-        scatter_signal = pld.window(scatter_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        scatter_signal = pld.window(scatter_signal_buffer, [TP_O_B_SIZE, 1], dtype=pl.INT32)
         sparse_attn_tp_test(
             q[rank],
             ori_kv[rank],
@@ -912,7 +925,7 @@ def golden_sparse_attn_tp(tensors):
             "wo_b_scale": tensors["wo_b_scale"][rank],
         }))
     reduced = torch.stack(partials).sum(dim=0).to(torch.bfloat16)
-    tensors["attn_out"][:] = reduced.reshape(TP_SIZE, SP_T, D)
+    tensors["attn_out"][:] = reduced.reshape(TP_O_B_SIZE, SP_T, D)
 
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
@@ -965,7 +978,7 @@ def build_tensor_specs(
 
     def init_attn_sink():
         """Initialize the per-head sink logits to zero."""
-        return torch.zeros(H)
+        return torch.zeros(ATTN_SINK_H)
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
@@ -1014,7 +1027,7 @@ def build_tensor_specs(
         """Initialize the grouped first-stage output-projection weights."""
         return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
 
-    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
+    wo_b_bf16 = ((torch.rand(D, O_B_LOCAL) - 0.5) / (O_B_LOCAL ** 0.5)).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     def init_wo_b():
@@ -1032,11 +1045,11 @@ def build_tensor_specs(
         TensorSpec("cmp_kv", [CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv),
         TensorSpec("cmp_block_table", [batch, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("cmp_sparse_indices", [tokens, CMP_TOPK], torch.int32, init_value=init_cmp_sparse_indices),
-        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("attn_sink", [ATTN_SINK_H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b", [D, O_B_LOCAL], torch.int8, init_value=init_wo_b),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
         TensorSpec("attn_out", [tokens, D], torch.bfloat16, is_output=True),
     ]
@@ -1065,7 +1078,7 @@ def build_tp_tensor_specs(
     q_full = torch.rand(GROUP_T_MAX, GLOBAL_H, HEAD_DIM) - 0.5
     if causal_regression_fixture:
         q_full[0].fill_(1.0)
-    q = torch.stack([chunk.contiguous() for chunk in torch.chunk(q_full, TP_SIZE, dim=1)])
+    q = torch.stack([chunk.contiguous() for chunk in torch.chunk(q_full, TP_Q_B_SIZE, dim=1)])
 
     ori_kv_one = torch.rand(ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM) - 0.5
     if causal_regression_fixture:
@@ -1115,7 +1128,7 @@ def build_tp_tensor_specs(
     cmp_sparse_indices = replicated(cmp_sparse_indices_one)
 
     attn_sink_full = torch.zeros(GLOBAL_H)
-    attn_sink = attn_sink_full.reshape(TP_SIZE, H).contiguous()
+    attn_sink = attn_sink_full.reshape(TP_ATTN_SINK_SIZE, ATTN_SINK_H).contiguous()
 
     angles = torch.arange(GROUP_T_MAX * HALF_ROPE).reshape(GROUP_T_MAX, HALF_ROPE) * 1e-3
     cos_half = torch.cos(angles)
@@ -1124,7 +1137,7 @@ def build_tp_tensor_specs(
     freqs_sin = replicated(torch.cat([sin_half, sin_half], dim=-1))
 
     wo_a_full = (torch.rand(GLOBAL_O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
-    wo_a = torch.stack([chunk.contiguous() for chunk in torch.chunk(wo_a_full, TP_SIZE, dim=0)])
+    wo_a = torch.stack([chunk.contiguous() for chunk in torch.chunk(wo_a_full, TP_O_A_SIZE, dim=0)])
 
     wo_b_full = (
         (torch.rand(D, GLOBAL_O_GROUPS * O_LORA) - 0.5)
@@ -1133,13 +1146,13 @@ def build_tp_tensor_specs(
     wo_b_full_i8, wo_b_scale_one = quant_w_per_channel(wo_b_full)
     wo_b_grouped = wo_b_full_i8.reshape(D, GLOBAL_O_GROUPS, O_LORA)
     wo_b = torch.stack([
-        chunk.contiguous().reshape(D, O_GROUPS * O_LORA)
-        for chunk in torch.chunk(wo_b_grouped, TP_SIZE, dim=1)
+        chunk.contiguous().reshape(D, O_B_LOCAL)
+        for chunk in torch.chunk(wo_b_grouped, TP_O_B_SIZE, dim=1)
     ])
     wo_b_scale = replicated(wo_b_scale_one)
 
     return [
-        TensorSpec("q", [TP_SIZE, GROUP_T_MAX, H, HEAD_DIM], torch.bfloat16, init_value=lambda: q),
+        TensorSpec("q", [TP_Q_B_SIZE, GROUP_T_MAX, H, HEAD_DIM], torch.bfloat16, init_value=lambda: q),
         TensorSpec(
             "ori_kv",
             [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
@@ -1170,7 +1183,9 @@ def build_tp_tensor_specs(
             torch.int32,
             init_value=lambda: cmp_sparse_indices,
         ),
-        TensorSpec("attn_sink", [TP_SIZE, H], torch.float32, init_value=lambda: attn_sink),
+        TensorSpec(
+            "attn_sink", [TP_ATTN_SINK_SIZE, ATTN_SINK_H], torch.float32, init_value=lambda: attn_sink
+        ),
         TensorSpec(
             "freqs_cos",
             [TP_SIZE, GROUP_T_MAX, ROPE_DIM],
@@ -1185,26 +1200,26 @@ def build_tp_tensor_specs(
         ),
         TensorSpec(
             "wo_a",
-            [TP_SIZE, O_GROUPS, O_LORA, O_GROUP_IN],
+            [TP_O_A_SIZE, O_GROUPS, O_LORA, O_GROUP_IN],
             torch.bfloat16,
             init_value=lambda: wo_a,
             resident="stacked",
         ),
         TensorSpec(
             "wo_b",
-            [TP_SIZE, D, O_GROUPS * O_LORA],
+            [TP_O_B_SIZE, D, O_B_LOCAL],
             torch.int8,
             init_value=lambda: wo_b,
             resident="stacked",
         ),
         TensorSpec(
             "wo_b_scale",
-            [TP_SIZE, D],
+            [TP_O_B_SIZE, D],
             torch.float32,
             init_value=lambda: wo_b_scale,
             resident="stacked",
         ),
-        TensorSpec("attn_out", [TP_SIZE, SP_T, D], torch.bfloat16, is_output=True),
+        TensorSpec("attn_out", [TP_O_B_SIZE, SP_T, D], torch.bfloat16, is_output=True),
     ]
 
 
@@ -1214,7 +1229,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp", type=int, default=None, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-q-b", type=int, default=TP_Q_B_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-attn-sink", type=int, default=TP_ATTN_SINK_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-o-a", type=int, default=TP_O_A_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-o-b", type=int, default=TP_O_B_SIZE, choices=list(TP_CHOICES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)))
     parser.add_argument("-b", "--batch", type=int, default=B,
                         help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
@@ -1239,8 +1258,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-    if args.tp != TP_SIZE:
-        parser.error(f"import-time TP size {TP_SIZE} does not match --tp {args.tp}")
+    parsed_tp = (args.tp_q_b, args.tp_attn_sink, args.tp_o_a, args.tp_o_b)
+    resolved_tp = (TP_Q_B_SIZE, TP_ATTN_SINK_SIZE, TP_O_A_SIZE, TP_O_B_SIZE)
+    if parsed_tp != resolved_tp:
+        parser.error(f"import-time attention TP {resolved_tp} does not match parsed TP {parsed_tp}")
     if TP_SIZE == 1:
         if args.batch < 4 or args.batch > LEGACY_B or args.batch % 4 != 0:
             parser.error(f"--batch must be a multiple of 4 in [4, {LEGACY_B}], got {args.batch}")

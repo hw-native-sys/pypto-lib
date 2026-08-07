@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=4
 """DeepSeek-V4 Q/KV LoRA + RoPE (dynamic shape): projects token-major
 attention-normalized inputs for both decode and prefill attention paths."""
 
@@ -14,7 +15,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from attention_tp import GROUP_T_MAX, TP_CHOICES, TP_SIZE, gather_sp_bf16
+from attention_tp import GROUP_T_MAX, TP_CHOICES, TP_Q_B_SIZE, gather_sp_bf16
 from config import DECODE_BATCH, DECODE_SEQ, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, PREFILL_BATCH, PREFILL_SEQ, TP
 
 
@@ -27,6 +28,7 @@ D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
 Q_DIM = H * HEAD_DIM
+TP_SIZE = TP_Q_B_SIZE
 LOCAL_H = H // TP_SIZE
 LOCAL_Q = LOCAL_H * HEAD_DIM
 SP_T = GROUP_T_MAX // TP_SIZE
@@ -744,7 +746,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("--tp", type=int, default=TP_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp", type=int, default=None, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-q-b", type=int, default=TP_Q_B_SIZE, choices=list(TP_CHOICES))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)))
     parser.add_argument("--mode", choices=["decode", "prefill", "all"], default="all",
                         help="Use decode or prefill batch sizes, or 'all' to test both.")
@@ -757,8 +760,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
-    if args.tp != TP_SIZE:
-        raise ValueError(f"import-time TP size {TP_SIZE} does not match --tp {args.tp}")
+    if args.tp_q_b != TP_Q_B_SIZE:
+        raise ValueError(f"import-time Q-B TP {TP_Q_B_SIZE} does not match --tp-q-b {args.tp_q_b}")
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) < TP_SIZE:
         raise ValueError(f"need at least {TP_SIZE} devices, got {device_ids}")
