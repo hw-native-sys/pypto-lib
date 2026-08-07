@@ -254,6 +254,22 @@ def topk_select_fwd(
     return topk_values, topk_indices
 
 
+@pl.jit.host
+def qwen3_topk_select_host(
+    logits: pl.Tensor[[BATCH_PAD, VOCAB], pl.FP32],
+    sampling_control: pl.Tensor[[2], pl.INT32],
+    topk_values: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.FP32]],
+    topk_indices: pl.Out[pl.Tensor[[BATCH_PAD, TOPK], pl.INT32]],
+) -> tuple[pl.Tensor, pl.Tensor]:
+    """HOST-level entry over topk_select_fwd for serving signature-mode compile."""
+    return topk_select_fwd(
+        logits,
+        sampling_control,
+        topk_values,
+        topk_indices,
+    )
+
+
 def build_tensor_specs(selection_k=TOPK):
     import torch
 

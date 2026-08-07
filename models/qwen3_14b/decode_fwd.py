@@ -1824,3 +1824,61 @@ if __name__ == "__main__":
               f"max_abs_err={(a-e).abs().max():.4f} | kernel_argmax={amax_k.tolist()} "
               f"sampled={sample_k.tolist()} ref_argmax={amax_r.tolist()}")
         raise SystemExit(0 if argmax_match == UB and sample_match == UB else 1)
+
+
+@pl.jit.host
+def qwen3_decode_host(  # noqa: PLR0913 — HOST entry over decode_fwd for serving signature-mode compile
+    input_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    wq: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    wk: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    wv: pl.Tensor[[NUM_LAYERS * HIDDEN, KV_HIDDEN], pl.BF16],
+    q_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    k_norm_weight: pl.Tensor[[NUM_LAYERS, HEAD_DIM], pl.FP32],
+    seq_lens: pl.Tensor[[BATCH_DYN], pl.INT32],
+    block_table: pl.Tensor[[D.block_table_flat], pl.INT32],
+    slot_mapping: pl.Tensor[[BATCH_DYN], pl.INT32],
+    rope_cos: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    rope_sin: pl.Tensor[[D.rope_seq, HEAD_DIM], pl.FP32],
+    k_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    v_cache: pl.Tensor[[KV_CACHE_ROWS_DYN, HEAD_DIM], pl.BF16],
+    wo: pl.Tensor[[NUM_LAYERS * HIDDEN, HIDDEN], pl.BF16],
+    w_gate: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_up: pl.Tensor[[NUM_LAYERS * HIDDEN, INTERMEDIATE], pl.BF16],
+    w_down: pl.Tensor[[NUM_LAYERS * INTERMEDIATE, HIDDEN], pl.BF16],
+    post_rms_weight: pl.Tensor[[NUM_LAYERS, HIDDEN], pl.FP32],
+    final_norm_weight: pl.Tensor[[1, HIDDEN], pl.FP32],
+    lm_head_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[BATCH_DYN, VOCAB], pl.FP32]],
+    embed_weight: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    sampled_ids_in: pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32],
+    sampled_ids: pl.Out[pl.Tensor[[BATCH_DYN, SAMPLED_IDS_PAD], pl.INT32]],
+    next_hidden: pl.Out[pl.Tensor[[BATCH_DYN, HIDDEN], pl.BF16]],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+    logits, sampled_ids, next_hidden = decode_fwd(
+        input_rms_weight,
+        wq,
+        wk,
+        wv,
+        q_norm_weight,
+        k_norm_weight,
+        seq_lens,
+        block_table,
+        slot_mapping,
+        rope_cos,
+        rope_sin,
+        k_cache,
+        v_cache,
+        wo,
+        w_gate,
+        w_up,
+        w_down,
+        post_rms_weight,
+        final_norm_weight,
+        lm_head_weight,
+        out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids,
+        next_hidden,
+    )
+    return logits, sampled_ids, next_hidden
