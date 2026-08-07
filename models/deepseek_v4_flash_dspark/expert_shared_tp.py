@@ -21,8 +21,7 @@ from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX
 # command-line config
 _TP_CHOICES = (2, 4, 8)
 _TP_DEFAULT = 2
-_ALLREDUCE_MODES = ("parallel-mesh", "mesh", "ring")
-_ALLREDUCE_DEFAULT = "parallel-mesh"
+_ALLREDUCE_MODES = ("parallel-mesh", "parallel-doubling", "mesh", "ring")
 
 
 def _parse_tp_argv():
@@ -34,24 +33,25 @@ def _parse_tp_argv():
     return _TP_DEFAULT
 
 
-def _parse_allreduce_mode_argv():
+def _parse_allreduce_mode_argv(tp_size):
     for index, token in enumerate(sys.argv):
         if token == "--allreduce-mode" and index + 1 < len(sys.argv):
             return sys.argv[index + 1]
         if token.startswith("--allreduce-mode="):
             return token.split("=", 1)[1]
-    return _ALLREDUCE_DEFAULT
+    return "parallel-doubling" if tp_size == 8 else "parallel-mesh"
 
 
 # distributed config
 TP_SIZE = _parse_tp_argv()
 if TP_SIZE not in _TP_CHOICES:
     raise ValueError(f"--tp must be one of {_TP_CHOICES}, got {TP_SIZE}")
-ALLREDUCE_MODE = _parse_allreduce_mode_argv()
+ALLREDUCE_MODE = _parse_allreduce_mode_argv(TP_SIZE)
 if ALLREDUCE_MODE not in _ALLREDUCE_MODES:
     raise ValueError(f"--allreduce-mode must be one of {_ALLREDUCE_MODES}, got {ALLREDUCE_MODE}")
 USE_RING_ALLREDUCE = ALLREDUCE_MODE == "ring"
 USE_PARALLEL_MESH = ALLREDUCE_MODE == "parallel-mesh"
+USE_PARALLEL_DOUBLING = ALLREDUCE_MODE == "parallel-doubling"
 
 # model config
 T = DECODE_TOKENS
@@ -337,6 +337,264 @@ def reduce_down_partial_parallel(
     return sh
 
 
+@pl.jit.inline(auto_scope=False)
+def doubling_pair_barrier(
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+    partner: pl.Scalar[pl.INT32],
+    dep_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Synchronize one recursive-doubling partner pair."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_tp_doubling_pair_barrier", deps=[dep_tid]) as barrier_tid:
+        pld.system.notify(
+            target=signal, peer=partner, offsets=[my_rank, 0],
+            value=1, op=pld.NotifyOp.AtomicAdd,
+        )
+        pld.system.wait(
+            signal=signal, offsets=[partner, 0],
+            expected=1, cmp=pld.WaitCmp.Ge,
+        )
+        pld.system.notify(
+            target=signal, peer=my_rank, offsets=[partner, 0],
+            value=-1, op=pld.NotifyOp.AtomicAdd,
+        )
+    return barrier_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def doubling_two_partner_barrier(
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+    current_partner: pl.Scalar[pl.INT32],
+    next_partner: pl.Scalar[pl.INT32],
+    dep_tid: pl.Scalar[pl.TASK_ID],
+) -> pl.Scalar[pl.TASK_ID]:
+    """Synchronize the current and next recursive-doubling partners."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_tp_doubling_pair2_barrier", deps=[dep_tid]) as barrier_tid:
+        pld.system.notify(
+            target=signal, peer=current_partner, offsets=[my_rank, 0],
+            value=1, op=pld.NotifyOp.AtomicAdd,
+        )
+        pld.system.notify(
+            target=signal, peer=next_partner, offsets=[my_rank, 0],
+            value=1, op=pld.NotifyOp.AtomicAdd,
+        )
+        pld.system.wait(
+            signal=signal, offsets=[current_partner, 0],
+            expected=1, cmp=pld.WaitCmp.Ge,
+        )
+        pld.system.wait(
+            signal=signal, offsets=[next_partner, 0],
+            expected=1, cmp=pld.WaitCmp.Ge,
+        )
+        pld.system.notify(
+            target=signal, peer=my_rank, offsets=[current_partner, 0],
+            value=-1, op=pld.NotifyOp.AtomicAdd,
+        )
+        pld.system.notify(
+            target=signal, peer=my_rank, offsets=[next_partner, 0],
+            value=-1, op=pld.NotifyOp.AtomicAdd,
+        )
+    return barrier_tid
+
+
+@pl.jit.inline(auto_scope=False)
+def finish_doubling_pair(
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+    partner: pl.Scalar[pl.INT32],
+    dep_tid: pl.Scalar[pl.TASK_ID],
+):
+    """Complete the final partner read and clear its signal credit."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="sh_tp_doubling_finish", deps=[dep_tid]):
+        _doubling_completion_anchor = pl.read(sh, [0, 0])
+        pld.system.notify(
+            target=signal, peer=partner, offsets=[my_rank, 0],
+            value=1, op=pld.NotifyOp.AtomicAdd,
+        )
+        pld.system.wait(
+            signal=signal, offsets=[partner, 0],
+            expected=1, cmp=pld.WaitCmp.Ge,
+        )
+        pld.system.notify(
+            target=signal, peer=my_rank, offsets=[partner, 0],
+            value=-1, op=pld.NotifyOp.AtomicAdd,
+        )
+    return sh
+
+
+@pl.jit.inline(auto_scope=False)
+def reduce_down_partial_doubling_tp2(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the TP2 24-worker recursive-doubling AllReduce."""
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_publish") as publish_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            pld.tensor.put(
+                dst=doubling_window, peer=my_rank, src=partial,
+                dst_offsets=[row, col], src_offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+
+    partner_group = my_rank % 2
+    partner = my_rank + 1 - 2 * partner_group
+    publish_barrier_tid = doubling_pair_barrier(signal, my_rank, partner, publish_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_1", deps=[publish_barrier_tid]) as reduce_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner,
+                offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            reduced_bf16 = pl.cast(reduced, target_type=pl.BF16, mode="rint")
+            pl.store(reduced_bf16, [row, col], sh)
+
+    return finish_doubling_pair(sh, signal, my_rank, partner, reduce_tid)
+
+
+@pl.jit.inline(auto_scope=False)
+def reduce_down_partial_doubling_tp4(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the TP4 24-worker recursive-doubling AllReduce."""
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_publish") as publish_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            pld.tensor.put(
+                dst=doubling_window, peer=my_rank, src=partial,
+                dst_offsets=[row, col], src_offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+
+    partner_group_1 = my_rank % 2
+    partner_1 = my_rank + 1 - 2 * partner_group_1
+    partner_group_2 = (my_rank // 2) % 2
+    partner_2 = my_rank + 2 - 4 * partner_group_2
+    publish_barrier_tid = doubling_pair_barrier(signal, my_rank, partner_1, publish_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_1", deps=[publish_barrier_tid]) as reduce_1_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner_1,
+                offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            pld.tile.remote_store(reduced, target=doubling_window, peer=my_rank, offsets=[T + row, col])
+
+    stage_1_tid = doubling_two_partner_barrier(signal, my_rank, partner_1, partner_2, reduce_1_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_2", deps=[stage_1_tid]) as reduce_2_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [T + row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner_2,
+                offsets=[T + row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            reduced_bf16 = pl.cast(reduced, target_type=pl.BF16, mode="rint")
+            pl.store(reduced_bf16, [row, col], sh)
+
+    return finish_doubling_pair(sh, signal, my_rank, partner_2, reduce_2_tid)
+
+
+@pl.jit.inline(auto_scope=False)
+def reduce_down_partial_doubling_tp8(
+    partial: pl.Tensor[[T, D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
+    signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the TP8 24-worker recursive-doubling AllReduce."""
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_publish") as publish_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            pld.tensor.put(
+                dst=doubling_window, peer=my_rank, src=partial,
+                dst_offsets=[row, col], src_offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+
+    partner_group_1 = my_rank % 2
+    partner_1 = my_rank + 1 - 2 * partner_group_1
+    partner_group_2 = (my_rank // 2) % 2
+    partner_2 = my_rank + 2 - 4 * partner_group_2
+    partner_group_4 = (my_rank // 4) % 2
+    partner_4 = my_rank + 4 - 8 * partner_group_4
+    publish_barrier_tid = doubling_pair_barrier(signal, my_rank, partner_1, publish_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_1", deps=[publish_barrier_tid]) as reduce_1_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner_1,
+                offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            pld.tile.remote_store(reduced, target=doubling_window, peer=my_rank, offsets=[T + row, col])
+
+    stage_1_tid = doubling_two_partner_barrier(signal, my_rank, partner_1, partner_2, reduce_1_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_2", deps=[stage_1_tid]) as reduce_2_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [T + row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner_2,
+                offsets=[T + row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            pld.tile.remote_store(reduced, target=doubling_window, peer=my_rank, offsets=[row, col])
+
+    stage_2_tid = doubling_two_partner_barrier(signal, my_rank, partner_2, partner_4, reduce_2_tid)
+
+    with pl.spmd(COMM_WORKERS, name_hint="sh_tp_doubling_reduce_4", deps=[stage_2_tid]) as reduce_4_tid:
+        comm_core = pl.tile.get_block_idx()
+        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+            row = block // (D // COMM_STAGE_TILE)
+            col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
+            local = pl.load(doubling_window, [row, col], [1, COMM_STAGE_TILE])
+            remote = pld.tile.remote_load(
+                doubling_window, peer=partner_4,
+                offsets=[row, col], shape=[1, COMM_STAGE_TILE],
+            )
+            reduced = pl.add(local, remote)
+            reduced_bf16 = pl.cast(reduced, target_type=pl.BF16, mode="rint")
+            pl.store(reduced_bf16, [row, col], sh)
+
+    return finish_doubling_pair(sh, signal, my_rank, partner_4, reduce_4_tid)
+
+
 @pl.jit.incore
 def reduce_down_partial(
     partial: pl.Tensor[[T, D], pl.FP32],
@@ -379,6 +637,7 @@ def expert_shared_tp(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
     partial_window: pl.InOut[pld.DistributedTensor[[T, D], pl.FP32]],
+    doubling_window: pl.InOut[pld.DistributedTensor[[2 * T, D], pl.FP32]],
     signal: pl.InOut[pld.DistributedTensor[[SIGNAL_ROWS, SIGNAL_COLS], pl.INT32]],
     my_rank: pl.Scalar[pl.INT32],
 ):
@@ -393,7 +652,14 @@ def expert_shared_tp(
 
     partial = pl.create_tensor([T, D], dtype=pl.FP32)
     shared_down_local(h_local, local_amax, shared_w2, shared_w2_scale, partial)
-    if USE_PARALLEL_MESH:
+    if USE_PARALLEL_DOUBLING:
+        if TP_SIZE == 2:
+            return reduce_down_partial_doubling_tp2(partial, sh, doubling_window, signal, my_rank)
+        elif TP_SIZE == 4:
+            return reduce_down_partial_doubling_tp4(partial, sh, doubling_window, signal, my_rank)
+        else:
+            return reduce_down_partial_doubling_tp8(partial, sh, doubling_window, signal, my_rank)
+    elif USE_PARALLEL_MESH:
         return reduce_down_partial_parallel(partial, sh, partial_window, signal, my_rank)
     else:
         return reduce_down_partial(partial, sh, partial_window, signal)
@@ -413,17 +679,19 @@ def l3_expert_shared_tp(
 ):
     """Launch one rank per TP shard in a single communication domain."""
     partial_window_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    doubling_window_buf = pld.alloc_window_buffer([2 * T, D], dtype=pl.FP32)
     signal_buf = pld.alloc_window_buffer([SIGNAL_ROWS, SIGNAL_COLS], dtype=pl.INT32)
 
     for rank in pl.range(pld.world_size()):
         partial_window = pld.window(partial_window_buf, [T, D], dtype=pl.FP32)
+        doubling_window = pld.window(doubling_window_buf, [2 * T, D], dtype=pl.FP32)
         signal = pld.window(signal_buf, [SIGNAL_ROWS, SIGNAL_COLS], dtype=pl.INT32)
         expert_shared_tp(
             x_local_i8[rank], x_local_scale_dq[rank],
             shared_w1[rank], shared_w1_scale[rank], shared_w3[rank], shared_w3_scale[rank],
             shared_w2[rank], shared_w2_scale[rank],
             sh[rank],
-            partial_window, signal, rank,
+            partial_window, doubling_window, signal, rank,
             device=rank,
         )
 
