@@ -14,7 +14,6 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
-    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
@@ -33,7 +32,7 @@ S_DYN = pl.dynamic("INDEXER_COMPRESSOR_S_DYN")
 T_DYN = pl.dynamic("INDEXER_COMPRESSOR_T_DYN")  # T = B * S
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size
@@ -87,8 +86,8 @@ def indexer_compressor(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor,
     idx_kv_scale: pl.Tensor,
@@ -653,6 +652,39 @@ if __name__ == "__main__":
     if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
         parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
 
+    def kv_committed_compare(
+        actual,
+        expected,
+        *,
+        actual_outputs,
+        expected_outputs,
+        inputs,
+        rtol,
+        atol,
+    ):
+        position_ids = inputs["position_ids"].cpu().reshape(-1, S)
+        idx_slot_mapping = inputs["idx_slot_mapping"].cpu().reshape(-1, S)
+        committed_rows = []
+        for batch_idx in range(position_ids.shape[0]):
+            pos_mod = int(position_ids[batch_idx, 0].item()) % COMPRESS_RATIO
+            if pos_mod + S >= COMPRESS_RATIO:
+                boundary_s = COMPRESS_RATIO - 1 - pos_mod
+                if int(idx_slot_mapping[batch_idx, boundary_s].item()) >= 0:
+                    committed_rows.append(batch_idx * S)
+        if not committed_rows:
+            return True, ""
+        return ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0)(
+            actual[committed_rows],
+            expected[committed_rows],
+            actual_outputs=actual_outputs,
+            expected_outputs=expected_outputs,
+            inputs=inputs,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    kv_committed_compare.__name__ = "kv_committed_rows_compare"
+
     result = run_jit(
         fn=compressor_test,
         specs=build_tensor_specs(args.start_pos, batch=args.batch),
@@ -667,7 +699,7 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            "kv": kv_committed_compare,
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),

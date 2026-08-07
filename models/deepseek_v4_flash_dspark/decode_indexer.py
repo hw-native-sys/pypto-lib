@@ -16,7 +16,6 @@ import pypto.language as pl
 from config import (
     FLASH as M,
     DECODE_BATCH,
-    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
@@ -34,7 +33,7 @@ B_DYN = pl.dynamic("INDEXER_B_DYN")
 T_DYN = pl.dynamic("INDEXER_T_DYN")  # T = B * S
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
@@ -71,8 +70,7 @@ CACHE_TILE = 64
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
 # REDUCE_TILE tiles the paged C8 cache one 128-row page per fused matmul+reduce step.
 REDUCE_TILE = 128
-# the fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes: T * NSPLIT.
-# T*NSPLIT=16 mixed blocks map to 16 AIC + 32 AIV (1:2), one clean wave on the 24+48 chip.
+# The fused score scope fans each token's cache-page loop across REDUCE_NSPLIT lanes.
 REDUCE_NSPLIT = 2
 Q_TILE = 256
 # Q_OUT_TILE is the per-task N granularity (sets idx_qr_proj task count); MM_N_TILE
@@ -125,8 +123,8 @@ def indexer(
     weights_proj: pl.Tensor[[D, IDX_N_HEADS], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
     hadamard: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],  # shared by q rotation and inner Compressor
     inner_kv: pl.Tensor,
     inner_compress_state: pl.Tensor,
@@ -197,7 +195,7 @@ def indexer(
     #
     # The j^1 lane-swap index permutes data, so no host table can hold it -- but it is
     # block-invariant, and rebuilding it inside the spmd cost the same arange/trunc-cast/
-    # lane/arithmetic chain on all 16 blocks. Built once here instead (same form as the
+    # lane/arithmetic chain on every block. Built once here instead (same form as the
     # rope_swap scope in decode_sparse_attn_hca) and loaded per block. No pypto bitwise
     # op is reachable at the tensor level, so the fp32 arithmetic chain is the only form.
     rope_swap_idx_t = pl.create_tensor([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.INT32)

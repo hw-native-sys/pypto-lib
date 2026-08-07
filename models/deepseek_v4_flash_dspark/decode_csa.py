@@ -65,12 +65,9 @@ T_DYN = pl.dynamic("T_DYN")  # T = B * S
 
 # model config
 LEGACY_B = DECODE_BATCH // TP
-LEGACY_T = LEGACY_B * DECODE_SEQ
 B = DECODE_BATCH if TP_SIZE > 1 else LEGACY_B
 S = DECODE_SEQ
-T = B * S
 SP_T = GROUP_T_MAX // TP_SIZE
-INDEXER_CHUNKS = GROUP_T_MAX // LEGACY_T
 EPS = M.rms_norm_eps
 D = M.hidden_size
 GLOBAL_H = M.num_attention_heads
@@ -125,7 +122,6 @@ CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
 CSA_WB_TOKEN_TILE = 8
 
 assert DECODE_BATCH * S == GROUP_T_MAX
-assert GROUP_T_MAX % LEGACY_T == 0
 assert GLOBAL_H % TP_SIZE == 0
 assert GLOBAL_O_GROUPS % TP_SIZE == 0
 
@@ -401,6 +397,9 @@ def attention_csa_tp(
                 freqs_sin[step_pos_b : step_pos_b + 1, 0:HALF_ROPE],
                 target_type=pl.FP32,
             )
+    step_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    step_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(step_cos, step_sin, step_cos_il, step_sin_signed)
 
     cmp_cos = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
     cmp_sin = pl.create_tensor([B, HALF_ROPE], dtype=pl.FP32)
@@ -476,108 +475,38 @@ def attention_csa_tp(
         late_dep,
     )
 
+    idx_kv = pl.create_tensor([GROUP_T_MAX, IDX_HEAD_DIM], dtype=pl.FP32)
+    idx_score = pl.create_tensor([GROUP_T_MAX, INDEXER_SCORE_LEN], dtype=pl.FP32)
     idx_topk_full = pl.create_tensor([GROUP_T_MAX, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    # The indexer retains its legacy B=16/T=32 static scratch geometry.
-    for chunk in pl.unroll(INDEXER_CHUNKS):
-        chunk_b0 = chunk * LEGACY_B
-        chunk_t0 = chunk * LEGACY_T
-        x_normed_chunk = pl.slice(
-            x_normed_group,
-            [LEGACY_T, D],
-            [chunk_t0, 0],
-        )
-        position_ids_chunk = pl.slice(
-            position_ids,
-            [LEGACY_T],
-            [chunk_t0],
-        )
-
-        qr_chunk = pl.slice(
-            qr,
-            [LEGACY_T, Q_LORA],
-            [chunk_t0, 0],
-        )
-        qr_scale_chunk = pl.slice(
-            qr_scale,
-            [LEGACY_T, 1],
-            [chunk_t0, 0],
-        )
-        step_cos_chunk = pl.slice(
-            step_cos,
-            [LEGACY_B, HALF_ROPE],
-            [chunk_b0, 0],
-        )
-        step_sin_chunk = pl.slice(
-            step_sin,
-            [LEGACY_B, HALF_ROPE],
-            [chunk_b0, 0],
-        )
-        step_cos_il_chunk = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        step_sin_signed_chunk = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        rope_interleave(
-            step_cos_chunk,
-            step_sin_chunk,
-            step_cos_il_chunk,
-            step_sin_signed_chunk,
-        )
-        idx_kv_chunk = pl.create_tensor([LEGACY_T, IDX_HEAD_DIM], dtype=pl.FP32)
-        idx_score_chunk = pl.create_tensor([LEGACY_T, INDEXER_SCORE_LEN], dtype=pl.FP32)
-        idx_topk_chunk = pl.create_tensor([LEGACY_T, INDEXER_SCORE_LEN], dtype=pl.INT32)
-        inner_compress_state_block_table_chunk = pl.slice(
-            inner_compress_state_block_table,
-            [LEGACY_B, INNER_STATE_MAX_BLOCKS],
-            [chunk_b0, 0],
-        )
-        idx_block_table_chunk = pl.slice(
-            idx_block_table,
-            [LEGACY_B, IDX_CACHE_MAX_BLOCKS],
-            [chunk_b0, 0],
-        )
-        idx_slot_mapping_chunk = pl.slice(
-            idx_slot_mapping,
-            [LEGACY_T],
-            [chunk_t0],
-        )
-        inner_state_slot_mapping_chunk = pl.slice(
-            inner_state_slot_mapping,
-            [LEGACY_T],
-            [chunk_t0],
-        )
-        kv_seq_lens_chunk = pl.slice(
-            kv_seq_lens,
-            [LEGACY_B],
-            [chunk_b0],
-        )
-        indexer(
-            x_normed_chunk,
-            qr_chunk,
-            qr_scale_chunk,
-            idx_wq_b,
-            idx_wq_b_scale,
-            weights_proj,
-            step_cos_il_chunk,
-            step_sin_signed_chunk,
-            hadamard_idx,
-            idx_kv_chunk,
-            inner_compress_state,
-            inner_compress_state_block_table_chunk,
-            inner_wkv,
-            inner_wgate,
-            inner_ape,
-            inner_norm_w,
-            idx_kv_cache,
-            idx_kv_scale,
-            idx_block_table_chunk,
-            idx_score_chunk,
-            idx_topk_chunk,
-            position_ids_chunk,
-            idx_slot_mapping_chunk,
-            inner_state_slot_mapping_chunk,
-            kv_seq_lens_chunk,
-            0,
-            late_dep,
-        )
-        idx_topk_full[chunk_t0 : chunk_t0 + LEGACY_T, :] = idx_topk_chunk
+    indexer(
+        x_normed_group,
+        qr,
+        qr_scale,
+        idx_wq_b,
+        idx_wq_b_scale,
+        weights_proj,
+        step_cos_il,
+        step_sin_signed,
+        hadamard_idx,
+        idx_kv,
+        inner_compress_state,
+        inner_compress_state_block_table,
+        inner_wkv,
+        inner_wgate,
+        inner_ape,
+        inner_norm_w,
+        idx_kv_cache,
+        idx_kv_scale,
+        idx_block_table,
+        idx_score,
+        idx_topk_full,
+        position_ids,
+        idx_slot_mapping,
+        inner_state_slot_mapping,
+        kv_seq_lens,
+        0,
+        late_dep,
+    )
 
     position_ids_t1 = pl.reshape(position_ids, [GROUP_T_MAX, 1])
     attn_out_local = pl.create_tensor([SP_T, D], dtype=pl.BF16)
@@ -1127,41 +1056,34 @@ def golden_attention_csa_tp(tensors):
         "state_slot_mapping": state_slot_mapping,
     })
 
-    for chunk in range(INDEXER_CHUNKS):
-        chunk_b0 = chunk * LEGACY_B
-        chunk_b1 = chunk_b0 + LEGACY_B
-        chunk_t0 = chunk * LEGACY_T
-        chunk_t1 = chunk_t0 + LEGACY_T
-        golden_indexer({
-            "x": x_normed[chunk_t0:chunk_t1],
-            "qr": qr[chunk_t0:chunk_t1],
-            "qr_scale": qr_scale[chunk_t0:chunk_t1],
-            "wq_b": tensors["idx_wq_b"][0],
-            "wq_b_scale": tensors["idx_wq_b_scale"][0],
-            "weights_proj": tensors["weights_proj"][0],
-            "cos": step_cos[chunk_b0:chunk_b1],
-            "sin": step_sin[chunk_b0:chunk_b1],
-            "hadamard": tensors["hadamard_idx"][0],
-            "inner_kv": torch.zeros(LEGACY_T, IDX_HEAD_DIM, dtype=torch.float32),
-            "inner_compress_state": tensors["inner_compress_state"][0],
-            "inner_compress_state_block_table": tensors["inner_compress_state_block_table"][
-                0, chunk_b0:chunk_b1
-            ],
-            "inner_wkv": tensors["inner_wkv"][0],
-            "inner_wgate": tensors["inner_wgate"][0],
-            "inner_ape": tensors["inner_ape"][0],
-            "inner_norm_w": tensors["inner_norm_w"][0],
-            "idx_kv_cache": tensors["idx_kv_cache"][0],
-            "idx_kv_scale": tensors["idx_kv_scale"][0],
-            "idx_block_table": tensors["idx_block_table"][0, chunk_b0:chunk_b1],
-            "score": torch.zeros(LEGACY_T, INDEXER_SCORE_LEN, dtype=torch.float32),
-            "topk_idxs": idx_topk_full[chunk_t0:chunk_t1],
-            "position_ids": position_ids[chunk_t0:chunk_t1],
-            "idx_slot_mapping": idx_slot_mapping[chunk_t0:chunk_t1],
-            "inner_state_slot_mapping": inner_state_slot_mapping[chunk_t0:chunk_t1],
-            "kv_seq_lens": tensors["kv_seq_lens"][0, chunk_b0:chunk_b1],
-            "offset": torch.tensor(0, dtype=torch.int32),
-        })
+    golden_indexer({
+        "x": x_normed,
+        "qr": qr,
+        "qr_scale": qr_scale,
+        "wq_b": tensors["idx_wq_b"][0],
+        "wq_b_scale": tensors["idx_wq_b_scale"][0],
+        "weights_proj": tensors["weights_proj"][0],
+        "cos": step_cos,
+        "sin": step_sin,
+        "hadamard": tensors["hadamard_idx"][0],
+        "inner_kv": torch.zeros(GROUP_T_MAX, IDX_HEAD_DIM, dtype=torch.float32),
+        "inner_compress_state": tensors["inner_compress_state"][0],
+        "inner_compress_state_block_table": tensors["inner_compress_state_block_table"][0],
+        "inner_wkv": tensors["inner_wkv"][0],
+        "inner_wgate": tensors["inner_wgate"][0],
+        "inner_ape": tensors["inner_ape"][0],
+        "inner_norm_w": tensors["inner_norm_w"][0],
+        "idx_kv_cache": tensors["idx_kv_cache"][0],
+        "idx_kv_scale": tensors["idx_kv_scale"][0],
+        "idx_block_table": tensors["idx_block_table"][0],
+        "score": torch.zeros(GROUP_T_MAX, INDEXER_SCORE_LEN, dtype=torch.float32),
+        "topk_idxs": idx_topk_full,
+        "position_ids": position_ids,
+        "idx_slot_mapping": idx_slot_mapping,
+        "inner_state_slot_mapping": inner_state_slot_mapping,
+        "kv_seq_lens": tensors["kv_seq_lens"][0],
+        "offset": torch.tensor(0, dtype=torch.int32),
+    })
 
     kv_cache = tensors["kv_cache"][0]
     ori_slot_mapping = tensors["ori_slot_mapping"][0].to(torch.int64)
