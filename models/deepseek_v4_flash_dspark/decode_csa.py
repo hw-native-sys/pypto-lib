@@ -70,7 +70,7 @@ B = DECODE_BATCH if TP_SIZE > 1 else LEGACY_B
 S = DECODE_SEQ
 T = B * S
 SP_T = GROUP_T_MAX // TP_SIZE
-TP_GROUP_CHUNKS = GROUP_T_MAX // LEGACY_T
+INDEXER_CHUNKS = GROUP_T_MAX // LEGACY_T
 EPS = M.rms_norm_eps
 D = M.hidden_size
 GLOBAL_H = M.num_attention_heads
@@ -418,6 +418,9 @@ def attention_csa_tp(
                 freqs_sin[cmp_pos_b : cmp_pos_b + 1, 0:HALF_ROPE],
                 target_type=pl.FP32,
             )
+    cmp_cos_il = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_interleave(cmp_cos, cmp_sin, cmp_cos_il, cmp_sin_signed)
 
     x_normed_local = pl.create_tensor([SP_T, D], dtype=pl.BF16)
     rms_tid = rms_norm(x_mixed, attn_norm_w, x_normed_local)
@@ -454,11 +457,28 @@ def attention_csa_tp(
                     write_t : write_t + 1, 0:HEAD_DIM
                 ]
 
+    cmp_out = pl.create_tensor([GROUP_T_MAX, HEAD_DIM], dtype=pl.FP32)
+    compressor_ratio4(
+        x_normed_group,
+        cmp_out,
+        compress_state,
+        compress_state_block_table,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        cmp_cos_il,
+        cmp_sin_signed,
+        cmp_kv,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
+        late_dep,
+    )
+
     idx_topk_full = pl.create_tensor([GROUP_T_MAX, INDEXER_SCORE_LEN], dtype=pl.INT32)
-    # The decode compressor and indexer retain their legacy B=16/T=32 static
-    # scratch geometry. Run the gathered 64-request group as four contiguous
-    # request chunks while sharing the replicated state/cache pools.
-    for chunk in pl.unroll(TP_GROUP_CHUNKS):
+    # The indexer retains its legacy B=16/T=32 static scratch geometry.
+    for chunk in pl.unroll(INDEXER_CHUNKS):
         chunk_b0 = chunk * LEGACY_B
         chunk_t0 = chunk * LEGACY_T
         x_normed_chunk = pl.slice(
@@ -470,58 +490,6 @@ def attention_csa_tp(
             position_ids,
             [LEGACY_T],
             [chunk_t0],
-        )
-
-        cmp_cos_chunk = pl.slice(
-            cmp_cos,
-            [LEGACY_B, HALF_ROPE],
-            [chunk_b0, 0],
-        )
-        cmp_sin_chunk = pl.slice(
-            cmp_sin,
-            [LEGACY_B, HALF_ROPE],
-            [chunk_b0, 0],
-        )
-        cmp_cos_il_chunk = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        cmp_sin_signed_chunk = pl.create_tensor([LEGACY_B, ROPE_HEAD_DIM], dtype=pl.FP32)
-        rope_interleave(
-            cmp_cos_chunk,
-            cmp_sin_chunk,
-            cmp_cos_il_chunk,
-            cmp_sin_signed_chunk,
-        )
-        cmp_out_chunk = pl.create_tensor([LEGACY_T, HEAD_DIM], dtype=pl.FP32)
-        compress_state_block_table_chunk = pl.slice(
-            compress_state_block_table,
-            [LEGACY_B, MAIN_STATE_MAX_BLOCKS],
-            [chunk_b0, 0],
-        )
-        cmp_slot_mapping_chunk = pl.slice(
-            cmp_slot_mapping,
-            [LEGACY_T],
-            [chunk_t0],
-        )
-        state_slot_mapping_chunk = pl.slice(
-            state_slot_mapping,
-            [LEGACY_T],
-            [chunk_t0],
-        )
-        compressor_ratio4(
-            x_normed_chunk,
-            cmp_out_chunk,
-            compress_state,
-            compress_state_block_table_chunk,
-            cmp_wkv,
-            cmp_wgate,
-            cmp_ape,
-            cmp_norm_w,
-            cmp_cos_il_chunk,
-            cmp_sin_signed_chunk,
-            cmp_kv,
-            position_ids_chunk,
-            cmp_slot_mapping_chunk,
-            state_slot_mapping_chunk,
-            late_dep,
         )
 
         qr_chunk = pl.slice(
@@ -1142,28 +1110,28 @@ def golden_attention_csa_tp(tensors):
         -1,
         dtype=torch.int32,
     )
-    for chunk in range(TP_GROUP_CHUNKS):
+    golden_compressor({
+        "x": x_normed,
+        "kv": cmp_out,
+        "compress_state": tensors["compress_state"][0],
+        "compress_state_block_table": tensors["compress_state_block_table"][0],
+        "wkv": tensors["cmp_wkv"][0],
+        "wgate": tensors["cmp_wgate"][0],
+        "ape": tensors["cmp_ape"][0],
+        "norm_w": tensors["cmp_norm_w"][0],
+        "cos": cmp_cos,
+        "sin": cmp_sin,
+        "cmp_kv_cache": cmp_kv,
+        "position_ids": position_ids,
+        "cmp_slot_mapping": cmp_slot_mapping,
+        "state_slot_mapping": state_slot_mapping,
+    })
+
+    for chunk in range(INDEXER_CHUNKS):
         chunk_b0 = chunk * LEGACY_B
         chunk_b1 = chunk_b0 + LEGACY_B
         chunk_t0 = chunk * LEGACY_T
         chunk_t1 = chunk_t0 + LEGACY_T
-        golden_compressor({
-            "x": x_normed[chunk_t0:chunk_t1],
-            "kv": cmp_out[chunk_t0:chunk_t1],
-            "compress_state": tensors["compress_state"][0],
-            "compress_state_block_table": tensors["compress_state_block_table"][0, chunk_b0:chunk_b1],
-            "wkv": tensors["cmp_wkv"][0],
-            "wgate": tensors["cmp_wgate"][0],
-            "ape": tensors["cmp_ape"][0],
-            "norm_w": tensors["cmp_norm_w"][0],
-            "cos": cmp_cos[chunk_b0:chunk_b1],
-            "sin": cmp_sin[chunk_b0:chunk_b1],
-            "cmp_kv_cache": cmp_kv,
-            "position_ids": position_ids[chunk_t0:chunk_t1],
-            "cmp_slot_mapping": cmp_slot_mapping[chunk_t0:chunk_t1],
-            "state_slot_mapping": state_slot_mapping[chunk_t0:chunk_t1],
-        })
-
         golden_indexer({
             "x": x_normed[chunk_t0:chunk_t1],
             "qr": qr[chunk_t0:chunk_t1],

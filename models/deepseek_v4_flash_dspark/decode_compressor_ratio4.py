@@ -19,7 +19,6 @@ from rope_interleave import rope_interleave
 from config import (
     FLASH as M,
     DECODE_BATCH,
-    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
@@ -35,7 +34,7 @@ S_DYN = pl.dynamic("S_DYN")
 T_DYN = pl.dynamic("COMPRESSOR_R4_T_DYN")  # T = B * S
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size
@@ -88,8 +87,8 @@ def compressor_ratio4(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
     cmp_kv_cache: pl.Tensor,
     position_ids: pl.Tensor,
     cmp_slot_mapping: pl.Tensor,
