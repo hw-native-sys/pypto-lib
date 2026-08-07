@@ -13,6 +13,12 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 
 from decode_fwd import *
+from decode_device_state import (
+    STATE_META_WIDTH,
+    STATE_TOKEN_WIDTH,
+    advance_decode_device_state,
+    prepare_decode_from_device_state,
+)
 from decode_mtp import (
     MOE_TOPK,
     MOE_VOCAB,
@@ -83,15 +89,15 @@ def decode_fwd_mtp_l2(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[T], pl.INT32],
-    kv_seq_lens: pl.Tensor[[B], pl.INT32],
+    position_ids: pl.InOut[pl.Tensor[[T], pl.INT32]],
+    kv_seq_lens: pl.InOut[pl.Tensor[[B], pl.INT32]],
     hca_compress_state_block_table: pl.Tensor[[B, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[B, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     block_counts: pl.Tensor[[B, N_CACHE_GROUPS], pl.INT32],
-    input_ids: pl.Tensor[[T], pl.INT64],
+    input_ids: pl.InOut[pl.Tensor[[T], pl.INT64]],
     hc_head_fn: pl.Tensor[[HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[1], pl.FP32],
     hc_head_base: pl.Tensor[[HC_MULT], pl.FP32],
@@ -115,9 +121,12 @@ def decode_fwd_mtp_l2(
     lm_head_logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, LM_HEAD_VOCAB], pl.FP32],
     lm_head_logits_done: pld.DistributedTensor[[LM_HEAD_TP_SIZE, 1], pl.INT32],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
-    mtp_tail_token_ids: pl.Tensor[[B], pl.INT64],
-    mtp_tail_positions: pl.Tensor[[B], pl.INT32],
+    mtp_tail_token_ids: pl.InOut[pl.Tensor[[B], pl.INT64]],
+    mtp_tail_positions: pl.InOut[pl.Tensor[[B], pl.INT32]],
     mtp_tail_slot_ids: pl.Tensor[[B], pl.INT32],
+    mtp_state_generations: pl.Tensor[[B], pl.INT32],
+    mtp_state_tokens: pl.InOut[pl.Tensor[[B, STATE_TOKEN_WIDTH], pl.INT64]],
+    mtp_state_meta: pl.InOut[pl.Tensor[[B, STATE_META_WIDTH], pl.INT32]],
     mtp_input_ids: pl.Out[pl.Tensor[[T], pl.INT64]],
     mtp_position_ids: pl.Out[pl.Tensor[[T], pl.INT32]],
     mtp_accepted_counts: pl.Out[pl.Tensor[[B], pl.INT32]],
@@ -188,6 +197,21 @@ def decode_fwd_mtp_l2(
     rank: pl.Scalar[pl.INT32],
     mtp_num_tokens: pl.Scalar[pl.INT32],
 ):
+    # The serving-prepared tensors contain cache/batch metadata but recurrent
+    # token, position, and length fields may be placeholders.  Resolve those
+    # fields from each request's stable device slot immediately before main
+    # decode consumes them.
+    prepare_decode_from_device_state(
+        mtp_tail_slot_ids,
+        mtp_state_generations,
+        mtp_state_tokens,
+        mtp_state_meta,
+        input_ids,
+        position_ids,
+        kv_seq_lens,
+        mtp_tail_token_ids,
+        mtp_tail_positions,
+    )
     decode_fwd_inline(embed_weight, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv, kv_cache, attn_sink, wo_a, wo_b, wo_b_scale, hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w, hca_compress_state, csa_cmp_wkv, csa_cmp_wgate, csa_cmp_ape, csa_cmp_norm_w, csa_compress_state, csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx, csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w, csa_inner_compress_state, cmp_kv, idx_kv_cache, idx_kv_scale, hc_ffn_fn, hc_ffn_scale, hc_ffn_base, norm_w, gate_w, gate_bias, tid2eid, routed_w1, routed_w1_scale, routed_w3, routed_w3_scale, routed_w2, routed_w2_scale, shared_w1, shared_w1_scale, shared_w3, shared_w3_scale, shared_w2, shared_w2_scale, freqs_cos, freqs_sin, block_table, position_ids, kv_seq_lens, hca_compress_state_block_table, csa_compress_state_block_table, csa_inner_compress_state_block_table, cmp_block_table, idx_block_table, block_counts, input_ids, hc_head_fn, hc_head_scale, hc_head_base, final_norm_w, lm_head_weight, logit_row_indices, pre_hc_hidden_out, hidden_out, logits, sampled_ids, recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived, routed_y_buf, combine_arrived, lm_head_hidden_window, lm_head_hidden_done, lm_head_logits_window, lm_head_logits_done, num_tokens_per_owner, rank)
     verify_and_pack_mtp_tokens(input_ids, position_ids, sampled_ids, mtp_tail_token_ids, mtp_tail_positions, mtp_tail_slot_ids, mtp_input_ids, mtp_position_ids, mtp_accepted_counts)
     mtp_decode_layer_inline(
@@ -267,6 +291,19 @@ def decode_fwd_mtp_l2(
         mtp_lm_head_logits_done,
         rank,
         mtp_num_tokens,
+    )
+    # Verification has packed a canonical committed window and MTP decode has
+    # sampled the next draft.  Commit both to the persistent slot so the next
+    # fused invocation no longer depends on a host state round trip.
+    advance_decode_device_state(
+        mtp_tail_slot_ids,
+        mtp_state_generations,
+        mtp_state_tokens,
+        mtp_state_meta,
+        mtp_input_ids,
+        mtp_position_ids,
+        mtp_sampled_ids,
+        mtp_accepted_counts,
     )
 
 
@@ -351,15 +388,15 @@ def l3_decode_fwd_mtp(
     freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     block_table: pl.Tensor[[N_RANKS, B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
-    position_ids: pl.Tensor[[N_RANKS, T], pl.INT32],
-    kv_seq_lens: pl.Tensor[[N_RANKS, B], pl.INT32],
+    position_ids: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT32]],
+    kv_seq_lens: pl.InOut[pl.Tensor[[N_RANKS, B], pl.INT32]],
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, B, HCA_COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
     block_counts: pl.Tensor[[N_RANKS, B, N_CACHE_GROUPS], pl.INT32],
-    input_ids: pl.Tensor[[N_RANKS, T], pl.INT64],
+    input_ids: pl.InOut[pl.Tensor[[N_RANKS, T], pl.INT64]],
     hc_head_fn: pl.Tensor[[N_RANKS, HC_MULT, HC_DIM], pl.FP32],
     hc_head_scale: pl.Tensor[[N_RANKS, 1], pl.FP32],
     hc_head_base: pl.Tensor[[N_RANKS, HC_MULT], pl.FP32],
@@ -371,11 +408,18 @@ def l3_decode_fwd_mtp(
     sampled_ids: pl.Out[pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS, SAMPLED_IDS_PAD], pl.INT32]],
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     logit_row_indices: pl.Tensor[[N_RANKS, MAX_LOGIT_ROWS], pl.INT32],
-    mtp_tail_token_ids: pl.Tensor[[N_RANKS, B], pl.INT64],
-    mtp_tail_positions: pl.Tensor[[N_RANKS, B], pl.INT32],
+    mtp_tail_token_ids: pl.InOut[pl.Tensor[[N_RANKS, B], pl.INT64]],
+    mtp_tail_positions: pl.InOut[pl.Tensor[[N_RANKS, B], pl.INT32]],
     mtp_tail_pre_hc_pool: pl.InOut[pl.Tensor[[N_RANKS, B, HC_MULT, D], pl.FP32]],
     mtp_accepted_counts: pl.Out[pl.Tensor[[N_RANKS, B], pl.INT32]],
     mtp_tail_slot_ids: pl.Tensor[[N_RANKS, B], pl.INT32],
+    mtp_state_generations: pl.Tensor[[N_RANKS, B], pl.INT32],
+    mtp_state_tokens: pl.InOut[
+        pl.Tensor[[N_RANKS, B, STATE_TOKEN_WIDTH], pl.INT64]
+    ],
+    mtp_state_meta: pl.InOut[
+        pl.Tensor[[N_RANKS, B, STATE_META_WIDTH], pl.INT32]
+    ],
     mtp_position_ids: pl.Out[pl.Tensor[[N_RANKS, T], pl.INT32]],
     mtp_enorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
     mtp_hnorm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
@@ -576,6 +620,9 @@ def l3_decode_fwd_mtp(
             mtp_tail_token_ids[rank],
             mtp_tail_positions[rank],
             mtp_tail_slot_ids[rank],
+            mtp_state_generations[rank],
+            mtp_state_tokens[rank],
+            mtp_state_meta[rank],
             mtp_input_ids[rank],
             mtp_position_ids[rank],
             mtp_accepted_counts[rank],

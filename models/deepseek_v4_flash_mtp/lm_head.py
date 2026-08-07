@@ -62,7 +62,10 @@ TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
 DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
-# Rows. logit_row_indices picks the sources; unused rows stay zero.
+# LM-head row routing.  The model may produce more hidden rows than need logits
+# (for example fixed-shape padding or an MTP committed window).
+# ``logit_row_indices[out_row]`` selects the source hidden row; -1 disables the
+# output row and leaves it zero.  It is a gather map, not a token/position id.
 MAX_LOGIT_ROWS = 8
 TEST_TOKENS = 16  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
