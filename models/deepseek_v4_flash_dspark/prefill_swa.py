@@ -62,17 +62,13 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
-# paged KV cache. The ratio-0 path has only the sliding-window cache: one
-# request, one window page, so block count / table length / per-request window
-# block count all collapse to 1.
+# paged KV cache. The ratio-0 path carries only the sliding-window cache.
 BLOCK_NUM = KV_ORI_BLOCK_NUM
 CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 SPARSE_ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 SPARSE_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 START_POS = 0
-
-assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN+t"
 
 
 @pl.jit.inline
@@ -104,8 +100,7 @@ def prefill_attention_swa(
     x_mixed = pl.create_tensor([T, D], dtype=pl.BF16)
     post = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
-    # Full prefill path mirrors the official block: hc_pre -> qkv/rope -> SWA
-    # attention/o_proj -> KV writeback -> hc_post.
+    # hc_pre -> qkv/rope -> KV writeback -> SWA attention/o_proj -> hc_post.
     hc_pre(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, x_mixed, post, comb)
 
     x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -115,16 +110,8 @@ def prefill_attention_swa(
 
     rope_cos_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
     rope_sin_t = pl.create_tensor([T, ROPE_HEAD_DIM], dtype=pl.BF16)
-    materialize_rope_rows(
-        freqs_cos,
-        freqs_sin,
-        position_ids,
-        num_tokens,
-        rope_cos_t,
-        rope_sin_t,
-    )
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, num_tokens, rope_cos_t, rope_sin_t)
 
-    # Reuse the shared prefill QKV/RoPE projection to stay aligned with decode.
     q = pl.create_tensor([T, H, HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([T, HEAD_DIM], dtype=pl.BF16)
     qr = pl.create_tensor([T, Q_LORA], dtype=pl.INT8)
@@ -146,15 +133,11 @@ def prefill_attention_swa(
                     kv_cache_flat[write_row : write_row + 1, :] = kv[write_t : write_t + 1, :]
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor(
-        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
-    )
+    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_swa_window_indices"):
         for idx_t in pl.range(T):
             idx_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full(
-                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
-            )
+            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if idx_t < num_tokens:
                 abs_pos = pl.read(position_ids, [idx_t])
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
@@ -169,19 +152,11 @@ def prefill_attention_swa(
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(idx_row, [0, win_col], row)
                             if win_col < SPARSE_BIAS_COLS:
-                                pl.write(
-                                    mask_row,
-                                    [0, win_col // PREFILL_ATTN_TILE],
-                                    pl.cast(1, pl.INT32),
-                                )
-            swa_indices = pl.assemble(swa_indices, idx_row, [idx_t, 0])
-            valid_block_mask = pl.assemble(
-                valid_block_mask, mask_row, [idx_t, 0]
-            )
+                                pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+            swa_indices[idx_t:idx_t + 1, 0:WIN] = idx_row
+            valid_block_mask[idx_t:idx_t + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
-    cmp_block_table_dummy = pl.create_tensor(
-        [SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0
-    )
+    cmp_block_table_dummy = pl.create_tensor([SPARSE_CMP_MAX_BLOCKS], dtype=pl.INT32, init_value=0)
     cmp_kv_dummy = pl.create_tensor([CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], dtype=pl.BF16)
     cmp_indices_dummy = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32, init_value=-1)
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
@@ -374,7 +349,6 @@ def build_tensor_specs(
     if max_position > MAX_SEQ_LEN:
         raise ValueError(f"position_ids exceed MAX_SEQ_LEN={MAX_SEQ_LEN}: got {max_position}")
 
-
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
         # Padding rows keep their arange default; they are inactive.
@@ -387,10 +361,9 @@ def build_tensor_specs(
         x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
         return x
-    # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
-    # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
-    # hc residual to near-zero in x_out where quant noise blows up the relative tail. Mirrors
-    # decode_swa.
+    # Real layer-0 (SWA) hc_attn scale/base, fn synthetic at real magnitude. A synthetic
+    # scale=0.5/base=0 cancels attn_out and the hc residual to near-zero in x_out, where
+    # quant noise blows up the relative tail.
     def init_hc_attn_fn():
         return torch.randn(MIX_HC, HC_DIM) * 0.039
     def init_hc_attn_scale():
@@ -506,10 +479,7 @@ if __name__ == "__main__":
 
     result = run_jit(
         fn=prefill_attention_swa_test,
-        specs=build_tensor_specs(
-            args.start_pos,
-            args.num_tokens,
-        ),
+        specs=build_tensor_specs(args.start_pos, args.num_tokens),
         golden_fn=golden_prefill_attention_swa,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
