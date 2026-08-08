@@ -730,18 +730,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
-    active_cmp = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-
-    def compare_attn_out(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        tail_nonzero = int(actual[args.num_tokens:].count_nonzero().item())
-        if tail_nonzero:
-            return False, f"    inactive attn_out tail contains {tail_nonzero} nonzero values"
-        return active_cmp(
-            actual[:args.num_tokens], expected[:args.num_tokens],
-            actual_outputs=actual_outputs, expected_outputs=expected_outputs,
-            inputs=inputs, rtol=rtol, atol=atol,
-        )
-
     result = run_jit(
         fn=prefill_sparse_attn_test,
         specs=build_tensor_specs(args.compress_ratio, args.num_tokens, args.ori_block_num, args.cmp_block_num),
@@ -756,7 +744,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compile_only=args.compile_only,
-        compare_fn={"attn_out": compare_attn_out},
+        compare_fn={
+            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128,
+                                       valid_rows=args.num_tokens, zero_tail=True),
+        },
     )
     if not result.passed:
         if result.error:

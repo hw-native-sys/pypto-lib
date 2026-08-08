@@ -676,54 +676,9 @@ def build_tensor_specs(
     ]
 
 
-def valid_ratio_reldiff(
-    num_tokens: int,
-    diff_thd: float,
-    pct_thd: float,
-    max_diff_hd: float,
-):
-    """Relative-diff comparator restricted to the valid (active) token rows.
-
-    Mirrors decode_hca's ``ratio_reldiff`` bar and prefill_layer's
-    ``valid_ratio_reldiff`` pattern: the packed buffer carries up to
-    ``T`` rows but only the leading ``num_tokens`` participate in attention
-    accuracy. The deterministic zero padding is sliced off so it cannot dilute
-    the active-token error ratio.
-    """
-    from golden import ratio_reldiff
-
-    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
-
-    def cmp(
-        actual,
-        expected,
-        *,
-        actual_outputs,
-        expected_outputs,
-        inputs,
-        rtol,
-        atol,
-    ):
-        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
-        if tail_nonzero:
-            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
-        return base_cmp(
-            actual[:num_tokens],
-            expected[:num_tokens],
-            actual_outputs=actual_outputs,
-            expected_outputs=expected_outputs,
-            inputs=inputs,
-            rtol=rtol,
-            atol=atol,
-        )
-
-    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
-    return cmp
-
-
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill HCA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -758,7 +713,8 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
+            "x_out": ratio_reldiff(diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1,
+                                   valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

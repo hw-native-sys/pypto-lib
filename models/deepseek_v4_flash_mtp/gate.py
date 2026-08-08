@@ -401,17 +401,10 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
     ]
 
 
-def gate_tile_prefix_compare(num_tokens, base_cmp):
+def gate_active_rows(num_tokens):
+    """Active token count rounded up to the gate M-tile, capped at T."""
     active_count = max(0, min(T, int(num_tokens)))
-    active_gate_tokens = min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
-
-    def cmp(actual, expected, **kwargs):
-        if active_gate_tokens <= 0:
-            return True, ""
-        return base_cmp(actual[:active_gate_tokens], expected[:active_gate_tokens], **kwargs)
-
-    cmp.__name__ = f"gate_tile_prefix_compare(active_gate_tokens={active_gate_tokens})"
-    return cmp
+    return min(T, ((active_count + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE)
 
 
 if __name__ == "__main__":
@@ -441,10 +434,8 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "x_norm_i8": gate_tile_prefix_compare(
-                args.num_tokens,
-                ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001),
-            ),
+            "x_norm_i8": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.001,
+                                        valid_rows=gate_active_rows(args.num_tokens)),
             "indices": topk_pair_compare("weights"),
         },
     )

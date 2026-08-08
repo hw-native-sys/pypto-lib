@@ -932,41 +932,6 @@ def build_tensor_specs(
     ]
 
 
-def valid_ratio_reldiff(
-    num_tokens: int,
-    diff_thd: float,
-    pct_thd: float,
-    max_diff_hd: float,
-):
-    """Relative-diff comparator restricted to the valid (active) token rows.
-
-    Mirrors decode_csa's ``ratio_reldiff`` bar: the packed buffer carries up to
-    ``T`` rows but only the leading ``num_tokens`` participate in attention
-    accuracy. The deterministic zero padding is sliced off so it cannot dilute
-    the active-token error ratio.
-    """
-    from golden import ratio_reldiff
-
-    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd, max_diff_hd=max_diff_hd)
-
-    def cmp(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        tail_nonzero = int(actual[num_tokens:].count_nonzero().item())
-        if tail_nonzero:
-            return False, f"    inactive x_out tail contains {tail_nonzero} nonzero values"
-        return base_cmp(
-            actual[:num_tokens],
-            expected[:num_tokens],
-            actual_outputs=actual_outputs,
-            expected_outputs=expected_outputs,
-            inputs=inputs,
-            rtol=rtol,
-            atol=atol,
-        )
-
-    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
-    return cmp
-
-
 def _quant_w_per_output_channel_local(w):
     import torch
 
@@ -980,7 +945,7 @@ def _quant_w_per_output_channel_local(w):
 
 if __name__ == "__main__":
     import argparse
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone DeepSeek V4 packed prefill CSA correctness test.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
@@ -995,16 +960,14 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
     compare_tokens = args.num_tokens
-    x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1)
-    if args.start_pos:
-        # Suffix attends WIN + up-to-INDEXER_SCORE_CAP compressed rows. The sparse-attn PV matmul
-        # casts the softmax probabilities to BF16 (prefill_sparse_attn), so accumulating over more
-        # rows adds ~1 extra BF16 ULP of x_out drift vs full prefill -- the bad points cluster at
-        # ~2 BF16 ULP. Measured at start_pos=896 (the 8-block worst case) the bad fraction is only
-        # 0.058% at diff_thd=8e-3 (vs 0.5% at 1/128). So bump the per-point bar to 8e-3 (== kv_cache
-        # rtol = 2 BF16 ULP) and the single-point cap to 2 (worst rdiff 1.37, from benign near-zero
-        # elements), but keep the 0.5% fraction bar identical to full prefill.
-        x_out_cmp = valid_ratio_reldiff(compare_tokens, diff_thd=8e-3, pct_thd=0.005, max_diff_hd=2)
+    # A start_pos suffix attends WIN + up-to-INDEXER_SCORE_CAP compressed rows. The sparse-attn PV
+    # matmul casts the softmax probabilities to BF16 (prefill_sparse_attn), so accumulating over
+    # more rows adds ~1 extra BF16 ULP of x_out drift vs full prefill -- the bad points cluster at
+    # ~2 BF16 ULP. Measured at start_pos=896 (the 8-block worst case) the bad fraction is only
+    # 0.058% at diff_thd=8e-3 (vs 0.5% at 1/128). So bump the per-point bar to 8e-3 (== kv_cache
+    # rtol = 2 BF16 ULP) and the single-point cap to 2 (worst rdiff 1.37, from benign near-zero
+    # elements), but keep the 0.5% fraction bar identical to full prefill.
+    x_out_diff_thd, x_out_max_diff = (8e-3, 2) if args.start_pos else (5e-3, 1)
 
     result = run_jit(
         fn=prefill_attention_csa_test,
@@ -1024,7 +987,8 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": x_out_cmp,
+            "x_out": ratio_reldiff(diff_thd=x_out_diff_thd, pct_thd=0.005, max_diff_hd=x_out_max_diff,
+                                   valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

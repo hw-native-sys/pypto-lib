@@ -542,5 +542,90 @@ class TestRatioReldiff:
             ratio_reldiff(diff_thd=0.01, max_diff_hd=0.0)
 
 
+class TestValidRows:
+    """Tests for the valid_rows / valid_axis / zero_tail restriction."""
+
+    @staticmethod
+    def _call(cmp, actual, expected):
+        return cmp(
+            actual, expected,
+            actual_outputs={"out": actual},
+            expected_outputs={"out": expected},
+            inputs={},
+            rtol=1e-5, atol=1e-5,
+        )
+
+    def test_inactive_tail_excluded_from_ratio(self):
+        """Garbage past valid_rows is ignored when valid_rows trims it off."""
+        actual = torch.zeros(10, 4)
+        expected = torch.zeros(10, 4)
+        actual[5:] = 99.0                      # inactive rows diverge wildly
+        cmp_all = ratio_allclose(atol=1e-3, rtol=0.0)
+        assert not self._call(cmp_all, actual, expected)[0]
+        cmp_valid = ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=5)
+        assert self._call(cmp_valid, actual, expected)[0]
+
+    def test_zero_tail_rejects_nonzero_padding(self):
+        """zero_tail turns a written-past-the-active-count tail into a failure."""
+        actual = torch.zeros(10, 4)
+        expected = torch.zeros(10, 4)
+        actual[7, 2] = 1.0
+        cmp = ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=5, zero_tail=True)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "inactive tail contains 1 nonzero" in detail
+
+    def test_zero_tail_accepts_zero_padding(self):
+        """A genuinely zero tail passes the zero_tail check."""
+        actual = torch.zeros(10, 4)
+        expected = torch.zeros(10, 4)
+        cmp = ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=5, zero_tail=True)
+        assert self._call(cmp, actual, expected)[0]
+
+    def test_valid_axis_one(self):
+        """valid_axis=1 slices the token axis behind a leading rank axis."""
+        actual = torch.zeros(2, 10, 4)
+        expected = torch.zeros(2, 10, 4)
+        actual[:, 5:] = 99.0
+        cmp = ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=5, valid_axis=1)
+        assert self._call(cmp, actual, expected)[0]
+
+    def test_reldiff_honours_valid_rows(self):
+        """ratio_reldiff takes the same restriction."""
+        actual = torch.ones(10, 4)
+        expected = torch.ones(10, 4)
+        actual[5:] = 99.0
+        assert not self._call(ratio_reldiff(diff_thd=1e-3, pct_thd=0.0), actual, expected)[0]
+        assert self._call(ratio_reldiff(diff_thd=1e-3, pct_thd=0.0, valid_rows=5), actual, expected)[0]
+
+    def test_zero_valid_rows_passes_vacuously(self):
+        """valid_rows=0 leaves nothing to compare and passes."""
+        actual = torch.full((4, 2), 99.0)
+        expected = torch.zeros(4, 2)
+        assert self._call(ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=0), actual, expected)[0]
+        assert self._call(ratio_reldiff(diff_thd=1e-3, pct_thd=0.0, valid_rows=0), actual, expected)[0]
+
+    def test_out_of_range_valid_rows_fails(self):
+        """A valid_rows beyond the axis length is reported, not silently clamped."""
+        actual = torch.zeros(4, 2)
+        expected = torch.zeros(4, 2)
+        cmp = ratio_allclose(atol=1e-3, rtol=0.0, valid_rows=9)
+        ok, detail = self._call(cmp, actual, expected)
+        assert not ok
+        assert "valid_rows=9 out of range" in detail
+
+    def test_name_records_every_param(self):
+        """The comparator label spells out every knob, defaults included."""
+        assert ratio_allclose(valid_rows=5, valid_axis=1).__name__ == (
+            "ratio_allclose(atol=None, rtol=None, max_error_ratio=0.005, "
+            "valid_rows=5, valid_axis=1, zero_tail=False)"
+        )
+        assert ratio_reldiff(valid_rows=5, zero_tail=True).__name__ == (
+            "ratio_reldiff(diff_thd=0.01, pct_thd=0.05, max_diff_hd=inf, "
+            "valid_rows=5, valid_axis=0, zero_tail=True)"
+        )
+        assert "valid_rows=None" in ratio_allclose().__name__
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

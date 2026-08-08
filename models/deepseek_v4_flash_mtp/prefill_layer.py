@@ -953,17 +953,10 @@ def golden_prefill_layer(tensors):
             x_next[:, base:base + valid] = x_next_tile[:, :valid]
 
 
-def valid_ratio_reldiff(diff_thd, pct_thd):
-    """Relative-diff comparator for the fixed 128 logical token rows."""
-    from golden import ratio_reldiff
-
-    return ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
-
-
 if __name__ == "__main__":
     import argparse
 
-    from golden import ratio_allclose, run_jit
+    from golden import ratio_allclose, ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
@@ -1004,7 +997,7 @@ if __name__ == "__main__":
         compare_fn={
             # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
             # B=1, S=128 single-request prefill.
-            "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
             # CSA runs preserve the standalone child-kernel precision
             # contracts: sparse BF16 cache rows may differ by one ULP, C8 rows

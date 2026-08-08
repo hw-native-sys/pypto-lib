@@ -14,7 +14,7 @@ import argparse
 
 import pypto.language as pl
 import pypto.language.distributed as pld
-from golden import ratio_allclose, run_jit
+from golden import ratio_allclose, ratio_reldiff, run_jit
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
 import config
@@ -715,18 +715,6 @@ def golden_mtp_prefill_fwd(tensors):
     golden_lm_head(lm_head_tensors)
 
 
-def valid_ratio_reldiff(num_tokens, diff_thd, pct_thd):
-    from golden import ratio_reldiff
-
-    base_cmp = ratio_reldiff(diff_thd=diff_thd, pct_thd=pct_thd)
-
-    def cmp(actual, expected, **kwargs):
-        return base_cmp(actual[:, :num_tokens], expected[:, :num_tokens], **kwargs)
-
-    cmp.__name__ = f"valid_ratio_reldiff(num_tokens={num_tokens})"
-    return cmp
-
-
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
@@ -787,8 +775,10 @@ def main():
         atol=1e-3,
         compare_fn={
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1e-2, max_error_ratio=0.01),
-            "hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
-            "pre_hc_hidden_out": valid_ratio_reldiff(args.num_tokens, diff_thd=0.02, pct_thd=0.05),
+            "hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
+                                        valid_rows=args.num_tokens, valid_axis=1),
+            "pre_hc_hidden_out": ratio_reldiff(diff_thd=0.02, pct_thd=0.05,
+                                               valid_rows=args.num_tokens, valid_axis=1),
             "logits": ratio_allclose(atol=1e-2, rtol=1e-2, max_error_ratio=0.05),
         },
     )

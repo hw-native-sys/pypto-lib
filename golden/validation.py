@@ -14,6 +14,41 @@ from collections.abc import Callable
 import torch
 
 
+def _valid_prefix(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    valid_rows: int | None,
+    valid_axis: int,
+    zero_tail: bool,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    """Restrict a comparison to the leading ``valid_rows`` along ``valid_axis``.
+
+    Packed kernels carry a padded token buffer where only the leading rows are
+    active; the inactive tail would otherwise dilute a ratio-based verdict.
+    Returns ``(actual, expected, error)``; ``error`` is non-empty only when
+    ``zero_tail`` is set and the dropped tail is not all zeros.
+    """
+    if valid_rows is None:
+        return actual, expected, ""
+    total = actual.shape[valid_axis]
+    if not 0 <= valid_rows <= total:
+        return actual, expected, (
+            f"    valid_rows={valid_rows} out of range for axis {valid_axis} of length {total}"
+        )
+    if zero_tail:
+        tail = actual.narrow(valid_axis, valid_rows, total - valid_rows)
+        tail_nonzero = int(tail.count_nonzero().item())
+        if tail_nonzero:
+            return actual, expected, (
+                f"    inactive tail contains {tail_nonzero} nonzero values"
+            )
+    return (
+        actual.narrow(valid_axis, 0, valid_rows),
+        expected.narrow(valid_axis, 0, valid_rows),
+        "",
+    )
+
+
 def validate_golden(
     outputs: dict[str, torch.Tensor],
     golden: dict[str, torch.Tensor],
@@ -256,6 +291,9 @@ def ratio_allclose(
     rtol: float | None = None,
     max_error_ratio: float = 0.005,
     max_show: int = 10,
+    valid_rows: int | None = None,
+    valid_axis: int = 0,
+    zero_tail: bool = False,
 ) -> Callable:
     """Return an allclose-style comparator that tolerates a bounded outlier ratio.
 
@@ -281,11 +319,26 @@ def ratio_allclose(
         max_error_ratio: Fraction of points permitted to exceed tolerance
             (default 0.5%). Set to 0.0 for strict allclose semantics.
         max_show: Maximum number of mismatched points printed on failure.
+        valid_rows: Compare only the leading ``valid_rows`` entries along
+            ``valid_axis``. ``None`` (default) compares the whole tensor, ``0``
+            compares nothing and passes. Use it for packed buffers whose
+            inactive tail would otherwise dilute the error ratio.
+        valid_axis: Axis ``valid_rows`` slices (default 0). Pass 1 when a
+            leading rank axis precedes the token axis.
+        zero_tail: Additionally require the dropped tail to be all zeros. Only
+            meaningful with ``valid_rows``; catches a kernel writing past the
+            active token count.
 
     Example — attention output with INT8 activation quant::
 
         compare_fn = {
             "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        }
+
+    Example — packed prefill output, active prefix only::
+
+        compare_fn = {
+            "x_out": ratio_allclose(atol=1e-4, rtol=1e-2, valid_rows=num_tokens, zero_tail=True),
         }
     """
     if max_error_ratio < 0.0 or max_error_ratio > 1.0:
@@ -303,6 +356,12 @@ def ratio_allclose(
     ) -> tuple[bool, str]:
         eff_atol = atol if (cmp.atol_override is None) else cmp.atol_override
         eff_rtol = rtol if (cmp.rtol_override is None) else cmp.rtol_override
+
+        actual, expected, prefix_error = _valid_prefix(actual, expected, valid_rows, valid_axis, zero_tail)
+        if prefix_error:
+            return False, prefix_error
+        if actual.numel() == 0:
+            return True, ""
 
         actual_f = actual.cpu().to(torch.float32)
         expected_f = expected.cpu().to(torch.float32)
@@ -356,8 +415,8 @@ def ratio_allclose(
     cmp.atol_override = atol
     cmp.rtol_override = rtol
     cmp.__name__ = (
-        f"ratio_allclose(atol={atol}, rtol={rtol}, "
-        f"max_error_ratio={max_error_ratio})"
+        f"ratio_allclose(atol={atol}, rtol={rtol}, max_error_ratio={max_error_ratio}, "
+        f"valid_rows={valid_rows}, valid_axis={valid_axis}, zero_tail={zero_tail})"
     )
     return cmp
 
@@ -367,6 +426,9 @@ def ratio_reldiff(
     pct_thd: float = 0.05,
     max_diff_hd: float = float("inf"),
     max_show: int = 10,
+    valid_rows: int | None = None,
+    valid_axis: int = 0,
+    zero_tail: bool = False,
 ) -> Callable:
     """Relative-diff comparator with bad-point ratio and single-point cap.
 
@@ -392,6 +454,15 @@ def ratio_reldiff(
             (no cap); pass an explicit value for a single-point catastrophic
             failure check.
         max_show: Maximum mismatched points to print on failure.
+        valid_rows: Compare only the leading ``valid_rows`` entries along
+            ``valid_axis``. ``None`` (default) compares the whole tensor, ``0``
+            compares nothing and passes. Use it for packed buffers whose
+            inactive tail would otherwise dilute the error ratio.
+        valid_axis: Axis ``valid_rows`` slices (default 0). Pass 1 when a
+            leading rank axis precedes the token axis.
+        zero_tail: Additionally require the dropped tail to be all zeros. Only
+            meaningful with ``valid_rows``; catches a kernel writing past the
+            active token count.
     """
     if not 0.0 < diff_thd:
         raise ValueError(f"diff_thd must be > 0, got {diff_thd}")
@@ -410,6 +481,12 @@ def ratio_reldiff(
         rtol: float,
         atol: float,
     ) -> tuple[bool, str]:
+        actual, expected, prefix_error = _valid_prefix(actual, expected, valid_rows, valid_axis, zero_tail)
+        if prefix_error:
+            return False, prefix_error
+        if actual.numel() == 0:
+            return True, ""
+
         actual_f = actual.cpu().to(torch.float32)
         expected_f = expected.cpu().to(torch.float32)
 
@@ -477,8 +554,8 @@ def ratio_reldiff(
         )
 
     cmp.__name__ = (
-        f"ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd}, "
-        f"max_diff_hd={max_diff_hd})"
+        f"ratio_reldiff(diff_thd={diff_thd}, pct_thd={pct_thd}, max_diff_hd={max_diff_hd}, "
+        f"valid_rows={valid_rows}, valid_axis={valid_axis}, zero_tail={zero_tail})"
     )
     return cmp
 

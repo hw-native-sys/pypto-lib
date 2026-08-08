@@ -335,6 +335,12 @@ per-output with the `compare_fn={"out_name": custom_callable}` argument.
 | `ratio_allclose(atol, rtol, max_error_ratio=0.005)` | Quantized kernels where a small outlier fraction may exceed per-point `atol + rtol·|expected|`. NaN/Inf always fail. |
 | `ratio_reldiff(diff_thd, pct_thd, max_diff_hd=inf)` | cann-recipes-infer-style relative-diff check: per-point `rdiff > diff_thd` bad-point ratio capped by `pct_thd`, with optional single-point `max_diff_hd` cap. |
 
+Both ratio comparators also take `valid_rows` / `valid_axis` / `zero_tail`:
+`valid_rows=n` compares only the leading `n` entries along `valid_axis`
+(default axis 0), so a packed buffer's inactive token tail cannot dilute the
+error ratio, and `zero_tail=True` additionally fails the check when that
+dropped tail is not all zeros. `valid_rows=0` compares nothing and passes.
+
 The harness returns `RunResult(passed=True)` on success. Validation mismatches
 and a small set of harness-level setup errors return
 `RunResult(passed=False, error=...)`. Compiler errors, golden-function errors,

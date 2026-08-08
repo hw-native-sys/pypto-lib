@@ -979,19 +979,6 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
-    active_score_cmp = ratio_allclose(atol=1e-4, rtol=1.0 / 128)
-
-    def score_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
-        return active_score_cmp(
-            actual[:args.num_tokens],
-            expected[:args.num_tokens],
-            actual_outputs=actual_outputs,
-            expected_outputs=expected_outputs,
-            inputs=inputs,
-            rtol=rtol,
-            atol=atol,
-        )
-
     def topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, inputs, rtol, atol):
         score = actual_outputs["score"]
         a_top = actual[..., :IDX_TOPK]
@@ -1027,7 +1014,8 @@ if __name__ == "__main__":
         atol=1e-3,
         compile_only=args.compile_only,
         compare_fn={
-            "score": score_compare,
+            # Inactive score rows carry -inf from the sort scratch, not zeros, hence no zero_tail.
+            "score": ratio_allclose(atol=1e-4, rtol=1.0 / 128, valid_rows=args.num_tokens),
             "topk_idxs": topk_idxs_compare,
             # C8 cache: INT8 rows exact bar boundary +/-1 LSB; scale rides alongside.
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
