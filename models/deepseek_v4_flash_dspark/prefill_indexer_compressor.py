@@ -18,6 +18,8 @@ from config import (
     FP32_NEG_INF,
     IDX_CACHE_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
 )
@@ -34,8 +36,8 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.index_nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-B = 1
-S = 128
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 START_POS = 0
 COMPRESS_RATIO = 4
@@ -43,7 +45,6 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
@@ -56,6 +57,7 @@ IDX_CACHE_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
 # tiling
 K_TILE = 512                 # projection D (K) reduction tile
 OUT_TILE = 64                # projection OUT_DIM (N) tile
+PROJ_ROW_TILE = min(128, T)  # projection token-row tile; Acc = ROW*OUT_TILE*4 sits under the a2a3 L0C wall
 HEAD_D_TILE = 128            # head-dim tile for the softmax pool
 HEAD_TILE = 64
 PACKED_RMS_TILE = 16
@@ -97,13 +99,16 @@ def _prefill_indexer_compressor_with_completion(
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_idx_c4_kv_score_proj"):
-        o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
+    proj_row_blocks = T // PROJ_ROW_TILE
+    for proj_idx in pl.spmd((OUT_DIM // OUT_TILE) * proj_row_blocks, name_hint="prefill_idx_c4_kv_score_proj"):
+        proj_n = proj_idx // proj_row_blocks
+        o0 = proj_n * OUT_TILE
+        t0 = (proj_idx - proj_n * proj_row_blocks) * PROJ_ROW_TILE
+        kv_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+        score_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x[0:T, k0 : k0 + K_TILE]
+            x_tile = x[t0 : t0 + PROJ_ROW_TILE, k0 : k0 + K_TILE]
             # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load
             # (K-contiguous long bursts) instead of ND2NZ strided; mirrors the main
             # compressor (prefill_compressor_ratio4) and the decode indexer compressor.
@@ -115,8 +120,8 @@ def _prefill_indexer_compressor_with_completion(
             else:
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+        kv_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = kv_acc
+        score_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once. Input-only deps, so it overlaps the
     # projection matmul, replacing the O(T) write-discovery scan repeated in pool / rmsnorm_rope /
@@ -768,15 +773,10 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer compressor validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on the *sim platforms CI uses.")
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)

@@ -17,6 +17,8 @@ from config import (
     FLASH as M,
     FP32_NEG_INF,
     KV_CMP_BLOCK_NUM,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
 )
 
 # Dynamic shape variables.
@@ -31,8 +33,8 @@ HEAD_DIM_INV = 1.0 / HEAD_DIM
 ROPE_HEAD_DIM = M.qk_rope_head_dim
 NOPE_HEAD_DIM = M.nope_head_dim
 MAX_SEQ_LEN = M.max_position_embeddings
-B = 1
-S = 128
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 START_POS = 0
 COMPRESS_RATIO = 4
@@ -40,7 +42,6 @@ OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
 STATE_LEN = COFF * COMPRESS_RATIO
-PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
@@ -52,6 +53,7 @@ CSA_STATE_BLOCK_NUM = CSA_STATE_PHYSICAL_BLOCKS
 # tiling
 K_TILE = 512                  # projection D (K) reduction tile
 OUT_TILE = 64                 # projection OUT_DIM (N) tile
+PROJ_ROW_TILE = min(128, T)   # projection token-row tile; Acc = ROW*OUT_TILE*4 sits under the a2a3 L0C wall
 HEAD_D_TILE = 512             # head-dim tile for the softmax pool
 HEAD_TILE = 64
 STATE_UPDATE_TOKEN_TILE = 2
@@ -86,13 +88,16 @@ def compressor_ratio4(
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
-    for proj_idx in pl.spmd(OUT_DIM // OUT_TILE, name_hint="prefill_c4_kv_score_proj"):
-        o0 = proj_idx * OUT_TILE
-        kv_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
-        score_acc = pl.create_tensor([T, OUT_TILE], dtype=pl.FP32)
+    proj_row_blocks = T // PROJ_ROW_TILE
+    for proj_idx in pl.spmd((OUT_DIM // OUT_TILE) * proj_row_blocks, name_hint="prefill_c4_kv_score_proj"):
+        proj_n = proj_idx // proj_row_blocks
+        o0 = proj_n * OUT_TILE
+        t0 = (proj_idx - proj_n * proj_row_blocks) * PROJ_ROW_TILE
+        kv_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
+        score_acc = pl.create_tensor([PROJ_ROW_TILE, OUT_TILE], dtype=pl.FP32)
         for kb in pl.pipeline(0, D // K_TILE, stage=2):
             k0 = kb * K_TILE
-            x_tile = x[0:T, k0 : k0 + K_TILE]
+            x_tile = x[t0 : t0 + PROJ_ROW_TILE, k0 : k0 + K_TILE]
             # Weights stored transposed [OUT_DIM, D] + b_trans=True -> DN2ZN load (K-contiguous
             # long bursts) instead of ND2NZ (strided short bursts). Matches ratio4/CSA/HCA layout.
             wkv_tile = wkv[o0 : o0 + OUT_TILE, k0 : k0 + K_TILE]
@@ -103,8 +108,8 @@ def compressor_ratio4(
             else:
                 kv_acc = pl.matmul_acc(kv_acc, x_tile, wkv_tile, b_trans=True)
                 score_acc = pl.matmul_acc(score_acc, x_tile, wgate_tile, b_trans=True)
-        cmp4_kv_proj_scratch[0:T, o0 : o0 + OUT_TILE] = kv_acc
-        cmp4_score_proj_scratch[0:T, o0 : o0 + OUT_TILE] = score_acc
+        cmp4_kv_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = kv_acc
+        cmp4_score_proj_scratch[t0 : t0 + PROJ_ROW_TILE, o0 : o0 + OUT_TILE] = score_acc
 
     # Precompute write_i -> (position, dst cache row) once. Depends only on the slot-mapping and
     # position inputs, so it overlaps the projection matmul, replacing the O(T) write-discovery

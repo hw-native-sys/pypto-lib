@@ -115,7 +115,6 @@ CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 # tiling
 CSA_TOPK_TOKEN_TILE = 2
 
-assert S == WIN, "packed CSA prefill currently assumes one static window page"
 assert COMPRESS_RATIO == INDEXER_COMPRESS_RATIO
 assert PREFILL_ATTN_BLOCKS <= VALID_BLOCK_MASK_COLS
 assert INDEXER_TOPK_CAP <= SPARSE_CMP_MAX_BLOCKS * BLOCK_SIZE
@@ -232,8 +231,8 @@ def prefill_attention_csa(
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_csa_idx_halfrope"):
         for idx_t in pl.range(T):
             idx_pos = pl.cast(pl.read(position_ids, [idx_t]), pl.INDEX)
-            idx_cos = pl.assemble(idx_cos, pl.cast(pl.slice(freqs_cos, [1, HALF_ROPE], [idx_pos, 0]), target_type=pl.FP32), [idx_t, 0])
-            idx_sin = pl.assemble(idx_sin, pl.cast(pl.slice(freqs_sin, [1, HALF_ROPE], [idx_pos, 0]), target_type=pl.FP32), [idx_t, 0])
+            idx_cos[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(freqs_cos[idx_pos : idx_pos + 1, 0:HALF_ROPE], target_type=pl.FP32)
+            idx_sin[idx_t : idx_t + 1, 0:HALF_ROPE] = pl.cast(freqs_sin[idx_pos : idx_pos + 1, 0:HALF_ROPE], target_type=pl.FP32)
 
     cmp_topk_indices = pl.create_tensor([T, IDX_TOPK], dtype=pl.INT32)
     idx_score_unused = pl.create_tensor([T, INDEXER_SCORE_CAP], dtype=pl.FP32)
@@ -250,41 +249,24 @@ def prefill_attention_csa(
     )
 
     swa_indices = pl.create_tensor([T, WIN], dtype=pl.INT32)
-    valid_block_mask = pl.create_tensor(
-        [T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32
-    )
-    for topk_block in pl.spmd((T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE,
-                              name_hint="prefill_csa_sparse_idx_tile"):
+    valid_block_mask = pl.create_tensor([T, VALID_BLOCK_MASK_COLS], dtype=pl.INT32)
+    csa_topk_blocks = (T + CSA_TOPK_TOKEN_TILE - 1) // CSA_TOPK_TOKEN_TILE
+    for topk_block in pl.spmd(csa_topk_blocks, name_hint="prefill_csa_sparse_idx_tile"):
         topk_t0 = topk_block * CSA_TOPK_TOKEN_TILE
         for topk_dt in pl.range(CSA_TOPK_TOKEN_TILE):
             t_idx = topk_t0 + topk_dt
             swa_row = pl.full([1, WIN], dtype=pl.INT32, value=-1)
-            mask_row = pl.full(
-                [1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0
-            )
+            mask_row = pl.full([1, VALID_BLOCK_MASK_COLS], dtype=pl.INT32, value=0)
             if t_idx < num_tokens:
                 abs_pos = pl.read(position_ids, [t_idx])
                 # Derive block liveness from the dense top-k prefix and -1 padding.
-                visible_cmp = pl.min(
-                    (abs_pos + 1) // COMPRESS_RATIO,
-                    pl.cast(INDEXER_TOPK_CAP, pl.INT32),
-                )
+                visible_cmp = pl.min((abs_pos + 1) // COMPRESS_RATIO, pl.cast(INDEXER_TOPK_CAP, pl.INT32))
                 for mask_sb in pl.unroll(PREFILL_ATTN_BLOCKS):
-                    cmp_lo = pl.max(
-                        mask_sb * PREFILL_ATTN_TILE - WIN,
-                        pl.cast(0, pl.INT32),
-                    )
-                    cmp_hi = pl.min(
-                        (mask_sb + 1) * PREFILL_ATTN_TILE - WIN,
-                        pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32),
-                    )
+                    cmp_lo = pl.max(mask_sb * PREFILL_ATTN_TILE - WIN, pl.cast(0, pl.INT32))
+                    cmp_hi = pl.min((mask_sb + 1) * PREFILL_ATTN_TILE - WIN, pl.cast(SPARSE_CMP_BIAS_COLS, pl.INT32))
                     if cmp_lo < cmp_hi:
                         if visible_cmp > cmp_lo:
-                            pl.write(
-                                mask_row,
-                                [0, mask_sb],
-                                pl.cast(1, pl.INT32),
-                            )
+                            pl.write(mask_row, [0, mask_sb], pl.cast(1, pl.INT32))
                 window_valid = pl.min(pl.cast(WIN, pl.INT32), abs_pos + 1)
                 key_start_abs = abs_pos + 1 - window_valid
                 for win_col in pl.range(WIN):
@@ -296,15 +278,9 @@ def prefill_attention_csa(
                         if blk >= 0:
                             row = pl.cast(blk * BLOCK_SIZE + (key_abs - blk_slot * BLOCK_SIZE), pl.INT32)
                             pl.write(swa_row, [0, win_col], row)
-                            pl.write(
-                                mask_row,
-                                [0, win_col // PREFILL_ATTN_TILE],
-                                pl.cast(1, pl.INT32),
-                            )
-            swa_indices = pl.assemble(swa_indices, swa_row, [t_idx, 0])
-            valid_block_mask = pl.assemble(
-                valid_block_mask, mask_row, [t_idx, 0]
-            )
+                            pl.write(mask_row, [0, win_col // PREFILL_ATTN_TILE], pl.cast(1, pl.INT32))
+            swa_indices[t_idx : t_idx + 1, 0:WIN] = swa_row
+            valid_block_mask[t_idx : t_idx + 1, 0:VALID_BLOCK_MASK_COLS] = mask_row
 
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
@@ -348,8 +324,8 @@ def prefill_attention_csa_test(
     cmp_wgate: pl.Tensor[[MAIN_OUT_DIM, D], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
     cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
-    compress_state: pl.Tensor[
-        [MAIN_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32
+    compress_state: pl.InOut[
+        pl.Tensor[[MAIN_STATE_BLOCK_NUM_DYN, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], pl.FP32]
     ],
     compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     hadamard_idx: pl.Tensor[[IDX_HEAD_DIM, IDX_HEAD_DIM], pl.BF16],
@@ -360,14 +336,14 @@ def prefill_attention_csa_test(
     inner_wgate: pl.Tensor[[INNER_OUT_DIM, D], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
     inner_norm_w: pl.Tensor[[IDX_HEAD_DIM], pl.BF16],
-    inner_compress_state: pl.Tensor[
-        [INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32
+    inner_compress_state: pl.InOut[
+        pl.Tensor[[INNER_STATE_BLOCK_NUM_DYN, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], pl.FP32]
     ],
     inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
     idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
@@ -869,12 +845,7 @@ def build_tensor_specs(
         TensorSpec("cmp_wgate", [MAIN_OUT_DIM, D], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
         TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
-        TensorSpec(
-            "compress_state",
-            [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_compress_state,
-        ),
+        TensorSpec("compress_state", [CSA_STATE_BLOCK_NUM, CSA_STATE_BLOCK_SIZE, MAIN_COMPRESS_STATE_DIM], torch.float32, init_value=init_compress_state, is_output=True),
         TensorSpec("compress_state_block_table", [CSA_STATE_MAX_BLOCKS], torch.int32, init_value=init_compress_state_block_table),
         TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
         TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
@@ -884,39 +855,18 @@ def build_tensor_specs(
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
         TensorSpec("inner_norm_w", [IDX_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
-        TensorSpec(
-            "inner_compress_state",
-            [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM],
-            torch.float32,
-            init_value=init_inner_compress_state,
-        ),
+        TensorSpec("inner_compress_state", [INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_COMPRESS_STATE_DIM], torch.float32, init_value=init_inner_compress_state, is_output=True),
         TensorSpec("inner_compress_state_block_table", [INNER_STATE_MAX_BLOCKS], torch.int32, init_value=init_inner_compress_state_block_table),
         TensorSpec("kv_cache", [CSA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16,
                    init_value=init_kv_cache, is_output=True),
         TensorSpec("ori_block_table", [SPARSE_ORI_MAX_BLOCKS], torch.int32, init_value=init_ori_block_table),
         TensorSpec("ori_slot_mapping", [T], torch.int64, init_value=init_ori_slot_mapping),
-        # Compressor / indexer caches are written in-place but not validated here
-        # (decode parity); the dedicated prefill_compressor_ratio4 and
-        # prefill_indexer tests cover them.
-        TensorSpec(
-            "cmp_kv",
-            [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
-            torch.bfloat16,
-            init_value=init_cmp_kv,
-        ),
+        TensorSpec("cmp_kv", [CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], torch.bfloat16, init_value=init_cmp_kv, is_output=True),
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
-        TensorSpec(
-            "idx_kv_cache",
-            [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
-            torch.int8,
-            init_value=init_idx_kv_cache,
-        ),
-        TensorSpec(
-            "idx_kv_scale",
-            [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1],
-            torch.float32,
-            init_value=init_idx_kv_scale,
-        ),
+        TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.int8,
+                   init_value=init_idx_kv_cache, is_output=True),
+        TensorSpec("idx_kv_scale", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], torch.float32,
+                   init_value=init_idx_kv_scale, is_output=True),
         TensorSpec("idx_block_table", [IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         TensorSpec("position_ids", [T], torch.int32, init_value=init_position_ids),
         TensorSpec("cmp_slot_mapping", [T], torch.int64, init_value=init_cmp_slot_mapping),
@@ -990,6 +940,12 @@ if __name__ == "__main__":
             "x_out": ratio_reldiff(diff_thd=x_out_diff_thd, pct_thd=0.005, max_diff_hd=x_out_max_diff,
                                    valid_rows=compare_tokens, zero_tail=True),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+            "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
+            "inner_compress_state": ratio_allclose(atol=1e-3, rtol=1e-3),
+            # INT8 quant-on-write: one LSB of rounding drift on a bounded row fraction.
+            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+            "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
         },
     )
     if not result.passed:

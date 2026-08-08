@@ -19,6 +19,8 @@ from config import (
     INT8_SCALE_MAX,
     INT8_AMAX_EPS,
     IDX_CACHE_BLOCK_NUM,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
 )
 from prefill_indexer_compressor import (
     INNER_STATE_BLOCK_NUM,
@@ -51,12 +53,13 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_COMPRESS_STATE_DIM = 2 * INNER_OUT_DIM
-B = 1
-S = 128
+B = PREFILL_BATCH
+S = PREFILL_SEQ
 T = B * S
 START_POS = 0
-# prefill_idx_score_out materializes [T, INDEXER_SCORE_CAP] in one Vec scope, so the
-# score output cap stays at 256 rows; the physical pool is sized by IDX_CACHE_BLOCK_NUM.
+# Scored compressed positions per token. Past this cap the visible set is clamped
+# and the tail is dropped, with no compile or runtime diagnostic.
+# The physical pool is sized by IDX_CACHE_BLOCK_NUM.
 INDEXER_SCORE_MAX_BLOCKS = 2
 INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
@@ -74,6 +77,7 @@ SCORE_TOKEN_TILE = 8
 TOPK_TILE = 4
 Q_TILE = 128
 Q_OUT_TILE = 256
+QR_PROJ_MM_ROW_TILE = min(128, T)     # qr_proj token-row tile; Acc = ROW*Q_OUT_TILE*4 sits on the a2a3 L0C wall
 QR_PROJ_ROW_TILE = 16
 HEAD_DIM_TILE = 32
 D_TILE = 32
@@ -94,6 +98,7 @@ SORT_LEN = 2048
 PREFILL_TOPK_CAP = INDEXER_TOPK_CAP
 TOPK_PAIR_WIDTH = 2 * PREFILL_TOPK_CAP
 SCORE_INIT_TILE = 16                   # rows per -inf init write; keeps [tile, SORT_LEN] under the Vec limit
+SCORE_OUT_ROW_TILE = 64                # rows per score copy-out; keeps [tile, INDEXER_SCORE_CAP] under the Vec limit
 
 # A misaligned topk prefix faults on device like a narrow sort.
 assert TOPK_PAIR_WIDTH > 0 and (TOPK_PAIR_WIDTH & (TOPK_PAIR_WIDTH - 1)) == 0
@@ -133,20 +138,25 @@ def prefill_indexer(
 ):
     # === Q projection: int8 qr x int8 wq_b -> dequant (mirrors decode_indexer qr_proj) ===
     qr_proj = pl.create_tensor([T, IDX_N_HEADS * IDX_HEAD_DIM], dtype=pl.FP32)
-    for idx in pl.spmd(IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE, name_hint="prefill_idx_qr_proj"):
-        o0 = idx * Q_OUT_TILE
-        qr_acc = pl.create_tensor([T, Q_OUT_TILE], dtype=pl.INT32)
+    qr_mm_row_blocks = T // QR_PROJ_MM_ROW_TILE
+    qr_proj_blocks = (IDX_N_HEADS * IDX_HEAD_DIM // Q_OUT_TILE) * qr_mm_row_blocks
+    for idx in pl.spmd(qr_proj_blocks, name_hint="prefill_idx_qr_proj"):
+        qr_n = idx // qr_mm_row_blocks
+        o0 = qr_n * Q_OUT_TILE
+        mm_t0 = (idx - qr_n * qr_mm_row_blocks) * QR_PROJ_MM_ROW_TILE
+        qr_acc = pl.create_tensor([QR_PROJ_MM_ROW_TILE, Q_OUT_TILE], dtype=pl.INT32)
         for kb in pl.pipeline(0, Q_LORA // Q_TILE, stage=2):
             q0 = kb * Q_TILE
-            qr_tile = qr[:, q0 : q0 + Q_TILE]
+            qr_tile = qr[mm_t0 : mm_t0 + QR_PROJ_MM_ROW_TILE, q0 : q0 + Q_TILE]
             wq_tile = wq_b[q0 : q0 + Q_TILE, o0 : o0 + Q_OUT_TILE]
             if q0 == 0:
                 qr_acc = pl.matmul(qr_tile, wq_tile, out_dtype=pl.INT32)
             else:
                 qr_acc = pl.matmul_acc(qr_acc, qr_tile, wq_tile)
         wq_scale = pl.reshape(wq_b_scale[o0 : o0 + Q_OUT_TILE], [1, Q_OUT_TILE])
-        for r0 in pl.range(0, T, QR_PROJ_ROW_TILE):
-            acc_fp32 = pl.cast(qr_acc[r0 : r0 + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
+        for rl in pl.range(0, QR_PROJ_MM_ROW_TILE, QR_PROJ_ROW_TILE):
+            r0 = mm_t0 + rl
+            acc_fp32 = pl.cast(qr_acc[rl : rl + QR_PROJ_ROW_TILE, :], target_type=pl.FP32, mode="none")
             scale_dq = qr_scale[r0 : r0 + QR_PROJ_ROW_TILE, :]
             qr_dequant = pl.col_expand_mul(pl.row_expand_mul(acc_fp32, scale_dq), wq_scale)
             qr_proj[r0 : r0 + QR_PROJ_ROW_TILE, o0 : o0 + Q_OUT_TILE] = qr_dequant
@@ -313,8 +323,10 @@ def prefill_indexer(
 
     # Expose the real per-key scores (first INDEXER_SCORE_CAP cols of the wide sort scratch).
     score_out_flat = pl.reshape(score, [T, INDEXER_SCORE_CAP])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="prefill_idx_score_out"):
-        score_out_flat[0:T, :] = score_wide[0:T, 0:INDEXER_SCORE_CAP]
+    for out_idx in pl.spmd(T // SCORE_OUT_ROW_TILE, name_hint="prefill_idx_score_out"):
+        out_t0 = out_idx * SCORE_OUT_ROW_TILE
+        score_out_rows = score_wide[out_t0 : out_t0 + SCORE_OUT_ROW_TILE, 0:INDEXER_SCORE_CAP]
+        score_out_flat[out_t0 : out_t0 + SCORE_OUT_ROW_TILE, :] = score_out_rows
 
     # === top-k per token over the visible (causally reachable) compressed positions ===
     for topk_idx in pl.spmd(T // TOPK_TILE, name_hint="prefill_idx_topk"):
@@ -962,15 +974,10 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run_jit, topk_pair_compare
 
     parser = argparse.ArgumentParser(description="Standalone token-major DeepSeek V4 prefill indexer validation.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("-d", "--device", type=int, default=0)
-    parser.add_argument(
-        "--compile-only",
-        action="store_true",
-        default=False,
-        help="Compile/codegen only. This is also the implicit behavior on *sim platforms used by CI.",
-    )
+    parser.add_argument("--compile-only", action="store_true", default=False,
+                        help="Compile/codegen only; also the implicit behavior on the *sim platforms CI uses.")
     parser.add_argument("--start-pos", type=int, default=START_POS,
                         help="Fixture-only absolute position for token 0; lowered into position_ids and dense idx_slot_mapping.")
     parser.add_argument("--num-tokens", type=int, default=T,
