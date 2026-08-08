@@ -6,6 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=4
 """DeepSeek-V4 CSA sparse attention with grouped output projection (decode).
 
 Ratio-4 compressed cache plus the sliding window, with the indexer top-k
@@ -14,7 +15,19 @@ masking folded in. The SWA and HCA variants live in sibling modules.
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
 
+from attention_tp import (
+    GROUP_T_MAX,
+    TP_ATTN_SINK_SIZE,
+    TP_CHOICES,
+    TP_O_A_SIZE,
+    TP_O_B_SIZE,
+    TP_Q_B_SIZE,
+    reduce_scatter_fp32,
+    require_fused_attention_tp,
+)
 from config import (
     FLASH as M,
     DECODE_BATCH,
@@ -31,17 +44,19 @@ from config import (
 
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")  # per-request axis (block tables)
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
-ORI_BLOCK_NUM_DYN = pl.dynamic("ORI_BLOCK_NUM_DYN")
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+B_DYN = pl.dynamic("CSA_ATTN_B_DYN")  # per-request axis (block tables)
+T_DYN = pl.dynamic("CSA_ATTN_T_DYN")  # T = B * S
+ORI_BLOCK_NUM_DYN = pl.dynamic("CSA_ATTN_ORI_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("CSA_ATTN_CMP_BLOCK_NUM_DYN")
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH // TP if TP_Q_B_SIZE == 1 else DECODE_BATCH
 S = DECODE_SEQ
 T = B * S
 D = M.hidden_size
-H = M.num_attention_heads
+GLOBAL_H = M.num_attention_heads
+H = GLOBAL_H // TP_Q_B_SIZE
+ATTN_SINK_H = GLOBAL_H // TP_ATTN_SINK_SIZE
 HEAD_DIM = M.head_dim
 ROPE_DIM = M.qk_rope_head_dim
 HALF_ROPE = ROPE_DIM // 2
@@ -52,9 +67,13 @@ IDX_TOPK = M.index_topk
 CMP_TOPK = IDX_TOPK
 SOFTMAX_SCALE = M.softmax_scale
 O_LORA = M.o_lora_rank
-O_GROUPS = M.o_groups
+GLOBAL_O_GROUPS = M.o_groups
+O_GROUPS = GLOBAL_O_GROUPS // TP_O_A_SIZE
+O_B_LOCAL = GLOBAL_O_GROUPS * O_LORA // TP_O_B_SIZE
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
+SP_T = GROUP_T_MAX // TP_O_B_SIZE
+TP_SIZE = require_fused_attention_tp()
 COMPRESS_RATIO = 4
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
@@ -69,7 +88,14 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 
 # tiling
 H_TILE = 16
-QK_M_TILE = 32           # qk_pv M rows per QK/PV matmul; QK_M_TILE/H_TILE-way KV L1->L0 reuse
+PADDED_H = max(H_TILE, H)
+HEAD_TILES = PADDED_H // H_TILE
+PACK_HEADS_PER_TILE = min(H_TILE, H)
+QK_M_TILE = min(32, max(16, H))  # qk_pv M rows; TP8 pads its eight local heads to the cube floor
+QK_BLOCKS = (H + QK_M_TILE - 1) // QK_M_TILE
+QK_PIPELINE_STAGE = min(2, QK_BLOCKS)
+QK_VALID_H = min(QK_M_TILE, H)
+QK_SUBTILES = QK_M_TILE // H_TILE
 ATTN_K_TILE = 128
 NUM_QK_CORES = 24        # qk_pv dispatch lanes = a2a3 AIC count; re-sweep for other AIC counts
 A_K_TILE = 256           # proj_a cube K frag
@@ -90,6 +116,7 @@ QUANT_TOKEN_TILE = 8
 PROJ_B_D_TILE = 512      # proj_b_mm D chunk per task; its N frags loop inside the task
 PROJ_B_ACT_T_TILE = 8    # proj_b_act inner token tile for the O_GROUPS-way INT32->FP32 accumulate
 PROJ_B_ACT_TASK_T_TILE = 8   # proj_b_act token block per task
+PROJ_B_ACT_PIPELINE_STAGE = min(2, O_GROUPS)
 TOPK = WIN + CMP_TOPK
 # Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
 # output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
@@ -100,10 +127,15 @@ QK_ITEMS = T * SPARSE_BLOCKS   # qk_pv work items: one per (token, sparse block)
 # [T, IDX_TOPK] FP32 tiles well past the Vec limit.
 BIAS_T_TILE = min(T, 8)
 assert T % BIAS_T_TILE == 0
+assert GLOBAL_H % TP_Q_B_SIZE == 0
+assert GLOBAL_H % TP_ATTN_SINK_SIZE == 0
+assert GLOBAL_O_GROUPS % TP_O_A_SIZE == 0
+assert GLOBAL_O_GROUPS * O_LORA % TP_O_B_SIZE == 0
+assert HEADS_PER_GROUP == GLOBAL_H // GLOBAL_O_GROUPS
 
 
 @pl.jit.inline
-def sparse_attn_csa(
+def sparse_attn_csa_partial(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -111,21 +143,21 @@ def sparse_attn_csa(
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    attn_partial: pl.Tensor[[T_DYN, D], pl.FP32],
 ):
-    """Run sparse decode attention, inverse RoPE, and grouped output projection."""
+    """Run CSA decode attention and produce one rank-local FP32 projection partial."""
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
-    t_blk = t_dim * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
-    t_hblocks = t_dim * (H // H_TILE)
+    t_blk = t_dim * HEAD_TILES * SPARSE_BLOCKS * H_TILE
+    t_hblocks = t_dim * HEAD_TILES
     qk_items = t_dim * SPARSE_BLOCKS
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
     act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
@@ -230,7 +262,7 @@ def sparse_attn_csa(
             qk_t = qk_item // SPARSE_BLOCKS
             qk_sb = qk_item - qk_t * SPARSE_BLOCKS
             qk_b = qk_t // S
-            qk_token_base = qk_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
+            qk_token_base = qk_t * HEAD_TILES * SPARSE_BLOCKS * H_TILE
             qk_s0 = qk_sb * ATTN_K_TILE
             qk_bias_row = sparse_bias[qk_t : qk_t + 1, qk_s0 : qk_s0 + ATTN_K_TILE]
             qk_block_valid = pl.read(valid_block_mask, [qk_t, qk_sb])
@@ -266,11 +298,20 @@ def sparse_attn_csa(
                 # stores at the SAME offsets as the per-head-tile path
                 # (qk_h_idx == qk_hb * (QK_M_TILE // H_TILE) + qk_sub), so the
                 # sparse_blk_* layout and merge_norm are bit-identical.
-                for qk_hb in pl.pipeline(H // QK_M_TILE, stage=2):
+                for qk_hb in pl.pipeline(QK_BLOCKS, stage=QK_PIPELINE_STAGE):
                     qk_h0 = qk_hb * QK_M_TILE
                     qk_head_row = qk_t * H + qk_h0
-                    qk_q_tile = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0 : HEAD_DIM]
-                    qk_raw = pl.matmul(qk_q_tile, qk_kv, b_trans=True, out_dtype=pl.FP32)
+                    if H < QK_M_TILE:
+                        qk_q_source = q_flat[qk_head_row : qk_head_row + QK_VALID_H, 0:HEAD_DIM]
+                        qk_q_padded = pl.fillpad_expand(
+                            qk_q_source,
+                            [QK_M_TILE, HEAD_DIM],
+                            pad_value=pl.PadValue.zero,
+                        )
+                        qk_raw = pl.matmul(qk_q_padded, qk_kv, b_trans=True, out_dtype=pl.FP32)
+                    else:
+                        qk_q_full = q_flat[qk_head_row : qk_head_row + QK_M_TILE, 0:HEAD_DIM]
+                        qk_raw = pl.matmul(qk_q_full, qk_kv, b_trans=True, out_dtype=pl.FP32)
                     qk_scaled = pl.mul(qk_raw, SOFTMAX_SCALE)
                     # Broadcast-add the per-block bias directly (col_expand_add) instead
                     # of col_expand into a dead pl.full(0) base + a separate add.
@@ -282,7 +323,7 @@ def sparse_attn_csa(
                     qk_li = pl.row_sum(qk_exp)
                     qk_exp_bf16 = pl.cast(qk_exp, target_type=pl.BF16, mode="rint")
                     qk_oi = pl.matmul(qk_exp_bf16, qk_kv, out_dtype=pl.FP32)
-                    for qk_sub in pl.unroll(QK_M_TILE // H_TILE):
+                    for qk_sub in pl.unroll(QK_SUBTILES):
                         qk_h_idx = qk_hb * (QK_M_TILE // H_TILE) + qk_sub
                         qk_r0 = qk_sub * H_TILE
                         qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
@@ -292,7 +333,7 @@ def sparse_attn_csa(
                         sparse_blk_oi[qk_row : qk_row + H_TILE, 0 : HEAD_DIM] = qk_oi[qk_r0 : qk_r0 + H_TILE, 0 : HEAD_DIM]
             else:
                 qk_oi_zero = pl.full([H_TILE, HEAD_DIM], dtype=pl.FP32, value=0.0)
-                for qk_h_idx in pl.range(H // H_TILE):
+                for qk_h_idx in pl.range(HEAD_TILES):
                     qk_blk_base = qk_token_base + qk_h_idx * SPARSE_BLOCKS * H_TILE
                     qk_row = qk_blk_base + qk_sb * H_TILE
                     for qk_hr in pl.range(H_TILE):
@@ -340,8 +381,8 @@ def sparse_attn_csa(
     o_packed = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
     with pl.spmd(t_hblocks, name_hint="merge_norm") as merge_tid:
         m_idx = pl.tile.get_block_idx()
-        m_t = m_idx // (H // H_TILE)
-        m_h_idx = m_idx - m_t * (H // H_TILE)
+        m_t = m_idx // HEAD_TILES
+        m_h_idx = m_idx - m_t * HEAD_TILES
         m_h0 = m_h_idx * H_TILE
         m_blk_base = m_idx * SPARSE_BLOCKS * H_TILE
         m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
@@ -360,7 +401,12 @@ def sparse_attn_csa(
             m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
             m_mi = m_mi_new
 
-        n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
+        n_sink_source = pl.reshape(attn_sink, [1, ATTN_SINK_H])
+        n_sink_valid = n_sink_source[0:1, m_h0 : m_h0 + PACK_HEADS_PER_TILE]
+        n_sink_zeros = pl.full([1, PACK_HEADS_PER_TILE], dtype=pl.FP32, value=0.0)
+        n_sink_materialized = pl.add(n_sink_valid, n_sink_zeros)
+        n_sink_padded = pl.fillpad_expand(n_sink_materialized, [1, H_TILE], pad_value=pl.PadValue.zero)
+        n_sink_bias = pl.reshape(n_sink_padded, [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
         n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
         n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
@@ -379,7 +425,7 @@ def sparse_attn_csa(
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
         n_full_bf16 = pl.concat(n_bf16[:, : NOPE_DIM], n_rope_bf16)
 
-        for n_hi in pl.unroll(H_TILE):
+        for n_hi in pl.unroll(PACK_HEADS_PER_TILE):
             n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T_PAD + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # one HEAD_DIM-wide store per head row instead of two: concat the nope and
@@ -473,7 +519,7 @@ def sparse_attn_csa(
     # per-row act scale -- then applies the per-channel weight scale -> BF16. Explicit
     # deps on all proj_b_mm tasks bridge manual_scope -> the return's auto-dep.
     with pl.spmd(act_t_blks * PROJ_B_ACT_N_REGS, name_hint="proj_b_act",
-                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as _act_tid:
+                 deps=[proj_b_tids[i] for i in range(O_GROUPS)], allow_early_resolve=True) as act_tid:
         act_idx = pl.tile.get_block_idx()
         tblk = act_idx // PROJ_B_ACT_N_REGS  # token block outermost
         nreg = act_idx - tblk * PROJ_B_ACT_N_REGS
@@ -483,7 +529,7 @@ def sparse_attn_csa(
         wb_scale_chunk = pl.reshape(wb_scale, [1, PROJ_B_ACT_N_TILE])
         for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TASK_T_TILE, PROJ_B_ACT_T_TILE):
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
-            for act_g in pl.pipeline(O_GROUPS, stage=2):
+            for act_g in pl.pipeline(O_GROUPS, stage=PROJ_B_ACT_PIPELINE_STAGE):
                 p_col0 = act_g * D + ob_n0
                 p_g = partials[b_tb : b_tb + PROJ_B_ACT_T_TILE, p_col0 : p_col0 + PROJ_B_ACT_N_TILE]
                 g_scale_row = act_scale_dq[act_g : act_g + 1, b_tb : b_tb + PROJ_B_ACT_T_TILE]
@@ -492,10 +538,199 @@ def sparse_attn_csa(
                 p_g_scaled = pl.row_expand_mul(p_g_f32, g_scale)
                 acc = pl.add(acc, p_g_scaled)
             out_t = pl.col_expand_mul(acc, wb_scale_chunk)
-            out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
-            attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
+            attn_partial[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_t
 
+    return act_tid
+
+
+@pl.jit.inline
+def sparse_attn_csa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Run the legacy single-rank CSA path and cast its FP32 projection once."""
+    t_dim = pl.tensor.dim(q, 0)
+    attn_partial = pl.create_tensor([t_dim, D], dtype=pl.FP32)
+    partial_ready = sparse_attn_csa_partial(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_partial,
+    )
+    with pl.spmd(
+        t_dim * PROJ_B_ACT_N_REGS,
+        name_hint="csa_out_cast",
+        deps=[partial_ready],
+    ) as _cast_tid:
+        index = pl.tile.get_block_idx()
+        token = index // PROJ_B_ACT_N_REGS
+        nreg = index - token * PROJ_B_ACT_N_REGS
+        n0 = nreg * PROJ_B_ACT_N_TILE
+        partial = attn_partial[token : token + 1, n0 : n0 + PROJ_B_ACT_N_TILE]
+        attn_out[token : token + 1, n0 : n0 + PROJ_B_ACT_N_TILE] = pl.cast(
+            partial,
+            target_type=pl.BF16,
+            mode="rint",
+        )
     return attn_out
+
+
+@pl.jit.inline(auto_scope=False)
+def sparse_attn_csa_tp(
+    q: pl.Tensor[[GROUP_T_MAX, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[GROUP_T_MAX, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[GROUP_T_MAX, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[GROUP_T_MAX, 1], pl.INT32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
+    freqs_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out_local: pl.Tensor[[SP_T, D], pl.BF16],
+    scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
+    scatter_signal: pld.DistributedTensor[[TP_O_B_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    """Run the local-head CSA shard and reduce-scatter its FP32 projection."""
+    attn_partial = pl.create_tensor([GROUP_T_MAX, D], dtype=pl.FP32)
+    partial_ready = sparse_attn_csa_partial(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_partial,
+    )
+    return reduce_scatter_fp32(
+        attn_partial,
+        attn_out_local,
+        scatter_window,
+        scatter_signal,
+        my_rank,
+        partial_ready,
+    )
+
+
+@pl.jit
+def sparse_attn_csa_tp_test(
+    q: pl.Tensor[[GROUP_T_MAX, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[GROUP_T_MAX, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[GROUP_T_MAX, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[GROUP_T_MAX, 1], pl.INT32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
+    freqs_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out_local: pl.Out[pl.Tensor[[SP_T, D], pl.BF16]],
+    scatter_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.FP32],
+    scatter_signal: pld.DistributedTensor[[TP_O_B_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    return sparse_attn_csa_tp(
+        q,
+        ori_kv,
+        window_swa_indices,
+        cmp_kv,
+        cmp_block_table,
+        idx_topk,
+        position_ids,
+        attn_sink,
+        freqs_cos,
+        freqs_sin,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        attn_out_local,
+        scatter_window,
+        scatter_signal,
+        my_rank,
+    )
+
+
+@pl.jit.host
+def l3_sparse_attn_csa_tp(
+    q: pl.Tensor[[TP_Q_B_SIZE, GROUP_T_MAX, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[TP_SIZE, GROUP_T_MAX, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[TP_SIZE, B, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[TP_SIZE, GROUP_T_MAX, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[TP_SIZE, GROUP_T_MAX, 1], pl.INT32],
+    attn_sink: pl.Tensor[[TP_ATTN_SINK_SIZE, ATTN_SINK_H], pl.FP32],
+    freqs_cos: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[TP_O_A_SIZE, O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[TP_O_B_SIZE, D, O_B_LOCAL], pl.INT8],
+    wo_b_scale: pl.Tensor[[TP_O_B_SIZE, D], pl.FP32],
+    attn_out_local: pl.Out[pl.Tensor[[TP_O_B_SIZE, SP_T, D], pl.BF16]],
+):
+    scatter_window_buffer = pld.alloc_window_buffer([GROUP_T_MAX, D], dtype=pl.FP32)
+    scatter_signal_buffer = pld.alloc_window_buffer([TP_O_B_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        scatter_window = pld.window(scatter_window_buffer, [GROUP_T_MAX, D], dtype=pl.FP32)
+        scatter_signal = pld.window(scatter_signal_buffer, [TP_O_B_SIZE, 1], dtype=pl.INT32)
+        sparse_attn_csa_tp_test(
+            q[rank],
+            ori_kv[rank],
+            window_swa_indices[rank],
+            cmp_kv[rank],
+            cmp_block_table[rank],
+            idx_topk[rank],
+            position_ids[rank],
+            attn_sink[rank],
+            freqs_cos[rank],
+            freqs_sin[rank],
+            wo_a[rank],
+            wo_b[rank],
+            wo_b_scale[rank],
+            attn_out_local[rank],
+            scatter_window,
+            scatter_signal,
+            rank,
+            device=rank,
+        )
+    return attn_out_local
+
 
 @pl.jit
 def sparse_attn_test(
@@ -506,11 +741,11 @@ def sparse_attn_test(
     cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
     position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
-    attn_sink: pl.Tensor[[H], pl.FP32],
+    attn_sink: pl.Tensor[[ATTN_SINK_H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b: pl.Tensor[[D, O_B_LOCAL], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],
     attn_out: pl.Out[pl.Tensor[[T_DYN, D], pl.BF16]],
 ):
@@ -535,8 +770,8 @@ def sparse_attn_test(
     return attn_out
 
 
-def golden_sparse_attn(tensors):
-    """Torch reference: sparse_attn decode path followed by grouped o_proj."""
+def golden_sparse_attn_partial(tensors):
+    """Torch reference for one local-head CSA FP32 projection partial."""
     import torch
 
     q = tensors["q"].float()
@@ -659,7 +894,50 @@ def golden_sparse_attn(tensors):
         out = out + p_g.float() * scale_dq_g[:, g]                             # per-row group scale
     out = out * wo_b_scale.unsqueeze(0)                                        # per-channel weight scale
 
-    tensors["attn_out"][:] = out.to(torch.bfloat16)
+    tensors["attn_partial"][:] = out
+
+
+def golden_sparse_attn(tensors):
+    """Torch reference for the legacy BF16 CSA output."""
+    import torch
+
+    partial_tensors = dict(tensors)
+    partial_tensors["attn_partial"] = torch.empty_like(tensors["attn_out"], dtype=torch.float32)
+    golden_sparse_attn_partial(partial_tensors)
+    tensors["attn_out"][:] = partial_tensors["attn_partial"].to(torch.bfloat16)
+
+
+def golden_sparse_attn_tp(tensors):
+    """Torch reference for FP32 rank reduction and sequence-parallel row scatter."""
+    import torch
+
+    reduced = torch.zeros([GROUP_T_MAX, D], dtype=torch.float32)
+    names = (
+        "q",
+        "ori_kv",
+        "window_swa_indices",
+        "cmp_kv",
+        "cmp_block_table",
+        "idx_topk",
+        "position_ids",
+        "attn_sink",
+        "freqs_cos",
+        "freqs_sin",
+        "wo_a",
+        "wo_b",
+        "wo_b_scale",
+    )
+    for rank in range(TP_SIZE):
+        partial = torch.empty([GROUP_T_MAX, D], dtype=torch.float32)
+        rank_tensors = {name: tensors[name][rank] for name in names}
+        rank_tensors["attn_partial"] = partial
+        golden_sparse_attn_partial(rank_tensors)
+        reduced.add_(partial)
+
+    reduced_bf16 = reduced.to(torch.bfloat16)
+    for rank in range(TP_SIZE):
+        row0 = rank * SP_T
+        tensors["attn_out_local"][rank].copy_(reduced_bf16[row0 : row0 + SP_T])
 
 def build_tensor_specs(
     causal_regression_fixture: bool = False,
@@ -715,7 +993,7 @@ def build_tensor_specs(
 
     def init_attn_sink():
         """Initialize the per-head sink logits to zero."""
-        return torch.zeros(H)
+        return torch.zeros(ATTN_SINK_H)
 
     def init_window_block_table():
         """Build the demo block table for the sliding-window cache pages."""
@@ -768,7 +1046,7 @@ def build_tensor_specs(
         """Initialize the grouped first-stage output-projection weights."""
         return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) / (O_GROUP_IN ** 0.5)
 
-    wo_b_bf16 = ((torch.rand(D, O_GROUPS * O_LORA) - 0.5) / ((O_GROUPS * O_LORA) ** 0.5)).to(torch.bfloat16)
+    wo_b_bf16 = ((torch.rand(D, O_B_LOCAL) - 0.5) / (O_B_LOCAL ** 0.5)).to(torch.bfloat16)
     wo_b_i8, wo_b_scale = quant_w_per_channel(wo_b_bf16)
 
     def init_wo_b():
@@ -787,13 +1065,149 @@ def build_tensor_specs(
         TensorSpec("cmp_block_table", [batch, CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec("idx_topk", [tokens, INDEXER_SCORE_LEN], torch.int32, init_value=init_idx_topk),
         TensorSpec("position_ids", [tokens, 1], torch.int32, init_value=init_position_ids),
-        TensorSpec("attn_sink", [H], torch.float32, init_value=init_attn_sink),
+        TensorSpec("attn_sink", [ATTN_SINK_H], torch.float32, init_value=init_attn_sink),
         TensorSpec("freqs_cos", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_cos),
         TensorSpec("freqs_sin", [tokens, ROPE_DIM], torch.bfloat16, init_value=init_sin),
         TensorSpec("wo_a", [O_GROUPS, O_LORA, O_GROUP_IN], torch.bfloat16, init_value=init_wo_a),
-        TensorSpec("wo_b", [D, O_GROUPS * O_LORA], torch.int8, init_value=init_wo_b),
+        TensorSpec("wo_b", [D, O_B_LOCAL], torch.int8, init_value=init_wo_b),
         TensorSpec("wo_b_scale", [D], torch.float32, init_value=init_wo_b_scale),
         TensorSpec("attn_out", [tokens, D], torch.bfloat16, is_output=True),
+    ]
+
+
+def build_tp_tensor_specs(
+    causal_regression_fixture: bool = False,
+    short_window_fixture: bool = False,
+    mixed_topk_fixture: bool = False,
+    cache_window_replacement_fixture: bool = False,
+):
+    """Build a full-group fixture and contiguous local-head/O-group TP shards."""
+    import torch
+    from golden import TensorSpec
+    from utils import quant_w_per_channel
+
+    base_specs = build_tensor_specs(
+        causal_regression_fixture,
+        short_window_fixture,
+        mixed_topk_fixture,
+        cache_window_replacement_fixture,
+        batch=B,
+    )
+    base = {spec.name: spec.create_tensor() for spec in base_specs if not spec.is_output}
+
+    q_full = torch.rand([GROUP_T_MAX, GLOBAL_H, HEAD_DIM], dtype=torch.bfloat16) - 0.5
+    if causal_regression_fixture:
+        q_full[0].fill_(1.0)
+    q = torch.stack([shard.contiguous() for shard in torch.chunk(q_full, TP_Q_B_SIZE, dim=1)])
+
+    sink_full = torch.zeros([GLOBAL_H], dtype=torch.float32)
+    attn_sink = torch.stack(
+        [shard.contiguous() for shard in torch.chunk(sink_full, TP_ATTN_SINK_SIZE, dim=0)]
+    )
+
+    wo_a_full = (
+        torch.rand([GLOBAL_O_GROUPS, O_LORA, O_GROUP_IN], dtype=torch.bfloat16) - 0.5
+    ) / (O_GROUP_IN ** 0.5)
+    wo_a = torch.stack([shard.contiguous() for shard in torch.chunk(wo_a_full, TP_O_A_SIZE, dim=0)])
+
+    wo_b_full = (
+        (torch.rand([D, GLOBAL_O_GROUPS * O_LORA]) - 0.5)
+        / ((GLOBAL_O_GROUPS * O_LORA) ** 0.5)
+    ).to(torch.bfloat16)
+    wo_b_full_i8, wo_b_scale_one = quant_w_per_channel(wo_b_full)
+    wo_b = torch.stack([shard.contiguous() for shard in torch.chunk(wo_b_full_i8, TP_O_B_SIZE, dim=1)])
+    wo_b_scale = wo_b_scale_one.unsqueeze(0).repeat(TP_O_B_SIZE, 1).contiguous()
+
+    def replicated(name):
+        value = base[name]
+        return value.unsqueeze(0).repeat(TP_SIZE, *([1] * value.ndim)).contiguous()
+
+    ori_kv = replicated("ori_kv")
+    window_swa_indices = replicated("window_swa_indices")
+    cmp_kv = replicated("cmp_kv")
+    cmp_block_table = replicated("cmp_block_table")
+    idx_topk = replicated("idx_topk")
+    position_ids = replicated("position_ids")
+    freqs_cos = replicated("freqs_cos")
+    freqs_sin = replicated("freqs_sin")
+
+    return [
+        TensorSpec("q", [TP_Q_B_SIZE, GROUP_T_MAX, H, HEAD_DIM], torch.bfloat16, init_value=lambda: q),
+        TensorSpec(
+            "ori_kv",
+            [TP_SIZE, ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: ori_kv,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "window_swa_indices",
+            [TP_SIZE, GROUP_T_MAX, WIN],
+            torch.int32,
+            init_value=lambda: window_swa_indices,
+        ),
+        TensorSpec(
+            "cmp_kv",
+            [TP_SIZE, CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM],
+            torch.bfloat16,
+            init_value=lambda: cmp_kv,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "cmp_block_table",
+            [TP_SIZE, B, CMP_MAX_BLOCKS],
+            torch.int32,
+            init_value=lambda: cmp_block_table,
+        ),
+        TensorSpec(
+            "idx_topk",
+            [TP_SIZE, GROUP_T_MAX, INDEXER_SCORE_LEN],
+            torch.int32,
+            init_value=lambda: idx_topk,
+        ),
+        TensorSpec(
+            "position_ids",
+            [TP_SIZE, GROUP_T_MAX, 1],
+            torch.int32,
+            init_value=lambda: position_ids,
+        ),
+        TensorSpec(
+            "attn_sink", [TP_ATTN_SINK_SIZE, ATTN_SINK_H], torch.float32, init_value=lambda: attn_sink
+        ),
+        TensorSpec(
+            "freqs_cos",
+            [TP_SIZE, GROUP_T_MAX, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: freqs_cos,
+        ),
+        TensorSpec(
+            "freqs_sin",
+            [TP_SIZE, GROUP_T_MAX, ROPE_DIM],
+            torch.bfloat16,
+            init_value=lambda: freqs_sin,
+        ),
+        TensorSpec(
+            "wo_a",
+            [TP_O_A_SIZE, O_GROUPS, O_LORA, O_GROUP_IN],
+            torch.bfloat16,
+            init_value=lambda: wo_a,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_b",
+            [TP_O_B_SIZE, D, O_B_LOCAL],
+            torch.int8,
+            init_value=lambda: wo_b,
+            resident="stacked",
+        ),
+        TensorSpec(
+            "wo_b_scale",
+            [TP_O_B_SIZE, D],
+            torch.float32,
+            init_value=lambda: wo_b_scale,
+            resident="stacked",
+        ),
+        TensorSpec("attn_out_local", [TP_O_B_SIZE, SP_T, D], torch.bfloat16, is_output=True),
     ]
 
 
@@ -803,7 +1217,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=None, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-q-b", type=int, default=TP_Q_B_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-attn-sink", type=int, default=TP_ATTN_SINK_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-o-a", type=int, default=TP_O_A_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-o-b", type=int, default=TP_O_B_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)))
     parser.add_argument("-b", "--batch", type=int, default=B,
                         help=f"runtime request count; a multiple of 4 up to {B} (the compile-time "
                              "upper bound). The token axis is pl.dynamic, so one compiled program "
@@ -817,41 +1236,80 @@ if __name__ == "__main__":
     parser.add_argument("--cache-window-replacement-fixture", action="store_true", default=False,
                         help="Place a sentinel row inside the cache window prefix.")
     parser.add_argument("--golden-data", type=str, default=None)
+    parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
+    parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2))
     parser.add_argument("--enable-dep-gen", action="store_true", default=False,
                         help="Capture PTO2 dependency edges (deps.json) for the swimlane converter.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    parsed_tp = (args.tp_q_b, args.tp_attn_sink, args.tp_o_a, args.tp_o_b)
+    resolved_tp = (TP_Q_B_SIZE, TP_ATTN_SINK_SIZE, TP_O_A_SIZE, TP_O_B_SIZE)
+    if parsed_tp != resolved_tp:
+        raise ValueError(f"import-time attention TP {resolved_tp} does not match parsed TP {parsed_tp}")
     if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
         parser.error(f"--batch must be a multiple of 4 in [4, {B}], got {args.batch}")
+    device_ids = [int(device) for device in args.device.split(",")]
+    if len(device_ids) < TP_SIZE:
+        raise ValueError(f"need at least {TP_SIZE} devices, got {device_ids}")
 
     print(f"compress_ratio={COMPRESS_RATIO} -> TOPK={TOPK} SPARSE_BLOCKS={SPARSE_BLOCKS} PADDED_TOPK={PADDED_TOPK}", flush=True)
 
-    result = run_jit(
-        fn=sparse_attn_test,
-        specs=build_tensor_specs(
+    if TP_SIZE == 1:
+        fn = sparse_attn_test
+        specs = build_tensor_specs(
             args.causal_regression_fixture,
             args.short_window_fixture,
             args.mixed_topk_fixture,
             args.cache_window_replacement_fixture,
             batch=args.batch,
-        ),
-        golden_fn=golden_sparse_attn,
-        golden_data=args.golden_data,
-        compile_cfg=dict(dump_passes=args.dump_passes),
-        runtime_cfg=dict(
+        )
+        golden_fn = golden_sparse_attn
+        compile_cfg = dict(dump_passes=args.dump_passes)
+        runtime_cfg = dict(
             platform=args.platform,
-            device_id=args.device,
+            device_id=device_ids[0],
             enable_l2_swimlane=args.enable_l2_swimlane,
             enable_dep_gen=args.enable_dep_gen,
             enable_pmu=args.enable_pmu,
-        ),
+        )
+        compare_fn = {"attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128)}
+    else:
+        if args.batch != B:
+            parser.error(f"distributed TP fixture requires --batch {B}, got {args.batch}")
+        fn = l3_sparse_attn_csa_tp
+        specs = build_tp_tensor_specs(
+            args.causal_regression_fixture,
+            args.short_window_fixture,
+            args.mixed_topk_fixture,
+            args.cache_window_replacement_fixture,
+        )
+        golden_fn = golden_sparse_attn_tp
+        compile_cfg = dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(device_ids=device_ids[:TP_SIZE], num_sub_workers=0),
+        )
+        runtime_cfg = dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+        )
+        compare_fn = {"attn_out_local": ratio_allclose(atol=1e-4, rtol=1.0 / 128)}
+
+    result = run_jit(
+        fn=fn,
+        specs=specs,
+        golden_fn=golden_fn,
+        golden_data=args.golden_data,
+        save_data=args.save_data,
+        runtime_dir=args.runtime_dir,
+        compile_cfg=compile_cfg,
+        runtime_cfg=runtime_cfg,
+        compile_only=args.compile_only,
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            "attn_out": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:

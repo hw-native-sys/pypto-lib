@@ -19,7 +19,6 @@ from rope_interleave import rope_interleave
 from config import (
     FLASH as M,
     DECODE_BATCH,
-    TP,
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
@@ -30,12 +29,12 @@ from config import (
 
 
 # Dynamic shape variables.
-B_DYN = pl.dynamic("B_DYN")
+B_DYN = pl.dynamic("COMPRESSOR_R4_B_DYN")
 S_DYN = pl.dynamic("S_DYN")
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic("COMPRESSOR_R4_T_DYN")  # T = B * S
 
 # model config
-B = DECODE_BATCH // TP
+B = DECODE_BATCH
 S = DECODE_SEQ
 EPS = M.rms_norm_eps
 D = M.hidden_size
@@ -60,7 +59,7 @@ COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("CSA_STATE_BLOCK_NUM_DYN")
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
-CMP_BLOCK_NUM_DYN = pl.dynamic("CMP_BLOCK_NUM_DYN")
+CMP_BLOCK_NUM_DYN = pl.dynamic("COMPRESSOR_R4_CMP_BLOCK_NUM_DYN")
 
 # tiling
 ROPE_TILE = 32
@@ -78,22 +77,22 @@ RMS_PAD_ROWS = RMS_PAD_BLOCKS * RMS_PAD_TILE
 
 @pl.jit.inline
 def compressor_ratio4(
-    x: pl.Tensor[[T_DYN, D], pl.BF16],
-    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.FP32],
-    compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
-    compress_state_block_table: pl.Tensor[[B_DYN, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
+    x: pl.Tensor,
+    kv: pl.Tensor,
+    compress_state: pl.Tensor,
+    compress_state_block_table: pl.Tensor,
     wkv: pl.Tensor[[OUT_DIM, D], pl.BF16],
     wgate: pl.Tensor[[OUT_DIM, D], pl.BF16],
     ape: pl.Tensor[[COMPRESS_RATIO, OUT_DIM], pl.FP32],
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     # Interleave-duplicated (j>>1) cos and sign-folded sin, built once by the caller:
     #   cos[j] = cos_half[j>>1];  sin[j] = sin_half[j>>1] * sign[j], sign = [-1,+1,...]
-    cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
-    cmp_kv_cache: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    position_ids: pl.Tensor[[T_DYN], pl.INT32],
-    cmp_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
-    state_slot_mapping: pl.Tensor[[T_DYN], pl.INT64],
+    cos: pl.Tensor,
+    sin: pl.Tensor,
+    cmp_kv_cache: pl.Tensor,
+    position_ids: pl.Tensor,
+    cmp_slot_mapping: pl.Tensor,
+    state_slot_mapping: pl.Tensor,
     late_dep: pl.Scalar[pl.TASK_ID],
 ):
     b_dim = pl.tensor.dim(compress_state_block_table, 0)

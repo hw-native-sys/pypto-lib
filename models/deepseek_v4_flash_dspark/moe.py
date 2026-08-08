@@ -7,12 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 MoE single-layer (decode), FLASH preset. --ep picks the EP world
-size: 2/4/8/16 run N-rank distributed; each rank keeps 16 experts."""
+"""DeepSeek-V4 MoE single-layer (decode), with EP routed experts and SP+TP shared experts."""
 
 
-# Sub-kernels freeze EP / n_routed_experts into their shapes at import
-# time, so read --ep from argv and override config before importing them below.
+# Sub-kernels freeze distributed sizes into their shapes at import time, so
+# override the EP and shared-expert TP config before importing them below.
 import dataclasses
 import sys
 
@@ -20,6 +19,8 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
+_TP_CHOICES = (2, 4, 8)
+_TP_DEFAULT = 2
 
 
 def _parse_ep_argv():
@@ -31,8 +32,32 @@ def _parse_ep_argv():
     return _EP_DEFAULT
 
 
+def _parse_tp_argv():
+    for name in ("--tp-shared-expert", "--tp"):
+        for i, tok in enumerate(sys.argv):
+            if tok == name and i + 1 < len(sys.argv):
+                return int(sys.argv[i + 1])
+            if tok.startswith(f"{name}="):
+                return int(tok.split("=", 1)[1])
+    return _TP_DEFAULT
+
+
 EP = _parse_ep_argv()
+TP_SIZE = _parse_tp_argv()
+if EP not in _EP_CHOICES:
+    raise ValueError(f"--ep must be one of {_EP_CHOICES}, got {EP}")
+if TP_SIZE not in _TP_CHOICES:
+    raise ValueError(f"--tp-shared-expert must be one of {_TP_CHOICES}, got {TP_SIZE}")
+if EP % TP_SIZE != 0:
+    raise ValueError(f"--ep must be divisible by --tp-shared-expert, got ep={EP}, tp={TP_SIZE}")
+if config.DECODE_TOKENS % TP_SIZE != 0:
+    raise ValueError(
+        f"decode tokens must be divisible by --tp-shared-expert, "
+        f"got {config.DECODE_TOKENS} and {TP_SIZE}"
+    )
 config.EP = EP
+config.TP_SHARED_EXPERT = TP_SIZE
+config.MOE_TOKENS = config.DECODE_TOKENS // TP_SIZE
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
@@ -44,11 +69,12 @@ from config import FLASH as M, MOE_TOKENS, RECV_MAX
 from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
-from expert_shared import expert_shared
 from expert_routed import expert_routed
+from expert_shared_tp import LOCAL_INTER, SP_T, expert_shared_sp_tp
 
 
 T = MOE_TOKENS
+GROUP_T = config.DECODE_TOKENS
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
@@ -73,9 +99,12 @@ AUX_W = 1
 IDX_PAD = 8  # INT32 route tile width; route rides a separate window from scale/w
              # (an FP32 tile can't hold it: INDEX->FP32 casts are unsupported).
 
-assert N_RANKS in _EP_CHOICES, f"--ep must be one of {_EP_CHOICES} (got {N_RANKS})"
-assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
-assert RECV_MAX == N_RANKS * MAX_PER_SRC
+if N_EXPERTS_GLOBAL != N_RANKS * N_LOCAL:
+    raise ValueError("global expert count must match the EP rank layout")
+if RECV_MAX != N_RANKS * MAX_PER_SRC:
+    raise ValueError("receive capacity must cover one token shard from every rank")
+if T != SP_T:
+    raise ValueError("MoE token rows must match the shared-expert SP shard")
 
 
 @pl.jit.inline
@@ -419,11 +448,11 @@ def moe(
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
@@ -436,11 +465,16 @@ def moe(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    gather_x_window: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+    gather_scale_window: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+    scatter_window: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    # 1-based MoE call id for the shared flag windows (distinct from layer_id).
+    # 1-based MoE call id for the reused routed-expert signals.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     # Non-output intermediates allocate locally, in their producer's scope.
@@ -463,11 +497,13 @@ def moe(
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared(
+    expert_shared_sp_tp(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
         sh,
+        gather_x_window, gather_scale_window, scatter_window,
+        gather_signal, scatter_signal, my_rank,
     )
 
     recv_x_out = pl.create_tensor([N_LOCAL, RECV_MAX, D], dtype=pl.INT8)
@@ -522,11 +558,11 @@ def moe_test(
     routed_w3_scale: pl.Tensor[[N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # final output
     x_next: pl.Out[pl.Tensor[[T, HC_MULT, D], pl.FP32]],
@@ -539,11 +575,16 @@ def moe_test(
     data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
     combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    gather_x_window: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+    gather_scale_window: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+    scatter_window: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     # scalars last: runtime TaskArgs forbids a tensor arg after a scalar arg.
     layer_id: pl.Scalar[pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    # 1-based MoE call id; multi-layer callers increment it per reused window.
+    # Multi-layer callers increment this for each routed-expert signal reuse.
     moe_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[T, HC_MULT, D], pl.FP32]:
     moe(
@@ -556,6 +597,8 @@ def moe_test(
         x_next,
         recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
         routed_y_buf, combine_arrived,
+        gather_x_window, gather_scale_window, scatter_window,
+        gather_signal, scatter_signal,
         layer_id, num_tokens, my_rank, moe_epoch,
     )
     clear_moe_signals(x_next, arrived, data_arrived, combine_arrived)
@@ -579,11 +622,11 @@ def l3_moe(
     routed_w3_scale: pl.Tensor[[N_RANKS, N_LOCAL, MOE_INTER], pl.FP32],
     routed_w2: pl.Tensor[[N_RANKS, N_LOCAL, D, MOE_INTER], pl.INT8],
     routed_w2_scale: pl.Tensor[[N_RANKS, N_LOCAL, D], pl.FP32],
-    shared_w1: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w1_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w3: pl.Tensor[[N_RANKS, MOE_INTER, D], pl.INT8],
-    shared_w3_scale: pl.Tensor[[N_RANKS, MOE_INTER], pl.FP32],
-    shared_w2: pl.Tensor[[N_RANKS, D, MOE_INTER], pl.INT8],
+    shared_w1: pl.Tensor[[N_RANKS, LOCAL_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[N_RANKS, LOCAL_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[N_RANKS, LOCAL_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[N_RANKS, LOCAL_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[N_RANKS, D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[N_RANKS, D], pl.FP32],
     x_next: pl.Out[pl.Tensor[[N_RANKS, T, HC_MULT, D], pl.FP32]],
     layer_id: pl.Scalar[pl.INT32],
@@ -597,6 +640,11 @@ def l3_moe(
     data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
     routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
     combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    gather_x_window_buf = pld.alloc_window_buffer([GROUP_T, D], dtype=pl.INT8)
+    gather_scale_window_buf = pld.alloc_window_buffer([GROUP_T, 1], dtype=pl.FP32)
+    scatter_window_buf = pld.alloc_window_buffer([GROUP_T, D], dtype=pl.FP32)
+    gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+    scatter_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
     for r in pl.range(pld.world_size()):
         recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
@@ -607,6 +655,11 @@ def l3_moe(
         data_arrived = pld.window(data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
         routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
         combine_arrived = pld.window(combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        gather_x_window = pld.window(gather_x_window_buf, [GROUP_T, D], dtype=pl.INT8)
+        gather_scale_window = pld.window(gather_scale_window_buf, [GROUP_T, 1], dtype=pl.FP32)
+        scatter_window = pld.window(scatter_window_buf, [GROUP_T, D], dtype=pl.FP32)
+        gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
+        scatter_signal = pld.window(scatter_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         moe_test(
             x_hc[r], hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
@@ -617,6 +670,8 @@ def l3_moe(
             x_next[r],
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
+            gather_x_window, gather_scale_window, scatter_window,
+            gather_signal, scatter_signal,
             layer_id, num_tokens, r, pl.const(1, pl.INT32),
             device=r,
         )
@@ -624,26 +679,24 @@ def l3_moe(
 
 # === Golden + test ==========================================================
 def golden_moe(tensors):
-    """Per-rank torch reference. Replays the 4 stages on host. Each rank's
-    output depends only on its own inputs because the dispatch+combine round-
-    trip is r_route-keyed and shape-preserving (test_l3 pattern).
+    """Torch reference for EP routing and SP+TP shared-expert groups.
 
     The per-route result is invariant to the packing layout (each recv row's
     SwiGLU output depends only on that row's own input), so this src-major host
     packing matches the device's per-source-lane cumsum layout by construction."""
     import torch
+    import torch.nn.functional as F
 
     from hc_pre import golden_hc_pre
     from hc_post import golden_hc_post
     from gate import golden_gate_core
-    from expert_shared import golden_expert_shared
     from expert_routed import golden_expert_routed
+    from utils import int8_quant_per_row
 
     x_next_out = torch.zeros(N_RANKS, T, HC_MULT, D, dtype=torch.float32)
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    # Stages 1-2: hc_pre + gate per rank. Rank-independent, so compute once and
-    # reuse for both the dispatch replay and each rank's local stages.
+    # Stages 1-2: hc_pre + gate once per rank, reused by both expert paths.
     all_post = []
     all_comb = []
     all_indices = []
@@ -687,6 +740,38 @@ def golden_moe(tensors):
         all_x_i8.append(src_x_norm_i8)
         all_scale.append(src_x_norm_scale)
         all_weights.append(src_weights)
+
+    # Shared-expert SP+TP: gather each TP group's token shards, compute one
+    # rank-local intermediate shard at a time, then reduce and scatter the
+    # contiguous token slices back to their owners in tp-rank order.
+    all_sh = [None] * N_RANKS
+    for group_base in range(0, N_RANKS, TP_SIZE):
+        group_end = group_base + TP_SIZE
+        group_x_i8 = torch.cat(all_x_i8[group_base:group_end], dim=0)
+        group_scale = torch.cat(all_scale[group_base:group_end], dim=0)
+        group_x = group_x_i8.float() * group_scale.float()
+        partials = []
+        for rank in range(group_base, group_end):
+            w1_scale = tensors["shared_w1_scale"][rank].float().unsqueeze(-1)
+            w3_scale = tensors["shared_w3_scale"][rank].float().unsqueeze(-1)
+            w2_scale = tensors["shared_w2_scale"][rank].float().unsqueeze(-1)
+            w1 = tensors["shared_w1"][rank].float() * w1_scale
+            w3 = tensors["shared_w3"][rank].float() * w3_scale
+            w2 = tensors["shared_w2"][rank].float() * w2_scale
+            gate_out = group_x @ w1.T
+            up_out = group_x @ w3.T
+            if M.swiglu_limit > 0:
+                gate_out = gate_out.clamp(max=M.swiglu_limit)
+                up_out = up_out.clamp(-M.swiglu_limit, M.swiglu_limit)
+            local_h = F.silu(gate_out) * up_out
+            local_h_i8, local_h_scale = int8_quant_per_row(local_h)
+            local_h = local_h_i8.float() * local_h_scale
+            partials.append(local_h @ w2.T)
+        group_sh = torch.stack(partials).sum(dim=0).to(torch.bfloat16)
+        for tp_rank in range(TP_SIZE):
+            rank = group_base + tp_rank
+            row_start = tp_rank * T
+            all_sh[rank] = group_sh[row_start : row_start + T]
 
     # Route counts per (src, dst, local expert); drives the per-source lane cumsum.
     send_counts = torch.zeros(N_RANKS, N_RANKS, N_LOCAL, dtype=torch.int32)
@@ -743,25 +828,11 @@ def golden_moe(tensors):
         dst_recv_y[dst] = d_recv_y
 
     for r in range(N_RANKS):
-        x_norm_i8 = all_x_i8[r]
-        x_norm_scale = all_scale[r]
         post_t = all_post[r]
         comb_t = all_comb[r]
 
-        # Stage 3: expert_shared (local)
-        sh = torch.zeros(T, D, dtype=torch.bfloat16)
-        golden_expert_shared({
-            "x_local_i8":       x_norm_i8,
-            "x_local_scale_dq": x_norm_scale,
-            "num_tokens":       tensors["num_tokens"],
-            "shared_w1":        tensors["shared_w1"][r],
-            "shared_w1_scale":  tensors["shared_w1_scale"][r],
-            "shared_w3":        tensors["shared_w3"][r],
-            "shared_w3_scale":  tensors["shared_w3_scale"][r],
-            "shared_w2":        tensors["shared_w2"][r],
-            "shared_w2_scale":  tensors["shared_w2_scale"][r],
-            "sh":               sh,
-        })
+        # Stage 3: shared-expert group result reduced and scattered to this rank.
+        sh = all_sh[r]
 
         # Stage 6: combine — for each (src, t, k) that originated on this
         # rank, find the (loc_e, slot) on rank dst where the SwiGLU result
@@ -819,8 +890,8 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     ROUTED_DEQUANT_STD = {"w1": 1.08e-2, "w2": 2.54e-2, "w3": 1.10e-2}
     SHARED_DEQUANT_STD = {"w1": 7.65e-3, "w2": 2.39e-2, "w3": 7.39e-3}
 
-    # Shared (replicated) weights are broadcast across ranks; the routed
-    # weights are per-rank shards.
+    # Shared weights are sharded inside each TP group and replicated across groups;
+    # routed weights are per-rank shards.
     def init_x_hc():
         return torch.randn(N_RANKS, T, HC_MULT, D)
 
@@ -880,10 +951,11 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         return torch.randint(0, VOCAB, (N_RANKS, T), dtype=torch.int64)
 
     if balanced_routing:
-        assert layer_id < M.num_hash_layers, "balanced routing requires a hash-routing layer"
+        if layer_id >= M.num_hash_layers:
+            raise ValueError("balanced routing requires a hash-routing layer")
         active_routes = N_RANKS * max(0, min(T, num_tokens)) * TOPK
-        assert active_routes % N_EXPERTS_GLOBAL == 0, \
-            "balanced routing requires the active route count to divide evenly across experts"
+        if active_routes % N_EXPERTS_GLOBAL != 0:
+            raise ValueError("balanced routing requires the active route count to divide evenly across experts")
 
     # Per-rank routed expert weights (different shards).
     routed_w1_i8_list = []
@@ -910,16 +982,19 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
     rw2_i8 = torch.stack(routed_w2_i8_list)
     rw2_s = torch.stack(routed_w2_s_list)
 
-    # Shared expert weights — replicated across ranks.
+    # Shared expert weights are sharded over the intermediate axis, then the TP
+    # shard sequence is repeated for every contiguous TP group.
     sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
     sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
     sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
-    sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw3_s = sw3_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+    group_count = N_RANKS // TP_SIZE
+    sw1_i8 = sw1_i8.reshape(TP_SIZE, LOCAL_INTER, D).repeat(group_count, 1, 1).contiguous()
+    sw1_s = sw1_s.reshape(TP_SIZE, LOCAL_INTER).repeat(group_count, 1).contiguous()
+    sw3_i8 = sw3_i8.reshape(TP_SIZE, LOCAL_INTER, D).repeat(group_count, 1, 1).contiguous()
+    sw3_s = sw3_s.reshape(TP_SIZE, LOCAL_INTER).repeat(group_count, 1).contiguous()
+    sw2_i8 = torch.stack([chunk.contiguous() for chunk in torch.chunk(sw2_i8, TP_SIZE, dim=1)])
+    sw2_i8 = sw2_i8.repeat(group_count, 1, 1).contiguous()
+    sw2_s = sw2_s.unsqueeze(0).repeat(N_RANKS, 1).contiguous()
 
     specs = [
         TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.float32, init_value=init_x_hc),
@@ -937,11 +1012,11 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         TensorSpec("routed_w3_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: rw3_s),
         TensorSpec("routed_w2",        [N_RANKS, N_LOCAL, D, MOE_INTER], torch.int8,    init_value=lambda: rw2_i8),
         TensorSpec("routed_w2_scale",  [N_RANKS, N_LOCAL, D],            torch.float32, init_value=lambda: rw2_s),
-        TensorSpec("shared_w1",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw1_i8),
-        TensorSpec("shared_w1_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw1_s),
-        TensorSpec("shared_w3",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw3_i8),
-        TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
-        TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
+        TensorSpec("shared_w1",        [N_RANKS, LOCAL_INTER, D],        torch.int8,    init_value=lambda: sw1_i8),
+        TensorSpec("shared_w1_scale",  [N_RANKS, LOCAL_INTER],           torch.float32, init_value=lambda: sw1_s),
+        TensorSpec("shared_w3",        [N_RANKS, LOCAL_INTER, D],        torch.int8,    init_value=lambda: sw3_i8),
+        TensorSpec("shared_w3_scale",  [N_RANKS, LOCAL_INTER],           torch.float32, init_value=lambda: sw3_s),
+        TensorSpec("shared_w2",        [N_RANKS, D, LOCAL_INTER],        torch.int8,    init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
         TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
@@ -981,6 +1056,11 @@ if __name__ == "__main__":
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
+    parser.add_argument(
+        "--tp-shared-expert", "--tp", dest="tp", type=int,
+        default=_TP_DEFAULT, choices=list(_TP_CHOICES),
+        help="shared-expert TP size within each contiguous EP rank group",
+    )
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
     parser.add_argument("--layer-id", type=int, default=0)
@@ -1000,8 +1080,12 @@ if __name__ == "__main__":
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
 
+    if args.ep != EP or args.tp != TP_SIZE:
+        configured = f"import-time ep/tp={EP}/{TP_SIZE}, parsed ep/tp={args.ep}/{args.tp}"
+        raise ValueError(f"distributed sizes changed after sub-kernel import: {configured}")
     device_ids = [int(d) for d in args.device.split(",")]
-    assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
+    if len(device_ids) != N_RANKS:
+        raise ValueError(f"need exactly {N_RANKS} devices, got {device_ids}")
 
     golden_data = args.golden_data
 
