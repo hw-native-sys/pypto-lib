@@ -552,6 +552,15 @@ runs:
         # message ("no matching distribution for packaging") under a wall of
         # version lists. pyproject already requires >=0.10.0.
         pip install 'scikit-build-core>=0.10' nanobind cmake ninja
+        # torch BEFORE pypto is built. pypto declares torch>=2.0.0, and if it is
+        # not installed yet pip resolves that from the default index, where the
+        # aarch64 wheel now drags ~1.5 GB of CUDA onto an Ascend host. Under
+        # conda this never showed: the base env already carried a torch, which
+        # turned out to be the only thing pinning it.
+        if ! pip install torch --index-url https://download.pytorch.org/whl/cpu; then
+          echo "note: download.pytorch.org unreachable — falling back to a pinned torch"
+          pip install 'torch==2.6.0'
+        fi
         # The from-source pypto / simpler builds compile native code (libbacktrace
         # et al.) with conda's compiler_compat toolchain, which intermittently
         # fails to configure on this host ("C compiler cannot create executables").
@@ -581,14 +590,7 @@ runs:
       run: |
         source activate.sh
         pip install nanobind
-        # Explicitly the CPU build: these are Ascend hosts, and an unpinned
-        # `pip install torch` now resolves to a version whose aarch64 wheel
-        # pulls ~1.5 GB of CUDA. Under conda this was masked by the base env
-        # already carrying a torch -- the only thing that was pinning it.
-        if ! pip install torch --index-url https://download.pytorch.org/whl/cpu; then
-          echo "note: download.pytorch.org unreachable — falling back to a pinned torch"
-          pip install 'torch==2.6.0'
-        fi
+        # torch is installed in the build step above, before pypto is resolved.
 
     - name: Show ccache stats (after)
       shell: bash
