@@ -245,7 +245,7 @@ DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per s
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs
-PREFILL_SEQ = 128                 # S: prefill sequence for the current kernel programs
+PREFILL_SEQ = 512                 # S: prefill sequence for the current kernel programs
 PREFILL_TOKENS = PREFILL_BATCH * PREFILL_SEQ
 
 # Paging constants

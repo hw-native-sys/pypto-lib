@@ -57,11 +57,12 @@ B = PREFILL_BATCH
 S = PREFILL_SEQ
 T = B * S
 START_POS = 0
-# Scored compressed positions per token. Past this cap the visible set is clamped
-# and the tail is dropped, with no compile or runtime diagnostic.
-# The physical pool is sized by IDX_CACHE_BLOCK_NUM.
-INDEXER_SCORE_MAX_BLOCKS = 2
-INDEXER_SCORE_CAP = INDEXER_SCORE_MAX_BLOCKS * BLOCK_SIZE
+# Scored compressed positions per token: this chunk plus one chunk of history, so
+# a --start-pos up to T still sees its compressed rows. Past the cap the visible
+# set is clamped and the tail dropped, with no compile or runtime diagnostic --
+# prefill_csa asserts the reach against its start_pos. The physical pool is sized
+# by IDX_CACHE_BLOCK_NUM.
+INDEXER_SCORE_CAP = 2 * max(1, T // COMPRESS_RATIO)
 INDEXER_TOPK_CAP = min(IDX_TOPK, INDEXER_SCORE_CAP)
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 # CP selector widths.

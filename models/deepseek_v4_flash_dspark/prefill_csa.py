@@ -578,6 +578,13 @@ def build_tensor_specs(
     if max_position >= MAX_SEQ_LEN:
         raise ValueError(f"position id {max_position} exceeds MAX_SEQ_LEN={MAX_SEQ_LEN}")
     max_visible_cmp = (context_len + q_len) // COMPRESS_RATIO
+    # The indexer clamps past its score cap and drops the tail without a runtime
+    # diagnostic, so refuse the run rather than return plausible wrong values.
+    if max_visible_cmp > INDEXER_SCORE_CAP:
+        raise ValueError(
+            f"needs {max_visible_cmp} scored compressed positions; the indexer score "
+            f"cap is {INDEXER_SCORE_CAP} and the tail past it is silently dropped"
+        )
     max_sparse_rows = WIN + max_visible_cmp
     if max_sparse_rows > SPARSE_PREFILL_SPARSE_PAD:
         raise ValueError(
