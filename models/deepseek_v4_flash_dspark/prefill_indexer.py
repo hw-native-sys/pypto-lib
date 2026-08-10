@@ -856,17 +856,16 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             if row >= 0:
                 flat[row] = (torch.rand(INNER_COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
-    # Calibrated to the real DeepSeek-V4-Flash indexer inner compressor (mean l8/l32 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean (not ones / not uniform). Mirrors decode_indexer.
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the CSA inner / indexer compressor). Mirrors decode_indexer.
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
     def init_inner_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(INNER_HEAD_DIM)
     # C8 historical index cache: completed compressed slots hold INT8 + a per-position dequant scale.
     # Build both from one bf16-rounded random draw so cache and scale stay consistent.
     _idx_hist = {}
@@ -926,8 +925,8 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
             mapping[t] = state_row(start_pos + t)
         return mapping
     def init_weights_proj():
-        # weights_proj calibrated to the real DeepSeek-V4-Flash indexer weights projection.
-        return torch.randn(D, IDX_N_HEADS) * 0.2313
+        # weights_proj std, averaged over DeepSeek-V4-Flash-0731 layers 8/32.
+        return torch.randn(D, IDX_N_HEADS) * 0.2218
     def init_cos():
         return materialize_half_rope_tables(shared_freqs_cos, shared_freqs_sin, init_position_ids().to(torch.int64))[0]
     def init_sin():

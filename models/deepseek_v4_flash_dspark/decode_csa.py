@@ -624,21 +624,20 @@ def build_tensor_specs(start_pos=None, batch=B):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
-    # Compressor/indexer fixtures calibrated to the real DeepSeek-V4-Flash CSA layers
-    # (mean l8/l32 of extract_weights_flash). The BF16 weights are clean zero-mean Gaussian
-    # (no quant grid), so randn x measured-std is in-distribution; the RMSNorm gammas center
-    # near a measured mean (not ones); idx_wq_b is the only quantized one (see below).
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 8/32 (the CSA main and inner compressors). idx_wq_b is the only quantized
+    # one and goes through the MXFP8 grid below, not a randn INT8.
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0245
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
 
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0388
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0381
 
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1226
 
     def init_cmp_norm_w():
-        return 0.9666 + 0.1929 * torch.randn(HEAD_DIM)
+        return 0.9569 + 0.1916 * torch.randn(HEAD_DIM)
 
     def init_compress_state():
         state = torch.zeros(MAIN_STATE_BLOCK_NUM, MAIN_STATE_BLOCK_SIZE, MAIN_STATE_DIM)
@@ -662,7 +661,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         )
 
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) * 0.2313
+        return torch.randn(D, IDX_N_HEADS) * 0.2218
 
     def init_hadamard_idx():
         h = torch.ones((1, 1))
@@ -674,16 +673,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         return h / (IDX_HEAD_DIM ** 0.5)
 
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
 
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
 
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
 
     def init_inner_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(IDX_HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(IDX_HEAD_DIM)
 
     def init_inner_compress_state():
         state = torch.zeros(INNER_STATE_BLOCK_NUM, INNER_STATE_BLOCK_SIZE, INNER_STATE_DIM)

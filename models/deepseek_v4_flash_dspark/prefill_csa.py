@@ -656,13 +656,13 @@ def build_tensor_specs(
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_csa / decode_compressor_ratio4.
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0245
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0388
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0381
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1243
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.1226
     def init_cmp_norm_w():
-        return 0.9666 + torch.randn(HEAD_DIM,) * 0.1929
+        return 0.9569 + torch.randn(HEAD_DIM,) * 0.1916
     state_table = _state_block_table(CSA_STATE_MAX_BLOCKS, CSA_STATE_PHYSICAL_BLOCKS)
     def init_compress_state_block_table():
         return state_table.clone()
@@ -689,13 +689,13 @@ def build_tensor_specs(
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_csa / decode_indexer.
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
     def init_inner_norm_w():
-        return 0.6850 + torch.randn(IDX_HEAD_DIM,) * 0.2610
+        return 0.6903 + torch.randn(IDX_HEAD_DIM,) * 0.2663
     inner_state_table = _state_block_table(
         INNER_STATE_MAX_BLOCKS,
         CSA_INNER_STATE_PHYSICAL_BLOCKS,
@@ -857,7 +857,7 @@ def build_tensor_specs(
         TensorSpec("hadamard_idx", [IDX_HEAD_DIM, IDX_HEAD_DIM], torch.bfloat16, init_value=init_hadamard_idx),
         TensorSpec("idx_wq_b", [Q_LORA, IDX_N_HEADS * IDX_HEAD_DIM], torch.int8, init_value=lambda: idx_wq_b_i8),
         TensorSpec("idx_wq_b_scale", [IDX_N_HEADS * IDX_HEAD_DIM], torch.float32, init_value=lambda: idx_wq_b_scale),
-        TensorSpec("idx_weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: (torch.randn(D, IDX_N_HEADS) * 0.2313).to(torch.bfloat16)),
+        TensorSpec("idx_weights_proj", [D, IDX_N_HEADS], torch.bfloat16, init_value=lambda: (torch.randn(D, IDX_N_HEADS) * 0.2218).to(torch.bfloat16)),
         TensorSpec("inner_wkv", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [INNER_OUT_DIM, D], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),

@@ -765,20 +765,21 @@ def build_tensor_specs(B, S):
 
     T = B * S
 
+    # hc_fn / hc_scale / hc_base copied from DeepSeek-V4-Flash-0731 layer 8.
     def init_x():
         return torch.randn(T, HC_MULT, D) * 0.05
     def init_hc_fn():
-        return torch.randn(MIX_HC, HC_DIM) * 0.0519
+        return torch.randn(MIX_HC, HC_DIM) * 0.0509
     def init_hc_scale():
-        return torch.tensor([0.076099, 0.032597, 0.226994])
+        return torch.tensor([0.075997, 0.032345, 0.226238])
     def init_hc_base():
         return torch.tensor([
-            5.9166, -3.6223, -2.9324, -3.3124,
-            -3.9100, -0.9384, -3.3256, -2.5240,
-            2.0706, -2.5728, 0.1424, -3.9453,
-            -3.8859, 3.4634, -3.3799, -2.6077,
-            -2.7191, -2.4846, 2.0395, -0.5010,
-            -3.5992, -2.7520, -3.3493, 3.1587,
+            5.9169, -3.6226, -2.9309, -3.3122,
+            -3.9082, -0.9381, -3.3257, -2.5300,
+            2.0703, -2.5724, 0.1430, -3.9461,
+            -3.8868, 3.4623, -3.3815, -2.6056,
+            -2.7185, -2.4849, 2.0391, -0.4999,
+            -3.5994, -2.7508, -3.3496, 3.1573,
         ])
 
     return [

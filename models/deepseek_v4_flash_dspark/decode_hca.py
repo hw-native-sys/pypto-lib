@@ -548,17 +548,16 @@ def build_tensor_specs(start_pos=None, batch=B):
         denom = cache.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(EPS)
         return (cache / denom).to(torch.bfloat16)
 
-    # Main compressor fixtures calibrated to the real DeepSeek-V4-Flash HCA layers
-    # (mean l7/l9 of extract_weights_flash): clean zero-mean Gaussian BF16 weights at the
-    # measured std; the RMSNorm gamma centers near a measured mean (not ones).
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 7/9 (the ratio-128 HCA main compressor).
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0246
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0316
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0309
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0340
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0332
     def init_cmp_norm_w():
-        return 0.1001 + 0.0549 * torch.randn(HEAD_DIM)
+        return 0.0982 + 0.0539 * torch.randn(HEAD_DIM)
     def init_compress_state():
         return torch.zeros(COMPRESS_STATE_BLOCK_NUM, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM)
     def init_compress_state_block_table():

@@ -624,11 +624,10 @@ def build_tensor_specs(start_pos=None, batch=B):
         return torch.rand(batch * S, D)
     def init_qr():
         return torch.rand(tokens, Q_LORA)
-    # weights_proj / inner compressor calibrated to the real DeepSeek-V4-Flash CSA indexer
-    # (mean l8/l32 of extract_weights_flash): zero-mean Gaussian at the measured std, gamma
-    # near the measured mean. idx wq_b uses the MXFP8 grid below (not a benign randn INT8).
+    # weights_proj / inner-compressor BF16 weight std and RMSNorm gamma mean/std, averaged
+    # over DeepSeek-V4-Flash-0731 layers 8/32. idx wq_b uses the MXFP8 grid below.
     def init_weights_proj():
-        return torch.randn(D, IDX_N_HEADS) * 0.2313
+        return torch.randn(D, IDX_N_HEADS) * 0.2218
     def init_rope_positions():
         return init_position_ids().to(torch.int64)[:, 0]
     def init_cos():
@@ -648,13 +647,13 @@ def build_tensor_specs(start_pos=None, batch=B):
             physical_blocks=INNER_STATE_PHYSICAL_BLOCKS,
         )
     def init_inner_wkv():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0293
+        return torch.randn(INNER_OUT_DIM, D) * 0.0270
     def init_inner_wgate():
-        return torch.randn(INNER_OUT_DIM, D) * 0.0512
+        return torch.randn(INNER_OUT_DIM, D) * 0.0513
     def init_inner_ape():
-        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1528
+        return torch.randn(COMPRESS_RATIO, INNER_OUT_DIM) * 0.1524
     def init_inner_norm_w():
-        return 0.6850 + 0.2610 * torch.randn(INNER_HEAD_DIM)
+        return 0.6903 + 0.2663 * torch.randn(INNER_HEAD_DIM)
     def init_idx_block_table():
         return block_table(
             batch=batch,

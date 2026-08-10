@@ -499,13 +499,13 @@ def build_tensor_specs(start_pos: int = START_POS, num_tokens: int = T):
     # Quant-faithful HCA (ratio-128) main compressor fixtures (mean l7/l9 of extract_weights_flash):
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     def init_cmp_wkv():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0246
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0240
     def init_cmp_wgate():
-        return torch.randn(MAIN_OUT_DIM, D) * 0.0316
+        return torch.randn(MAIN_OUT_DIM, D) * 0.0309
     def init_cmp_ape():
-        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0340
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0332
     def init_cmp_norm_w():
-        return 0.1001 + torch.randn(HEAD_DIM,) * 0.0549
+        return 0.0982 + torch.randn(HEAD_DIM,) * 0.0539
     state_table = _state_block_table(HCA_STATE_MAX_BLOCKS, HCA_STATE_PHYSICAL_BLOCKS)
     def init_compress_state_block_table():
         return state_table.clone()

@@ -394,17 +394,16 @@ def build_tensor_specs(start_pos: int = START_POS):
             if row >= 0:
                 state.view(-1, COMPRESS_STATE_DIM)[row] = (torch.rand(COMPRESS_STATE_DIM) - 0.5) * 0.05
         return state
-    # Calibrated to the real DeepSeek-V4-Flash HCA (ratio-128) main compressor (mean l7/l9 of
-    # extract_weights_flash): zero-mean Gaussian BF16 weights at the measured std; the RMSNorm
-    # gamma centers near the measured mean.
+    # BF16 weight std and RMSNorm gamma mean/std, averaged over DeepSeek-V4-Flash-0731
+    # layers 7/9 (the ratio-128 HCA main compressor).
     def init_wkv():
-        return torch.randn(OUT_DIM, D) * 0.0246
+        return torch.randn(OUT_DIM, D) * 0.0240
     def init_wgate():
-        return torch.randn(OUT_DIM, D) * 0.0316
+        return torch.randn(OUT_DIM, D) * 0.0309
     def init_ape():
-        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.0340
+        return torch.randn(COMPRESS_RATIO, OUT_DIM) * 0.0332
     def init_norm_w():
-        return 0.1001 + 0.0549 * torch.randn(HEAD_DIM)
+        return 0.0982 + 0.0539 * torch.randn(HEAD_DIM)
     def init_freqs_cos():
         return shared_freqs_cos.clone()
     def init_freqs_sin():
