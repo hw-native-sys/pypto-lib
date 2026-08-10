@@ -110,7 +110,7 @@ assert T % BIAS_T_TILE == 0
 
 
 @pl.jit.inline
-def sparse_attn_csa(
+def sparse_attn_csa_heads(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -121,12 +121,13 @@ def sparse_attn_csa(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Run sparse decode attention, inverse RoPE, and grouped output projection."""
+    o_packed_heads: pl.Tensor,
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write CSA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
+
+    Only the first runtime ``t_dim`` rows in each group are valid. The
+    returned task ID covers every write to the packed output tensor.
+    """
     # Compressed index contract: -1 invalid, [0, ...) compressed KV slots.
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     t_dim = pl.tensor.dim(q, 0)
@@ -135,8 +136,6 @@ def sparse_attn_csa(
     t_hblocks = t_dim * (H // H_TILE)
     qk_items = t_dim * SPARSE_BLOCKS
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
-    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
-    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
 
     # WAR marker (pypto-lib#481): a scalar-driven gather_row does not mark ori_kv
@@ -371,9 +370,7 @@ def sparse_attn_csa(
 
     # Online-softmax merge across sparse-K tiles, sink-norm, then fused inverse RoPE,
     # one spmd block per (token, head-tile). The rotated rope segment is packed
-    # straight into o_packed's rope columns. with-form spmd so merge_tid can be an
-    # explicit dep of the manual-scope proj_a tasks below.
-    o_packed = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+    # straight into the group-major output.
     with pl.spmd(t_hblocks, name_hint="merge_norm") as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
@@ -406,7 +403,7 @@ def sparse_attn_csa(
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
         # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
         # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
-        # o_packed's rope columns.
+        # the group-major output.
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
@@ -419,8 +416,25 @@ def sparse_attn_csa(
             n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T_PAD + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # one HEAD_DIM-wide store per head row instead of two: concat the nope and
-            # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
+            # inverse-RoPE halves on chip so o_packed_heads takes a single contiguous write.
+            o_packed_heads[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
+
+    return o_packed_heads, merge_tid
+
+
+@pl.jit.inline
+def sparse_attn_csa_local_o_proj(
+    o_packed: pl.Tensor,
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project local-token, full-group CSA heads into BF16 hidden rows."""
+    t_dim = pl.tensor.dim(attn_out, 0)
+    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
+    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
 
     # Back-to-back grouped output projection: proj_a[g] -> quant[g] -> proj_b[g]
     # pipelines per group, because the PER-GROUP amax keeps the quant reduction
@@ -441,7 +455,7 @@ def sparse_attn_csa(
             row_base_o = g * T_PAD
             out_col_g = g * O_LORA
 
-            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[merge_tid],
+            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // PA_N_FRAGS  # row block outermost
@@ -532,6 +546,42 @@ def sparse_attn_csa(
             attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
 
     return attn_out
+
+
+@pl.jit.inline
+def sparse_attn_csa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    idx_topk: pl.Tensor[[T_DYN, INDEXER_SCORE_LEN], pl.INT32],
+    position_ids: pl.Tensor[[T_DYN, 1], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Compute CSA sparse attention and the grouped output projection."""
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_csa_heads(
+        q,
+        ori_kv, window_swa_indices,
+        cmp_kv, cmp_block_table, idx_topk,
+        position_ids, attn_sink,
+        freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+    attn_out = sparse_attn_csa_local_o_proj(
+        o_packed_heads,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
+    )
+    return attn_out
+
 
 @pl.jit
 def sparse_attn_test(
