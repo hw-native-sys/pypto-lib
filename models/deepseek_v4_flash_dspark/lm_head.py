@@ -63,7 +63,8 @@ DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
 # Rows. logit_row_indices picks the sources; unused rows stay zero. A decode step
-# samples every one of its DECODE_TOKENS rows (B requests x S verified tokens).
+# samples every one of its DECODE_TOKENS rows (B requests x S target-model
+# token positions: one committed token plus DSPARK_SPEC_TOKENS drafts).
 MAX_LOGIT_ROWS = DECODE_TOKENS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS

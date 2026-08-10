@@ -19,10 +19,10 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
-    PREFILL_CMP_BLOCK_NUM,
-    PREFILL_CMP_MAX_BLOCKS,
-    PREFILL_ORI_BLOCK_NUM,
-    PREFILL_ORI_MAX_BLOCKS,
+    KV_CMP_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_BLOCK_NUM,
+    KV_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
@@ -80,15 +80,14 @@ START_POS = 0
 
 # paged KV cache
 PREFILL_MAX_COMPRESSED = max(1, min(IDX_TOPK, WIN + WIN // 2))
-SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
-SPARSE_CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-HCA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+SPARSE_ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+SPARSE_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
+SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+SPARSE_CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+HCA_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 HCA_CMP_BLOCK_NUM = SPARSE_CMP_BLOCK_NUM
 
 assert S == COMPRESS_RATIO, "first prefill HCA bring-up targets one ratio-128 prompt chunk"
-assert WIN == BLOCK_SIZE, "prefill HCA currently assumes one window page per batch"
 # HCA has no indexer: the compressed tail is every slot the cache holds, so the
 # shared prefill pruning width must cover the whole cache, not a top-k budget.
 assert MAX_SEQ_LEN // COMPRESS_RATIO <= PREFILL_MAX_COMPRESSED, (

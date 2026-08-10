@@ -18,10 +18,11 @@ from config import (
     FLASH as M,
     BLOCK_SIZE,
     C128_COMPRESSOR_BLOCK_SIZE,
+    HCA_STATE_PHYSICAL_BLOCKS,
     DECODE_BATCH,
     TP,
     DECODE_SEQ,
-    DECODE_CMP_BLOCK_NUM,
+    KV_CMP_BLOCK_NUM,
     FP32_NEG_INF,
     KV_CMP_MAX_BLOCKS,
 )
@@ -62,12 +63,12 @@ STATE_LEN = COFF * COMPRESS_RATIO
 COMPRESS_STATE_BLOCK_SIZE = C128_COMPRESSOR_BLOCK_SIZE
 # Logical state block tables cover MAX_SEQ_LEN while the physical state pool
 # remains bounded to the per-request rolling state capacity.
-COMPRESS_STATE_PHYSICAL_BLOCKS = 64
+COMPRESS_STATE_PHYSICAL_BLOCKS = HCA_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
 if IDX_KV_LEN > CMP_MAX_BLOCKS * BLOCK_SIZE:
     raise ValueError("ratio128 compressed KV cache capacity is smaller than max compressed sequence length")
 
@@ -520,7 +521,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         return block_table(
             batch=batch,
             table_blocks=CMP_MAX_BLOCKS,
-            physical_blocks=CMP_MAX_BLOCKS,
+            physical_blocks=CMP_BLOCK_NUM,
             permuted=True,
         )
     def init_default_start_pos():

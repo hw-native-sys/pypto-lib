@@ -20,7 +20,8 @@ from config import (
     DECODE_SEQ,
     BLOCK_SIZE,
     C4A_COMPRESSOR_BLOCK_SIZE,
-    DECODE_IDX_BLOCK_NUM,
+    CSA_INNER_STATE_PHYSICAL_BLOCKS,
+    IDX_CACHE_BLOCK_NUM,
     IDX_CACHE_MAX_BLOCKS,
     FP32_NEG_INF,
     INT8_SCALE_MAX,
@@ -55,22 +56,24 @@ INNER_COFF = 1 + int(INNER_OVERLAP)
 INNER_HEAD_DIM = IDX_HEAD_DIM
 INNER_OUT_DIM = INNER_COFF * INNER_HEAD_DIM
 INNER_STATE_BLOCK_SIZE = C4A_COMPRESSOR_BLOCK_SIZE
-INNER_STATE_PHYSICAL_BLOCKS = 65
+INNER_STATE_PHYSICAL_BLOCKS = CSA_INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + INNER_STATE_BLOCK_SIZE - 1) // INNER_STATE_BLOCK_SIZE
 INNER_STATE_BLOCK_NUM = INNER_STATE_PHYSICAL_BLOCKS
 INNER_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
 INNER_STATE_DIM = 2 * INNER_OUT_DIM
 
 IDX_KV_LEN = MAX_SEQ_LEN // COMPRESS_RATIO
-IDX_CACHE_BLOCK_NUM = DECODE_IDX_BLOCK_NUM
+IDX_CACHE_BLOCK_NUM = IDX_CACHE_BLOCK_NUM
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 SCORE_LEN = IDX_KV_LEN
 
 # tiling
-CACHE_TILE = 64
+CACHE_TILE = min(64, BLOCK_SIZE)
 assert BLOCK_SIZE % CACHE_TILE == 0, "CACHE_TILE must not cross a paged idx_kv_cache block"
-# REDUCE_TILE tiles the paged C8 cache one 128-row page per fused matmul+reduce step.
-REDUCE_TILE = 128
+# REDUCE_TILE tiles the paged C8 cache one fused matmul+reduce step at a time.
+# A tile is one contiguous cache slice, so it caps at the page size.
+REDUCE_TILE = min(128, BLOCK_SIZE)
+assert BLOCK_SIZE % REDUCE_TILE == 0, "REDUCE_TILE must not cross a paged idx_kv_cache block"
 # the fused score scope fans the cache-page loop across REDUCE_NSPLIT extra lanes: T * NSPLIT.
 # T*NSPLIT=16 mixed blocks map to 16 AIC + 32 AIV (1:2), one clean wave on the 24+48 chip.
 REDUCE_NSPLIT = 2
@@ -325,11 +328,11 @@ def indexer(
             cache0 = cb * REDUCE_TILE
             valid_len = pl.min(REDUCE_TILE, visible_len_t - cache0)
             idx_blk_id = pl.cast(
-                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cb]),
+                pl.read(idx_block_table_flat, [b * IDX_CACHE_MAX_BLOCKS + cache0 // BLOCK_SIZE]),
                 pl.INDEX,
             )
-            kv0 = idx_blk_id * BLOCK_SIZE
-            kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + BLOCK_SIZE, :]
+            kv0 = idx_blk_id * BLOCK_SIZE + cache0 % BLOCK_SIZE
+            kv_i8_mat = kv_cache_i8_flat[kv0 : kv0 + REDUCE_TILE, :]
             score_acc_red = pl.matmul(kv_i8_mat, qr_full, out_dtype=pl.INT32, b_trans=True)
             kv_dq_red = kv_scale_flat[kv0 : kv0 + REDUCE_TILE, :]  # paged per-position dequant scale
             score_tile_red = pl.cast(score_acc_red, target_type=pl.FP32, mode="none")
@@ -656,7 +659,7 @@ def build_tensor_specs(start_pos=None, batch=B):
         return block_table(
             batch=batch,
             table_blocks=IDX_CACHE_MAX_BLOCKS,
-            physical_blocks=IDX_CACHE_MAX_BLOCKS,
+            physical_blocks=IDX_CACHE_BLOCK_NUM,
         )
     def init_default_start_pos():
         # Canonical CSA start-position set (ratio-4 compressor + indexer + sliding-window + 8k).

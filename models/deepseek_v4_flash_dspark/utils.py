@@ -117,7 +117,7 @@ def csa_decode_start_set(
     pattern = [
         long_pos,                   # 8k long-context (rolling state, INT64 slot, topk 4096)
         0,                          # cold start, no valid compressed cache
-        R - seq,                    # compress boundary on 2nd token (== R-1 at seq=1)
+        (R - min(seq, 2)) % R,      # compress boundary on 2nd token (1st at seq=1)
         R - 1,                      # compress boundary on 1st token
         2 * R - 1,                  # 2nd window with previous-window overlap
         window - 1,                 # sliding-window boundary

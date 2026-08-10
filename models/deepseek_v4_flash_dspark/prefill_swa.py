@@ -16,10 +16,10 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
-    PREFILL_CMP_BLOCK_NUM,
-    PREFILL_CMP_MAX_BLOCKS,
-    PREFILL_ORI_BLOCK_NUM,
-    PREFILL_ORI_MAX_BLOCKS,
+    KV_CMP_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+    KV_ORI_BLOCK_NUM,
+    KV_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
 from hc_post import golden_hc_post_prefill, hc_post_prefill
@@ -65,14 +65,13 @@ O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 # paged KV cache. The ratio-0 path has only the sliding-window cache: one
 # request, one window page, so block count / table length / per-request window
 # block count all collapse to 1.
-BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
-SPARSE_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-SPARSE_CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
+BLOCK_NUM = KV_ORI_BLOCK_NUM
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+SPARSE_ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
+SPARSE_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
+SPARSE_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 START_POS = 0
 
-assert WIN == BLOCK_SIZE, "SWA prefill currently assumes one window page per batch"
 assert S == WIN, "SWA overlay raw-index contract maps current suffix rows as WIN+t"
 
 

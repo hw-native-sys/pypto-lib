@@ -24,7 +24,7 @@ from config import (
     FLASH as M,
     IDX_CACHE_MAX_BLOCKS,
     KV_CMP_MAX_BLOCKS,
-    KV_ORI_TABLE_MAX_BLOCKS,
+    KV_ORI_MAX_BLOCKS,
 )
 
 
@@ -32,7 +32,7 @@ B = DECODE_BATCH // TP
 S = DECODE_SEQ
 T = B * S
 WIN = M.sliding_window
-ORI_TABLE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
+ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
 IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS
 HCA_STATE_MAX_BLOCKS = 2048
@@ -52,7 +52,7 @@ N_CACHE_GROUPS = 6
 def build_swa_metadata(
     # Inputs: bare Tensor parameters have PyPTO's default In direction.
     position_ids: pl.Tensor[[T], pl.INT32],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     # Outputs.
     swa_slot_mapping: pl.Out[pl.Tensor[[T], pl.INT64]],
     swa_indices: pl.Out[pl.Tensor[[T, WIN], pl.INT32]],
@@ -111,7 +111,7 @@ def build_swa_metadata(
 def build_decode_metadata(
     # Inputs: bare Tensor parameters have PyPTO's default In direction.
     position_ids: pl.Tensor[[T], pl.INT32],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
     hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -273,7 +273,7 @@ def build_decode_metadata(
 @pl.jit
 def decode_metadata(
     position_ids: pl.Tensor[[T], pl.INT32],
-    ori_block_table: pl.Tensor[[B, ORI_TABLE_MAX_BLOCKS], pl.INT32],
+    ori_block_table: pl.Tensor[[B, ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[B, IDX_MAX_BLOCKS], pl.INT32],
     hca_state_block_table: pl.Tensor[[B, HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -349,7 +349,7 @@ def _test_inputs():
 
     return {
         "position_ids": positions,
-        "ori_block_table": table(ORI_TABLE_MAX_BLOCKS, GROUP_ORI, repeat=True),
+        "ori_block_table": table(ORI_MAX_BLOCKS, GROUP_ORI, repeat=True),
         "cmp_block_table": table(CMP_MAX_BLOCKS, GROUP_CMP, repeat=False),
         "idx_block_table": table(IDX_MAX_BLOCKS, GROUP_IDX, repeat=False),
         "hca_state_block_table": table(

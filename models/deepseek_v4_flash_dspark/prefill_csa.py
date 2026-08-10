@@ -20,11 +20,11 @@ from config import (
     INT8_AMAX_EPS,
     INT8_SCALE_MAX,
     PREFILL_BATCH,
-    PREFILL_CMP_BLOCK_NUM,
-    PREFILL_CMP_MAX_BLOCKS,
-    PREFILL_IDX_BLOCK_NUM,
-    PREFILL_ORI_BLOCK_NUM,
-    PREFILL_ORI_MAX_BLOCKS,
+    KV_CMP_BLOCK_NUM,
+    KV_CMP_MAX_BLOCKS,
+    IDX_CACHE_BLOCK_NUM,
+    KV_ORI_BLOCK_NUM,
+    KV_ORI_MAX_BLOCKS,
     PREFILL_SEQ,
 )
 
@@ -104,12 +104,12 @@ INNER_STATE_LEN = COFF * COMPRESS_RATIO
 MAX_CMP_WRITES = max(1, T // COMPRESS_RATIO)
 
 # paged KV cache
-ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
-CMP_MAX_BLOCKS = PREFILL_CMP_MAX_BLOCKS
-CMP_BLOCK_NUM = PREFILL_CMP_BLOCK_NUM
-SPARSE_ORI_MAX_BLOCKS = PREFILL_ORI_MAX_BLOCKS
+ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
+CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS
+CMP_BLOCK_NUM = KV_CMP_BLOCK_NUM
+SPARSE_ORI_MAX_BLOCKS = KV_ORI_MAX_BLOCKS
 SPARSE_CMP_MAX_BLOCKS = CMP_MAX_BLOCKS
-CSA_ORI_BLOCK_NUM = PREFILL_ORI_BLOCK_NUM
+CSA_ORI_BLOCK_NUM = KV_ORI_BLOCK_NUM
 CSA_CMP_BLOCK_NUM = CMP_BLOCK_NUM
 
 # tiling
@@ -739,10 +739,10 @@ def build_tensor_specs(
     def _build_idx_hist():
         if "cache" in _idx_hist:
             return
-        cache_i8 = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
-        scale = torch.zeros(PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1)
-        c_flat = cache_i8.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
-        s_flat = scale.view(PREFILL_IDX_BLOCK_NUM * BLOCK_SIZE, 1)
+        cache_i8 = torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM, dtype=torch.int8)
+        scale = torch.zeros(IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1)
+        c_flat = cache_i8.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, IDX_HEAD_DIM)
+        s_flat = scale.view(IDX_CACHE_BLOCK_NUM * BLOCK_SIZE, 1)
         table = init_idx_block_table()
         completed = context_len // COMPRESS_RATIO
         for cmp_slot in range(completed):
@@ -907,13 +907,13 @@ def build_tensor_specs(
         TensorSpec("cmp_block_table", [SPARSE_CMP_MAX_BLOCKS], torch.int32, init_value=init_cmp_block_table),
         TensorSpec(
             "idx_kv_cache",
-            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
+            [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM],
             torch.int8,
             init_value=init_idx_kv_cache,
         ),
         TensorSpec(
             "idx_kv_scale",
-            [PREFILL_IDX_BLOCK_NUM, BLOCK_SIZE, 1, 1],
+            [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1],
             torch.float32,
             init_value=init_idx_kv_scale,
         ),
