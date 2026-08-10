@@ -106,7 +106,7 @@ assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZ
 
 
 @pl.jit.inline(auto_scope=False)
-def lm_head(
+def lm_head_core(
     hidden_states: pl.Tensor,
     lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
     logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
@@ -296,15 +296,45 @@ def lm_head(
                     tl = src_vocab_base + tail_o0
                     logits[:, tl : tl + LOGITS_COMM_TAIL] = logits_window[:, tl : tl + LOGITS_COMM_TAIL]
 
-    # Every local wait has observed all current-round peer notifies before the
-    # logits gather can complete. Clear only this rank's counters so a retained
-    # CommDomain can safely reuse the fixed done_epoch on the next forward.
+    return logits
+
+
+@pl.jit.inline
+def clear_lm_head_signals(
+    completion_anchor: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+):
+    """Clear this rank's LM-head signal windows after projection completes."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="lm_head_signal_clear"):
-        _completion_anchor = pl.read(logits, [0, 0])
+        _completion_anchor = pl.read(completion_anchor, [0, 0])
         zero = pl.cast(0, pl.INT32)
         for src_tp in pl.range(TP_SIZE):
             pl.write(hidden_done, [src_tp, 0], zero)
             pl.write(logits_done, [src_tp, 0], zero)
+    return completion_anchor
+
+
+@pl.jit.inline(auto_scope=False)
+def lm_head(
+    hidden_states: pl.Tensor,
+    lm_head_weight: pl.Tensor[[VOCAB_PER_TP, D], pl.BF16],
+    logit_row_indices: pl.Tensor[[MAX_LOGIT_ROWS], pl.INT32],
+    logits: pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    hidden_window: pld.DistributedTensor[[GROUP_LOGIT_ROWS, D], pl.BF16],
+    hidden_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    logits_window: pld.DistributedTensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32],
+    logits_done: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    group_base: pl.Scalar[pl.INT32],
+    tp_rank: pl.Scalar[pl.INT32],
+    done_epoch: pl.Scalar[pl.INT32],
+) -> pl.Tensor[[MAX_LOGIT_ROWS, VOCAB], pl.FP32]:
+    lm_head_core(
+        hidden_states, lm_head_weight, logit_row_indices, logits,
+        hidden_window, hidden_done, logits_window, logits_done,
+        group_base, tp_rank, done_epoch,
+    )
+    clear_lm_head_signals(logits, hidden_done, logits_done)
     return logits
 
 
