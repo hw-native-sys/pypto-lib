@@ -546,7 +546,12 @@ runs:
       run: |
         source activate.sh
         python -m pip install --upgrade pip
-        pip install scikit-build-core nanobind cmake ninja
+        # Constrained deliberately. Unconstrained, a transient index failure on
+        # one transitive dependency sends pip backtracking through sixty
+        # releases of scikit-build-core before reporting it, burying the real
+        # message ("no matching distribution for packaging") under a wall of
+        # version lists. pyproject already requires >=0.10.0.
+        pip install 'scikit-build-core>=0.10' nanobind cmake ninja
         # The from-source pypto / simpler builds compile native code (libbacktrace
         # et al.) with conda's compiler_compat toolchain, which intermittently
         # fails to configure on this host ("C compiler cannot create executables").
