@@ -56,7 +56,6 @@ COMPRESS_STATE_PHYSICAL_BLOCKS = CSA_INNER_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_MAX_BLOCKS = (MAX_SEQ_LEN + COMPRESS_STATE_BLOCK_SIZE - 1) // COMPRESS_STATE_BLOCK_SIZE
 COMPRESS_STATE_BLOCK_NUM = COMPRESS_STATE_PHYSICAL_BLOCKS
 COMPRESS_STATE_DIM = 2 * OUT_DIM
-IDX_CACHE_BLOCK_NUM = IDX_CACHE_BLOCK_NUM
 IDX_CACHE_BLOCK_NUM_DYN = pl.dynamic("IDX_CACHE_BLOCK_NUM_DYN")
 COMPRESS_STATE_BLOCK_NUM_DYN = pl.dynamic("INNER_STATE_BLOCK_NUM_DYN")
 
@@ -648,6 +647,8 @@ if __name__ == "__main__":
                              "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False,
+                        help="Persist this run's data/{in,out} for offline inspection.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
     if args.batch < 4 or args.batch > B or args.batch % 4 != 0:
@@ -658,6 +659,7 @@ if __name__ == "__main__":
         specs=build_tensor_specs(args.start_pos, batch=args.batch),
         golden_fn=golden_compressor,
         runtime_dir=args.runtime_dir,
+        save_data=args.save_data,
         compile_cfg=dict(dump_passes=args.dump_passes),
         runtime_cfg=dict(
             platform=args.platform,
@@ -667,7 +669,12 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
-            "kv":          ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.0),
+            # kv leaves the 128x128 hadamard rotation, so an element is a 128-term sum of
+            # rows reaching |x| ~ 10 and the row's dynamic range runs past 1e4:1. Its error
+            # floor is set by that input scale, not by the cancelled output, so atol carries
+            # it -- a 1e-4 floor asks small elements for a relative accuracy the bf16 inputs
+            # cannot hold. rtol still bounds the large elements.
+            "kv":          ratio_allclose(atol=1e-3, rtol=1.0 / 128, max_error_ratio=0.0),
             "compress_state": ratio_allclose(atol=1e-3, rtol=1e-3, max_error_ratio=0.0),
             "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
             "idx_kv_scale": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.01),
