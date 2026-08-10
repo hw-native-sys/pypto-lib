@@ -33,11 +33,15 @@ LOCAL_O_GROUPS = O_GROUPS // O_A_SHARDS
 
 # tiling and collective-native layouts
 TOKEN_TILE = 16
-COMM_ROW_TILE = 1
+COMM_ROW_TILE = 8
 LOCAL_T_PAD = (LOCAL_T + TOKEN_TILE - 1) // TOKEN_TILE * TOKEN_TILE
 GROUP_T_PAD = SP_SIZE * LOCAL_T_PAD
 ATTENTION_WINDOW_ROWS = LOCAL_O_GROUPS * GROUP_T_PAD
 O_WINDOW_ROWS = SP_SIZE * LOCAL_T_PAD
+
+# fixture
+FIXTURE_LOCAL_T = max(1, LOCAL_T - 1)
+FIXTURE_OUTPUT_SENTINEL = -7.0
 
 if DECODE_TOKENS % SP_SIZE != 0:
     raise ValueError(f"decode tokens {DECODE_TOKENS} must be divisible by SP {SP_SIZE}")
@@ -90,25 +94,27 @@ def reset_sp_group_signal(
 @pl.jit.incore
 def kv_token_allgather_step(
     kv_local: pl.Tensor[[LOCAL_T, D], pl.BF16],
-    group_out: pl.Out[pl.Tensor[[GROUP_T, D], pl.BF16]],
+    group_out: pl.InOut[pl.Tensor[[GROUP_T, D], pl.BF16]],
     gather_window: pld.DistributedTensor[[GROUP_T, D], pl.BF16],
     gather_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     sp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
 ):
-    """Gather rank-major token shards for the replicated KV projections."""
-    target_row = sp_rank * LOCAL_T
+    """Gather valid rank-major token rows for the replicated KV projections."""
+    group_t = SP_SIZE * local_t
+    target_row = sp_rank * local_t
     for peer_sp in pl.range(SP_SIZE):
         pld.tensor.put(
             dst=gather_window, peer=group_base + peer_sp, src=kv_local,
-            dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[LOCAL_T, D],
-            chunk_rows=COMM_ROW_TILE, chunk_cols=D, pipeline=True,
+            dst_offsets=[target_row, 0], src_offsets=[0, 0], shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE, chunk_cols=D,
         )
 
     expected_one = pl.cast(1, pl.INT32)
     gather_signal = sp_group_barrier(gather_signal, group_base, sp_rank, expected_one)
-    for group_t in pl.range(GROUP_T):
-        group_out[group_t : group_t + 1, 0:D] = gather_window[group_t : group_t + 1, 0:D]
+    for group_row in pl.range(group_t):
+        group_out[group_row : group_row + 1, 0:D] = gather_window[group_row : group_row + 1, 0:D]
     expected_two = pl.cast(2, pl.INT32)
     gather_signal = sp_group_barrier(gather_signal, group_base, sp_rank, expected_two)
     gather_signal = reset_sp_group_signal(gather_signal, group_base, sp_rank)
@@ -118,29 +124,34 @@ def kv_token_allgather_step(
 @pl.jit.incore
 def attention_token_head_all_to_all_step(
     attention_grouped: pl.Tensor[[O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], pl.BF16],
-    local_groups_out: pl.Out[pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
+    local_groups_out: pl.InOut[pl.Tensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
     exchange_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
     exchange_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     sp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
 ):
-    """Exchange contiguous output-group slabs into local-group, group-token order."""
+    """Exchange valid output-group rows into local-group, group-token order."""
+    group_t = SP_SIZE * local_t
     for destination_rank in pl.range(SP_SIZE):
         for local_group in pl.range(LOCAL_O_GROUPS):
             global_group = destination_rank * LOCAL_O_GROUPS + local_group
             source_row = global_group * LOCAL_T_PAD
-            target_row = local_group * GROUP_T_PAD + sp_rank * LOCAL_T_PAD
+            target_row = local_group * GROUP_T_PAD + sp_rank * local_t
             pld.tensor.put(
                 dst=exchange_window, peer=group_base + destination_rank, src=attention_grouped,
-                dst_offsets=[target_row, 0], src_offsets=[source_row, 0], shape=[LOCAL_T_PAD, O_GROUP_IN],
-                chunk_rows=COMM_ROW_TILE, chunk_cols=O_GROUP_IN, pipeline=True,
+                dst_offsets=[target_row, 0], src_offsets=[source_row, 0], shape=[local_t, O_GROUP_IN],
+                chunk_rows=COMM_ROW_TILE, chunk_cols=O_GROUP_IN,
             )
 
     expected_one = pl.cast(1, pl.INT32)
     exchange_signal = sp_group_barrier(exchange_signal, group_base, sp_rank, expected_one)
-    for copy_row in pl.range(ATTENTION_WINDOW_ROWS):
-        window_row = exchange_window[copy_row : copy_row + 1, 0:O_GROUP_IN]
-        local_groups_out[copy_row : copy_row + 1, 0:O_GROUP_IN] = window_row
+    for local_group in pl.range(LOCAL_O_GROUPS):
+        group_base_row = local_group * GROUP_T_PAD
+        for group_row in pl.range(group_t):
+            copy_row = group_base_row + group_row
+            window_row = exchange_window[copy_row : copy_row + 1, 0:O_GROUP_IN]
+            local_groups_out[copy_row : copy_row + 1, 0:O_GROUP_IN] = window_row
     expected_two = pl.cast(2, pl.INT32)
     exchange_signal = sp_group_barrier(exchange_signal, group_base, sp_rank, expected_two)
     exchange_signal = reset_sp_group_signal(exchange_signal, group_base, sp_rank)
@@ -150,32 +161,33 @@ def attention_token_head_all_to_all_step(
 @pl.jit.incore
 def o_projection_reduce_scatter_step(
     o_partial: pl.Tensor[[GROUP_T_PAD, D], pl.FP32],
-    local_out: pl.Out[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
+    local_out: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
     reduce_window: pld.DistributedTensor[[O_WINDOW_ROWS, D], pl.FP32],
     reduce_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     sp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
 ):
-    """Sum O-B rank partials and scatter contiguous token-owner rows."""
+    """Sum O-B rank partials and scatter valid contiguous token-owner rows."""
     for owner_rank in pl.range(SP_SIZE):
-        owner_source_row = owner_rank * LOCAL_T_PAD
-        target_row = sp_rank * LOCAL_T_PAD
+        owner_source_row = owner_rank * local_t
+        target_row = sp_rank * local_t
         pld.tensor.put(
             dst=reduce_window, peer=group_base + owner_rank, src=o_partial,
-            dst_offsets=[target_row, 0], src_offsets=[owner_source_row, 0], shape=[LOCAL_T_PAD, D],
-            chunk_rows=COMM_ROW_TILE, chunk_cols=D, pipeline=True,
+            dst_offsets=[target_row, 0], src_offsets=[owner_source_row, 0], shape=[local_t, D],
+            chunk_rows=COMM_ROW_TILE, chunk_cols=D,
         )
 
     expected_one = pl.cast(1, pl.INT32)
     reduce_signal = sp_group_barrier(reduce_signal, group_base, sp_rank, expected_one)
-    for local_t in pl.range(LOCAL_T_PAD):
-        acc = pl.load(reduce_window, [local_t, 0], [1, D])
+    for local_row in pl.range(local_t):
+        acc = pl.load(reduce_window, [local_row, 0], [1, D])
         for source_rank in pl.range(1, SP_SIZE):
-            source_partial_row = source_rank * LOCAL_T_PAD + local_t
+            source_partial_row = source_rank * local_t + local_row
             source_partial = pl.load(reduce_window, [source_partial_row, 0], [1, D])
             acc = pl.add(acc, source_partial)
         reduced_bf16 = pl.cast(acc, target_type=pl.BF16, mode="rint")
-        pl.store(reduced_bf16, [local_t, 0], local_out)
+        pl.store(reduced_bf16, [local_row, 0], local_out)
     expected_two = pl.cast(2, pl.INT32)
     reduce_signal = sp_group_barrier(reduce_signal, group_base, sp_rank, expected_two)
     reduce_signal = reset_sp_group_signal(reduce_signal, group_base, sp_rank)
@@ -187,9 +199,9 @@ def decode_attention_cp_layout(
     kv_local: pl.Tensor[[LOCAL_T, D], pl.BF16],
     attention_grouped: pl.Tensor[[O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], pl.BF16],
     o_partial: pl.Tensor[[GROUP_T_PAD, D], pl.FP32],
-    kv_group: pl.Out[pl.Tensor[[GROUP_T, D], pl.BF16]],
-    attention_local_groups: pl.Out[pl.Tensor[[LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN], pl.BF16]],
-    o_local: pl.Out[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
+    kv_group: pl.InOut[pl.Tensor[[GROUP_T, D], pl.BF16]],
+    attention_local_groups: pl.InOut[pl.Tensor[[LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN], pl.BF16]],
+    o_local: pl.InOut[pl.Tensor[[LOCAL_T_PAD, D], pl.BF16]],
     kv_window: pld.DistributedTensor[[GROUP_T, D], pl.BF16],
     kv_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
     attention_window: pld.DistributedTensor[[ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16],
@@ -198,16 +210,17 @@ def decode_attention_cp_layout(
     o_signal: pld.DistributedTensor[[SP_SIZE, 1], pl.INT32],
     group_base: pl.Scalar[pl.INT32],
     sp_rank: pl.Scalar[pl.INT32],
+    local_t: pl.Scalar[pl.INT32],
 ):
     """Apply the three decode attention communication seams on one rank."""
     kv_group, kv_signal = kv_token_allgather_step(
-        kv_local, kv_group, kv_window, kv_signal, group_base, sp_rank,
+        kv_local, kv_group, kv_window, kv_signal, group_base, sp_rank, local_t,
     )
     attention_local_groups, attention_signal = attention_token_head_all_to_all_step(
-        attention_grouped, attention_local_groups, attention_window, attention_signal, group_base, sp_rank,
+        attention_grouped, attention_local_groups, attention_window, attention_signal, group_base, sp_rank, local_t,
     )
     o_local, o_signal = o_projection_reduce_scatter_step(
-        o_partial, o_local, o_window, o_signal, group_base, sp_rank,
+        o_partial, o_local, o_window, o_signal, group_base, sp_rank, local_t,
     )
     return kv_group, attention_local_groups, o_local, kv_signal, attention_signal, o_signal
 
@@ -217,9 +230,10 @@ def l3_decode_attention_cp_layout(
     kv_local: pl.Tensor[[SP_SIZE, LOCAL_T, D], pl.BF16],
     attention_grouped: pl.Tensor[[SP_SIZE, O_GROUPS * LOCAL_T_PAD, O_GROUP_IN], pl.BF16],
     o_partial: pl.Tensor[[SP_SIZE, GROUP_T_PAD, D], pl.FP32],
-    kv_group: pl.Out[pl.Tensor[[SP_SIZE, GROUP_T, D], pl.BF16]],
-    attention_local_groups: pl.Out[pl.Tensor[[SP_SIZE, ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
-    o_local: pl.Out[pl.Tensor[[SP_SIZE, LOCAL_T_PAD, D], pl.BF16]],
+    kv_group: pl.InOut[pl.Tensor[[SP_SIZE, GROUP_T, D], pl.BF16]],
+    attention_local_groups: pl.InOut[pl.Tensor[[SP_SIZE, ATTENTION_WINDOW_ROWS, O_GROUP_IN], pl.BF16]],
+    o_local: pl.InOut[pl.Tensor[[SP_SIZE, LOCAL_T_PAD, D], pl.BF16]],
+    local_t: pl.Scalar[pl.INT32],
 ):
     """Launch the decode DSA-CP layout fixture on one physical SP group."""
     kv_window_buf = pld.alloc_window_buffer([GROUP_T, D], dtype=pl.BF16)
@@ -240,29 +254,39 @@ def l3_decode_attention_cp_layout(
             kv_local[rank], attention_grouped[rank], o_partial[rank],
             kv_group[rank], attention_local_groups[rank], o_local[rank],
             kv_window, kv_signal, attention_window, attention_signal, o_window, o_signal,
-            0, rank, device=rank,
+            0, rank, local_t, device=rank,
         )
 
 
-def build_tensor_specs():
-    """Build deterministic four-rank layout inputs."""
+def build_tensor_specs(local_t=FIXTURE_LOCAL_T):
+    """Build deterministic four-rank inputs with poisoned capacity rows."""
     import torch
 
-    from golden import TensorSpec
+    from golden import ScalarSpec, TensorSpec
+
+    if local_t < 1 or local_t > LOCAL_T:
+        raise ValueError(f"local_t must be in [1, {LOCAL_T}], got {local_t}")
 
     def init_kv_local():
         values = torch.arange(SP_SIZE * LOCAL_T * D, dtype=torch.int32)
-        return values.remainder(251).reshape(SP_SIZE, LOCAL_T, D).to(torch.bfloat16)
+        values = values.remainder(251).reshape(SP_SIZE, LOCAL_T, D).to(torch.bfloat16)
+        values[:, local_t:] = -1000.0
+        return values
 
     def init_attention_grouped():
         shape = (SP_SIZE, O_GROUPS * LOCAL_T_PAD, O_GROUP_IN)
         values = torch.arange(SP_SIZE * O_GROUPS * LOCAL_T_PAD * O_GROUP_IN, dtype=torch.int32)
-        return values.remainder(127).reshape(shape).to(torch.bfloat16)
+        values = values.remainder(127).reshape(shape).to(torch.bfloat16)
+        grouped = values.reshape(SP_SIZE, O_GROUPS, LOCAL_T_PAD, O_GROUP_IN)
+        grouped[:, :, local_t:] = -2000.0
+        return values
 
     def init_o_partial():
         shape = (SP_SIZE, GROUP_T_PAD, D)
         values = torch.arange(SP_SIZE * GROUP_T_PAD * D, dtype=torch.int32)
-        return values.remainder(17).reshape(shape).to(torch.float32)
+        values = values.remainder(17).reshape(shape).to(torch.float32)
+        values[:, SP_SIZE * local_t:] = -3000.0
+        return values
 
     attention_grouped_shape = [SP_SIZE, O_GROUPS * LOCAL_T_PAD, O_GROUP_IN]
     attention_local_shape = [SP_SIZE, LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN]
@@ -270,9 +294,19 @@ def build_tensor_specs():
         TensorSpec("kv_local", [SP_SIZE, LOCAL_T, D], torch.bfloat16, init_value=init_kv_local),
         TensorSpec("attention_grouped", attention_grouped_shape, torch.bfloat16, init_value=init_attention_grouped),
         TensorSpec("o_partial", [SP_SIZE, GROUP_T_PAD, D], torch.float32, init_value=init_o_partial),
-        TensorSpec("kv_group", [SP_SIZE, GROUP_T, D], torch.bfloat16, is_output=True),
-        TensorSpec("attention_local_groups", attention_local_shape, torch.bfloat16, is_output=True),
-        TensorSpec("o_local", [SP_SIZE, LOCAL_T_PAD, D], torch.bfloat16, is_output=True),
+        TensorSpec(
+            "kv_group", [SP_SIZE, GROUP_T, D], torch.bfloat16,
+            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+        ),
+        TensorSpec(
+            "attention_local_groups", attention_local_shape, torch.bfloat16,
+            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+        ),
+        TensorSpec(
+            "o_local", [SP_SIZE, LOCAL_T_PAD, D], torch.bfloat16,
+            init_value=FIXTURE_OUTPUT_SENTINEL, is_output=True,
+        ),
+        ScalarSpec("local_t", torch.int32, local_t),
     ]
 
 
@@ -280,24 +314,28 @@ def golden_decode_attention_cp_layout(tensors):
     """Assemble the rank-major gather, grouped exchange, and reduced token shards."""
     import torch
 
-    gathered_kv = tensors["kv_local"].reshape(GROUP_T, D)
-    tensors["kv_group"][:] = gathered_kv.unsqueeze(0).expand_as(tensors["kv_group"])
+    local_t = int(tensors["local_t"])
+    group_t = SP_SIZE * local_t
+    gathered_kv = tensors["kv_local"][:, :local_t].reshape(group_t, D)
+    tensors["kv_group"].fill_(FIXTURE_OUTPUT_SENTINEL)
+    tensors["kv_group"][:, :group_t] = gathered_kv.unsqueeze(0)
 
     grouped = tensors["attention_grouped"].reshape(SP_SIZE, O_GROUPS, LOCAL_T_PAD, O_GROUP_IN)
-    exchanged = torch.empty_like(tensors["attention_local_groups"])
+    exchanged = torch.full_like(tensors["attention_local_groups"], FIXTURE_OUTPUT_SENTINEL)
     for destination_rank in range(SP_SIZE):
         for local_group in range(LOCAL_O_GROUPS):
             global_group = destination_rank * LOCAL_O_GROUPS + local_group
             target_row = local_group * GROUP_T_PAD
-            group_rows = grouped[:, global_group].reshape(GROUP_T_PAD, O_GROUP_IN)
-            exchanged[destination_rank, target_row : target_row + GROUP_T_PAD] = group_rows
+            group_rows = grouped[:, global_group, :local_t].reshape(group_t, O_GROUP_IN)
+            exchanged[destination_rank, target_row : target_row + group_t] = group_rows
     tensors["attention_local_groups"][:] = exchanged
 
-    reduced = tensors["o_partial"].sum(dim=0)
+    reduced = tensors["o_partial"][:, :group_t].sum(dim=0)
+    tensors["o_local"].fill_(FIXTURE_OUTPUT_SENTINEL)
     for rank in range(SP_SIZE):
-        token_start = rank * LOCAL_T_PAD
-        token_end = token_start + LOCAL_T_PAD
-        tensors["o_local"][rank] = reduced[token_start:token_end].to(torch.bfloat16)
+        token_start = rank * local_t
+        token_end = token_start + local_t
+        tensors["o_local"][rank, :local_t] = reduced[token_start:token_end].to(torch.bfloat16)
 
 
 if __name__ == "__main__":
@@ -309,6 +347,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=("a2a3", "a2a3sim", "a5", "a5sim"))
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(SP_SIZE)))
+    parser.add_argument("--local-t", type=int, default=FIXTURE_LOCAL_T)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -317,10 +356,12 @@ if __name__ == "__main__":
     device_ids = [int(device) for device in args.device.split(",")]
     if len(device_ids) != SP_SIZE:
         parser.error(f"need exactly {SP_SIZE} devices, got {device_ids}")
+    if args.local_t < 1 or args.local_t > LOCAL_T:
+        parser.error(f"--local-t must be in [1, {LOCAL_T}], got {args.local_t}")
 
     result = run_jit(
         fn=l3_decode_attention_cp_layout,
-        specs=build_tensor_specs(),
+        specs=build_tensor_specs(args.local_t),
         golden_fn=golden_decode_attention_cp_layout,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
