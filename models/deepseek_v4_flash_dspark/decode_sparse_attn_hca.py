@@ -119,7 +119,7 @@ assert BLOCK_SIZE % GATHER_RUN == 0, "a contiguous run must not straddle two pag
 
 
 @pl.jit.inline
-def sparse_attn_hca(
+def sparse_attn_hca_heads(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -129,12 +129,13 @@ def sparse_attn_hca(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Run sparse decode attention, inverse RoPE, and grouped output projection."""
+    o_packed_heads: pl.Tensor,
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write HCA heads as ``[group, T_PAD, O_GROUP_IN]`` slabs.
+
+    Only the first runtime ``t_dim`` rows in each group are valid. The
+    returned task ID covers every write to the packed output tensor.
+    """
     # Gather the historical/current window + compressed-cache rows.
     # Compressed index contract:
     #   -1              invalid
@@ -147,8 +148,6 @@ def sparse_attn_hca(
     t_hblocks = t_dim * (H // H_TILE)
     valid_blocks = t_dim // VALID_TOKEN_TILE
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
-    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
-    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
@@ -234,7 +233,6 @@ def sparse_attn_hca(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [t_heads, HEAD_DIM])
-    o_packed = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, HEAD_DIM], dtype=pl.FP32)
@@ -331,9 +329,9 @@ def sparse_attn_hca(
     # fans out over that many AIVs instead of T blocks each running a serial head-tile
     # loop. The inverse-RoPE rotation + rope-column pack is fused in (was a separate
     # "rope" spmd reading an attn_rope_stage GM round-trip): the head-tile's fp32 rope
-    # segment is rotated in UB and packed straight into o_packed's rope columns.
+    # segment is rotated in UB and packed straight into the output group's rope columns.
     # with-form spmd so the dispatch TaskId (merge_tid) can be an explicit dep of
-    # the manual-scope proj_a tasks below (which read merge_norm's o_packed cols).
+    # the downstream proj_a tasks (which read merge_norm's packed output columns).
     with pl.spmd(t_hblocks, name_hint="merge_norm") as merge_tid:
         m_idx = pl.tile.get_block_idx()
         m_t = m_idx // (H // H_TILE)
@@ -369,7 +367,7 @@ def sparse_attn_hca(
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
         # rope_swap_idx (j^1, prebuilt above) pairs the interleaved real/imag lanes.
         # Rounded to bf16 (golden also rounds inverse-RoPE to bf16) and packed into
-        # o_packed's rope columns.
+        # the packed output's rope columns.
         m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
@@ -382,9 +380,28 @@ def sparse_attn_hca(
             n_pack_row = ((m_h0 + n_hi) // HEADS_PER_GROUP) * T_PAD + m_t
             n_col = ((m_h0 + n_hi) % HEADS_PER_GROUP) * HEAD_DIM
             # one HEAD_DIM-wide store per head row instead of two: concat the nope and
-            # inverse-RoPE halves on chip so o_packed takes a single contiguous write.
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, :]
+            # inverse-RoPE halves on chip so the packed tensor takes one contiguous write.
+            n_full_head = n_full_bf16[n_hi : n_hi + 1, :]
+            o_packed_heads[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_head
 
+    return o_packed_heads, merge_tid
+
+
+@pl.jit.inline
+def sparse_attn_hca_local_o_proj(
+    o_packed_heads: pl.Tensor,
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project local-token, full-group HCA heads into BF16 hidden rows."""
+    t_dim = pl.tensor.dim(attn_out, 0)
+    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
+    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
+
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     # Back-to-back grouped output projection: proj_a[g] -> quant[g] -> proj_b[g]
     # pipelines per group, because the PER-GROUP amax keeps the quant reduction
     # inside one O_LORA group instead of barriering the whole row. manual_scope
@@ -405,7 +422,7 @@ def sparse_attn_hca(
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T_PAD
             out_col_g = g * O_LORA
-            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[merge_tid],
+            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // PA_N_FRAGS  # row block outermost
@@ -501,6 +518,39 @@ def sparse_attn_hca(
             attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
 
     return attn_out
+
+
+@pl.jit.inline
+def sparse_attn_hca(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    window_swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_block_table: pl.Tensor[[B_DYN, CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[T_DYN, CMP_TOPK], pl.INT32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Compute HCA sparse attention and the grouped output projection."""
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD, O_GROUP_IN], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_hca_heads(
+        q, ori_kv, window_swa_indices,
+        cmp_kv, cmp_block_table, cmp_sparse_indices,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+    attn_out = sparse_attn_hca_local_o_proj(
+        o_packed_heads,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
+    )
+    return attn_out
+
 
 @pl.jit
 def sparse_attn_test(
