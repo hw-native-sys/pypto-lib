@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=4
-"""DeepSeek-V4 shared expert with local and SP-boundary tensor-parallel execution."""
+"""DeepSeek-V4 shared expert with replicated and experimental weight-TP execution."""
 
 import sys
 
@@ -15,43 +15,43 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, TP_SHARED_EXPERT
+from config import FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, MOE_TOKENS, TP
 
 
 # command-line config
-_TP_CHOICES = (1, 2, 4, 8)
-_TP_DEFAULT = TP_SHARED_EXPERT
+_TP_CHOICES = (1, 2, 4)
+_TP_DEFAULT = 1
 
 
 def _parse_tp_argv():
-    for name in ("--tp-shared-expert", "--tp"):
-        for index, token in enumerate(sys.argv):
-            if token == name and index + 1 < len(sys.argv):
-                return int(sys.argv[index + 1])
-            if token.startswith(f"{name}="):
-                return int(token.split("=", 1)[1])
+    for index, token in enumerate(sys.argv):
+        if token == "--tp-shared-expert" and index + 1 < len(sys.argv):
+            return int(sys.argv[index + 1])
+        if token.startswith("--tp-shared-expert="):
+            return int(token.split("=", 1)[1])
     return _TP_DEFAULT
 
 
 # distributed config
 TP_SIZE = _parse_tp_argv()
+SP_SIZE = TP
 if TP_SIZE not in _TP_CHOICES:
     raise ValueError(f"--tp-shared-expert must be one of {_TP_CHOICES}, got {TP_SIZE}")
 
 # model config
-T = DECODE_TOKENS
 D = M.hidden_size
 MOE_INTER = M.moe_intermediate_size
 LOCAL_INTER = MOE_INTER // TP_SIZE
-SP_T = T // TP_SIZE
+SP_T = MOE_TOKENS
+GROUP_T = SP_T * TP_SIZE
 SWIGLU_LIMIT = M.swiglu_limit
 
 # local tiling
 LOCAL_M_TILE = 16
 LOCAL_ROW_TILE = 8
 LOCAL_ACT_M_TILE = 2
-LOCAL_T_PAD = ((T + LOCAL_M_TILE - 1) // LOCAL_M_TILE) * LOCAL_M_TILE
-LOCAL_VALID_M = T if T < LOCAL_M_TILE else LOCAL_M_TILE
+LOCAL_T_PAD = ((SP_T + LOCAL_M_TILE - 1) // LOCAL_M_TILE) * LOCAL_M_TILE
+LOCAL_VALID_M = SP_T if SP_T < LOCAL_M_TILE else LOCAL_M_TILE
 LOCAL_K_TILE = 512
 LOCAL_INTER_K_TILE = 512
 LOCAL_MM_INTER_TILE = 256
@@ -65,8 +65,8 @@ LOCAL_W2_GROUP_TILE = 4096
 SH_M_TILE = 32
 SH_AMAX_TILE = 8
 SH_ACT_M_TILE = 2
-T_PAD = ((T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
-SH_VALID_M = T if T < SH_M_TILE else SH_M_TILE
+T_PAD = ((GROUP_T + SH_M_TILE - 1) // SH_M_TILE) * SH_M_TILE
+SH_VALID_M = GROUP_T if GROUP_T < SH_M_TILE else SH_M_TILE
 
 K_TILE = 512
 MM_INTER_TILE = 256
@@ -79,13 +79,13 @@ W2_GROUP_TILE = 1024
 COMM_STAGE_TILE = 4096
 
 # communication
-COMM_WORKERS = min(24, T * (D // COMM_STAGE_TILE))
+COMM_WORKERS = min(24, GROUP_T * (D // COMM_STAGE_TILE))
 SP_COMM_WORKERS = min(24, SP_T * (D // COMM_STAGE_TILE))
 if MOE_INTER % TP_SIZE != 0:
     raise ValueError(f"intermediate size {MOE_INTER} is not divisible by TP {TP_SIZE}")
-if T % TP_SIZE != 0:
-    raise ValueError(f"token rows {T} must be divisible by TP {TP_SIZE}")
-if T > SH_M_TILE and T % SH_M_TILE != 0:
+if SP_SIZE % TP_SIZE != 0:
+    raise ValueError(f"shared-expert TP {TP_SIZE} must divide physical SP {SP_SIZE}")
+if GROUP_T > SH_M_TILE and GROUP_T % SH_M_TILE != 0:
     raise ValueError("token rows must fit one M tile or be an exact M-tile multiple")
 if SH_VALID_M % SH_ACT_M_TILE != 0:
     raise ValueError("valid M rows must be divisible by rows per activation block")
@@ -99,9 +99,9 @@ if LOCAL_INTER % DOWN_K_TILE != 0:
     raise ValueError("local intermediate size must be divisible by the down K tile")
 if D % COMM_STAGE_TILE != 0:
     raise ValueError("hidden size must be divisible by the communication staging tile")
-if (T * (D // COMM_STAGE_TILE)) % TP_SIZE != 0:
+if (GROUP_T * (D // COMM_STAGE_TILE)) % TP_SIZE != 0:
     raise ValueError("communication blocks must be divisible by TP size")
-if T > LOCAL_M_TILE and T % LOCAL_M_TILE != 0:
+if SP_T > LOCAL_M_TILE and SP_T % LOCAL_M_TILE != 0:
     raise ValueError("local token rows must fit one M tile or be an exact M-tile multiple")
 if LOCAL_VALID_M % LOCAL_ACT_M_TILE != 0:
     raise ValueError("local valid M rows must be divisible by rows per activation block")
@@ -109,15 +109,15 @@ if LOCAL_VALID_M % LOCAL_ACT_M_TILE != 0:
 
 @pl.jit.inline
 def expert_shared(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Tensor[[T, D], pl.BF16],
+    sh: pl.Tensor[[SP_T, D], pl.BF16],
 ):
     """Compute a rank-local shared expert with replicated weights."""
     for mt in pl.parallel(LOCAL_T_PAD // LOCAL_M_TILE):
@@ -233,15 +233,15 @@ def expert_shared(
 
 @pl.jit
 def expert_shared_test(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
     shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
     shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+    sh: pl.Out[pl.Tensor[[SP_T, D], pl.BF16]],
 ):
     expert_shared(
         x_local_i8, x_local_scale_dq,
@@ -254,14 +254,14 @@ def expert_shared_test(
 
 @pl.jit.inline
 def shared_gate_up_local(
-    x_local_i8: pl.Tensor[[T, D], pl.INT8],
-    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    x_local_i8: pl.Tensor[[GROUP_T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[GROUP_T, 1], pl.FP32],
     shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
     shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
     shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
     shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
-    h_local: pl.Tensor[[T, LOCAL_INTER], pl.FP32],
-    local_amax: pl.Tensor[[T, SH_AMAX_TILE], pl.FP32],
+    h_local: pl.Tensor[[GROUP_T, LOCAL_INTER], pl.FP32],
+    local_amax: pl.Tensor[[GROUP_T, SH_AMAX_TILE], pl.FP32],
 ):
     """Compute the local gate/up shard and its row amax values."""
     for mt in pl.parallel(T_PAD // SH_M_TILE):
@@ -336,11 +336,11 @@ def shared_gate_up_local(
 
 @pl.jit.inline
 def shared_down_local(
-    h_local: pl.Tensor[[T, LOCAL_INTER], pl.FP32],
-    local_amax: pl.Tensor[[T, SH_AMAX_TILE], pl.FP32],
+    h_local: pl.Tensor[[GROUP_T, LOCAL_INTER], pl.FP32],
+    local_amax: pl.Tensor[[GROUP_T, SH_AMAX_TILE], pl.FP32],
     shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
-    partial: pl.Tensor[[T, D], pl.FP32],
+    partial: pl.Tensor[[GROUP_T, D], pl.FP32],
 ):
     """Quantize the local activation shard and emit dequantized partials."""
     for mt in pl.parallel(T_PAD // SH_M_TILE):
@@ -397,10 +397,10 @@ def shared_down_local(
 def gather_sp_input(
     x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
     x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
-    gathered_x: pl.Tensor[[T, D], pl.INT8],
-    gathered_scale: pl.Tensor[[T, 1], pl.FP32],
-    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
-    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+    gathered_x: pl.Tensor[[GROUP_T, D], pl.INT8],
+    gathered_scale: pl.Tensor[[GROUP_T, 1], pl.FP32],
+    gather_x: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
@@ -449,12 +449,12 @@ def gather_sp_input(
 
     with pl.spmd(SP_COMM_WORKERS, name_hint="sh_sp_tp_gather_copy", deps=[wait_tid]) as copy_tid:
         comm_core = pl.tile.get_block_idx()
-        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), SP_COMM_WORKERS):
+        for block in pl.range(comm_core, GROUP_T * (D // COMM_STAGE_TILE), SP_COMM_WORKERS):
             row = block // (D // COMM_STAGE_TILE)
             col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
             gathered_x_tile = gather_x[row : row + 1, col : col + COMM_STAGE_TILE]
             gathered_x[row : row + 1, col : col + COMM_STAGE_TILE] = gathered_x_tile
-        for scale_block in pl.range(comm_core, T // SH_AMAX_TILE, SP_COMM_WORKERS):
+        for scale_block in pl.range(comm_core, GROUP_T // SH_AMAX_TILE, SP_COMM_WORKERS):
             row = scale_block * SH_AMAX_TILE
             gathered_scale[row : row + SH_AMAX_TILE, :] = gather_scale[row : row + SH_AMAX_TILE, :]
 
@@ -489,9 +489,9 @@ def gather_sp_input(
 
 @pl.jit.inline(auto_scope=False)
 def reduce_scatter_sp_partial(
-    partial: pl.Tensor[[T, D], pl.FP32],
+    partial: pl.Tensor[[GROUP_T, D], pl.FP32],
     sh_local: pl.Tensor[[SP_T, D], pl.BF16],
-    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    scatter: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
     scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
@@ -501,7 +501,7 @@ def reduce_scatter_sp_partial(
 
     with pl.spmd(COMM_WORKERS, name_hint="sh_sp_tp_scatter_publish") as publish_tid:
         comm_core = pl.tile.get_block_idx()
-        for block in pl.range(comm_core, T * (D // COMM_STAGE_TILE), COMM_WORKERS):
+        for block in pl.range(comm_core, GROUP_T * (D // COMM_STAGE_TILE), COMM_WORKERS):
             source_row = block // (D // COMM_STAGE_TILE)
             col = block % (D // COMM_STAGE_TILE) * COMM_STAGE_TILE
             owner_tp = source_row // SP_T
@@ -584,16 +584,16 @@ def expert_shared_sp_tp(
     shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh_local: pl.Tensor[[SP_T, D], pl.BF16],
-    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
-    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
-    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    gather_x: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+    scatter: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run the shared expert across contiguous SP and TP rank groups."""
-    gathered_x = pl.create_tensor([T, D], dtype=pl.INT8)
-    gathered_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
+    gathered_x = pl.create_tensor([GROUP_T, D], dtype=pl.INT8)
+    gathered_scale = pl.create_tensor([GROUP_T, 1], dtype=pl.FP32)
     gather_sp_input(
         x_local_i8, x_local_scale_dq,
         gathered_x, gathered_scale,
@@ -601,15 +601,15 @@ def expert_shared_sp_tp(
         my_rank,
     )
 
-    h_local = pl.create_tensor([T, LOCAL_INTER], dtype=pl.FP32)
-    local_amax = pl.create_tensor([T, SH_AMAX_TILE], dtype=pl.FP32)
+    h_local = pl.create_tensor([GROUP_T, LOCAL_INTER], dtype=pl.FP32)
+    local_amax = pl.create_tensor([GROUP_T, SH_AMAX_TILE], dtype=pl.FP32)
     shared_gate_up_local(
         gathered_x, gathered_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         h_local, local_amax,
     )
 
-    partial = pl.create_tensor([T, D], dtype=pl.FP32)
+    partial = pl.create_tensor([GROUP_T, D], dtype=pl.FP32)
     shared_down_local(h_local, local_amax, shared_w2, shared_w2_scale, partial)
     return reduce_scatter_sp_partial(partial, sh_local, scatter, scatter_signal, my_rank)
 
@@ -628,9 +628,9 @@ def _bind_run_expert_shared():
             shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
             shared_w2_scale: pl.Tensor[[D], pl.FP32],
             sh_local: pl.Tensor[[SP_T, D], pl.BF16],
-            gather_x: pld.DistributedTensor[[T, D], pl.INT8],
-            gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
-            scatter: pld.DistributedTensor[[T, D], pl.FP32],
+            gather_x: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+            gather_scale: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+            scatter: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
             gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
             scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -654,9 +654,9 @@ def _bind_run_expert_shared():
             shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
             shared_w2_scale: pl.Tensor[[D], pl.FP32],
             sh_local: pl.Tensor[[SP_T, D], pl.BF16],
-            gather_x: pld.DistributedTensor[[T, D], pl.INT8],
-            gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
-            scatter: pld.DistributedTensor[[T, D], pl.FP32],
+            gather_x: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+            gather_scale: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+            scatter: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
             gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
             scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
             my_rank: pl.Scalar[pl.INT32],
@@ -687,9 +687,9 @@ def expert_shared_sp_tp_test(
     shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     sh: pl.Out[pl.Tensor[[SP_T, D], pl.BF16]],
-    gather_x: pld.DistributedTensor[[T, D], pl.INT8],
-    gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
-    scatter: pld.DistributedTensor[[T, D], pl.FP32],
+    gather_x: pld.DistributedTensor[[GROUP_T, D], pl.INT8],
+    gather_scale: pld.DistributedTensor[[GROUP_T, 1], pl.FP32],
+    scatter: pld.DistributedTensor[[GROUP_T, D], pl.FP32],
     gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
@@ -719,16 +719,16 @@ def l3_expert_shared_sp_tp(
     sh: pl.Out[pl.Tensor[[TP_SIZE, SP_T, D], pl.BF16]],
 ):
     """Launch one SP-local shared-expert rank per TP shard."""
-    gather_x_buf = pld.alloc_window_buffer([T, D], dtype=pl.INT8)
-    gather_scale_buf = pld.alloc_window_buffer([T, 1], dtype=pl.FP32)
-    scatter_buf = pld.alloc_window_buffer([T, D], dtype=pl.FP32)
+    gather_x_buf = pld.alloc_window_buffer([GROUP_T, D], dtype=pl.INT8)
+    gather_scale_buf = pld.alloc_window_buffer([GROUP_T, 1], dtype=pl.FP32)
+    scatter_buf = pld.alloc_window_buffer([GROUP_T, D], dtype=pl.FP32)
     gather_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
     scatter_signal_buf = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
 
     for rank in pl.range(TP_SIZE):
-        gather_x = pld.window(gather_x_buf, [T, D], dtype=pl.INT8)
-        gather_scale = pld.window(gather_scale_buf, [T, 1], dtype=pl.FP32)
-        scatter = pld.window(scatter_buf, [T, D], dtype=pl.FP32)
+        gather_x = pld.window(gather_x_buf, [GROUP_T, D], dtype=pl.INT8)
+        gather_scale = pld.window(gather_scale_buf, [GROUP_T, 1], dtype=pl.FP32)
+        scatter = pld.window(scatter_buf, [GROUP_T, D], dtype=pl.FP32)
         gather_signal = pld.window(gather_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         scatter_signal = pld.window(scatter_signal_buf, [TP_SIZE, 1], dtype=pl.INT32)
         expert_shared_sp_tp_test(
@@ -778,8 +778,8 @@ def golden_expert_shared_sp_tp(tensors):
 
     from utils import int8_quant_per_row
 
-    x_group_i8 = tensors["x_local_i8"].reshape(T, D)
-    x_group_scale = tensors["x_local_scale_dq"].reshape(T, 1)
+    x_group_i8 = tensors["x_local_i8"].reshape(GROUP_T, D)
+    x_group_scale = tensors["x_local_scale_dq"].reshape(GROUP_T, 1)
     x_group = x_group_i8.float() * x_group_scale.float()
 
     partials = []
@@ -877,7 +877,7 @@ def build_local_tensor_specs():
     from golden import TensorSpec
     from utils import int8_quant_per_row
 
-    x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
+    x_local_bf16 = torch.randn(SP_T, D, dtype=torch.bfloat16)
     x_local_i8, x_local_scale_dq = int8_quant_per_row(x_local_bf16)
 
     shared_dequant_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
@@ -886,15 +886,15 @@ def build_local_tensor_specs():
     sw2_i8, sw2_scale = gen_shared_weight((D, MOE_INTER), shared_dequant_std["w2"], chan_cv=0.33)
 
     return [
-        TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8),
-        TensorSpec("x_local_scale_dq", [T, 1], torch.float32, init_value=lambda: x_local_scale_dq.float()),
+        TensorSpec("x_local_i8", [SP_T, D], torch.int8, init_value=lambda: x_local_i8),
+        TensorSpec("x_local_scale_dq", [SP_T, 1], torch.float32, init_value=lambda: x_local_scale_dq.float()),
         TensorSpec("shared_w1", [MOE_INTER, D], torch.int8, init_value=lambda: sw1_i8),
         TensorSpec("shared_w1_scale", [MOE_INTER], torch.float32, init_value=lambda: sw1_scale),
         TensorSpec("shared_w3", [MOE_INTER, D], torch.int8, init_value=lambda: sw3_i8),
         TensorSpec("shared_w3_scale", [MOE_INTER], torch.float32, init_value=lambda: sw3_scale),
         TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
         TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_scale),
-        TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
+        TensorSpec("sh", [SP_T, D], torch.bfloat16, is_output=True),
     ]
 
 
@@ -905,7 +905,7 @@ def build_sp_tensor_specs():
     from golden import TensorSpec
     from utils import int8_quant_per_row
 
-    x_group_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
+    x_group_bf16 = torch.randn(GROUP_T, D, dtype=torch.bfloat16)
     x_group_i8, x_group_scale_dq = int8_quant_per_row(x_group_bf16)
     x_local_i8 = x_group_i8.reshape(TP_SIZE, SP_T, D).contiguous()
     x_local_scale_dq = x_group_scale_dq.float().reshape(TP_SIZE, SP_T, 1).contiguous()
@@ -945,9 +945,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument(
-        "--tp-shared-expert", "--tp", dest="tp", type=int,
+        "--tp-shared-expert", dest="tp", type=int,
         default=TP_SIZE, choices=list(_TP_CHOICES),
-        help="shared-expert tensor-parallel world size; 1 disables shared TP",
+        help=(
+            f"experimental shared-weight TP degree inside physical SP{SP_SIZE}; "
+            "1 uses replicated weights without shared TP collectives"
+        ),
     )
     default_devices = ",".join(str(rank) for rank in range(TP_SIZE))
     parser.add_argument(
@@ -967,7 +970,9 @@ if __name__ == "__main__":
 
     device_ids = [int(device) for device in args.device.split(",")]
     if args.tp != TP_SIZE:
-        raise ValueError(f"import-time TP size must match --tp, got {TP_SIZE} and {args.tp}")
+        raise ValueError(
+            f"import-time shared-expert TP must match --tp-shared-expert, got {TP_SIZE} and {args.tp}"
+        )
     if len(device_ids) < TP_SIZE:
         raise ValueError(f"need at least {TP_SIZE} devices for TP, got {device_ids}")
 

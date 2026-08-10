@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 MoE decode with EP routed experts and optional SP+TP shared experts."""
+"""DeepSeek-V4 MoE decode with EP routing and experimental shared-weight TP."""
 
 
 # Sub-kernels freeze distributed sizes into their shapes at import time, so
@@ -19,8 +19,8 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
-_TP_CHOICES = (1, 2, 4, 8)
-_TP_DEFAULT = 2
+_TP_CHOICES = (1, 2, 4)
+_TP_DEFAULT = 1
 
 
 def _parse_ep_argv():
@@ -33,31 +33,32 @@ def _parse_ep_argv():
 
 
 def _parse_tp_argv():
-    for name in ("--tp-shared-expert", "--tp"):
-        for i, tok in enumerate(sys.argv):
-            if tok == name and i + 1 < len(sys.argv):
-                return int(sys.argv[i + 1])
-            if tok.startswith(f"{name}="):
-                return int(tok.split("=", 1)[1])
+    for i, tok in enumerate(sys.argv):
+        if tok == "--tp-shared-expert" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if tok.startswith("--tp-shared-expert="):
+            return int(tok.split("=", 1)[1])
     return _TP_DEFAULT
 
 
 EP = _parse_ep_argv()
 TP_SIZE = _parse_tp_argv()
+SP_SIZE = config.TP
 if EP not in _EP_CHOICES:
     raise ValueError(f"--ep must be one of {_EP_CHOICES}, got {EP}")
 if TP_SIZE not in _TP_CHOICES:
     raise ValueError(f"--tp-shared-expert must be one of {_TP_CHOICES}, got {TP_SIZE}")
 if EP % TP_SIZE != 0:
     raise ValueError(f"--ep must be divisible by --tp-shared-expert, got ep={EP}, tp={TP_SIZE}")
-if config.DECODE_TOKENS % TP_SIZE != 0:
+if SP_SIZE % TP_SIZE != 0:
     raise ValueError(
-        f"decode tokens must be divisible by --tp-shared-expert, "
-        f"got {config.DECODE_TOKENS} and {TP_SIZE}"
+        f"--tp-shared-expert must divide physical SP {SP_SIZE}, got {TP_SIZE}"
     )
+if config.DECODE_TOKENS % SP_SIZE != 0:
+    raise ValueError(f"decode tokens {config.DECODE_TOKENS} must be divisible by physical SP {SP_SIZE}")
 config.EP = EP
 config.TP_SHARED_EXPERT = TP_SIZE
-config.MOE_TOKENS = config.DECODE_TOKENS // TP_SIZE
+config.MOE_TOKENS = config.DECODE_TOKENS // SP_SIZE
 config.FLASH = dataclasses.replace(config.FLASH, n_routed_experts=config.FLASH.n_routed_experts // 16 * EP)
 config.RECV_MAX = EP * config.MOE_TOKENS
 
@@ -70,11 +71,10 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_routed import expert_routed
-from expert_shared import LOCAL_INTER, SP_T, run_expert_shared
+from expert_shared import GROUP_T, LOCAL_INTER, SP_T, run_expert_shared
 
 
 T = MOE_TOKENS
-GROUP_T = config.DECODE_TOKENS
 D = M.hidden_size
 TOPK = M.num_experts_per_tok
 VOCAB = M.vocab_size
@@ -104,6 +104,8 @@ assert N_EXPERTS_GLOBAL == N_RANKS * N_LOCAL
 assert RECV_MAX == N_RANKS * MAX_PER_SRC
 if T != SP_T:
     raise ValueError("MoE token rows must match the shared-expert SP shard")
+if GROUP_T != T * TP_SIZE:
+    raise ValueError("shared-expert group rows must match local SP rows times the experimental degree")
 
 
 @pl.jit.inline
@@ -1054,9 +1056,12 @@ if __name__ == "__main__":
     parser.add_argument("--ep", type=int, default=_EP_DEFAULT, choices=list(_EP_CHOICES),
                         help="EP world size / rank count")
     parser.add_argument(
-        "--tp-shared-expert", "--tp", dest="tp", type=int,
+        "--tp-shared-expert", dest="tp", type=int,
         default=_TP_DEFAULT, choices=list(_TP_CHOICES),
-        help="shared-expert TP size within each contiguous EP rank group; 1 disables shared TP",
+        help=(
+            f"experimental shared-weight TP degree inside physical SP{SP_SIZE}; "
+            "1 uses replicated weights without shared TP collectives"
+        ),
     )
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
