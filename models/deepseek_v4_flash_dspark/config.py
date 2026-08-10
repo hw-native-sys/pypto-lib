@@ -269,16 +269,17 @@ FP32_NEG_INF = -3.4028234663852886e38     # most-negative finite fp32 (softmax m
 
 # Parallelism constants
 TP = 4         # tensor-parallel ranks per DP group
+SP = TP        # sequence-parallel token owners in the TP group
 DP = 4         # DP groups per node
 EP = 16        # expert-parallel world size (moe overrides it from --ep)
 
 # Per-component TP degree, over the components that shard.
-TP_Q_B = TP            # wq_b: ColumnParallel over heads
-TP_O_A = TP            # wo_a: ColumnParallel over o_groups
-TP_O_B = TP            # wo_b: RowParallel, then allreduce
-TP_ATTN_SINK = TP      # attn_sink: one entry per local head
-TP_SHARED_EXPERT = TP  # shared expert: gate_up ColumnParallel, down RowParallel then allreduce
-TP_VOCAB = TP          # embed_tokens / lm_head: vocab-parallel
+TP_Q_B = 1            # wq_b: replicated across the DSA-CP group
+TP_O_A = TP           # wo_a: ColumnParallel over o_groups
+TP_O_B = TP           # wo_b: RowParallel, then reduce-scatter
+TP_ATTN_SINK = 1      # attn_sink: all attention heads on every DSA-CP rank
+TP_SHARED_EXPERT = 1  # shared expert: sequence-parallel with replicated weights
+TP_VOCAB = TP         # embed_tokens / lm_head: vocab-parallel
 
 # MoE constants
 MOE_TOKENS = DECODE_TOKENS * DP // EP
