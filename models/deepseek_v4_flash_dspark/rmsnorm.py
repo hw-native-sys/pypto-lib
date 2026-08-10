@@ -15,7 +15,7 @@ from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREF
 
 
 # Dynamic shape variables.
-T_DYN = pl.dynamic("T_DYN")  # T = B * S
+T_DYN = pl.dynamic("RMSNORM_T_DYN")  # T = B * S
 
 
 # model config

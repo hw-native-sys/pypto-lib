@@ -6,13 +6,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+# ci: devices=4
 """DeepSeek-V4 Q/KV LoRA + RoPE (dynamic shape): projects token-major
 attention-normalized inputs for both decode and prefill attention paths."""
 
 
 import pypto.language as pl
+import pypto.language.distributed as pld
+from pypto.ir.distributed_compiled_program import DistributedConfig
 
-from config import FLASH as M, DECODE_BATCH, DECODE_SEQ, TP, PREFILL_BATCH, PREFILL_SEQ, INT8_SCALE_MAX, INT8_AMAX_EPS
+from attention_tp import GROUP_T_MAX, TP_CHOICES, TP_Q_B_SIZE, gather_sp_bf16
+from config import (
+    DECODE_BATCH,
+    DECODE_SEQ,
+    FLASH as M,
+    INT8_AMAX_EPS,
+    INT8_SCALE_MAX,
+    PREFILL_BATCH,
+    PREFILL_SEQ,
+    TP,
+)
 
 
 # Dynamic shape variables. The q branch, the kv branch and the rope tables each
@@ -26,6 +39,11 @@ ROPE_T_DYN = pl.dynamic("ROPE_T_DYN")
 D = M.hidden_size
 H = M.num_attention_heads
 HEAD_DIM = M.head_dim
+Q_DIM = H * HEAD_DIM
+TP_SIZE = TP_Q_B_SIZE
+LOCAL_H = H // TP_SIZE
+LOCAL_Q = LOCAL_H * HEAD_DIM
+SP_T = GROUP_T_MAX // TP_SIZE
 ROPE_DIM = M.qk_rope_head_dim
 ROPE_HALF = ROPE_DIM // 2
 NOPE_DIM = M.nope_head_dim
@@ -56,6 +74,9 @@ KV_RMS_T_TILE = 8               # kv rms-norm + rope fused token (T) tile
 Q_ROPE_T_TILE = 8
 Q_ROPE_H_TILE = 4               # heads per fused qproj dequant/rms/rope task
 assert QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
+assert H % TP_SIZE == 0
+assert LOCAL_H % Q_ROPE_H_TILE == 0
+assert LOCAL_Q % QPROJ_MM_N_TILE == 0
 
 
 @pl.jit.inline
@@ -122,18 +143,20 @@ def rope_prepare(
 def q_proj_rope(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
-    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
-    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wq_b: pl.Tensor,
+    wq_b_scale: pl.Tensor,
     gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
     rope_cos_il: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_sin_signed: pl.Tensor[[T_DYN, ROPE_DIM], pl.FP32],
     rope_swap_idx: pl.Tensor[[T_DYN, ROPE_DIM], pl.INT32],
-    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    q: pl.Tensor,
     qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
     qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
 ):
     """Q LoRA (wq_a -> rms/quant -> wq_b) + per-head RMSNorm + interleaved RoPE."""
     t_dim = pl.tensor.dim(x, 0)
+    q_heads = pl.tensor.dim(q, 1)
+    q_dim = q_heads * HEAD_DIM
     x_view = pl.reshape(x, [t_dim, D])
     t_matmul = ((t_dim + MATMUL_T_TILE - 1) // MATMUL_T_TILE) * MATMUL_T_TILE  # ceil to whole 16-row cube tiles
 
@@ -207,9 +230,9 @@ def q_proj_rope(
             qr_i8_matmul[tg : tg + T_TILE, qa : qa + QUANT_TILE] = qr_q_i8
 
     # Pure-matmul qproj scope (cube, INT32 -> GM), unmixed with downstream vector work.
-    q_proj_i32 = pl.create_tensor([t_matmul, H * HEAD_DIM], dtype=pl.INT32)
+    q_proj_i32 = pl.create_tensor([t_matmul, q_dim], dtype=pl.INT32)
     # One output-column fragment per task.
-    for qproj_n_idx in pl.spmd((H * HEAD_DIM) // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
+    for qproj_n_idx in pl.spmd(q_dim // QPROJ_MM_N_TILE, name_hint="qproj_matmul"):
         w_col0 = qproj_n_idx * QPROJ_MM_N_TILE
         for t0 in pl.range(0, t_matmul, QPROJ_M_TILE):
             col_acc = pl.create_tensor([QPROJ_M_TILE, QPROJ_MM_N_TILE], dtype=pl.INT32)
@@ -224,8 +247,8 @@ def q_proj_rope(
 
     # Fused qproj dequant, per-head RMSNorm, NOPE writeback, and interleaved RoPE.
     # RoPE: out[j] = inv_rms * (x[j] * cos[j] + x[j^1] * sign[j] * sin[j]).
-    q_flat = pl.reshape(q, [t_dim, H * HEAD_DIM])
-    for hg_idx in pl.spmd(H // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
+    q_flat = pl.reshape(q, [t_dim, q_dim])
+    for hg_idx in pl.spmd(q_heads // Q_ROPE_H_TILE, name_hint="qproj_dequant_rms_nope_rope", allow_early_resolve=True):
         hg = hg_idx * Q_ROPE_H_TILE
         for tg in pl.range(0, t_dim, Q_ROPE_T_TILE):
             qr_scale_dq_t = qr_scale_view[tg : tg + Q_ROPE_T_TILE, :]
@@ -386,6 +409,82 @@ def qkv_proj_rope(
     return q
 
 
+@pl.jit.inline(auto_scope=False)
+def qkv_proj_rope_local(
+    x: pl.Tensor[[T_DYN, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[T_DYN, LOCAL_H, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[T_DYN, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[T_DYN, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[T_DYN, 1], pl.FP32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project one TP rank's local Q-head shard and the replicated KV branch."""
+    t_dim = pl.tensor.dim(x, 0)
+    rope_cos_il = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.FP32)
+    rope_swap_idx = pl.create_tensor([t_dim, ROPE_DIM], dtype=pl.INT32)
+    rope_prepare(rope_cos, rope_sin, rope_cos_il, rope_sin_signed, rope_swap_idx)
+    q_proj_rope(
+        x, wq_a, wq_b, wq_b_scale, gamma_cq,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        q, qr, qr_scale,
+    )
+    kv_proj_rope(
+        x, wkv, gamma_ckv,
+        rope_cos_il, rope_sin_signed, rope_swap_idx,
+        kv, late_dep,
+    )
+    return q
+
+
+@pl.jit.inline(auto_scope=False)
+def qkv_proj_rope_tp(
+    x_local: pl.Tensor[[SP_T, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Tensor[[GROUP_T_MAX, LOCAL_H, HEAD_DIM], pl.BF16],
+    kv: pl.Tensor[[GROUP_T_MAX, HEAD_DIM], pl.BF16],
+    qr: pl.Tensor[[GROUP_T_MAX, Q_LORA], pl.INT8],
+    qr_scale: pl.Tensor[[GROUP_T_MAX, 1], pl.FP32],
+    gather_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    late_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Gather SP rows and project one rank-local Q-head shard."""
+    x_group = pl.create_tensor([GROUP_T_MAX, D], dtype=pl.BF16)
+    gather_sp_bf16(
+        x_local,
+        x_group,
+        gather_window,
+        gather_signal,
+        my_rank,
+        late_dep,
+    )
+    return qkv_proj_rope_local(
+        x_group,
+        wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos, rope_sin,
+        gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
+        late_dep,
+    )
+
+
 @pl.jit
 def qkv_proj_rope_test(
     x: pl.Tensor[[T_DYN, D], pl.BF16],
@@ -421,6 +520,70 @@ def qkv_proj_rope_test(
         late_dep,
     )
     return q
+
+
+@pl.jit
+def qkv_proj_rope_tp_test(
+    x_local: pl.Tensor[[SP_T, D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    q: pl.Out[pl.Tensor[[GROUP_T_MAX, LOCAL_H, HEAD_DIM], pl.BF16]],
+    kv: pl.Out[pl.Tensor[[GROUP_T_MAX, HEAD_DIM], pl.BF16]],
+    qr: pl.Out[pl.Tensor[[GROUP_T_MAX, Q_LORA], pl.INT8]],
+    qr_scale: pl.Out[pl.Tensor[[GROUP_T_MAX, 1], pl.FP32]],
+    gather_window: pld.DistributedTensor[[GROUP_T_MAX, D], pl.BF16],
+    gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+):
+    late_dep = pl.system.task_dummy(deps=[])
+    return qkv_proj_rope_tp(
+        x_local,
+        wq_a, wq_b, wq_b_scale, wkv,
+        rope_cos, rope_sin,
+        gamma_cq, gamma_ckv,
+        q, kv, qr, qr_scale,
+        gather_window, gather_signal, my_rank, late_dep,
+    )
+
+
+@pl.jit.host
+def l3_qkv_proj_rope_tp(
+    x_local: pl.Tensor[[TP_SIZE, SP_T, D], pl.BF16],
+    wq_a: pl.Tensor[[TP_SIZE, D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[TP_SIZE, Q_LORA, LOCAL_Q], pl.INT8],
+    wq_b_scale: pl.Tensor[[TP_SIZE, LOCAL_Q], pl.FP32],
+    wkv: pl.Tensor[[TP_SIZE, D, HEAD_DIM], pl.BF16],
+    rope_cos: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    rope_sin: pl.Tensor[[TP_SIZE, GROUP_T_MAX, ROPE_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[TP_SIZE, Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[TP_SIZE, HEAD_DIM], pl.BF16],
+    q: pl.Out[pl.Tensor[[TP_SIZE, GROUP_T_MAX, LOCAL_H, HEAD_DIM], pl.BF16]],
+    kv: pl.Out[pl.Tensor[[TP_SIZE, GROUP_T_MAX, HEAD_DIM], pl.BF16]],
+    qr: pl.Out[pl.Tensor[[TP_SIZE, GROUP_T_MAX, Q_LORA], pl.INT8]],
+    qr_scale: pl.Out[pl.Tensor[[TP_SIZE, GROUP_T_MAX, 1], pl.FP32]],
+):
+    gather_window_buffer = pld.alloc_window_buffer([GROUP_T_MAX, D], dtype=pl.BF16)
+    gather_signal_buffer = pld.alloc_window_buffer([TP_SIZE, 1], dtype=pl.INT32)
+
+    for rank in pl.range(pld.world_size()):
+        gather_window = pld.window(gather_window_buffer, [GROUP_T_MAX, D], dtype=pl.BF16)
+        gather_signal = pld.window(gather_signal_buffer, [TP_SIZE, 1], dtype=pl.INT32)
+        qkv_proj_rope_tp_test(
+            x_local[rank],
+            wq_a[rank], wq_b[rank], wq_b_scale[rank], wkv[rank],
+            rope_cos[rank], rope_sin[rank],
+            gamma_cq[rank], gamma_ckv[rank],
+            q[rank], kv[rank], qr[rank], qr_scale[rank],
+            gather_window, gather_signal, rank,
+            device=rank,
+        )
+    return q, kv, qr, qr_scale
 
 
 # Split-branch coverage geometry: q on a CP-local token slice, kv on the full run.
@@ -570,7 +733,8 @@ def golden_qkv_proj_rope(tensors):
     # flash: also quantizes wq_a/wkv to fp8 (default Linear dtype).
     qr_i8, qr_scale = int8_quant_per_row(qr_out.float())
     q_i32 = torch.matmul(qr_i8.to(torch.int32), wq_b.to(torch.int32))
-    q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, H, HEAD_DIM)
+    q_heads = wq_b.shape[1] // HEAD_DIM
+    q_full = (q_i32.float() * qr_scale * wq_b_scale.view(1, -1)).view(t_dim, q_heads, HEAD_DIM)
     inv = torch.rsqrt(q_full.square().mean(-1, keepdim=True) + EPS)
     q_full = q_full * inv                                            # per-head RMSNorm (no gamma)
     q_nope = q_full[..., :NOPE_DIM]
@@ -588,6 +752,38 @@ def golden_qkv_proj_rope(tensors):
     tensors["kv"][:] = kv_out.to(torch.bfloat16)
     tensors["qr"][:] = qr_i8
     tensors["qr_scale"][:] = qr_scale
+
+
+def golden_qkv_proj_rope_tp(tensors):
+    """Torch reference for SP-gathered inputs and rank-local Q-head shards."""
+    import torch
+
+    x_group = torch.cat([tensors["x_local"][rank] for rank in range(TP_SIZE)], dim=0)
+    q_full = torch.zeros(GROUP_T_MAX, H, HEAD_DIM, dtype=torch.bfloat16)
+    kv_full = torch.zeros(GROUP_T_MAX, HEAD_DIM, dtype=torch.bfloat16)
+    qr_full = torch.zeros(GROUP_T_MAX, Q_LORA, dtype=torch.int8)
+    qr_scale_full = torch.zeros(GROUP_T_MAX, 1, dtype=torch.float32)
+    golden_qkv_proj_rope({
+        "x": x_group,
+        "wq_a": tensors["wq_a"][0],
+        "wq_b": torch.cat([tensors["wq_b"][rank] for rank in range(TP_SIZE)], dim=1),
+        "wq_b_scale": torch.cat([tensors["wq_b_scale"][rank] for rank in range(TP_SIZE)]),
+        "wkv": tensors["wkv"][0],
+        "rope_cos": tensors["rope_cos"][0],
+        "rope_sin": tensors["rope_sin"][0],
+        "gamma_cq": tensors["gamma_cq"][0],
+        "gamma_ckv": tensors["gamma_ckv"][0],
+        "q": q_full,
+        "kv": kv_full,
+        "qr": qr_full,
+        "qr_scale": qr_scale_full,
+    })
+    for rank in range(TP_SIZE):
+        head_start = rank * LOCAL_H
+        tensors["q"][rank].copy_(q_full[:, head_start : head_start + LOCAL_H])
+        tensors["kv"][rank].copy_(kv_full)
+        tensors["qr"][rank].copy_(qr_full)
+        tensors["qr_scale"][rank].copy_(qr_scale_full)
 
 
 def build_tensor_specs(B, S):
@@ -643,44 +839,139 @@ def build_tensor_specs(B, S):
     ]
 
 
+def build_tp_tensor_specs(B, S):
+    import torch
+    from golden import TensorSpec
+
+    group_t = B * S
+    if group_t != GROUP_T_MAX:
+        raise ValueError(f"standalone TP fixture requires {GROUP_T_MAX} group rows, got {group_t}")
+
+    def quant_w_per_output_channel(w):
+        amax = w.float().abs().amax(dim=0).clamp_min(INT8_AMAX_EPS)
+        scale_quant = INT8_SCALE_MAX / amax
+        scaled = w.float() * scale_quant.view(1, Q_DIM)
+        w_i32 = torch.round(scaled).to(torch.int32)
+        w_i32 = torch.clamp(w_i32, -int(INT8_SCALE_MAX), int(INT8_SCALE_MAX))
+        w_i8 = w_i32.to(torch.float16).to(torch.int8)
+        return w_i8, (1.0 / scale_quant).float()
+
+    x_group = torch.empty([GROUP_T_MAX, D], dtype=torch.bfloat16).uniform_(-1, 1)
+    x_local = x_group.reshape(TP_SIZE, SP_T, D).contiguous()
+    wq_a_one = torch.empty([D, Q_LORA], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
+    wq_b_full = torch.empty([Q_LORA, Q_DIM], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
+    wq_b_full_i8, wq_b_full_scale = quant_w_per_output_channel(wq_b_full)
+    wq_b = torch.stack([chunk.contiguous() for chunk in torch.chunk(wq_b_full_i8, TP_SIZE, dim=1)])
+    wq_b_scale = wq_b_full_scale.reshape(TP_SIZE, LOCAL_Q).contiguous()
+    wkv_one = torch.empty([D, HEAD_DIM], dtype=torch.bfloat16).uniform_(-0.1, 0.1)
+    rope_cos_one = torch.empty([GROUP_T_MAX, ROPE_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
+    rope_sin_one = torch.empty([GROUP_T_MAX, ROPE_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
+    gamma_cq_one = torch.empty([Q_LORA], dtype=torch.bfloat16).uniform_(-1, 1)
+    gamma_ckv_one = torch.empty([HEAD_DIM], dtype=torch.bfloat16).uniform_(-1, 1)
+
+    wq_a = wq_a_one.unsqueeze(0).repeat(TP_SIZE, 1, 1).contiguous()
+    wkv = wkv_one.unsqueeze(0).repeat(TP_SIZE, 1, 1).contiguous()
+    rope_cos = rope_cos_one.unsqueeze(0).repeat(TP_SIZE, 1, 1).contiguous()
+    rope_sin = rope_sin_one.unsqueeze(0).repeat(TP_SIZE, 1, 1).contiguous()
+    gamma_cq = gamma_cq_one.unsqueeze(0).repeat(TP_SIZE, 1).contiguous()
+    gamma_ckv = gamma_ckv_one.unsqueeze(0).repeat(TP_SIZE, 1).contiguous()
+
+    return [
+        TensorSpec("x_local", [TP_SIZE, SP_T, D], torch.bfloat16, init_value=lambda: x_local),
+        TensorSpec("wq_a", [TP_SIZE, D, Q_LORA], torch.bfloat16, init_value=lambda: wq_a, resident="stacked"),
+        TensorSpec("wq_b", [TP_SIZE, Q_LORA, LOCAL_Q], torch.int8, init_value=lambda: wq_b, resident="stacked"),
+        TensorSpec("wq_b_scale", [TP_SIZE, LOCAL_Q], torch.float32, init_value=lambda: wq_b_scale, resident="stacked"),
+        TensorSpec("wkv", [TP_SIZE, D, HEAD_DIM], torch.bfloat16, init_value=lambda: wkv, resident="stacked"),
+        TensorSpec("rope_cos", [TP_SIZE, GROUP_T_MAX, ROPE_DIM], torch.bfloat16, init_value=lambda: rope_cos),
+        TensorSpec("rope_sin", [TP_SIZE, GROUP_T_MAX, ROPE_DIM], torch.bfloat16, init_value=lambda: rope_sin),
+        TensorSpec("gamma_cq", [TP_SIZE, Q_LORA], torch.bfloat16, init_value=lambda: gamma_cq),
+        TensorSpec("gamma_ckv", [TP_SIZE, HEAD_DIM], torch.bfloat16, init_value=lambda: gamma_ckv),
+        TensorSpec("q", [TP_SIZE, GROUP_T_MAX, LOCAL_H, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("kv", [TP_SIZE, GROUP_T_MAX, HEAD_DIM], torch.bfloat16, is_output=True),
+        TensorSpec("qr", [TP_SIZE, GROUP_T_MAX, Q_LORA], torch.int8, is_output=True),
+        TensorSpec("qr_scale", [TP_SIZE, GROUP_T_MAX, 1], torch.float32, is_output=True),
+    ]
+
+
 if __name__ == "__main__":
     import argparse
     from golden import ratio_allclose, run_jit
 
     MODES = {
-        "decode":  (DECODE_BATCH // TP, DECODE_SEQ),
+        "decode":  (DECODE_BATCH // TP if TP_SIZE == 1 else DECODE_BATCH, DECODE_SEQ),
         "prefill": (PREFILL_BATCH, PREFILL_SEQ),
     }
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3",
                         choices=["a2a3", "a2a3sim", "a5", "a5sim"])
-    parser.add_argument("-d", "--device", type=int, default=0)
+    parser.add_argument("--tp", type=int, default=None, choices=list(TP_CHOICES))
+    parser.add_argument("--tp-q-b", type=int, default=TP_Q_B_SIZE, choices=list(TP_CHOICES))
+    parser.add_argument("-d", "--device", type=str, default=",".join(str(rank) for rank in range(TP_SIZE)))
     parser.add_argument("--mode", choices=["decode", "prefill", "split", "all"], default="all",
                         help="decode / prefill batch sizes, 'split' for mismatched q and kv rows, or 'all'.")
     parser.add_argument("--enable-l2-swimlane", type=int, choices=[0, 1, 2, 4], default=0,
                         help="L2 swimlane level: 0=off, 1=per-kernel AICore timing "
                              "(prints the per-function Task Statistics table), 2=+AICPU timing.")
     parser.add_argument("--runtime-dir", type=str, default=None)
+    parser.add_argument("--save-data", action="store_true", default=False)
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+    if args.tp_q_b != TP_Q_B_SIZE:
+        raise ValueError(f"import-time Q-B TP {TP_Q_B_SIZE} does not match --tp-q-b {args.tp_q_b}")
+    device_ids = [int(device) for device in args.device.split(",")]
+    needs_distributed = args.mode in ("decode", "all") and TP_SIZE > 1
+    if needs_distributed and len(device_ids) < TP_SIZE:
+        raise ValueError(f"need at least {TP_SIZE} devices, got {device_ids}")
 
     modes_to_run = list(MODES.keys()) + ["split"] if args.mode == "all" else [args.mode]
 
     for mode_name in modes_to_run:
         if mode_name == "split":
-            fn, specs, golden = q_kv_split_test, build_split_tensor_specs(), golden_q_kv_split
+            fn = q_kv_split_test
+            specs = build_split_tensor_specs()
+            golden_fn = golden_q_kv_split
+            compile_cfg = dict(dump_passes=args.dump_passes)
+            runtime_cfg = dict(
+                platform=args.platform,
+                device_id=device_ids[0],
+                enable_l2_swimlane=args.enable_l2_swimlane,
+            )
             print(f"--- qkv_proj_rope split: q rows={SPLIT_T_LOCAL}, kv rows={SPLIT_T_FULL} ---")
         else:
             B, S = MODES[mode_name]
-            fn, specs, golden = qkv_proj_rope_test, build_tensor_specs(B, S), golden_qkv_proj_rope
             print(f"--- qkv_proj_rope {mode_name}: B={B}, S={S} ---")
+            if mode_name != "decode" or TP_SIZE == 1:
+                fn = qkv_proj_rope_test
+                specs = build_tensor_specs(B, S)
+                golden_fn = golden_qkv_proj_rope
+                compile_cfg = dict(dump_passes=args.dump_passes)
+                runtime_cfg = dict(
+                    platform=args.platform,
+                    device_id=device_ids[0],
+                    enable_l2_swimlane=args.enable_l2_swimlane,
+                )
+            else:
+                fn = l3_qkv_proj_rope_tp
+                specs = build_tp_tensor_specs(B, S)
+                golden_fn = golden_qkv_proj_rope_tp
+                compile_cfg = dict(
+                    dump_passes=args.dump_passes,
+                    distributed_config=DistributedConfig(
+                        device_ids=device_ids[:TP_SIZE],
+                        num_sub_workers=0,
+                    ),
+                )
+                runtime_cfg = dict(
+                    platform=args.platform,
+                    enable_l2_swimlane=args.enable_l2_swimlane,
+                )
         result = run_jit(
             fn=fn,
             specs=specs,
-            golden_fn=golden,
+            golden_fn=golden_fn,
             # W8A8C16 q_proj adds INT8 quant/dequant round-off before per-head RMSNorm.
             rtol=5e-3,
             atol=5e-3,
@@ -694,12 +985,9 @@ if __name__ == "__main__":
             },
             runtime_dir=args.runtime_dir,
             golden_data=args.golden_data,
-            compile_cfg=dict(dump_passes=args.dump_passes),
-            runtime_cfg=dict(
-                platform=args.platform,
-                device_id=args.device,
-                enable_l2_swimlane=args.enable_l2_swimlane,
-            ),
+            save_data=args.save_data,
+            compile_cfg=compile_cfg,
+            runtime_cfg=runtime_cfg,
             compile_only=args.compile_only,
         )
         if not result.passed:
