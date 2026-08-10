@@ -141,10 +141,19 @@ PA_BLOCKS = PA_NFRAGS // PA_NF_PER_BLOCK
 assert PA_NFRAGS % PA_NF_PER_BLOCK == 0, "proj_a N-frag loop must cover PA_NFRAGS"
 # proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
 # so the per-group split does not multiply the task count by N-frags. The block count
-# is O_GROUPS * PB_DCHUNKS, so a 3584-column chunk gives 16 * (7168 / 3584) = 32 cube
-# blocks -- one wave over a5's 28 cube cores. Narrower chunks only add dispatch
-# stagger: the cube tile is set by PROJ_B_MM_N_TILE, not by the chunk width.
-PROJ_B_D_CHUNK = 3584
+# is O_GROUPS * PB_DCHUNKS; the cube tile is set by PROJ_B_MM_N_TILE, not by the chunk
+# width, so the chunk only picks the block granularity.
+#
+# 1792 (64 blocks), not the 3584 (32 blocks) that "one wave over a5's 28 cube cores"
+# suggests. The one-wave argument assumes the wave starts together, but proj_b bundle g
+# is gated by its own proj_a -> quant chain, so the 8 bundles enter the cube array
+# staggered over ~80us and the array DRAINS at the end of the tail (AIC occupancy falls
+# 86% -> 64% -> 27% over t=620..700 in the level-4 capture). Half-width chunks halve the
+# quantum a late bundle has to fit into that draining array. Device-measured on the
+# a5 CSA decode case, paired interleaved A/B, 5 reps x 100 rounds: 715.6 -> 709.5us
+# (-6.1). 1024 (112 blocks) gave back the win (+0.4us) -- past 64 blocks the extra
+# matmul setups outweigh the finer fit.
+PROJ_B_D_CHUNK = 1792
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.
 PROJ_B_ACT_T_TILE = 8    # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate

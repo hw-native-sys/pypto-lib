@@ -25,7 +25,26 @@ EPS = M.rms_norm_eps
 # tiling
 D_TILE = 128
 T_TILE = 8
+# Blocks per token-tile. A decode step has t_dim == T == 8 == T_TILE, so the grid was
+# ONE block and rms_norm sat on the observed critical path as 22.4us of single-core
+# work with 83 cores idle (level-4 capture: it is task #4 of the 24-task path, and the
+# 0-88us window averages 5% engine occupancy).
+#
+# The token axis cannot go finer: T_TILE < 8 puts the [1, T_TILE] FP32 row accumulator
+# below the 32-byte alloc-tile row floor and codegen rejects it. So split D instead.
+# Each block recomputes the SAME full-row sum of squares -- deliberately redundant, so
+# the task stays one dispatch with no cross-block reduction -- and then applies the
+# normalization to its own D // RMS_D_SPLIT columns only. Bit-identical: every block
+# derives x_inv_rms from the same inputs in the same chunk order, and the applied
+# column ranges are disjoint.
+#
+# The trade is core-time for wall-time: 4-way costs ~35us of extra vector busy but the
+# task's wall drops 26.1 -> 16.0us in the swimlane. Device-measured on the a5 CSA decode
+# case, paired interleaved A/B, 5 reps x 100 rounds: 715.6 -> 709.7us (-5.9). 2-way gave
+# -4.2us and 7-way -8.1us with more variance, so 4 is the knee.
+RMS_D_SPLIT = 4
 assert D % D_TILE == 0, "D must be divisible by D_TILE"
+assert (D // D_TILE) % RMS_D_SPLIT == 0, "apply-pass D-chunk loop must cover D"
 assert (DECODE_BATCH * DECODE_SEQ) % T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % T_TILE == 0
 
@@ -39,8 +58,10 @@ def rms_norm(
     t_dim = pl.tensor.dim(x, 0)
     # Capture form (not `for ... in pl.spmd`): callers need the producer TaskId to
     # hang a `pl.system.task_dummy` barrier off it and defer non-critical consumers.
-    with pl.spmd(t_dim // T_TILE, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
-        tg_idx = pl.tile.get_block_idx()
+    with pl.spmd((t_dim // T_TILE) * RMS_D_SPLIT, name_hint="rms_norm", allow_early_resolve=True) as rms_tid:
+        rms_blk = pl.tile.get_block_idx()
+        tg_idx = rms_blk // RMS_D_SPLIT
+        rms_dsplit = rms_blk - tg_idx * RMS_D_SPLIT
         tg = tg_idx * T_TILE
         x_sq_sum = pl.full([1, T_TILE], dtype=pl.FP32, value=0.0)
         for rms_db in pl.pipeline(D // D_TILE, stage=2):
@@ -49,8 +70,9 @@ def rms_norm(
             x_sq_sum = pl.add(x_sq_sum, pl.reshape(pl.row_sum(pl.mul(rms_x_chunk, rms_x_chunk)), [1, T_TILE]))
         x_inv_rms = pl.rsqrt(pl.add(pl.mul(x_sq_sum, 1.0 / D), EPS), high_precision=True)
         x_inv_rms_t = pl.reshape(x_inv_rms, [T_TILE, 1])
-        for apply_db in pl.pipeline(D // D_TILE, stage=2):
-            apply_d0 = apply_db * D_TILE
+        apply_dbs = (D // D_TILE) // RMS_D_SPLIT
+        for apply_db in pl.pipeline(apply_dbs, stage=2):
+            apply_d0 = (rms_dsplit * apply_dbs + apply_db) * D_TILE
             apply_x_chunk = pl.cast(x[tg : tg + T_TILE, apply_d0 : apply_d0 + D_TILE], target_type=pl.FP32)
             norm_w_chunk = pl.cast(pl.reshape(norm_w[apply_d0 : apply_d0 + D_TILE], [1, D_TILE]), pl.FP32)
             x_normed_chunk = pl.col_expand_mul(pl.row_expand_mul(apply_x_chunk, x_inv_rms_t), norm_w_chunk)
