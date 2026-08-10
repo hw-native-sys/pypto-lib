@@ -47,25 +47,34 @@ _DP_CHOICES = (2, 4, 8, 16)
 _TP_DEFAULT = 2
 
 
-def _parse_int_argv(name, default=None):
+def _parse_argv(name):
     for i, tok in enumerate(sys.argv):
         if tok == name and i + 1 < len(sys.argv):
-            return int(sys.argv[i + 1])
+            return sys.argv[i + 1]
         if tok.startswith(f"{name}="):
-            return int(tok.split("=", 1)[1])
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _parse_int_argv(name, default=None):
+    value = _parse_argv(name)
+    if value is not None:
+        return int(value)
     return default
 
 
 TP_SIZE: int = _parse_int_argv("--tp") or _TP_DEFAULT
+_PLATFORM = _parse_argv("-p") or _parse_argv("--platform") or "a2a3"
 # --dp only sizes the standalone l3_lm_head fixture: how many DP ranks it builds.
 # The kernel itself carries no DP extent, so composed callers never pass it.
 DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
-# Rows. logit_row_indices picks the sources; unused rows stay zero. A decode step
-# samples every one of its DECODE_TOKENS rows (B requests x S target-model
-# token positions: one committed token plus DSPARK_SPEC_TOKENS drafts).
-MAX_LOGIT_ROWS = DECODE_TOKENS
+# Rows. Each owner samples its SP-local decode rows. The TP group collectively
+# covers every row in the full decode token stream.
+if DECODE_TOKENS % TP_SIZE != 0:
+    raise ValueError(f"decode token count {DECODE_TOKENS} must be divisible by TP {TP_SIZE}")
+MAX_LOGIT_ROWS = DECODE_TOKENS // TP_SIZE
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 
@@ -75,7 +84,7 @@ FUSED_VOCAB_TILE = 128
 # Matmul M tile: GROUP_LOGIT_ROWS x FUSED_VOCAB_TILE fp32 overruns the 128KiB Acc
 # space once a decode step carries more than 64 rows per group member. The row
 # blocks of one vocab tile share its weight tile, so weight traffic stays at 1x.
-MM_ROW_TILE = min(GROUP_LOGIT_ROWS, 128)
+MM_ROW_TILE = min(GROUP_LOGIT_ROWS, 64 if _PLATFORM in ("a5", "a5sim") else 128)
 N_MM_ROW_BLOCKS = GROUP_LOGIT_ROWS // MM_ROW_TILE
 HIDDEN_GATHER_TILE = 512
 # Row tiles for the two window->local copies. Both copy tiles stage through UB,
