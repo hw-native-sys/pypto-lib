@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=2  # CI: 2-card run; borrows 2 cards via task-submit --device-num
-"""DeepSeek-V4 MoE single-layer (decode), with EP routed experts and SP+TP shared experts."""
+"""DeepSeek-V4 MoE decode with EP routed experts and optional SP+TP shared experts."""
 
 
 # Sub-kernels freeze distributed sizes into their shapes at import time, so
@@ -19,7 +19,7 @@ import config
 
 _EP_CHOICES = (2, 4, 8, 16)
 _EP_DEFAULT = 2
-_TP_CHOICES = (2, 4, 8)
+_TP_CHOICES = (1, 2, 4, 8)
 _TP_DEFAULT = 2
 
 
@@ -70,7 +70,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_routed import expert_routed
-from expert_shared import LOCAL_INTER, SP_T, expert_shared_sp_tp
+from expert_shared import LOCAL_INTER, SP_T, run_expert_shared
 
 
 T = MOE_TOKENS
@@ -496,7 +496,7 @@ def moe(
     )
 
     sh = pl.create_tensor([T, D], dtype=pl.BF16)
-    expert_shared_sp_tp(
+    sh = run_expert_shared(
         x_norm_i8, x_norm_scale,
         shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
         shared_w2, shared_w2_scale,
@@ -1056,7 +1056,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tp-shared-expert", "--tp", dest="tp", type=int,
         default=_TP_DEFAULT, choices=list(_TP_CHOICES),
-        help="shared-expert TP size within each contiguous EP rank group",
+        help="shared-expert TP size within each contiguous EP rank group; 1 disables shared TP",
     )
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")

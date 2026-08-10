@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ci: devices=4
-"""DeepSeek-V4 shared-expert TP with SP gather and reduce-scatter boundaries."""
+"""DeepSeek-V4 shared expert with local and SP-boundary tensor-parallel execution."""
 
 import sys
 
@@ -19,7 +19,7 @@ from config import DECODE_TOKENS, FLASH as M, INT8_AMAX_EPS, INT8_SCALE_MAX, TP_
 
 
 # command-line config
-_TP_CHOICES = (2, 4, 8)
+_TP_CHOICES = (1, 2, 4, 8)
 _TP_DEFAULT = TP_SHARED_EXPERT
 
 
@@ -46,7 +46,22 @@ LOCAL_INTER = MOE_INTER // TP_SIZE
 SP_T = T // TP_SIZE
 SWIGLU_LIMIT = M.swiglu_limit
 
-# tiling
+# local tiling
+LOCAL_M_TILE = 16
+LOCAL_ROW_TILE = 8
+LOCAL_ACT_M_TILE = 2
+LOCAL_T_PAD = ((T + LOCAL_M_TILE - 1) // LOCAL_M_TILE) * LOCAL_M_TILE
+LOCAL_VALID_M = T if T < LOCAL_M_TILE else LOCAL_M_TILE
+LOCAL_K_TILE = 512
+LOCAL_INTER_K_TILE = 512
+LOCAL_MM_INTER_TILE = 256
+LOCAL_ACT_INTER_TILE = 1024
+LOCAL_QUANT_TILE = 2048
+LOCAL_D_OUT_TILE = 256
+LOCAL_W2_ACT_TILE = 512
+LOCAL_W2_GROUP_TILE = 4096
+
+# TP tiling
 SH_M_TILE = 32
 SH_AMAX_TILE = 8
 SH_ACT_M_TILE = 2
@@ -86,6 +101,155 @@ if D % COMM_STAGE_TILE != 0:
     raise ValueError("hidden size must be divisible by the communication staging tile")
 if (T * (D // COMM_STAGE_TILE)) % TP_SIZE != 0:
     raise ValueError("communication blocks must be divisible by TP size")
+if T > LOCAL_M_TILE and T % LOCAL_M_TILE != 0:
+    raise ValueError("local token rows must fit one M tile or be an exact M-tile multiple")
+if LOCAL_VALID_M % LOCAL_ACT_M_TILE != 0:
+    raise ValueError("local valid M rows must be divisible by rows per activation block")
+
+
+@pl.jit.inline
+def expert_shared(
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh: pl.Tensor[[T, D], pl.BF16],
+):
+    """Compute a rank-local shared expert with replicated weights."""
+    for mt in pl.parallel(LOCAL_T_PAD // LOCAL_M_TILE):
+        ts0 = mt * LOCAL_M_TILE
+
+        gate_i32 = pl.create_tensor([LOCAL_M_TILE, MOE_INTER], dtype=pl.INT32)
+        for nb_idx in pl.spmd(MOE_INTER // LOCAL_MM_INTER_TILE, name_hint="sh_gate_mm", allow_early_resolve=True):
+            n0 = nb_idx * LOCAL_MM_INTER_TILE
+            gate_acc = pl.create_tensor([LOCAL_M_TILE, LOCAL_MM_INTER_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, D, LOCAL_K_TILE, stage=2):
+                xs_k = pl.slice(x_local_i8, [LOCAL_M_TILE, LOCAL_K_TILE], [ts0, k0], valid_shape=[LOCAL_VALID_M, LOCAL_K_TILE])
+                sw1_k = shared_w1[n0 : n0 + LOCAL_MM_INTER_TILE, k0 : k0 + LOCAL_K_TILE]
+                if k0 == 0:
+                    gate_acc = pl.matmul(xs_k, sw1_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    gate_acc = pl.matmul_acc(gate_acc, xs_k, sw1_k, b_trans=True)
+            gate_i32[:, n0 : n0 + LOCAL_MM_INTER_TILE] = gate_acc
+
+        up_i32 = pl.create_tensor([LOCAL_M_TILE, MOE_INTER], dtype=pl.INT32)
+        for nb_idx in pl.spmd(MOE_INTER // LOCAL_MM_INTER_TILE, name_hint="sh_up_mm", allow_early_resolve=True):
+            n0 = nb_idx * LOCAL_MM_INTER_TILE
+            up_acc = pl.create_tensor([LOCAL_M_TILE, LOCAL_MM_INTER_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, D, LOCAL_K_TILE, stage=2):
+                xs_k = pl.slice(x_local_i8, [LOCAL_M_TILE, LOCAL_K_TILE], [ts0, k0], valid_shape=[LOCAL_VALID_M, LOCAL_K_TILE])
+                sw3_k = shared_w3[n0 : n0 + LOCAL_MM_INTER_TILE, k0 : k0 + LOCAL_K_TILE]
+                if k0 == 0:
+                    up_acc = pl.matmul(xs_k, sw3_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    up_acc = pl.matmul_acc(up_acc, xs_k, sw3_k, b_trans=True)
+            up_i32[:, n0 : n0 + LOCAL_MM_INTER_TILE] = up_acc
+
+        h_tile_fp32 = pl.create_tensor([LOCAL_M_TILE, MOE_INTER], dtype=pl.FP32)
+        h_tile_i8 = pl.create_tensor([LOCAL_M_TILE, MOE_INTER], dtype=pl.INT8, init_value=0)
+        h_tile_scale_dq = pl.create_tensor([LOCAL_M_TILE, LOCAL_ROW_TILE], dtype=pl.FP32, manual_dep=True)
+        for row_block in pl.spmd(LOCAL_VALID_M // LOCAL_ACT_M_TILE, name_hint="sh_gate_up_act_q"):
+            row0 = row_block * LOCAL_ACT_M_TILE
+            row_start = ts0 + row0
+            x_scale = pl.slice(x_local_scale_dq, [LOCAL_ROW_TILE, 1], [row_start, 0], valid_shape=[LOCAL_ACT_M_TILE, 1])
+            row_amax = pl.full([1, LOCAL_ROW_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
+            for part in pl.pipeline(MOE_INTER // LOCAL_ACT_INTER_TILE, stage=1):
+                n0 = part * LOCAL_ACT_INTER_TILE
+                gate_rows_i32 = pl.slice(gate_i32, [LOCAL_ROW_TILE, LOCAL_ACT_INTER_TILE], [row0, n0], valid_shape=[LOCAL_ACT_M_TILE, LOCAL_ACT_INTER_TILE])
+                up_rows_i32 = pl.slice(up_i32, [LOCAL_ROW_TILE, LOCAL_ACT_INTER_TILE], [row0, n0], valid_shape=[LOCAL_ACT_M_TILE, LOCAL_ACT_INTER_TILE])
+                w1_scale = pl.reshape(shared_w1_scale[n0 : n0 + LOCAL_ACT_INTER_TILE], [1, LOCAL_ACT_INTER_TILE])
+                w3_scale = pl.reshape(shared_w3_scale[n0 : n0 + LOCAL_ACT_INTER_TILE], [1, LOCAL_ACT_INTER_TILE])
+                gate_fp32 = pl.cast(gate_rows_i32, target_type=pl.FP32, mode="none")
+                up_fp32 = pl.cast(up_rows_i32, target_type=pl.FP32, mode="none")
+                gate_fp32 = pl.row_expand_mul(gate_fp32, x_scale)
+                gate_fp32 = pl.col_expand_mul(gate_fp32, w1_scale)
+                up_fp32 = pl.row_expand_mul(up_fp32, x_scale)
+                up_fp32 = pl.col_expand_mul(up_fp32, w3_scale)
+                if SWIGLU_LIMIT > 0.0:
+                    gate_fp32 = pl.minimum(gate_fp32, SWIGLU_LIMIT)
+                    up_fp32 = pl.minimum(up_fp32, SWIGLU_LIMIT)
+                    up_fp32 = pl.maximum(up_fp32, -SWIGLU_LIMIT)
+                gate_neg = pl.neg(gate_fp32)
+                gate_exp = pl.exp(gate_neg)
+                sigmoid_den = pl.add(gate_exp, 1.0)
+                sigmoid = pl.recip(sigmoid_den)
+                silu = pl.mul(gate_fp32, sigmoid)
+                gated = pl.mul(silu, up_fp32)
+                gated_abs = pl.abs(gated)
+                gated_amax = pl.row_max(gated_abs)
+                chunk_amax = pl.reshape(gated_amax, [1, LOCAL_ROW_TILE])
+                row_amax = pl.maximum(row_amax, chunk_amax)
+                h_tile_fp32[row0 : row0 + LOCAL_ACT_M_TILE, n0 : n0 + LOCAL_ACT_INTER_TILE] = gated[0:LOCAL_ACT_M_TILE, :]
+
+            row_scale_numerator = pl.full([1, LOCAL_ROW_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
+            row_scale_q = pl.div(row_scale_numerator, row_amax)
+            row_scale_q_col = pl.reshape(row_scale_q, [LOCAL_ROW_TILE, 1])
+            row_scale_dq = pl.recip(row_scale_q)
+            row_scale_dq_col = pl.reshape(row_scale_dq, [LOCAL_ROW_TILE, 1])
+            row_scale_dq_zeros = pl.full([LOCAL_ROW_TILE, LOCAL_ROW_TILE], dtype=pl.FP32, value=0.0)
+            row_scale_dq_matrix = pl.row_expand(row_scale_dq_zeros, row_scale_dq_col)
+            h_tile_scale_dq[row0 : row0 + LOCAL_ACT_M_TILE, :] = row_scale_dq_matrix[0:LOCAL_ACT_M_TILE, :]
+            for q_idx in pl.pipeline(MOE_INTER // LOCAL_QUANT_TILE, stage=1):
+                k0 = q_idx * LOCAL_QUANT_TILE
+                h_fp32 = pl.slice(h_tile_fp32, [LOCAL_ROW_TILE, LOCAL_QUANT_TILE], [row0, k0], valid_shape=[LOCAL_ACT_M_TILE, LOCAL_QUANT_TILE])
+                h_scaled = pl.row_expand_mul(h_fp32, row_scale_q_col)
+                h_i32 = pl.cast(h_scaled, target_type=pl.INT32, mode="rint")
+                h_fp16 = pl.cast(h_i32, target_type=pl.FP16, mode="round")
+                h_i8 = pl.cast(h_fp16, target_type=pl.INT8, mode="trunc")
+                h_tile_i8[row0 : row0 + LOCAL_ACT_M_TILE, k0 : k0 + LOCAL_QUANT_TILE] = h_i8[0:LOCAL_ACT_M_TILE, :]
+
+        y_i32 = pl.create_tensor([LOCAL_M_TILE, D], dtype=pl.INT32)
+        for db_idx in pl.spmd(D // LOCAL_D_OUT_TILE, name_hint="sh_w2_mm"):
+            d0 = db_idx * LOCAL_D_OUT_TILE
+            y_acc = pl.create_tensor([LOCAL_M_TILE, LOCAL_D_OUT_TILE], dtype=pl.INT32)
+            for k0 in pl.pipeline(0, MOE_INTER, LOCAL_INTER_K_TILE, stage=2):
+                hs_k = h_tile_i8[:, k0 : k0 + LOCAL_INTER_K_TILE]
+                sw2_k = shared_w2[d0 : d0 + LOCAL_D_OUT_TILE, k0 : k0 + LOCAL_INTER_K_TILE]
+                if k0 == 0:
+                    y_acc = pl.matmul(hs_k, sw2_k, b_trans=True, out_dtype=pl.INT32)
+                else:
+                    y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True)
+            y_i32[:, d0 : d0 + LOCAL_D_OUT_TILE] = y_acc
+
+        for db_idx in pl.spmd(D // LOCAL_W2_GROUP_TILE, name_hint="sh_w2_act", allow_early_resolve=True):
+            d_base = db_idx * LOCAL_W2_GROUP_TILE
+            h_scale = pl.row_max(h_tile_scale_dq[:, :])
+            for d_offset in pl.pipeline(0, LOCAL_W2_GROUP_TILE, LOCAL_W2_ACT_TILE, stage=2):
+                d0 = d_base + d_offset
+                y_2d_i32 = y_i32[:, d0 : d0 + LOCAL_W2_ACT_TILE]
+                w2_scale = pl.reshape(shared_w2_scale[d0 : d0 + LOCAL_W2_ACT_TILE], [1, LOCAL_W2_ACT_TILE])
+                y_2d = pl.cast(y_2d_i32, target_type=pl.FP32, mode="none")
+                y_2d = pl.row_expand_mul(y_2d, h_scale)
+                y_2d = pl.col_expand_mul(y_2d, w2_scale)
+                y_bf16 = pl.cast(y_2d, target_type=pl.BF16, mode="rint")
+                sh[ts0 : ts0 + LOCAL_VALID_M, d0 : d0 + LOCAL_W2_ACT_TILE] = y_bf16[0:LOCAL_VALID_M, :]
+
+    return sh
+
+
+@pl.jit
+def expert_shared_test(
+    x_local_i8: pl.Tensor[[T, D], pl.INT8],
+    x_local_scale_dq: pl.Tensor[[T, 1], pl.FP32],
+    shared_w1: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w1_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w3: pl.Tensor[[MOE_INTER, D], pl.INT8],
+    shared_w3_scale: pl.Tensor[[MOE_INTER], pl.FP32],
+    shared_w2: pl.Tensor[[D, MOE_INTER], pl.INT8],
+    shared_w2_scale: pl.Tensor[[D], pl.FP32],
+    sh: pl.Out[pl.Tensor[[T, D], pl.BF16]],
+):
+    expert_shared(
+        x_local_i8, x_local_scale_dq,
+        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+        shared_w2, shared_w2_scale,
+        sh,
+    )
+    return sh
 
 
 @pl.jit.inline
@@ -450,6 +614,68 @@ def expert_shared_sp_tp(
     return reduce_scatter_sp_partial(partial, sh_local, scatter, scatter_signal, my_rank)
 
 
+def _bind_run_expert_shared():
+    """Bind the shared-expert implementation for the import-time TP size."""
+    if TP_SIZE == 1:
+        @pl.jit.inline(auto_scope=False)
+        def run_expert_shared(
+            x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+            x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
+            shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+            shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+            shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+            shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+            shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
+            shared_w2_scale: pl.Tensor[[D], pl.FP32],
+            sh_local: pl.Tensor[[SP_T, D], pl.BF16],
+            gather_x: pld.DistributedTensor[[T, D], pl.INT8],
+            gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+            scatter: pld.DistributedTensor[[T, D], pl.FP32],
+            gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+            scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            sh_local = expert_shared(
+                x_local_i8, x_local_scale_dq,
+                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                shared_w2, shared_w2_scale,
+                sh_local,
+            )
+            return sh_local
+    else:
+        @pl.jit.inline(auto_scope=False)
+        def run_expert_shared(
+            x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
+            x_local_scale_dq: pl.Tensor[[SP_T, 1], pl.FP32],
+            shared_w1: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+            shared_w1_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+            shared_w3: pl.Tensor[[LOCAL_INTER, D], pl.INT8],
+            shared_w3_scale: pl.Tensor[[LOCAL_INTER], pl.FP32],
+            shared_w2: pl.Tensor[[D, LOCAL_INTER], pl.INT8],
+            shared_w2_scale: pl.Tensor[[D], pl.FP32],
+            sh_local: pl.Tensor[[SP_T, D], pl.BF16],
+            gather_x: pld.DistributedTensor[[T, D], pl.INT8],
+            gather_scale: pld.DistributedTensor[[T, 1], pl.FP32],
+            scatter: pld.DistributedTensor[[T, D], pl.FP32],
+            gather_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+            scatter_signal: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            sh_local = expert_shared_sp_tp(
+                x_local_i8, x_local_scale_dq,
+                shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+                shared_w2, shared_w2_scale,
+                sh_local,
+                gather_x, gather_scale, scatter,
+                gather_signal, scatter_signal, my_rank,
+            )
+            return sh_local
+    return run_expert_shared
+
+
+run_expert_shared = _bind_run_expert_shared()
+
+
 @pl.jit
 def expert_shared_sp_tp_test(
     x_local_i8: pl.Tensor[[SP_T, D], pl.INT8],
@@ -514,6 +740,35 @@ def l3_expert_shared_sp_tp(
             gather_signal, scatter_signal, rank,
             device=rank,
         )
+
+
+def golden_expert_shared(tensors):
+    """Torch reference for the rank-local shared expert."""
+    import torch
+    import torch.nn.functional as F
+
+    from utils import int8_quant_per_row
+
+    x_local_i8 = tensors["x_local_i8"]
+    x_local_scale_dq = tensors["x_local_scale_dq"].float()
+    x_local = x_local_i8.float() * x_local_scale_dq
+    sw1_scale = tensors["shared_w1_scale"].float().unsqueeze(-1)
+    sw3_scale = tensors["shared_w3_scale"].float().unsqueeze(-1)
+    sw2_scale = tensors["shared_w2_scale"].float().unsqueeze(-1)
+    sw1 = tensors["shared_w1"].float() * sw1_scale
+    sw3 = tensors["shared_w3"].float() * sw3_scale
+    sw2 = tensors["shared_w2"].float() * sw2_scale
+
+    sh_gate = x_local @ sw1.T
+    sh_up = x_local @ sw3.T
+    if SWIGLU_LIMIT > 0:
+        sh_gate = sh_gate.clamp(max=SWIGLU_LIMIT)
+        sh_up = sh_up.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+    sh_h = F.silu(sh_gate) * sh_up
+    sh_h_i8, sh_h_scale_dq = int8_quant_per_row(sh_h)
+    sh_h = sh_h_i8.float() * sh_h_scale_dq
+    sh = sh_h @ sw2.T
+    tensors["sh"][:] = sh.to(torch.bfloat16)
 
 
 def golden_expert_shared_sp_tp(tensors):
@@ -615,6 +870,34 @@ def gen_shared_weight(shape, dequant_std, chan_cv):
     return w_i8, scale
 
 
+def build_local_tensor_specs():
+    """Create local inputs and replicated shared-expert weights."""
+    import torch
+
+    from golden import TensorSpec
+    from utils import int8_quant_per_row
+
+    x_local_bf16 = torch.randn(T, D, dtype=torch.bfloat16)
+    x_local_i8, x_local_scale_dq = int8_quant_per_row(x_local_bf16)
+
+    shared_dequant_std = {"w1": 1.71e-2, "w2": 1.68e-2, "w3": 1.70e-2}
+    sw1_i8, sw1_scale = gen_shared_weight((MOE_INTER, D), shared_dequant_std["w1"], chan_cv=0.50)
+    sw3_i8, sw3_scale = gen_shared_weight((MOE_INTER, D), shared_dequant_std["w3"], chan_cv=0.50)
+    sw2_i8, sw2_scale = gen_shared_weight((D, MOE_INTER), shared_dequant_std["w2"], chan_cv=0.33)
+
+    return [
+        TensorSpec("x_local_i8", [T, D], torch.int8, init_value=lambda: x_local_i8),
+        TensorSpec("x_local_scale_dq", [T, 1], torch.float32, init_value=lambda: x_local_scale_dq.float()),
+        TensorSpec("shared_w1", [MOE_INTER, D], torch.int8, init_value=lambda: sw1_i8),
+        TensorSpec("shared_w1_scale", [MOE_INTER], torch.float32, init_value=lambda: sw1_scale),
+        TensorSpec("shared_w3", [MOE_INTER, D], torch.int8, init_value=lambda: sw3_i8),
+        TensorSpec("shared_w3_scale", [MOE_INTER], torch.float32, init_value=lambda: sw3_scale),
+        TensorSpec("shared_w2", [D, MOE_INTER], torch.int8, init_value=lambda: sw2_i8),
+        TensorSpec("shared_w2_scale", [D], torch.float32, init_value=lambda: sw2_scale),
+        TensorSpec("sh", [T, D], torch.bfloat16, is_output=True),
+    ]
+
+
 def build_sp_tensor_specs():
     """Create distinct SP input shards and intermediate-sharded shared weights."""
     import torch
@@ -657,14 +940,14 @@ def build_sp_tensor_specs():
 if __name__ == "__main__":
     import argparse
 
-    from golden import run_jit
+    from golden import ratio_reldiff, run_jit
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
     parser.add_argument(
         "--tp-shared-expert", "--tp", dest="tp", type=int,
         default=TP_SIZE, choices=list(_TP_CHOICES),
-        help="shared-expert tensor-parallel world size",
+        help="shared-expert tensor-parallel world size; 1 disables shared TP",
     )
     default_devices = ",".join(str(rank) for rank in range(TP_SIZE))
     parser.add_argument(
@@ -688,10 +971,33 @@ if __name__ == "__main__":
     if len(device_ids) < TP_SIZE:
         raise ValueError(f"need at least {TP_SIZE} devices for TP, got {device_ids}")
 
-    run_fn = l3_expert_shared_sp_tp
-    specs = build_sp_tensor_specs()
-    golden_fn = golden_expert_shared_sp_tp
-    output_compare = compare_sp_shared_output
+    if TP_SIZE == 1:
+        run_fn = expert_shared_test
+        specs = build_local_tensor_specs()
+        golden_fn = golden_expert_shared
+        output_compare = ratio_reldiff(diff_thd=2e-3, pct_thd=0.01)
+        compile_cfg = dict(dump_passes=args.dump_passes)
+        runtime_cfg = dict(
+            platform=args.platform,
+            device_id=device_ids[0],
+            enable_l2_swimlane=args.enable_l2_swimlane,
+        )
+    else:
+        run_fn = l3_expert_shared_sp_tp
+        specs = build_sp_tensor_specs()
+        golden_fn = golden_expert_shared_sp_tp
+        output_compare = compare_sp_shared_output
+        compile_cfg = dict(
+            dump_passes=args.dump_passes,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:TP_SIZE],
+                num_sub_workers=0,
+            ),
+        )
+        runtime_cfg = dict(
+            platform=args.platform,
+            enable_l2_swimlane=args.enable_l2_swimlane,
+        )
 
     result = run_jit(
         fn=run_fn,
@@ -701,17 +1007,8 @@ if __name__ == "__main__":
         save_data=args.save_data,
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
-        compile_cfg=dict(
-            dump_passes=args.dump_passes,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:TP_SIZE],
-                num_sub_workers=0,
-            ),
-        ),
-        runtime_cfg=dict(
-            platform=args.platform,
-            enable_l2_swimlane=args.enable_l2_swimlane,
-        ),
+        compile_cfg=compile_cfg,
+        runtime_cfg=runtime_cfg,
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
