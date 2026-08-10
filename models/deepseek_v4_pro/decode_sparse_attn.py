@@ -139,8 +139,10 @@ PA_NF_PER_BLOCK = 2
 PA_BLOCKS = PA_NFRAGS // PA_NF_PER_BLOCK
 assert PA_NFRAGS % PA_NF_PER_BLOCK == 0, "proj_a N-frag loop must cover PA_NFRAGS"
 # proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
-# so the per-group split does not multiply the task count by N-frags. A 512-column
-# chunk produces 16 * (7168 / 512) = 224 balanced cube blocks.
+# so the per-group split does not multiply the task count by N-frags. The block count
+# is O_GROUPS * PB_DCHUNKS, so a 3584-column chunk gives 16 * (7168 / 3584) = 32 cube
+# blocks -- one wave over a5's 28 cube cores. Narrower chunks only add dispatch
+# stagger: the cube tile is set by PROJ_B_MM_N_TILE, not by the chunk width.
 PROJ_B_D_CHUNK = 3584
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.
@@ -463,8 +465,11 @@ def sparse_attn(
         n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
         n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
         n_denom = pl.add(m_li, pl.exp(pl.sub(n_sink_tile, m_mi)))
-        n_full = pl.row_expand_div(m_oi, n_denom)[0 : H_TILE, 0 : HEAD_DIM]
-        n_bf16 = pl.cast(n_full, target_type=pl.BF16, mode="rint")
+        # Only the nope half survives the concat below -- the rope half is re-derived
+        # from m_oi with the inverse rotation folded in -- so normalize and cast the
+        # nope columns alone rather than all HEAD_DIM and throwing ROPE_DIM away.
+        n_nope = pl.row_expand_div(m_oi[0 : H_TILE, 0 : NOPE_DIM], n_denom)
+        n_nope_bf16 = pl.cast(n_nope, target_type=pl.BF16, mode="rint")
 
         # Inverse RoPE on this head-tile's fp32 rope segment. cos_il / sign*sin are
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
@@ -483,7 +488,7 @@ def sparse_attn(
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
         # NOPE_DIM + ROPE_DIM == HEAD_DIM, so one full-width store per head row writes
         # exactly the bytes the split nope/rope stores wrote -- half the GM stores.
-        n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
+        n_full_bf16 = pl.concat(n_nope_bf16, n_rope_bf16)
 
         for n_hi in pl.range(H_TILE):
             n_gh = m_h0 + n_hi

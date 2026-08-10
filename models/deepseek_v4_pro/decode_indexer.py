@@ -228,6 +228,12 @@ def indexer(
         sin_row = sin_signed_t[batch_idx : batch_idx + 1, 0:ROPE_HEAD_DIM]
         qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
         qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
+        # qr_proj_flat is a GM tensor, so this column window lowers to its own
+        # tile.load and lands as a dense [ROPE_ROW_TILE, ROPE_HEAD_DIM] tile in UB:
+        # the UB row stride is ROPE_HEAD_DIM, which is what the flat index assumes.
+        # Slicing a UB *tile* would instead inherit the parent's row stride -- see
+        # merge_norm in decode_sparse_attn.py, where the rope half is materialized as
+        # an elementwise result for exactly that reason.
         # rows == 1 -> the a5 lowering uses this index as the flat index directly.
         qr_rope_flat = pl.reshape(qr_rope_slice, [1, ROPE_SWAP_FLAT_LEN])
         qr_swapped = pl.reshape(
