@@ -240,7 +240,8 @@ PRESETS = {p.name: p for p in (DEMO, FLASH, PRO)}
 
 # Deployment constants
 DECODE_BATCH = 64                 # B: requests per decode step, per DP rank
-DECODE_SEQ = 2                    # S: [previous, current] tokens per serving step
+DSPARK_SPEC_TOKENS = 7            # drafts the DSpark drafter proposes per request
+DECODE_SEQ = 1 + DSPARK_SPEC_TOKENS  # S: tokens the target model verifies per step
 DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ
 DECODE_START_POS = 8192
 PREFILL_BATCH = 1                 # B: prefill batch for the current kernel programs

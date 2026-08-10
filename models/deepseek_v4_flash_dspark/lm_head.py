@@ -63,7 +63,7 @@ DP_SIZE: int = _parse_int_argv("--dp") or TP_SIZE
 VOCAB_PER_TP = VOCAB // TP_SIZE
 
 # Rows. logit_row_indices picks the sources; unused rows stay zero. A decode step
-# samples every one of its DECODE_TOKENS rows (B main + B draft at MTP = 1).
+# samples every one of its DECODE_TOKENS rows (B requests x S verified tokens).
 MAX_LOGIT_ROWS = DECODE_TOKENS
 TEST_TOKENS = 2 * MAX_LOGIT_ROWS  # standalone fixture: hidden rows per card, > MAX_LOGIT_ROWS
 GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
@@ -71,6 +71,11 @@ GROUP_LOGIT_ROWS = TP_SIZE * MAX_LOGIT_ROWS
 # Tiling
 FUSED_K_TILE = 256
 FUSED_VOCAB_TILE = 128
+# Matmul M tile: GROUP_LOGIT_ROWS x FUSED_VOCAB_TILE fp32 overruns the 128KiB Acc
+# space once a decode step carries more than 64 rows per group member. The row
+# blocks of one vocab tile share its weight tile, so weight traffic stays at 1x.
+MM_ROW_TILE = min(GROUP_LOGIT_ROWS, 128)
+N_MM_ROW_BLOCKS = GROUP_LOGIT_ROWS // MM_ROW_TILE
 HIDDEN_GATHER_TILE = 512
 # Row tiles for the two window->local copies. Both copy tiles stage through UB,
 # so the row extent has to be tiled rather than taken whole once the row count
@@ -106,6 +111,7 @@ assert VOCAB % TP_SIZE == 0
 assert VOCAB % GREEDY_VOCAB_CHUNK == 0
 assert GREEDY_NUM_VOCAB_CHUNKS <= GREEDY_CHUNK_PAD
 assert GROUP_LOGIT_ROWS % 16 == 0, "matmul M extent must be a multiple of 16"
+assert GROUP_LOGIT_ROWS % MM_ROW_TILE == 0
 assert TP_SIZE in _TP_CHOICES, f"--tp must be one of {_TP_CHOICES} (got {TP_SIZE})"
 assert DP_SIZE in _DP_CHOICES, f"--dp must be one of {_DP_CHOICES} (got {DP_SIZE})"
 assert DP_SIZE % TP_SIZE == 0, f"--dp must be a multiple of --tp, got dp={DP_SIZE}, tp={TP_SIZE}"
@@ -197,34 +203,42 @@ def lm_head(
         ]
 
     logits_shards = pl.create_tensor([GROUP_LOGIT_ROWS, VOCAB_PER_TP], dtype=pl.FP32)
-    # Project all group-owner rows in one matmul M tile.
+    # Project the group-owner rows one M tile at a time against this card's shard.
     for lm_core in pl.spmd(FUSED_LM_HEAD_CORES, name_hint="lm_head_matmul"):
         for mm_ob in pl.range(lm_core, VOCAB_PER_TP // FUSED_VOCAB_TILE, FUSED_LM_HEAD_CORES):
             mm_o0 = mm_ob * FUSED_VOCAB_TILE
-            mm_hidden0 = owner_hiddens[:, 0:FUSED_K_TILE]
-            mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
-            mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
-            for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                mm_k0 = mm_kb * FUSED_K_TILE
-                mm_hidden_tile = owner_hiddens[:, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
-                mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
-            logits_shards[:, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
+            for mm_rb in pl.range(N_MM_ROW_BLOCKS):
+                mm_r0 = mm_rb * MM_ROW_TILE
+                mm_hidden0 = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, 0:FUSED_K_TILE]
+                mm_weight0 = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, 0:FUSED_K_TILE]
+                mm_acc = pl.matmul(mm_hidden0, mm_weight0, b_trans=True, out_dtype=pl.FP32)
+                for mm_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                    mm_k0 = mm_kb * FUSED_K_TILE
+                    mm_hidden_tile = owner_hiddens[mm_r0 : mm_r0 + MM_ROW_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
+                    mm_weight_tile = lm_head_weight[mm_o0 : mm_o0 + FUSED_VOCAB_TILE, mm_k0 : mm_k0 + FUSED_K_TILE]
+                    mm_acc = pl.matmul_acc(mm_acc, mm_hidden_tile, mm_weight_tile, b_trans=True)
+                logits_shards[mm_r0 : mm_r0 + MM_ROW_TILE, mm_o0 : mm_o0 + FUSED_VOCAB_TILE] = mm_acc
 
         if VOCAB_TAIL != 0:
             if lm_core == (VOCAB_PER_TP // FUSED_VOCAB_TILE) % FUSED_LM_HEAD_CORES:
                 mm_tail_o0 = VOCAB_PER_TP // FUSED_VOCAB_TILE * FUSED_VOCAB_TILE
-                mm_hidden_t0 = owner_hiddens[:, 0:FUSED_K_TILE]
-                mm_weight_t0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
-                mm_acc_tail = pl.matmul(mm_hidden_t0, mm_weight_t0, b_trans=True, out_dtype=pl.FP32)
-                for mm_tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
-                    mm_tail_k0 = mm_tail_kb * FUSED_K_TILE
-                    mm_hidden_tk = owner_hiddens[:, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE]
-                    mm_weight_tk = lm_head_weight[
-                        mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
-                    ]
-                    mm_acc_tail = pl.matmul_acc(mm_acc_tail, mm_hidden_tk, mm_weight_tk, b_trans=True)
-                logits_shards[:, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL] = mm_acc_tail
+                for mm_tail_rb in pl.range(N_MM_ROW_BLOCKS):
+                    mm_tail_r0 = mm_tail_rb * MM_ROW_TILE
+                    mm_hidden_t0 = owner_hiddens[mm_tail_r0 : mm_tail_r0 + MM_ROW_TILE, 0:FUSED_K_TILE]
+                    mm_weight_t0 = lm_head_weight[mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, 0:FUSED_K_TILE]
+                    mm_acc_tail = pl.matmul(mm_hidden_t0, mm_weight_t0, b_trans=True, out_dtype=pl.FP32)
+                    for mm_tail_kb in pl.pipeline(1, D // FUSED_K_TILE, stage=2):
+                        mm_tail_k0 = mm_tail_kb * FUSED_K_TILE
+                        mm_hidden_tk = owner_hiddens[
+                            mm_tail_r0 : mm_tail_r0 + MM_ROW_TILE, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
+                        ]
+                        mm_weight_tk = lm_head_weight[
+                            mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL, mm_tail_k0 : mm_tail_k0 + FUSED_K_TILE
+                        ]
+                        mm_acc_tail = pl.matmul_acc(mm_acc_tail, mm_hidden_tk, mm_weight_tk, b_trans=True)
+                    logits_shards[
+                        mm_tail_r0 : mm_tail_r0 + MM_ROW_TILE, mm_tail_o0 : mm_tail_o0 + VOCAB_TAIL
+                    ] = mm_acc_tail
 
     # Send each owner its slice of this card's vocab shard, split over vocab comm
     # tiles: block blk pushes its tiles to every owner.

@@ -268,10 +268,11 @@ def history_window_swa_indices_and_lens(
     """Lower historical HCA/CSA window rows to physical KV-cache slots.
 
     Current decode-chunk positions are excluded from this list because HCA/CSA
-    still attend current MTP tokens through their overlay raw-index range. The
-    returned rows are packed oldest-to-newest; invalid tail columns are -1. The
-    block table follows the same vLLM-style absolute logical block contract as
-    SWA, while physical blocks may still be a small sliding-window ring.
+    still attend the current speculated tokens through their overlay raw-index
+    range. The returned rows are packed oldest-to-newest; invalid tail columns
+    are -1. The block table follows the same vLLM-style absolute logical block
+    contract as SWA, while physical blocks may still be a small sliding-window
+    ring.
     """
     if positions.ndim != 2:
         raise ValueError("history window indices expect positions with shape [B, S]")
