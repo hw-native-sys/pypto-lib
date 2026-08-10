@@ -382,6 +382,8 @@ jobs:
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
+          # pypto-serving's NPU runners call torch.npu.mem_get_info.
+          install-torch-npu: 'true'
           # Own ccache: serving's churn must not LRU-evict the a2a3/sim entries.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
@@ -441,6 +443,8 @@ jobs:
           needs-device: 'true'
           build-namespace: serving
           toolchain: bundle
+          # pypto-serving's NPU runners call torch.npu.mem_get_info.
+          install-torch-npu: 'true'
           # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving

@@ -83,6 +83,18 @@ inputs:
       one at a time and each reverts on its own line.
     required: false
     default: 'conda'
+  install-torch-npu:
+    description: >-
+      When 'true', install torch_npu into the venv. It is what puts `torch.npu`
+      on the torch module, and only the serving jobs need it — they run
+      pypto-serving's NPU runners, which call torch.npu.mem_get_info to size the
+      KV cache. Nothing in pypto-lib itself touches torch.npu, and the wheel is
+      large, so the other jobs leave it out.
+
+      It hard-pins torch to an exact version, so this and the torch pin in the
+      build step move together.
+    required: false
+    default: 'false'
   build-namespace:
     description: >-
       Per-job-type discriminator for the pypto build tree, which is stored at
@@ -543,6 +555,8 @@ runs:
       # the toolchain pins were read from).
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
+      env:
+        INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
       run: |
         source activate.sh
         python -m pip install --upgrade pip
@@ -557,9 +571,31 @@ runs:
         # aarch64 wheel now drags ~1.5 GB of CUDA onto an Ascend host. Under
         # conda this never showed: the base env already carried a torch, which
         # turned out to be the only thing pinning it.
-        if ! pip install torch --index-url https://download.pytorch.org/whl/cpu; then
-          echo "note: download.pytorch.org unreachable — falling back to a pinned torch"
-          pip install 'torch==2.6.0'
+        #
+        # The version is pinned to what py310-lib actually resolved torch>=2.0.0
+        # to, so this migration changes the toolchain and nothing else. Unpinned,
+        # pip takes the newest (2.13.0 today). It is also forced from below when
+        # install-torch-npu is on: the torch_npu 2.6.0 line requires torch==2.6.0
+        # exactly, and one torch is installed here for every job.
+        TORCH_PIN='torch==2.6.0'
+        if ! pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
+          echo "note: download.pytorch.org unreachable — falling back to PyPI"
+          pip install "$TORCH_PIN"
+        fi
+        # torch_npu is what puts `torch.npu` on the torch module. Nothing imports
+        # it explicitly — PyTorch autoloads it through its `torch.backends` entry
+        # point — which is how it stayed an undeclared dependency: under
+        # --system-site-packages the conda env just had it. Only the serving jobs
+        # need it (pypto-serving's NPU runners call torch.npu.mem_get_info to
+        # size the KV cache); nothing in pypto-lib itself touches torch.npu.
+        #
+        # Not on PyPI, which stops at 2.3.1, so the index is named explicitly.
+        # The version must track TORCH_PIN: the wheel's metadata is
+        # `Requires-Dist: torch==2.6.0`, satisfied by the 2.6.0+cpu installed
+        # above because a specifier carrying no local label ignores one.
+        if [ "$INSTALL_TORCH_NPU" = "true" ]; then
+          pip install 'torch_npu==2.6.0.post5' \
+            --index-url https://mirrors.huaweicloud.com/repository/pypi/simple
         fi
         # The from-source pypto / simpler builds compile native code (libbacktrace
         # et al.) with conda's compiler_compat toolchain, which intermittently
