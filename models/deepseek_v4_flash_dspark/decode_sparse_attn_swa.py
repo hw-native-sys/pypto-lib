@@ -92,7 +92,7 @@ assert WIN == ATTN_K_TILE, f"SWA decode expects WIN ({WIN}) == ATTN_K_TILE ({ATT
 
 
 @pl.jit.inline
-def sparse_attn_swa(
+def sparse_attn_swa_heads(
     q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
@@ -100,12 +100,13 @@ def sparse_attn_swa(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
-    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
-    wo_b_scale: pl.Tensor[[D], pl.FP32],
-    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
-):
-    """Standalone sparse attention with a BF16 projected output."""
+    o_packed_heads: pl.Tensor,
+) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
+    """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs.
+
+    Only the first runtime ``t_dim`` rows in each group are valid. The
+    returned task ID covers every write to the packed output tensor.
+    """
     t_dim = pl.tensor.dim(q, 0)
     t_heads = t_dim * H
     t_win = t_dim * WIN
@@ -113,13 +114,8 @@ def sparse_attn_swa(
     t_hblocks = t_dim * (H // H_TILE)
     t_gather = t_dim * GATHER_SPLITS
     rope_cs_blocks = t_dim // ROPE_CS_T_TILE
-    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
-    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
     ori_block_num = pl.tensor.dim(ori_kv, 0)
     ori_kv_flat = pl.reshape(ori_kv, [ori_block_num * BLOCK_SIZE, HEAD_DIM])
-    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
-    act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
-    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     # SWA metadata already lowered each logical window row to a physical cache
     # slot. Current decode tokens must be inserted into ori_kv by the caller
     # before this function runs; there is no speculative overlay path here.
@@ -163,8 +159,6 @@ def sparse_attn_swa(
     # fused on a2a3: the PV output (Acc) -> online rescale (Vec) needs an
     # unsupported tmov, and a [H_TILE, HEAD_DIM] carry overflows the Vec buffer.
     q_flat = pl.reshape(q, [t_heads, HEAD_DIM])
-    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
-    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     sparse_blk_mi = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([t_blk, 1], dtype=pl.FP32)
     sparse_blk_oi = pl.create_tensor([t_blk, HEAD_DIM], dtype=pl.FP32)
@@ -292,6 +286,19 @@ def sparse_attn_swa(
                 m_src_h0 : m_src_h0 + HEADS_PER_GROUP, 0:ROPE_DIM
             ]
 
+    return o_packed_heads, merge_tid
+
+
+@pl.jit.inline
+def sparse_attn_swa_local_o_proj(
+    o_packed_heads: pl.Tensor,
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+    heads_dep: pl.Scalar[pl.TASK_ID],
+):
+    """Project local-token, full-group SWA heads into BF16 hidden rows."""
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
     #
@@ -303,11 +310,16 @@ def sparse_attn_swa(
     # groups are still in flight (a genuine proj_a<->proj_b back-to-back GEMM).
     #
     # manual_scope SUPPRESSES auto-dep, so every edge is explicit: proj_a[g]
-    # reads only its o_packed slab -> deps=[merge_tid]; quant[g] deps on group
+    # reads only its o_packed slab -> deps=[heads_dep]; quant[g] deps on group
     # g's proj_a task; proj_b depends directly on quant[g] and writes a disjoint
     # group partial. proj_b_act combines those partials with their group row scales,
     # applies the per-channel weight scale, and is the consolidated attn_out writer.
     # ========================================================================
+    t_dim = pl.tensor.dim(attn_out, 0)
+    proj_a_rows = (t_dim + PROJ_A_ROW_TILE - 1) // PROJ_A_ROW_TILE
+    act_t_blks = t_dim // PROJ_B_ACT_TASK_T_TILE
+
+    o_packed = pl.reshape(o_packed_heads, [O_GROUPS * T_PAD, O_GROUP_IN])
     o_r_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.FP32)
     o_r_i8_pad = pl.create_tensor([T_PAD, O_GROUPS * O_LORA], dtype=pl.INT8)
     # [G, T] keeps each group's per-row scale as one contiguous row;
@@ -318,12 +330,15 @@ def sparse_attn_swa(
     # Package each group's fragments into one grid. The group TaskId is the
     # exact dependency granularity needed by quant/proj_b, while 80 individual
     # orchestration submissions disappear from the critical projection tail.
+    partials = pl.create_tensor([T_PAD, O_GROUPS * D], dtype=pl.INT32)
+    act_scale_dq = pl.create_tensor([O_GROUPS, T_PAD], dtype=pl.FP32)
+    proj_b_tids = pl.array.create(O_GROUPS, pl.TASK_ID)
     with pl.manual_scope():
         for g in pl.parallel(O_GROUPS):
             row_base_o = g * T_PAD
             out_col_g = g * O_LORA
 
-            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[merge_tid],
+            with pl.spmd(proj_a_rows * PA_N_FRAGS, name_hint="proj_a_mm", deps=[heads_dep],
                          allow_early_resolve=True) as pa_tid:
                 pa_unit = pl.tile.get_block_idx()
                 pa_rb = pa_unit // PA_N_FRAGS  # row block outermost
@@ -413,6 +428,35 @@ def sparse_attn_swa(
             out_t = pl.col_expand_mul(acc, wb_scale_chunk)
             out_bf16 = pl.cast(out_t, target_type=pl.BF16, mode="rint")
             attn_out[b_tb : b_tb + PROJ_B_ACT_T_TILE, ob_n0 : ob_n0 + PROJ_B_ACT_N_TILE] = out_bf16
+    return attn_out
+
+
+@pl.jit.inline
+def sparse_attn_swa(
+    q: pl.Tensor[[T_DYN, H, HEAD_DIM], pl.BF16],
+    ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    swa_indices: pl.Tensor[[T_DYN, WIN], pl.INT32],
+    sparse_bias: pl.Tensor[[T_DYN, PADDED_TOPK], pl.FP32],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    attn_out: pl.Tensor[[T_DYN, D], pl.BF16],
+):
+    """Compute SWA sparse attention and the grouped output projection."""
+    o_packed_heads = pl.create_tensor([O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], dtype=pl.BF16)
+    o_packed_heads, heads_dep = sparse_attn_swa_heads(
+        q, ori_kv, swa_indices, sparse_bias,
+        attn_sink, freqs_cos, freqs_sin,
+        o_packed_heads,
+    )
+    attn_out = sparse_attn_swa_local_o_proj(
+        o_packed_heads,
+        wo_a, wo_b, wo_b_scale,
+        attn_out, heads_dep,
+    )
     return attn_out
 
 
