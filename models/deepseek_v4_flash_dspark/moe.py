@@ -70,7 +70,7 @@ from hc_pre import hc_pre
 from hc_post import hc_post
 from gate import gate
 from expert_routed import expert_routed
-from expert_shared_tp import LOCAL_INTER, SP_T, expert_shared_sp_tp
+from expert_shared import LOCAL_INTER, SP_T, expert_shared_sp_tp
 
 
 T = MOE_TOKENS
