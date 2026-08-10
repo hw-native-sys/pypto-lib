@@ -279,7 +279,7 @@ def build_tensor_specs(local_t=FIXTURE_LOCAL_T):
         values = values.remainder(127).reshape(shape).to(torch.bfloat16)
         grouped = values.reshape(SP_SIZE, O_GROUPS, LOCAL_T_PAD, O_GROUP_IN)
         grouped[:, :, local_t:] = -2000.0
-        return values
+        return grouped.reshape(shape)
 
     def init_o_partial():
         shape = (SP_SIZE, GROUP_T_PAD, D)

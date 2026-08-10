@@ -100,7 +100,7 @@ def sparse_attn_swa_heads(
     attn_sink: pl.Tensor[[H], pl.FP32],
     freqs_cos: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[T_DYN, ROPE_DIM], pl.BF16],
-    o_packed_heads: pl.Tensor,
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
 ) -> tuple[pl.Tensor, pl.Scalar[pl.TASK_ID]]:
     """Write SWA heads as ``[group, T_PAD, head-in-group, dim]`` slabs.
 
@@ -291,7 +291,7 @@ def sparse_attn_swa_heads(
 
 @pl.jit.inline
 def sparse_attn_swa_local_o_proj(
-    o_packed_heads: pl.Tensor,
+    o_packed_heads: pl.Tensor[[O_GROUPS * T_PAD * HEADS_PER_GROUP, HEAD_DIM], pl.BF16],
     wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
     wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
     wo_b_scale: pl.Tensor[[D], pl.FP32],

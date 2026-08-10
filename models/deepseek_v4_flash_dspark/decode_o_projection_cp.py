@@ -183,6 +183,8 @@ def build_tensor_specs(local_t):
 
     from golden import ScalarSpec, TensorSpec
 
+    if local_t < 1 or local_t > LOCAL_T:
+        raise ValueError(f"local_t must be in [1, {LOCAL_T}], got {local_t}")
     group_t = SP_SIZE * local_t
 
     def init_attention_local_groups():
