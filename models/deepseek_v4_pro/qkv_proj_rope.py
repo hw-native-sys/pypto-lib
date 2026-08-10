@@ -33,6 +33,13 @@ MAX_SEQ_LEN = M.max_position_embeddings
 # tiling
 Q_PROJ_TILE = 128       # qproj K-tile (Q_LORA reduction); 8 slices -> deep stage=2 pipeline, double-buffered Mat fits
 QPROJ_MM_N_TILE = 1024  # full L2 lines per wq_b row (no over-fetch)
+# N-tiles folded into one qproj_matmul SPMD block; the grid is
+# (H*HEAD_DIM // QPROJ_MM_N_TILE) // QPROJ_TILES_PER_BLOCK. PRO's 64 N-tiles over a5's
+# 28 AIC cores make the block count the dominant term: 4 gives 16 blocks in a single
+# wave, while 2 gives 32 -- one full wave plus 4 stragglers that run with 24 cores idle
+# -- and 1 gives 64, whose per-shard launch stagger exceeds the wave it saves. The cube
+# tile itself is unchanged, so L0A/L0B/L0C occupancy is identical at every setting.
+QPROJ_TILES_PER_BLOCK = 4
 Q_LORA_TILE = 256       # qr rms-norm / quant N granularity (decoupled from qr_proj matmul)
 KV_TILE = 64            # kv rms-norm / rope / NOPE N granularity (decoupled from kv_proj matmul)
 QUANT_TILE = 256
@@ -90,6 +97,7 @@ def _even_pipeline_trip(name: str, trip: int) -> None:
 _even_pipeline_trip("qr_proj", QR_K_SLICE // QR_K_TILE)
 _even_pipeline_trip("kv_proj", KV_K_SLICE // KV_K_TILE)
 assert (H * HEAD_DIM) % QPROJ_MM_N_TILE == 0 and ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % 4 == 0
+assert ((H * HEAD_DIM) // QPROJ_MM_N_TILE) % QPROJ_TILES_PER_BLOCK == 0
 assert Q_LORA % Q_PROJ_TILE == 0 and QPROJ_MM_N_TILE * QPROJ_M_TILE * 4 <= 128 * 1024  # L0C Acc cap
 assert (DECODE_BATCH * DECODE_SEQ) % KV_RMS_T_TILE == 0
 assert (PREFILL_BATCH * PREFILL_SEQ) % KV_RMS_T_TILE == 0
@@ -181,7 +189,7 @@ def qkv_proj_rope(
     # before every atomic RMW.
     qr_fp32 = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.FP32)
     qr_i8_matmul = pl.create_tensor([T_MAX, Q_LORA], dtype=pl.INT8)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_proj_seed", allow_early_resolve=True):
         for tc in pl.range(t_matmul // QR_M_TILE):
             ts0 = tc * QR_M_TILE
             for nb in pl.range(Q_LORA // QR_N_TILE):
@@ -247,9 +255,10 @@ def qkv_proj_rope(
     # downstream vector work. This lets the scheduler defer q dequant until AIV is free
     # instead of pinning it next to qproj and competing with the critical qr_proj AIV work.
     q_proj_i32 = pl.create_tensor([T_MAX, H * HEAD_DIM], dtype=pl.INT32)
-    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // 2, name_hint="qproj_matmul", allow_early_resolve=True):
-        hg = hg_idx * 2
-        for h_inner in pl.range(2):
+    for hg_idx in pl.spmd(((H * HEAD_DIM) // QPROJ_MM_N_TILE) // QPROJ_TILES_PER_BLOCK,
+                          name_hint="qproj_matmul", allow_early_resolve=True):
+        hg = hg_idx * QPROJ_TILES_PER_BLOCK
+        for h_inner in pl.range(QPROJ_TILES_PER_BLOCK):
             w_col0 = (hg + h_inner) * QPROJ_MM_N_TILE
             for tc in pl.range(t_matmul // QPROJ_M_TILE):
                 t0 = tc * QPROJ_M_TILE

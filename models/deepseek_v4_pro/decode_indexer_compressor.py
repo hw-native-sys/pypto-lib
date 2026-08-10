@@ -62,6 +62,11 @@ BS_PAD = ((B * S + MM_B_TILE - 1) // MM_B_TILE) * MM_B_TILE
 HEAD_TILE = 64
 HEAD_DIM_TILE = 128
 RMS_PAD_TILE = 16  # pad B rows up to one 16-row block (hadamard matmul M multiple of 16)
+# rmsnorm_rope gathers with a single-row flat index so the a5 gather lowering's
+# per-call row-base chain (tile.ci/divs/muls/add) hits its rows==1 early-out.
+CMP_SWAP_FLAT_LEN = RMS_PAD_TILE * ROPE_HEAD_DIM
+ROPE_HEAD_DIM_F = float(ROPE_HEAD_DIM)
+ROPE_HEAD_DIM_INV = 1.0 / ROPE_HEAD_DIM
 RMS_PAD_ROWS = RMS_PAD_TILE  # single block; requires B <= RMS_PAD_TILE
 assert B <= RMS_PAD_TILE
 
@@ -205,12 +210,44 @@ def indexer_compressor(
 
     normed_kv = pl.create_tensor([RMS_PAD_ROWS, HEAD_DIM], dtype=pl.BF16)
     norm_w_2d = pl.reshape(norm_w, [1, HEAD_DIM])
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
+    # The interleave tables and the j^1 lane-swap index do not depend on the pooled KV,
+    # so they are built in their own scope instead of inside rmsnorm_rope. rmsnorm_rope is
+    # a single-block AIV task on the critical path; each pl.gather there also drags the a5
+    # row-base chain behind it, so moving two of the three gathers out and flattening the
+    # third takes that work off the path entirely.
+    cmp_cos_il = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_sin_signed = pl.create_tensor([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32)
+    cmp_swap_flat = pl.create_tensor([1, CMP_SWAP_FLAT_LEN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cmp_rope_tables", allow_early_resolve=True):
         # single 16-row block: B real rows at rows 0..B-1, rows B..15 are pad
         cos_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         sin_b = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=0.0)
         cos_b[0:B, 0 : ROPE_HEAD_DIM // 2] = cos[0:B, 0 : ROPE_HEAD_DIM // 2]
         sin_b[0:B, 0 : ROPE_HEAD_DIM // 2] = sin[0:B, 0 : ROPE_HEAD_DIM // 2]
+        t_col = pl.col_expand_mul(
+            pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        t_dup_f = pl.cast(pl.cast(pl.mul(t_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        t_dup_idx = pl.cast(t_dup_f, target_type=pl.INT32)                                      # j>>1
+        t_lane = pl.sub(t_col, pl.mul(t_dup_f, 2.0))                                            # j%2
+        t_sign = pl.sub(pl.mul(t_lane, 2.0), 1.0)                                               # [-1,+1,...]
+        cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = pl.gather(cos_b, dim=-1, index=t_dup_idx)
+        # Folding the sign into sin is exact: it only flips a sign bit.
+        cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM] = pl.mul(
+            pl.gather(sin_b, dim=-1, index=t_dup_idx), t_sign)
+        f_col = pl.cast(pl.arange(0, [1, CMP_SWAP_FLAT_LEN], dtype=pl.INT32), target_type=pl.FP32)
+        f_rowbase = pl.mul(
+            pl.cast(pl.cast(pl.mul(f_col, ROPE_HEAD_DIM_INV), target_type=pl.INT32, mode="trunc"),
+                    target_type=pl.FP32),
+            ROPE_HEAD_DIM_F)                                                                    # r*ROPE_HEAD_DIM
+        f_j = pl.sub(f_col, f_rowbase)
+        f_dup = pl.cast(pl.cast(pl.mul(f_j, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        f_lane = pl.sub(f_j, pl.mul(f_dup, 2.0))                                                # j%2
+        f_jx = pl.sub(pl.add(f_j, 1.0), pl.mul(f_lane, 2.0))                                    # j^1
+        cmp_swap_flat[0:1, 0:CMP_SWAP_FLAT_LEN] = pl.cast(
+            pl.add(f_rowbase, f_jx), target_type=pl.INT32)
+
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rmsnorm_rope"):
         partial_sq = pl.full([1, RMS_PAD_TILE], dtype=pl.FP32, value=0.0)
         for k0 in pl.range(0, HEAD_DIM, HEAD_TILE):
             kv_rms_chunk = pooled_kv[0 : RMS_PAD_TILE, k0 : k0 + HEAD_TILE]
@@ -240,17 +277,15 @@ def indexer_compressor(
         # are dup-gathered from the per-batch cos/sin rows. normed_kv is BF16 -> cast on write.
         #   out[j] = n[j]*cos_il[j] + n[j^1]*sign[j]*sin_il[j]
         rope_normed = pl.col_expand_mul(pl.row_expand_mul(kv_rope_norm, inv_rms), gamma_rope)
-        rope_ones = pl.full([RMS_PAD_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_il = pl.gather(cos_b, dim=-1, index=rope_dup_idx)
-        sin_il = pl.gather(sin_b, dim=-1, index=rope_dup_idx)
-        swapped = pl.gather(rope_normed, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(rope_normed, cos_il), pl.mul(pl.mul(swapped, rope_sign), sin_il))
+        # rope_normed is a fresh elementwise result, hence contiguous: a single-row flat
+        # index addresses it correctly and rows == 1 skips the a5 row-base chain.
+        rope_flat = pl.reshape(rope_normed, [1, CMP_SWAP_FLAT_LEN])
+        swapped = pl.reshape(
+            pl.gather(rope_flat, dim=-1, index=cmp_swap_flat[0:1, 0:CMP_SWAP_FLAT_LEN]),
+            [RMS_PAD_TILE, ROPE_HEAD_DIM])
+        rope_rot = pl.add(
+            pl.mul(rope_normed, cmp_cos_il[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM]),
+            pl.mul(swapped, cmp_sin_signed[0:RMS_PAD_TILE, 0:ROPE_HEAD_DIM]))
         normed_kv[0 : RMS_PAD_TILE, NOPE_HEAD_DIM : HEAD_DIM] = pl.cast(
             rope_rot,
             target_type=pl.BF16,

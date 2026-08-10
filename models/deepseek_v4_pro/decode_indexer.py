@@ -99,6 +99,12 @@ QH_HEAD_DIM_TILE = 64
 ROPE_ROW_BLOCK = S * IDX_N_HEADS
 # qr_rope SPMD tile == row block: one ROPE_ROW_TILE-row block per SPMD tile.
 ROPE_ROW_TILE = 32
+# qr_rope gathers with a single-row flat index so the a5 lowering's per-block
+# row-base chain is skipped (see the qr_rope_tables scope).
+ROPE_SWAP_FLAT_LEN = ROPE_ROW_TILE * ROPE_HEAD_DIM
+# float forms: the tracer does not accept float()/int() calls inside a kernel body.
+ROPE_HEAD_DIM_F = float(ROPE_HEAD_DIM)
+ROPE_HEAD_DIM_INV = 1.0 / ROPE_HEAD_DIM
 TOPK_HALF_LEN = SCORE_LEN // 2
 TOPK_HALF_PAIR_OFFSET = 2 * TOPK_HALF_LEN
 TOPK_PAIR_WIDTH = 2 * IDX_TOPK
@@ -164,33 +170,75 @@ def indexer(
     # BF16 q for the Hadamard matmul: nope half rounded from the FP32 dequant, rope
     # half rotated then rounded.
     qr_bf16 = pl.create_tensor([T * IDX_N_HEADS, IDX_HEAD_DIM], dtype=pl.BF16)
+    # The interleave tables are block-invariant: cos_il[j] = cos[b, j>>1], the sign
+    # pattern, and the j^1 lane-swap index do not depend on the spmd block. pl.gather
+    # lowers to a per-row TGATHER loop, so rebuilding them inside the grid cost
+    # 16 blocks x ROPE_ROW_TILE rows x 2 tables of row-gathers per layer. Build them
+    # once here and read them as plain loads per block.
+    #   out[j] = x[j]*cos_il[j] + x[j^1]*sin_il_signed[j]  (sign folded into sin)
+    # Folding the sign into sin is exact: multiplying by +/-1 only flips the sign bit,
+    # so (x*sign)*sin and x*(sin*sign) are bit-identical.
+    cos_il_t = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    sin_signed_t = pl.create_tensor([B, ROPE_HEAD_DIM], dtype=pl.FP32)
+    rope_swap_idx_t = pl.create_tensor([1, ROPE_SWAP_FLAT_LEN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="qr_rope_tables", allow_early_resolve=True):
+        il_col = pl.col_expand_mul(
+            pl.full([B, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
+        il_dup_f = pl.cast(pl.cast(pl.mul(il_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        il_dup_idx = pl.cast(il_dup_f, target_type=pl.INT32)                                    # j>>1
+        il_lane = pl.sub(il_col, pl.mul(il_dup_f, 2.0))                                         # j%2
+        il_sign = pl.sub(pl.mul(il_lane, 2.0), 1.0)                                             # [-1,+1,...]
+        cos_il_t[0:B, 0:ROPE_HEAD_DIM] = pl.gather(
+            cos[0:B, 0 : ROPE_HEAD_DIM // 2], dim=-1, index=il_dup_idx)
+        sin_signed_t[0:B, 0:ROPE_HEAD_DIM] = pl.mul(
+            pl.gather(sin[0:B, 0 : ROPE_HEAD_DIM // 2], dim=-1, index=il_dup_idx), il_sign)
+        # The j^1 lane swap permutes data, so it stays an index tensor; it is block
+        # invariant all the same. Store it as a SINGLE-ROW *flat* index over the
+        # [ROPE_ROW_TILE, ROPE_HEAD_DIM] block: flat[r*RHD + j] = r*RHD + (j^1).
+        #
+        # Why flat and single-row: on a5 the gather lowering (op_conversion_registry
+        # emit_a5_flat_idx) rebuilds a row-base chain -- tile.ci over rows*cols, reshape,
+        # divs, muls, add -- inside EVERY spmd block whenever the index has more than one
+        # row, and returns the index untouched when rows == 1. The row base is a compile-
+        # time constant here, so folding it into this once-per-layer table removes four
+        # full-tile INT32 passes per block.
+        sw_col = pl.cast(
+            pl.arange(0, [1, ROPE_SWAP_FLAT_LEN], dtype=pl.INT32), target_type=pl.FP32)
+        sw_rowbase = pl.mul(
+            pl.cast(pl.cast(pl.mul(sw_col, ROPE_HEAD_DIM_INV), target_type=pl.INT32, mode="trunc"),
+                    target_type=pl.FP32),
+            ROPE_HEAD_DIM_F)                                                               # r*RHD
+        sw_j = pl.sub(sw_col, sw_rowbase)                                                       # j
+        sw_dup_f = pl.cast(pl.cast(pl.mul(sw_j, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane = pl.sub(sw_j, pl.mul(sw_dup_f, 2.0))                                           # j%2
+        sw_jx = pl.sub(pl.add(sw_j, 1.0), pl.mul(sw_lane, 2.0))                                 # j^1
+        rope_swap_idx_t[0:1, 0:ROPE_SWAP_FLAT_LEN] = pl.cast(
+            pl.add(sw_rowbase, sw_jx), target_type=pl.INT32)
+
     # spmd over ROPE_ROW_TILE-row blocks; batch_idx = block base // ROPE_ROW_BLOCK
-    # picks the per-batch cos/sin row. Rotation indices/sign and cos_il/sin_il are
-    # built once per block.
-    #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]  (sign folded into sin_il_signed)
+    # picks the per-batch cos/sin row. col_expand_mul folds the [1, ROPE_HEAD_DIM]
+    # row broadcast into the rotation multiply, so no cos_il/sin_il tile is
+    # materialized per block.
     for idx in pl.spmd(T * IDX_N_HEADS // ROPE_ROW_TILE, name_hint="qr_rope", allow_early_resolve=True):
         o0 = idx * ROPE_ROW_TILE
         batch_idx = o0 // ROPE_ROW_BLOCK
-        cos_b = cos[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        sin_b = sin[batch_idx : batch_idx + 1, 0 : ROPE_HEAD_DIM // 2]
-        rope_ones = pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM], dtype=pl.FP32, value=1.0)
-        rope_col = pl.col_expand_mul(rope_ones, pl.cast(pl.arange(0, [1, ROPE_HEAD_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        rope_dup_f = pl.cast(pl.cast(pl.mul(rope_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        rope_dup_idx = pl.cast(rope_dup_f, target_type=pl.INT32)                                       # j>>1
-        rope_lane = pl.sub(rope_col, pl.mul(rope_dup_f, 2.0))                                          # j%2
-        rope_swap_idx = pl.cast(pl.sub(pl.add(rope_col, 1.0), pl.mul(rope_lane, 2.0)), target_type=pl.INT32)  # j^1
-        rope_sign = pl.sub(pl.mul(rope_lane, 2.0), 1.0)                                                # [-1,+1,...]
-        cos_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), cos_b)
-        sin_b32 = pl.col_expand_mul(pl.full([ROPE_ROW_TILE, ROPE_HEAD_DIM // 2], dtype=pl.FP32, value=1.0), sin_b)
-        cos_il = pl.gather(cos_b32, dim=-1, index=rope_dup_idx)
-        # fold sign into sin_il
-        sin_il_signed = pl.mul(pl.gather(sin_b32, dim=-1, index=rope_dup_idx), rope_sign)
+        rope_swap_flat = rope_swap_idx_t[0:1, 0:ROPE_SWAP_FLAT_LEN]
+        cos_row = cos_il_t[batch_idx : batch_idx + 1, 0:ROPE_HEAD_DIM]
+        sin_row = sin_signed_t[batch_idx : batch_idx + 1, 0:ROPE_HEAD_DIM]
         qr_nope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM]
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, 0 : IDX_NOPE_HEAD_DIM] = pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint")
         qr_rope_slice = qr_proj_flat[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM]
-        qr_swapped = pl.gather(qr_rope_slice, dim=-1, index=rope_swap_idx)
-        rope_rot = pl.add(pl.mul(qr_rope_slice, cos_il), pl.mul(qr_swapped, sin_il_signed))
-        qr_bf16[o0 : o0 + ROPE_ROW_TILE, IDX_NOPE_HEAD_DIM : IDX_HEAD_DIM] = pl.cast(rope_rot, target_type=pl.BF16, mode="rint")
+        # rows == 1 -> the a5 lowering uses this index as the flat index directly.
+        qr_rope_flat = pl.reshape(qr_rope_slice, [1, ROPE_SWAP_FLAT_LEN])
+        qr_swapped = pl.reshape(
+            pl.gather(qr_rope_flat, dim=-1, index=rope_swap_flat),
+            [ROPE_ROW_TILE, ROPE_HEAD_DIM])
+        rope_rot = pl.add(
+            pl.col_expand_mul(qr_rope_slice, cos_row), pl.col_expand_mul(qr_swapped, sin_row))
+        qr_vec = pl.concat(
+            pl.cast(qr_nope_slice, target_type=pl.BF16, mode="rint"),
+            pl.cast(rope_rot, target_type=pl.BF16, mode="rint"))
+        qr_bf16[o0 : o0 + ROPE_ROW_TILE, :] = qr_vec
 
     # cube-only scope: q @ hadamard lands in GM, keeping the vector amax/quant below
     # in its own scope so the two run as separate cube and vector tasks.

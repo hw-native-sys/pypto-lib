@@ -63,6 +63,13 @@ CMP_BLOCK_NUM = DECODE_CMP_BLOCK_NUM
 # tiling
 ROPE_OUT_TOK_TILE = 8
 H_TILE = 16
+# merge_norm gathers with a single-row flat index so the a5 gather lowering's
+# per-block row-base chain (tile.ci/divs/muls/add) hits its rows==1 early-out.
+# The gather source must be CONTIGUOUS for a flat index to address it correctly,
+# so the rope half is produced as its own tile rather than sliced out of n_full.
+MERGE_SWAP_FLAT_LEN = H_TILE * ROPE_DIM
+ROPE_DIM_F = float(ROPE_DIM)
+ROPE_DIM_INV = 1.0 / ROPE_DIM
 # qk_pv cube-batch tile (M for the QK/PV matmuls). Batching QK_M_TILE head rows
 # per matmul extracts the shared KV tile L1->L0 once per QK_M_TILE/H_TILE
 # head-tiles (2x reuse at 32) instead of per H_TILE head-tile, then slices the
@@ -124,10 +131,17 @@ QUANT_TOKEN_TILE = 8
 # Each proj_b group writes a disjoint INT32 partial; the final vector task combines
 # all group partials with their row scales, then applies the channel weight scale.
 PA_NFRAGS = O_LORA // PROJ_A_MM_N_TILE   # proj_a cube N-frags per group
+# proj_a N-frags per SPMD block. The cube tile stays PROJ_A_MM_N_TILE (L0A/L0B are
+# the wall, see above); this only folds several frags into one block so the grid
+# shrinks and the per-shard dispatch stagger amortises, exactly as the D-chunk loop
+# already does for proj_b below.
+PA_NF_PER_BLOCK = 2
+PA_BLOCKS = PA_NFRAGS // PA_NF_PER_BLOCK
+assert PA_NFRAGS % PA_NF_PER_BLOCK == 0, "proj_a N-frag loop must cover PA_NFRAGS"
 # proj_b is one task per (D-chunk, group): the D-chunk's N-frags loop INSIDE the task,
 # so the per-group split does not multiply the task count by N-frags. A 512-column
 # chunk produces 16 * (7168 / 512) = 224 balanced cube blocks.
-PROJ_B_D_CHUNK = 512
+PROJ_B_D_CHUNK = 3584
 PB_DCHUNKS = D // PROJ_B_D_CHUNK
 # proj_b_act uses one block per 512-column output region, eight blocks in total.
 PROJ_B_ACT_T_TILE = 8    # inner token tile for the proj_b_act O_GROUPS-way INT32->FP32 accumulate
@@ -291,7 +305,7 @@ def sparse_attn(
     # One lane per core. Each lane walks its planned items -- the (token, block)
     # work is derived per item, and qk_pv directly gathers window/compressed KV
     # rows into the shared matmul operand.
-    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid]) as qk_tid:
+    with pl.spmd(NUM_QK_CORES, name_hint="qk_pv", deps=[qk_plan_tid], allow_early_resolve=True) as qk_tid:
         qk_core = pl.tile.get_block_idx()
         # Items for this lane: qk_core, qk_core + NUM_QK_CORES, ...  The per-lane
         # count is derived from the lane index (no stored per-core count); a lane
@@ -382,7 +396,22 @@ def sparse_attn(
     # so it overlaps it and is off merge_norm's critical path.
     rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
     rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs"):
+    # The j^1 lane-swap index is block-invariant too; merge_norm rebuilt the whole
+    # arange/trunc/lane chain on each of its T*(H//H_TILE) blocks. Build it here.
+    rope_swap_idx_m = pl.create_tensor([1, MERGE_SWAP_FLAT_LEN], dtype=pl.INT32)
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="rope_cs", allow_early_resolve=True):
+        sw_col_m = pl.cast(
+            pl.arange(0, [1, MERGE_SWAP_FLAT_LEN], dtype=pl.INT32), target_type=pl.FP32)
+        sw_rowbase_m = pl.mul(
+            pl.cast(pl.cast(pl.mul(sw_col_m, ROPE_DIM_INV), target_type=pl.INT32, mode="trunc"),
+                    target_type=pl.FP32),
+            ROPE_DIM_F)                                                                           # r*ROPE_DIM
+        sw_j_m = pl.sub(sw_col_m, sw_rowbase_m)                                                   # j
+        sw_dup_f_m = pl.cast(pl.cast(pl.mul(sw_j_m, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sw_lane_m = pl.sub(sw_j_m, pl.mul(sw_dup_f_m, 2.0))                                       # j%2
+        sw_jx_m = pl.sub(pl.add(sw_j_m, 1.0), pl.mul(sw_lane_m, 2.0))                              # j^1
+        rope_swap_idx_m[0:1, 0:MERGE_SWAP_FLAT_LEN] = pl.cast(
+            pl.add(sw_rowbase_m, sw_jx_m), target_type=pl.INT32)
         cs_col = pl.col_expand_mul(
             pl.full([T, ROPE_DIM], dtype=pl.FP32, value=1.0),
             pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
@@ -416,7 +445,10 @@ def sparse_attn(
         # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
         # single block's stats directly instead of an empty merge loop.
         if SPARSE_BLOCKS > 1:
-            for m_sb in pl.range(1, SPARSE_BLOCKS):
+            # stage=2 so the next sparse block's mi/li/oi GM reads overlap the current
+            # block's online-softmax rescale. Body replication does not reassociate the
+            # m_mi/m_li/m_oi carry, so the merge stays bit-identical.
+            for m_sb in pl.pipeline(1, SPARSE_BLOCKS, stage=2):
                 m_row = m_blk_base + m_sb * H_TILE
                 m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
                 m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
@@ -438,18 +470,20 @@ def sparse_attn(
         # head-invariant for token m_t, so col_expand them over the H_TILE head rows;
         # swap_idx (j^1) pairs the interleaved real/imag lanes. Rounded to bf16 (golden
         # also rounds inverse-RoPE to bf16) and packed into o_packed's rope columns.
-        m_col = pl.col_expand_mul(
-            pl.full([H_TILE, ROPE_DIM], dtype=pl.FP32, value=1.0),
-            pl.cast(pl.arange(0, [1, ROPE_DIM], dtype=pl.INT32), target_type=pl.FP32))
-        m_dup_f = pl.cast(pl.cast(pl.mul(m_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        m_lane = pl.sub(m_col, pl.mul(m_dup_f, 2.0))                                              # j%2
-        m_swap_idx = pl.cast(pl.sub(pl.add(m_col, 1.0), pl.mul(m_lane, 2.0)), target_type=pl.INT32)  # j^1
-        m_rope = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
+        m_swap_flat = rope_swap_idx_m[0:1, 0:MERGE_SWAP_FLAT_LEN]
+        m_rope = pl.row_expand_div(m_oi[0 : H_TILE, NOPE_DIM : HEAD_DIM], n_denom)
         m_cos_il = rope_cos_il[m_t : m_t + 1, 0 : ROPE_DIM]
         m_sin_signed = rope_sin_signed[m_t : m_t + 1, 0 : ROPE_DIM]
-        m_swapped = pl.gather(m_rope, dim=-1, index=m_swap_idx)
+        # m_rope is a fresh elementwise result, hence contiguous, so the flat index
+        # addresses it correctly and rows == 1 skips the a5 row-base chain.
+        m_rope_flat = pl.reshape(m_rope, [1, MERGE_SWAP_FLAT_LEN])
+        m_swapped = pl.reshape(
+            pl.gather(m_rope_flat, dim=-1, index=m_swap_flat), [H_TILE, ROPE_DIM])
         m_rot = pl.add(pl.col_expand_mul(m_rope, m_cos_il), pl.col_expand_mul(m_swapped, m_sin_signed))
         n_rope_bf16 = pl.cast(m_rot, target_type=pl.BF16, mode="rint")
+        # NOPE_DIM + ROPE_DIM == HEAD_DIM, so one full-width store per head row writes
+        # exactly the bytes the split nope/rope stores wrote -- half the GM stores.
+        n_full_bf16 = pl.concat(n_bf16[0:H_TILE, 0:NOPE_DIM], n_rope_bf16)
 
         for n_hi in pl.range(H_TILE):
             n_gh = m_h0 + n_hi
@@ -457,8 +491,7 @@ def sparse_attn(
             n_hh = n_gh - n_g * HEADS_PER_GROUP
             n_pack_row = n_g * T + m_t
             n_col = n_hh * HEAD_DIM
-            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_bf16[n_hi : n_hi + 1, 0 : NOPE_DIM]
-            o_packed[n_pack_row : n_pack_row + 1, n_col + NOPE_DIM : n_col + HEAD_DIM] = n_rope_bf16[n_hi : n_hi + 1, 0 : ROPE_DIM]
+            o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + HEAD_DIM] = n_full_bf16[n_hi : n_hi + 1, 0 : HEAD_DIM]
 
     # ========================================================================
     # Back-to-back grouped output projection (manual scope, PER-GROUP INT8 quant).
@@ -490,22 +523,26 @@ def sparse_attn(
             out_col_g = g * O_LORA
 
             with pl.spmd(
-                PA_NFRAGS,
+                PA_BLOCKS,
                 name_hint="proj_a_mm",
                 deps=[merge_tid],
                 allow_early_resolve=True,
             ) as pa_tid:
-                nf = pl.tile.get_block_idx()
-                n0 = nf * PROJ_A_MM_N_TILE
-                xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
-                wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
-                acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
-                for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
-                    k0 = kb * A_K_TILE
-                    xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
-                    wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
-                    acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
-                o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
+                pa_blk = pl.tile.get_block_idx()
+                # One accumulator per N-frag, assembled before the next frag starts, so
+                # only one L0C tile is live at a time -- same shape the proj_b D-chunk
+                # loop below already runs.
+                for anf in pl.range(PA_NF_PER_BLOCK):
+                    n0 = pa_blk * (PA_NF_PER_BLOCK * PROJ_A_MM_N_TILE) + anf * PROJ_A_MM_N_TILE
+                    xa0_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, 0], valid_shape=[T, A_K_TILE])
+                    wa0_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, 0:A_K_TILE]
+                    acc_a = pl.matmul(xa0_chunk, wa0_chunk, b_trans=True, out_dtype=pl.FP32)
+                    for kb in pl.pipeline(1, O_GROUP_IN // A_K_TILE, stage=2):
+                        k0 = kb * A_K_TILE
+                        xa_k_chunk = pl.slice(o_packed, [MM_T_TILE, A_K_TILE], [row_base_o, k0], valid_shape=[T, A_K_TILE])
+                        wa_k_chunk = wo_a[g : g + 1, n0 : n0 + PROJ_A_MM_N_TILE, k0 : k0 + A_K_TILE]
+                        acc_a = pl.matmul_acc(acc_a, xa_k_chunk, wa_k_chunk, b_trans=True)
+                    o_r_pad = pl.assemble(o_r_pad, acc_a, [0, out_col_g + n0])
 
             col_g = g * O_LORA
             with pl.at(
@@ -525,16 +562,19 @@ def sparse_attn(
                     g_sq_row = pl.div(g_scale_num, g_amax)
                     act_scale_dq = pl.assemble(act_scale_dq, pl.recip(g_sq_row), [g, qt])
                     g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
-                    oc_q = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
-                    oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
+                    # Reuse the amax load: this is the same [QUANT_TOKEN_TILE, O_LORA]
+                    # window with no intervening writer, and no pass in the pipeline
+                    # does CSE, so a second read is a real second GM round-trip.
+                    oq_scaled = pl.row_expand_mul(oc_amax, g_sq_col)
                     oq_i32 = pl.cast(oq_scaled, target_type=pl.INT32, mode="rint")
                     oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
                     oq_i8 = pl.cast(oq_half, target_type=pl.INT8, mode="trunc")
                     o_r_i8_pad = pl.assemble(o_r_i8_pad, oq_i8, [qt, col_g])
-                    if T_PAD > T:
-                        zero_half = pl.full([T_PAD - T, O_LORA], dtype=pl.FP16, value=0.0)
-                        zero_i8 = pl.cast(zero_half, target_type=pl.INT8, mode="trunc")
-                        o_r_i8_pad = pl.assemble(o_r_i8_pad, zero_i8, [T, col_g])
+                    # Rows [T, T_PAD) are write-only: proj_b_act reads partials[0:T]
+                    # only (PB_ACT_TBLKS == T // PROJ_B_ACT_TBLK == 1), so the pad rows
+                    # never reach an output. proj_b_mm still multiplies them, but INT8
+                    # over K=O_LORA is bounded well inside INT32 and integer MACs do
+                    # not trap, so seeding them costs a store for nothing.
 
             with pl.spmd(PB_DCHUNKS, name_hint="proj_b_mm", deps=[q_tid], allow_early_resolve=True) as pb_tid:
                 dc = pl.tile.get_block_idx()
