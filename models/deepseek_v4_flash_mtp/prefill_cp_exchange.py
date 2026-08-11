@@ -120,23 +120,31 @@ def _prefill_cp_dual_tail_exchange_wave(
         ]
     ],
     my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
+    payload_epoch: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[EPOCHS * CP_TAIL_WINDOW_ROWS, D], pl.BF16]:
-    """Exchange hidden and KV tails with one barrier."""
-    epoch_value = pl.cast(epoch + 1, pl.INT32)
+    """Exchange hidden and KV tails with one barrier.
+
+    ``payload_epoch`` selects rows in the invocation-local payload/output
+    tensors; ``comm_epoch`` drives the shared cross-layer ready/consumed
+    counters (``consumed >= comm_epoch``, ``ready >= comm_epoch + 1``).
+    Splitting the two lets a multi-layer FWD pass a monotonic communication
+    epoch per global layer while keeping the local payload index at 0.
+    """
+    epoch_value = pl.cast(comm_epoch + 1, pl.INT32)
 
     for peer in pl.range(CP_SIZE):
         if peer != my_rank:
             pld.system.wait(
                 signal=consumed, offsets=[peer, 0],
-                expected=epoch, cmp=pld.WaitCmp.Ge,
+                expected=comm_epoch, cmp=pld.WaitCmp.Ge,
             )
 
     for peer in pl.range(CP_SIZE):
         for part in pl.range(LOCAL_PARTS):
             publish_pos = my_rank * LOCAL_PARTS + part
             publish_dst_row = publish_pos * TAIL_ROWS
-            src_row_base = epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS
+            src_row_base = payload_epoch * LOCAL_PARTS * TAIL_ROWS + part * TAIL_ROWS
             pld.tensor.put(
                 dst=hidden_window, peer=peer, src=local_hidden_tail,
                 dst_offsets=[publish_dst_row, 0], src_offsets=[src_row_base, 0], shape=[TAIL_ROWS, D],
@@ -164,7 +172,7 @@ def _prefill_cp_dual_tail_exchange_wave(
                 expected=epoch_value, cmp=pld.WaitCmp.Ge,
             )
         gather_src_row = gather_pos * TAIL_ROWS
-        gather_dst_row = epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
+        gather_dst_row = payload_epoch * CP_TAIL_WINDOW_ROWS + seg * TAIL_ROWS
         for t0 in pl.range(0, TAIL_ROWS, ROW_TILE):
             hidden_tile = hidden_window[gather_src_row + t0 : gather_src_row + t0 + ROW_TILE, 0:D]
             kv_tile = kv_window[gather_src_row + t0 : gather_src_row + t0 + ROW_TILE, 0:HEAD_DIM]
@@ -229,22 +237,30 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
         ]
     ],
     my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
+    payload_epoch: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[
     [PREFILL_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM], pl.BF16
 ]:
-    """Publish HCA compact rows and commit receiver-local cache/state."""
-    epoch_value = pl.cast(epoch + 1, pl.INT32)
+    """Publish HCA compact rows and commit receiver-local cache/state.
+
+    ``payload_epoch`` selects rows in the invocation-local payload tensors
+    (``local_cmp_payload``/``local_cmp_meta``/``local_state_payload``/
+    ``local_state_meta``); ``comm_epoch`` drives the HCA compact
+    ready/consumed counters (``consumed >= comm_epoch``,
+    ``ready >= comm_epoch + 1``).
+    """
+    epoch_value = pl.cast(comm_epoch + 1, pl.INT32)
 
     for peer in pl.range(CP_SIZE):
         if peer != my_rank:
             pld.system.wait(
                 signal=consumed, offsets=[peer, 0],
-                expected=epoch, cmp=pld.WaitCmp.Ge,
+                expected=comm_epoch, cmp=pld.WaitCmp.Ge,
             )
 
-    cmp_src_row = epoch * CMP_ROWS_PER_RANK
-    state_src_row = epoch * TAIL_ROWS
+    cmp_src_row = payload_epoch * CMP_ROWS_PER_RANK
+    state_src_row = payload_epoch * TAIL_ROWS
     for peer in pl.range(CP_SIZE):
         cmp_dst_row = my_rank * CMP_ROWS_PER_RANK
         state_dst_row = my_rank * TAIL_ROWS
@@ -265,7 +281,7 @@ def _prefill_cp_hca_compact_exchange_commit_wave(
         )
         pld.tensor.put(
             dst=state_meta_window, peer=peer, src=local_state_meta,
-            dst_offsets=[my_rank, 0], src_offsets=[epoch, 0], shape=[1, STATE_META_DIM],
+            dst_offsets=[my_rank, 0], src_offsets=[payload_epoch, 0], shape=[1, STATE_META_DIM],
             chunk_rows=1, chunk_cols=STATE_META_DIM, pipeline=True,
         )
 
@@ -387,19 +403,20 @@ def _prefill_cp_csa_compact_transport_wave(
     ready: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     consumed: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
+    payload_epoch: pl.Scalar[pl.INT32],
+    comm_epoch: pl.Scalar[pl.INT32],
 ):
-    epoch_i32 = pl.cast(epoch, pl.INT32)
-    ready_expected = pl.cast(epoch_i32 + 1, pl.INT32)
+    comm_i32 = pl.cast(comm_epoch, pl.INT32)
+    ready_expected = pl.cast(comm_i32 + 1, pl.INT32)
     for peer in pl.range(CP_SIZE):
         if peer != my_rank:
             pld.system.wait(
                 signal=consumed, offsets=[peer, 0],
-                expected=epoch_i32, cmp=pld.WaitCmp.Ge,
+                expected=comm_i32, cmp=pld.WaitCmp.Ge,
             )
 
-    payload_row = epoch * ROWS_PER_RANK
-    state_row = epoch * STATE_ROWS_PER_RANK
+    payload_row = payload_epoch * ROWS_PER_RANK
+    state_row = payload_epoch * STATE_ROWS_PER_RANK
     destination_row = my_rank * ROWS_PER_RANK
     destination_state_row = my_rank * STATE_ROWS_PER_RANK
     for peer in pl.range(CP_SIZE):

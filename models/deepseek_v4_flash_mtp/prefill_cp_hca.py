@@ -577,10 +577,18 @@ def prefill_cp_hca_core(
         ]
     ],
     my_rank: pl.Scalar[pl.INT32],
+    tail_comm_epoch: pl.Scalar[pl.INT32],
+    compact_comm_epoch_base: pl.Scalar[pl.INT32],
 ):
     """CP-HCA attention math (inline). Shared by the standalone rank child
     and the layer composition child. Inlining avoids child-in-child nesting
-    (@pl.jit cannot call another @pl.jit)."""
+    (@pl.jit cannot call another @pl.jit).
+
+    ``tail_comm_epoch`` and ``compact_comm_epoch_base`` drive the shared
+    cross-layer ready/consumed counters of the dual-tail and HCA compact
+    domains respectively; local payload rows stay at 0 (``EPOCHS == 1``).
+    Standalone/single-layer callers pass 0 for both, preserving behavior.
+    """
     q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
     post = pl.create_tensor([LOCAL_ROWS, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -671,7 +679,7 @@ def prefill_cp_hca_core(
             reverse_index, owner_rank_table,
             hidden_tail_window, kv_tail_window, tail_ready, tail_consumed,
             logical_hidden, logical_kv,
-            my_rank, pl.cast(0, pl.INT32),
+            my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
         )
 
     effective_x = pl.create_tensor(
@@ -944,6 +952,7 @@ def prefill_cp_hca_core(
             compress_state_flat,
             my_rank,
             pl.cast(0, pl.INT32),
+            compact_comm_epoch_base,
         )
 
     cache_flat = pl.reshape(kv_cache, [ORI_CACHE_ROWS, HEAD_DIM])
@@ -1151,6 +1160,7 @@ def prefill_cp_hca_rank(
         compact_ready, compact_consumed,
         attn_sink, wo_a, wo_b, wo_b_scale,
         x_out, my_rank,
+        pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
     )
 
 

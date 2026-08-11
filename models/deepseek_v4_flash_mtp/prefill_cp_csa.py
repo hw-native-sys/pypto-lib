@@ -133,6 +133,12 @@ CP_CANDIDATE_CAPACITY = 1024
 SPARSE_SELECTED_WIDTH = 256
 
 NUM_LOCAL_TILES = LOCAL_PARTS * MAX_SEGMENT_TILES
+# §8.17.8e.2 leaf-capture completion token: number of x_out tile producers
+# (== NUM_LOCAL_TILES here) and also the row count of the rank-local
+# completion_token published by the terminal cp_csa_rank_complete task. Each
+# tile producer writes a distinct token row so no write is dead-store-
+# eliminated. Mirrors prefill_cp_fwd.py:NUM_MOE_WAVES / prefill_cp_layer.py.
+NUM_MOE_WAVES = NUM_LOCAL_TILES
 LOCAL_ROWS = NUM_LOCAL_TILES * T
 LOCAL_SPARSE_ROWS = LOCAL_ROWS * PREFILL_SPARSE_PAD
 MAX_COMPRESS_LEAVES = 1 + MAX_SEGMENT_TILES
@@ -1434,9 +1440,30 @@ def prefill_cp_csa_core(
             [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32
         ]
     ],
+    # §8.17.8e.2 leaf-capture completion token. Published atomically by the
+    # terminal cp_csa_rank_complete task (deps=[resource_done_tid]), which fans
+    # the four leaf-internal commit/transport TIDs via a pl.system.task_dummy.
+    # [NUM_MOE_WAVES, 1, 8] = 4 rows x 32B; one row per x_out tile producer so
+    # no row write is dead-store-eliminated. Consumed downstream by
+    # _attention_stage_barrier (copies row 0 into stage_token). The token's
+    # payload value is irrelevant -- only its producer/consumer edges matter.
+    # Placed before the scalars (Scalars-last rule: no tensor arg after a
+    # scalar arg in runtime TaskArgs).
+    completion_token: pl.Out[
+        pl.Tensor[[NUM_MOE_WAVES, 1, 8], pl.FP32]
+    ],
     my_rank: pl.Scalar[pl.INT32],
+    tail_comm_epoch: pl.Scalar[pl.INT32],
+    compact_comm_epoch_base: pl.Scalar[pl.INT32],
 ):
-    """Run inline CP-CSA attention for one rank."""
+    """Run inline CP-CSA attention for one rank.
+
+    ``tail_comm_epoch`` drives the shared cross-layer tail ready/consumed
+    counters; ``compact_comm_epoch_base`` is the base for the CSA compact
+    counters (``compact_comm_epoch_base + local_epoch`` per local wave).
+    Local payload rows stay at ``local_epoch`` (``EPOCHS == 1`` in this
+    phase). Standalone/single-layer callers pass 0 for both.
+    """
     q = pl.create_tensor([LOCAL_ROWS, H, HEAD_DIM], dtype=pl.BF16, init_value=0.0)
     post = pl.create_tensor([LOCAL_ROWS, HC_MULT], dtype=pl.FP32)
     comb = pl.create_tensor([LOCAL_ROWS, HC_MULT * HC_MULT], dtype=pl.FP32)
@@ -1505,13 +1532,13 @@ def prefill_cp_csa_core(
 
     logical_hidden = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, D], dtype=pl.BF16)
     logical_kv = pl.create_tensor([EPOCHS * CP_TAIL_WINDOW_ROWS, HEAD_DIM], dtype=pl.BF16)
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_exchange"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_tail_exchange") as tail_exchange_tid:
         _prefill_cp_dual_tail_exchange_wave(
             local_hidden_tail, local_kv_tail,
             reverse_index, owner_rank_table,
             hidden_tail_window, kv_tail_window, tail_ready, tail_consumed,
             logical_hidden, logical_kv,
-            my_rank, pl.cast(0, pl.INT32),
+            my_rank, pl.cast(0, pl.INT32), tail_comm_epoch,
         )
 
     effective_x = effective_x_workspace
@@ -1842,11 +1869,19 @@ def prefill_cp_csa_core(
     inner_state_flat = pl.reshape(
         inner_compress_state, [INNER_STATE_ROWS, INNER_STATE_DIM]
     )
+    # §8.17.8e.2 leaf-capture completion token: collect the TaskId of every
+    # leaf-internal commit/transport task so the terminal cp_csa_rank_complete
+    # task can fan them in via pl.system.task_dummy(deps=[...]). With EPOCHS==1
+    # each array holds one entry; the array form keeps the epoch loop's existing
+    # per-epoch structure (idiom: prefill_cp_csa.py:1084 pl.array.create(1, ...) +
+    # :1125 deps=[main_completion[0], inner_completion[0]]).
+    compact_transport_tids = pl.array.create(EPOCHS, pl.TASK_ID)
+    receiver_commit_tids = pl.array.create(EPOCHS, pl.TASK_ID)
     for epoch in pl.range(EPOCHS):
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_compact_transport",
-        ):
+        ) as compact_transport_tid:
             _prefill_cp_csa_compact_transport_wave(
                 packed_main_payload,
                 packed_idx_payload,
@@ -1868,11 +1903,15 @@ def prefill_cp_csa_core(
                 compact_consumed,
                 my_rank,
                 pl.cast(epoch, pl.INT32),
+                pl.cast(compact_comm_epoch_base + epoch, pl.INT32),
             )
+        # Store the captured TaskId for this epoch (idiom:
+        # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
+        compact_transport_tids[epoch] = compact_transport_tid
         with pl.at(
             level=pl.Level.CORE_GROUP,
             name_hint="cp_csa_receiver_commit",
-        ):
+        ) as receiver_commit_tid:
             for source_rank in pl.range(CP_SIZE):
                 source_row = source_rank * ROWS_PER_RANK
                 source_state_row = source_rank * STATE_ROWS_PER_RANK
@@ -1964,6 +2003,9 @@ def prefill_cp_csa_core(
                                 inner_destination_end = destination + 1
                                 inner_state_flat[destination:inner_destination_end, :] = received_inner_state
             _prefill_cp_csa_compact_finish_wave(compact_consumed, my_rank)
+        # Store the captured receiver-commit TaskId for this epoch (idiom:
+        # prefill_sparse_attn.py:300 proj_a_tids[...] = pa_tid).
+        receiver_commit_tids[epoch] = receiver_commit_tid
 
     cmp_indices = pl.create_tensor([LOCAL_ROWS, IDX_TOPK], dtype=pl.INT32, init_value=-1)
     for tile in pl.range(NUM_LOCAL_TILES):
@@ -2010,7 +2052,7 @@ def prefill_cp_csa_core(
         sparse_kv, sparse_bias, valid_mask, overlay_active_flat,
     )
 
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_raw_commit"):
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cp_csa_raw_commit") as raw_commit_tid:
         for row in pl.range(T):
             raw_segment = pl.read(final_win_seg_src, [row])
             raw_source_row = pl.read(final_win_row_src, [row])
@@ -2055,6 +2097,41 @@ def prefill_cp_csa_core(
             y_tile, active,
         )
         x_out_flat[row0 : row0 + T, 0:HC_MULT, 0:D] = y_tile
+
+    # §8.17.8e.2 leaf-capture completion token. Fan the four leaf-internal
+    # commit/transport TaskIds into a single resource_done_tid via
+    # pl.system.task_dummy (a no-op task that only waits -- idiom:
+    # prefill_compressor_ratio4.py:338 completion[0] = pl.system.task_dummy(...)).
+    # Only these four paths are waited; they are NOT serialized against each
+    # other, no new dep is added into any existing internal task, and no dep is
+    # added into the MoE. compact_transport_tids / receiver_commit_tids are
+    # pl.array.create(EPOCHS, pl.TASK_ID); with EPOCHS==1 each contributes one
+    # entry via [0]. tail_exchange_tid and raw_commit_tid are scalar TaskIds
+    # captured by the `as <tid>:` form (idiom: prefill_sparse_attn.py:289
+    # `with pl.at(..., deps=[merge_tid]) as pa_tid`).
+    resource_done_tid = pl.system.task_dummy(
+        deps=[
+            tail_exchange_tid,
+            compact_transport_tids[0],
+            receiver_commit_tids[0],
+            raw_commit_tid,
+        ]
+    )
+    # Terminal rank-complete task: deps=[resource_done_tid] (the four-path
+    # fan-in) AND an AUTO dep on the four x_out tile producers established by
+    # the slice-copy reads of x_out_flat below. Writes one tile slice per
+    # distinct token row --禁止反复覆盖同一个 [0:1, 0:1, 0:8]，否则前面三次写可能
+    # 被 dead-store elimination 消除 (user design requirement). Each row is
+    # 8 × FP32 = 32B, satisfying the pto.alloc_tile 32-byte column alignment.
+    with pl.at(
+        level=pl.Level.CORE_GROUP,
+        name_hint="cp_csa_rank_complete",
+        deps=[resource_done_tid],
+    ):
+        for tile in pl.range(NUM_MOE_WAVES):
+            completion_token[tile : tile + 1, 0:1, 0:8] = pl.slice(
+                x_out_flat, [1, 1, 8], [tile * T, 0, 0]
+            )
 
     return pl.reshape(x_out_flat, [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D])
 
@@ -2227,6 +2304,16 @@ def prefill_cp_csa_rank(
     my_rank: pl.Scalar[pl.INT32],
 ):
     """Run standalone CP-CSA attention for one rank."""
+    # §8.17.8e.2 leaf-capture completion token: child-local, allocated here and
+    # passed into prefill_cp_csa_core (which publishes it via its terminal
+    # cp_csa_rank_complete task). The standalone test does not consume the
+    # token -- it only certifies, within this rank's graph, that the
+    # leaf-internal commit/transport tasks retired before x_out is published.
+    # Keeping it child-local avoids changing the standalone test's host
+    # interface / build_tensor_specs (the token is not a host-visible output).
+    completion_token = pl.create_tensor(
+        [NUM_MOE_WAVES, 1, 8], dtype=pl.FP32, init_value=0.0
+    )
     return prefill_cp_csa_core(
         x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
         wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
@@ -2238,7 +2325,8 @@ def prefill_cp_csa_rank(
         leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
         kv_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
         main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
-        wo_b_scale, x_out, my_rank,
+        wo_b_scale, x_out, completion_token, my_rank,
+        pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
     )
 
 @pl.jit.host

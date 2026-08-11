@@ -131,6 +131,9 @@ assert NUM_MOE_WAVES == 4
 assert RECV_MAX == N_RANKS * T, (
     f"CP layer requires RECV_MAX == N_RANKS * T (got {RECV_MAX} vs {N_RANKS * T})"
 )
+META_WINDOW_ROWS = N_RANKS
+PAYLOAD_WINDOW_ROWS = N_LOCAL * RECV_MAX
+ROUTED_WINDOW_ROWS = N_ROUTES
 
 # Supported representative layer IDs for each attention kind.
 SWA_LAYER_ID = 0
@@ -147,86 +150,63 @@ def _assert_layer_id(layer_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Coarse stage synchronization
+# Local stage sequencing
 # ---------------------------------------------------------------------------
-# One distributed INT32 stage window, monotonic across five global boundaries.
-# Each rank uses row my_rank. Each stage AtomicAdds(1) to peers and waits with
-# Ge(expected_stage). Expected values 1..5 map to: attention complete, MoE
-# wave 0..3 complete. The counter is never reset.
-_ATTN_STAGE = 1          # attention-complete boundary
-_WAVE0_STAGE = 2         # MoE wave 0 complete
+# Attention and MoE close their own distributed protocols. The layer only needs
+# a rank-local tensor chain from attention completion through the four MoE
+# waves; adding another distributed barrier here can block MoE's own rendezvous.
 COPY_TOKEN_TILE = 4      # FP32 copy tile: 4 tokens x 1 HC lane x D = 64 KiB
 assert T % COPY_TOKEN_TILE == 0
 
 
 @pl.jit.inline
-def _attention_stage_barrier(
-    x_attn_flat: pl.Tensor[[4 * T, HC_MULT, D], pl.FP32],
+def _attention_stage_barrier_from_x_attn(
+    x_attn_flat: pl.Tensor[[NUM_MOE_WAVES * T, HC_MULT, D], pl.FP32],
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    stage_token: pl.Out[pl.Tensor[[1, 1, 8], pl.FP32]],
+    stage_tokens: pl.Out[
+        pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32]
+    ],
 ):
-    """Boundary 1: all four local x_attn tile producers complete.
-
-    The task reads all four 128-row tile ranges, then publishes a tensor token
-    consumed by the first MoE-wave copy."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_stage_barrier") as stage_tid:
-        # Anchor the boundary to every local attention tile producer.
-        for k in pl.range(NUM_MOE_WAVES):
-            _anchor = pl.read(x_attn_flat, [k * T, 0, 0])
-        one = pl.cast(1, pl.INT32)
-        for peer in pl.range(CP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=stage_done, peer=peer, offsets=[my_rank, 0],
-                    value=one, op=pld.NotifyOp.AtomicAdd,
-                )
-        for peer in pl.range(CP_SIZE):
-            if peer != my_rank:
-                pld.system.wait(
-                    signal=stage_done, offsets=[peer, 0],
-                    expected=pl.cast(_ATTN_STAGE, pl.INT32),
-                    cmp=pld.WaitCmp.Ge,
-                )
-        # Write the completion token (8 FP32 = 32 bytes, aligned).
-        stage_token[0:1, 0:1, 0:8] = pl.slice(
-            x_attn_flat, [1, 1, 8], [0, 0, 0]
-        )
-    return stage_token
+    """Publish a rank-local token after the first SWA/HCA output is ready."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_stage_token"):
+        completion = pl.slice(x_attn_flat, [1, 1, 8], [0, 0, 0])
+        stage_tokens[0:1, 0:1, 0:8] = completion
+    return stage_tokens
 
 
 @pl.jit.inline
-def _wave_stage_barrier(
-    wave_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+def _attention_stage_barrier_from_completion(
+    completion_token: pl.Tensor[[NUM_MOE_WAVES, 1, 8], pl.FP32],
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    expected_stage: pl.Scalar[pl.INT32],
-    stage_token: pl.Out[pl.Tensor[[1, 1, 8], pl.FP32]],
+    stage_tokens: pl.Out[
+        pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32]
+    ],
 ):
-    """Wave boundary (2..5): the whole wave's x_next_tile completes before the
-    next wave reuses the shared MoE window bank. The output token creates the
-    tensor dependency consumed by the next wave."""
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="wave_stage_barrier") as wave_tid:
-        _anchor = pl.read(wave_out, [0, 0, 0])
-        one = pl.cast(1, pl.INT32)
-        for peer in pl.range(CP_SIZE):
-            if peer != my_rank:
-                pld.system.notify(
-                    target=stage_done, peer=peer, offsets=[my_rank, 0],
-                    value=one, op=pld.NotifyOp.AtomicAdd,
-                )
-        for peer in pl.range(CP_SIZE):
-            if peer != my_rank:
-                pld.system.wait(
-                    signal=stage_done, offsets=[peer, 0],
-                    expected=expected_stage,
-                    cmp=pld.WaitCmp.Ge,
-                )
-        # Write the completion token from the wave output (8 FP32 = 32 bytes).
-        stage_token[0:1, 0:1, 0:8] = pl.slice(
+    """Publish a rank-local token after the attention leaf fan-in closes."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="attn_stage_token"):
+        completion = pl.slice(completion_token, [1, 1, 8], [0, 0, 0])
+        stage_tokens[0:1, 0:1, 0:8] = completion
+    return stage_tokens
+
+
+@pl.jit.inline
+def _record_wave_completion(
+    wave_out: pl.Tensor[[T, HC_MULT, D], pl.FP32],
+    wave: pl.Scalar[pl.INT32],
+    stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    my_rank: pl.Scalar[pl.INT32],
+    stage_tokens: pl.Out[
+        pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32]
+    ],
+):
+    """Admit the next local wave after this rank completes the current MoE."""
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="wave_complete"):
+        stage_tokens[wave + 1 : wave + 2, 0:1, 0:8] = pl.slice(
             wave_out, [1, 1, 8], [0, 0, 0]
         )
-    return stage_token
+    return stage_tokens
 
 
 @pl.jit.inline
@@ -319,16 +299,17 @@ def _prefill_layer_cp_moe_tail(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # MoE distributed windows (reused across the four waves; ordered by wave
     # through the stage counter).
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[META_WINDOW_ROWS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
+    stage_tokens: pl.Tensor[[NUM_MOE_WAVES + 1, 1, 8], pl.FP32],
     # Layer output.
     x_next: pl.Out[
         pl.Tensor[
@@ -340,19 +321,9 @@ def _prefill_layer_cp_moe_tail(
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D], pl.FP32]:
     """Shared MoE tail: attention boundary -> four MoE waves -> publish
-    x_next -> clear MoE signals. Used by every mode-specific rank child
-    (SWA/HCA/CSA) after its accepted CP attention core writes x_attn."""
+    x_next -> clear MoE signals after a mode-specific attention barrier."""
     x_attn_flat = pl.reshape(x_attn, [NUM_MOE_WAVES * T, HC_MULT, D])
-    # Barriers and their consumers are connected by this small tensor token.
-    stage_token = pl.create_tensor(
-        [1, 1, 8], dtype=pl.FP32, init_value=0.0
-    )
-    stage_token = _attention_stage_barrier(
-        x_attn_flat, stage_done, my_rank, stage_token
-    )
 
-    # Reusable MoE input and per-wave output scratch, both child-local.
-    x_moe_ready = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
     x_next_work = pl.create_tensor(
         [NUM_MOE_WAVES * T, HC_MULT, D], dtype=pl.FP32, init_value=0.0
     )
@@ -362,16 +333,14 @@ def _prefill_layer_cp_moe_tail(
     input_ids_flat = pl.reshape(input_ids, [NUM_MOE_WAVES * T])
 
     one = pl.cast(1, pl.INT32)
+    x_moe_ready = pl.create_tensor(
+        [T, HC_MULT, D], dtype=pl.FP32, init_value=0.0
+    )
     for wave in pl.range(NUM_MOE_WAVES):
         row0 = wave * T
-        active = pl.read(active_flat, [wave, 1])
-        # CP metadata guarantees active is in [0, T]. Empty waves still execute
-        # one deterministic row so every rank participates in the MoE protocol.
-        effective_tokens = pl.max(active, one)
+        effective_tokens = pl.max(pl.read(active_flat, [wave, 1]), one)
         x_src = pl.slice(x_attn_flat, [T, HC_MULT, D], [row0, 0, 0])
         ids = pl.slice(input_ids_flat, [T], [row0])
-        # Each 64 KiB copy tile consumes the preceding completion token and
-        # stays below the A2/A3 Vec-memory limit.
         with pl.spmd(
             (T // COPY_TOKEN_TILE) * HC_MULT,
             name_hint="moe_input_copy",
@@ -380,8 +349,7 @@ def _prefill_layer_cp_moe_tail(
             token_block = copy_idx // HC_MULT
             hc_lane = copy_idx % HC_MULT
             token0 = token_block * COPY_TOKEN_TILE
-            # Establish the natural barrier-to-copy tensor dependency.
-            _tok = pl.read(stage_token, [0, 0, 0])
+            _tok = pl.read(stage_tokens, [wave, 0, 0])
             x_moe_ready[
                 token0 : token0 + COPY_TOKEN_TILE,
                 hc_lane : hc_lane + 1,
@@ -391,27 +359,23 @@ def _prefill_layer_cp_moe_tail(
                 [COPY_TOKEN_TILE, 1, D],
                 [token0, hc_lane, 0],
             )
-        # MoE requires a concrete output tensor rather than a slice alias.
-        wave_out = pl.create_tensor([T, HC_MULT, D], dtype=pl.FP32, init_value=0.0)
-        moe_epoch = pl.cast(wave + 1, pl.INT32)
+        wave_out = pl.create_tensor(
+            [T, HC_MULT, D], dtype=pl.FP32, init_value=0.0
+        )
         moe(
             x_moe_ready, hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
             norm_w, gate_w, gate_bias, tid2eid, ids,
             routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
             routed_w2, routed_w2_scale,
             shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-            shared_w2, shared_w2_scale,
-            wave_out,
+            shared_w2, shared_w2_scale, wave_out,
             recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
             routed_y_buf, combine_arrived,
-            layer_id, effective_tokens, my_rank, moe_epoch,
+            layer_id, effective_tokens, my_rank, pl.cast(wave + 1, pl.INT32),
         )
-        # Assemble the wave into the child-local full output.
         x_next_work = pl.assemble(x_next_work, wave_out, [row0, 0, 0])
-        # The next wave consumes the token written by this boundary.
-        stage_token = _wave_stage_barrier(
-            wave_out, stage_done, my_rank,
-            pl.cast(_WAVE0_STAGE + wave, pl.INT32), stage_token,
+        stage_tokens = _record_wave_completion(
+            wave_out, wave, stage_done, my_rank, stage_tokens
         )
 
     # Materialize an aligned rank-3 anchor for final signal cleanup.
@@ -422,12 +386,16 @@ def _prefill_layer_cp_moe_tail(
         name_hint="final_completion_anchor",
     ):
         _anchor_idx = pl.tile.get_block_idx()
-        # Order cleanup after the final all-rank wave boundary.
-        _final_tok = pl.read(stage_token, [0, 0, 0])
-        final_element = pl.slice(
-            x_next_work, [1, 1, 8], [final_row, 0, 0]
+        completion = pl.add(
+            pl.slice(x_next_work, [1, 1, 8], [0, 0, 0]),
+            pl.slice(stage_tokens, [1, 1, 8], [NUM_MOE_WAVES, 0, 0]),
         )
-        anchor_tile[0:1, 0:1, 0:8] = final_element
+        for wave in pl.range(1, NUM_MOE_WAVES):
+            completion = pl.add(
+                completion,
+                pl.slice(x_next_work, [1, 1, 8], [wave * T, 0, 0]),
+            )
+        anchor_tile[0:1, 0:1, 0:8] = completion
     # Publication naturally depends on all rank-local wave outputs.
     x_next = _publish_x_next_after_stage(x_next_work, active_flat, x_next)
     clear_moe_signals(anchor_tile, arrived, data_arrived, combine_arrived)
@@ -437,7 +405,7 @@ def _prefill_layer_cp_moe_tail(
 # ---------------------------------------------------------------------------
 # Rank-local child
 # ---------------------------------------------------------------------------
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_layer_cp_swa(
     # CP hidden + SWA attention inputs (same set as prefill_cp_swa_test passes
     # into prefill_cp_swa_core).
@@ -516,14 +484,14 @@ def prefill_layer_cp_swa(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # MoE distributed windows (reused across the four waves; ordered by wave
     # through the stage counter).
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[META_WINDOW_ROWS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -543,41 +511,51 @@ def prefill_layer_cp_swa(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
         dtype=pl.FP32, init_value=0.0,
     )
-    # The accepted inline attention core writes x_attn and mutates kv_cache.
-    prefill_cp_swa_core(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin, kv_cache,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        segment_starts_t, predecessor_segments,
-        query_position_ids, query_token_to_request,
-        overlay_position_ids, overlay_token_to_request,
-        overlay_active_lengths, swa_indices,
-        reverse_index, owner_rank_table,
-        final_win_seg_src, final_win_row_src, final_slot_mapping,
-        kv_tail_window, ready, consumed,
-        x_attn, my_rank,
+    completion_token = pl.create_tensor(
+        [NUM_MOE_WAVES, 1, 8], dtype=pl.FP32, init_value=0.0
     )
+    with pl.scope():
+        prefill_cp_swa_core(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin, kv_cache,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            segment_starts_t, predecessor_segments,
+            query_position_ids, query_token_to_request,
+            overlay_position_ids, overlay_token_to_request,
+            overlay_active_lengths, swa_indices,
+            reverse_index, owner_rank_table,
+            final_win_seg_src, final_win_row_src, final_slot_mapping,
+            kv_tail_window, ready, consumed,
+            x_attn, completion_token, my_rank, pl.cast(0, pl.INT32),
+        )
 
-    # Shared MoE tail: attention boundary -> four waves -> publish x_next.
-    return _prefill_layer_cp_moe_tail(
-        x_attn, overlay_active_lengths, input_ids,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        stage_done, x_next, layer_id, my_rank,
-    )
+    with pl.scope():
+        stage_tokens = pl.create_tensor(
+            [NUM_MOE_WAVES + 1, 1, 8], dtype=pl.FP32, init_value=0.0
+        )
+        stage_tokens = _attention_stage_barrier_from_completion(
+            completion_token, stage_done, my_rank, stage_tokens
+        )
+        x_next = _prefill_layer_cp_moe_tail(
+            x_attn, overlay_active_lengths, input_ids,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias, tid2eid,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            routed_y_buf, combine_arrived,
+            stage_done, stage_tokens, x_next, layer_id, my_rank,
+        )
+    return x_next
 
 
 # ---------------------------------------------------------------------------
 # Rank-local child: HCA
 # ---------------------------------------------------------------------------
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_layer_cp_hca(
     # CP hidden + HCA attention inputs (same set as prefill_cp_hca_rank passes
     # into prefill_cp_hca_core).
@@ -708,14 +686,14 @@ def prefill_layer_cp_hca(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # MoE distributed windows (reused across the four waves; ordered by wave
     # through the stage counter).
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[META_WINDOW_ROWS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -735,50 +713,58 @@ def prefill_layer_cp_hca(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
         dtype=pl.FP32, init_value=0.0,
     )
-    # The accepted inline attention core writes x_attn and mutates
-    # kv_cache / cmp_kv / compress_state.
-    prefill_cp_hca_core(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
-        wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
-        freqs_cos, freqs_sin,
-        cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
-        compress_state, compress_state_block_table,
-        kv_cache, cmp_kv, cmp_block_table,
-        segment_starts_t, segment_active_lengths,
-        owner_segments_t, predecessor_segments,
-        query_positions, query_requests,
-        overlay_positions, overlay_requests,
-        overlay_active_lengths, swa_indices, cmp_indices,
-        segment_tail_positions,
-        snapshot_positions, snapshot_valid, final_segment_t,
-        reverse_index, owner_rank_table, owner_part_table,
-        final_win_seg_src, final_win_row_src, final_slot_mapping,
-        hidden_tail_window, kv_tail_window,
-        tail_ready, tail_consumed,
-        cmp_window, cmp_meta_window,
-        state_window, state_meta_window,
-        compact_ready, compact_consumed,
-        attn_sink, wo_a, wo_b, wo_b_scale,
-        x_attn, my_rank,
-    )
+    with pl.scope():
+        prefill_cp_hca_core(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w,
+            wq_a, wq_b, wq_b_scale, wkv, gamma_cq, gamma_ckv,
+            freqs_cos, freqs_sin,
+            cmp_wkv, cmp_wgate, cmp_ape, cmp_norm_w,
+            compress_state, compress_state_block_table,
+            kv_cache, cmp_kv, cmp_block_table,
+            segment_starts_t, segment_active_lengths,
+            owner_segments_t, predecessor_segments,
+            query_positions, query_requests,
+            overlay_positions, overlay_requests,
+            overlay_active_lengths, swa_indices, cmp_indices,
+            segment_tail_positions,
+            snapshot_positions, snapshot_valid, final_segment_t,
+            reverse_index, owner_rank_table, owner_part_table,
+            final_win_seg_src, final_win_row_src, final_slot_mapping,
+            hidden_tail_window, kv_tail_window,
+            tail_ready, tail_consumed,
+            cmp_window, cmp_meta_window,
+            state_window, state_meta_window,
+            compact_ready, compact_consumed,
+            attn_sink, wo_a, wo_b, wo_b_scale,
+            x_attn, my_rank,
+            pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
+        )
 
-    # Shared MoE tail: attention boundary -> four waves -> publish x_next.
-    return _prefill_layer_cp_moe_tail(
-        x_attn, overlay_active_lengths, input_ids,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        stage_done, x_next, layer_id, my_rank,
-    )
+    with pl.scope():
+        x_attn_flat = pl.reshape(x_attn, [NUM_MOE_WAVES * T, HC_MULT, D])
+        stage_tokens = pl.create_tensor(
+            [NUM_MOE_WAVES + 1, 1, 8], dtype=pl.FP32, init_value=0.0
+        )
+        stage_tokens = _attention_stage_barrier_from_x_attn(
+            x_attn_flat, stage_done, my_rank, stage_tokens
+        )
+        x_next = _prefill_layer_cp_moe_tail(
+            x_attn, overlay_active_lengths, input_ids,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias, tid2eid,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            routed_y_buf, combine_arrived,
+            stage_done, stage_tokens, x_next, layer_id, my_rank,
+        )
+    return x_next
 
 
 
-@pl.jit
+@pl.jit(auto_scope=False)
 def prefill_layer_cp_csa(
     # CP hidden + CSA attention inputs (same set as prefill_cp_csa_rank passes
     # into prefill_cp_csa_core; x_out becomes the child-local x_attn).
@@ -964,14 +950,14 @@ def prefill_layer_cp_csa(
     shared_w2_scale: pl.Tensor[[D], pl.FP32],
     # MoE distributed windows (reused across the four waves; ordered by wave
     # through the stage counter).
-    recv_meta: pld.DistributedTensor[[N_RANKS, N_LOCAL], pl.INT32],
-    recv_x: pld.DistributedTensor[[N_LOCAL * RECV_MAX, D], pl.INT8],
-    recv_aux: pld.DistributedTensor[[N_LOCAL * RECV_MAX, AUX_PAD], pl.FP32],
-    recv_route: pld.DistributedTensor[[N_LOCAL * RECV_MAX, IDX_PAD], pl.INT32],
-    arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    data_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
-    routed_y_buf: pld.DistributedTensor[[N_ROUTES, D], pl.BF16],
-    combine_arrived: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
+    recv_meta: pld.DistributedTensor[[META_WINDOW_ROWS, N_LOCAL], pl.INT32],
+    recv_x: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, D], pl.INT8],
+    recv_aux: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, AUX_PAD], pl.FP32],
+    recv_route: pld.DistributedTensor[[PAYLOAD_WINDOW_ROWS, IDX_PAD], pl.INT32],
+    arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    data_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
+    routed_y_buf: pld.DistributedTensor[[ROUTED_WINDOW_ROWS, D], pl.BF16],
+    combine_arrived: pld.DistributedTensor[[META_WINDOW_ROWS, 1], pl.INT32],
     # Layer stage synchronization window.
     stage_done: pld.DistributedTensor[[CP_SIZE, 1], pl.INT32],
     # Layer output.
@@ -991,37 +977,52 @@ def prefill_layer_cp_csa(
         [LOCAL_PARTS, MAX_SEGMENT_TILES, T, HC_MULT, D],
         dtype=pl.FP32, init_value=0.0,
     )
-    # The accepted inline attention core writes x_attn and mutates
-    # kv_cache / cmp_kv / compress_state / inner_compress_state /
-    # idx_kv_cache / idx_kv_scale.
-    prefill_cp_csa_core(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
-        wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
-        cmp_norm_w, hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj, inner_wkv, inner_wgate, inner_ape,
-        inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state,
-        inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t,
-        segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests, overlay_positions, overlay_requests,
-        overlay_active_lengths, swa_indices, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
-        leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
-        kv_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
-        main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
-        wo_b_scale, x_attn, my_rank,
+    # The leaf publishes one row per x_out tile after its communication and
+    # persistent cache/state updates have retired.
+    completion_token = pl.create_tensor(
+        [NUM_MOE_WAVES, 1, 8], dtype=pl.FP32, init_value=0.0
     )
+    # The accepted inline attention core writes x_attn, mutates
+    # kv_cache / cmp_kv / compress_state / inner_compress_state /
+    # idx_kv_cache / idx_kv_scale, AND publishes completion_token via its
+    # terminal cp_csa_rank_complete task.
+    with pl.scope():
+        prefill_cp_csa_core(
+            x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_w, wq_a, wq_b, wq_b_scale,
+            wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin, cmp_wkv, cmp_wgate, cmp_ape,
+            cmp_norm_w, hadamard_idx, idx_wq_b, idx_wq_b_scale, idx_weights_proj, inner_wkv, inner_wgate, inner_ape,
+            inner_norm_w, main_state_workspace0, inner_state_workspace0, main_state_workspace1, inner_state_workspace1, compress_state, compress_state_block_table, inner_compress_state,
+            inner_compress_state_block_table, kv_cache, cmp_kv, cmp_block_table, idx_kv_cache, idx_kv_scale, idx_block_table, segment_starts_t,
+            segment_lengths_t, segment_active_lengths, owner_segments_t, predecessor_segments, query_positions, query_requests, overlay_positions, overlay_requests,
+            overlay_active_lengths, swa_indices, final_segment_t, reverse_index, owner_rank_table, final_win_seg_src, final_win_row_src, final_slot_mapping,
+            leaf_positions_input, leaf_main_slots_input, leaf_idx_slots_input, leaf_main_state_slots_input, leaf_inner_state_slots_input, leaf_num_tokens_input, effective_x_workspace, hidden_tail_window,
+            kv_tail_window, tail_ready, tail_consumed, main_window, idx_window, scale_window, record_window, main_state_window,
+            main_state_meta_window, inner_state_window, inner_state_meta_window, compact_ready, compact_consumed, attn_sink, wo_a, wo_b,
+            wo_b_scale, x_attn, completion_token, my_rank,
+            pl.cast(0, pl.INT32), pl.cast(0, pl.INT32),
+        )
 
     # Shared MoE tail: attention boundary -> four waves -> publish x_next.
-    return _prefill_layer_cp_moe_tail(
-        x_attn, overlay_active_lengths, input_ids,
-        hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
-        norm_w, gate_w, gate_bias, tid2eid,
-        routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
-        routed_w2, routed_w2_scale,
-        shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
-        shared_w2, shared_w2_scale,
-        recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
-        routed_y_buf, combine_arrived,
-        stage_done, x_next, layer_id, my_rank,
-    )
-
+    with pl.scope():
+        stage_tokens = pl.create_tensor(
+            [NUM_MOE_WAVES + 1, 1, 8], dtype=pl.FP32, init_value=0.0
+        )
+        stage_tokens = _attention_stage_barrier_from_completion(
+            completion_token, stage_done, my_rank, stage_tokens
+        )
+        x_next = _prefill_layer_cp_moe_tail(
+            x_attn, overlay_active_lengths, input_ids,
+            hc_ffn_fn, hc_ffn_scale, hc_ffn_base,
+            norm_w, gate_w, gate_bias, tid2eid,
+            routed_w1, routed_w1_scale, routed_w3, routed_w3_scale,
+            routed_w2, routed_w2_scale,
+            shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
+            shared_w2, shared_w2_scale,
+            recv_meta, recv_x, recv_aux, recv_route, arrived, data_arrived,
+            routed_y_buf, combine_arrived,
+            stage_done, stage_tokens, x_next, layer_id, my_rank,
+        )
+    return x_next
 
 
 # ---------------------------------------------------------------------------
@@ -1118,18 +1119,18 @@ def l3_prefill_layer_cp_swa(
     consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
 
     # Domain 2: baseline MoE window bank (same as l3_prefill_layer).
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_meta_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+        [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
     )
     recv_route_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+        [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1140,21 +1141,21 @@ def l3_prefill_layer_cp_swa(
         )
         ready = pld.window(ready_buf, [CP_SIZE, 1], dtype=pl.INT32)
         consumed = pld.window(consumed_buf, [CP_SIZE, 1], dtype=pl.INT32)
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_meta = pld.window(recv_meta_buf, [META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
         recv_aux = pld.window(
-            recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+            recv_aux_buf, [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
         )
         recv_route = pld.window(
-            recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+            recv_route_buf, [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
         )
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # SWA attention weights are shared across ranks (passed directly, not
@@ -1358,18 +1359,18 @@ def l3_prefill_layer_cp_hca(
     )
 
     # Domain 3: baseline MoE window bank (same as l3_prefill_layer_cp_swa).
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_meta_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+        [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
     )
     recv_route_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+        [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 4: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1406,21 +1407,21 @@ def l3_prefill_layer_cp_hca(
         compact_consumed = pld.window(
             compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
         )
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_meta = pld.window(recv_meta_buf, [META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
         recv_aux = pld.window(
-            recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+            recv_aux_buf, [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
         )
         recv_route = pld.window(
-            recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+            recv_route_buf, [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
         )
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
         # HCA attention weights are shared across ranks (passed directly, not
@@ -1678,18 +1679,18 @@ def l3_prefill_layer_cp_csa(
     compact_consumed_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
 
     # Domain 2: baseline MoE window bank (same as l3_prefill_layer_cp_swa).
-    recv_meta_buf = pld.alloc_window_buffer([N_RANKS, N_LOCAL], dtype=pl.INT32)
-    recv_x_buf = pld.alloc_window_buffer([N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+    recv_meta_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+    recv_x_buf = pld.alloc_window_buffer([PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
     recv_aux_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+        [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
     )
     recv_route_buf = pld.alloc_window_buffer(
-        [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+        [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
     )
-    arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    data_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
-    routed_y_buf_buf = pld.alloc_window_buffer([N_ROUTES, D], dtype=pl.BF16)
-    combine_arrived_buf = pld.alloc_window_buffer([N_RANKS, 1], dtype=pl.INT32)
+    arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    data_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
+    routed_y_buf_buf = pld.alloc_window_buffer([ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
+    combine_arrived_buf = pld.alloc_window_buffer([META_WINDOW_ROWS, 1], dtype=pl.INT32)
 
     # Domain 3: layer stage synchronization (monotonic counter, 1..5).
     stage_done_buf = pld.alloc_window_buffer([CP_SIZE, 1], dtype=pl.INT32)
@@ -1744,21 +1745,21 @@ def l3_prefill_layer_cp_csa(
             compact_consumed_buf, [CP_SIZE, 1], dtype=pl.INT32
         )
         # MoE window bindings (baseline bank).
-        recv_meta = pld.window(recv_meta_buf, [N_RANKS, N_LOCAL], dtype=pl.INT32)
-        recv_x = pld.window(recv_x_buf, [N_LOCAL * RECV_MAX, D], dtype=pl.INT8)
+        recv_meta = pld.window(recv_meta_buf, [META_WINDOW_ROWS, N_LOCAL], dtype=pl.INT32)
+        recv_x = pld.window(recv_x_buf, [PAYLOAD_WINDOW_ROWS, D], dtype=pl.INT8)
         recv_aux = pld.window(
-            recv_aux_buf, [N_LOCAL * RECV_MAX, AUX_PAD], dtype=pl.FP32
+            recv_aux_buf, [PAYLOAD_WINDOW_ROWS, AUX_PAD], dtype=pl.FP32
         )
         recv_route = pld.window(
-            recv_route_buf, [N_LOCAL * RECV_MAX, IDX_PAD], dtype=pl.INT32
+            recv_route_buf, [PAYLOAD_WINDOW_ROWS, IDX_PAD], dtype=pl.INT32
         )
-        arrived = pld.window(arrived_buf, [N_RANKS, 1], dtype=pl.INT32)
+        arrived = pld.window(arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32)
         data_arrived = pld.window(
-            data_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            data_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
-        routed_y_buf = pld.window(routed_y_buf_buf, [N_ROUTES, D], dtype=pl.BF16)
+        routed_y_buf = pld.window(routed_y_buf_buf, [ROUTED_WINDOW_ROWS, D], dtype=pl.BF16)
         combine_arrived = pld.window(
-            combine_arrived_buf, [N_RANKS, 1], dtype=pl.INT32
+            combine_arrived_buf, [META_WINDOW_ROWS, 1], dtype=pl.INT32
         )
         stage_done = pld.window(stage_done_buf, [CP_SIZE, 1], dtype=pl.INT32)
 
@@ -2231,6 +2232,8 @@ if __name__ == "__main__":
         help="layer 0 = SWA, layer 2 = CSA, layer 3 = HCA",
     )
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False)
+    parser.add_argument("--no-golden", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
@@ -2292,7 +2295,7 @@ if __name__ == "__main__":
     result = run_jit(
         fn=host_fn,
         specs=specs,
-        golden_fn=golden_prefill_layer_cp,
+        golden_fn=None if args.no_golden else golden_prefill_layer_cp,
         compile_only=args.compile_only,
         compile_cfg=dict(
             distributed_config=DistributedConfig(
@@ -2303,6 +2306,7 @@ if __name__ == "__main__":
         runtime_cfg=dict(
             platform=args.platform,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
         ),
         rtol=1e-2,
         atol=1e-2,
