@@ -1429,6 +1429,107 @@ class TestResidentPath:
             TensorSpec("y", [4], torch.float32, is_output=True),             # output
         ]
 
+    def test_prepare_l3_worker_filters_unsupported_prepare_timeout(self):
+        """Legacy prepare() signatures ignore the optional startup deadline."""
+        import golden.runner as R
+
+        worker = object()
+
+        class _LegacyDCP:
+            def prepare(self, startup_timeout_s=None, /):
+                return worker
+
+        result = R._prepare_l3_worker(
+            _LegacyDCP(),
+            run_config=None,
+            bench=False,
+            inherited_host_tensors=(),
+            startup_timeout_s=900.0,
+        )
+
+        assert result is worker
+
+    def test_prepare_l3_worker_filters_unsupported_worker_timeout(self):
+        """The fallback preserves inherited tensors on a legacy worker API."""
+        import golden.runner as R
+
+        inherited = (torch.ones(4),)
+        calls = {}
+
+        class _LegacyDCP:
+            def prepare(self):
+                pytest.fail("prepare() cannot inherit resident host tensors")
+
+        class _LegacyDistributedWorker:
+            def __init__(self, compiled, config, *, inherited_host_tensors=()):
+                calls["compiled"] = compiled
+                calls["config"] = config
+                calls["inherited"] = inherited_host_tensors
+
+        compiled = _LegacyDCP()
+        fake_runtime = types.ModuleType("pypto.runtime")
+        fake_runtime.DistributedWorker = _LegacyDistributedWorker
+        with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+            result = R._prepare_l3_worker(
+                compiled,
+                run_config="RUNCFG",
+                bench=False,
+                inherited_host_tensors=inherited,
+                startup_timeout_s=900.0,
+            )
+
+        assert isinstance(result, _LegacyDistributedWorker)
+        assert calls == {
+            "compiled": compiled,
+            "config": None,
+            "inherited": inherited,
+        }
+
+    def test_prepare_l3_worker_passes_supported_worker_timeout(self):
+        """The fallback forwards the deadline when the worker API supports it."""
+        import golden.runner as R
+
+        inherited = (torch.ones(4),)
+        calls = {}
+
+        class _LegacyDCP:
+            def prepare(self):
+                pytest.fail("prepare() cannot inherit resident host tensors")
+
+        class _DistributedWorker:
+            def __init__(
+                self,
+                compiled,
+                config,
+                *,
+                inherited_host_tensors=(),
+                startup_timeout_s=None,
+            ):
+                calls["compiled"] = compiled
+                calls["config"] = config
+                calls["inherited"] = inherited_host_tensors
+                calls["startup_timeout_s"] = startup_timeout_s
+
+        compiled = _LegacyDCP()
+        fake_runtime = types.ModuleType("pypto.runtime")
+        fake_runtime.DistributedWorker = _DistributedWorker
+        with patch.dict(sys.modules, {"pypto.runtime": fake_runtime}):
+            result = R._prepare_l3_worker(
+                compiled,
+                run_config="RUNCFG",
+                bench=False,
+                inherited_host_tensors=inherited,
+                startup_timeout_s=900.0,
+            )
+
+        assert isinstance(result, _DistributedWorker)
+        assert calls == {
+            "compiled": compiled,
+            "config": None,
+            "inherited": inherited,
+            "startup_timeout_s": 900.0,
+        }
+
     def test_resident_routes_to_l3_resident_not_single_chip(self, tmp_path):
         """A resident spec dispatches via _run_l3_resident; execute_compiled never runs."""
         compiled_dir = tmp_path / "build"

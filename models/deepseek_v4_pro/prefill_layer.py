@@ -1315,6 +1315,29 @@ if __name__ == "__main__":
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
     chunk_lens = tuple(int(x) for x in args.chunk_lens.split(","))
     start_positions = None if args.start_positions is None else tuple(int(x) for x in args.start_positions.split(","))
+    golden_fn = None if args.smoke_weights else golden_prefill_layer
+    compare_fn = None if args.smoke_weights else {
+        # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
+        # --chunk-lens 128,192
+        # TODO: re-measure on Pro real weights. The numbers below are the
+        # Flash measurements (2 SWA layers, 256 experts, routed_scaling 1.5)
+        # and do not describe Pro, whose layer 0 is HCA, not SWA:
+        #   swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
+        "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+        # Packed CSA runs preserve the standalone child-kernel precision
+        # contracts: sparse BF16 cache rows may differ by one ULP, C8 rows
+        # by one LSB, and only a small fraction of recurrent-state values
+        # cross the strict pointwise FP32 threshold.
+        "csa_compress_state": ratio_allclose(
+            atol=1e-3, rtol=1e-3, max_error_ratio=0.005
+        ),
+        "csa_inner_compress_state": ratio_allclose(
+            atol=1e-3, rtol=1e-3, max_error_ratio=0.005
+        ),
+        "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
+        "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
+    }
 
     result = run_jit(
         fn=l3_prefill_layer,
@@ -1324,7 +1347,7 @@ if __name__ == "__main__":
             start_positions=start_positions,
             smoke_weights=args.smoke_weights,
         ),
-        golden_fn=golden_prefill_layer,
+        golden_fn=golden_fn,
         compile_only=args.compile_only,
         compile_cfg=dict(
             dump_passes=args.dump_passes,
@@ -1339,28 +1362,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
-            # --chunk-lens 128,192
-            # TODO: re-measure on Pro real weights. The numbers below are the
-            # Flash measurements (2 SWA layers, 256 experts, routed_scaling 1.5)
-            # and do not describe Pro, whose layer 0 is HCA, not SWA:
-            #   swa(L0) 0.15% / 0.0006%, hca(L9) 1.1% / 0.45%, csa(L8) 3.89% / 0.63%.
-            "x_next": valid_ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # Packed CSA runs preserve the standalone child-kernel precision
-            # contracts: sparse BF16 cache rows may differ by one ULP, C8 rows
-            # by one LSB, and only a small fraction of recurrent-state values
-            # cross the strict pointwise FP32 threshold.
-            "csa_compress_state": ratio_allclose(
-                atol=1e-3, rtol=1e-3, max_error_ratio=0.005
-            ),
-            "csa_inner_compress_state": ratio_allclose(
-                atol=1e-3, rtol=1e-3, max_error_ratio=0.005
-            ),
-            "cmp_kv": ratio_allclose(atol=1e-4, rtol=1.0 / 128, max_error_ratio=0.005),
-            "idx_kv_cache": ratio_allclose(atol=1, rtol=0, max_error_ratio=0.01),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:

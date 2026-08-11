@@ -827,7 +827,13 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) >= N_RANKS, f"need at least {N_RANKS} devices, got {device_ids}"
     host_fn = l3_decode_layer
-    golden_fn = golden_decode_layer_auto
+    golden_fn = None if args.smoke_weights else golden_decode_layer_auto
+    compare_fn = None if args.smoke_weights else {
+        # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2),
+        # to be re-measured at Pro dims: hca(L0/L1 lead, L9 steady), csa(L8).
+        "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
+        "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
+    }
 
     result = run_jit(
         fn=host_fn,
@@ -852,12 +858,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2),
-            # to be re-measured at Pro dims: hca(L0/L1 lead, L9 steady), csa(L8).
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
-            "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:

@@ -103,6 +103,10 @@ def build_tensor_specs(token_count):
         )
 
     base = [5.9166, -3.6223, -2.9324, -3.3124]
+    if len(base) != HC_MULT:
+        raise ValueError(
+            f"hc_head_base fixture has {len(base)} entries; expected HC_MULT={HC_MULT}"
+        )
     specs = [
         TensorSpec(
             "x_hc", [N_RANKS, token_count, HC_MULT, D], torch.float32,

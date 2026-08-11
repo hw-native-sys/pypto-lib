@@ -813,37 +813,51 @@ def _prepare_l3_worker(
     """
     import inspect
 
+    def accepts_keyword(parameters, name):
+        parameter = parameters.get(name)
+        accepts_named_keyword = parameter is not None and parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        return accepts_named_keyword or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
     args = (run_config,) if bench else ()
     kwargs = (
         {"persistent": True, "reset_persistent_windows": False}
         if bench
         else {}
     )
-    if startup_timeout_s is not None:
-        kwargs["startup_timeout_s"] = startup_timeout_s
-    if not inherited_host_tensors:
-        return compiled.prepare(*args, **kwargs)
-
-    parameters = inspect.signature(compiled.prepare).parameters.values()
-    accepts_inherited = any(
-        parameter.name == "inherited_host_tensors"
-        for parameter in parameters
+    prepare_parameters = inspect.signature(compiled.prepare).parameters
+    prepare_kwargs = dict(kwargs)
+    if startup_timeout_s is not None and accepts_keyword(
+        prepare_parameters, "startup_timeout_s"
+    ):
+        prepare_kwargs["startup_timeout_s"] = startup_timeout_s
+    accepts_inherited = accepts_keyword(
+        prepare_parameters, "inherited_host_tensors"
     )
-    if accepts_inherited:
-        return compiled.prepare(
-            *args,
-            inherited_host_tensors=inherited_host_tensors,
-            **kwargs,
-        )
+    if not inherited_host_tensors or accepts_inherited:
+        if inherited_host_tensors:
+            prepare_kwargs["inherited_host_tensors"] = inherited_host_tensors
+        return compiled.prepare(*args, **prepare_kwargs)
 
     from pypto.runtime import DistributedWorker
 
+    worker_kwargs = dict(kwargs)
+    worker_parameters = inspect.signature(DistributedWorker).parameters
+    if startup_timeout_s is not None and accepts_keyword(
+        worker_parameters, "startup_timeout_s"
+    ):
+        worker_kwargs["startup_timeout_s"] = startup_timeout_s
     config = run_config if bench else None
     return DistributedWorker(
         compiled,
         config,
         inherited_host_tensors=inherited_host_tensors,
-        **kwargs,
+        **worker_kwargs,
     )
 
 

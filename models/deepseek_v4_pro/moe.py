@@ -1016,7 +1016,14 @@ if __name__ == "__main__":
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
 
-    golden_data = args.golden_data
+    golden_fn = None if args.smoke_weights else golden_moe
+    golden_data = None if args.smoke_weights else args.golden_data
+    compare_fn = None if args.smoke_weights else {
+        # BF16 x_next. Tightened 5e-3 -> 3e-3 with the real layer-0 hc_ffn
+        # gate (~2.1% of points > 3e-3). No max_diff_hd (near-zero
+        # residual/FFN cancellations blow up relatively).
+        "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
+    }
 
     result = run_jit(
         fn=l3_moe,
@@ -1026,7 +1033,7 @@ if __name__ == "__main__":
             balanced_routing=args.balanced_routing,
             smoke_weights=args.smoke_weights,
         ),
-        golden_fn=golden_moe,
+        golden_fn=golden_fn,
         golden_data=golden_data,
         save_data=args.save_data,
         compile_only=args.compile_only,
@@ -1045,12 +1052,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-3,
         atol=1e-3,
-        compare_fn={
-            # BF16 x_next. Tightened 5e-3 -> 3e-3 with the real layer-0 hc_ffn
-            # gate (~2.1% of points > 3e-3). No max_diff_hd (near-zero
-            # residual/FFN cancellations blow up relatively).
-            "x_next": ratio_reldiff(diff_thd=3e-3, pct_thd=0.05),
-        },
+        compare_fn=compare_fn,
     )
     if not result.passed:
         if result.error:
