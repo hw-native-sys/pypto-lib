@@ -14,7 +14,7 @@ Public entry points: :func:`run` and :func:`run_jit`.
 
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +34,7 @@ class RunResult:
     execution_time: float | None = None
     work_dir: Path | None = None
     bench: Any = None  # BenchmarkStats when benchmark=True; None otherwise
+    outputs: dict[str, torch.Tensor] | None = None
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time is not None else ""
@@ -123,15 +124,22 @@ _DFX_FLAG_KEYS = (
     "enable_scope_stats",
 )
 
+_L3_ONLY_RUNTIME_KEYS = ("startup_timeout_s",)
+
 
 def _execute_compiled_kwargs(runtime: dict[str, Any]) -> dict[str, Any]:
     """Translate user-facing ``runtime_cfg`` into ``execute_compiled`` kwargs.
 
-    The five DFX flags get bundled into a single ``dfx: _DfxOpts``; all other
-    keys pass through unfiltered, so ``execute_compiled`` raises ``TypeError``
-    on unknown keys rather than us silently dropping them.
+    The five DFX flags get bundled into a single ``dfx: _DfxOpts``. L3-only
+    worker controls are retained for the distributed path but omitted here;
+    all remaining keys pass through unfiltered, so ``execute_compiled`` raises
+    ``TypeError`` on unknown keys rather than us silently dropping them.
     """
-    out: dict[str, Any] = {k: v for k, v in runtime.items() if k not in _DFX_FLAG_KEYS}
+    out: dict[str, Any] = {
+        k: v
+        for k, v in runtime.items()
+        if k not in _DFX_FLAG_KEYS and k not in _L3_ONLY_RUNTIME_KEYS
+    }
     dfx_flags = {k: runtime[k] for k in _DFX_FLAG_KEYS if runtime.get(k)}
     if dfx_flags:
         try:
@@ -249,6 +257,7 @@ def _prepare_inputs(
     data_dir: Path | None,
     work_dir: Path,
     save_data: bool = True,
+    snapshot_inputs: bool = True,
 ) -> tuple[dict[str, torch.Tensor], dict[str, ScalarSpec], dict[str, torch.Tensor]]:
     """Build inputs for the runtime stage.
 
@@ -256,20 +265,25 @@ def _prepare_inputs(
     leave ``input_snapshot`` empty (golden will be loaded from cache, no need
     to clone inputs for ``golden_fn``). Otherwise generate from *specs* and,
     when *save_data* is True, persist into ``{work_dir}/data/in/``. Set
+    *snapshot_inputs* False when neither a golden function nor persistence needs
+    an immutable copy; this avoids cloning large runtime-only inputs. Set
     *save_data* False to skip the on-disk ``.pt`` snapshot (validation still
-    works via the in-memory ``input_snapshot``); useful when inputs are large
-    (e.g. full-model weights) and golden replay is not needed.
+    works via ``input_snapshot`` when requested).
 
     Raises ``ValueError`` on missing files or scalar dtype mismatch.
     """
     if data_dir is None:
         tensors = {spec.name: spec.create_tensor() for spec in tensor_specs}
         scalar_specs_eff = {s.name: s for s in scalar_specs}
-        input_snapshot = {
-            spec.name: tensors[spec.name].clone()
-            for spec in tensor_specs
-            if not spec.is_output or spec.init_value is not None
-        }
+        input_snapshot = (
+            {
+                spec.name: tensors[spec.name].clone()
+                for spec in tensor_specs
+                if not spec.is_output or spec.init_value is not None
+            }
+            if snapshot_inputs or save_data
+            else {}
+        )
         if save_data:
             in_dir = work_dir / "data" / "in"
             _save_tensors(in_dir, input_snapshot)
@@ -746,21 +760,91 @@ def _try_l3_dispatch(
     return True
 
 
-def _share_in_place(tensors: dict[str, torch.Tensor]) -> None:
-    """Make every tensor shared-memory in place (required by the prepared L3 worker).
+def _share_in_place(
+    tensors: dict[str, torch.Tensor],
+    names: Iterable[str] | None = None,
+) -> None:
+    """Make selected tensors shared-memory in place for a prepared L3 worker.
 
     A prepared :class:`~pypto.runtime.distributed_runner.DistributedWorker` reads
-    per-call IO and resident-weight upload sources through the shared mapping the
-    forked chip worker inherits at ``prepare()``, so each buffer must be CPU,
-    contiguous and ``share_memory_()`` *before* the fork. Replaces any
-    non-contiguous / non-shared tensor with a contiguous shared copy in the same
-    dict, so the caller's later :func:`_validate` reads the device-written
-    outputs back from these same buffers.
+    per-call IO through the shared mapping the forked chip worker inherits at
+    ``prepare()``, so each such buffer must be CPU, contiguous and
+    ``share_memory_()`` *before* the fork. Replaces any non-contiguous /
+    non-shared selected tensor with a contiguous shared copy in the same dict,
+    so the caller's later :func:`_validate` reads device-written outputs from
+    these same buffers. With *names* omitted, preserves the historical behavior
+    of sharing every tensor.
     """
-    for name, t in list(tensors.items()):
+    selected = tensors.keys() if names is None else names
+    for name in selected:
+        t = tensors[name]
         if t.is_shared() and t.is_contiguous():
             continue
         tensors[name] = t.cpu().contiguous().share_memory_()
+
+
+def _make_cpu_contiguous_in_place(
+    tensors: dict[str, torch.Tensor],
+    names: Iterable[str],
+) -> None:
+    """Normalize selected tensors without moving their storage to shared memory."""
+    for name in names:
+        tensor = tensors[name]
+        if tensor.device.type == "cpu" and tensor.is_contiguous():
+            continue
+        tensors[name] = tensor.cpu().contiguous()
+
+
+def _prepare_l3_worker(
+    compiled: Any,
+    run_config: Any,
+    *,
+    bench: bool,
+    inherited_host_tensors: tuple[torch.Tensor, ...],
+    startup_timeout_s: float | None = None,
+) -> Any:
+    """Prepare an L3 worker while keeping read-only upload sources out of shm.
+
+    Newer ``DistributedCompiledProgram.prepare`` implementations may expose
+    ``inherited_host_tensors`` directly. The pinned runtime already supports the
+    contract on its public ``DistributedWorker`` constructor, so use that
+    constructor as a compatibility bridge when ``prepare`` has not yet plumbed
+    the keyword through.
+    """
+    import inspect
+
+    args = (run_config,) if bench else ()
+    kwargs = (
+        {"persistent": True, "reset_persistent_windows": False}
+        if bench
+        else {}
+    )
+    if startup_timeout_s is not None:
+        kwargs["startup_timeout_s"] = startup_timeout_s
+    if not inherited_host_tensors:
+        return compiled.prepare(*args, **kwargs)
+
+    parameters = inspect.signature(compiled.prepare).parameters.values()
+    accepts_inherited = any(
+        parameter.name == "inherited_host_tensors"
+        for parameter in parameters
+    )
+    if accepts_inherited:
+        return compiled.prepare(
+            *args,
+            inherited_host_tensors=inherited_host_tensors,
+            **kwargs,
+        )
+
+    from pypto.runtime import DistributedWorker
+
+    config = run_config if bench else None
+    return DistributedWorker(
+        compiled,
+        config,
+        inherited_host_tensors=inherited_host_tensors,
+        **kwargs,
+    )
 
 
 def _strip_ssa_suffix(name: str) -> str:
@@ -879,17 +963,19 @@ def _run_l3_resident(
     rtol: float,
     atol: float,
     compare_fn: dict[str, Callable],
+    return_outputs: bool = False,
 ) -> Any:
     """Dispatch an L3 program keeping resident weights device-resident.
 
-    Routes through :meth:`DistributedCompiledProgram.prepare` — the only path
-    that can build worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
+    Routes through a prepared ``DistributedWorker`` that can build
+    worker-resident :class:`~pypto.runtime.DeviceTensor` buffers.
     Each resident input / ``InOut`` spec is uploaded once via
     ``rt.alloc_tensor(init=...)`` and reused across the validation dispatch and
     every benchmark round. A pure ``Out`` resident is allocated uninitialized,
     because its host tensor is only an output destination and uploading its
     zero-filled placeholder would be wasted work. Resident outputs are read back
-    once before golden validation via :func:`_readback_resident_outputs`.
+    once for golden validation or requested output capture via
+    :func:`_readback_resident_outputs`.
 
     When :func:`_bench_enabled` (``PYPTO_BENCH``), the resident weights are reused
     for :func:`_bench_loop_sizes` timed rounds. This cannot go through
@@ -919,14 +1005,31 @@ def _run_l3_resident(
             "(a @pl.jit.host kernel compiled with distributed_config)."
         )
 
-    # Per-call IO + resident upload sources must be shared memory before prepare().
-    _share_in_place(tensors)
-
     ordered_names = _l3_ordered_names(compiled)
     pure_out_names = _l3_pure_out_names(compiled)
     run_config = _l3_run_config(runtime_cfg)
     resident_specs = [s for s in tensor_specs if s.is_resident]
     bench = _bench_enabled()
+
+    # Only direct per-call host IO must use shared memory. Read-only resident
+    # upload sources can stay in ordinary CPU memory: the worker registers their
+    # storage before fork and the children inherit it copy-on-write. A resident
+    # output needs shared storage only when it will actually be read back.
+    needs_resident_readback = golden_outputs is not None or return_outputs
+    shared_names = [
+        spec.name
+        for spec in tensor_specs
+        if not spec.is_resident or (needs_resident_readback and spec.is_output)
+    ]
+    _share_in_place(tensors, shared_names)
+    shared_name_set = set(shared_names)
+    inherited_names = [
+        spec.name
+        for spec in resident_specs
+        if spec.name not in pure_out_names and spec.name not in shared_name_set
+    ]
+    _make_cpu_contiguous_in_place(tensors, inherited_names)
+    inherited_host_tensors = tuple(tensors[name] for name in inherited_names)
 
     def _dispatch_resident(
         dispatch_fn: "Callable[[Any, list[Any], list], None]",
@@ -944,14 +1047,13 @@ def _run_l3_resident(
         # Benchmarks model serving's steady-state dispatch: retain CommDomains
         # across rounds and let kernels clear their own signal windows. Keep the
         # ordinary validation path one-shot.
-        if bench:
-            prepared = compiled.prepare(
-                run_config,
-                persistent=True,
-                reset_persistent_windows=False,
-            )
-        else:
-            prepared = compiled.prepare()
+        prepared = _prepare_l3_worker(
+            compiled,
+            run_config,
+            bench=bench,
+            inherited_host_tensors=inherited_host_tensors,
+            startup_timeout_s=runtime_cfg.get("startup_timeout_s"),
+        )
         with prepared as rt:
             # (name, handle, is_stacked, worker_id) — is_stacked picks the matching
             # free below; worker_id is the card a whole-tensor buffer was allocated on.
@@ -1002,23 +1104,28 @@ def _run_l3_resident(
                     except Exception as e:  # noqa: BLE001 — best-effort cleanup
                         print(f"[RUN] warning: failed to free resident tensor {name}: {e}", flush=True)
 
-    def _validate_once(rt: Any, resident_handles: list[tuple[str, Any, bool, int]]) -> None:
-        if golden_outputs is None:
-            return
+    def _readback_once(rt: Any, resident_handles: list[tuple[str, Any, bool, int]]) -> None:
         # A resident spec that is also an output is a read-write state buffer
         # (e.g. a KV cache): updated in place on-device and skipping the
         # per-dispatch D2H, so its host tensor is stale. Read the final device
-        # state back once into that host tensor — while the prepare() context and
-        # its handles are still live — so _validate compares what the kernel
-        # actually produced (one end-of-run D2H, not a per-dispatch one).
+        # state back once into that host tensor while the prepare() context and
+        # its handles are still live.
         _readback_resident_outputs(rt, resident_specs, resident_handles, tensors)
+
+    def _validate_once(rt: Any, resident_handles: list[tuple[str, Any, bool, int]]) -> None:
+        if golden_outputs is None:
+            return
+        _readback_once(rt, resident_handles)
         _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
 
     # Non-benchmark: one validation dispatch, no capture.
     if not bench:
         def _plain_dispatch(rt: Any, ordered: list[Any], resident_handles: list) -> None:
             rt(*ordered, config=run_config)
-            _validate_once(rt, resident_handles)
+            if golden_outputs is not None:
+                _validate_once(rt, resident_handles)
+            elif return_outputs:
+                _readback_once(rt, resident_handles)
 
         _dispatch_resident(_plain_dispatch)
         return None
@@ -1054,6 +1161,11 @@ def _run_l3_resident(
                 rt(*ordered, config=run_config)
         except Exception as e:  # noqa: BLE001 — benchmark rounds are never a correctness gate
             print(f"[RUN] benchmark rounds interrupted: {type(e).__name__}: {e}", flush=True)
+        if return_outputs:
+            # Capture the final resident state after all timed dispatches. With
+            # golden validation this is intentionally a second readback: the
+            # first one validates the correctness-gate dispatch above.
+            _readback_once(rt, resident_handles)
 
     prior_level = current_level()
     configure_log(_STRACE_LOG_LEVEL)
@@ -1184,6 +1296,17 @@ def _validate(
         )
 
 
+def _collect_outputs(
+    tensor_specs: list[TensorSpec],
+    tensors: dict[str, torch.Tensor],
+    enabled: bool,
+) -> dict[str, torch.Tensor] | None:
+    """Return live output tensors when opt-in output capture is enabled."""
+    if not enabled:
+        return None
+    return {spec.name: tensors[spec.name] for spec in tensor_specs if spec.is_output}
+
+
 def run(
     program: Any,
     specs: list[TensorSpec | ScalarSpec],
@@ -1197,6 +1320,7 @@ def run(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    return_outputs: bool = False,
 ) -> RunResult:
     """Compile *program*, run on device, and validate against golden.
 
@@ -1231,6 +1355,9 @@ def run(
             Defaults to False, skipping the on-disk ``.pt`` snapshot;
             validation still runs against the in-memory golden. Enable it
             when you need to replay the exact inputs/outputs later.
+        return_outputs: When True, expose every ``TensorSpec(is_output=True)``
+            tensor in :attr:`RunResult.outputs`. Resident outputs are read back
+            from device even when validation is disabled. Defaults to False.
 
     Returns:
         :class:`RunResult`.
@@ -1294,7 +1421,13 @@ def run(
     try:
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
-                specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                specs,
+                tensor_specs,
+                scalar_specs,
+                data_dir,
+                work_dir,
+                save_data,
+                snapshot_inputs=golden_fn is not None or save_data,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1316,6 +1449,7 @@ def run(
                 bench = _run_l3_resident(
                     compiled, tensor_specs, tensors, scalar_specs_eff,
                     runtime_cfg, golden_outputs, rtol, atol, compare_fn,
+                    return_outputs=return_outputs,
                 )
             except (AssertionError, ValueError) as e:
                 return _fail(str(e))
@@ -1323,7 +1457,13 @@ def run(
         total = time.time() - start
         skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
         print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+        return RunResult(
+            passed=True,
+            execution_time=total,
+            work_dir=work_dir,
+            bench=bench,
+            outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+        )
 
     # Runtime
     with _Stage("runtime"):
@@ -1356,7 +1496,13 @@ def run(
     if golden_outputs is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+        return RunResult(
+            passed=True,
+            execution_time=total,
+            work_dir=work_dir,
+            bench=bench,
+            outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+        )
     try:
         _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
     except AssertionError as e:
@@ -1364,7 +1510,13 @@ def run(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+    return RunResult(
+        passed=True,
+        execution_time=total,
+        work_dir=work_dir,
+        bench=bench,
+        outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+    )
 
 
 def run_jit(
@@ -1380,6 +1532,7 @@ def run_jit(
     compile_only: bool = False,
     runtime_dir: str | None = None,
     save_data: bool = False,
+    return_outputs: bool = False,
 ) -> RunResult:
     """JIT-flavoured :func:`run`: compile via ``@pl.jit``, then same harness.
 
@@ -1417,6 +1570,9 @@ def run_jit(
             Defaults to False, skipping the on-disk ``.pt`` snapshot;
             validation still runs against the in-memory golden. Enable it
             when you need to replay the exact inputs/outputs later.
+        return_outputs: When True, expose every ``TensorSpec(is_output=True)``
+            tensor in :attr:`RunResult.outputs`. Resident outputs are read back
+            from device even when validation is disabled. Defaults to False.
 
     Returns:
         :class:`RunResult`.
@@ -1484,7 +1640,13 @@ def run_jit(
     try:
         with _Stage("generate inputs"):
             tensors, scalar_specs_eff, input_snapshot = _prepare_inputs(
-                specs, tensor_specs, scalar_specs, data_dir, work_dir, save_data,
+                specs,
+                tensor_specs,
+                scalar_specs,
+                data_dir,
+                work_dir,
+                save_data,
+                snapshot_inputs=golden_fn is not None or save_data,
             )
     except ValueError as e:
         return _fail(str(e))
@@ -1506,6 +1668,7 @@ def run_jit(
                 bench = _run_l3_resident(
                     compiled, tensor_specs, tensors, scalar_specs_eff,
                     runtime_cfg, golden_outputs, rtol, atol, compare_fn,
+                    return_outputs=return_outputs,
                 )
             except (AssertionError, ValueError) as e:
                 return _fail(str(e))
@@ -1513,7 +1676,13 @@ def run_jit(
         total = time.time() - start
         skip_note = ", validation skipped: no golden_fn or golden_data" if validation_skipped else ""
         print(f"[RUN] PASS ({total:.2f}s{skip_note})", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+        return RunResult(
+            passed=True,
+            execution_time=total,
+            work_dir=work_dir,
+            bench=bench,
+            outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+        )
 
     # Runtime
     with _Stage("runtime"):
@@ -1549,7 +1718,13 @@ def run_jit(
     if golden_outputs is None:
         total = time.time() - start
         print(f"[RUN] PASS ({total:.2f}s, validation skipped: no golden_fn or golden_data)", flush=True)
-        return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+        return RunResult(
+            passed=True,
+            execution_time=total,
+            work_dir=work_dir,
+            bench=bench,
+            outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+        )
     try:
         _validate(tensor_specs, tensors, golden_outputs, rtol, atol, compare_fn)
     except AssertionError as e:
@@ -1557,4 +1732,10 @@ def run_jit(
 
     total = time.time() - start
     print(f"[RUN] PASS ({total:.2f}s)", flush=True)
-    return RunResult(passed=True, execution_time=total, work_dir=work_dir, bench=bench)
+    return RunResult(
+        passed=True,
+        execution_time=total,
+        work_dir=work_dir,
+        bench=bench,
+        outputs=_collect_outputs(tensor_specs, tensors, return_outputs),
+    )

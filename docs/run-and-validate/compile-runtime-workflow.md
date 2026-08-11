@@ -253,6 +253,9 @@ after dispatch.
 `runtime_cfg` is therefore not forwarded verbatim in every case:
 
 - `log_level` is consumed by the harness to configure PyPTO's runtime logger;
+- `startup_timeout_s` optionally overrides the positive finite startup
+  readiness deadline for the prepared L3 resident-worker path and is not
+  forwarded to single-chip execution;
 - the five DFX fields below are bundled into the runtime's DFX options on the
   single-chip path;
 - remaining single-chip fields are passed to `execute_compiled`, which rejects

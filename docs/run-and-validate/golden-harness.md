@@ -132,6 +132,7 @@ RunResult(
     execution_time=...,
     work_dir=...,
     bench=...,
+    outputs=...,
 )
 ```
 
@@ -147,6 +148,14 @@ if not result.passed:
 
 `work_dir` identifies the generated build directory and is the reliable way
 to locate its reports and optional saved data.
+
+Set `return_outputs=True` on `run` or `run_jit` to expose the live tensors for
+every `TensorSpec(is_output=True)` through `result.outputs`. The default is
+`None`, avoiding unnecessary resident-output readback. With output capture
+enabled, resident state is copied back once before its worker is released,
+which lets execution-only staged drivers chain an activation or cache without
+enabling a golden comparison. This remains a launchability mechanism, not a
+correctness check.
 
 ## Golden CPU threads
 

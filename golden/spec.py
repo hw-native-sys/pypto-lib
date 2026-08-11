@@ -57,7 +57,7 @@ class TensorSpec:
             (e.g. a KV cache): an ``InOut`` state is uploaded once from
             ``init_value``, both kinds are updated on-device, and they are read
             back **once** at the end (via ``copy_stacked_from`` / ``copy_from``)
-            when golden validation is enabled.
+            when golden validation or ``return_outputs`` capture is enabled.
             Values:
 
             - ``None`` / ``False`` — not resident (default).
