@@ -144,14 +144,10 @@ from prefill_cp_swa import (
 from prefill_cp_hca import (
     COMPRESS_RATIO as HCA_COMPRESS_RATIO,
     COMPRESS_STATE_DIM as HCA_COMPRESS_STATE_DIM,
-    HCA_STATE_BLOCK_NUM,
     HCA_STATE_BLOCK_SIZE,
     HCA_STATE_MAX_BLOCKS,
     HCA_STATE_PHYSICAL_BLOCKS,
     IDX_TOPK,
-    MAX_COMPRESSED_ROWS_PER_SEGMENT as HCA_MAX_COMPRESSED_ROWS_PER_SEGMENT,
-    PREFILL_CMP_BLOCK_NUM as HCA_PREFILL_CMP_BLOCK_NUM,
-    PREFILL_CMP_MAX_BLOCKS as HCA_PREFILL_CMP_MAX_BLOCKS,
     build_tensor_specs as build_hca_tensor_specs,
     prefill_cp_hca_core,
 )
@@ -169,8 +165,6 @@ from prefill_cp_csa import (
     MAIN_STATE_DIM as CSA_MAIN_STATE_DIM,
     MAIN_STATE_MAX_BLOCKS as CSA_MAIN_STATE_MAX_BLOCKS,
     MAX_COMPRESS_LEAVES as CSA_MAX_COMPRESS_LEAVES,
-    MAX_COMPRESSED_ROWS_PER_SEGMENT as CSA_MAX_COMPRESSED_ROWS_PER_SEGMENT,
-    MAX_COMPRESSED_ROWS_PER_TILE as CSA_MAX_COMPRESSED_ROWS_PER_TILE,
     build_tensor_specs as build_csa_tensor_specs,
     prefill_cp_csa_core,
 )
@@ -182,20 +176,15 @@ from config import (
     PREFILL_CMP_BLOCK_NUM,
     PREFILL_CMP_MAX_BLOCKS,
     PREFILL_IDX_BLOCK_NUM,
-    PREFILL_IDX_MAX_BLOCKS,
 )
 from prefill_cp_exchange import (
     CMP_META_DIM,
-    CMP_ROWS_PER_RANK,
     CMP_WINDOW_ROWS,
-    MAIN_CACHE_ROWS,
     META_DIM,
     RECORDS_PER_WINDOW,
-    ROWS_PER_RANK,
     SCALE_TILE_COLS,
     STATE_META_DIM,
     STATE_RECORDS_PER_WINDOW,
-    STATE_ROWS_PER_RANK,
     STATE_WINDOW_ROWS,
 )
 from golden import TensorSpec, run_jit
