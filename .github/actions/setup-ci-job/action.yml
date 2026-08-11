@@ -642,6 +642,8 @@ runs:
       # or toolchain bundle — so this step asks that env rather than naming one.
       shell: bash
       working-directory: ${{ inputs.checkout-path }}
+      env:
+        CHECKOUT_PATH: ${{ inputs.checkout-path }}
       run: |
         # PTOAS_ROOT belongs to the calling job's env: block, so this action
         # cannot assume it arrived. Checked before the `rm -rf` below, which
@@ -650,6 +652,25 @@ runs:
           echo "::error::PTOAS_ROOT is not set — the calling job must define it"
           exit 1
         fi
+        # Non-empty is not enough for a `rm -rf`. Every caller points PTOAS_ROOT
+        # at <checkout>/ptoas-bin, and a value one component short of that —
+        # $GITHUB_WORKSPACE/checkout, or the sibling serving-checkout — would
+        # aim the delete at a checkout instead. Canonicalize both sides and
+        # require a strict descendant, so equality with the checkout dir, a
+        # sibling sharing its prefix, and any `..` escape are all rejected
+        # before anything is removed. realpath -m: neither path need exist yet.
+        checkout_dir="$(realpath -m "$GITHUB_WORKSPACE/$CHECKOUT_PATH")"
+        ptoas_root="$(realpath -m "$PTOAS_ROOT")"
+        case "$ptoas_root" in
+          "$checkout_dir"/?*) ;;
+          *)
+            echo "::error::PTOAS_ROOT must be a directory inside $checkout_dir"
+            echo "Got '$PTOAS_ROOT' (resolves to '$ptoas_root'). This step"
+            echo "recreates that directory from scratch, so it must be one this"
+            echo "action owns rather than the checkout itself."
+            exit 1
+            ;;
+        esac
         # Since v0.55 the release ships no per-arch ptoas-bin tarball, and its
         # standalone archive requires CPython 3.11 while this CI runs 3.10.
         # Install the matching cp310 wheel into an isolated venv, which keeps
