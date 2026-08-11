@@ -31,11 +31,14 @@ description: >-
   curl on PATH. The `.env` makes the *locations* portable; these names are the
   provisioning contract a runner has to satisfy to be usable at all.
 
-  The CPU architecture is detected, not pinned: ptoas is fetched as
-  ptoas-bin-$(uname -m).tar.gz and checked against the matching
+  The CPU architecture is detected, not pinned: ptoas is fetched as the CPython
+  3.10 manylinux wheel for $(uname -m) and checked against the matching
   PTOAS_SHA256_<ARCH> in pypto's toolchain/versions.env, which is also where the
   ptoas *version* is managed. So a new arch needs no change here — only an entry
-  upstream.
+  upstream. Since v0.55 the release no longer ships a per-arch ptoas-bin tarball
+  and its standalone archive requires CPython 3.11, so the wheel is installed
+  into an isolated venv at PTOAS_ROOT, which keeps the PTOAS_ROOT/bin/ptoas
+  layout pypto's discovery already accepts.
 
   The calling job must define the PTOAS_ROOT, PTO_ISA_ROOT, CMAKE_* and the
   non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
@@ -203,7 +206,7 @@ runs:
         # locking or giving up the cache. See issue #802.
         #
         # Only this tree needs it: ccache is built for concurrent access and is
-        # worth far more shared, and the ptoas archive is content-addressed.
+        # worth far more shared, and the ptoas wheel is named by its version.
         {
           echo "CCACHE_DIR=$CI_CACHE_ROOT/$CCACHE_NAME"
           echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
@@ -306,11 +309,11 @@ runs:
         fi
         retry git -C "$PYPTO_SRC" submodule update --init --recursive --depth=1 || exit 1
         rm -rf "$PYPTO_SRC/build" "$PYPTO_SRC/_skbuild" "$PYPTO_SRC/runtime/build"
-        # PTOAS ships one release asset per arch, named ptoas-bin-<uname -m>.tar.gz,
-        # with a matching PTOAS_SHA256_<ARCH> in versions.env — so the arch is
-        # detected here rather than pinned, and only the version has to be managed
-        # (upstream, in pypto's versions.env). An unlisted arch is a hard error: a
-        # missing sha would otherwise silently skip the integrity check.
+        # PTOAS ships one wheel per arch, with a matching PTOAS_SHA256_<ARCH> in
+        # versions.env — so the arch is detected here rather than pinned, and only
+        # the version has to be managed (upstream, in pypto's versions.env). An
+        # unlisted arch is a hard error: a missing sha would otherwise silently
+        # skip the integrity check.
         PTOAS_ARCH="$(uname -m)"
         PTOAS_SHA256=$(sed -n "s/^PTOAS_SHA256_$(echo "$PTOAS_ARCH" | tr '[:lower:]' '[:upper:]')=//p" \
           "$PYPTO_SRC/toolchain/versions.env" | tr -d '[:space:]')
@@ -321,7 +324,7 @@ runs:
           exit 1
         fi
         # Strip trailing CR/whitespace: a CRLF versions.env or pto_isa.pin would
-        # otherwise leak a '\r' into the cache archive name and break the download.
+        # otherwise leak a '\r' into the cache entry name and break the download.
         {
           echo "PTOAS_VERSION=$(grep -E '^PTOAS_VERSION=' "$PYPTO_SRC/toolchain/versions.env" | cut -d= -f2 | tr -d '[:space:]')"
           echo "PTOAS_ARCH=$PTOAS_ARCH"
@@ -633,37 +636,68 @@ runs:
       run: ccache -s || true
 
     - name: Install ptoas (local cache)
-      # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step.
+      # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step. Runs after
+      # the bootstrap step on purpose: the wheel is cp310-only and the
+      # interpreter it must match is whichever activate.sh selected, conda env
+      # or toolchain bundle — so this step asks that env rather than naming one.
       shell: bash
+      working-directory: ${{ inputs.checkout-path }}
       run: |
-        # $PTOAS_ARCH keeps the cache entry arch-specific: the sha in the name
-        # already differs per arch, but naming the arch too keeps a shared cache
-        # dir readable and makes a wrong-arch entry obvious.
-        CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-${PTOAS_ARCH}-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+        # PTOAS_ROOT belongs to the calling job's env: block, so this action
+        # cannot assume it arrived. Checked before the `rm -rf` below, which
+        # unset would aim at nothing.
+        if [ -z "${PTOAS_ROOT:-}" ]; then
+          echo "::error::PTOAS_ROOT is not set — the calling job must define it"
+          exit 1
+        fi
+        # Since v0.55 the release ships no per-arch ptoas-bin tarball, and its
+        # standalone archive requires CPython 3.11 while this CI runs 3.10.
+        # Install the matching cp310 wheel into an isolated venv, which keeps
+        # the PTOAS_ROOT/bin/ptoas layout pypto's ptoas discovery accepts.
+        #
+        # The cache entry is named exactly as the release asset, so it is the
+        # same file the pypto repo's own jobs put in this shared dir.
+        PTOAS_PACKAGE_VERSION="${PTOAS_VERSION#v}"
+        PTOAS_WHEEL_NAME="ptoas-${PTOAS_PACKAGE_VERSION}-cp310-cp310-manylinux_2_34_${PTOAS_ARCH}.whl"
+        CACHE_WHEEL="$PTOAS_CACHE_DIR/$PTOAS_WHEEL_NAME"
         download_ptoas() {
           echo "Downloading ptoas ${PTOAS_VERSION} for ${PTOAS_ARCH}"
           mkdir -p "$PTOAS_CACHE_DIR"
-          # Unique per-process temp file: a shared "$CACHE_ARCHIVE.tmp" would let
-          # two concurrent cache-miss jobs clobber each other's download.
+          # Unique per-process temp file: a shared "$CACHE_WHEEL.tmp" would let
+          # two concurrent cache-miss jobs clobber each other's download. The
+          # dot prefix keeps a partial download from looking like a wheel.
           local tmp
-          tmp="$(mktemp "$CACHE_ARCHIVE.XXXXXX")"
+          tmp="$(mktemp "$PTOAS_CACHE_DIR/.ptoas-${PTOAS_ARCH}.XXXXXX")"
           curl --fail --location --retry 3 --retry-all-errors \
-            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${PTOAS_ARCH}.tar.gz" \
+            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/${PTOAS_WHEEL_NAME}" \
             -o "$tmp"
           echo "${PTOAS_SHA256}  $tmp" | sha256sum -c -
-          mv "$tmp" "$CACHE_ARCHIVE"
+          mv -f "$tmp" "$CACHE_WHEEL"
         }
-        if [ ! -f "$CACHE_ARCHIVE" ]; then
+        if [ ! -f "$CACHE_WHEEL" ]; then
           echo "Cache miss"
           download_ptoas
-        elif ! echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -; then
+        elif ! echo "${PTOAS_SHA256}  $CACHE_WHEEL" | sha256sum -c -; then
           echo "Cache corrupted — removing and re-downloading"
-          rm -f "$CACHE_ARCHIVE"
+          rm -f "$CACHE_WHEEL"
           download_ptoas
         else
-          echo "Cache hit — using $CACHE_ARCHIVE"
+          echo "Cache hit — using $CACHE_WHEEL"
         fi
-        mkdir -p "$PTOAS_ROOT"
-        tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
-        chmod +x "$PTOAS_ROOT/ptoas"
-        chmod +x "$PTOAS_ROOT/bin/ptoas"
+        # activate.sh gives both the interpreter and the LD_LIBRARY_PATH ptoas
+        # needs (it wants a newer GLIBCXX than these hosts carry), for either
+        # toolchain. The venv is created from it rather than from a named conda
+        # env so 'bundle' jobs are not silently pinned to a conda python.
+        source activate.sh
+        # The wheel is cp310-only: pip would reject it with "not a supported
+        # wheel on this platform", which does not say that the *environment* is
+        # the wrong version. Say it here instead.
+        py_version="$(python -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+        if [ "$py_version" != "3.10" ]; then
+          echo "::error::ptoas ${PTOAS_VERSION} ships a cp310 wheel, but this job's python is $py_version"
+          exit 1
+        fi
+        rm -rf "$PTOAS_ROOT"
+        python -m venv "$PTOAS_ROOT" --system-site-packages
+        "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
+        "$PTOAS_ROOT/bin/ptoas" --version
