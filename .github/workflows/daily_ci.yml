@@ -54,6 +54,7 @@ jobs:
           needs-device: 'false'
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
+          toolchain: bundle
 
       - name: Run model tests (${{ matrix.platform }})
         shell: bash
@@ -180,6 +181,7 @@ jobs:
           needs-device: 'true'
           build-namespace: a2a3-daily
           pip-cache-name: pip-a2a3
+          toolchain: bundle
 
       - name: Run model tests (a2a3, via task-submit)
         shell: bash
@@ -339,6 +341,7 @@ jobs:
           needs-device: 'true'
           build-namespace: a5-daily
           pip-cache-name: pip-a5
+          toolchain: bundle
 
       - name: Run V4-Pro tests (a5, via task-submit)
         shell: bash

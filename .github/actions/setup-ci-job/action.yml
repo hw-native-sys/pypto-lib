@@ -72,6 +72,17 @@ inputs:
       driver, no card and no Ascend env.
     required: false
     default: 'false'
+  toolchain:
+    description: >-
+      Where Python and GCC come from. 'conda' is the historical path: a
+      per-machine conda env under CONDA_ROOT with a --system-site-packages venv
+      layered on it. 'bundle' uses the pinned pypto-toolchain bundle at
+      /opt/pypto/toolchain/current, identical on every host.
+
+      Default stays 'conda' so an unprovisioned runner keeps working; jobs move
+      one at a time and each reverts on its own line.
+    required: false
+    default: 'conda'
   build-namespace:
     description: >-
       Per-job-type discriminator for the pypto build tree, which is stored at
@@ -103,12 +114,23 @@ runs:
         CCACHE_NAME: ${{ inputs.ccache-name }}
         PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
         BUILD_NAMESPACE: ${{ inputs.build-namespace }}
+        TOOLCHAIN_IN: ${{ inputs.toolchain }}
       run: |
         set -uo pipefail
         # Prerequisites CI does not create, so they must already be there. The
         # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
         # dirs are only needed by the serving job, which checks its own.
-        required="CONDA_ROOT"
+        case "${TOOLCHAIN_IN:-conda}" in
+          conda|bundle) ;;
+          *)
+            echo "::error::Unsupported toolchain '$TOOLCHAIN_IN'. Use 'conda' or 'bundle'."
+            exit 1
+            ;;
+        esac
+        required=""
+        if [ "${TOOLCHAIN_IN:-conda}" = "conda" ]; then
+          required="CONDA_ROOT"
+        fi
         if [ "$NEEDS_DEVICE" = "true" ]; then
           required="$required CANN_ROOT"
         fi
@@ -372,6 +394,7 @@ runs:
         git checkout "$PTO_ISA_COMMIT"
 
     - name: Bootstrap conda + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'conda' }}
       # Per-job venv layered on the conda env; activate.sh lets each later step
       # (and every task-submit child) enter the env with a single
       # `source activate.sh`. For device jobs it also sources set_env.sh, which
@@ -468,6 +491,49 @@ runs:
         # set_env.sh, so LD_LIBRARY_PATH is often unset when activate.sh runs.
         printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' >> activate.sh
 
+    - name: Enter the toolchain bundle + per-job venv + write activate.sh
+      if: ${{ inputs.toolchain == 'bundle' }}
+      # Same contract as the conda step: a per-job venv and an activate.sh that
+      # any later step, and any task-submit child, enters with one `source`.
+      #
+      # No toolchain-bin shims. Those existed because simpler invokes the host
+      # compiler as g++-15 while the conda env installs it as plain g++; the
+      # bundle's is named g++-15 already, so PATH alone is enough.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+      run: |
+        pypto-toolchain verify \
+          --require python=3.10 --require 'gcc>=15' --require 'ccache>=4.8'
+        source /opt/pypto/toolchain/current/activate.sh
+
+        rm -rf venv toolchain-bin
+        # No --system-site-packages: nothing outside the venv is depended on,
+        # which also retires the trap where a failed install in the venv was
+        # masked by a copy of pypto in the base env.
+        python3.10 -m venv venv
+
+        # Baked in as a literal, like the conda roots were: activate.sh is also
+        # sourced by task-submit children, whose env snapshot is truncated.
+        echo "_PYPTO_TOOLCHAIN=$PYPTO_TOOLCHAIN" > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+          # Sourced BEFORE the bundle: set_env.sh prepends its own directories
+          # to LD_LIBRARY_PATH and the bundle's libstdc++ has to stay ahead of
+          # them -- ptoas needs GLIBCXX_3.4.29, the host stops at 3.4.28.
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_TOOLCHAIN/activate.sh"
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        EOF
+
+        ( source activate.sh
+          command -v python3.10 g++-15 ccache uv >/dev/null
+          python3.10 -c 'import sys; assert sys.version_info[:2]==(3,10)' )
+
     - name: Show ccache stats (before)
       shell: bash
       run: ccache -s || true
@@ -510,7 +576,14 @@ runs:
       run: |
         source activate.sh
         pip install nanobind
-        pip install torch
+        # Explicitly the CPU build: these are Ascend hosts, and an unpinned
+        # `pip install torch` now resolves to a version whose aarch64 wheel
+        # pulls ~1.5 GB of CUDA. Under conda this was masked by the base env
+        # already carrying a torch -- the only thing that was pinning it.
+        if ! pip install torch --index-url https://download.pytorch.org/whl/cpu; then
+          echo "note: download.pytorch.org unreachable — falling back to a pinned torch"
+          pip install 'torch==2.6.0'
+        fi
 
     - name: Show ccache stats (after)
       shell: bash

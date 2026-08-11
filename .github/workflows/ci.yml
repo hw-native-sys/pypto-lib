@@ -184,6 +184,7 @@ jobs:
           needs-device: 'false'
           build-namespace: ${{ matrix.platform }}
           pip-cache-name: pip-sim
+          toolchain: bundle
 
       - name: Run ${{ matrix.platform }} tests
         shell: bash
@@ -285,6 +286,7 @@ jobs:
           needs-device: 'true'
           build-namespace: a2a3
           pip-cache-name: pip-a2a3
+          toolchain: bundle
 
       - name: Run a2a3 tests (via task-submit)
         shell: bash
@@ -379,6 +381,7 @@ jobs:
           checkout-path: checkout
           needs-device: 'true'
           build-namespace: serving
+          toolchain: bundle
           # Own ccache: serving's churn must not LRU-evict the a2a3/sim entries.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
@@ -437,6 +440,7 @@ jobs:
           checkout-path: checkout
           needs-device: 'true'
           build-namespace: serving
+          toolchain: bundle
           # Share serving's dedicated ccache so a2a3/sim entries are not evicted.
           ccache-name: ccache-serving
           pip-cache-name: pip-serving
