@@ -797,7 +797,7 @@ def golden_moe(tensors):
     tensors["x_next"][:] = x_next_out
 
 
-def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
+def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False, smoke_weights=False):
     import torch
     from golden import ScalarSpec, TensorSpec
     from expert_routed import gen_routed_weight
@@ -877,41 +877,60 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         assert active_routes % N_EXPERTS_GLOBAL == 0, \
             "balanced routing requires the active route count to divide evenly across experts"
 
-    # Per-rank routed expert weights (different shards).
-    routed_w1_i8_list = []
-    routed_w1_s_list = []
-    routed_w3_i8_list = []
-    routed_w3_s_list = []
-    routed_w2_i8_list = []
-    routed_w2_s_list = []
-    for _ in range(N_RANKS):
-        w1_i8, w1_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
-        w3_i8, w3_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
-        w2_i8, w2_s = gen_routed_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
-        routed_w1_i8_list.append(w1_i8)
-        routed_w1_s_list.append(w1_s)
-        routed_w3_i8_list.append(w3_i8)
-        routed_w3_s_list.append(w3_s)
-        routed_w2_i8_list.append(w2_i8)
-        routed_w2_s_list.append(w2_s)
+    if smoke_weights:
+        # Lazy shape-correct expert payloads for low-memory execution smoke runs.
+        routed_w1_init = routed_w3_init = routed_w2_init = torch.zeros
+        routed_w1_scale_init = routed_w3_scale_init = routed_w2_scale_init = torch.ones
+        shared_w1_init = shared_w3_init = shared_w2_init = torch.zeros
+        shared_w1_scale_init = shared_w3_scale_init = shared_w2_scale_init = torch.ones
+    else:
+        # Per-rank routed expert weights (different shards).
+        routed_w1_i8_list = []
+        routed_w1_s_list = []
+        routed_w3_i8_list = []
+        routed_w3_s_list = []
+        routed_w2_i8_list = []
+        routed_w2_s_list = []
+        for _ in range(N_RANKS):
+            w1_i8, w1_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w1"])
+            w3_i8, w3_s = gen_routed_weight((N_LOCAL, MOE_INTER, D), ROUTED_DEQUANT_STD["w3"])
+            w2_i8, w2_s = gen_routed_weight((N_LOCAL, D, MOE_INTER), ROUTED_DEQUANT_STD["w2"])
+            routed_w1_i8_list.append(w1_i8)
+            routed_w1_s_list.append(w1_s)
+            routed_w3_i8_list.append(w3_i8)
+            routed_w3_s_list.append(w3_s)
+            routed_w2_i8_list.append(w2_i8)
+            routed_w2_s_list.append(w2_s)
 
-    rw1_i8 = torch.stack(routed_w1_i8_list)
-    rw1_s = torch.stack(routed_w1_s_list)
-    rw3_i8 = torch.stack(routed_w3_i8_list)
-    rw3_s = torch.stack(routed_w3_s_list)
-    rw2_i8 = torch.stack(routed_w2_i8_list)
-    rw2_s = torch.stack(routed_w2_s_list)
+        rw1_i8 = torch.stack(routed_w1_i8_list)
+        rw1_s = torch.stack(routed_w1_s_list)
+        rw3_i8 = torch.stack(routed_w3_i8_list)
+        rw3_s = torch.stack(routed_w3_s_list)
+        rw2_i8 = torch.stack(routed_w2_i8_list)
+        rw2_s = torch.stack(routed_w2_s_list)
+        routed_w1_init = rw1_i8
+        routed_w1_scale_init = rw1_s
+        routed_w3_init = rw3_i8
+        routed_w3_scale_init = rw3_s
+        routed_w2_init = rw2_i8
+        routed_w2_scale_init = rw2_s
 
-    # Shared expert weights — replicated across ranks.
-    sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
-    sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
-    sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
-    sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw3_s = sw3_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
-    sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
-    sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        # Shared expert weights — replicated across ranks.
+        sw1_i8, sw1_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w1"], chan_cv=0.50)
+        sw3_i8, sw3_s = gen_shared_weight((MOE_INTER, D), SHARED_DEQUANT_STD["w3"], chan_cv=0.50)
+        sw2_i8, sw2_s = gen_shared_weight((D, MOE_INTER), SHARED_DEQUANT_STD["w2"], chan_cv=0.33)
+        sw1_i8 = sw1_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+        sw1_s = sw1_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        sw3_i8 = sw3_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+        sw3_s = sw3_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        sw2_i8 = sw2_i8.unsqueeze(0).expand(N_RANKS, -1, -1).contiguous()
+        sw2_s = sw2_s.unsqueeze(0).expand(N_RANKS, -1).contiguous()
+        shared_w1_init = sw1_i8
+        shared_w1_scale_init = sw1_s
+        shared_w3_init = sw3_i8
+        shared_w3_scale_init = sw3_s
+        shared_w2_init = sw2_i8
+        shared_w2_scale_init = sw2_s
 
     specs = [
         TensorSpec("x_hc",          [N_RANKS, T, HC_MULT, D],     torch.float32, init_value=init_x_hc),
@@ -923,18 +942,18 @@ def build_tensor_specs(layer_id=0, num_tokens=T, balanced_routing=False):
         TensorSpec("gate_bias",     [N_RANKS, N_EXPERTS_GLOBAL],     torch.float32,  init_value=init_gate_bias),
         TensorSpec("tid2eid",       [N_RANKS, VOCAB, TOPK],          torch.int32,    init_value=init_tid2eid),
         TensorSpec("input_ids",     [N_RANKS, T],                 torch.int64,    init_value=init_input_ids),
-        TensorSpec("routed_w1",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: rw1_i8),
-        TensorSpec("routed_w1_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: rw1_s),
-        TensorSpec("routed_w3",        [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8,    init_value=lambda: rw3_i8),
-        TensorSpec("routed_w3_scale",  [N_RANKS, N_LOCAL, MOE_INTER],    torch.float32, init_value=lambda: rw3_s),
-        TensorSpec("routed_w2",        [N_RANKS, N_LOCAL, D, MOE_INTER], torch.int8,    init_value=lambda: rw2_i8),
-        TensorSpec("routed_w2_scale",  [N_RANKS, N_LOCAL, D],            torch.float32, init_value=lambda: rw2_s),
-        TensorSpec("shared_w1",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw1_i8),
-        TensorSpec("shared_w1_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw1_s),
-        TensorSpec("shared_w3",        [N_RANKS, MOE_INTER, D],          torch.int8,    init_value=lambda: sw3_i8),
-        TensorSpec("shared_w3_scale",  [N_RANKS, MOE_INTER],             torch.float32, init_value=lambda: sw3_s),
-        TensorSpec("shared_w2",        [N_RANKS, D, MOE_INTER],          torch.int8,    init_value=lambda: sw2_i8),
-        TensorSpec("shared_w2_scale",  [N_RANKS, D],                     torch.float32, init_value=lambda: sw2_s),
+        TensorSpec("routed_w1", [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8, init_value=routed_w1_init),
+        TensorSpec("routed_w1_scale", [N_RANKS, N_LOCAL, MOE_INTER], torch.float32, init_value=routed_w1_scale_init),
+        TensorSpec("routed_w3", [N_RANKS, N_LOCAL, MOE_INTER, D], torch.int8, init_value=routed_w3_init),
+        TensorSpec("routed_w3_scale", [N_RANKS, N_LOCAL, MOE_INTER], torch.float32, init_value=routed_w3_scale_init),
+        TensorSpec("routed_w2", [N_RANKS, N_LOCAL, D, MOE_INTER], torch.int8, init_value=routed_w2_init),
+        TensorSpec("routed_w2_scale", [N_RANKS, N_LOCAL, D], torch.float32, init_value=routed_w2_scale_init),
+        TensorSpec("shared_w1", [N_RANKS, MOE_INTER, D], torch.int8, init_value=shared_w1_init),
+        TensorSpec("shared_w1_scale", [N_RANKS, MOE_INTER], torch.float32, init_value=shared_w1_scale_init),
+        TensorSpec("shared_w3", [N_RANKS, MOE_INTER, D], torch.int8, init_value=shared_w3_init),
+        TensorSpec("shared_w3_scale", [N_RANKS, MOE_INTER], torch.float32, init_value=shared_w3_scale_init),
+        TensorSpec("shared_w2", [N_RANKS, D, MOE_INTER], torch.int8, init_value=shared_w2_init),
+        TensorSpec("shared_w2_scale", [N_RANKS, D], torch.float32, init_value=shared_w2_scale_init),
         TensorSpec("x_next",           [N_RANKS, T, HC_MULT, D],      torch.float32, is_output=True),
         ScalarSpec("layer_id",         torch.int32,                      layer_id),
         ScalarSpec("num_tokens",       torch.int32,                      num_tokens),
@@ -980,6 +999,8 @@ if __name__ == "__main__":
                         help=f"active token count for MoE dispatch/combine (0..{T})")
     parser.add_argument("--balanced-routing", action="store_true", default=False,
                         help="use deterministic hash routes balanced evenly across all experts")
+    parser.add_argument("--smoke-weights", action="store_true", default=False,
+                        help="use lazy constant expert weights for execution-only smoke runs")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
@@ -1003,6 +1024,7 @@ if __name__ == "__main__":
             layer_id=args.layer_id,
             num_tokens=args.num_tokens,
             balanced_routing=args.balanced_routing,
+            smoke_weights=args.smoke_weights,
         ),
         golden_fn=golden_moe,
         golden_data=golden_data,

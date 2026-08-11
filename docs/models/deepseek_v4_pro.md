@@ -17,7 +17,7 @@ is the same architecture at a shorter sequence budget.
 | Decode context length | up to 16,384 positions (`KERNEL_MAX_SEQ_LEN`), 128-token pages |
 | Prefill shape | one request of 128 tokens per program |
 | Platform | Ascend A5 (`-p a5`); the parsers also accept A2/A3 and both simulators |
-| Expert parallelism | `--ep 2/4/8`, `384 / ep` routed experts per rank |
+| Expert parallelism | EP8 deployment: 384 global / 48 per rank; reduced EP2/EP4 smoke fixtures keep 48 per rank |
 | LM-head parallelism | `--tp 2/4/8` vocab shards; `LM_HEAD_TP_SIZE = 8` is the deployment value |
 | Other components | no tensor parallelism — attention is data-parallel, MoE is expert-parallel |
 | Quantization | Hybrid MXFP8-MXFP4 — MXFP8 for the dense path, MXFP4 for the routed-expert weights |
@@ -35,6 +35,39 @@ stand-in with the same tensor split as
 [V4-Flash](deepseek_v4_flash_mtp.md#what-is-quantized): `gen_routed_weight` in
 [expert_routed.py](../../models/deepseek_v4_pro/expert_routed.py) re-quantizes
 off the MXFP4 grid into INT8 rather than feeding the cube MXFP4 weights.
+
+### Staged EP2 execution smoke
+
+The draft staged drivers execute all 61 main-model layers in order while
+keeping one layer's synthetic weights live at a time. They compile four
+attention/routing specializations, chain `x_next` and each layer's mutable
+attention state across rounds, then run `hc_head` and the final RMSNorm.
+
+This path is an execution smoke rather than a numerical validation:
+
+- `smoke_weights=True` uses zero INT8 routed/shared expert payloads and unit
+  FP32 scales; native MXFP8-MXFP4 is not exercised.
+- The EP2 fixture keeps 48 routed experts per rank, or 96 globally. The
+  deployment configuration remains 384 global experts at EP8.
+- The drivers pass no golden function or replay data. A successful run covers
+  compilation, runtime scheduling, EP dispatch/combine, cache/state chaining,
+  and output shapes, but not output values.
+- Embedding, MTP, the standalone LM head, and logits are omitted; execution
+  ends at the normalized hidden state.
+
+Select a PTOAS build with operation fusion disabled for bring-up runs:
+
+```bash
+export PTOAS_ROOT=/path/to/ptoas-nofuse
+
+task-submit --device auto --device-num 2 --env PTOAS_ROOT --max-time 0 --run \
+  "python models/deepseek_v4_pro/decode_fwd_staged_draft.py \
+  -p a5 --ep 2 -d \$TASK_DEVICE --rounds 2"
+
+task-submit --device auto --device-num 2 --env PTOAS_ROOT --max-time 0 --run \
+  "python models/deepseek_v4_pro/prefill_fwd_staged_draft.py \
+  -p a5 --ep 2 -d \$TASK_DEVICE --rounds 2"
+```
 
 ### Model shape and layer schedule
 
@@ -127,6 +160,7 @@ prefill_mtp     mtp_projection → prefill_attention_swa → moe → hc_head →
 | Group | Files |
 | --- | --- |
 | Full forward | [decode_fwd.py](../../models/deepseek_v4_pro/decode_fwd.py), [prefill_fwd.py](../../models/deepseek_v4_pro/prefill_fwd.py) |
+| Staged execution smoke | [decode_fwd_staged_draft.py](../../models/deepseek_v4_pro/decode_fwd_staged_draft.py), [prefill_fwd_staged_draft.py](../../models/deepseek_v4_pro/prefill_fwd_staged_draft.py), [staged_fwd_tail.py](../../models/deepseek_v4_pro/staged_fwd_tail.py), [staged_fwd_utils.py](../../models/deepseek_v4_pro/staged_fwd_utils.py) |
 | Layer composition | [decode_layer.py](../../models/deepseek_v4_pro/decode_layer.py), [prefill_layer.py](../../models/deepseek_v4_pro/prefill_layer.py) |
 | MTP | [decode_mtp.py](../../models/deepseek_v4_pro/decode_mtp.py), [prefill_mtp.py](../../models/deepseek_v4_pro/prefill_mtp.py), [mtp_projection.py](../../models/deepseek_v4_pro/mtp_projection.py) |
 | Decode attention orchestration | [decode_attention_swa.py](../../models/deepseek_v4_pro/decode_attention_swa.py), [decode_attention_csa.py](../../models/deepseek_v4_pro/decode_attention_csa.py), [decode_attention_hca.py](../../models/deepseek_v4_pro/decode_attention_hca.py) |

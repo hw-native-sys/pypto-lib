@@ -878,7 +878,12 @@ def _resolve_batch(chunk_lens, start_positions, torch):
             total_tokens)
 
 
-def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_positions=None):
+def build_tensor_specs(
+    layer_id=2,
+    chunk_lens=DEFAULT_CHUNK_LENS,
+    start_positions=None,
+    smoke_weights=False,
+):
     """Packed batch tensor specs for the chunked prefill layer.
 
     ``chunk_lens`` lists the current-chunk length per request;
@@ -1090,7 +1095,7 @@ def build_tensor_specs(layer_id=2, chunk_lens=DEFAULT_CHUNK_LENS, start_position
                                    init_value=replicate(tile_offsets_t)))
 
     # MoE weight tensors (per rank). tid2eid keeps its hash-table init.
-    for spec in build_moe_tensor_specs(layer_id=layer_id):
+    for spec in build_moe_tensor_specs(layer_id=layer_id, smoke_weights=smoke_weights):
         if not isinstance(spec, TensorSpec) or spec.name in {"x_hc", "x_next", "input_ids"}:
             continue
         if spec.name == "tid2eid":
@@ -1299,6 +1304,8 @@ if __name__ == "__main__":
                         help="Comma-separated per-request logical chunk lengths.")
     parser.add_argument("--start-positions", type=str, default=None,
                         help="Comma-separated per-request prior context lengths; defaults to all zeros.")
+    parser.add_argument("--smoke-weights", action="store_true", default=False,
+                        help="use lazy constant expert weights for execution-only smoke runs")
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
     parser.add_argument("--compile-only", action="store_true", default=False)
     parser.add_argument("--dump-passes", action="store_true", default=False)
@@ -1315,6 +1322,7 @@ if __name__ == "__main__":
             layer_id=args.layer_id,
             chunk_lens=chunk_lens,
             start_positions=start_positions,
+            smoke_weights=args.smoke_weights,
         ),
         golden_fn=golden_prefill_layer,
         compile_only=args.compile_only,
