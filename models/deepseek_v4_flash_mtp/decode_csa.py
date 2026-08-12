@@ -900,6 +900,8 @@ if __name__ == "__main__":
     parser.add_argument("--start-pos", type=int, default=None,
                         help="Uniform fixture-only start_pos override for all batches; "
                              "default (unset) uses the canonical per-batch CSA set that includes the 8k point.")
+    parser.add_argument("--seed", type=int, default=1807,
+                        help="Seed for deterministic input and weight fixtures.")
     parser.add_argument("--enable-l2-swimlane", type=int, nargs="?", const=1, default=0, choices=(0, 1, 2, 4))
     parser.add_argument("--runtime-dir", type=str, default=None)
     parser.add_argument("--golden-data", type=str, default=None,
@@ -907,6 +909,10 @@ if __name__ == "__main__":
                              "requires an unchanged spec set.")
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    import torch
+
+    torch.manual_seed(args.seed)
 
     result = run_jit(
         fn=attention_csa_test,
