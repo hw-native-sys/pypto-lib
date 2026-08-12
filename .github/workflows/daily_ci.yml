@@ -57,6 +57,7 @@ jobs:
           toolchain: bundle
 
       - name: Run model tests (${{ matrix.platform }})
+        id: sweep
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/checkout
@@ -121,7 +122,15 @@ jobs:
         run: rm -rf build_output
 
       - name: Upload results artifact
-        if: always()
+        # Not a bare always(): on this persistent runner a results.tsv from a
+        # previous run survives in the checkout dir, so if the job dies before
+        # the sweep (setup failure, checkout failure), an unconditional upload
+        # re-publishes the LEFTOVER table and the summary renders days-old
+        # results as if they were tonight's — with the ":warning: No results
+        # artifact" branch silently defeated. Gate on the sweep step having
+        # actually started: it truncates results.tsv first thing, so anything
+        # it uploads (even from a failed or cancelled sweep) is from this run.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.platform }}
@@ -184,6 +193,7 @@ jobs:
           toolchain: bundle
 
       - name: Run model tests (a2a3, via task-submit)
+        id: sweep
         shell: bash
         env:
           PYPTO_LOG_LEVEL: error
@@ -276,7 +286,10 @@ jobs:
         run: rm -rf build_output
 
       - name: Upload results artifact
-        if: always()
+        # Gated on the sweep having started — see the sim job's upload step
+        # for why a bare always() re-publishes a previous run's leftover
+        # results.tsv when the job dies in setup.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: results-a2a3
@@ -323,6 +336,36 @@ jobs:
       CCACHE_UMASK: '000'
 
     steps:
+      - name: Point git at the runner's live proxy
+        # The A5 host's git carries a file-scope http(s).proxy that has gone
+        # stale (a dead local forwarder — every nightly since 2026-08-07 died
+        # in the checkout below with "Failed to connect to 127.0.0.1 port
+        # 7890"), and file-scope git config beats the proxy environment. So
+        # git dials the dead port while the runner service and curl use the
+        # live proxy from the runner's own environment ("Runner is running
+        # behind proxy server ..." in Set up job). Re-point git at that same
+        # live proxy for this job only: GIT_CONFIG_* is command-scope config,
+        # which outranks every config file and touches no host state — when
+        # the host's git config is repaired this becomes a harmless no-op, as
+        # it already is on runners with no proxy in their environment.
+        # Runs before the checkout, so it must not assume ./checkout exists.
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          live="${https_proxy:-${HTTPS_PROXY:-}}"
+          if [ -n "$live" ]; then
+            {
+              echo "GIT_CONFIG_COUNT=2"
+              echo "GIT_CONFIG_KEY_0=http.proxy"
+              echo "GIT_CONFIG_VALUE_0=$live"
+              echo "GIT_CONFIG_KEY_1=https.proxy"
+              echo "GIT_CONFIG_VALUE_1=$live"
+            } >> "$GITHUB_ENV"
+            echo "git proxy pinned to the runner's live proxy for this job"
+          else
+            echo "no proxy in the runner environment — leaving git alone"
+          fi
+
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
         # but this job checks the repo out into ./checkout — sparse-fetch just
@@ -344,6 +387,7 @@ jobs:
           toolchain: bundle
 
       - name: Run V4-Pro tests (a5, via task-submit)
+        id: sweep
         shell: bash
         env:
           PYPTO_LOG_LEVEL: error
@@ -422,7 +466,13 @@ jobs:
         run: rm -rf build_output
 
       - name: Upload results artifact
-        if: always()
+        # Gated on the sweep having started — see the sim job's upload step
+        # for the full note. This job is where the bare always() actually
+        # bit: every nightly from 2026-08-07 to 2026-08-11 died in checkout
+        # (dead git proxy, fixed by this job's first step) yet re-uploaded a
+        # byte-identical results-a5 leftover from the 08-05 sweep, so the
+        # summary kept presenting six-day-old V4-Pro numbers as current.
+        if: ${{ always() && steps.sweep.outcome != 'skipped' }}
         uses: actions/upload-artifact@v4
         with:
           name: results-a5
