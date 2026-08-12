@@ -282,12 +282,11 @@ def dispatch(
     # dst == my_rank puts are already ordered by the local RAW edges on
     # recv_x / recv_aux / recv_route. deps on _meta_tid for recv_meta_local, which is
     # manual_dep and so has no auto edge from the cumsum.
-    # Keep normal dependency resolution here: at EP8 this 32-block consumer can
-    # otherwise occupy cores while waiting and starve its own dispatch producers.
     with pl.spmd(
         N_LOCAL,
         name_hint="dispatch_gather",
         deps=[_wait_tid, _meta_tid],
+        allow_early_resolve=True,
     ) as _gather_tid:
         e = pl.tile.get_block_idx()
         e_base_row = e * RECV_MAX
