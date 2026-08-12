@@ -45,6 +45,9 @@ QUANT_TILE = 256
 SCORE_PAD = 256         # padded expert row for sort32 + mrgsort
 TOPK_PAD = 8            # TOPK padded to 32B-aligned width
 SORT_PAD = TOPK_PAD * 2 # (val, idx) interleaved slice width
+DISPATCH_AUX_PAD = 8
+DISPATCH_ROUTE_PAD = 8
+N_ROUTES = T * TOPK
 assert TOPK <= TOPK_PAD
 
 @pl.jit.inline
@@ -61,6 +64,8 @@ def gate(
     x_norm_scale: pl.Tensor[[T, 1], pl.FP32],
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
+    dispatch_aux: pl.Tensor[[N_ROUTES, DISPATCH_AUX_PAD], pl.FP32],
+    dispatch_route: pl.Tensor[[N_ROUTES, DISPATCH_ROUTE_PAD], pl.INT32],
 ):
     # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
     # the per-token positive scalar inv_rms factors out of everything downstream:
@@ -232,8 +237,15 @@ def gate(
             for hs_wt_tt in pl.range(GATE_T_TILE):
                 if t1 + hs_wt_tt < active_tokens:
                     for hs_wt_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k]))
-                        pl.write(weights, [t1 + hs_wt_tt, hs_wt_k], pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k]))
+                        token = t1 + hs_wt_tt
+                        route = token * TOPK + hs_wt_k
+                        route_index = pl.read(hs_idx_read, [hs_wt_tt, hs_wt_k])
+                        route_weight = pl.read(hs_weights_pad, [hs_wt_tt, hs_wt_k])
+                        pl.write(indices, [token, hs_wt_k], route_index)
+                        pl.write(weights, [token, hs_wt_k], route_weight)
+                        pl.write(dispatch_aux, [route, 0], pl.read(x_norm_scale, [token, 0]))
+                        pl.write(dispatch_aux, [route, 1], route_weight)
+                        pl.write(dispatch_route, [route, 0], pl.cast(route, pl.INT32))
     else:
         for ts_idx in pl.spmd(active_route_tiles, name_hint="route_sort", allow_early_resolve=True):
             t1 = ts_idx * GATE_T_TILE
@@ -269,8 +281,15 @@ def gate(
             for nm_tt in pl.range(GATE_T_TILE):
                 if t1 + nm_tt < active_tokens:
                     for nm_k in pl.range(TOPK):
-                        pl.write(indices, [t1 + nm_tt, nm_k], pl.read(topk_idx_read, [nm_tt, nm_k]))
-                        pl.write(weights, [t1 + nm_tt, nm_k], pl.read(nm_weights_pad, [nm_tt, nm_k]))
+                        token = t1 + nm_tt
+                        route = token * TOPK + nm_k
+                        route_index = pl.read(topk_idx_read, [nm_tt, nm_k])
+                        route_weight = pl.read(nm_weights_pad, [nm_tt, nm_k])
+                        pl.write(indices, [token, nm_k], route_index)
+                        pl.write(weights, [token, nm_k], route_weight)
+                        pl.write(dispatch_aux, [route, 0], pl.read(x_norm_scale, [token, 0]))
+                        pl.write(dispatch_aux, [route, 1], route_weight)
+                        pl.write(dispatch_route, [route, 0], pl.cast(route, pl.INT32))
 
     # The @pl.inline parser requires inline call expressions to have a return
     # value. weights is convenient because it's already pl.Out and reads as
@@ -292,13 +311,15 @@ def gate_test(
     x_norm_scale: pl.Out[pl.Tensor[[T, 1], pl.FP32]],
     indices: pl.Out[pl.Tensor[[T, TOPK], pl.INT32]],
     weights: pl.Out[pl.Tensor[[T, TOPK], pl.FP32]],
+    dispatch_aux: pl.Out[pl.Tensor[[N_ROUTES, DISPATCH_AUX_PAD], pl.FP32]],
+    dispatch_route: pl.Out[pl.Tensor[[N_ROUTES, DISPATCH_ROUTE_PAD], pl.INT32]],
 ):
     gate(
         x_mixed,
         norm_w, gate_w, gate_bias,
         layer_id, num_tokens,
         tid2eid, input_ids,
-        x_norm_i8, x_norm_scale, indices, weights,
+        x_norm_i8, x_norm_scale, indices, weights, dispatch_aux, dispatch_route,
     )
     return x_norm_i8, x_norm_scale, indices, weights
 
@@ -366,6 +387,16 @@ def golden_gate_core(tensors):
     tensors["x_norm_scale"][:] = x_norm_scale.reshape(T, 1)
     tensors["indices"][:] = indices.to(torch.int32)
     tensors["weights"][:] = weights.to(torch.float32)
+    dispatch_aux = torch.zeros(N_ROUTES, DISPATCH_AUX_PAD, dtype=torch.float32)
+    dispatch_route = torch.zeros(N_ROUTES, DISPATCH_ROUTE_PAD, dtype=torch.int32)
+    for token in range(num_tokens):
+        for topk in range(TOPK):
+            route = token * TOPK + topk
+            dispatch_aux[route, 0] = x_norm_scale[token, 0]
+            dispatch_aux[route, 1] = weights[token, topk]
+            dispatch_route[route, 0] = route
+    tensors["dispatch_aux"][:] = dispatch_aux
+    tensors["dispatch_route"][:] = dispatch_route
 
 
 def build_tensor_specs(layer_id=0, num_tokens=T):
@@ -398,6 +429,8 @@ def build_tensor_specs(layer_id=0, num_tokens=T):
         TensorSpec("x_norm_scale", [T, 1], torch.float32, is_output=True),
         TensorSpec("indices", [T, TOPK], torch.int32, is_output=True),
         TensorSpec("weights", [T, TOPK], torch.float32, is_output=True),
+        TensorSpec("dispatch_aux", [N_ROUTES, DISPATCH_AUX_PAD], torch.float32, is_output=True),
+        TensorSpec("dispatch_route", [N_ROUTES, DISPATCH_ROUTE_PAD], torch.int32, is_output=True),
     ]
 
 
