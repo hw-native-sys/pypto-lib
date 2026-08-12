@@ -262,11 +262,7 @@ def dispatch(
     # with dispatch_push instead of trailing dispatch_meta's spin. Anchor it to
     # something -- an unanchored wait is dispatched immediately and spins holding a
     # core group, so pipelined layers stack up spinners.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="dispatch_wait",
-        allow_early_resolve=True,
-    ) as _wait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="dispatch_wait", allow_early_resolve=True) as _wait_tid:
         _idx_anchor = pl.read(indices, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
@@ -369,11 +365,7 @@ def combine(
     # starts. Anchor it to something -- a wait with no dep at all is dispatched the
     # moment the scheduler reaches it and spins holding a core group, so pipelined
     # layers stack up spinners that starve the scatters they wait on.
-    with pl.at(
-        level=pl.Level.CORE_GROUP,
-        name_hint="combine_wait",
-        allow_early_resolve=True,
-    ) as _cwait_tid:
+    with pl.at(level=pl.Level.CORE_GROUP, name_hint="combine_wait", allow_early_resolve=True) as _cwait_tid:
         _recv_y_anchor = pl.read(recv_y_flat, [0, 0])
         for src in pl.range(N_RANKS):
             if src != my_rank:
