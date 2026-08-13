@@ -92,6 +92,8 @@ if D % O_B_D_TILE != 0 or O_B_D_TILE % O_B_N_TILE != 0:
     raise ValueError("O-B output tiles must divide the hidden dimension")
 if D % ACT_N_TILE != 0:
     raise ValueError(f"O-B activation tile {ACT_N_TILE} must divide hidden size {D}")
+if GROUP_T_PAD % O_B_T_TILE != 0:
+    raise ValueError(f"O-B token tile {O_B_T_TILE} must divide token capacity {GROUP_T_PAD}")
 
 
 @pl.jit.inline
@@ -158,7 +160,8 @@ def decode_o_proj_tp1(
                     g_amax = pl.maximum(g_amax_floor, g_row_max)
                     g_scale_num = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX)
                     g_sq_row = pl.div(g_scale_num, g_amax)
-                    act_scale_dq[g : g + 1, qt : qt + QUANT_TOKEN_TILE] = pl.recip(g_sq_row)
+                    g_scale_dq = pl.mul(g_amax, 1.0 / INT8_SCALE_MAX)
+                    act_scale_dq[g : g + 1, qt : qt + QUANT_TOKEN_TILE] = g_scale_dq
                     g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
                     oc_q = o_r_pad[qt : qt + QUANT_TOKEN_TILE, col_g : col_g + O_LORA]
                     oq_scaled = pl.row_expand_mul(oc_q, g_sq_col)
@@ -519,6 +522,7 @@ def decode_sharded_o_projection(
     group_t = TP_SIZE * local_t
     o_a_rows = (group_t + O_A_T_TILE - 1) // O_A_T_TILE
     o_b_rows = (group_t + O_B_T_TILE - 1) // O_B_T_TILE
+    o_b_group_t = o_b_rows * O_B_T_TILE
     act_rows = (group_t + ACT_T_TILE - 1) // ACT_T_TILE
 
     attn_2d = pl.reshape(attention_local_groups, [LOCAL_O_GROUPS * GROUP_T_PAD, O_GROUP_IN])
@@ -571,6 +575,13 @@ def decode_sharded_o_projection(
                 o_a_quant = pl.cast(o_a_fp16, target_type=pl.INT8, mode="trunc")
                 o_a_quant_valid = pl.set_validshape(o_a_quant, quant_rows, O_LORA)
                 o_a_i8[qt : qt + QUANT_T_TILE, o_a_col : o_a_col + O_LORA] = o_a_quant_valid
+            # Pad the compact O-A prefix to complete 128-row O-B slabs.
+            for qt in pl.range(group_t, o_b_group_t, QUANT_T_TILE):
+                pad_rows = pl.min(QUANT_T_TILE, o_b_group_t - qt)
+                o_a_padding_fp16 = pl.full([QUANT_T_TILE, O_LORA], dtype=pl.FP16, value=0.0)
+                o_a_padding = pl.cast(o_a_padding_fp16, target_type=pl.INT8, mode="trunc")
+                o_a_padding_valid = pl.set_validshape(o_a_padding, pad_rows, O_LORA)
+                o_a_i8[qt : qt + QUANT_T_TILE, o_a_col : o_a_col + O_LORA] = o_a_padding_valid
 
         with pl.spmd(o_b_rows * (D // O_B_D_TILE), name_hint="tp_o_b", deps=[quant_tid]) as proj_b_tid:
             proj_b_unit = pl.tile.get_block_idx()
@@ -578,19 +589,17 @@ def decode_sharded_o_projection(
             d_block = proj_b_unit - row_block * (D // O_B_D_TILE)
             t0 = row_block * O_B_T_TILE
             d0 = d_block * O_B_D_TILE
-            b_rows = pl.min(O_B_T_TILE, group_t - t0)
             for n0 in pl.range(d0, d0 + O_B_D_TILE, O_B_N_TILE):
-                o_b_x0 = pl.slice(o_a_i8, [O_B_T_TILE, O_B_K_TILE], [t0, o_a_col], valid_shape=[b_rows, O_B_K_TILE])
+                o_b_x0 = o_a_i8[t0 : t0 + O_B_T_TILE, o_a_col : o_a_col + O_B_K_TILE]
                 o_b_w0 = wo_b[n0 : n0 + O_B_N_TILE, o_a_col : o_a_col + O_B_K_TILE]
                 o_b_acc = pl.matmul(o_b_x0, o_b_w0, b_trans=True, out_dtype=pl.INT32)
                 for k0 in pl.pipeline(O_B_K_TILE, O_LORA, O_B_K_TILE, stage=2):
                     b_k0 = o_a_col + k0
-                    o_b_xk = pl.slice(o_a_i8, [O_B_T_TILE, O_B_K_TILE], [t0, b_k0], valid_shape=[b_rows, O_B_K_TILE])
+                    o_b_xk = o_a_i8[t0 : t0 + O_B_T_TILE, b_k0 : b_k0 + O_B_K_TILE]
                     o_b_wk = wo_b[n0 : n0 + O_B_N_TILE, b_k0 : b_k0 + O_B_K_TILE]
                     o_b_acc = pl.matmul_acc(o_b_acc, o_b_xk, o_b_wk, b_trans=True)
-                o_b_i32_valid = pl.set_validshape(o_b_acc, b_rows, O_B_N_TILE)
                 partial_col = local_group * D + n0
-                o_b_i32[t0 : t0 + O_B_T_TILE, partial_col : partial_col + O_B_N_TILE] = o_b_i32_valid
+                o_b_i32[t0 : t0 + O_B_T_TILE, partial_col : partial_col + O_B_N_TILE] = o_b_acc
         proj_b_tids[local_group] = proj_b_tid
 
     with pl.spmd(
