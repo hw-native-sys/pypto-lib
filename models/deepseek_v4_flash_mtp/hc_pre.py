@@ -424,8 +424,8 @@ def _hc_pre_separate(
 
     Identical math to _hc_pre_syncall, but each work-type is its OWN pl.spmd task instead
     of one full-occupancy pl.spmd + hard pl.system.syncall barriers. The runtime task
-    graph orders the scopes by their GM read/write dependencies (seed -> linear atomic-add
-    -> split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
+    graph orders the scopes by their GM read/write dependencies (linear partials -> fixed-order
+    reduce -> split_pre_post -> write_post / comb_sinkhorn / mix_x), so this path needs dep_gen ON
     (the __main__ harness sets enable_dep_gen accordingly). Tile sizes are aligned to the
     tuned syncall version (D_CHUNK / D_SPMD / LINEAR_* / t_linear round-up); cross-barrier
     buffers are sized to the dynamic t_linear (the 8->16 padded row count), not a static
@@ -446,6 +446,12 @@ def _hc_pre_separate(
     # linear matmul masks them with valid_shape (zero-fill past t_dim), and rms only reads
     # the t_dim real rows.
     mixes_raw = pl.create_tensor([t_linear, MIX_PAD], dtype=pl.FP32)
+    # Keep split-K partials in disjoint rows and reduce them in a fixed order.
+    # AtomicAdd makes the FP32 projection depend on the order in which the four
+    # cube tasks reach HBM. Different EP ranks can observe different rounding,
+    # which changes the FP32 hyper-connection gates and is amplified by the next
+    # attention layer even when every rank starts from identical hidden states.
+    mixes_partials = pl.create_tensor([LINEAR_OK * t_linear, MIX_PAD], dtype=pl.FP32)
 
     # rms: full-K sum-of-squares per token-tile -> inv_rms (one scope, no split-K).
     for t in pl.spmd(t_dim // T_TILE, name_hint="hc_pre_rms", allow_early_resolve=True):
@@ -458,18 +464,12 @@ def _hc_pre_separate(
         inv = pl.reshape(pl.rsqrt(pl.add(pl.mul(sq_sum, HC_DIM_INV), NORM_EPS), high_precision=True), [T_TILE, 1])
         inv_rms = pl.assemble(inv_rms, inv, [t0, 0])
 
-    # seed: zero mixes_raw for the split-K atomic-add accumulation. ONE task (single InCore
-    # region) loops the t_linear // T_TILE row-blocks internally, instead of fanning them out.
-    # On-core (not create_tensor init_value=0): AICPU init serializes on the scheduler and
-    # roughly doubles the decode orch window, whereas the on-core memset overlaps.
-    with pl.at(level=pl.Level.CORE_GROUP, name_hint="hc_pre_seed", allow_early_resolve=True):
-        for ts0 in pl.range(0, t_linear, T_TILE):
-            mixes_raw[ts0:ts0 + T_TILE, 0:MIX_PAD] = pl.full([T_TILE, MIX_PAD], dtype=pl.FP32, value=0.0)
-
-    # linear: split-K matmul; each (row-block, K-slice) atomic-adds its FP32 partial.
+    # Linear: split-K matmul. Each split writes a disjoint row range, then a
+    # separate task reduces split 0..LINEAR_OK-1 in that canonical order.
     for task in pl.spmd((t_linear // LINEAR_T_TILE) * LINEAR_OK, name_hint="hc_pre_linear", allow_early_resolve=True):
+        split = task % LINEAR_OK
         t0 = (task // LINEAR_OK) * LINEAR_T_TILE
-        k_base = (task % LINEAR_OK) * LINEAR_K_PER_SPLIT
+        k_base = split * LINEAR_K_PER_SPLIT
         t_rows = pl.min(LINEAR_T_TILE, t_dim - t0)  # last row-block spills past t_dim; valid_shape zero-fills the tail
         acc = pl.create_tensor([LINEAR_T_TILE, MIX_PAD], dtype=pl.FP32)
         for kb in pl.pipeline(0, LINEAR_CHUNKS_PER_SPLIT, stage=2):
@@ -480,7 +480,19 @@ def _hc_pre_separate(
                 acc = pl.matmul(x_linear_chunk, w_chunk, b_trans=True, out_dtype=pl.FP32)
             else:
                 acc = pl.matmul_acc(acc, x_linear_chunk, w_chunk, b_trans=True)
-        mixes_raw = pl.assemble(mixes_raw, acc, [t0, 0], atomic=pl.AtomicType.Add)
+        partial_t0 = split * t_linear + t0
+        mixes_partials = pl.assemble(mixes_partials, acc, [partial_t0, 0])
+
+    for row_block in pl.spmd(t_linear // LINEAR_T_TILE, name_hint="hc_pre_linear_reduce"):
+        t0 = row_block * LINEAR_T_TILE
+        mixed = mixes_partials[t0:t0 + LINEAR_T_TILE, 0:MIX_PAD]
+        for split in pl.range(1, LINEAR_OK):
+            partial_t0 = split * t_linear + t0
+            mixed = pl.add(
+                mixed,
+                mixes_partials[partial_t0:partial_t0 + LINEAR_T_TILE, 0:MIX_PAD],
+            )
+        mixes_raw = pl.assemble(mixes_raw, mixed, [t0, 0])
 
     # split_pre_post: inv_rms-scaled pre gate -> pre_val_store (for mix_x), post gate -> post.
     # Both compute at HC_PAD width; post narrows to HC_MULT via a valid-shape slice (an 8-wide
@@ -832,8 +844,8 @@ if __name__ == "__main__":
     # AIC count and its hard full-occupancy mix-syncall hangs (AICore timeout 507018) unless
     # the launch fills every physical core; A5 (Ascend950) has a different AIC count (36), so
     # the syncall impl is rejected on A5. The "separate" impl has no such barrier -- it uses
-    # data-derived pl.spmd(work_count) + CORE_GROUP + atomic-add (the same structural pattern
-    # as hc_head/hc_post, which already pass on A5), so it is core-count-agnostic and runs on
+    # data-derived pl.spmd(work_count) + CORE_GROUP tasks with a deterministic split-K
+    # reduction, so it is core-count-agnostic and runs on
     # A5. Its tile sizes are 910B-tuned (perf, not correctness); a5 perf may be suboptimal
     # until re-swept, but precision is unaffected.
     if args.platform in ("a5", "a5sim") and HC_PRE_IMPL == "syncall":
