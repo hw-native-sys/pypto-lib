@@ -9,7 +9,7 @@ jobs:
   model-tests-sim:
     # Simulator job: no device needed, so it runs on the CPU runner — but on the
     # host, through the same setup-ci-job composite as the a2a3 device job (same
-    # user, same conda venv + activate.sh, same ci-cache). needs-device:false is
+    # user, same bundle venv + activate.sh, same ci-cache). needs-device:false is
     # the only difference: no npu-smi check and no Ascend env, which the simulator
     # does not use.
     runs-on: [self-hosted, linux, arm64, cpu]
