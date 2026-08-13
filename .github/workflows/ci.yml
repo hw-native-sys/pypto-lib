@@ -13,6 +13,11 @@ concurrency:
 
 jobs:
   pre-commit:
+    # TEMPORARY (this branch): the experiment branch exists only to fire the
+    # daily A5 sweep on push; skip the whole CI workflow for its PR. The
+    # downstream jobs (sim, a2a3, serving-*) all gate on detect-changes
+    # outputs, so gating the three root jobs skips everything.
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,6 +30,8 @@ jobs:
           extra_args: --all-files
 
   unit-tests:
+    # TEMPORARY (this branch): skipped — see pre-commit's note.
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -52,6 +59,10 @@ jobs:
         run: pytest tests/golden -v
 
   detect-changes:
+    # TEMPORARY (this branch): skipped — see pre-commit's note. Skipping this
+    # job leaves its outputs empty, which cascades the skip to sim, a2a3,
+    # and both serving jobs.
+    if: github.head_ref != 'exp/ptoas-op-fusion-ab'
     runs-on: ubuntu-latest
     outputs:
       has_changes: ${{ steps.check.outputs.has_changes }}
