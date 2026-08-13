@@ -38,6 +38,7 @@ S = 128
 T = B * S
 START_POS = 0
 COMPRESS_RATIO = 4
+IDX_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
@@ -73,8 +74,8 @@ def _prefill_indexer_compressor_with_completion(
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
     # C8 indexer cache: INT8 KV (quant-on-write) + per-position FP32 dequant scale; no bf16 cache.
-    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -90,8 +91,8 @@ def _prefill_indexer_compressor_with_completion(
         compress_state,
         [state_block_num * INNER_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, HEAD_DIM])
-    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, HEAD_DIM])
+    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, 1])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.BF16)
     final_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
@@ -369,7 +370,7 @@ def _prefill_indexer_compressor_with_completion(
                 dst_row = pl.cast(dst_row_raw, pl.INDEX)
                 idx_kv_cache_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = kv_i8_blk[final_dt : final_dt + 1, :]
             else:
-                keepalive_row = idx_block_num * BLOCK_SIZE - MAX_CMP_WRITES + final_i
+                keepalive_row = idx_block_num * IDX_STORAGE_BLOCK_SIZE - MAX_CMP_WRITES + final_i
                 idx_kv_cache_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = idx_kv_cache_flat[
                     keepalive_row : keepalive_row + 1,
                     0:HEAD_DIM,
@@ -384,7 +385,7 @@ def _prefill_indexer_compressor_with_completion(
                 scale_value = pl.read(scale_tile, [scale_i, 0])
                 pl.write(idx_kv_scale_flat, [dst_row, 0], scale_value)
             else:
-                keepalive_row = idx_block_num * BLOCK_SIZE - MAX_CMP_WRITES + scale_i
+                keepalive_row = idx_block_num * IDX_STORAGE_BLOCK_SIZE - MAX_CMP_WRITES + scale_i
                 keepalive_value = pl.read(idx_kv_scale_flat, [keepalive_row, 0])
                 pl.write(idx_kv_scale_flat, [keepalive_row, 0], keepalive_value)
 
@@ -436,8 +437,8 @@ def prefill_indexer_compressor(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -471,8 +472,8 @@ def prefill_indexer_compressor_test(
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
@@ -480,7 +481,7 @@ def prefill_indexer_compressor_test(
     inner_state_slot_mapping: pl.Tensor[[T], pl.INT64],
 ):
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
-    idx_cache_rows = idx_block_num * BLOCK_SIZE
+    idx_cache_rows = idx_block_num * IDX_STORAGE_BLOCK_SIZE
     completion = pl.array.create(1, pl.TASK_ID)
     _prefill_indexer_compressor_with_completion(
         x, compress_state, inner_compress_state_block_table,

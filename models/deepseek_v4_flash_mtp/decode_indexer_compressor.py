@@ -39,6 +39,7 @@ MAX_SEQ_LEN = M.max_position_embeddings
 
 # kernel-local (ratio-4 overlapping compressor)
 COMPRESS_RATIO = 4
+IDX_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
@@ -84,8 +85,8 @@ def indexer_compressor(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
-    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32],
+    idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.INT8],
+    idx_kv_scale: pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32],
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],
@@ -98,8 +99,8 @@ def indexer_compressor(
     idx_block_num = pl.tensor.dim(idx_kv_cache, 0)
     compress_state_flat = pl.reshape(compress_state, [compress_state_block_num * COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
     kv_flat = pl.reshape(kv, [B * S, HEAD_DIM])
-    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * BLOCK_SIZE, HEAD_DIM])
-    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * BLOCK_SIZE, 1])
+    idx_kv_cache_flat = pl.reshape(idx_kv_cache, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, HEAD_DIM])
+    idx_kv_scale_flat = pl.reshape(idx_kv_scale, [idx_block_num * IDX_STORAGE_BLOCK_SIZE, 1])
 
     # Deferred behind the caller's rms_norm dummy barrier: qkv's qr_proj_matmul is the
     # critical path and must win the cores when rms_norm retires.
@@ -317,8 +318,8 @@ def compressor_test(
     cos: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     sin: pl.Tensor[[B, ROPE_HEAD_DIM // 2], pl.FP32],
     hadamard: pl.Tensor[[HEAD_DIM, HEAD_DIM], pl.BF16],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_CACHE_BLOCK_NUM_DYN, IDX_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     position_ids: pl.Tensor[[B, S], pl.INT32],
     idx_slot_mapping: pl.Tensor[[B, S], pl.INT64],
     inner_state_slot_mapping: pl.Tensor[[B, S], pl.INT64],

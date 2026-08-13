@@ -96,7 +96,7 @@ from moe import (
 )
 
 assert HCA_CMP_BLOCK_NUM == CSA_CMP_BLOCK_NUM, "unified host shares cmp_kv between HCA and CSA"
-assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS, "unified host shares cmp_block_table between HCA and CSA"
+assert HCA_CMP_MAX_BLOCKS == CSA_CMP_MAX_BLOCKS
 
 
 @pl.jit
@@ -163,7 +163,8 @@ def decode_layer(
     ],
     csa_inner_compress_state_block_table: pl.Tensor[[B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[B, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -219,7 +220,7 @@ def decode_layer(
             wkv, gamma_cq, gamma_ckv, freqs_cos, freqs_sin,
             hca_cmp_wkv, hca_cmp_wgate, hca_cmp_ape, hca_cmp_norm_w,
             hca_compress_state, hca_compress_state_block_table,
-            kv_cache, cmp_kv, cmp_block_table,
+            kv_cache, cmp_kv, hca_cmp_block_table,
             ori_slot_mapping, window_swa_indices, window_swa_lens,
             hca_cmp_slot_mapping, hca_state_slot_mapping,
             position_ids, kv_seq_lens,
@@ -237,7 +238,7 @@ def decode_layer(
             csa_idx_wq_b, csa_idx_wq_b_scale, csa_weights_proj, csa_hadamard_idx,
             csa_inner_wkv, csa_inner_wgate, csa_inner_ape, csa_inner_norm_w,
             csa_inner_compress_state, csa_inner_compress_state_block_table,
-            kv_cache, cmp_kv, cmp_block_table,
+            kv_cache, cmp_kv, csa_cmp_block_table,
             idx_kv_cache, idx_kv_scale, idx_block_table,
             ori_slot_mapping, window_swa_indices, window_swa_lens,
             csa_cmp_slot_mapping, csa_idx_slot_mapping,
@@ -332,7 +333,8 @@ def l3_decode_layer(
     ],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, B, CSA_INNER_STATE_MAX_BLOCKS], pl.INT32],
     cmp_kv: pl.Tensor[[N_RANKS, CSA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
+    hca_cmp_block_table: pl.Tensor[[N_RANKS, B, HCA_CMP_MAX_BLOCKS], pl.INT32],
+    csa_cmp_block_table: pl.Tensor[[N_RANKS, B, CSA_CMP_MAX_BLOCKS], pl.INT32],
     idx_kv_cache: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, CSA_IDX_HEAD_DIM], pl.INT8],
     idx_kv_scale: pl.Tensor[[N_RANKS, CSA_IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, 1], pl.FP32],
     idx_block_table: pl.Tensor[[N_RANKS, B, CSA_IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -399,7 +401,8 @@ def l3_decode_layer(
             csa_idx_wq_b[r], csa_idx_wq_b_scale[r], csa_weights_proj[r], csa_hadamard_idx[r],
             csa_inner_wkv[r], csa_inner_wgate[r], csa_inner_ape[r], csa_inner_norm_w[r],
             csa_inner_compress_state[r], csa_inner_compress_state_block_table[r],
-            cmp_kv[r], cmp_block_table[r], idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r],
+            cmp_kv[r], hca_cmp_block_table[r], csa_cmp_block_table[r],
+            idx_kv_cache[r], idx_kv_scale[r], idx_block_table[r],
             hc_ffn_fn[r], hc_ffn_scale[r], hc_ffn_base[r],
             norm_w[r], gate_w[r], gate_bias[r], tid2eid[r], input_ids[r],
             routed_w1[r], routed_w1_scale[r], routed_w3[r], routed_w3_scale[r],
@@ -443,7 +446,7 @@ def golden_decode_layer(tensors):
             "swa_lens": tensors["swa_lens"][r],
             "position_ids": tensors["position_ids"][r],
             "cmp_kv": tensors["cmp_kv"][r],
-            "cmp_block_table": tensors["cmp_block_table"][r],
+            "cmp_block_table": tensors["csa_cmp_block_table"][r],
             "attn_sink": tensors["attn_sink"][r],
             "wo_a": tensors["wo_a"][r],
             "wo_b": tensors["wo_b"][r],
@@ -484,7 +487,7 @@ def golden_decode_layer_hca(tensors):
             "compress_state_block_table": tensors["compress_state_block_table"][r],
             "kv_cache": tensors["kv_cache"][r],
             "cmp_kv": tensors["cmp_kv"][r],
-            "cmp_block_table": tensors["cmp_block_table"][r],
+            "cmp_block_table": tensors["hca_cmp_block_table"][r],
             "ori_slot_mapping": tensors["ori_slot_mapping"][r],
             "window_swa_indices": tensors["window_swa_indices"][r],
             "window_swa_lens": tensors["window_swa_lens"][r],
@@ -542,7 +545,7 @@ def golden_decode_layer_csa(tensors):
             "inner_compress_state_block_table": tensors["inner_compress_state_block_table"][r],
             "kv_cache": tensors["kv_cache"][r],
             "cmp_kv": tensors["cmp_kv"][r],
-            "cmp_block_table": tensors["cmp_block_table"][r],
+            "cmp_block_table": tensors["csa_cmp_block_table"][r],
             "idx_kv_cache": tensors["idx_kv_cache"][r],
             "idx_kv_scale": tensors["idx_kv_scale"][r],
             "idx_block_table": tensors["idx_block_table"][r],
@@ -769,7 +772,8 @@ def build_tensor_specs(start_pos=DECODE_START_POS, layer_id=10):
         ("csa_inner_compress_state", csa_specs["inner_compress_state"]),
         ("csa_inner_compress_state_block_table", csa_specs["inner_compress_state_block_table"]),
         ("cmp_kv", csa_specs["cmp_kv"]),
-        ("cmp_block_table", csa_specs["cmp_block_table"]),
+        ("hca_cmp_block_table", hca_specs["cmp_block_table"]),
+        ("csa_cmp_block_table", csa_specs["cmp_block_table"]),
         ("idx_kv_cache", csa_specs["idx_kv_cache"]),
         ("idx_kv_scale", csa_specs["idx_kv_scale"]),
         ("idx_block_table", csa_specs["idx_block_table"]),

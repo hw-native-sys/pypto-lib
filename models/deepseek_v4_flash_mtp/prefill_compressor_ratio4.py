@@ -35,6 +35,7 @@ S = 128
 T = B * S
 START_POS = 0
 COMPRESS_RATIO = 4
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OVERLAP = COMPRESS_RATIO == 4
 COFF = 1 + int(OVERLAP)
 OUT_DIM = COFF * HEAD_DIM
@@ -69,7 +70,7 @@ def compressor_ratio4(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -81,7 +82,7 @@ def compressor_ratio4(
     cmp4_kv_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     cmp4_score_proj_scratch = pl.create_tensor([T, OUT_DIM], dtype=pl.FP32)
     compress_state_flat = pl.reshape(compress_state, [state_block_num * CSA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM])
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     pooled_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
     normed_kv = pl.create_tensor([MAX_CMP_WRITES, HEAD_DIM], dtype=pl.FP32)
 
@@ -285,7 +286,7 @@ def compressor_ratio4(
                 final_row = normed_kv[final_i : final_i + 1, 0:HEAD_DIM]
                 cmp_kv_flat[dst_row : dst_row + 1, 0:HEAD_DIM] = pl.cast(final_row, target_type=pl.BF16, mode="rint")
             else:
-                keepalive_row = cmp_block_num * BLOCK_SIZE - MAX_CMP_WRITES + final_i
+                keepalive_row = cmp_block_num * CMP_STORAGE_BLOCK_SIZE - MAX_CMP_WRITES + final_i
                 cmp_kv_flat[keepalive_row : keepalive_row + 1, 0:HEAD_DIM] = cmp_kv_flat[
                     keepalive_row : keepalive_row + 1,
                     0:HEAD_DIM,
@@ -467,7 +468,7 @@ def prefill_compressor_ratio4_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],

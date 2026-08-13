@@ -258,8 +258,10 @@ C128_COMPRESSOR_BLOCK_SIZE = 8            # ratio-128 compressor state page size
 # compute batch. Per-request ownership is expressed only by block tables.
 KV_ORI_TABLE_MAX_BLOCKS = (FLASH.max_position_embeddings + BLOCK_SIZE - 1) // BLOCK_SIZE
 KV_ORI_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
-KV_CMP_MAX_BLOCKS = 32
-IDX_CACHE_MAX_BLOCKS = 64
+# Scheduler-visible tables use the same 128-source-token block granularity as
+# the uncompressed KV cache. Compressed pools store fewer rows per table entry.
+KV_CMP_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
+IDX_CACHE_MAX_BLOCKS = KV_ORI_TABLE_MAX_BLOCKS
 ORI_KV_BLOCK_NUM = 128
 CMP_KV_BLOCK_NUM = 32
 IDX_KV_BLOCK_NUM = 64

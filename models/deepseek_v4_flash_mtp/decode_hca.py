@@ -64,6 +64,7 @@ O_GROUP_IN = H * HEAD_DIM // O_GROUPS
 
 # kernel-local (HCA: ratio-128 main compressor, no indexer)
 COMPRESS_RATIO = 128  # HCA
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OVERLAP = COMPRESS_RATIO == 4   # always False for HCA
 COFF = 1 + int(OVERLAP)         # always 1 for HCA
 MAIN_OUT_DIM = COFF * HEAD_DIM
@@ -123,7 +124,7 @@ def attention_hca(
     # KV cache split into ori (sliding window) and cmp (compressed) pools to match sparse_attn's contract.
     # cmp_kv is shared with the compressor: it writes the compressed row directly into this pool.
     kv_cache: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
@@ -286,7 +287,7 @@ def attention_hca_test(
     compress_state: pl.Tensor[[COMPRESS_STATE_BLOCK_NUM_DYN, COMPRESS_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[B, COMPRESS_STATE_MAX_BLOCKS], pl.INT32],
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],

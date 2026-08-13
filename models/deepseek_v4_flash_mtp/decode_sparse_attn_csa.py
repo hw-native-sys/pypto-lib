@@ -53,6 +53,7 @@ O_GROUPS = M.o_groups
 HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 COMPRESS_RATIO = 4
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 COMPRESS_RATIO_INV = 1.0 / COMPRESS_RATIO
 INDEXER_SCORE_LEN = MAX_SEQ_LEN // 4
 CSA_CMP_GE_BIAS = 1.0  # raw + 1, folded for the ge clamp
@@ -100,7 +101,7 @@ def sparse_attn_csa(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
@@ -188,7 +189,7 @@ def sparse_attn_csa(
     # window/compressed KV rows into one L1 matmul operand; invalid lanes gather a
     # finite row and are zeroed by the NEG_INF softmax bias.
     cmp_block_num = pl.tensor.dim(cmp_kv, 0)
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     q_flat = pl.reshape(q, [T * H, HEAD_DIM])
     sparse_blk_mi = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
     sparse_blk_li = pl.create_tensor([T * (H // H_TILE) * SPARSE_BLOCKS * H_TILE, 1], dtype=pl.FP32)
@@ -252,8 +253,8 @@ def sparse_attn_csa(
                         qk_ridx = pl.read(cmp_sparse_indices, [qk_t, qk_cmp_k])
                         if qk_ridx >= 0:
                             qk_slot = qk_ridx
-                            qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // BLOCK_SIZE]), pl.INDEX)
-                            qk_csrc = qk_cblk * BLOCK_SIZE + qk_slot % BLOCK_SIZE
+                            qk_cblk = pl.cast(pl.read(cmp_block_table, [qk_b, qk_slot // 32]), pl.INDEX)
+                            qk_csrc = qk_cblk * CMP_STORAGE_BLOCK_SIZE + qk_slot % CMP_STORAGE_BLOCK_SIZE
                             qk_kv = pl.gather_row(qk_kv, cmp_kv_flat, [qk_r, 0], [qk_csrc, 0], [1, HEAD_DIM])
                         else:
                             qk_kv = pl.gather_row(qk_kv, ori_kv_flat, [qk_r, 0], [0, 0], [1, HEAD_DIM])
@@ -487,7 +488,7 @@ def sparse_attn_test(
     q: pl.Tensor[[T, H, HEAD_DIM], pl.BF16],
     ori_kv: pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     window_swa_indices: pl.Tensor[[T, WIN], pl.INT32],
-    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    cmp_kv: pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
     cmp_block_table: pl.Tensor[[B, CMP_MAX_BLOCKS], pl.INT32],
     idx_topk: pl.Tensor[[T, INDEXER_SCORE_LEN], pl.INT32],
     position_ids: pl.Tensor[[T, 1], pl.INT32],
@@ -558,9 +559,8 @@ def golden_sparse_attn(tensors):
                 valid.append(False)
                 continue
             cmp_slot = int(raw)
-            blk_id = int(cmp_block_table[b, cmp_slot // BLOCK_SIZE].item())
-            intra = cmp_slot % BLOCK_SIZE
-            kv_rows.append(cmp_kv[blk_id, intra, 0])
+            block_id = int(cmp_block_table[b, cmp_slot // CMP_STORAGE_BLOCK_SIZE].item())
+            kv_rows.append(cmp_kv[block_id, cmp_slot % CMP_STORAGE_BLOCK_SIZE, 0])
             valid.append(True)
 
         if not any(valid):
@@ -700,7 +700,8 @@ def build_tensor_specs(
 
     def init_cmp_block_table():
         """Build the demo block table for the compressed-cache pages."""
-        return block_table(batch=B, table_blocks=CMP_MAX_BLOCKS, physical_blocks=CMP_BLOCK_NUM)
+        rows = torch.arange(CMP_MAX_BLOCKS, dtype=torch.int32) % CMP_BLOCK_NUM
+        return rows.unsqueeze(0).expand(B, -1).clone()
 
     def init_cmp_sparse_indices():
         """Build the compressed sparse index list."""

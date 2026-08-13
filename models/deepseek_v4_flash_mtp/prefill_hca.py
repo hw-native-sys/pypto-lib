@@ -73,6 +73,7 @@ HEADS_PER_GROUP = H // O_GROUPS
 O_GROUP_IN = HEADS_PER_GROUP * HEAD_DIM
 
 COMPRESS_RATIO = 128
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 MAIN_OUT_DIM = HEAD_DIM
 MAIN_COMPRESS_STATE_DIM = 2 * MAIN_OUT_DIM
 PREFILL_COMPRESSED_LEN = S // COMPRESS_RATIO
@@ -122,7 +123,7 @@ def prefill_attention_hca(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -236,7 +237,7 @@ def prefill_attention_hca(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, swa_indices,
-        cmp_kv, cmp_block_table,
+        cmp_kv, cmp_block_table, pl.cast(BLOCK_SIZE // COMPRESS_RATIO, pl.INT32),
         cmp_indices,
         valid_block_mask,
         attn_sink, num_tokens,
@@ -274,7 +275,7 @@ def prefill_attention_hca_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -413,6 +414,7 @@ def golden_prefill_attention_hca(tensors):
         "swa_indices": swa_indices,
         "cmp_kv": cmp_kv,
         "cmp_block_table": tensors["cmp_block_table"],
+        "cmp_storage_block_size": BLOCK_SIZE // COMPRESS_RATIO,
         "cmp_indices": cmp_indices,
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],

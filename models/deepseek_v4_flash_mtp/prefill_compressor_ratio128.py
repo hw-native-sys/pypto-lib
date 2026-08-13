@@ -39,6 +39,7 @@ NOPE_HEAD_DIM = HEAD_DIM - ROPE_HEAD_DIM
 MAX_SEQ_LEN = M.max_position_embeddings
 START_POS = 0
 COMPRESS_RATIO = 128
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 OUT_DIM = HEAD_DIM
 STATE_LEN = COMPRESS_RATIO
 COMPRESS_STATE_DIM = 2 * OUT_DIM
@@ -73,7 +74,7 @@ def prefill_compressor_ratio128(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -88,7 +89,7 @@ def prefill_compressor_ratio128(
         compress_state,
         [state_block_num * HCA_STATE_BLOCK_SIZE, COMPRESS_STATE_DIM],
     )
-    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * BLOCK_SIZE, HEAD_DIM])
+    cmp_kv_flat = pl.reshape(cmp_kv, [cmp_block_num * CMP_STORAGE_BLOCK_SIZE, HEAD_DIM])
     pooled_kv_pad = pl.create_tensor(
         [HCA_C128_RMS_PAD_ROWS, HEAD_DIM], dtype=pl.FP32, init_value=0
     )
@@ -278,7 +279,7 @@ def prefill_compressor_ratio128_test(
     norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.InOut[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     position_ids: pl.Tensor[[T], pl.INT32],
     num_tokens: pl.Scalar[pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],

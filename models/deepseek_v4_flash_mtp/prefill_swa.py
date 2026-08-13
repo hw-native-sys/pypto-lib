@@ -188,7 +188,7 @@ def prefill_attention_swa(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, swa_indices,
-        cmp_kv_dummy, cmp_block_table_dummy,
+        cmp_kv_dummy, cmp_block_table_dummy, pl.cast(BLOCK_SIZE, pl.INT32),
         cmp_indices_dummy,
         valid_block_mask,
         attn_sink, num_tokens,

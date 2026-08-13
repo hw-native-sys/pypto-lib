@@ -84,6 +84,7 @@ Q_LORA = M.q_lora_rank
 MAX_SEQ_LEN = M.max_position_embeddings
 WIN = M.sliding_window
 COMPRESS_RATIO = 4
+CMP_STORAGE_BLOCK_SIZE = BLOCK_SIZE // COMPRESS_RATIO
 START_POS = 0
 IDX_HEAD_DIM = M.index_head_dim
 IDX_N_HEADS = M.index_n_heads
@@ -159,10 +160,10 @@ def prefill_attention_csa(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.Out[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -309,7 +310,7 @@ def prefill_attention_csa(
     attn_out = pl.create_tensor([T, D], dtype=pl.BF16)
     sparse_attn(
         q, kv_cache, swa_indices,
-        cmp_kv, cmp_block_table,
+        cmp_kv, cmp_block_table, pl.cast(BLOCK_SIZE // COMPRESS_RATIO, pl.INT32),
         cmp_topk_indices,
         valid_block_mask,
         attn_sink, num_tokens,
@@ -367,10 +368,10 @@ def prefill_attention_csa_test(
     kv_cache: pl.InOut[pl.Tensor[[ORI_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     ori_slot_mapping: pl.Tensor[[T], pl.INT64],
-    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_kv: pl.Out[pl.Tensor[[CMP_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
-    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
-    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, BLOCK_SIZE, 1, 1], pl.FP32]],
+    idx_kv_cache: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.INT8]],
+    idx_kv_scale: pl.InOut[pl.Tensor[[IDX_BLOCK_NUM_DYN, CMP_STORAGE_BLOCK_SIZE, 1, 1], pl.FP32]],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
     position_ids: pl.Tensor[[T], pl.INT32],
     cmp_slot_mapping: pl.Tensor[[T], pl.INT64],
@@ -542,6 +543,7 @@ def golden_prefill_attention_csa(tensors):
         "swa_indices": swa_indices,
         "cmp_kv": tensors["cmp_kv"],
         "cmp_block_table": tensors["cmp_block_table"],
+        "cmp_storage_block_size": BLOCK_SIZE // COMPRESS_RATIO,
         "cmp_indices": cmp_indices,
         "attn_sink": tensors["attn_sink"],
         "num_tokens": tensors["num_tokens"],
