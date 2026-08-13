@@ -96,7 +96,14 @@ runs:
       working-directory: ${{ inputs.pypto-lib-checkout-path }}
       run: |
         source activate.sh
-        pip install transformers safetensors pytest fastapi uvicorn msgspec
+        # setup-ci-job builds the job venv with `uv venv` on the toolchain
+        # bundle, and that venv carries no pip at all — so the installer is the
+        # one it named in PYPTO_USE_UV, not a hardcoded `pip`.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          uv pip install transformers safetensors pytest fastapi uvicorn msgspec
+        else
+          pip install transformers safetensors pytest fastapi uvicorn msgspec
+        fi
 
     - name: Run pypto-serving Qwen tests
       if: ${{ inputs.model-name == 'qwen3-14b' }}

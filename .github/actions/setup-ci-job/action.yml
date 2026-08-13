@@ -5,7 +5,7 @@ description: >-
   `serving`, daily_ci.yml `model-tests-a2a3`). All of them run directly on the
   host, as the same user, through this one action: resilient checkout into a
   per-job dir, toolchain resolution from the cached pypto source, a ptoas install,
-  a per-job conda venv + activate.sh, and a from-source build/install of
+  a per-job venv + activate.sh, and a from-source build/install of
   pypto + simpler. Simpler's own installer resolves the pinned pto-isa checkout
   (pypto's runtime/pto_isa.pin is the single source of truth), so this action
   never clones it. The device jobs differ only in that they additionally check the
@@ -24,15 +24,29 @@ description: >-
   one and a differently-laid-out host needs no repo change. The runner must set:
 
     CONDA_ROOT             conda install to layer the per-job venv on
+                           (toolchain: conda only)
     CI_CACHE_ROOT          dir CI may keep its caches in (created if absent)
     CANN_ROOT              CANN toolkit — device runners only (needs-device)
     PYPTO_QWEN3_MODEL_DIR  model weights — only the serving job reads these
     PYPTO_DSV4_MODEL_DIR
 
-  Beyond those, the host is expected to provide (by name, not by path): a conda
-  env `py310-lib` under CONDA_ROOT, and task-submit / npu-smi / ccache / git /
-  curl on PATH. The `.env` makes the *locations* portable; these names are the
-  provisioning contract a runner has to satisfy to be usable at all.
+  The bundle (toolchain: bundle) deliberately has no entry here: its location is
+  not a free choice, so there is nothing for a host to declare. The prefix
+  /opt/pypto/toolchain/<version> is compiled into the bundle's gcc and python, so
+  a bundle unpacked anywhere else is subtly broken; a host that needs the bytes
+  elsewhere symlinks /opt/pypto at them.
+
+  Beyond those, the host is expected to provide (by name, not by path):
+  task-submit / npu-smi / ccache / git / curl on PATH, and — on the conda path
+  only — a conda env `py310-lib` under CONDA_ROOT. The `.env` makes the
+  *locations* portable; these names are the provisioning contract a runner has to
+  satisfy to be usable at all.
+
+  A bundle runner needs no conda whatsoever: CONDA_ROOT is read only inside the
+  `toolchain: conda` bootstrap step, and nothing else reaches for a conda prefix.
+  Keep it that way. A step that runs before the bootstrap has no activate.sh and
+  is tempted to find an interpreter on its own; conda is the wrong answer, and
+  the right one is to move the step after the bootstrap instead.
 
   The CPU architecture is detected, not pinned: ptoas is fetched as the CPython
   3.10 manylinux wheel for $(uname -m) and checked against the matching
@@ -47,8 +61,17 @@ description: >-
   non-path CCACHE_* (MAXSIZE / UMASK) environment variables; they are read from
   the job environment here. PTOAS_VERSION, PTOAS_SHA256, PTO_ISA_COMMIT and
   CCACHE_NAMESPACE are resolved and exported by this action, as is every cache
-  path (CCACHE_DIR, PIP_CACHE_DIR, PTOAS_CACHE_DIR, PYPTO_SRC) — they derive from
-  CI_CACHE_ROOT and so cannot live in the caller's static job-level `env:` block.
+  path (CCACHE_DIR, PIP_CACHE_DIR, PTOAS_CACHE_DIR, UV_CACHE_DIR, PYPTO_SRC) —
+  they derive from CI_CACHE_ROOT and so cannot live in the caller's static
+  job-level `env:` block.
+
+  Which installer a job gets follows from its toolchain, and the bootstrap step
+  states it in PYPTO_USE_UV. The bundle carries uv, so bundle jobs build the venv
+  with `uv venv` and install with `uv pip`; that venv has no pip in it at all.
+  Conda jobs keep pip, since uv is not in the conda env. A step that runs after
+  this action and installs into the job venv must therefore not hardcode `pip` —
+  on a bundle job it is simply not there (see the pypto-serving-tests action,
+  which branches on PYPTO_USE_UV for exactly this reason).
 
 inputs:
   ccache-name:
@@ -83,12 +106,20 @@ inputs:
       Where Python and GCC come from. 'conda' is the historical path: a
       per-machine conda env under CONDA_ROOT with a --system-site-packages venv
       layered on it. 'bundle' uses the pinned pypto-toolchain bundle at
-      /opt/pypto/toolchain/current, identical on every host.
+      /opt/pypto/toolchain/current, identical on every host, which also carries
+      the ccache and the uv every bundle job builds and installs with.
 
-      Default stays 'conda' so an unprovisioned runner keeps working; jobs move
-      one at a time and each reverts on its own line.
+      The default was 'conda' while the fleet was migrated a label at a time.
+      That is finished — every caller in this repo (sim, a2a3, both serving jobs,
+      and the a5 daily sweep) passes 'bundle' explicitly — so the default
+      follows, and a job added without this input lands on the path CI actually
+      exercises rather than on one with no coverage that additionally demands
+      CONDA_ROOT and a py310-lib env on the runner.
+
+      'conda' still works and is still the way to revert a single job, but it is
+      now untested. Removing it altogether waits on conda leaving the runners.
     required: false
-    default: 'conda'
+    default: 'bundle'
   install-torch-npu:
     description: >-
       When 'true', install torch_npu into the venv. It is what puts `torch.npu`
@@ -147,7 +178,13 @@ runs:
         # Prerequisites CI does not create, so they must already be there. The
         # simulator needs no Ascend env, so CANN_ROOT is device-jobs-only. Model
         # dirs are only needed by the serving job, which checks its own.
-        case "${TOOLCHAIN_IN:-conda}" in
+        #
+        # Matched bare, with no shell-side default: the input carries one, so an
+        # empty value here means a caller passed `toolchain: ''`. Substituting a
+        # default for it would accept a spelling the `if:` gates on the two
+        # bootstrap steps reject, and the first symptom of that silent skip is an
+        # unrelated "activate.sh: No such file" ten minutes into the build.
+        case "$TOOLCHAIN_IN" in
           conda|bundle) ;;
           *)
             echo "::error::Unsupported toolchain '$TOOLCHAIN_IN'. Use 'conda' or 'bundle'."
@@ -155,7 +192,7 @@ runs:
             ;;
         esac
         required=""
-        if [ "${TOOLCHAIN_IN:-conda}" = "conda" ]; then
+        if [ "$TOOLCHAIN_IN" = "conda" ]; then
           required="CONDA_ROOT"
         fi
         if [ "$NEEDS_DEVICE" = "true" ]; then
@@ -219,10 +256,18 @@ runs:
         #
         # Only this tree needs it: ccache is built for concurrent access and is
         # worth far more shared, and the ptoas wheel is named by its version.
+        #
+        # UV_CACHE_DIR is deliberately NOT per-job the way PIP_CACHE_DIR is. The
+        # pip dirs are split because pip has no shared-umask knob and concurrent
+        # jobs end up fighting over file ownership; uv's cache is built for
+        # concurrent access, and sharing it is the point — a wheel any job has
+        # already downloaded is hardlinked into the next venv instead of being
+        # fetched and unpacked again (torch, at ~200 MB, dominates this).
         {
           echo "CCACHE_DIR=$CI_CACHE_ROOT/$CCACHE_NAME"
           echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
           echo "PTOAS_CACHE_DIR=$CI_CACHE_ROOT/ptoas"
+          echo "UV_CACHE_DIR=$CI_CACHE_ROOT/uv"
           echo "PYPTO_SRC=$CI_CACHE_ROOT/pypto-src-$BUILD_NAMESPACE-$RUNNER_NAME"
         } >> "$GITHUB_ENV"
         echo "runner config OK (checked: CI_CACHE_ROOT $required)"
@@ -434,6 +479,10 @@ runs:
         # venv` reuse it and carry over old site-packages.
         rm -rf venv
         python -m venv venv --system-site-packages
+        # uv ships in the toolchain bundle, not in the conda env, so the conda
+        # path keeps installing with pip. Stated rather than defaulted: the
+        # build, ptoas and serving-deps steps below all branch on it.
+        echo "PYPTO_USE_UV=false" >> "$GITHUB_ENV"
         # simpler's sim toolchain invokes the host compiler as g++-15 / gcc-15
         # (hardcoded in simpler_setup/toolchain.py), but the conda env ships them
         # as plain g++ / gcc. Publish those names here instead of relying on a
@@ -519,12 +568,27 @@ runs:
         pypto-toolchain verify \
           --require python=3.10 --require 'gcc>=15' --require 'ccache>=4.8'
         source /opt/pypto/toolchain/current/activate.sh
+        # The bundle's activate.sh exports PYPTO_TOOLCHAIN as the versioned
+        # prefix, and the per-job file written below is built around it — so an
+        # empty value here would surface much later, as a venv built by the host
+        # python or an activate.sh that sources nothing.
+        if [ -z "${PYPTO_TOOLCHAIN:-}" ]; then
+          echo "::error::the toolchain bundle did not export PYPTO_TOOLCHAIN"
+          exit 1
+        fi
 
         rm -rf venv toolchain-bin
         # No --system-site-packages: nothing outside the venv is depended on,
         # which also retires the trap where a failed install in the venv was
         # masked by a copy of pypto in the base env.
-        python3.10 -m venv venv
+        #
+        # `uv venv`, not `python3.10 -m venv`: the bundle carries uv, every
+        # install into this venv goes through it, and skipping ensurepip is most
+        # of why it is quick. The venv therefore has no pip — which is the point,
+        # not an oversight. Anything reaching for `python -m pip` here is
+        # reaching for the wrong tool; use `uv pip`.
+        uv venv --python python3.10 venv
+        echo "PYPTO_USE_UV=true" >> "$GITHUB_ENV"
 
         # Baked in as a literal, like the conda roots were: activate.sh is also
         # sourced by task-submit children, whose env snapshot is truncated.
@@ -542,13 +606,46 @@ runs:
         source "$_PYPTO_ENV_DIR/venv/bin/activate"
         EOF
 
+        # Prove the file works before the rest of the job depends on it.
         ( source activate.sh
-          command -v python3.10 g++-15 ccache uv >/dev/null
+          # One name per iteration. `command -v a b c` returns 0 when ANY name
+          # resolves and non-zero only when they all fail, so the multi-name form
+          # this replaces asserted almost nothing — it passed on a bundle with no
+          # uv in it at all, since python3.10 alone satisfied it. uv is now what
+          # builds the venv and installs into it, so a missing one has to fail
+          # here rather than as "uv: command not found" in the build step.
+          for tool in python3.10 g++-15 ccache uv; do
+            command -v "$tool" >/dev/null && continue
+            echo "::error::$tool is not on PATH after sourcing activate.sh"
+            exit 1
+          done
           python3.10 -c 'import sys; assert sys.version_info[:2]==(3,10)' )
 
-    - name: Show ccache stats (before)
+    - name: Show cache stats (before)
       shell: bash
-      run: ccache -s || true
+      run: |
+        ccache -s || true
+        # The uv cache is the one thing in this action whose effect is invisible
+        # in the logs: a hit and a miss differ only in how long `uv pip install`
+        # took. That matters because the miss is expensive — torch is 91 MB and
+        # cmake 29 MB, and re-fetching both costs ~2 min of a ~4 min setup — and
+        # because concurrent jobs on one host share this dir, so a cold entry is
+        # paid once per job rather than once per host. Report where uv actually
+        # keeps it and how big it is, before and after, so "the cache is not
+        # retaining across runs" becomes a fact rather than an inference from
+        # install timings.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          ( source activate.sh
+            # `uv cache dir` is authoritative: it reports the directory uv
+            # resolved, which is what proves UV_CACHE_DIR reached it at all.
+            echo "uv_cache configured=${UV_CACHE_DIR:-<unset>} resolved=$(uv cache dir 2>/dev/null || echo '<unknown>')"
+            if [ -d "${UV_CACHE_DIR:-/nonexistent}" ]; then
+              echo "uv_cache size=$(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1) mtime=$(date -r "$UV_CACHE_DIR" '+%F %T' 2>/dev/null)"
+            else
+              echo "uv_cache MISSING — every wheel this job needs is a fresh download"
+            fi )
+        fi
+      working-directory: ${{ inputs.checkout-path }}
 
     - name: Build and install pypto and simpler
       # Reuses the pypto source synced by the resolve step above (same revision
@@ -559,7 +656,23 @@ runs:
         INSTALL_TORCH_NPU: ${{ inputs.install-torch-npu }}
       run: |
         source activate.sh
-        python -m pip install --upgrade pip
+        # One installer per toolchain, chosen by the bootstrap step that built
+        # the venv: uv on the bundle path (it is in the bundle, and that venv has
+        # no pip at all), pip on the conda path. Every install below goes through
+        # this, so the two paths cannot drift in their flags.
+        #
+        # uv resolves the target environment from $VIRTUAL_ENV, which activate.sh
+        # has already exported by sourcing venv/bin/activate.
+        py_install() {
+          if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+            uv pip install "$@"
+          else
+            pip install "$@"
+          fi
+        }
+        if [ "${PYPTO_USE_UV:-false}" != "true" ]; then
+          python -m pip install --upgrade pip
+        fi
         # Constrained deliberately. Unconstrained, a transient index failure on
         # one transitive dependency sends pip backtracking through sixty
         # releases of scikit-build-core before reporting it, burying the real
@@ -573,7 +686,7 @@ runs:
         # bound class, which is what pypto's TileView uses for `start_offset`, so
         # `ir.TileView()` no longer matches its own all-defaulted overload and
         # every `pl.Tile` annotation fails to parse.
-        pip install 'scikit-build-core>=0.10' 'nanobind<3' cmake ninja
+        py_install 'scikit-build-core>=0.10' 'nanobind<3' cmake ninja
         # torch BEFORE pypto is built. pypto declares torch>=2.0.0, and if it is
         # not installed yet pip resolves that from the default index, where the
         # aarch64 wheel now drags ~1.5 GB of CUDA onto an Ascend host. Under
@@ -586,9 +699,9 @@ runs:
         # install-torch-npu is on: the torch_npu 2.6.0 line requires torch==2.6.0
         # exactly, and one torch is installed here for every job.
         TORCH_PIN='torch==2.6.0'
-        if ! pip install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
+        if ! py_install "$TORCH_PIN" --index-url https://download.pytorch.org/whl/cpu; then
           echo "note: download.pytorch.org unreachable — falling back to PyPI"
-          pip install "$TORCH_PIN"
+          py_install "$TORCH_PIN"
         fi
         # torch_npu is what puts `torch.npu` on the torch module. Nothing imports
         # it explicitly — PyTorch autoloads it through its `torch.backends` entry
@@ -602,7 +715,7 @@ runs:
         # `Requires-Dist: torch==2.6.0`, satisfied by the 2.6.0+cpu installed
         # above because a specifier carrying no local label ignores one.
         if [ "$INSTALL_TORCH_NPU" = "true" ]; then
-          pip install 'torch_npu==2.6.0.post5' \
+          py_install 'torch_npu==2.6.0.post5' \
             --index-url https://mirrors.huaweicloud.com/repository/pypi/simple
         fi
         # The from-source pypto / simpler builds compile native code (libbacktrace
@@ -612,7 +725,7 @@ runs:
         # configure / ccache state from the failed attempt can't poison the retry.
         retry_build() {
           local target="$1" attempt=0
-          until pip install --no-build-isolation "$target"; do
+          until py_install --no-build-isolation "$target"; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge 3 ]; then
               echo "build of '$target' failed after $attempt attempts"; return 1
@@ -633,12 +746,28 @@ runs:
       working-directory: ${{ inputs.checkout-path }}
       run: |
         source activate.sh
-        pip install 'nanobind<3'  # same cap as the build step above
+        # Same installer split as the build step: the bundle venv has no pip.
+        # Same nanobind cap as the build step above, and for the same reason.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          uv pip install 'nanobind<3'
+        else
+          pip install 'nanobind<3'
+        fi
         # torch is installed in the build step above, before pypto is resolved.
 
-    - name: Show ccache stats (after)
+    - name: Show cache stats (after)
       shell: bash
-      run: ccache -s || true
+      run: |
+        ccache -s || true
+        # Paired with the "before" reading. A cache that is retaining across
+        # runs grows once and then stays flat; one that is being emptied between
+        # runs grows by the same ~120 MB every time, which is the signature to
+        # look for.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          ( source activate.sh
+            echo "uv_cache size=$(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1) mtime=$(date -r "$UV_CACHE_DIR" '+%F %T' 2>/dev/null)" )
+        fi
+      working-directory: ${{ inputs.checkout-path }}
 
     - name: Install ptoas (local cache)
       # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the loader step. Runs after
@@ -724,6 +853,22 @@ runs:
           exit 1
         fi
         rm -rf "$PTOAS_ROOT"
-        python -m venv "$PTOAS_ROOT" --system-site-packages
-        "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
+        # Both branches build the same thing: a venv layered on the toolchain
+        # underneath the job venv — conda's py310-lib or the bundle's python3.10
+        # — with --system-site-packages exposing that same prefix.
+        #
+        # They differ only in who builds it, and that is forced: on the bundle
+        # path the job venv is made by `uv venv` and has no pip, so neither
+        # `python -m venv` (which needs ensurepip to seed the child) nor
+        # `$PTOAS_ROOT/bin/python -m pip` is available to it. The base
+        # interpreter is named explicitly rather than left to uv's discovery,
+        # which would otherwise resolve against the active venv.
+        if [ "${PYPTO_USE_UV:-false}" = "true" ]; then
+          base_python="$(python -c 'import sys; print(sys.base_prefix)')/bin/python3.10"
+          uv venv --python "$base_python" --system-site-packages "$PTOAS_ROOT"
+          uv pip install --python "$PTOAS_ROOT/bin/python" "$CACHE_WHEEL"
+        else
+          python -m venv "$PTOAS_ROOT" --system-site-packages
+          "$PTOAS_ROOT/bin/python" -m pip install "$CACHE_WHEEL"
+        fi
         "$PTOAS_ROOT/bin/ptoas" --version
