@@ -281,8 +281,8 @@ def prefill_fwd(
     hca_compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -331,6 +331,30 @@ def prefill_fwd(
     num_tokens_per_owner: pl.Tensor[[N_RANKS], pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
 ) -> pl.Tensor[[FWD_TOKENS_DYN, D], pl.BF16]:
+    swa_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    swa_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [0, 0, 0]
+    )
+    compressed_cos_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_cos, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    compressed_sin_profile: pl.Tensor[[1, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.slice(
+        freqs_sin, [1, MAX_SEQ_LEN, ROPE_HEAD_DIM], [1, 0, 0]
+    )
+    swa_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    swa_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        swa_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_cos_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
+    compressed_freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16] = pl.reshape(
+        compressed_sin_profile, [MAX_SEQ_LEN, ROPE_HEAD_DIM]
+    )
     total_nt: pl.Scalar[pl.INT32] = pl.cast(0, pl.INT32)
     for owner_rank in pl.range(N_RANKS):
         total_nt = pl.max(total_nt, pl.read(num_tokens_per_owner, [owner_rank]))
@@ -411,7 +435,7 @@ def prefill_fwd(
                     x_hc_tile,
                     hc_attn_fn_l0, hc_attn_scale_l0, hc_attn_base_l0, attn_norm_w_l0,
                     wq_a_l0, wq_b_l0, wq_b_scale_l0, wkv_l0, gamma_cq_l0, gamma_ckv_l0,
-                    freqs_cos, freqs_sin,
+                    swa_freqs_cos, swa_freqs_sin,
                     kv_cache_l0, ori_block_table, ori_slot_mapping_tile,
                     position_ids_tile,
                     attn_sink_l0, wo_a_l0, wo_b_l0, wo_b_scale_l0,
@@ -473,7 +497,7 @@ def prefill_fwd(
                     hidden,
                     hc_attn_fn_l1, hc_attn_scale_l1, hc_attn_base_l1, attn_norm_w_l1,
                     wq_a_l1, wq_b_l1, wq_b_scale_l1, wkv_l1, gamma_cq_l1, gamma_ckv_l1,
-                    freqs_cos, freqs_sin,
+                    swa_freqs_cos, swa_freqs_sin,
                     kv_cache_l1, ori_block_table, ori_slot_mapping_tile,
                     position_ids_tile,
                     attn_sink_l1, wo_a_l1, wo_b_l1, wo_b_scale_l1,
@@ -560,7 +584,7 @@ def prefill_fwd(
                         hidden,
                         hc_attn_fn_csa, hc_attn_scale_csa, hc_attn_base_csa, attn_norm_w_csa,
                         wq_a_csa, wq_b_csa, wq_b_scale_csa, wkv_csa, gamma_cq_csa, gamma_ckv_csa,
-                        freqs_cos, freqs_sin,
+                        compressed_freqs_cos, compressed_freqs_sin,
                         csa_cmp_wkv_csa, csa_cmp_wgate_csa, csa_cmp_ape_csa, csa_cmp_norm_w_csa,
                         csa_compress_state_csa, csa_compress_state_block_table,
                         csa_hadamard_idx_csa,
@@ -636,7 +660,7 @@ def prefill_fwd(
                         hidden_mid,
                         hc_attn_fn_hca, hc_attn_scale_hca, hc_attn_base_hca, attn_norm_w_hca,
                         wq_a_hca, wq_b_hca, wq_b_scale_hca, wkv_hca, gamma_cq_hca, gamma_ckv_hca,
-                        freqs_cos, freqs_sin,
+                        compressed_freqs_cos, compressed_freqs_sin,
                         hca_cmp_wkv_hca, hca_cmp_wgate_hca, hca_cmp_ape_hca, hca_cmp_norm_w_hca,
                         hca_compress_state_hca, hca_compress_state_block_table,
                         kv_cache_hca, ori_slot_mapping_tile, ori_block_table,
@@ -721,7 +745,7 @@ def prefill_fwd(
                     hidden,
                     hc_attn_fn_last, hc_attn_scale_last, hc_attn_base_last, attn_norm_w_last,
                     wq_a_last, wq_b_last, wq_b_scale_last, wkv_last, gamma_cq_last, gamma_ckv_last,
-                    freqs_cos, freqs_sin,
+                    compressed_freqs_cos, compressed_freqs_sin,
                     csa_cmp_wkv_last, csa_cmp_wgate_last, csa_cmp_ape_last, csa_cmp_norm_w_last,
                     csa_compress_state_last, csa_compress_state_block_table,
                     csa_hadamard_idx_last,
@@ -800,8 +824,8 @@ def l3_prefill_fwd(
     hca_compress_state_block_table: pl.Tensor[[N_RANKS, HCA_STATE_MAX_BLOCKS], pl.INT32],
     csa_compress_state_block_table: pl.Tensor[[N_RANKS, CSA_STATE_MAX_BLOCKS], pl.INT32],
     csa_inner_compress_state_block_table: pl.Tensor[[N_RANKS, INNER_STATE_MAX_BLOCKS], pl.INT32],
-    freqs_cos: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
-    freqs_sin: pl.Tensor[[N_RANKS, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[N_RANKS, 2, MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
     ori_block_table: pl.Tensor[[N_RANKS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
     cmp_block_table: pl.Tensor[[N_RANKS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
     idx_block_table: pl.Tensor[[N_RANKS, IDX_CACHE_MAX_BLOCKS], pl.INT32],
@@ -1240,8 +1264,30 @@ def build_single_layer_tensor_specs(start_pos=START_POS, num_tokens=T, layer_id=
         ("wkv", active["wkv"]),
         ("gamma_cq", active["gamma_cq"]),
         ("gamma_ckv", active["gamma_ckv"]),
-        ("freqs_cos", active["freqs_cos"]),
-        ("freqs_sin", active["freqs_sin"]),
+        (
+            "freqs_cos",
+            TensorSpec(
+                "freqs_cos",
+                [2, *swa["freqs_cos"].shape],
+                swa["freqs_cos"].dtype,
+                init_value=lambda: torch.stack(
+                    (_spec_value(swa["freqs_cos"], torch), _spec_value(csa["freqs_cos"], torch)),
+                    dim=0,
+                ),
+            ),
+        ),
+        (
+            "freqs_sin",
+            TensorSpec(
+                "freqs_sin",
+                [2, *swa["freqs_sin"].shape],
+                swa["freqs_sin"].dtype,
+                init_value=lambda: torch.stack(
+                    (_spec_value(swa["freqs_sin"], torch), _spec_value(csa["freqs_sin"], torch)),
+                    dim=0,
+                ),
+            ),
+        ),
         ("hca_cmp_wkv", hca["cmp_wkv"]),
         ("hca_cmp_wgate", hca["cmp_wgate"]),
         ("hca_cmp_ape", hca["cmp_ape"]),
