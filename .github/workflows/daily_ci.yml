@@ -94,7 +94,7 @@ jobs:
           # `# ci: no-sim` (full multi-layer / multi-card forwards) are
           # device-only and would just argparse-reject *sim, so skip them here.
           for f in $(find models -name '*.py' ! -name '*draft*' \
-              ! -path 'models/deepseek_v4_pro/*' | sort); do
+              ! -path 'models/deepseek_v4/*' | sort); do
             # Shared modules (config.py, helper libs) have no __main__ guard —
             # they are imported by kernels, not run. Running them import-exits 0
             # and shows a misleading pass, so drop them from the report entirely
@@ -252,7 +252,7 @@ jobs:
           }
           # Run every model file once at its default world size (ep2 / 2-card).
           for f in $(find models -name '*.py' ! -name '*draft*' \
-              ! -path 'models/deepseek_v4_pro/*' | sort); do
+              ! -path 'models/deepseek_v4/*' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper libs):
             # they are imported, not run, so they don't belong in the report.
             if ! grep -q '__main__' "$f"; then
@@ -306,7 +306,7 @@ jobs:
     # blockers land and the sweep is green.
     continue-on-error: true
     # Real Ascend 950 (A5) device job — the dedicated daily coverage of the
-    # DeepSeek V4-Pro variant (models/deepseek_v4_pro/). Mirrors
+    # DeepSeek V4-Pro variant (the Pro preset in models/deepseek_v4/). Mirrors
     # model-tests-a2a3 but runs -p a5 on the npu-a5 self-hosted runner and
     # sweeps ONLY Pro: Pro is excluded from the a2a3/a2a3sim/a5sim
     # sweeps above (it is the A5-targeted variant, so running it on 910B
@@ -424,7 +424,7 @@ jobs:
             devnum_flag=""
             [ "$ndev" -gt 1 ] && devnum_flag="--device-num $ndev"
             out=$( task-submit --device "$DEVICE_ID" $devnum_flag --timeout 3600 --max-time 900 \
-              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
+              --run "cd $GITHUB_WORKSPACE/checkout && source activate.sh && DEEPSEEK_V4_VARIANT=pro PYTHONPATH=$GITHUB_WORKSPACE/checkout python $file -p a5 -d \$TASK_DEVICE $*" 2>&1 )
             rc=$?
             printf '%s\n' "$out"
             perf=$(printf '%s\n' "$out" | extract_perf)
@@ -439,7 +439,8 @@ jobs:
             echo "::endgroup::"
           }
           # Sweep ONLY the V4-Pro variant — its dedicated A5 daily set.
-          for f in $(find models/deepseek_v4_pro -name '*.py' ! -name '*draft*' | sort); do
+          for f in $(find models/deepseek_v4 -name '*.py' ! -name '*draft*' \
+              ! -name 'synthetic_token_loop.py' | sort); do
             # Skip shared modules with no __main__ guard (config.py, helper
             # libs): they are imported, not run.
             if ! grep -q '__main__' "$f"; then
@@ -499,7 +500,7 @@ jobs:
           import pathlib
 
           # Two tables, not one matrix: model-tests-a5 sweeps only
-          # models/deepseek_v4_pro and the other three jobs exclude it, so the
+          # models/deepseek_v4 Pro sweep and the other three jobs exclude it, so the
           # case sets are disjoint. A single table makes every row half filler —
           # 35 Pro rows blank under a2a3/sim, 48 others blank under a5.
           ICON = {"pass": ":white_check_mark:", "fail": ":x:", "missing": ":heavy_minus_sign:"}
